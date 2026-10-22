@@ -683,6 +683,97 @@ impl LogicalExecutionTestHarness {
         .expect("test-only watchdog: original End delivery, decoding and Ready acceptance")
     }
 
+    /// Drives the real registered consumer and reports its actual future exit.
+    /// No End receipt or Ready proposal is authored by this harness helper.
+    pub async fn run_registered_internal_consumer(
+        &self,
+        consumer: std::sync::Arc<dyn crate::api::InternalComputationConsumer>,
+        activation: crate::api::InternalConsumerActivation,
+    ) -> Result<(), QueryExecutionError> {
+        let exit = activation.supervise_exit().await.map_err(|error| {
+            QueryExecutionError::new(
+                crate::api::QueryExecutionErrorKind::Failed,
+                format!("internal consumer fixture supervision failed: {error}"),
+            )
+        })?;
+        let result = consumer.consume(activation).await;
+        exit.complete(result.clone());
+        result
+    }
+
+    /// Delivers only the original input. The fixed consumer must decode End
+    /// and propose readiness through its own original source.
+    pub async fn deliver_original_internal_end(
+        &self,
+        root: novarocks_execution_contract::TaskIdentity,
+        status: novarocks_execution_contract::TaskStatus,
+        end: novarocks_execution_contract::root_result::RootResultEnd,
+    ) -> Result<(), LogicalExecutionActorError> {
+        let running = self.running.as_ref().expect("fixture attempt is active");
+        let observer = running.bind_root_result(root).await?;
+        observer.observe_local_root_end(root, end).await?;
+        observer.observe_status(status).await?;
+        running.deliver_internal_end(root, end).await
+    }
+
+    /// Transfers one original retained internal segment through its real
+    /// actor delivery receipt. The concrete consumer performs actual decoding.
+    pub async fn deliver_original_internal_segment(
+        &self,
+        sequence: novarocks_execution_contract::ResultPacketSequence,
+        segment: std::sync::Arc<crate::api::RetainedRootReply>,
+        rows: u64,
+    ) -> Result<(), LogicalExecutionActorError> {
+        self.running
+            .as_ref()
+            .expect("fixture attempt is active")
+            .deliver_root_segment(
+                sequence,
+                segment,
+                None,
+                rows,
+                crate::api::RootRelayResidentWindow::default(),
+            )
+            .await
+    }
+
+    /// The exact same failure-freeze entry used by the real root pump. This
+    /// helper cannot replace its running authority or conclude the statement.
+    pub async fn freeze_original_internal_failure(
+        &self,
+        error: QueryExecutionError,
+    ) -> Result<(), LogicalExecutionActorError> {
+        self.running
+            .as_ref()
+            .expect("fixture attempt is active")
+            .freeze_result_attempt_failure(error)
+            .await
+    }
+
+    /// Completes the real Native pump's NoRecovery decision with its original
+    /// running authority. Freezing an attempt error alone is not a conclusion.
+    pub async fn fail_original_running_attempt(
+        &mut self,
+        error: QueryExecutionError,
+    ) -> Result<crate::coordination::LogicalConclusion, LogicalExecutionActorError> {
+        let running = self
+            .running
+            .take()
+            .ok_or(LogicalExecutionActorError::WrongPhase)?;
+        self.actor().fail_attempt_with_error(running, error).await
+    }
+
+    /// The original actor's logical outcome watch, retained across activation
+    /// retirement. This accessor cannot manufacture a cut or decoded receipt.
+    pub fn original_internal_outcome(
+        &self,
+    ) -> watch::Receiver<Option<Result<crate::api::ComputationReadyToken, QueryExecutionError>>>
+    {
+        self.actor()
+            .internal_outcome()
+            .expect("the fixture installed the real internal computation actor")
+    }
+
     pub async fn activate_initial(
         &mut self,
     ) -> Result<AttemptActivationIdentity, LogicalExecutionActorError> {

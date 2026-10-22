@@ -1106,6 +1106,14 @@ impl TaskExecutionPreparedQuery {
         &self.options
     }
 
+    /// Retain the original frozen table, including sealed-empty identity,
+    /// after Establish has borrowed it. Internal handoff checks its author.
+    pub(crate) fn take_terminal_storage(
+        &mut self,
+    ) -> Arc<crate::query_execution::lifecycle_plan::AttemptCredentialStorage> {
+        self.options.take_credential_leases().into_storage()
+    }
+
     /// Takes this attempt's vended-storage capability, once.
     ///
     /// Called after the establish froze its own copy of the material: the

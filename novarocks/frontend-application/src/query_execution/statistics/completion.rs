@@ -30,7 +30,7 @@ pub(crate) struct StatisticsProtocolTracker {
     facts: Box<[StatisticsTaskCompletionFact]>,
     nonterminal: usize,
     incompatible: usize,
-    round_failure: Option<TerminationDetail>,
+    selected_failure: Option<novarocks_coordination_contract::SelectedTaskTermination>,
 }
 impl StatisticsProtocolTracker {
     pub(crate) fn from_initial(
@@ -57,7 +57,7 @@ impl StatisticsProtocolTracker {
             facts,
             provenance,
             revision: 0,
-            round_failure: None,
+            selected_failure: None,
         };
         tracker.observe(changes)?;
         Ok(tracker)
@@ -102,9 +102,7 @@ impl StatisticsProtocolTracker {
             self.nonterminal += usize::from(!fact.terminal);
             self.incompatible += usize::from(!statistics_task_is_success_compatible(fact));
         }
-        self.round_failure = changes
-            .selected_failure()
-            .map(|selected| selected.detail().clone());
+        self.selected_failure = changes.selected_failure().cloned();
         self.revision = changes.revision();
         Ok(())
     }
@@ -112,10 +110,20 @@ impl StatisticsProtocolTracker {
         self.nonterminal == 0
     }
     pub(crate) fn all_success_compatible(&self) -> bool {
-        self.incompatible == 0 && self.round_failure.is_none()
+        self.incompatible == 0 && self.selected_failure.is_none()
+    }
+    pub(crate) fn selected_failure(
+        &self,
+    ) -> Option<&novarocks_coordination_contract::SelectedTaskTermination> {
+        self.selected_failure.as_ref()
     }
     pub(crate) fn failure_message(&self) -> Option<String> {
-        statistics_all_success_failure_message(&self.facts, self.round_failure.as_ref())
+        statistics_all_success_failure_message(
+            &self.facts,
+            self.selected_failure
+                .as_ref()
+                .map(|selected| selected.detail()),
+        )
     }
 }
 

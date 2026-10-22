@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Serial Internal domain state moved between the coordinator and finite CPU jobs.
+//! Serial Internal domain state moved between application consumers and finite CPU jobs.
+
+use std::sync::Arc;
 
 use crate::query_execution::{
     row_mutation::CowMatchRootConsumer,
@@ -29,7 +31,7 @@ use novarocks_spi::connector::{ConnectorRowMutationSelection, StatisticsArtifact
 /// The actual Internal domain retains typed sources through its CPU result.
 /// Legacy diagnostic-only domains keep their original projection separately.
 #[derive(Debug)]
-pub(super) enum InternalDomainFailure {
+pub(crate) enum InternalDomainFailure {
     Diagnostic(String),
     Source(novarocks_failure_contract::SharedFailureCause),
 }
@@ -49,7 +51,7 @@ impl From<novarocks_spi::connector::ConnectorError> for InternalDomainFailure {
     }
 }
 impl InternalDomainFailure {
-    pub(super) fn execution_input(
+    pub(crate) fn execution_input(
         &self,
     ) -> Option<novarocks_query_application::execution_error::ExecutionFailureInput> {
         use novarocks_failure_contract::FailureProjection;
@@ -68,19 +70,19 @@ impl InternalDomainFailure {
     }
 }
 
-pub(super) enum InternalDomainState {
+pub(crate) enum InternalDomainState {
     Statistics(StatisticsRootResultDecoder),
     Write(RootWriteResultDecoder),
     Cow(Box<CowMatchRootConsumer>),
 }
 
-pub(super) enum InternalDomainCompletion {
+pub(crate) enum InternalDomainCompletion {
     Statistics(StatisticsRootResultDecoder),
     Write(DecodedPreparedWriteSet),
     Cow(ConnectorRowMutationSelection),
 }
 
-pub(super) enum InternalDomainSlot {
+pub(crate) enum InternalDomainSlot {
     Collecting {
         state: Box<InternalDomainState>,
         receipt: Option<u64>,
@@ -92,24 +94,24 @@ pub(super) enum InternalDomainSlot {
     StatisticsFinished(Vec<StatisticsArtifactDraft>),
 }
 impl InternalDomainSlot {
-    pub(super) fn receipt(&self) -> Option<u64> {
+    pub(crate) fn receipt(&self) -> Option<u64> {
         match self {
             Self::Collecting { receipt, .. } => *receipt,
             _ => None,
         }
     }
-    pub(super) fn end(&self) -> Option<RootResultEnd> {
+    pub(crate) fn end(&self) -> Option<RootResultEnd> {
         match self {
             Self::Eof { end, .. } => Some(*end),
             _ => None,
         }
     }
-    pub(super) fn statistics_finished(&self) -> bool {
+    pub(crate) fn statistics_finished(&self) -> bool {
         matches!(self, Self::StatisticsFinished(_))
     }
-    pub(super) fn apply_body(
+    pub(crate) fn apply_body(
         self,
-        reply: RetainedRootReply,
+        reply: Arc<RetainedRootReply>,
     ) -> Result<Self, InternalDomainFailure> {
         let Self::Collecting { mut state, .. } = self else {
             return Err("internal domain received data after EOF".into());
@@ -128,8 +130,8 @@ impl InternalDomainSlot {
                 .push_body(body)
                 .map_err(InternalDomainFailure::from),
         };
-        // Receipt contains no body alias. Actual retained reply destruction
-        // precedes CPU completion, local consumption and the remote ACK.
+        // Receipt contains no body alias. Relinquish this job's original reply
+        // before CPU completion, local consumption and the remote ACK.
         drop(reply);
         result?;
         Ok(Self::Collecting {
@@ -137,7 +139,7 @@ impl InternalDomainSlot {
             receipt: Some(sequence.get() - 1),
         })
     }
-    pub(super) fn finish_eof(self, end: RootResultEnd) -> Result<Self, InternalDomainFailure> {
+    pub(crate) fn finish_eof(self, end: RootResultEnd) -> Result<Self, InternalDomainFailure> {
         let Self::Collecting { state, .. } = self else {
             return Err("internal domain received duplicate EOF".into());
         };
@@ -159,7 +161,7 @@ impl InternalDomainSlot {
         };
         Ok(Self::Eof { completion, end })
     }
-    pub(super) fn finish_statistics(self) -> Result<Self, InternalDomainFailure> {
+    pub(crate) fn finish_statistics(self) -> Result<Self, InternalDomainFailure> {
         let Self::Eof {
             completion: InternalDomainCompletion::Statistics(mut decoder),
             ..
@@ -170,7 +172,7 @@ impl InternalDomainSlot {
         decoder.observe_execution_success()?;
         Ok(Self::StatisticsFinished(decoder.finish()?))
     }
-    pub(super) fn into_write(self) -> Result<DecodedPreparedWriteSet, String> {
+    pub(crate) fn into_write(self) -> Result<DecodedPreparedWriteSet, String> {
         match self {
             Self::Eof {
                 completion: InternalDomainCompletion::Write(prepared),
@@ -179,7 +181,7 @@ impl InternalDomainSlot {
             _ => Err("write lost its CPU-validated prepared set".into()),
         }
     }
-    pub(super) fn into_cow(self) -> Result<ConnectorRowMutationSelection, String> {
+    pub(crate) fn into_cow(self) -> Result<ConnectorRowMutationSelection, String> {
         match self {
             Self::Eof {
                 completion: InternalDomainCompletion::Cow(selection),
@@ -188,7 +190,7 @@ impl InternalDomainSlot {
             _ => Err("COW lost its CPU-validated selection".into()),
         }
     }
-    pub(super) fn into_statistics(self) -> Result<Vec<StatisticsArtifactDraft>, String> {
+    pub(crate) fn into_statistics(self) -> Result<Vec<StatisticsArtifactDraft>, String> {
         match self {
             Self::StatisticsFinished(artifacts) => Ok(artifacts),
             _ => Err("statistics lost its CPU-validated artifact membership".into()),
@@ -440,7 +442,7 @@ mod tests {
             cancellation.view(),
             &runtime,
             Arc::new(CondvarWake::default()),
-            |(slot, reply), _| slot.apply_body(reply),
+            |(slot, reply), _| slot.apply_body(Arc::new(reply)),
         );
         assert!(claim(&mut job).await.is_err());
         binding.wait_result_activities_exited();

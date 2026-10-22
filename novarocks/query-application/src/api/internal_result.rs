@@ -333,6 +333,24 @@ impl InternalResultStream {
     pub const fn carrier(&self) -> ResultRowCarrier {
         self.carrier
     }
+    /// The same original failure owner remains observable after provisional
+    /// End while a domain waits for its remaining completion facts.
+    pub fn current_failure(&self) -> Option<QueryExecutionError> {
+        self.failure.borrow().clone()
+    }
+
+    pub async fn failure(&mut self) -> QueryExecutionError {
+        loop {
+            if let Some(error) = self.current_failure() {
+                return error;
+            }
+            if self.failure.changed().await.is_err() {
+                return self
+                    .current_failure()
+                    .unwrap_or_else(|| ResultOwnerObservation::FailureOwnerClosed.into_error());
+            }
+        }
+    }
     pub async fn next(&mut self) -> Result<Option<InternalResultDelivery>, QueryExecutionError> {
         if self.terminal_seen {
             return Ok(None);

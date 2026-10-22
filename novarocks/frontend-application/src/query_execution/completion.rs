@@ -22,7 +22,7 @@
 //! query intent or rehydrate planning inputs after admission.
 
 use crate::query_execution::lifecycle_plan::{
-    AttemptCredentialLeaseCollector, QueryCredentialLeases,
+    AttemptCredentialLeaseCollector, AttemptTerminalCredentialResolver, QueryCredentialLeases,
 };
 use novarocks_query_application::api::build_string_query_result;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
@@ -105,14 +105,45 @@ impl QueryAttemptReservation {
                 error.to_string(),
             )
         })?;
-        Ok(Self {
-            query_id,
+        Ok(Self::for_execution(execution_id))
+    }
+
+    /// Retains the exact initial identity allocated by the QA process owner.
+    /// The original move-only token still has to pass QA's issuer check at start.
+    pub(super) fn from_reserved(
+        reserved: &novarocks_query_application::api::ReservedExecutionIdentity,
+    ) -> Result<Self, crate::query_execution::contract::DistributedQueryError> {
+        let execution_id = reserved.execution();
+        if execution_id.attempt_id().get() != 1 {
+            return Err(
+                crate::query_execution::contract::DistributedQueryError::new(
+                    crate::query_execution::contract::DistributedQueryErrorKind::ContractViolation,
+                    "initial computation reservation must name the original first attempt",
+                ),
+            );
+        }
+        Ok(Self::for_execution(execution_id))
+    }
+
+    fn for_execution(execution_id: QueryExecutionId) -> Self {
+        Self {
+            query_id: execution_id.query_id(),
             execution_id,
             credential_collector: AttemptCredentialLeaseCollector::new(execution_id),
             request_scope: ConnectorRequestScope::new(),
             #[cfg(novarocks_dev_controls)]
             test_nomination: std::sync::OnceLock::new(),
-        })
+        }
+    }
+
+    pub(super) fn terminal_storage_resolver(&self) -> Arc<AttemptTerminalCredentialResolver> {
+        self.credential_collector.terminal_storage_resolver()
+    }
+
+    pub(super) fn seal_for_terminal(
+        &self,
+    ) -> Result<(), crate::query_execution::contract::DistributedQueryError> {
+        self.credential_collector.seal_for_terminal().map(|_| ())
     }
 
     pub(crate) const fn query_id(&self) -> QueryId {
@@ -175,6 +206,15 @@ impl QueryAttemptReservation {
     ) -> Result<QueryCredentialLeases, crate::query_execution::contract::DistributedQueryError>
     {
         self.credential_collector.drain_credential_leases()
+    }
+}
+
+impl Drop for QueryAttemptReservation {
+    fn drop(&mut self) {
+        // Abandonment closes collection/Native transfer rights. It does not
+        // prove any asynchronous initializer or external operation has exited.
+        // An explicit terminal owner observes validation errors before Drop.
+        let _ = self.seal_for_terminal();
     }
 }
 

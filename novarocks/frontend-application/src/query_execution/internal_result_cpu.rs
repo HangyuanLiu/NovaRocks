@@ -258,25 +258,42 @@ pub(crate) struct InternalResultCpuJob<T> {
     completion: oneshot::Receiver<Result<InternalResultValue<T>, ExecutionFailureInput>>,
     forwarder: Option<tokio::task::JoinHandle<()>>,
     closing: bool,
+    claimed: bool,
     closed: Option<Result<(), Arc<tokio::task::JoinError>>>,
 }
 impl<T> InternalResultCpuJob<T> {
     /// Refuse further result delivery. Sender::closed wakes the same original
     /// forwarder, which continues awaiting the already-owned CPU receipt.
     pub(crate) fn begin_close(&mut self) {
+        drop(self.close_delivery());
+    }
+
+    /// Move unclaimed output to the stable caller so its potentially large
+    /// graph is destroyed outside the caller's custody lock. Returning this
+    /// value is not actual exit; the original forwarder must still be joined.
+    pub(crate) fn close_delivery(
+        &mut self,
+    ) -> Option<Result<InternalResultValue<T>, ExecutionFailureInput>> {
         self.closing = true;
         self.completion.close();
-        if let Ok(unclaimed) = self.completion.try_recv() {
-            drop(unclaimed);
-        }
+        self.completion.try_recv().ok()
     }
 
     pub(crate) fn poll_closed(
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), &tokio::task::JoinError>> {
-        use std::{future::Future, pin::Pin, task::Poll};
         self.begin_close();
+        self.poll_forwarder_closed(cx)
+    }
+
+    /// Observe the original join without destroying delivery output. A stable
+    /// caller closes delivery separately and retires its result outside locks.
+    pub(crate) fn poll_forwarder_closed(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), &tokio::task::JoinError>> {
+        use std::{future::Future, pin::Pin, task::Poll};
         if self.closed.is_none() {
             let result = std::task::ready!(
                 Pin::new(
@@ -289,7 +306,6 @@ impl<T> InternalResultCpuJob<T> {
             self.closed = Some(result.map_err(Arc::new));
             self.forwarder.take();
         }
-        self.begin_close();
         Poll::Ready(
             self.closed
                 .as_ref()
@@ -323,11 +339,12 @@ impl<T> InternalResultCpuJob<T> {
     pub(crate) fn try_take(
         &mut self,
     ) -> Option<Result<InternalResultValue<T>, ExecutionFailureInput>> {
-        if self.closing {
+        if self.closing || self.claimed {
             return None;
         }
         match self.completion.try_recv() {
             Ok(mut value) => {
+                self.claimed = true;
                 // A claimed receipt proves CPU execution has exited. The
                 // serial consumer keeps the payload/window, not a CPU lease.
                 if let Ok(value) = &mut value {
@@ -336,10 +353,40 @@ impl<T> InternalResultCpuJob<T> {
                 Some(value)
             }
             Err(oneshot::error::TryRecvError::Empty) => None,
-            Err(oneshot::error::TryRecvError::Closed) => Some(Err(cpu_execution_failure(
-                "internal result CPU forwarder exited without its outcome",
-            ))),
+            Err(oneshot::error::TryRecvError::Closed) => {
+                self.claimed = true;
+                Some(Err(cpu_execution_failure(
+                    "internal result CPU forwarder exited without its outcome",
+                )))
+            }
         }
+    }
+
+    /// Poll the original bounded receipt directly. A cancelled waiter leaves
+    /// both the receipt and the original join in this job's stable owner.
+    pub(crate) fn poll_take(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<InternalResultValue<T>, ExecutionFailureInput>> {
+        use std::{future::Future, pin::Pin, task::Poll};
+        if self.closing || self.claimed {
+            return Poll::Ready(Err(cpu_execution_failure(
+                "internal result CPU receipt is no longer available",
+            )));
+        }
+        let result = std::task::ready!(Pin::new(&mut self.completion).poll(cx));
+        self.claimed = true;
+        Poll::Ready(match result {
+            Ok(mut result) => {
+                if let Ok(value) = &mut result {
+                    value.activity.take();
+                }
+                result
+            }
+            Err(_) => Err(cpu_execution_failure(
+                "internal result CPU forwarder exited without its outcome",
+            )),
+        })
     }
 }
 impl<T> Drop for InternalResultCpuJob<T> {
@@ -406,6 +453,7 @@ impl InternalResultCpu {
             completion,
             forwarder: Some(forwarder),
             closing: false,
+            claimed: false,
             closed: None,
         }
     }

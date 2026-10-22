@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::query_execution::contract::{
@@ -49,8 +49,26 @@ struct AttemptCredentialLeaseStorageRoute {
 
 enum AttemptCredentialLeaseStorageRouteOwner {
     Planning(Weak<AttemptCredentialLeaseCollector>),
-    Admitted(Weak<dyn ConnectorStorageResolver>),
+    Admitted(Weak<AttemptCredentialStorage>),
     Revoked,
+}
+
+/// A single in-flight resolve's original owner projection. It may outlive
+/// the route lock while the collector atomically seals its table.
+enum CurrentAttemptStorageOwner {
+    Planning(Arc<AttemptCredentialLeaseCollector>),
+    Frozen(Arc<AttemptCredentialStorage>),
+}
+impl CurrentAttemptStorageOwner {
+    fn resolve(
+        self,
+        request: &StorageAccessRequest,
+    ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+        match self {
+            Self::Planning(owner) => owner.resolve_retained_original(request),
+            Self::Frozen(owner) => owner.resolve_vended_s3(request),
+        }
+    }
 }
 
 impl AttemptCredentialLeaseStorageRoute {
@@ -60,14 +78,28 @@ impl AttemptCredentialLeaseStorageRoute {
         }
     }
 
-    fn adopt(&self, owner: Arc<dyn ConnectorStorageResolver>) {
+    fn adopt(&self, owner: &Arc<AttemptCredentialStorage>) {
         *self.owner.lock().expect("attempt credential storage route") =
-            AttemptCredentialLeaseStorageRouteOwner::Admitted(Arc::downgrade(&owner));
+            AttemptCredentialLeaseStorageRouteOwner::Admitted(Arc::downgrade(owner));
     }
 
     fn revoke(&self) {
         *self.owner.lock().expect("attempt credential storage route") =
             AttemptCredentialLeaseStorageRouteOwner::Revoked;
+    }
+
+    fn current_owner(&self) -> Result<CurrentAttemptStorageOwner, ConnectorError> {
+        let owner = self.owner.lock().expect("attempt credential storage route");
+        match &*owner {
+            AttemptCredentialLeaseStorageRouteOwner::Planning(owner) => {
+                owner.upgrade().map(CurrentAttemptStorageOwner::Planning)
+            }
+            AttemptCredentialLeaseStorageRouteOwner::Admitted(owner) => {
+                owner.upgrade().map(CurrentAttemptStorageOwner::Frozen)
+            }
+            AttemptCredentialLeaseStorageRouteOwner::Revoked => None,
+        }
+        .ok_or_else(vended_storage_access_denied)
     }
 }
 
@@ -76,19 +108,10 @@ impl ConnectorStorageResolver for AttemptCredentialLeaseStorageRoute {
         &self,
         request: &StorageAccessRequest,
     ) -> Result<ResolvedVendedS3Access, ConnectorError> {
-        let owner = {
-            let owner = self.owner.lock().expect("attempt credential storage route");
-            match &*owner {
-                AttemptCredentialLeaseStorageRouteOwner::Planning(owner) => owner
-                    .upgrade()
-                    .map(|owner| Arc::clone(&owner) as Arc<dyn ConnectorStorageResolver>),
-                AttemptCredentialLeaseStorageRouteOwner::Admitted(owner) => owner.upgrade(),
-                AttemptCredentialLeaseStorageRouteOwner::Revoked => None,
-            }
-        };
-        owner
-            .ok_or_else(vended_storage_access_denied)?
-            .resolve_vended_s3(request)
+        // Sealing may have happened after upgrading the original weak
+        // planning owner. The route mutex is released before resolving the
+        // exact current table under the collector's own transition lock.
+        self.current_owner()?.resolve(request)
     }
 }
 
@@ -124,6 +147,7 @@ impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseSinkRoute {
 pub(crate) struct AttemptCredentialLeaseCollector {
     execution_id: QueryExecutionId,
     state: Mutex<AttemptCredentialLeaseCollectorState>,
+    frozen: OnceLock<Arc<AttemptCredentialStorage>>,
     route: Arc<AttemptCredentialLeaseStorageRoute>,
     sink_route: Arc<AttemptCredentialLeaseSinkRoute>,
 }
@@ -134,7 +158,14 @@ struct AttemptCredentialLeaseCollectorState {
         StorageCredentialScopePrefix,
     )>,
     leases: Vec<QueryCredentialLease>,
-    drained: bool,
+    phase: AttemptCredentialCollectionPhase,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AttemptCredentialCollectionPhase {
+    Collecting,
+    NativeDrained,
+    TerminalOnly,
 }
 
 impl AttemptCredentialLeaseCollector {
@@ -144,8 +175,9 @@ impl AttemptCredentialLeaseCollector {
             state: Mutex::new(AttemptCredentialLeaseCollectorState {
                 scopes: BTreeSet::new(),
                 leases: Vec::new(),
-                drained: false,
+                phase: AttemptCredentialCollectionPhase::Collecting,
             }),
+            frozen: OnceLock::new(),
             route: Arc::new(AttemptCredentialLeaseStorageRoute::new_planning(
                 collector.clone(),
             )),
@@ -164,24 +196,122 @@ impl AttemptCredentialLeaseCollector {
             .is_empty()
     }
 
-    pub(crate) fn drain_credential_leases(
+    /// Claims the one Native transfer right. A terminal-only seal never
+    /// grants that right, even though both paths share the same frozen Arc.
+    pub(crate) fn into_credential_leases(
         &self,
     ) -> Result<QueryCredentialLeases, DistributedQueryError> {
         let mut state = self
             .state
             .lock()
             .expect("attempt credential collector lock");
-        if state.drained {
+        if state.phase != AttemptCredentialCollectionPhase::Collecting {
             return Err(contract_error(
-                "attempt credential lease collector was consumed more than once",
+                "attempt credential lease collector has no unclaimed Native transfer",
             ));
         }
-        state.drained = true;
+        let storage =
+            self.seal_locked(&mut state, AttemptCredentialCollectionPhase::NativeDrained)?;
+        Ok(QueryCredentialLeases { storage })
+    }
+
+    /// Explicit terminal retirement freezes existing material and refuses all
+    /// later offers. Repeating this, including sealed-empty, returns the same
+    /// original table. It never turns failure into a Native startup grant.
+    pub(crate) fn seal_for_terminal(
+        &self,
+    ) -> Result<Arc<AttemptCredentialStorage>, DistributedQueryError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("attempt credential collector lock");
+        if state.phase == AttemptCredentialCollectionPhase::Collecting {
+            return self.seal_locked(&mut state, AttemptCredentialCollectionPhase::TerminalOnly);
+        }
+        Ok(Arc::clone(self.frozen.get().expect(
+            "a retired collector published its original frozen table",
+        )))
+    }
+
+    fn verify_native_storage(
+        &self,
+        execution: QueryExecutionId,
+        storage: &Arc<AttemptCredentialStorage>,
+    ) -> Result<(), DistributedQueryError> {
+        let state = self
+            .state
+            .lock()
+            .expect("attempt credential collector lock");
+        if self.execution_id != execution
+            || state.phase != AttemptCredentialCollectionPhase::NativeDrained
+            || !self
+                .frozen
+                .get()
+                .is_some_and(|original| Arc::ptr_eq(original, storage))
+        {
+            return Err(contract_error(
+                "Native credential handoff does not retain the original drained attempt table",
+            ));
+        }
+        Ok(())
+    }
+
+    fn seal_locked(
+        &self,
+        state: &mut AttemptCredentialLeaseCollectorState,
+        phase: AttemptCredentialCollectionPhase,
+    ) -> Result<Arc<AttemptCredentialStorage>, DistributedQueryError> {
+        debug_assert!(state.phase == AttemptCredentialCollectionPhase::Collecting);
+        let validation = canonicalize_credential_leases(&mut state.leases);
+        let storage = Arc::new(AttemptCredentialStorage {
+            leases: std::mem::take(&mut state.leases),
+            route: Some(Arc::clone(&self.route)),
+        });
+        // Every read and write of the collection/frozen transition holds the
+        // same state lock. No resolver can observe drained without this Arc.
+        assert!(self.frozen.set(Arc::clone(&storage)).is_ok());
+        // A malformed Native contribution still closes collection. It must
+        // never reopen startup or accept late material after a failed seal.
+        state.phase = if validation.is_ok() {
+            phase
+        } else {
+            AttemptCredentialCollectionPhase::TerminalOnly
+        };
         state.scopes.clear();
-        QueryCredentialLeases::try_new_with_storage_route(
-            std::mem::take(&mut state.leases),
-            Arc::clone(&self.route),
-        )
+        self.route.adopt(&storage);
+        validation?;
+        Ok(storage)
+    }
+
+    /// A terminal responsibility owner may retain the original collector
+    /// before planning has finished. Ordinary wrapper Drop only releases that
+    /// custody; failure/retirement must call seal_for_terminal explicitly.
+    pub(crate) fn terminal_storage_resolver(
+        self: &Arc<Self>,
+    ) -> Arc<AttemptTerminalCredentialResolver> {
+        Arc::new(AttemptTerminalCredentialResolver {
+            collector: Arc::clone(self),
+        })
+    }
+
+    fn resolve_retained_original(
+        &self,
+        request: &StorageAccessRequest,
+    ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+        let state = self
+            .state
+            .lock()
+            .expect("attempt credential collector lock");
+        if state.phase == AttemptCredentialCollectionPhase::Collecting {
+            return resolve_vended_s3_access(&state.leases, request);
+        }
+        let storage = Arc::clone(
+            self.frozen
+                .get()
+                .expect("a retired collector published its original frozen table"),
+        );
+        drop(state);
+        storage.resolve_vended_s3(request)
     }
 
     pub(crate) fn sink(&self) -> Arc<dyn ConnectorVendedCredentialLeaseSink> {
@@ -206,7 +336,7 @@ impl ConnectorStorageResolver for AttemptCredentialLeaseCollector {
             .state
             .lock()
             .expect("attempt credential collector lock");
-        if state.drained {
+        if state.phase != AttemptCredentialCollectionPhase::Collecting {
             return Err(vended_storage_access_denied());
         }
         resolve_vended_s3_access(&state.leases, request)
@@ -251,7 +381,7 @@ impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseCollector {
             .state
             .lock()
             .expect("attempt credential collector lock");
-        if state.drained {
+        if state.phase != AttemptCredentialCollectionPhase::Collecting {
             return Err(collector_error(
                 "vended credential contribution arrived after attempt collector consumption",
             ));
@@ -391,120 +521,127 @@ impl QueryCredentialLease {
 }
 
 /// Canonical secret-bearing lease contribution retained by the FE attempt.
-/// It is deliberately not `Debug` or `Clone`: retries reuse this exact
-/// in-memory material and code outside the lifecycle owner cannot copy it.
+/// The unique table is not copied: Native materialization borrows this exact
+/// frozen Arc, and terminal storage later receives that same allocation.
 pub(crate) struct QueryCredentialLeases {
-    leases: Vec<QueryCredentialLease>,
-    storage_route: Option<Arc<AttemptCredentialLeaseStorageRoute>>,
+    storage: Arc<AttemptCredentialStorage>,
+}
+
+fn canonicalize_credential_leases(
+    leases: &mut [QueryCredentialLease],
+) -> Result<(), DistributedQueryError> {
+    leases.sort_by_key(|lease| lease.descriptor().lease_id());
+    if leases
+        .windows(2)
+        .any(|pair| pair[0].descriptor().lease_id() == pair[1].descriptor().lease_id())
+    {
+        return Err(contract_error(
+            "query credential lease contribution repeats a lease id",
+        ));
+    }
+    Ok(())
 }
 
 impl QueryCredentialLeases {
     pub(crate) fn empty() -> Self {
         Self {
-            leases: Vec::new(),
-            storage_route: None,
+            storage: Arc::new(AttemptCredentialStorage {
+                leases: Vec::new(),
+                route: None,
+            }),
         }
     }
 
     pub(crate) fn try_new(
         mut leases: Vec<QueryCredentialLease>,
     ) -> Result<Self, DistributedQueryError> {
-        leases.sort_by_key(|lease| lease.descriptor().lease_id());
-        if leases
-            .windows(2)
-            .any(|pair| pair[0].descriptor().lease_id() == pair[1].descriptor().lease_id())
-        {
-            return Err(contract_error(
-                "query credential lease contribution repeats a lease id",
-            ));
-        }
+        canonicalize_credential_leases(&mut leases)?;
         Ok(Self {
-            leases,
-            storage_route: None,
+            storage: Arc::new(AttemptCredentialStorage {
+                leases,
+                route: None,
+            }),
         })
     }
 
-    fn try_new_with_storage_route(
-        leases: Vec<QueryCredentialLease>,
-        storage_route: Arc<AttemptCredentialLeaseStorageRoute>,
-    ) -> Result<Self, DistributedQueryError> {
-        let mut leases = Self::try_new(leases)?;
-        leases.storage_route = Some(storage_route);
-        Ok(leases)
-    }
-
     pub(crate) fn leases(&self) -> &[QueryCredentialLease] {
-        &self.leases
+        &self.storage.leases
     }
 
-    /// Turns this attempt's frozen table into the storage capability its own
-    /// commit reads through.
-    ///
-    /// The table is moved because the caller must be finished contributing it:
-    /// on the task protocol the establish has already copied the material into
-    /// wire form, and a second owner of the same secrets would be a second
-    /// place it could outlive the attempt.
-    ///
-    /// The route connectors were handed during planning is re-pointed at the
-    /// returned owner, so one capability serves both that route and the
-    /// frontend's terminal commit. The route holds it weakly, so the caller
-    /// must keep the returned value alive for as long as either may resolve.
+    /// Move the same table even when empty: identity-sensitive handoff must
+    /// retain the original allocation rather than replacing it with absence.
+    pub(crate) fn into_storage(self) -> Arc<AttemptCredentialStorage> {
+        self.storage
+    }
+
+    /// Native initialization has already borrowed this exact table while
+    /// encoding Establish. No new table or credential copy is created here.
     pub(crate) fn into_attempt_storage_resolver(self) -> Option<Arc<AttemptCredentialStorage>> {
-        if self.leases.is_empty() {
+        if self.storage.leases.is_empty() {
             return None;
         }
-        let owner = Arc::new(AttemptCredentialStorage {
-            leases: Mutex::new(self.leases),
-            route: self.storage_route.clone(),
-        });
-        if let Some(route) = &self.storage_route {
-            route.adopt(Arc::clone(&owner) as Arc<dyn ConnectorStorageResolver>);
-        }
-        Some(owner)
+        Some(self.storage)
     }
 }
 
-/// One attempt's frozen credential table, as a storage resolver.
-///
-/// It is the task protocol's counterpart of the old lifecycle's terminal
-/// credential capability. There is no attempt state to gate on here because
-/// there is none to consult: the frontend holds the table itself, and the call
-/// site that hands this to a write session is the one that already proved the
-/// attempt completed.
-/// The table is behind a lock because a long query rotates it in place: the
-/// frontend is the credential principal, so it is this table that must hold the
-/// current epoch of every vended lease -- both for its own reads and for the
-/// material each rotation hands to the backends.
+/// One immutable original attempt credential table. Provider-local refresh
+/// capabilities remain attached to the original leases; they do not mutate
+/// this table or replace its material during Native/terminal handoff.
 pub(crate) struct AttemptCredentialStorage {
-    leases: Mutex<Vec<QueryCredentialLease>>,
+    leases: Vec<QueryCredentialLease>,
     route: Option<Arc<AttemptCredentialLeaseStorageRoute>>,
 }
-
-impl AttemptCredentialStorage {}
 
 impl ConnectorStorageResolver for AttemptCredentialStorage {
     fn resolve_vended_s3(
         &self,
         request: &StorageAccessRequest,
     ) -> Result<ResolvedVendedS3Access, ConnectorError> {
-        resolve_vended_s3_access(
-            &self
-                .leases
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()),
-            request,
-        )
+        resolve_vended_s3_access(&self.leases, request)
     }
 }
 
 impl Drop for AttemptCredentialStorage {
-    /// Revokes the planning route rather than leaving it pointing at a dead
-    /// weak reference: a revoked route denies access, an expired one would
-    /// deny it with a message about the wrong thing.
+    /// The original weak route is revoked only when the final owner of this
+    /// frozen table exits, never because one observer or Native waiter drops.
     fn drop(&mut self) {
         if let Some(route) = &self.route {
             route.revoke();
         }
+    }
+}
+
+/// Strong custody reserved for the terminal responsibility owner. Planning
+/// routes and contribution sinks deliberately remain weak. This wrapper is
+/// not adopted by the route and cannot grant or replay Native initialization.
+pub(crate) struct AttemptTerminalCredentialResolver {
+    collector: Arc<AttemptCredentialLeaseCollector>,
+}
+
+impl AttemptTerminalCredentialResolver {
+    /// Pure observation of the original Native transfer. This never seals a
+    /// collector or grants startup to a terminal-only table.
+    pub(crate) fn verify_native_storage(
+        &self,
+        execution: QueryExecutionId,
+        storage: &Arc<AttemptCredentialStorage>,
+    ) -> Result<(), DistributedQueryError> {
+        self.collector.verify_native_storage(execution, storage)
+    }
+
+    pub(crate) fn seal_for_terminal(
+        &self,
+    ) -> Result<Arc<AttemptCredentialStorage>, DistributedQueryError> {
+        self.collector.seal_for_terminal()
+    }
+}
+
+impl ConnectorStorageResolver for AttemptTerminalCredentialResolver {
+    fn resolve_vended_s3(
+        &self,
+        request: &StorageAccessRequest,
+    ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+        self.collector.resolve_retained_original(request)
     }
 }
 
@@ -737,7 +874,7 @@ mod tests {
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
         CatalogProperties, CatalogVersion, ConnectorControlPlanningLease, ConnectorInstanceId,
-        ConnectorProviderId, ConnectorVendedCredentialLeaseSink,
+        ConnectorProviderId, ConnectorStorageResolver, ConnectorVendedCredentialLeaseSink,
         ConnectorVendedS3CredentialLeaseRefresher, CredentialConsumerRole, StorageAccessRequest,
         StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
         VendedS3CredentialLeaseEntry, VendedS3CredentialLeaseRefresh,
@@ -858,13 +995,13 @@ mod tests {
             .offer_vended_s3_credential_lease(&properties, vended_contribution("second-canary"))
             .expect("duplicate scope is dropped without retaining its value");
 
-        let leases = collector.drain_credential_leases().expect("one-time drain");
+        let leases = collector.into_credential_leases().expect("one-time drain");
         assert_eq!(leases.leases().len(), 1);
         assert!(
             !leases.leases()[0].descriptor().refresh_capable(),
             "an endpoint-free contribution without a provider source is not refreshable"
         );
-        assert!(collector.drain_credential_leases().is_err());
+        assert!(collector.into_credential_leases().is_err());
     }
 
     #[test]
@@ -910,7 +1047,7 @@ mod tests {
             .offer_vended_s3_credential_lease(&properties, contribution)
             .expect("provider-local contribution");
 
-        let leases = collector.drain_credential_leases().expect("one-time drain");
+        let leases = collector.into_credential_leases().expect("one-time drain");
         assert!(leases.leases()[0].descriptor().refresh_capable());
         assert!(leases.leases()[0].provider().is_some());
     }
@@ -933,10 +1070,379 @@ mod tests {
             .expect("collector resolves its current attempt scope");
         assert_eq!(resolved.matched_prefix().as_str(), "s3://warehouse/data");
 
-        collector
-            .drain_credential_leases()
+        let leases = collector
+            .into_credential_leases()
             .expect("one-way lifecycle handoff");
+        assert!(
+            novarocks_spi::connector::ConnectorStorageResolver::resolve_vended_s3(
+                collector.as_ref(),
+                &request,
+            )
+            .is_err(),
+            "the original planning collector refuses after its one-way drain"
+        );
+        assert!(resolver.resolve_vended_s3(&request).is_ok());
+        drop(collector);
+        assert!(resolver.resolve_vended_s3(&request).is_ok());
+        drop(leases);
         assert!(resolver.resolve_vended_s3(&request).is_err());
+    }
+
+    #[test]
+    fn terminal_custody_retains_original_material_when_planning_fails_before_native_drain() {
+        let collector = AttemptCredentialLeaseCollector::new(execution_id());
+        let terminal = collector.terminal_storage_resolver();
+        let weak_collector = Arc::downgrade(&collector);
+        let sink = collector.sink();
+        let properties = vended_catalog_properties();
+        let failed_preparation = (|| {
+            sink.offer_vended_s3_credential_lease(
+                &properties,
+                vended_contribution("pre-seal-failure"),
+            )?;
+            Err::<(), _>(novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+                "injected preparation failure after the original contribution",
+            ))
+        })();
+        assert!(failed_preparation.is_err());
+        let request = StorageAccessRequest::try_new(
+            properties.handle().clone(),
+            "s3://warehouse/data/file.parquet",
+        )
+        .unwrap();
+        assert_eq!(
+            terminal
+                .resolve_vended_s3(&request)
+                .unwrap()
+                .matched_prefix()
+                .as_str(),
+            "s3://warehouse/data"
+        );
+        // The terminal owner was registered before the failed planning path
+        // releases its collector. Cancellation is not an actual-exit receipt.
+        drop(collector);
+        assert!(weak_collector.upgrade().is_some());
+        let frozen = terminal.seal_for_terminal().unwrap();
+        let again = terminal.seal_for_terminal().unwrap();
+        assert!(Arc::ptr_eq(&frozen, &again));
+        assert!(
+            sink.offer_vended_s3_credential_lease(
+                &properties,
+                vended_contribution("late-after-failure")
+            )
+            .is_err()
+        );
+        let retained = weak_collector.upgrade().unwrap();
+        assert!(retained.into_credential_leases().is_err());
+        assert!(retained.resolve_vended_s3(&request).is_err());
+        assert!(terminal.resolve_vended_s3(&request).is_ok());
+        let foreign_scope = StorageAccessRequest::try_new(
+            properties.handle().clone(),
+            "s3://warehouse/other/file.parquet",
+        )
+        .unwrap();
+        assert!(terminal.resolve_vended_s3(&foreign_scope).is_err());
+        let foreign_owner = StorageAccessRequest::try_new(
+            CatalogHandle::new(
+                ConnectorInstanceId::try_from_canonical("catalog.foreign").unwrap(),
+                CatalogVersion::from_bytes([0x24; 32]),
+            ),
+            "s3://warehouse/data/file.parquet",
+        )
+        .unwrap();
+        assert!(terminal.resolve_vended_s3(&foreign_owner).is_err());
+        drop((retained, frozen, again, terminal));
+        assert!(weak_collector.upgrade().is_none());
+    }
+
+    #[test]
+    fn native_and_terminal_handoffs_share_one_frozen_arc_until_the_final_owner_exits() {
+        let collector = AttemptCredentialLeaseCollector::new(execution_id());
+        let weak_collector = Arc::downgrade(&collector);
+        let terminal = collector.terminal_storage_resolver();
+        let route = collector.storage_resolver();
+        let raw_route = Arc::clone(&collector.route);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let properties = vended_catalog_properties();
+        collector
+            .offer_vended_s3_credential_lease(
+                &properties,
+                vended_contribution("native-same-original")
+                    .with_refresher(Arc::new(DropTrackedRefresher {
+                        dropped: Arc::clone(&dropped),
+                    }))
+                    .unwrap(),
+            )
+            .unwrap();
+        let request = StorageAccessRequest::try_new(
+            properties.handle().clone(),
+            "s3://warehouse/data/file.parquet",
+        )
+        .unwrap();
+        let leases = collector.into_credential_leases().unwrap();
+        let original = terminal.seal_for_terminal().unwrap();
+        assert!(Arc::ptr_eq(&leases.storage, &original));
+        assert!(std::ptr::eq(
+            leases.leases().as_ptr(),
+            original.leases.as_ptr()
+        ));
+        assert!(collector.into_credential_leases().is_err());
+        assert!(collector.resolve_vended_s3(&request).is_err());
+        let native = leases.into_attempt_storage_resolver().unwrap();
+        assert!(Arc::ptr_eq(&native, &original));
+        let repeated = collector.seal_for_terminal().unwrap();
+        assert!(Arc::ptr_eq(&repeated, &native));
+        let weak_storage = Arc::downgrade(&native);
+        assert!(route.resolve_vended_s3(&request).is_ok());
+        drop(collector);
+        assert!(weak_collector.upgrade().is_some());
+        drop(terminal);
+        assert!(weak_collector.upgrade().is_none());
+        assert!(route.resolve_vended_s3(&request).is_ok());
+        drop((original, repeated));
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert!(route.resolve_vended_s3(&request).is_ok());
+        drop(native);
+        assert!(weak_storage.upgrade().is_none());
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(route.resolve_vended_s3(&request).is_err());
+        assert!(matches!(
+            &*raw_route.owner.lock().unwrap(),
+            super::AttemptCredentialLeaseStorageRouteOwner::Revoked
+        ));
+    }
+
+    #[test]
+    fn sealed_empty_is_idempotent_and_never_reopens_collection_or_native_startup() {
+        let collector = AttemptCredentialLeaseCollector::new(execution_id());
+        let terminal = collector.terminal_storage_resolver();
+        let first = terminal.seal_for_terminal().unwrap();
+        let second = collector.seal_for_terminal().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(first.leases.is_empty());
+        assert!(collector.into_credential_leases().is_err());
+        assert!(
+            collector
+                .sink()
+                .offer_vended_s3_credential_lease(
+                    &vended_catalog_properties(),
+                    vended_contribution("late-empty"),
+                )
+                .is_err()
+        );
+        let native_collector = AttemptCredentialLeaseCollector::new(execution_id());
+        let native = native_collector.into_credential_leases().unwrap();
+        let frozen_empty = native_collector.seal_for_terminal().unwrap();
+        assert!(Arc::ptr_eq(&native.storage, &frozen_empty));
+        assert!(native.into_attempt_storage_resolver().is_none());
+        assert!(native_collector.into_credential_leases().is_err());
+        assert!(Arc::ptr_eq(
+            &frozen_empty,
+            &native_collector.seal_for_terminal().unwrap()
+        ));
+    }
+
+    #[test]
+    fn native_storage_verification_retains_exact_phase_and_arc_including_empty() {
+        for has_material in [false, true] {
+            let collector = AttemptCredentialLeaseCollector::new(execution_id());
+            let terminal = collector.terminal_storage_resolver();
+            let unrelated_empty = super::QueryCredentialLeases::empty().into_storage();
+            assert!(
+                terminal
+                    .verify_native_storage(execution_id(), &unrelated_empty)
+                    .is_err()
+            );
+            assert!(
+                collector.frozen.get().is_none(),
+                "verification cannot seal the collector"
+            );
+            if has_material {
+                collector
+                    .offer_vended_s3_credential_lease(
+                        &vended_catalog_properties(),
+                        vended_contribution("original-native"),
+                    )
+                    .unwrap();
+            }
+            let original = collector.into_credential_leases().unwrap().into_storage();
+            assert!(Arc::ptr_eq(collector.frozen.get().unwrap(), &original));
+            assert!(
+                terminal
+                    .verify_native_storage(execution_id(), &original)
+                    .is_ok()
+            );
+            assert!(
+                terminal
+                    .verify_native_storage(execution_id(), &unrelated_empty)
+                    .is_err()
+            );
+            let other_execution = QueryExecutionId::new(
+                execution_id().query_id(),
+                novarocks_types::AttemptId::new(execution_id().attempt_id().get() + 1).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                terminal
+                    .verify_native_storage(other_execution, &original)
+                    .is_err()
+            );
+            let other_collector = AttemptCredentialLeaseCollector::new(execution_id());
+            let foreign = other_collector
+                .into_credential_leases()
+                .unwrap()
+                .into_storage();
+            assert!(
+                terminal
+                    .verify_native_storage(execution_id(), &foreign)
+                    .is_err()
+            );
+
+            let terminal_only = AttemptCredentialLeaseCollector::new(execution_id());
+            if has_material {
+                terminal_only
+                    .offer_vended_s3_credential_lease(
+                        &vended_catalog_properties(),
+                        vended_contribution("original-terminal"),
+                    )
+                    .unwrap();
+            }
+            let terminal = terminal_only.terminal_storage_resolver();
+            let sealed = terminal.seal_for_terminal().unwrap();
+            assert!(Arc::ptr_eq(terminal_only.frozen.get().unwrap(), &sealed));
+            assert!(
+                terminal
+                    .verify_native_storage(execution_id(), &sealed)
+                    .is_err()
+            );
+            assert!(terminal_only.into_credential_leases().is_err());
+        }
+    }
+
+    #[test]
+    fn dropping_a_terminal_wrapper_does_not_retire_collection_or_native_startup() {
+        let collector = AttemptCredentialLeaseCollector::new(execution_id());
+        let terminal = collector.terminal_storage_resolver();
+        drop(terminal);
+        assert!(collector.frozen.get().is_none());
+        collector
+            .offer_vended_s3_credential_lease(
+                &vended_catalog_properties(),
+                vended_contribution("collect-after-wrapper-drop"),
+            )
+            .unwrap();
+        assert_eq!(
+            collector.into_credential_leases().unwrap().leases().len(),
+            1
+        );
+        assert!(collector.into_credential_leases().is_err());
+    }
+
+    #[test]
+    fn original_planning_route_projection_survives_sealing_before_its_resolve() {
+        let collector = AttemptCredentialLeaseCollector::new(execution_id());
+        let properties = vended_catalog_properties();
+        collector
+            .offer_vended_s3_credential_lease(&properties, vended_contribution("route-cut"))
+            .unwrap();
+        let request = StorageAccessRequest::try_new(
+            properties.handle().clone(),
+            "s3://warehouse/data/file.parquet",
+        )
+        .unwrap();
+        // Capture exactly what a concurrent resolve upgraded before seal.
+        // The real route releases its lock before invoking this projection.
+        let selected = collector.route.current_owner().unwrap();
+        let leases = collector.into_credential_leases().unwrap();
+        assert!(collector.resolve_vended_s3(&request).is_err());
+        assert!(selected.resolve(&request).is_ok());
+        let original = leases.into_attempt_storage_resolver().unwrap();
+        let route = collector.storage_resolver();
+        drop(collector);
+        assert!(route.resolve_vended_s3(&request).is_ok());
+        drop(original);
+        assert!(route.resolve_vended_s3(&request).is_err());
+    }
+
+    #[test]
+    fn malformed_native_seal_retires_collection_but_keeps_original_terminal_material() {
+        let collector = AttemptCredentialLeaseCollector::new(execution_id());
+        let duplicate = AttemptCredentialLeaseCollector::new(execution_id());
+        let properties = vended_catalog_properties();
+        for original in [&collector, &duplicate] {
+            original
+                .offer_vended_s3_credential_lease(&properties, vended_contribution("duplicate-id"))
+                .unwrap();
+        }
+        let material = duplicate.into_credential_leases().unwrap();
+        drop(duplicate);
+        let mut material = Arc::try_unwrap(material.storage)
+            .ok()
+            .expect("one original test table");
+        collector
+            .state
+            .lock()
+            .unwrap()
+            .leases
+            .append(&mut material.leases);
+        assert!(collector.into_credential_leases().is_err());
+        assert!(collector.into_credential_leases().is_err());
+        assert!(
+            collector
+                .sink()
+                .offer_vended_s3_credential_lease(&properties, vended_contribution("late-invalid"))
+                .is_err()
+        );
+        let frozen = collector.seal_for_terminal().unwrap();
+        assert!(Arc::ptr_eq(
+            &frozen,
+            &collector.seal_for_terminal().unwrap()
+        ));
+        let request = StorageAccessRequest::try_new(
+            properties.handle().clone(),
+            "s3://warehouse/data/file.parquet",
+        )
+        .unwrap();
+        assert!(
+            collector
+                .terminal_storage_resolver()
+                .resolve_vended_s3(&request)
+                .is_ok()
+        );
+        assert!(collector.resolve_vended_s3(&request).is_err());
+    }
+
+    #[test]
+    fn terminal_resolver_has_no_drained_gap_during_concurrent_native_sealing() {
+        let collector = AttemptCredentialLeaseCollector::new(execution_id());
+        let properties = vended_catalog_properties();
+        collector
+            .offer_vended_s3_credential_lease(&properties, vended_contribution("sealing-race"))
+            .unwrap();
+        let terminal = collector.terminal_storage_resolver();
+        let request = StorageAccessRequest::try_new(
+            properties.handle().clone(),
+            "s3://warehouse/data/file.parquet",
+        )
+        .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let resolving = {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..1024 {
+                    assert!(terminal.resolve_vended_s3(&request).is_ok());
+                }
+            })
+        };
+        barrier.wait();
+        let native = collector.into_credential_leases().unwrap();
+        resolving
+            .join()
+            .expect("the original resolver thread actually exits");
+        let frozen = collector.seal_for_terminal().unwrap();
+        assert!(Arc::ptr_eq(&native.storage, &frozen));
     }
 
     /// The control leases a query froze drain exactly once, when the attempt

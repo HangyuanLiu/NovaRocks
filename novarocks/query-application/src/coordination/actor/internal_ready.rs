@@ -592,10 +592,17 @@ pub(super) fn retire(runtime: &mut ResultRuntime, activation: AttemptActivationI
     {
         return;
     }
-    let error = logical_owner_failure(
-        crate::execution_error::QueryFailureReason::LogicalOwnerStopped,
-        "internal consumer belongs to a retired attempt",
-    );
+    let error = runtime
+        .attempt_error
+        .as_ref()
+        .filter(|failure| failure.activation == activation)
+        .map(|failure| failure.error.clone())
+        .unwrap_or_else(|| {
+            logical_owner_failure(
+                crate::execution_error::QueryFailureReason::LogicalOwnerStopped,
+                "internal consumer belongs to a retired attempt",
+            )
+        });
     if let Some(mut record) = internal.consumer.take() {
         // Retirement is not a logical terminal verdict. Closing this
         // activation's observer must not publish a statement failure while

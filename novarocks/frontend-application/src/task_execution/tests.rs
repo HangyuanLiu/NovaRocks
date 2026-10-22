@@ -7744,6 +7744,21 @@ pub(crate) fn manifest_normal_release_ack_with_protocol_fixture(
     super::protocol_facts::AttemptProtocolFactsReceiver,
     Vec<(OperationIntent, OperationAcknowledgement)>,
 ) {
+    let harness = manifest_protocol_harness(execution);
+    let (round, acks, release, clock, protocol, facts) =
+        manifest_normal_release_ack_fixture(harness, Some(plan));
+    (
+        round,
+        acks,
+        release,
+        clock,
+        protocol.expect("original receiver installed once"),
+        facts,
+    )
+}
+
+#[cfg(novarocks_dev_controls)]
+fn manifest_protocol_harness(execution: QueryExecutionId) -> Harness {
     let processes = backends(1);
     let schedule = chain_schedule(&[0], &[0]);
     let edges = chain_edges();
@@ -7759,16 +7774,27 @@ pub(crate) fn manifest_normal_release_ack_with_protocol_fixture(
         &mut FakePlans::new(&schedule, &edges, 64),
     )
     .expect("the caller execution builds one original graph");
-    let (round, acks, release, clock, protocol, facts) =
-        manifest_normal_release_ack_fixture(Harness::from_graph(graph), Some(plan));
-    (
-        round,
-        acks,
-        release,
-        clock,
-        protocol.expect("original receiver installed once"),
-        facts,
-    )
+    Harness::from_graph(graph)
+}
+
+/// Same original fixture paused before its upstream terminal facts. The root
+/// is Finished; the caller records EOS only after its real decoded receipt.
+/// Remaining tasks are Running, and no actor success state is assigned.
+#[cfg(novarocks_dev_controls)]
+pub(crate) fn manifest_pending_release_with_protocol_fixture(
+    execution: QueryExecutionId,
+    plan: novarocks_query_application::api::PlanSeal,
+) -> (
+    TaskRoundForTest,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    ManifestReleaseTail,
+    Arc<ManualClock>,
+    super::protocol_facts::AttemptProtocolFactsReceiver,
+    Vec<(OperationIntent, OperationAcknowledgement)>,
+) {
+    let (round, acks, tail, clock, protocol, facts) =
+        manifest_pending_release_fixture(manifest_protocol_harness(execution), Some(plan));
+    (round, acks, tail, clock, protocol.unwrap(), facts)
 }
 
 fn manifest_normal_release_ack_fixture(
@@ -7778,6 +7804,234 @@ fn manifest_normal_release_ack_fixture(
     TaskRoundForTest,
     crate::native::task_transport::TaskAckIntakeHandle,
     OperationIntent,
+    Arc<ManualClock>,
+    Option<super::protocol_facts::AttemptProtocolFactsReceiver>,
+    Vec<(OperationIntent, OperationAcknowledgement)>,
+) {
+    let (mut round, acks, tail, clock, protocol, facts) =
+        manifest_pending_release_fixture(harness, plan);
+    tail.observe_original_consumed_end(&mut round, 0);
+    let release = tail
+        .complete(&mut round, &acks)
+        .expect("normal completion releases its original context");
+    (round, acks, release, clock, protocol, facts)
+}
+
+/// Concrete custody of the existing fixture's delayed upstream terminals and
+/// exact Quiesce/Release operations. It never writes actor state or receipts.
+pub(crate) struct ManifestReleaseTail {
+    status: super::status_intake::StatusIntakeHandle,
+    upstream: Vec<TaskIdentity>,
+    sink: Arc<RecordingSink>,
+    split_delivery: Arc<super::split_transport::SplitDeliveryBridge>,
+}
+impl ManifestReleaseTail {
+    pub(crate) fn observe_original_consumed_end(
+        &self,
+        round: &mut TaskRoundForTest,
+        data_packets: u64,
+    ) {
+        for sequence in 0..=data_packets {
+            round
+                .consume_root_result_packet(sequence, sequence == data_packets)
+                .expect("only actual consumed original packets precede this EOS");
+        }
+        super::manifest_round::begin_convergence(
+            round,
+            &self.split_delivery,
+            Some(&novarocks_query_application::api::NativeAttemptTerminal::Completed),
+        );
+        assert!(!round.attempt_drained());
+        assert!(
+            round
+                .execution_mut()
+                .enqueue_task_update(
+                    self.upstream[0].task_id(),
+                    split_update(SCAN_NODE, 1, false)
+                )
+                .is_err()
+        );
+    }
+
+    pub(crate) fn publish_original_failure(
+        &self,
+        round: &mut TaskRoundForTest,
+        failure: novarocks_execution_contract::TaskFailure,
+    ) -> novarocks_coordination_contract::SelectedTaskTermination {
+        let identity = self.upstream[0];
+        self.status.publish(StatusEvent::Published(
+            TaskStatus::try_new(
+                identity,
+                TaskStatusVersion::new(3).unwrap(),
+                TaskState::Failing,
+                Some(TerminationDetail::Failed(failure.clone())),
+                TaskOutputFacts::new(false),
+            )
+            .unwrap(),
+        ));
+        self.status.publish(StatusEvent::Published(
+            TaskStatus::try_new(
+                identity,
+                TaskStatusVersion::new(4).unwrap(),
+                TaskState::Failed,
+                Some(TerminationDetail::Failed(failure)),
+                TaskOutputFacts::new(false),
+            )
+            .unwrap(),
+        ));
+        round
+            .turn()
+            .expect("the original status owner accepts the Task failure");
+        round
+            .execution()
+            .selected_task_failure()
+            .expect("original selected failure")
+            .clone()
+    }
+
+    pub(crate) fn complete(
+        self,
+        round: &mut TaskRoundForTest,
+        acks: &crate::native::task_transport::TaskAckIntakeHandle,
+    ) -> Option<OperationIntent> {
+        for identity in self.upstream {
+            if round
+                .execution()
+                .task(identity.task_id())
+                .is_some_and(|task| task.is_terminal())
+            {
+                continue;
+            }
+            let canceling = TaskStatus::try_new(
+                identity,
+                TaskStatusVersion::new(3).expect("v3"),
+                TaskState::Canceling,
+                Some(TerminationDetail::Canceled(
+                    CancelReason::UpstreamNoLongerNeeded,
+                )),
+                TaskOutputFacts::new(false),
+            )
+            .expect("a valid canceling upstream task");
+            self.status.publish(StatusEvent::Published(canceling));
+            let canceled = TaskStatus::try_new(
+                identity,
+                TaskStatusVersion::new(4).expect("v4"),
+                TaskState::Canceled,
+                Some(TerminationDetail::Canceled(
+                    CancelReason::UpstreamNoLongerNeeded,
+                )),
+                TaskOutputFacts::new(false),
+            )
+            .expect("a valid canceled upstream task");
+            self.status.publish(StatusEvent::Published(canceled));
+        }
+
+        let mut releases = Vec::new();
+        for _ in 0..8 {
+            round
+                .turn()
+                .expect("normal convergence keeps the Task owner live");
+            for intent in self
+                .sink
+                .take()
+                .into_iter()
+                .flat_map(|(_, operations)| operations)
+            {
+                assert!(
+                    !matches!(
+                        intent.kind(),
+                        OperationKind::CreateTask | OperationKind::UpdateTask
+                    ),
+                    "success drain cannot issue a new Create or Update"
+                );
+                if intent.kind() == OperationKind::ReleaseQueryContext {
+                    releases.push(intent);
+                } else if let OperationIntent::AbortQueryContext(request) = &intent {
+                    // A real selected Task failure adds this exact operation
+                    // to the normal tail. Its receipt settles the request; it
+                    // does not prove Worker exit or replace the later Release.
+                    acks.publish(OperationAcknowledgement::worker_receipt(
+                        intent.operation_id(),
+                        OperationKind::AbortQueryContext,
+                        OperationOutcome::ContextTerminalReceipt,
+                        AckPayload::Context(QueryContextReceipt::new(
+                            request.context(),
+                            QueryContextState::TerminalRetained,
+                        )),
+                    ));
+                } else if intent.kind() == OperationKind::QuiesceQueryContext {
+                    let context = *round
+                        .execution()
+                        .graph()
+                        .contexts()
+                        .next()
+                        .expect("one backend context");
+                    let mut accepted = round
+                        .execution()
+                        .graph()
+                        .tasks()
+                        .map(|task| task.identity())
+                        .collect::<Vec<_>>();
+                    accepted.sort();
+                    acks.publish(OperationAcknowledgement::new(
+                        intent.operation_id(),
+                        OperationKind::QuiesceQueryContext,
+                        OperationOutcome::Accepted,
+                        AckPayload::Quiesce(QuiesceQueryContextReceipt::new(
+                            context,
+                            1,
+                            accepted,
+                            QueryContextState::Quiescing,
+                        )),
+                    ));
+                }
+            }
+            if !releases.is_empty() {
+                break;
+            }
+        }
+        let context = *round
+            .execution()
+            .graph()
+            .contexts()
+            .next()
+            .expect("one backend context");
+        let owner = round.execution().owner(context).expect("the context owner");
+        assert!(
+            owner.creates_closed(),
+            "all creates settled before the seal"
+        );
+        assert!(
+            owner.locally_drained(),
+            "all local tasks and outputs must drain: {:?}",
+            round.execution().attempt_drain_facts()
+        );
+        if owner.is_released() {
+            assert!(
+                round.execution().selected_task_failure().is_some(),
+                "only the original failed Task path settles Abort instead of Release"
+            );
+            assert!(releases.is_empty());
+            assert!(round.attempt_drained());
+            return None;
+        }
+        assert_eq!(
+            releases.len(),
+            1,
+            "the drained context must be released: owner={owner:?}, queued_actor_aborts={}",
+            round.queued_abort_effects()
+        );
+        releases.pop()
+    }
+}
+
+fn manifest_pending_release_fixture(
+    harness: Harness,
+    plan: Option<novarocks_query_application::api::PlanSeal>,
+) -> (
+    TaskRoundForTest,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    ManifestReleaseTail,
     Arc<ManualClock>,
     Option<super::protocol_facts::AttemptProtocolFactsReceiver>,
     Vec<(OperationIntent, OperationAcknowledgement)>,
@@ -7846,128 +8100,13 @@ fn manifest_normal_release_ack_fixture(
     status.publish(StatusEvent::Published(Box::new(finished)));
     round.turn().expect("the root finish is observed");
     sink.take();
-    round
-        .consume_root_result_packet(0, true)
-        .expect("the result owner consumed root EOS before sealing success");
-
-    // A row attempt returns Completed only after TaskRound accepted the root
-    // success seal. Start convergence at that post-seal terminal boundary.
-    super::manifest_round::begin_convergence(
-        &mut round,
-        &split_delivery,
-        Some(&novarocks_query_application::api::NativeAttemptTerminal::Completed),
-    );
-    assert!(
-        !round.attempt_drained(),
-        "the accepted root seal precedes upstream terminal status"
-    );
-    assert!(
-        round
-            .execution_mut()
-            .enqueue_task_update(upstream[0].task_id(), split_update(SCAN_NODE, 1, false))
-            .is_err(),
-        "the post-seal owner must reject new input before it reaches dispatch"
-    );
-    for identity in upstream {
-        let canceling = TaskStatus::try_new(
-            identity,
-            TaskStatusVersion::new(3).expect("v3"),
-            TaskState::Canceling,
-            Some(TerminationDetail::Canceled(
-                CancelReason::UpstreamNoLongerNeeded,
-            )),
-            TaskOutputFacts::new(false),
-        )
-        .expect("a valid canceling upstream task");
-        status.publish(StatusEvent::Published(Box::new(canceling)));
-        let canceled = TaskStatus::try_new(
-            identity,
-            TaskStatusVersion::new(4).expect("v4"),
-            TaskState::Canceled,
-            Some(TerminationDetail::Canceled(
-                CancelReason::UpstreamNoLongerNeeded,
-            )),
-            TaskOutputFacts::new(false),
-        )
-        .expect("a valid canceled upstream task");
-        status.publish(StatusEvent::Published(Box::new(canceled)));
-    }
-
-    let mut releases = Vec::new();
-    for _ in 0..8 {
-        round
-            .turn()
-            .expect("normal convergence keeps the Task owner live");
-        for intent in sink
-            .take()
-            .into_iter()
-            .flat_map(|(_, operations)| operations)
-        {
-            assert!(
-                !matches!(
-                    intent.kind(),
-                    OperationKind::CreateTask | OperationKind::UpdateTask
-                ),
-                "success drain cannot issue a new Create or Update"
-            );
-            if intent.kind() == OperationKind::ReleaseQueryContext {
-                releases.push(intent);
-            } else if intent.kind() == OperationKind::QuiesceQueryContext {
-                let context = *round
-                    .execution()
-                    .graph()
-                    .contexts()
-                    .next()
-                    .expect("one backend context");
-                let mut accepted = round
-                    .execution()
-                    .graph()
-                    .tasks()
-                    .map(|task| task.identity())
-                    .collect::<Vec<_>>();
-                accepted.sort();
-                acks.publish(OperationAcknowledgement::new(
-                    intent.operation_id(),
-                    OperationKind::QuiesceQueryContext,
-                    OperationOutcome::Accepted,
-                    AckPayload::Quiesce(QuiesceQueryContextReceipt::new(
-                        context,
-                        1,
-                        accepted,
-                        QueryContextState::Quiescing,
-                    )),
-                ));
-            }
-        }
-        if !releases.is_empty() {
-            break;
-        }
-    }
-    let context = *round
-        .execution()
-        .graph()
-        .contexts()
-        .next()
-        .expect("one backend context");
-    let owner = round.execution().owner(context).expect("the context owner");
-    assert!(
-        owner.creates_closed(),
-        "all creates settled before the seal"
-    );
-    assert!(
-        owner.locally_drained(),
-        "all local tasks and outputs must drain: {:?}",
-        round.execution().attempt_drain_facts()
-    );
-    assert_eq!(releases.len(), 1, "the drained context must be released");
-    (
-        round,
-        acks,
-        releases.pop().expect("one original Release"),
-        clock,
-        protocol,
-        facts,
-    )
+    let tail = ManifestReleaseTail {
+        status,
+        upstream,
+        sink,
+        split_delivery,
+    };
+    (round, acks, tail, clock, protocol, facts)
 }
 
 #[test]

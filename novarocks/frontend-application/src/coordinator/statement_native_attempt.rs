@@ -22,12 +22,12 @@
 
 use super::{
     execution::{FinalTaskInfoCollector, RootResultPolls},
-    internal_result::{InternalDomainFailure, InternalDomainSlot},
     query_registry::ActiveQueryGuard,
 };
 use crate::{
     query_execution::{
         artifact::TaskExecutionPreparedQuery,
+        internal_consumer::domain_state::{InternalDomainFailure, InternalDomainSlot},
         internal_result_cpu::{InternalResultCpuJob, InternalResultValue},
         lifecycle_diagnostics::{
             FrontendLifecycleDiagnostics, QueryLifecycleConvergenceErrorSource,

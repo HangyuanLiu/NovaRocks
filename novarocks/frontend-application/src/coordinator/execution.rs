@@ -21,7 +21,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::internal_result::{InternalDomainFailure, InternalDomainSlot, InternalDomainState};
 use super::root_result_relay::{RelayedRootAnswer, RelayedRootPolls};
 use crate::native::fragment_transport::{
     NativeTaskResultTransport, TaskReadGrace, TaskResultTransport,
@@ -33,6 +32,9 @@ use crate::query_execution::completion::{PreReadyRetryBoundary, QueryAttemptRese
 use crate::query_execution::contract::{
     DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
     DistributedQueryIntent, DistributedQueryRequest, PreReadyTopologyOutcome,
+};
+use crate::query_execution::internal_consumer::domain_state::{
+    InternalDomainFailure, InternalDomainSlot, InternalDomainState,
 };
 use crate::query_execution::internal_result_cpu::{
     InternalResultCpu, InternalResultCpuJob, InternalResultValue, require_internal_result_capacity,
@@ -1807,7 +1809,7 @@ impl FrontendDistributedQueryCoordinator {
                                             cancellation.clone(),
                                             &self.data_runtime,
                                             Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
-                                            |(domain, reply), _| domain.apply_body(reply),
+                                            |(domain, reply), _| domain.apply_body(Arc::new(reply)),
                                         ),
                                 );
                                 // The actual CPU completion, never enqueue, owns ACK.

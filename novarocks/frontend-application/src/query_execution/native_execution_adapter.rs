@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::task_protocol_config::CoordinationBudgets;
@@ -86,7 +86,8 @@ use crate::query_execution::internal_consumer::attempt_handoff::{
 };
 use crate::query_execution::lifecycle_plan::QueryInitOptions;
 use crate::query_execution::logical_execution::{
-    ComputationDiagnostics, LogicalExecutionLauncher, PreparedLogicalComputation,
+    ComputationDiagnostics, InitialComputationCredentials, LogicalExecutionLauncher,
+    PreparedLogicalComputation,
 };
 use crate::query_execution::split_assignment_round::SplitAssignmentRoundGuard;
 use crate::runtime_filter::compiler::{
@@ -941,6 +942,7 @@ struct InternalNativeRegistration {
     consumer: Arc<dyn novarocks_query_application::api::InternalComputationConsumer>,
     handoffs: Arc<AttemptHandoffOfferPort>,
     diagnostics: ComputationDiagnostics,
+    initial_credentials: Option<Arc<InitialComputationCredentials>>,
 }
 
 impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
@@ -991,6 +993,7 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
             consumer,
             handoffs,
             diagnostics,
+            initial_credentials,
         } = computation;
         self.start_native(
             FrontendLogicalLaunch {
@@ -1001,6 +1004,7 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
                     consumer,
                     handoffs,
                     diagnostics,
+                    initial_credentials,
                 }),
             },
             owner,
@@ -1029,14 +1033,37 @@ impl FrontendNativeLogicalExecutionLauncher {
             options,
             internal,
         } = launch;
-        let (consumer, handoffs, diagnostics) = match internal {
+        let (consumer, handoffs, diagnostics, initial_credentials) = match internal {
             Some(InternalNativeRegistration {
                 consumer,
                 handoffs,
                 diagnostics,
-            }) => (Some(consumer), Some(handoffs), diagnostics),
-            None => (None, None, ComputationDiagnostics::None),
+                initial_credentials,
+            }) => (
+                Some(consumer),
+                Some(handoffs),
+                diagnostics,
+                initial_credentials,
+            ),
+            None => (None, None, ComputationDiagnostics::None, None),
         };
+        if initial_credentials.as_ref().is_some_and(|credentials| {
+            description.recovery() != RecoveryMode::NoRecovery
+                || reservation.as_ref().map(|reserved| reserved.execution())
+                    != Some(credentials.execution())
+        }) {
+            return Box::pin(async {
+                Err(QueryExecutionError::from_execution(
+                    ExecutionFailureInput::new(
+                        QueryFailureReason::PreparationProtocol.failure_fact(),
+                        SafeDetail::truncating(
+                            "initial computation credentials require the matching reserved NoRecovery execution",
+                        ),
+                        ExecutionFailureSite::Coordinator,
+                    ),
+                ))
+            });
+        }
         if result_window
             .as_ref()
             .is_some_and(|window| !window.is_for_scope(&owner.scope()))
@@ -1078,6 +1105,11 @@ impl FrontendNativeLogicalExecutionLauncher {
             Ok(delivery) => delivery,
             Err(error) => return Box::pin(async move { Err(error) }),
         };
+        // The Native seed borrows this FA-private handoff port; it never
+        // retains attempt credentials. The statement/domain owner must keep
+        // the strong custody registered before preparation and through open.
+        let initial_credentials =
+            initial_credentials.map(|credentials| Arc::downgrade(&credentials));
         let aborts = LogicalAbortRouter::new();
         let replacements = LogicalReplacementQualificationPort::new(
             self.runtime.clone(),
@@ -1092,6 +1124,7 @@ impl FrontendNativeLogicalExecutionLauncher {
                 aborts: Arc::clone(&aborts),
                 delivery,
                 diagnostics,
+                initial_credentials,
             },
             replacements: replacements.clone(),
             handoffs,
@@ -1141,6 +1174,7 @@ struct ProductionManifestAttemptProjection {
     aborts: Arc<LogicalAbortRouter>,
     delivery: ProductionRootDelivery,
     diagnostics: ComputationDiagnostics,
+    initial_credentials: Option<Weak<InitialComputationCredentials>>,
 }
 
 impl std::fmt::Debug for ProductionManifestAttemptProjection {
@@ -1527,7 +1561,24 @@ impl ProductionManifestAttemptProjection {
                 ))
                 .unwrap_or_else(Instant::now)
         });
-        let credential_source = RoundCredentialLeaseSource::fresh(execution);
+        // This projection runs only after QA binds the original open ticket.
+        // Upgrade once under the admitted attempt, then keep that exact owner
+        // until its original table has crossed Native initialization.
+        let initial_credentials = self
+            .initial_credentials
+            .as_ref()
+            .map(|credentials| {
+                credentials.upgrade().ok_or_else(|| projection_message(
+                "initial computation credential custody was released before Native projection",
+            ))
+            })
+            .transpose()?;
+        let credential_source = match &initial_credentials {
+            Some(credentials) => credentials
+                .take_source(execution)
+                .map_err(projection_failure)?,
+            None => RoundCredentialLeaseSource::fresh(execution),
+        };
         let connector_context = crate::connector::query_connector_request_context_on_runtime(
             self.runtime.data_runtime.handle(),
             deadline,
@@ -1651,7 +1702,14 @@ impl ProductionManifestAttemptProjection {
         // Preserve the original capability beyond projection. Its planning
         // route and material remain attached to this exact attempt until the
         // domain result transfers them to its publication owner.
-        let credential_storage = task_prepared.take_terminal_storage_resolver();
+        let storage = task_prepared.take_terminal_storage();
+        if let Some(credentials) = &initial_credentials {
+            credentials
+                .verify_native_storage(&storage)
+                .map_err(projection_failure)?;
+        }
+        // Even an empty table carries the original collector's transfer fact.
+        let credential_storage = Some(storage);
         let backends = manifest
             .contexts()
             .iter()

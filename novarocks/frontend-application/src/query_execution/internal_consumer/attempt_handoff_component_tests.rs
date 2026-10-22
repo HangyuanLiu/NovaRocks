@@ -74,7 +74,10 @@ impl TaskResultTransport for UnavailableFinalInfo {
 struct OriginalAttempt {
     round: TaskRound,
     acks: TaskAckIntakeHandle,
-    release: OperationIntent,
+    release: Option<OperationIntent>,
+    pending_upstream: Option<crate::task_execution::tests::ManifestReleaseTail>,
+    scope: novarocks_workload_control::WorkScope,
+    capacity: novarocks_workload_control::ResultCapacityHandle,
     clock: Arc<ManualClock>,
     plan: PlanSeal,
     root: TaskIdentity,
@@ -83,20 +86,44 @@ struct OriginalAttempt {
     // This stands for the original Native active behavior's strong custody.
     native_credentials: Arc<AttemptCredentialStorage>,
     diagnostics: TaskFinalInfoCollector,
-    _abort_intake: crate::task_execution::abort_effect::NativeAbortEffectIntake,
     _control: WorkloadControl,
     business: BusinessPermit,
 }
 impl OriginalAttempt {
     async fn new(attempt: u64) -> (Self, AttemptHandoffResources, InternalConsumerActivation) {
+        Self::new_with_transport(attempt, Arc::new(UnavailableFinalInfo)).await
+    }
+    async fn new_with_transport(
+        attempt: u64,
+        transport: Arc<dyn TaskResultTransport>,
+    ) -> (Self, AttemptHandoffResources, InternalConsumerActivation) {
+        let (description, plan) = internal_count_description();
+        Self::new_with_description(attempt, transport, description, plan, false).await
+    }
+    async fn new_with_description(
+        attempt: u64,
+        transport: Arc<dyn TaskResultTransport>,
+        description: novarocks_query_application::preparation::FrozenExecutionDescription,
+        plan: PlanSeal,
+        pending: bool,
+    ) -> (Self, AttemptHandoffResources, InternalConsumerActivation) {
         let execution =
             QueryExecutionId::new(QueryId::new(0x92, 0x31), AttemptId::new(attempt).unwrap())
                 .unwrap();
-        let (description, plan) = internal_count_description();
-        let (round, acks, release, clock, protocol, establish_facts) =
-            crate::task_execution::tests::manifest_normal_release_ack_with_protocol_fixture(
-                execution, plan,
-            );
+        let (mut round, acks, release, pending_upstream, clock, protocol, establish_facts) =
+            if pending {
+                let (round, acks, tail, clock, protocol, facts) =
+                    crate::task_execution::tests::manifest_pending_release_with_protocol_fixture(
+                        execution, plan,
+                    );
+                (round, acks, None, Some(tail), clock, protocol, facts)
+            } else {
+                let (round, acks, release, clock, protocol, facts) =
+                    crate::task_execution::tests::manifest_normal_release_ack_with_protocol_fixture(
+                        execution, plan,
+                    );
+                (round, acks, Some(release), None, clock, protocol, facts)
+            };
         let root = round.root_task();
         let context = *round.execution().graph().contexts().next().unwrap();
         let control = WorkloadControl::try_new(
@@ -108,10 +135,14 @@ impl OriginalAttempt {
             },
         )
         .unwrap();
+        let capacity = control
+            .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+            .unwrap();
         control.mark_ready().unwrap();
         let governed = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
+        let scope = governed.owner.scope();
         let stage = governed
             .owner
             .scope()
@@ -122,6 +153,7 @@ impl OriginalAttempt {
                 NonZeroUsize::new(2).unwrap(),
                 Arc::new(CountingWake::default()),
             );
+        round.install_abort_effect_intake(abort_intake);
         let config = LogicalExecutionActorConfig::single_attempt_completion(
             execution,
             ExecutionEffect::None,
@@ -155,12 +187,8 @@ impl OriginalAttempt {
         )
         .await;
         let activation = logical.internal_consumer_activation(root).await.unwrap();
-        let mut diagnostics = TaskFinalInfoCollector::new(
-            Arc::new(UnavailableFinalInfo),
-            true,
-            &round,
-            Arc::new(CountingWake::default()),
-        );
+        let mut diagnostics =
+            TaskFinalInfoCollector::new(transport, true, &round, Arc::new(CountingWake::default()));
         let profile = diagnostics.enable_profile_observation().unwrap();
         let native_credentials = original_credentials(execution);
         let resources = AttemptHandoffResources::new(
@@ -173,6 +201,9 @@ impl OriginalAttempt {
                 round,
                 acks,
                 release,
+                pending_upstream,
+                scope,
+                capacity,
                 clock,
                 plan,
                 root,
@@ -180,7 +211,6 @@ impl OriginalAttempt {
                 logical,
                 native_credentials,
                 diagnostics,
-                _abort_intake: abort_intake,
                 _control: control,
                 business: governed.business,
             },
@@ -233,22 +263,35 @@ impl OriginalAttempt {
         assert!(self.diagnostics.all_terminal_observed());
     }
     async fn finish(mut self) {
-        let OperationIntent::ReleaseQueryContext(request) = &self.release else {
-            unreachable!("the fixture returns its original Release")
-        };
-        self.acks.publish(OperationAcknowledgement::new(
-            self.release.operation_id(),
-            OperationKind::ReleaseQueryContext,
-            OperationOutcome::Accepted,
-            AckPayload::Release {
-                receipt: QueryContextReceipt::new(
-                    request.context(),
-                    QueryContextState::TerminalRetained,
-                ),
-                outcome: ReleaseOutcome::Released,
-                runtime_filter: None,
-            },
-        ));
+        if let Some(release) = self.release.as_ref() {
+            let OperationIntent::ReleaseQueryContext(request) = release else {
+                unreachable!("the fixture returns its original Release")
+            };
+            self.acks.publish(OperationAcknowledgement::new(
+                release.operation_id(),
+                OperationKind::ReleaseQueryContext,
+                OperationOutcome::Accepted,
+                AckPayload::Release {
+                    receipt: QueryContextReceipt::new(
+                        request.context(),
+                        QueryContextState::TerminalRetained,
+                    ),
+                    outcome: ReleaseOutcome::Released,
+                    runtime_filter: None,
+                },
+            ));
+        } else {
+            assert!(self.pending_upstream.is_none());
+            assert!(self.round.execution().selected_task_failure().is_some());
+            assert!(
+                self.round
+                    .execution()
+                    .owner(self.context)
+                    .unwrap()
+                    .is_released()
+            );
+            assert!(self.round.attempt_drained());
+        }
         self.round.turn().unwrap();
         self.round
             .execution_mut()
@@ -272,7 +315,19 @@ impl OriginalAttempt {
         assert!(self.round.attempt_drained());
         assert!(self.round.pumps_closed());
         assert!(self.round.execution().worker_contexts_stopped());
-        self.logical.abandon_running_attempt();
+        // A Native failure may already have consumed the original permit.
+        // Only an unconcluded attempt needs abandonment; finish_until drops
+        // any retained permit without choosing another logical conclusion.
+        if self
+            .logical
+            .actor_snapshot()
+            .await
+            .unwrap()
+            .conclusion
+            .is_none()
+        {
+            self.logical.abandon_running_attempt();
+        }
         self.logical
             .observe_worker_stopped_and_context_fenced(self.context)
             .await
@@ -480,3 +535,10 @@ async fn claimed_old_bundle_survives_replacement_and_a_stale_source_cannot_take_
     old.finish().await;
     next.finish().await;
 }
+
+// Child tests reuse this original private fixture instead of cloning a driver.
+#[path = "profile_component_tests.rs"]
+mod profile_consumer_tests;
+
+#[path = "statistics_component_tests.rs"]
+mod statistics_consumer_tests;

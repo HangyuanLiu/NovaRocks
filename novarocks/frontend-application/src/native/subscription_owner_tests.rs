@@ -313,12 +313,27 @@ async fn original_panic_payload_destructor_is_actually_retired_before_scope_rele
 async fn stale_lease_drop_cannot_abort_recycled_original_position() {
     let (control, root) = work(2);
     let (mut owner, port) = owner(2);
-    let stale = port
-        .reserve(&root.owner.scope(), None, None)
-        .unwrap()
-        .start(async {})
-        .unwrap();
-    until(|| {
+    let reservation = port.reserve(&root.owner.scope(), None, None).unwrap();
+    let original_scope = {
+        let state = owner.core.state.lock().unwrap();
+        let record = state.records[reservation.index].as_ref().unwrap();
+        let scope = record
+            .backing
+            .owner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .scope();
+        scope
+    };
+    let stale = reservation.start(async {}).unwrap();
+    // The reaper removes the role slot before dropping its original backing
+    // outside the lock. Wait for that exact Work child to release capacity.
+    tokio::time::timeout(Duration::from_secs(2), original_scope.wait_released())
+        .await
+        .expect("the original subscription child must actually release its scope record");
+    assert!(
         owner
             .core
             .state
@@ -327,13 +342,13 @@ async fn stale_lease_drop_cannot_abort_recycled_original_position() {
             .records
             .iter()
             .all(Option::is_none)
-    })
-    .await;
+    );
     let live = port
         .reserve(&root.owner.scope(), None, None)
         .unwrap()
         .start(std::future::pending())
         .unwrap();
+    let recycled_position = stale.index == live.index;
     let old_generation = stale.generation;
     let new_generation = live.generation;
     drop(stale);
@@ -347,6 +362,7 @@ async fn stale_lease_drop_cannot_abort_recycled_original_position() {
         .await;
     drop(live);
     finish_work(control, root);
+    assert!(recycled_position);
     assert_ne!(old_generation, new_generation);
     assert!(!requested);
     assert_eq!(actual, DrainObservation::Joined);

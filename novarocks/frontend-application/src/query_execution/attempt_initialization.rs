@@ -141,6 +141,13 @@ impl RoundCredentialLeaseSource {
 impl Drop for RoundCredentialLeaseSource {
     fn drop(&mut self) {
         self.publish_observed();
+        if let Self::Fresh { collector, .. } = self {
+            // A terminal holder may keep the collector alive after this source
+            // exits. Close its production rights without claiming actual exit.
+            let _ = collector.seal_for_terminal();
+        }
+        // A still-owned Reservation seals through its own Drop; a consumed
+        // NativeDrained collector keeps the same immutable storage table.
     }
 }
 
@@ -972,9 +979,9 @@ mod tests {
     fn dropped_attempt_source_publishes_credentials_observed_before_failure() {
         let reservation =
             QueryAttemptReservation::retry(QueryId::new(17, 23), 2).expect("attempt reservation");
-        reservation
-            .credential_lease_sink()
-            .offer_vended_s3_credential_lease(&vended_catalog_properties(), vended_contribution())
+        let terminal = reservation.terminal_storage_resolver();
+        let sink = reservation.credential_lease_sink();
+        sink.offer_vended_s3_credential_lease(&vended_catalog_properties(), vended_contribution())
             .expect("credential contribution");
         let observed = Arc::new(AtomicBool::new(false));
         let source = RoundCredentialLeaseSource::Reservation {
@@ -987,6 +994,59 @@ mod tests {
         assert!(
             observed.load(Ordering::Acquire),
             "dropping a failed attempt source must publish credentials already collected"
+        );
+        assert!(
+            sink.offer_vended_s3_credential_lease(
+                &vended_catalog_properties(),
+                vended_contribution(),
+            )
+            .is_err(),
+            "terminal custody cannot keep the abandoned collection right open"
+        );
+        let request = novarocks_spi::connector::StorageAccessRequest::try_new(
+            vended_catalog_properties().handle().clone(),
+            "s3://warehouse/data/file.parquet",
+        )
+        .unwrap();
+        assert!(
+            novarocks_spi::connector::ConnectorStorageResolver::resolve_vended_s3(
+                terminal.as_ref(),
+                &request,
+            )
+            .is_ok(),
+            "the original contribution stays available for terminal work"
+        );
+    }
+
+    #[test]
+    fn dropped_fresh_source_closes_collection_under_retained_terminal_custody() {
+        let source = RoundCredentialLeaseSource::fresh(execution_id(1));
+        let RoundCredentialLeaseSource::Fresh { collector, .. } = &source else {
+            unreachable!("fresh source owns the original collector");
+        };
+        let terminal = collector.terminal_storage_resolver();
+        let sink = collector.sink();
+        sink.offer_vended_s3_credential_lease(&vended_catalog_properties(), vended_contribution())
+            .unwrap();
+        drop(source);
+        assert!(
+            sink.offer_vended_s3_credential_lease(
+                &vended_catalog_properties(),
+                vended_contribution(),
+            )
+            .is_err()
+        );
+        let request = novarocks_spi::connector::StorageAccessRequest::try_new(
+            vended_catalog_properties().handle().clone(),
+            "s3://warehouse/data/file.parquet",
+        )
+        .unwrap();
+        assert!(
+            novarocks_spi::connector::ConnectorStorageResolver::resolve_vended_s3(
+                terminal.as_ref(),
+                &request,
+            )
+            .is_ok()
         );
     }
 

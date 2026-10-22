@@ -50,9 +50,21 @@ impl InternalFixture {
     }
 
     async fn with_clock(tag: i64, clock: Arc<dyn MonotonicClock>) -> Self {
+        Self::with_clock_and_qualification(
+            tag,
+            clock,
+            Arc::new(DelayedQualificationPort::default()),
+        )
+        .await
+    }
+
+    async fn with_clock_and_qualification(
+        tag: i64,
+        clock: Arc<dyn MonotonicClock>,
+        qualification: Arc<DelayedQualificationPort>,
+    ) -> Self {
         let first = execution(tag);
-        let config =
-            internal_config(first, Arc::new(DelayedQualificationPort::default())).with_clock(clock);
+        let config = internal_config(first, qualification).with_clock(clock);
         let (owner, initial, output) = spawn_logical_execution_actor(&Handle::current(), config)
             .unwrap()
             .into_parts();
@@ -996,4 +1008,289 @@ async fn deferred_end_retirement_keeps_execution_outcome_open_until_successor_fa
         outcome.borrow().as_ref().unwrap().as_ref().unwrap_err(),
         &error
     );
+}
+
+fn internal_end_task_failure(
+    identity: TaskIdentity,
+    phase: novarocks_execution_contract::TaskFailurePhase,
+    reason: crate::execution_error::QueryFailureReason,
+    detail: &'static str,
+) -> QueryExecutionError {
+    use novarocks_execution_contract::{
+        SafeDetail, TaskFailure, TerminationDetail, failure::FailureProjection,
+    };
+    let selected = novarocks_coordination_contract::SelectedTaskTermination::new(
+        identity,
+        TerminationDetail::Failed(TaskFailure::new_in_phase(
+            reason.failure_fact(),
+            SafeDetail::new(detail).unwrap(),
+            phase,
+        )),
+    );
+    QueryExecutionError::from_execution(
+        crate::execution_error::ExecutionFailureInput::from_selected_task(&selected).unwrap(),
+    )
+}
+
+async fn join_original_internal_actor(owner: LogicalExecutionActorOwner) {
+    let (actor, join) = owner.into_test_parts();
+    drop(actor);
+    tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("the original internal actor must actually exit")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn provisional_end_failure_waiter_receives_the_original_frozen_task_input() {
+    use crate::execution_error::{ExecutionFailureSite, QueryFailureReason};
+    use novarocks_execution_contract::{TaskFailurePhase, failure::FailureProjection};
+
+    let mut fixture = InternalFixture::new(12_401).await;
+    // Complete the real actor-delivered End, but never propose Ready.
+    let decoded = fixture.decoded_end().await;
+    let origin = root_task(fixture.running.identity().execution(), 2);
+    let original = internal_end_task_failure(
+        origin,
+        TaskFailurePhase::Preparation,
+        QueryFailureReason::TransportCapacity,
+        "the original peer Task exhausted its admitted preparation position",
+    );
+    let original_input = original.execution_failure().unwrap().clone();
+    assert_eq!(
+        original_input.site(),
+        ExecutionFailureSite::Task {
+            identity: origin,
+            phase: TaskFailurePhase::Preparation,
+        }
+    );
+    assert_eq!(
+        original_input.fact(),
+        QueryFailureReason::TransportCapacity.failure_fact()
+    );
+    assert!(fixture.activation.stream.current_failure().is_none());
+    let mut waiting = Box::pin(fixture.activation.stream.failure());
+    poll_pending(waiting.as_mut()).await;
+    fixture
+        .running
+        .freeze_result_attempt_failure(original.clone())
+        .await
+        .unwrap();
+    let observed = tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("the retired original stream must wake its pending failure waiter");
+    assert_eq!(observed.execution_failure(), Some(&original_input));
+    assert_eq!(observed, original);
+    assert_eq!(
+        fixture.activation.stream.current_failure(),
+        Some(original.clone())
+    );
+    assert!(fixture.activation.ready.borrow().is_none());
+    assert!(
+        fixture
+            .owner
+            .actor()
+            .internal_outcome()
+            .unwrap()
+            .borrow()
+            .is_none()
+    );
+    let snapshot = fixture.owner.actor().snapshot().await.unwrap();
+    assert_eq!(snapshot.conclusion, None);
+    assert!(!snapshot.output_visible);
+    // Attempt freezing still does not choose the logical terminal verdict.
+    let InternalFixture {
+        owner,
+        running,
+        observer,
+        activation,
+        _output,
+    } = fixture;
+    let running = Arc::try_unwrap(running).expect("the original End sender actually exited");
+    assert_eq!(
+        owner
+            .actor()
+            .fail_attempt_with_error(running, original)
+            .await
+            .unwrap(),
+        LogicalConclusion::Failed
+    );
+    drop((decoded, observer, activation, _output));
+    join_original_internal_actor(owner).await;
+}
+
+#[tokio::test]
+async fn replaced_provisional_end_failure_stays_with_its_original_stream() {
+    use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason};
+    use novarocks_execution_contract::{SafeDetail, TaskFailurePhase, failure::FailureProjection};
+
+    let qualification = Arc::new(DelayedQualificationPort::default());
+    let mut fixture = InternalFixture::with_clock_and_qualification(
+        12_402,
+        Arc::new(ProcessMonotonicClock::new()),
+        Arc::clone(&qualification),
+    )
+    .await;
+    let old_decoded = fixture.decoded_end().await;
+    let original = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+        QueryFailureReason::BackendLost.failure_fact(),
+        SafeDetail::new("the original attempt lost its exact backend before Ready").unwrap(),
+        ExecutionFailureSite::Backend {
+            process: BackendProcessId::new_v7(),
+        },
+    ));
+    assert_eq!(
+        original.execution_failure().unwrap().attempt_class(),
+        AttemptFailureClass::RecoverableInfrastructure
+    );
+    fixture
+        .running
+        .freeze_result_attempt_failure(original.clone())
+        .await
+        .unwrap();
+    assert_eq!(fixture.activation.stream.failure().await, original);
+    let InternalFixture {
+        owner,
+        running,
+        observer: old_observer,
+        activation: mut old,
+        _output,
+    } = fixture;
+    let running = Arc::try_unwrap(running).expect("the old original End sender actually exited");
+    let successor = replace_internal_attempt(&owner, running, &qualification).await;
+    let next_root = root_task(successor.identity().execution(), 1);
+    let next_activation = successor.bind_internal_consumer(next_root).await.unwrap();
+    let next_observer = successor.bind_root_result(next_root).await.unwrap();
+    let mut next = InternalFixture {
+        owner,
+        running: Arc::new(successor),
+        observer: next_observer,
+        activation: next_activation,
+        _output,
+    };
+    assert!(old.source.accept(old_decoded).await.is_err());
+    let next_decoded = next.decoded_end().await;
+    assert!(next.activation.stream.current_failure().is_none());
+    assert_eq!(old.stream.current_failure(), Some(original.clone()));
+    assert!(
+        next.owner
+            .actor()
+            .internal_outcome()
+            .unwrap()
+            .borrow()
+            .is_none()
+    );
+
+    let current = internal_end_task_failure(
+        root_task(next.running.identity().execution(), 3),
+        TaskFailurePhase::Preparation,
+        QueryFailureReason::TransportCapacity,
+        "the successor peer Task exhausted its own preparation position",
+    );
+    assert_ne!(current.execution_failure(), original.execution_failure());
+    let mut waiting = Box::pin(next.activation.stream.failure());
+    poll_pending(waiting.as_mut()).await;
+    next.running
+        .freeze_result_attempt_failure(current.clone())
+        .await
+        .unwrap();
+    let observed = tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("the successor stream must receive only its original failure");
+    assert_eq!(observed.execution_failure(), current.execution_failure());
+    assert_eq!(observed, current);
+    assert_eq!(old.stream.failure().await, original);
+    assert!(old.ready.borrow().is_none());
+    assert!(next.activation.ready.borrow().is_none());
+    assert_eq!(
+        next.owner.actor().snapshot().await.unwrap().conclusion,
+        None
+    );
+
+    let InternalFixture {
+        owner,
+        running,
+        observer,
+        activation,
+        _output,
+    } = next;
+    let running =
+        Arc::try_unwrap(running).expect("the successor original End sender actually exited");
+    assert_eq!(
+        owner
+            .actor()
+            .fail_attempt_with_error(running, current)
+            .await
+            .unwrap(),
+        LogicalConclusion::Failed
+    );
+    drop((
+        old_observer,
+        old.stream,
+        old.ready,
+        next_decoded,
+        observer,
+        activation,
+        _output,
+    ));
+    join_original_internal_actor(owner).await;
+}
+
+#[tokio::test]
+async fn provisional_end_failure_waiter_receives_the_accepted_governed_cancellation() {
+    use crate::execution_error::{ExecutionFailureSite, QueryFailureReason};
+    use novarocks_execution_contract::failure::FailureProjection;
+
+    let mut fixture = InternalFixture::new(12_403).await;
+    let decoded = fixture.decoded_end().await;
+    let mut outcome = fixture.owner.actor().internal_outcome().unwrap();
+    let mut waiting = Box::pin(fixture.activation.stream.failure());
+    poll_pending(waiting.as_mut()).await;
+    fixture
+        .owner
+        .actor()
+        .request_registry_close_for_join(RegistryClose::Shutdown);
+    let observed = tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("governed cancellation must wake the provisional End waiter");
+    let input = observed.execution_failure().unwrap();
+    assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+    assert_eq!(input.fact(), QueryFailureReason::Cancelled.failure_fact());
+    assert_eq!(
+        observed.message(),
+        "logical execution was cancelled before success EOF"
+    );
+    assert_eq!(
+        fixture.activation.stream.current_failure(),
+        Some(observed.clone())
+    );
+    assert_eq!(
+        fixture
+            .activation
+            .ready
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap_err(),
+        &observed
+    );
+    let accepted = tokio::time::timeout(
+        Duration::from_secs(5),
+        outcome.wait_for(|value| value.is_some()),
+    )
+    .await
+    .expect("the original actor must publish its selected outcome")
+    .unwrap();
+    assert_eq!(accepted.as_ref().unwrap().as_ref().unwrap_err(), &observed);
+    drop(accepted);
+    let InternalFixture {
+        owner,
+        running,
+        observer,
+        activation,
+        _output,
+    } = fixture;
+    drop((decoded, running, observer, activation, _output, outcome));
+    join_original_internal_actor(owner).await;
 }

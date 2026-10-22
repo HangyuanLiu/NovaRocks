@@ -18,6 +18,10 @@
 //! Fixed application-owned internal computation consumers.
 
 pub(crate) mod attempt_handoff;
+pub(crate) mod decoded;
+pub(crate) mod domain_cpu;
+pub(crate) mod domain_state;
+pub(crate) mod profile;
 
 #[cfg(all(test, novarocks_dev_controls))]
 pub(crate) mod test_fixture;

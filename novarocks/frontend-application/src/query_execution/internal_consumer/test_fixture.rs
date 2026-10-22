@@ -38,13 +38,31 @@ pub(crate) fn internal_count_description() -> (
     FrozenExecutionDescription,
     novarocks_query_application::api::PlanSeal,
 ) {
+    internal_description(novarocks_result_contract::FrozenRootOutput::CountOnly)
+}
+
+pub(crate) fn internal_statistics_description() -> (
+    FrozenExecutionDescription,
+    novarocks_query_application::api::PlanSeal,
+) {
+    internal_description(novarocks_result_contract::FrozenRootOutput::InternalFacts(
+        novarocks_result_contract::InternalResultDomain::StatisticsArtifactV1,
+    ))
+}
+
+fn internal_description(
+    root_output: novarocks_result_contract::FrozenRootOutput,
+) -> (
+    FrozenExecutionDescription,
+    novarocks_query_application::api::PlanSeal,
+) {
     use novarocks_physical_plan::{
         FragmentBuilder, FragmentId, FragmentSink, OutputPort, PipelineDopDomain, PlanBuilder,
         PlanVersionId, ResultPort,
     };
-    use novarocks_result_contract::{FrozenRootOutput, RootOutputContract, RootProfileId};
-    // Diagnostics are carrier-independent. A validated zero-row CountOnly
-    // program keeps this test focused on the real actor End/Ready boundary.
+    use novarocks_result_contract::{RootOutputContract, RootProfileId};
+    // Only the frozen purpose varies; every fixture uses the same validated
+    // physical author and actual actor End/Ready boundary.
     let fragment_id = FragmentId::new(0);
     let mut fragment = FragmentBuilder::new(fragment_id);
     let node = fragment.reserve_node_id().unwrap();
@@ -56,7 +74,7 @@ pub(crate) fn internal_count_description() -> (
             node,
             FragmentSink::RootResult(Box::new(RootOutputContract::new(
                 RootProfileId::V1,
-                FrozenRootOutput::CountOnly,
+                root_output,
             ))),
             PipelineDopDomain {
                 min: 1,
