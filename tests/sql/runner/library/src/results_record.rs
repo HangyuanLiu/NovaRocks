@@ -300,6 +300,7 @@ pub(crate) fn declarations(suites: &BTreeMap<String, SuiteConfig>) -> Result<Val
             facts["explicit_only"] = json!(suite.manifest.explicit_only);
             facts["disabled_reason"] = json!(suite.manifest.disabled_reason);
             facts["heavy"] = json!(suite.manifest.heavy);
+            facts["prepared_dataset"] = json!(suite.manifest.prepared_dataset);
             facts["tier"] = json!(if suite.manifest.explicit_only {
                 "full"
             } else {
@@ -1029,9 +1030,14 @@ mod lifecycle_tests {
             suite.manifest.explicit_only = explicit;
             if explicit {
                 suite.manifest.heavy = Some(crate::suite_manifest::HeavyDeclaration {
-                    reason: crate::suite_manifest::HeavyReason::Cost,
-                    detail: "Existing independently selected heavy fixture".to_owned(),
+                    reason: crate::suite_manifest::HeavyReason::Dataset,
+                    detail: "Existing independently selected dataset fixture".to_owned(),
                 });
+                suite.manifest.prepared_dataset =
+                    Some(crate::suite_manifest::PreparedDatasetRequirement {
+                        dataset: crate::suite_manifest::DatasetName::Ssb,
+                        scale: "1".to_owned(),
+                    });
             }
             suites.insert(name.to_owned(), suite);
         }
@@ -1065,6 +1071,10 @@ mod lifecycle_tests {
                 json!(original.manifest.explicit_only)
             );
             assert_eq!(entry["heavy"], json!(original.manifest.heavy));
+            assert_eq!(
+                entry["prepared_dataset"],
+                json!(original.manifest.prepared_dataset)
+            );
             assert_eq!(entry["reuse"], json!(original.manifest.reuse));
             assert_eq!(entry["cases"], suite_inputs(original).unwrap()["cases"]);
             assert_eq!(

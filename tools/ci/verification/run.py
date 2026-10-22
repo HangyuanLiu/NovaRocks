@@ -942,6 +942,8 @@ def execute(repo,root,native,chosen,scope_values,pending=None):
                 if not config:
                     record_error('sql-suite',name,error='NOVAROCKS_SQL_TEST_CONFIG is required');continue
                 argv=[native['receipt']['novarocks-sql-test']['path'],'--config',config,'--suite',name,'--mode','verify','--results-file',str(output),'--cluster-mode','cross-process','--cluster-size','3','-j','1']+sql_case_arguments(declaration,cases)
+                if declaration.get('prepared_dataset') is not None:
+                    argv+=['--cluster-launch-profile','performance']
                 units=[unit for scope in group for unit in scope.units]
                 spec={'inputs':[],'files':{'runner':argv[0],'server':env['NOVAROCKS_BIN'],'config':config},'env_inputs':declaration.get('reuse',{}).get('env_inputs') or [],'declared':declaration.get('reuse',{}).get('env_inputs') is not None}
                 code=invoke(attempt,repo,'sql-suite',name,units,argv,spec,{'sql_results':str(output)},env)
