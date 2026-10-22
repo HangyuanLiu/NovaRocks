@@ -944,17 +944,26 @@ class ScratchSweeper:
                     cached_roots = saved.get("observed_run_roots", [])
                     if not isinstance(cached_roots, list) or len(cached_roots) > MAX_PENDING_PREFIXES:
                         raise runtime.RuntimeFailure("RuntimeStateUnreadable", "invalid scratch root continuation")
+                    parents = {}
                     for root in cached_roots:
+                        self._check(deadline)
                         bucket, key = s3_parts(root)
                         parent, _, run = key.rpartition("/")
                         ScratchIdentity(run, root)
                         if canonical_s3(root) != root or self._protected(root, deletion=True):
                             raise runtime.RuntimeFailure("RuntimeStateUnreadable", "unsafe continued scratch root")
-                        # A cursor is only a hint. A fresh native parent listing
-                        # must re-establish every retained root before cleanup.
+                        parents.setdefault((bucket, parent), {})[run] = root
+                    for (bucket, parent), requested in parents.items():
+                        self._check(deadline)
+                        # Keep only requested-run presence from each fresh
+                        # listing, never the full rows of multiple parents.
                         rows = self._mc(["ls", "store/" + bucket + "/" + parent + "/"], deadline, absent_ok=True)
-                        if any(self._folder_component(row) == run for row in rows):
-                            self._identity_fact(ScratchIdentity(run, root))
+                        for row in rows:
+                            self._check(deadline)
+                            run = self._folder_component(row)
+                            if run in requested:
+                                self._identity_fact(ScratchIdentity(run, requested[run]))
+                        del rows
         if not pending:
             for row in self._mc(["ls", "store"], deadline):
                 if row.get("type") != "folder" or not isinstance(row.get("key"), str):
