@@ -1,0 +1,255 @@
+{
+  "schema": 1,
+  "license": "Licensed to the Apache Software Foundation (ASF) under the Apache License, Version 2.0.",
+  "record": {
+    "policy": {
+      "scratch_ttl_seconds": 604800,
+      "max_run_seconds": 86400,
+      "cleanup_grace_seconds": 300
+    },
+    "id": "machine-test",
+    "control_root": "/machine-test",
+    "daemon_id": "daemon-test",
+    "version": "v1",
+    "generation": "g1",
+    "config": {
+      "benchmark_root": "s3://novarocks/shared/benchmarks",
+      "minio_volume": "minio-test"
+    },
+    "protected_benchmark_roots": [
+      "s3://novarocks/shared/benchmarks"
+    ],
+    "ports": {
+      "rest": 28002,
+      "rest_mv": 28003
+    },
+    "server_warehouses": {
+      "rest": "s3://warehouse/service",
+      "rest-mv": "s3://warehouse/service-mv"
+    },
+    "offline_catalog_barrier": {
+      "schema": 1,
+      "daemon_id": "daemon-test",
+      "generation": "g1",
+      "volumes": [
+        "nr-fixture-machine_rest-catalog",
+        "nr-fixture-machine_rest-mv-catalog"
+      ],
+      "complete": true
+    }
+  },
+  "identity": {
+    "schema": 1,
+    "run_id": "nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "created_unix_ms": 1800000000000,
+    "scope_root": "s3://novarocks/worktree-a/scratch/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "projection": {
+    "schema": 1,
+    "identity": {
+      "schema": 1,
+      "run_id": "nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "created_unix_ms": 1800000000000,
+      "scope_root": "s3://novarocks/worktree-a/scratch/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "machine": {
+      "id": "machine-test",
+      "control_root": "/machine-test",
+      "daemon_id": "daemon-test",
+      "version": "v1",
+      "generation": "g1"
+    },
+    "storage_owner": {
+      "daemon_id": "daemon-test",
+      "minio_volume": "minio-test"
+    },
+    "ranges": {
+      "run_root": "s3://novarocks/worktree-a/scratch/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/",
+      "rest": {
+        "warehouse": "s3://warehouse/service/",
+        "namespace_prefix": "nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_"
+      },
+      "rest_mv": {
+        "warehouse": "s3://warehouse/service-mv/",
+        "namespace_prefix": "nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_"
+      }
+    }
+  },
+  "policy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": [
+          "s3:GetBucketLocation"
+        ],
+        "Resource": [
+          "arn:aws:s3:::novarocks"
+        ]
+      },
+      {
+        "Effect": "Allow",
+        "Action": [
+          "s3:ListBucket"
+        ],
+        "Resource": [
+          "arn:aws:s3:::novarocks"
+        ],
+        "Condition": {
+          "StringLike": {
+            "s3:prefix": [
+              "worktree-a/scratch/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/*"
+            ]
+          }
+        }
+      },
+      {
+        "Effect": "Allow",
+        "Action": [
+          "s3:GetBucketLocation"
+        ],
+        "Resource": [
+          "arn:aws:s3:::warehouse"
+        ]
+      },
+      {
+        "Effect": "Allow",
+        "Action": [
+          "s3:ListBucket"
+        ],
+        "Resource": [
+          "arn:aws:s3:::warehouse"
+        ],
+        "Condition": {
+          "StringLike": {
+            "s3:prefix": [
+              "service/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_*",
+              "service-mv/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_*"
+            ]
+          }
+        }
+      },
+      {
+        "Effect": "Allow",
+        "Action": [
+          "s3:GetObject",
+          "s3:GetObjectVersion",
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:DeleteObjectVersion",
+          "s3:AbortMultipartUpload",
+          "s3:ListMultipartUploadParts"
+        ],
+        "Resource": [
+          "arn:aws:s3:::novarocks/worktree-a/scratch/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/*",
+          "arn:aws:s3:::warehouse/service/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_*",
+          "arn:aws:s3:::warehouse/service-mv/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_*"
+        ]
+      }
+    ]
+  },
+  "membership": [
+    {
+      "uri": "s3://novarocks/worktree-a/scratch/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "belongs": true
+    },
+    {
+      "uri": "s3://novarocks/worktree-a/scratch/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ctas/staged/table",
+      "belongs": true
+    },
+    {
+      "uri": "s3://warehouse/service/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_old/renamed",
+      "belongs": true
+    },
+    {
+      "uri": "s3a://warehouse/service/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_old/renamed",
+      "belongs": true
+    },
+    {
+      "uri": "s3://warehouse/service-mv/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_mv/view",
+      "belongs": true
+    },
+    {
+      "uri": "s3://novarocks/worktree-a/scratch/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaasibling/file",
+      "belongs": false
+    },
+    {
+      "uri": "s3://warehouse/service/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/table",
+      "belongs": false
+    },
+    {
+      "uri": "s3://warehouse/service/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_toolong/table",
+      "belongs": false
+    },
+    {
+      "uri": "s3://warehouse/service/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_test0/table",
+      "belongs": true
+    },
+    {
+      "uri": "s3://warehouse/service2/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_old/table",
+      "belongs": false
+    },
+    {
+      "uri": "s3://novarocks/worktree-a/scratch/nr_scratch_1800000000000_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/table",
+      "belongs": false
+    },
+    {
+      "uri": "s3://novarocks/worktree-a/scratch/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/../file",
+      "error": "InvalidScratchScope"
+    },
+    {
+      "uri": "s3://novarocks/worktree-a/scratch/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa//file",
+      "error": "InvalidScratchScope"
+    },
+    {
+      "uri": "s3://novarocks/worktree-a/scratch/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/%2f/file",
+      "error": "InvalidScratchScope"
+    },
+    {
+      "uri": "s3://novarocks/worktree-a/scratch/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/file?",
+      "error": "InvalidScratchScope"
+    },
+    {
+      "uri": "s3://novarocks/worktree-a/scratch/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/file#",
+      "error": "InvalidScratchScope"
+    },
+    {
+      "uri": "s3://novarocks/worktree-a/scratch/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/file*",
+      "error": "InvalidScratchScope"
+    },
+    {
+      "uri": "https://warehouse/service/table",
+      "error": "InvalidScratchScope"
+    }
+  ],
+  "namespaces": [
+    {
+      "name": "nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "owned": false
+    },
+    {
+      "name": "nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_a",
+      "owned": true
+    },
+    {
+      "name": "nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_a1234",
+      "owned": true
+    },
+    {
+      "name": "nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_a12345",
+      "owned": false
+    },
+    {
+      "name": "nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_123",
+      "owned": false
+    },
+    {
+      "name": "nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_a_b",
+      "owned": false
+    },
+    {
+      "name": "nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0_a",
+      "owned": false
+    }
+  ]
+}

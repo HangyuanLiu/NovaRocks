@@ -45,6 +45,7 @@ MAX_MC_BYTES = 16 * 1024 * 1024
 MAX_PREFIX_VISITS = 2048
 MAX_PREFIX_DEPTH = 32
 MAX_PENDING_PREFIXES = 10000
+RUN_STORAGE_ENV = "NOVA_FIXTURE_RUN_STORAGE"
 
 
 class _DeadlineSocket(socket.socket):
@@ -88,7 +89,7 @@ def s3_parts(uri: str) -> tuple[str, str]:
     parsed = urlsplit(uri)
     parts = parsed.path.strip("/").split("/") if parsed.path.strip("/") else []
     if (parsed.scheme != "s3" or not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", parsed.netloc)
-            or parsed.query or parsed.fragment or "%" in uri or "//" in parsed.path
+            or parsed.query or parsed.fragment or any(c in uri for c in ("%", "*", "?", "#")) or "//" in parsed.path
             or any(p in {"", ".", ".."} or any(ord(c) <= 32 for c in p) for p in parts)):
         raise runtime.RuntimeFailure("InvalidScratchScope", "invalid S3 scope")
     return parsed.netloc, "/".join(parts)
@@ -107,6 +108,50 @@ def contains(root: str, value: str) -> bool:
 def resource_run(name: str) -> str | None:
     match = RESOURCE_RE.fullmatch(name) if isinstance(name, str) and len(name) <= 63 else None
     return match[1] if match else None
+
+
+def namespace_run(name: str) -> str | None:
+    """Only a complete, bounded run-plus-purpose name owns a namespace."""
+    match = RESOURCE_RE.fullmatch(name) if isinstance(name, str) and len(name) <= 63 else None
+    return match[1] if match and match[2] else None
+
+
+def _policy_shape(document):
+    """Compare native IAM set representations without changing their grants.
+
+    MinIO may marshal a singleton set as a string and reorder string sets or
+    statements. Sid carries no authority. Every other field remains part of
+    the comparison; unknown policy/statement fields are never discarded.
+    """
+    def strings(value):
+        values = [value] if isinstance(value, str) else value
+        if not isinstance(values, list) or not values or not all(isinstance(v, str) and v for v in values):
+            raise runtime.RuntimeFailure("InvalidScratchScope", "invalid native IAM string set")
+        return tuple(sorted(set(values)))
+
+    if (not isinstance(document, dict) or set(document) != {"Version", "Statement"}
+            or document["Version"] != "2012-10-17"
+            or not isinstance(document["Statement"], list) or not document["Statement"]):
+        raise runtime.RuntimeFailure("InvalidScratchScope", "invalid native IAM policy shape")
+    statements = []
+    for statement in document["Statement"]:
+        if (not isinstance(statement, dict) or statement.get("Effect") != "Allow"
+                or set(statement) - {"Effect", "Action", "Resource", "Condition", "Sid"}
+                or ("Sid" in statement and not isinstance(statement["Sid"], str))):
+            raise runtime.RuntimeFailure("InvalidScratchScope", "unsupported native IAM statement")
+        condition = statement.get("Condition", {})
+        if not isinstance(condition, dict):
+            raise runtime.RuntimeFailure("InvalidScratchScope", "invalid native IAM condition")
+        predicates = []
+        for operator, values in condition.items():
+            if not isinstance(operator, str) or not isinstance(values, dict) or not values:
+                raise runtime.RuntimeFailure("InvalidScratchScope", "invalid native IAM condition predicates")
+            if not all(isinstance(key, str) and key for key in values):
+                raise runtime.RuntimeFailure("InvalidScratchScope", "invalid native IAM condition key")
+            predicates.append((operator, tuple(sorted((key, strings(value)) for key, value in values.items()))))
+        statements.append(("Allow", strings(statement.get("Action")), strings(statement.get("Resource")),
+                           tuple(sorted(predicates))))
+    return tuple(sorted(statements))
 
 
 def created_ms(run_id: str) -> int:
@@ -178,6 +223,113 @@ class ScratchIdentity:
 
 
 @dataclass(frozen=True)
+class RunStorageScope:
+    """A fixed storage projection, independently validated against its machine.
+
+    The two warehouse ranges are lexical prefixes of one direct namespace
+    component. Their IAM wildcards do not replace namespace grammar checks.
+    """
+    identity: ScratchIdentity
+    machine: dict
+    storage_owner: dict
+    ranges: dict
+
+    @classmethod
+    def from_record(cls, identity, record):
+        warehouses = record.get("server_warehouses", {})
+        value = dict(schema=1, identity=identity.as_dict(),
+                     machine={k: record.get(k) for k in ("id", "control_root", "daemon_id", "version", "generation")},
+                     storage_owner=dict(daemon_id=record.get("daemon_id"),
+                                        minio_volume=record.get("config", {}).get("minio_volume")),
+                     ranges=dict(run_root=identity.scope_root + "/", **{
+                         name: dict(warehouse=canonical_s3(warehouses.get(service)) + "/",
+                                    namespace_prefix=identity.run_id + "_")
+                         for name, service in (("rest", "rest"), ("rest_mv", "rest-mv"))}))
+        result = cls.from_dict(value)
+        protected = record.get("protected_benchmark_roots", []) + [record.get("config", {}).get(
+            "benchmark_root", "s3://novarocks/shared/benchmarks")]
+        roots = [result.identity.scope_root] + [result.ranges[k]["warehouse"] for k in ("rest", "rest_mv")]
+        if any(contains(root, p) or contains(p, root) for root in roots for p in protected):
+            raise runtime.RuntimeFailure("InvalidScratchScope", "storage scope overlaps protected data")
+        return result
+
+    @classmethod
+    def from_dict(cls, value):
+        if not isinstance(value, dict) or set(value) != {"schema", "identity", "machine", "storage_owner", "ranges"} or value.get("schema") != 1:
+            raise runtime.RuntimeFailure("InvalidScratchScope", "invalid run storage schema")
+        identity = ScratchIdentity.from_dict(value["identity"])
+        machine, owner, ranges = value["machine"], value["storage_owner"], value["ranges"]
+        if (not isinstance(machine, dict) or set(machine) != {"id", "control_root", "daemon_id", "version", "generation"}
+                or not all(isinstance(v, str) and v for v in machine.values())
+                or not isinstance(owner, dict) or set(owner) != {"daemon_id", "minio_volume"}
+                or not all(isinstance(v, str) and v for v in owner.values())
+                or owner["daemon_id"] != machine["daemon_id"]
+                or not isinstance(ranges, dict) or set(ranges) != {"run_root", "rest", "rest_mv"}
+                or ranges["run_root"] != identity.scope_root + "/"):
+            raise runtime.RuntimeFailure("InvalidScratchScope", "invalid run storage owner or ranges")
+        roots = [identity.scope_root]
+        for key in ("rest", "rest_mv"):
+            entry = ranges[key]
+            if (not isinstance(entry, dict) or set(entry) != {"warehouse", "namespace_prefix"}
+                    or entry["namespace_prefix"] != identity.run_id + "_"
+                    or not isinstance(entry["warehouse"], str)
+                    or canonical_s3(entry["warehouse"]) + "/" != entry["warehouse"]):
+                raise runtime.RuntimeFailure("InvalidScratchScope", "invalid warehouse namespace range")
+            roots.append(entry["warehouse"])
+        if any(contains(a, b) or contains(b, a) for i, a in enumerate(roots) for b in roots[i + 1:]):
+            raise runtime.RuntimeFailure("InvalidScratchScope", "independent run storage roots overlap")
+        # Copy caller-owned maps: subsequent mutations cannot add authority.
+        return cls(identity, dict(machine), dict(owner), json.loads(json.dumps(ranges)))
+
+    def as_dict(self):
+        return dict(schema=1, identity=self.identity.as_dict(), machine=dict(self.machine),
+                    storage_owner=dict(self.storage_owner), ranges=json.loads(json.dumps(self.ranges)))
+
+    def validate_against(self, identity, record):
+        if self.as_dict() != self.from_record(identity, record).as_dict():
+            raise runtime.RuntimeFailure("InvalidScratchScope", "inherited storage projection differs from the machine")
+        return self
+
+    def owns_namespace(self, name):
+        return namespace_run(name) == self.identity.run_id
+
+    def belongs(self, uri):
+        # Alias only within a projection with an exact common MinIO owner. The
+        # caller must validate_against before trusting an inherited projection.
+        if isinstance(uri, str) and uri.startswith("s3a://") and self.storage_owner["daemon_id"] == self.machine["daemon_id"]:
+            uri = "s3://" + uri[6:]
+        bucket, key = s3_parts(uri)
+        if contains(self.identity.scope_root, uri):
+            return True
+        parts = key.split("/") if key else []
+        for name in ("rest", "rest_mv"):
+            wh_bucket, wh_key = s3_parts(self.ranges[name]["warehouse"])
+            base = wh_key.split("/") if wh_key else []
+            if bucket == wh_bucket and parts[:len(base)] == base and len(parts) > len(base) and self.owns_namespace(parts[len(base)]):
+                return True
+        return False
+
+    def iam_policy(self):
+        prefixes = [self.ranges["run_root"]] + [self.ranges[k]["warehouse"] + self.ranges[k]["namespace_prefix"] for k in ("rest", "rest_mv")]
+        by_bucket = {}
+        objects = []
+        for uri in prefixes:
+            bucket, key = s3_parts(uri)
+            prefix = key + ("/" if uri.endswith("/") else "")
+            by_bucket.setdefault(bucket, []).append(prefix)
+            objects.append("arn:aws:s3:::" + bucket + "/" + prefix + "*")
+        statements = []
+        for bucket, values in sorted(by_bucket.items()):
+            statements.append(dict(Effect="Allow", Action=["s3:GetBucketLocation"], Resource=["arn:aws:s3:::" + bucket]))
+            statements.append(dict(Effect="Allow", Action=["s3:ListBucket"], Resource=["arn:aws:s3:::" + bucket],
+                                   Condition={"StringLike": {"s3:prefix": [p + "*" for p in values]}}))
+        statements.append(dict(Effect="Allow", Action=["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject",
+                                                       "s3:DeleteObjectVersion", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"],
+                               Resource=objects))
+        return dict(Version="2012-10-17", Statement=statements)
+
+
+@dataclass(frozen=True)
 class RunBudget:
     identity: ScratchIdentity
     started_unix_ms: int
@@ -245,6 +397,10 @@ class ScratchSweeper:
         self.record, self.backend = record, backend
         self.wall_clock, self.monotonic = wall_clock, monotonic
         self.blocked_runs = set()
+        self.groups = {}
+        self.collecting = False
+        self.iam_inventory_complete = True
+        self.iam_policy_inventory_complete = True
         self.protected = [canonical_s3(p) for p in record.get("protected_benchmark_roots", [])]
         self.protected.append(canonical_s3(record.get("config", {}).get(
             "benchmark_root", "s3://novarocks/shared/benchmarks")))
@@ -337,7 +493,19 @@ class ScratchSweeper:
     def _unknown(self, report, kind):
         if "unknown_counts" in report:
             report["unknown_counts"][kind] += 1
-            report["enumeration_complete"] = False
+            if kind != "rest-namespace":
+                report["enumeration_complete"] = False
+
+    def _group(self, run):
+        return self.groups.setdefault(run, dict(roots=set(), prefixes=set(), pairs=[], policies=set()))
+
+    def _identity_fact(self, identity):
+        group = self._group(identity.run_id)
+        group["roots"].add(identity.scope_root)
+        if len(group["roots"]) != 1:
+            self.blocked_runs.add(identity.run_id)
+            raise runtime.RuntimeFailure("InvalidScratchScope", "run has contradictory original storage roots")
+        return group
 
     def _protected_namespace(self, run):
         # Namespace names alone cannot establish their children's locations.
@@ -354,6 +522,8 @@ class ScratchSweeper:
             items = self._mc(["admin", "policy", "list", "store"], deadline)
         except runtime.RuntimeFailure as error:
             inventory_complete, items = False, []
+            if self.collecting:
+                self.iam_inventory_complete = False
             if "enumeration_complete" in report:
                 report["enumeration_complete"] = False
             self._error(report, "inspect-policies", "store", error)
@@ -378,9 +548,18 @@ class ScratchSweeper:
                 if len(facts) >= MAX_PENDING_PREFIXES or fact_bytes > MAX_MC_BYTES:
                     raise runtime.RuntimeFailure("InvalidMcResponse", "IAM policy inventory exceeds its input bound")
                 facts[name] = identity, purpose
+                if self.collecting:
+                    group = self._identity_fact(identity)
+                    group["policies"].add(name)
                 candidates.setdefault(identity.iam_name(purpose), set()).add(name)
             except runtime.RuntimeFailure as error:
                 inventory_complete = False
+                if self.collecting:
+                    run = resource_run(name)
+                    if run:
+                        self.blocked_runs.add(run)
+                    else:
+                        self.iam_inventory_complete = False
                 self._unknown(report, "policy")
                 self._error(report, "inspect-policy", name if isinstance(name, str) else "unknown", error)
                 if error.code == "ScratchSweepTimeout":
@@ -423,12 +602,22 @@ class ScratchSweeper:
                 expired = self._expired(created_ms(identity.run_id), expired_only)
                 self._observe(report, "user", name, identity.run_id)
                 classified = True
+                if self.collecting:
+                    self._identity_fact(identity)["pairs"].append(dict(user=name, policy=policy))
+                    continue
                 if not expired:
                     continue
                 operation = "disable" if disable else "remove"
                 self._mc(["admin", "user", "disable" if disable else "rm", "store", name], deadline, absent_ok=True)
                 report["removed"].append(dict(kind="user", name=name, operation=operation))
             except runtime.RuntimeFailure as error:
+                if self.collecting:
+                    runs = {resource_run(p) for p in possible | ({policy} if isinstance(policy, str) else set())}
+                    runs.discard(None)
+                    if runs:
+                        self.blocked_runs.update(runs)
+                    else:
+                        self.iam_inventory_complete = False
                 if not classified:
                     self._unknown(report, "user")
                 # Preserve every validated candidate as well as explicit native
@@ -442,7 +631,7 @@ class ScratchSweeper:
         for name, (identity, _) in facts.items():
             self._check(deadline)
             self._observe(report, "policy", name, identity.run_id)
-            if disable or not inventory_complete or name in failed_policies:
+            if self.collecting or disable or not inventory_complete or name in failed_policies:
                 continue
             try:
                 if self._expired(created_ms(identity.run_id), expired_only):
@@ -452,6 +641,8 @@ class ScratchSweeper:
                 self._error(report, "remove", name, error)
                 if error.code == "ScratchSweepTimeout":
                     raise
+        if self.collecting:
+            self.iam_policy_inventory_complete = inventory_complete
 
     def _policy_identity(self, name, deadline):
         match = RESOURCE_RE.fullmatch(name)
@@ -470,6 +661,25 @@ class ScratchSweeper:
                 or set(document) - {"Version", "Statement"}
                 or not isinstance(document.get("Statement"), list) or not document["Statement"]):
             raise runtime.RuntimeFailure("InvalidScratchScope", "invalid scoped IAM policy document")
+        # New fixed-range policies are recognized from their one original run
+        # root, then compared with the complete machine-derived policy. A
+        # metadata location can never supply an additional deletion range.
+        roots = set()
+        for statement in document["Statement"]:
+            resources = statement.get("Resource", []) if isinstance(statement, dict) else []
+            resources = [resources] if isinstance(resources, str) else resources
+            if not isinstance(resources, list):
+                continue
+            for resource in resources:
+                if isinstance(resource, str) and resource.startswith("arn:aws:s3:::") and resource.endswith("/*"):
+                    uri = "s3://" + resource[len("arn:aws:s3:::"):-2]
+                    if uri.endswith("/scratch/" + match[1]):
+                        roots.add(canonical_s3(uri))
+        if len(roots) == 1:
+            identity = ScratchIdentity(match[1], next(iter(roots)))
+            scope = RunStorageScope.from_record(identity, self.record)
+            if _policy_shape(document) == _policy_shape(scope.iam_policy()):
+                return identity, match[2]
         object_actions = {"s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject",
                           "s3:DeleteObjectVersion", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"}
         root, bucket_statements = None, []
@@ -527,24 +737,167 @@ class ScratchSweeper:
             raise runtime.RuntimeFailure("ScratchCredentialRevocationFailed", "scratch users were not all disabled")
         return report
 
-    def cleanup_run(self, identity: ScratchIdentity, exact_users_and_policies: list,
-                    deadline: float) -> dict:
-        """Settle only resources predeclared by this exact original run context.
+    def _catalog_inventory(self, deadline, report):
+        inventory = {}
+        for service in ("rest", "rest-mv"):
+            names = []
+            for namespace in self._pages(service, "namespaces", "namespaces", deadline):
+                if not isinstance(namespace, list) or not namespace or not all(isinstance(n, str) for n in namespace):
+                    raise runtime.RuntimeFailure("InvalidRestResponse", "invalid namespace identity")
+                run = namespace_run(namespace[0]) if len(namespace) == 1 else None
+                if run is None:
+                    self._unknown(report, "rest-namespace")
+                    continue
+                if namespace[0] in names:
+                    raise runtime.RuntimeFailure("InvalidRestResponse", "duplicate namespace identity")
+                self._expired(created_ms(run), False)
+                if self._protected_namespace(run):
+                    continue
+                names.append(namespace[0])
+                self._group(run)
+                self._observe(report, "rest-namespace", (service, namespace[0]), run)
+            inventory[service] = names
+        return inventory
 
-        Unlike discovery-based TTL collection, this operation can settle a user
-        whose creation succeeded before attaching its predeclared policy. An
-        unrelated policy/group mapping remains a refusal, never a guessed owner.
-        The caller owns the inherited complete budget and actual writer exit.
-        """
-        report = dict(complete=True, removed=[], errors=[])
+    def _belongs_group(self, run, location):
+        if isinstance(location, str) and location.startswith("s3a://"):
+            # The sweeper already runs under the exact machine/MinIO lock and
+            # backend binding. Never rewrite the URI used for object I/O.
+            if not self.record.get("daemon_id") or not self.record.get("config", {}).get("minio_volume"):
+                return False
+            location = "s3://" + location[6:]
+        bucket, key = s3_parts(location)
+        if self._protected(location, deletion=True):
+            return False
+        if any(contains(root, location) for root in self._group(run)["roots"]):
+            return True
+        parts = key.split("/") if key else []
+        for service in ("rest", "rest-mv"):
+            wh_bucket, wh_key = s3_parts(self.record["server_warehouses"][service])
+            base = wh_key.split("/") if wh_key else []
+            if bucket == wh_bucket and parts[:len(base)] == base and len(parts) > len(base) and namespace_run(parts[len(base)]) == run:
+                return True
+        return False
+
+    def _catalog_run(self, run, inventory, deadline, report):
+        barrier = dict(complete=False, services={s: dict(enumeration_complete=False, entries_absent=False)
+                                               for s in ("rest", "rest-mv")})
+        report.setdefault("catalog_barrier", {})[run] = barrier
+        children, namespaces = [], []
+        # Validate every child in both catalogs before the first catalog delete.
+        for service, names in inventory.items():
+            for name in names:
+                if namespace_run(name) != run:
+                    continue
+                base = "namespaces/" + quote(name, safe="")
+                namespaces.append((service, base, name))
+                for collection in ("views", "tables"):
+                    seen = set()
+                    for child in self._pages(service, base + "/" + collection, "identifiers", deadline, absent_ok=True):
+                        if (not isinstance(child, dict) or child.get("namespace") != [name]
+                                or not isinstance(child.get("name"), str) or not child["name"] or child["name"] in seen):
+                            raise runtime.RuntimeFailure("InvalidRestResponse", "invalid child identifier")
+                        seen.add(child["name"])
+                        path = base + "/" + collection + "/" + quote(child["name"], safe="")
+                        metadata = self._rest_request(service, "GET", path, deadline, absent_ok=True)
+                        if metadata is None:
+                            continue
+                        facts = metadata.get("metadata") if isinstance(metadata, dict) else None
+                        location = facts.get("location") if isinstance(facts, dict) else None
+                        if not isinstance(location, str) or not self._belongs_group(run, location):
+                            raise runtime.RuntimeFailure("InvalidScratchScope", "REST child is outside the fixed run storage ranges")
+                        children.append((service, path, collection))
+            barrier["services"][service]["enumeration_complete"] = True
+        for service, path, collection in children:
+            self._rest_request(service, "DELETE", path + ("?purgeRequested=false" if collection == "tables" else ""),
+                               deadline, absent_ok=True)
+            report["removed"].append(dict(kind="rest-child", service=service, path=path))
+        for service, base, name in namespaces:
+            self._rest_request(service, "DELETE", base, deadline, absent_ok=True)
+            report["removed"].append(dict(kind="rest-namespace", service=service, namespace=[name]))
+        # A renamed table can still reference another namespace's directory.
+        # Only absence of every owned namespace in BOTH catalogs clears files.
+        for service in ("rest", "rest-mv"):
+            for namespace in self._pages(service, "namespaces", "namespaces", deadline):
+                if not isinstance(namespace, list) or not namespace or not all(isinstance(n, str) for n in namespace):
+                    raise runtime.RuntimeFailure("InvalidRestResponse", "invalid namespace identity during barrier confirmation")
+                if len(namespace) == 1 and namespace_run(namespace[0]) == run:
+                    raise runtime.RuntimeFailure("ScratchCatalogNotEmpty", "run catalog entries remain after deletion")
+            barrier["services"][service]["entries_absent"] = True
+        barrier["complete"] = True
+
+    def _remove_pairs(self, identity, pairs, policies, deadline, report):
+        verified = []
+        for pair in pairs:
+            rows = self._mc(["admin", "user", "info", "store", pair["user"]], deadline, absent_ok=True)
+            if rows and (len(rows) != 1 or rows[0].get("accessKey") != pair["user"] or rows[0].get("memberOf")
+                         or not isinstance(rows[0].get("policyName", ""), str)
+                         or rows[0].get("policyName", "") not in {"", pair["policy"]}):
+                raise runtime.RuntimeFailure("ScratchIamUnmapped", "cleanup user has a foreign IAM binding")
+            verified.append((pair, bool(rows)))
+        for policy in policies:
+            found, _ = self._policy_identity(policy, deadline)
+            if found is not None and found != identity:
+                raise runtime.RuntimeFailure("InvalidScratchScope", "cleanup policy differs from the original run")
+        for pair, present in verified:
+            if present:
+                for operation in ("disable", "rm"):
+                    self._mc(["admin", "user", operation, "store", pair["user"]], deadline, absent_ok=True)
+                    report["removed"].append(dict(kind="user", name=pair["user"], operation=operation))
+        for policy in policies:
+            self._mc(["admin", "policy", "rm", "store", policy], deadline, absent_ok=True)
+            report["removed"].append(dict(kind="policy", name=policy, operation="remove"))
+
+    def _remove_prefixes(self, group, deadline, report):
+        for uri in sorted(group["roots"] | group["prefixes"]):
+            if self._protected(uri, deletion=True):
+                raise runtime.RuntimeFailure("InvalidScratchScope", "scratch deletion overlaps protected data")
+            bucket, key = s3_parts(uri)
+            self._mc(["rm", "--recursive", "--force", "store/" + bucket + "/" + key + "/"], deadline, absent_ok=True)
+            report["removed"].append(dict(kind="s3-prefix", uri=uri))
+
+    def _warehouse_prefixes(self, deadline, report, *, run=None):
+        for service in ("rest", "rest-mv"):
+            warehouse = canonical_s3(self.record["server_warehouses"][service])
+            if self._protected(warehouse, deletion=True):
+                raise runtime.RuntimeFailure("InvalidScratchScope", "warehouse overlaps protected data")
+            bucket, key = s3_parts(warehouse)
+            for row in self._mc(["ls", "store/" + bucket + ("/" + key if key else "") + "/"], deadline, absent_ok=True):
+                component = self._folder_component(row)
+                if component is None:
+                    continue
+                owner = namespace_run(component)
+                if owner is not None and (run is None or owner == run):
+                    uri = warehouse + "/" + component
+                    self._group(owner)["prefixes"].add(uri)
+                    self._observe(report, "s3-prefix", uri, owner)
+
+    @staticmethod
+    def _folder_component(row):
+        child = row.get("key")
+        if row.get("type") not in {"folder", "file"} or not isinstance(child, str):
+            raise runtime.RuntimeFailure("InvalidMcResponse", "invalid S3 object listing")
+        if row["type"] == "file":
+            return None
+        component = child[:-1] if child.endswith("/") else ""
+        if not component or "/" in component or component in {".", ".."}:
+            raise runtime.RuntimeFailure("InvalidMcResponse", "unsafe listed S3 prefix")
+        # Parse before any path can become traversal or deletion authority.
+        s3_parts("s3://validation/" + component)
+        return component
+
+    def cleanup_run(self, scope: RunStorageScope, exact_users_and_policies: list, deadline: float) -> dict:
+        """The caller confirms actual writer exit and retains its original budget."""
+        report = dict(complete=True, removed=[], errors=[], catalog_barrier={})
         try:
             self._check(deadline)
-            if not isinstance(identity, ScratchIdentity) or self._protected(identity.scope_root, deletion=True):
-                raise runtime.RuntimeFailure("InvalidScratchScope", "cleanup scope is not an admitted scratch root")
+            if not isinstance(scope, RunStorageScope):
+                raise runtime.RuntimeFailure("InvalidScratchScope", "cleanup requires a fixed run storage projection")
+            scope.validate_against(scope.identity, self.record)
+            identity = scope.identity
             if not isinstance(exact_users_and_policies, list):
                 raise runtime.RuntimeFailure("ScratchIamUnmapped", "cleanup needs predeclared IAM pairs")
-            pairs, seen = [], set()
-            # Validate the complete caller-owned set before any remote operation.
+            seen = set()
             for pair in exact_users_and_policies:
                 if not isinstance(pair, dict) or set(pair) != {"user", "policy"}:
                     raise runtime.RuntimeFailure("ScratchIamUnmapped", "invalid cleanup IAM pair")
@@ -553,43 +906,15 @@ class ScratchSweeper:
                 if purpose is None or purpose in seen:
                     raise runtime.RuntimeFailure("ScratchIamUnmapped", "cleanup pair differs from the original run")
                 seen.add(purpose)
-                pairs.append(pair)
-            verified = []
-            # Read every exact mapping/scope before the first disable or remove.
-            for pair in pairs:
-                rows = self._mc(["admin", "user", "info", "store", pair["user"]], deadline, absent_ok=True)
-                if rows:
-                    if (len(rows) != 1 or rows[0].get("accessKey") != pair["user"]
-                            or rows[0].get("memberOf")
-                            or not isinstance(rows[0].get("policyName", ""), str)
-                            or rows[0].get("policyName", "") not in {"", pair["policy"]}):
-                        raise runtime.RuntimeFailure("ScratchIamUnmapped", "cleanup user has a foreign IAM binding")
-                policy_identity, _ = self._policy_identity(pair["policy"], deadline)
-                if policy_identity is not None and policy_identity != identity:
-                    raise runtime.RuntimeFailure("InvalidScratchScope", "cleanup policy scope differs from the original run")
-                verified.append((pair, bool(rows), policy_identity is not None))
-            for pair, user_present, policy_present in verified:
-                try:
-                    if user_present:
-                        self._mc(["admin", "user", "disable", "store", pair["user"]], deadline, absent_ok=True)
-                        report["removed"].append(dict(kind="user", name=pair["user"], operation="disable"))
-                        self._mc(["admin", "user", "rm", "store", pair["user"]], deadline, absent_ok=True)
-                        report["removed"].append(dict(kind="user", name=pair["user"], operation="remove"))
-                    if policy_present:
-                        self._mc(["admin", "policy", "rm", "store", pair["policy"]], deadline, absent_ok=True)
-                        report["removed"].append(dict(kind="policy", name=pair["policy"], operation="remove"))
-                except runtime.RuntimeFailure as error:
-                    self._error(report, "cleanup-iam-pair", pair["user"], error)
-                    if error.code == "ScratchSweepTimeout":
-                        raise
-            # An unrevoked identity may still write. Preserve its data on IAM
-            # failure and retain the exact context for an explicit retry.
-            if report["complete"]:
-                bucket, key = s3_parts(identity.scope_root)
-                self._mc(["rm", "--recursive", "--force", "store/" + bucket + "/" + key + "/"], deadline, absent_ok=True)
-                report["removed"].append(dict(kind="s3-prefix", uri=identity.scope_root))
+            self.groups, self.blocked_runs = {}, set()
+            group = self._identity_fact(identity)
+            inventory = self._catalog_inventory(deadline, report)
+            self._catalog_run(identity.run_id, inventory, deadline, report)
+            self._remove_pairs(identity, exact_users_and_policies, {p["policy"] for p in exact_users_and_policies}, deadline, report)
+            self._warehouse_prefixes(deadline, report, run=identity.run_id)
+            self._remove_prefixes(group, deadline, report)
         except runtime.RuntimeFailure as error:
-            self._error(report, "cleanup-run", getattr(identity, "run_id", "invalid-context"), error)
+            self._error(report, "cleanup-run", getattr(getattr(scope, "identity", None), "run_id", "invalid-context"), error)
         return report
 
     def _s3(self, expired_only, deadline, report):
@@ -598,6 +923,7 @@ class ScratchSweeper:
         cursor = (Path(self.record["compose_file"]).parent / "scratch-cursor.json"
                   if self.record.get("compose_file") else None)
         pending = []
+        cached_roots = []
         cursor_identity = dict(schema=1, version=self.record.get("version"),
                                generation=self.record.get("generation"), expired_only=expired_only)
         if cursor and cursor.is_symlink():
@@ -611,6 +937,20 @@ class ScratchSweeper:
                     raise runtime.RuntimeFailure("RuntimeStateUnreadable", "invalid scratch enumeration continuation")
                 if pending:
                     report["enumeration_complete"] = False
+                    cached_roots = saved.get("observed_run_roots", [])
+                    if not isinstance(cached_roots, list) or len(cached_roots) > MAX_PENDING_PREFIXES:
+                        raise runtime.RuntimeFailure("RuntimeStateUnreadable", "invalid scratch root continuation")
+                    for root in cached_roots:
+                        bucket, key = s3_parts(root)
+                        parent, _, run = key.rpartition("/")
+                        ScratchIdentity(run, root)
+                        if canonical_s3(root) != root or self._protected(root, deletion=True):
+                            raise runtime.RuntimeFailure("RuntimeStateUnreadable", "unsafe continued scratch root")
+                        # A cursor is only a hint. A fresh native parent listing
+                        # must re-establish every retained root before cleanup.
+                        rows = self._mc(["ls", "store/" + bucket + "/" + parent + "/"], deadline, absent_ok=True)
+                        if any(self._folder_component(row) == run for row in rows):
+                            self._identity_fact(ScratchIdentity(run, root))
         if not pending:
             for row in self._mc(["ls", "store"], deadline):
                 if row.get("type") != "folder" or not isinstance(row.get("key"), str):
@@ -645,16 +985,11 @@ class ScratchSweeper:
                         continue
                     expired = self._expired(created_ms(run), expired_only)
                     self._observe(report, "s3-prefix", uri, run)
-                    if run in self.blocked_runs or not expired:
-                        pending.pop()
-                        continue
-                    try:
-                        self._mc(["rm", "--recursive", "--force", "store/" + bucket + "/" + key + "/"], deadline, absent_ok=True)
-                        report["removed"].append(dict(kind="s3-prefix", uri=uri))
-                    except runtime.RuntimeFailure as error:
-                        self._error(report, "remove-s3-prefix", uri, error)
-                        if error.code == "ScratchSweepTimeout":
-                            raise
+                    if expired:
+                        self._identity_fact(ScratchIdentity(run, uri))
+                    pending.pop()
+                    continue
+                if uri in {canonical_s3(v) for v in self.record["server_warehouses"].values()}:
                     pending.pop()
                     continue
                 children = []
@@ -677,7 +1012,8 @@ class ScratchSweeper:
                 pending.extend(sorted(set(children), reverse=True))
         finally:
             if cursor:
-                runtime.atomic_json(cursor, {**cursor_identity, "pending": pending})
+                roots = sorted({root for group in self.groups.values() for root in group["roots"]}) if pending else []
+                runtime.atomic_json(cursor, {**cursor_identity, "pending": pending, "observed_run_roots": roots})
 
     def _rest_request(self, service, method, path, deadline, *, absent_ok=False):
         self._check(deadline)
@@ -729,79 +1065,64 @@ class ScratchSweeper:
                 raise runtime.RuntimeFailure("InvalidRestResponse", "invalid REST continuation")
             seen.add(token)
 
-    def _rest(self, deadline, report):
-        for service in self.record.get("server_warehouses", {"rest": ""}):
-            namespaces = list(self._pages(service, "namespaces", "namespaces", deadline))
-            for namespace in namespaces:
-                self._check(deadline)
-                if not isinstance(namespace, list) or not all(isinstance(n, str) for n in namespace):
-                    raise runtime.RuntimeFailure("InvalidRestResponse", "invalid namespace identity")
-                if len(namespace) != 1 or not (run := resource_run(namespace[0])):
-                    continue
-                expired = self._expired(created_ms(run), True)
-                if self._protected_namespace(run):
-                    continue
-                sample_key = (service, namespace[0])
-                self._observe(report, "rest-namespace", sample_key, run)
-                if not expired:
-                    continue
-                base = "namespaces/" + quote(namespace[0], safe="")
-                try:
-                    children = []
-                    for collection in ("views", "tables"):
-                        for child in self._pages(service, base + "/" + collection, "identifiers", deadline, absent_ok=True):
-                            if (not isinstance(child, dict) or child.get("namespace") != namespace
-                                    or not isinstance(child.get("name"), str) or not child["name"]):
-                                raise runtime.RuntimeFailure("InvalidRestResponse", "invalid child identifier")
-                            path = base + "/" + collection + "/" + quote(child["name"], safe="")
-                            metadata = self._rest_request(service, "GET", path, deadline, absent_ok=True)
-                            if metadata is None:
-                                continue
-                            facts = metadata.get("metadata") if isinstance(metadata, dict) else None
-                            location = facts.get("location") if isinstance(facts, dict) else None
-                            if not isinstance(location, str) or self._protected(location, deletion=True):
-                                raise runtime.RuntimeFailure("InvalidScratchScope", "REST child has no safe scratch location")
-                            _, key = s3_parts(location)
-                            if "/scratch/" + run + "/" not in "/" + key + "/":
-                                raise runtime.RuntimeFailure("InvalidScratchScope", "REST location belongs to a different run")
-                            children.append(path)
-                    # Validate every child before deleting the first one.
-                    for path in children:
-                        self._rest_request(service, "DELETE", path, deadline, absent_ok=True)
-                        report["removed"].append(dict(kind="rest-child", service=service, path=path))
-                    self._rest_request(service, "DELETE", base, deadline, absent_ok=True)
-                    report["removed"].append(dict(kind="rest-namespace", service=service, namespace=namespace))
-                except runtime.RuntimeFailure as error:
-                    if error.code == "InvalidScratchScope" and "_observed" in report:
-                        report["_observed"].pop(("rest-namespace", sample_key), None)
-                    self.blocked_runs.add(run)
-                    self._error(report, "remove-rest-namespace", namespace[0], error)
-                    if error.code == "ScratchSweepTimeout":
-                        raise
+    def _offline_barrier(self):
+        expected = dict(schema=1, daemon_id=self.record.get("daemon_id"), generation=self.record.get("generation"),
+                        volumes=["nr-fixture-machine_rest-catalog", "nr-fixture-machine_rest-mv-catalog"], complete=True)
+        barrier = self.record.get("offline_catalog_barrier")
+        if (not expected["daemon_id"] or not expected["generation"] or barrier != expected):
+            raise runtime.RuntimeFailure("ScratchCatalogBarrierRequired", "offline purge requires the exact confirmed catalog-state absence barrier")
+        return dict(expected)
 
     def sweep(self, *, expired_only: bool, deadline: float) -> dict:
         kinds = ["s3-prefix", "rest-namespace", "user", "policy"]
-        report = dict(complete=True, removed=[], errors=[],
-                      observed_counts={kind: 0 for kind in kinds},
-                      oldest_created_unix_ms=None, unknown_counts=dict(user=0, policy=0),
+        report = dict(complete=True, removed=[], errors=[], catalog_barrier={},
+                      observed_counts={kind: 0 for kind in kinds}, oldest_created_unix_ms=None,
+                      unknown_counts=dict(user=0, policy=0, **{"rest-namespace": 0}),
                       sampled_at_unix_ms=int(self.wall_clock() * 1000), counts_are_pre_cleanup=True,
-                      enumeration_complete=True,
-                      enumeration_scope=kinds if expired_only else [kind for kind in kinds if kind != "rest-namespace"],
-                      classification_basis={
-                          "rest-namespace": "parseable-namespace-name; nonexpired child metadata not inspected",
-                          "s3-prefix": "exact run directory; protected roots excluded",
-                          "user": "native binding or unique complete policy inventory; exact scoped policy",
-                          "policy": "full run policy name and exact scoped policy"},
-                      _observed={})
-        self.blocked_runs = set()
+                      enumeration_complete=True, enumeration_scope=kinds if expired_only else [k for k in kinds if k != "rest-namespace"],
+                      classification_basis={"rest-namespace": "complete run-plus-purpose grammar; nonexpired child metadata not inspected",
+                                            "s3-prefix": "independently enumerated exact run root or warehouse direct namespace directory",
+                                            "user": "native binding or unique complete policy inventory; exact scoped policy",
+                                            "policy": "full run policy name and verified scoped policy"}, _observed={})
+        self.groups, self.blocked_runs = {}, set()
+        self.iam_inventory_complete = True
+        self.iam_policy_inventory_complete = True
         try:
             self._check(deadline)
-            # Maintenance has stopped REST writers and will delete their exact
-            # state volumes. Its S3/IAM purge must not call stopped listeners.
             if expired_only:
-                self._rest(deadline, report)
+                inventory = self._catalog_inventory(deadline, report)
+            else:
+                report["offline_catalog_barrier"] = self._offline_barrier()
+                inventory = None
+            self._warehouse_prefixes(deadline, report)
             self._s3(expired_only, deadline, report)
-            self._iam(expired_only, deadline, report)
+            self.collecting = True
+            try:
+                self._iam(expired_only, deadline, report)
+            finally:
+                self.collecting = False
+            for run, group in sorted(self.groups.items()):
+                if not self._expired(created_ms(run), expired_only) or self._protected_namespace(run):
+                    continue
+                if run in self.blocked_runs:
+                    continue
+                try:
+                    if inventory is not None:
+                        self._catalog_run(run, inventory, deadline, report)
+                    if len(group["roots"]) > 1:
+                        raise runtime.RuntimeFailure("InvalidScratchScope", "run has contradictory original roots")
+                    if group["policies"] or group["pairs"]:
+                        if not group["roots"]:
+                            raise runtime.RuntimeFailure("ScratchIamUnmapped", "IAM cleanup has no independent run root")
+                        self._remove_pairs(ScratchIdentity(run, next(iter(group["roots"]))), group["pairs"],
+                                           group["policies"] if self.iam_policy_inventory_complete else set(), deadline, report)
+                    if self.iam_inventory_complete:
+                        self._remove_prefixes(group, deadline, report)
+                except runtime.RuntimeFailure as error:
+                    self.blocked_runs.add(run)
+                    self._error(report, "cleanup-discovered-run", run, error)
+                    if error.code == "ScratchSweepTimeout":
+                        raise
         except runtime.RuntimeFailure as error:
             report["enumeration_complete"] = False
             self._error(report, "enumerate-scratch", "machine", error)

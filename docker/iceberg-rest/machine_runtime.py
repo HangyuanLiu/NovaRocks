@@ -81,13 +81,16 @@ def machine_config(value: dict[str, Any] | None = None) -> dict[str, Any]:
         raise runtime.RuntimeFailure("InvalidConfiguration", "scratch TTL must exceed twice the complete run budget and cleanup reserve")
     if policy["max_run_seconds"] <= policy["cleanup_grace_seconds"]:
         raise runtime.RuntimeFailure("InvalidConfiguration", "cleanup reserve exhausts the run budget")
-    from scratch import canonical_s3
+    from scratch import canonical_s3, contains
     try:
         benchmark = canonical_s3(value.get("benchmark_root", "s3://novarocks/shared/benchmarks"))
         if "/" not in benchmark[5:]:
             raise runtime.RuntimeFailure("InvalidScratchScope", "benchmark root has no prefix")
     except runtime.RuntimeFailure as error:
         raise runtime.RuntimeFailure("InvalidConfiguration", "benchmark root requires a canonical s3://bucket/prefix") from error
+    for warehouse in ("s3://warehouse/fixture-machine/rest", "s3://warehouse/fixture-machine/rest-mv"):
+        if contains(benchmark, warehouse) or contains(warehouse, benchmark):
+            raise runtime.RuntimeFailure("InvalidConfiguration", "benchmark root overlaps a shared REST warehouse")
     volume = value.get("minio_volume", PROJECT + "_minio-data")
     runtime.safe_component(volume)
     return dict(ports=ports, policy=policy, benchmark_root=benchmark, minio_volume=volume)

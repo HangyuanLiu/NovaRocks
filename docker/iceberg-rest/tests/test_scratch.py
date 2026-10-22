@@ -49,9 +49,12 @@ def identity(age_seconds=0, token="a" * 32, worktree="s3://novarocks/worktree-a"
 
 
 def record():
-    return dict(policy=copy.deepcopy(POLICY), config=dict(benchmark_root="s3://novarocks/shared/benchmarks"),
+    return dict(policy=copy.deepcopy(POLICY), id="machine-test", control_root="/machine-test", daemon_id="daemon-test", version="v1", generation="g1",
+                config=dict(benchmark_root="s3://novarocks/shared/benchmarks", minio_volume="minio-test"),
                 protected_benchmark_roots=["s3://novarocks/shared/benchmarks"],
-                ports=dict(rest=28002, rest_mv=28003), server_warehouses={"rest": "s3://warehouse/service"},
+                ports=dict(rest=28002, rest_mv=28003), server_warehouses={"rest": "s3://warehouse/service", "rest-mv": "s3://warehouse/service-mv"},
+                offline_catalog_barrier=dict(schema=1, daemon_id="daemon-test", generation="g1",
+                    volumes=["nr-fixture-machine_rest-catalog", "nr-fixture-machine_rest-mv-catalog"], complete=True),
                 credentials=dict(access_key="SECRETACCESS", secret_key="SECRETSECRET"))
 
 
@@ -146,31 +149,33 @@ class Sweeper(scratch.ScratchSweeper):
     def __init__(self, record, backend, clock):
         super().__init__(record, backend, wall_clock=clock.wall, monotonic=clock.mono)
         self.rest, self.rest_calls, self.rest_fail = {}, [], {}
+        self.rest_mv = {}
 
     def _rest_request(self, service, method, path, deadline, *, absent_ok=False):
         self._check(deadline)
         self.rest_calls.append((service, method, path))
         if (method, path) in self.rest_fail:
             raise runtime.RuntimeFailure(self.rest_fail[method, path], "private diagnostic SECRETSECRET")
+        rest = self.rest if service == "rest" else self.rest_mv
         parts = path.split("?")[0].split("/")
         if path == "namespaces":
-            return {"namespaces": [[n] for n in self.rest]}
+            return {"namespaces": [[n] for n in rest]}
         name = unquote(parts[1])
-        if name not in self.rest:
+        if name not in rest:
             if absent_ok:
                 return None
             raise AssertionError(path)
         if len(parts) == 2 and method == "DELETE":
-            del self.rest[name]
+            del rest[name]
             return {}
         collection = parts[2]
         if method == "GET" and len(parts) == 3:
             return {"identifiers": [dict(namespace=[name], name=child)
-                                    for child in self.rest[name][collection]]}
+                                    for child in rest[name][collection]]}
         child = unquote(parts[3])
         if method == "GET":
-            return dict(metadata=dict(location=self.rest[name][collection][child]))
-        del self.rest[name][collection][child]
+            return dict(metadata=dict(location=rest[name][collection][child]))
+        del rest[name][collection][child]
         return {}
 
 
@@ -321,7 +326,7 @@ class SweepTests(unittest.TestCase):
         for value in (self.old, self.young):
             self.backend.provision(value)
             self.backend.objects.add(value.scope_root + "/file")
-            self.sweeper.rest[value.run_id] = dict(tables={}, views={})
+            self.sweeper.rest[value.resource_name("test")] = dict(tables={}, views={})
         result = self.sweep()
         self.assertEqual(result["observed_counts"], {"s3-prefix": 2, "rest-namespace": 2, "user": 2, "policy": 2})
         self.assertEqual(result["oldest_created_unix_ms"], scratch.created_ms(self.old.run_id))
@@ -340,12 +345,12 @@ class SweepTests(unittest.TestCase):
         self.record["protected_benchmark_roots"].append(self.old.scope_root + "/staging")
         self.sweeper = Sweeper(self.record, self.backend, self.clock)
         self.backend.objects = {self.old.scope_root + "/file"}
-        self.sweeper.rest[self.old.run_id] = dict(tables={}, views={})
+        self.sweeper.rest[self.old.resource_name("test")] = dict(tables={}, views={})
         self.backend.users.add(self.young.iam_name("init"))
         result = self.sweep()
         self.assertEqual(result["observed_counts"], {"s3-prefix": 0, "rest-namespace": 0, "user": 0, "policy": 0})
         self.assertIsNone(result["oldest_created_unix_ms"])
-        self.assertEqual(result["unknown_counts"], dict(user=1, policy=0))
+        self.assertEqual(result["unknown_counts"], dict(user=1, policy=0, **{"rest-namespace": 0}))
         self.assertFalse(result["enumeration_complete"])
 
     def test_upgrade_observation_explicitly_excludes_stopped_rest_scope(self):
@@ -425,7 +430,7 @@ class SweepTests(unittest.TestCase):
                         self.backend.calls.index(("admin", "policy", "rm", "store", old_policy)))
         self.assertTrue(self.sweep()["complete"])
         self.assertTrue(self.sweeper.revoke_users()["complete"])
-        self.assertEqual(self.backend.disabled, {young_user})
+        self.assertEqual(self.backend.disabled, {old_user, young_user})
 
     def test_upgrade_revokes_unattached_unique_user_without_removing_mapping_policy(self):
         for value, purpose in ((self.old,"init"),(self.young,"rot")):
@@ -631,20 +636,20 @@ class SweepTests(unittest.TestCase):
         peer_user, peer_policy = self.backend.provision(self.old)
         self.backend.objects = {self.young.scope_root + "/file", self.old.scope_root + "/file"}
         pair = [{"user": user, "policy": policy}]
-        result = self.sweeper.cleanup_run(self.young, pair, self.clock.mono() + 100)
+        result = self.sweeper.cleanup_run(scratch.RunStorageScope.from_record(self.young, self.record), pair, self.clock.mono() + 100)
         self.assertTrue(result["complete"], result)
         self.assertEqual(self.backend.users, {peer_user})
         self.assertEqual(self.backend.policies, {peer_policy})
         self.assertEqual(self.backend.objects, {self.old.scope_root + "/file"})
-        self.assertFalse(any(c[0] == "ls" or c[:3] == ("admin", "user", "list") for c in self.backend.calls))
-        self.assertTrue(self.sweeper.cleanup_run(self.young, pair, self.clock.mono() + 100)["complete"])
+        self.assertFalse(any(c == ("ls", "store") or c[:3] == ("admin", "user", "list") for c in self.backend.calls))
+        self.assertTrue(self.sweeper.cleanup_run(scratch.RunStorageScope.from_record(self.young, self.record), pair, self.clock.mono() + 100)["complete"])
 
     def test_cleanup_run_settles_predeclared_user_before_policy_was_attached(self):
         user, policy = self.backend.provision(self.young)
         self.backend.user_info[user].pop("policyName")
         self.backend.policies.clear()
         self.backend.objects = {self.young.scope_root + "/file"}
-        result = self.sweeper.cleanup_run(self.young, [{"user": user, "policy": policy}], self.clock.mono() + 100)
+        result = self.sweeper.cleanup_run(scratch.RunStorageScope.from_record(self.young, self.record), [{"user": user, "policy": policy}], self.clock.mono() + 100)
         self.assertTrue(result["complete"], result)
         self.assertFalse(self.backend.users)
         self.assertFalse(self.backend.objects)
@@ -652,7 +657,7 @@ class SweepTests(unittest.TestCase):
     def test_cleanup_run_can_remove_valid_orphan_policy_and_absent_user(self):
         user, policy = self.backend.provision(self.young)
         self.backend.users.clear()
-        result = self.sweeper.cleanup_run(self.young, [{"user": user, "policy": policy}], self.clock.mono() + 100)
+        result = self.sweeper.cleanup_run(scratch.RunStorageScope.from_record(self.young, self.record), [{"user": user, "policy": policy}], self.clock.mono() + 100)
         self.assertTrue(result["complete"], result)
         self.assertFalse(self.backend.policies)
 
@@ -660,7 +665,7 @@ class SweepTests(unittest.TestCase):
         user, policy = self.backend.provision(self.young)
         peer_user, peer_policy = self.backend.provision(self.old)
         pairs = [{"user": user, "policy": policy}, {"user": peer_user, "policy": peer_policy}]
-        result = self.sweeper.cleanup_run(self.young, pairs, self.clock.mono() + 100)
+        result = self.sweeper.cleanup_run(scratch.RunStorageScope.from_record(self.young, self.record), pairs, self.clock.mono() + 100)
         self.assertFalse(result["complete"])
         self.assertFalse(self.backend.calls)
         self.assertEqual(self.backend.users, {user, peer_user})
@@ -672,7 +677,7 @@ class SweepTests(unittest.TestCase):
             user, policy = self.backend.provision(self.young)
             self.backend.user_info[user].update(change)
             self.backend.objects = {self.young.scope_root + "/file"}
-            result = self.sweeper.cleanup_run(self.young, [{"user": user, "policy": policy}], self.clock.mono() + 100)
+            result = self.sweeper.cleanup_run(scratch.RunStorageScope.from_record(self.young, self.record), [{"user": user, "policy": policy}], self.clock.mono() + 100)
             self.assertFalse(result["complete"])
             self.assertIn(user, self.backend.users)
             self.assertIn(policy, self.backend.policies)
@@ -683,18 +688,19 @@ class SweepTests(unittest.TestCase):
         user, policy = self.backend.provision(self.young)
         self.backend.objects = {self.young.scope_root + "/file"}
         self.backend.fail[("admin", "user", "disable", "store", user)] = "AccessDenied"
-        result = self.sweeper.cleanup_run(self.young, [{"user": user, "policy": policy}], self.clock.mono() + 100)
+        result = self.sweeper.cleanup_run(scratch.RunStorageScope.from_record(self.young, self.record), [{"user": user, "policy": policy}], self.clock.mono() + 100)
         self.assertFalse(result["complete"])
         self.assertEqual(result["errors"][0]["code"], "ScratchAccessDenied")
         self.assertTrue(self.backend.objects)
         self.assertIn(user, self.backend.users)
 
     def test_cleanup_run_cannot_touch_protected_scope_or_dispatch_after_deadline(self):
+        original_scope = scratch.RunStorageScope.from_record(self.young, self.record)
         self.record["protected_benchmark_roots"] = [self.young.scope_root + "/ready"]
         self.sweeper = Sweeper(self.record, self.backend, self.clock)
-        self.assertFalse(self.sweeper.cleanup_run(self.young, [], self.clock.mono() + 100)["complete"])
+        self.assertFalse(self.sweeper.cleanup_run(original_scope, [], self.clock.mono() + 100)["complete"])
         self.assertFalse(self.backend.calls)
-        self.assertFalse(self.sweeper.cleanup_run(self.old, [], self.clock.mono())["complete"])
+        self.assertFalse(self.sweeper.cleanup_run(scratch.RunStorageScope.from_record(self.old, self.record), [], self.clock.mono())["complete"])
         self.assertFalse(self.backend.calls)
 
     def test_large_benchmark_is_never_recursively_listed_or_loaded(self):
@@ -828,7 +834,7 @@ class SweepTests(unittest.TestCase):
             self.sweeper._mc(["ls", "store/missing/"], self.clock.mono() + 1, absent_ok=True)
 
     def test_rest_children_are_validated_and_dropped_before_namespace_and_data(self):
-        name = self.old.run_id
+        name = self.old.resource_name("test")
         self.sweeper.rest[name] = dict(views=dict(v=self.old.scope_root + "/view"),
                                        tables=dict(t=self.old.scope_root + "/table"))
         self.sweeper.rest["ordinary"] = dict(views={}, tables={})
@@ -836,22 +842,22 @@ class SweepTests(unittest.TestCase):
         result = self.sweep()
         self.assertTrue(result["complete"], result)
         deletions = [c[2] for c in self.sweeper.rest_calls if c[1] == "DELETE"]
-        self.assertEqual(deletions, [f"namespaces/{name}/views/v", f"namespaces/{name}/tables/t", f"namespaces/{name}"])
+        self.assertEqual(deletions, [f"namespaces/{name}/views/v", f"namespaces/{name}/tables/t?purgeRequested=false", f"namespaces/{name}"])
         self.assertEqual(list(self.sweeper.rest), ["ordinary"])
         self.assertFalse(self.backend.objects)
 
     def test_foreign_or_benchmark_child_location_blocks_catalog_and_s3_deletion(self):
         for location in (self.young.scope_root + "/table", "s3://novarocks/shared/benchmarks/table"):
-            self.sweeper.rest[self.old.run_id] = dict(views={}, tables=dict(t=location))
+            self.sweeper.rest[self.old.resource_name("test")] = dict(views={}, tables=dict(t=location))
             self.backend.objects = {self.old.scope_root + "/important"}
             result = self.sweep()
             self.assertFalse(result["complete"])
-            self.assertIn(self.old.run_id, self.sweeper.rest)
+            self.assertIn(self.old.resource_name("test"), self.sweeper.rest)
             self.assertTrue(self.backend.objects)
             self.assertFalse(any(c[1] == "DELETE" for c in self.sweeper.rest_calls))
 
     def test_namespace_delete_failure_preserves_s3_data_for_retry(self):
-        name = self.old.run_id
+        name = self.old.resource_name("test")
         self.sweeper.rest[name] = dict(views={}, tables={})
         self.sweeper.rest_fail["DELETE", "namespaces/" + name] = "ScratchRestUnavailable"
         self.backend.objects = {self.old.scope_root + "/file"}
@@ -874,6 +880,310 @@ class SweepTests(unittest.TestCase):
         with patch.object(self.backend, "run_mc", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 self.sweep(False)
+
+
+class FixedStorageTests(RuntimeAssertions, unittest.TestCase):
+    def setUp(self):
+        self.identity, self.record = identity(), record()
+        self.scope = scratch.RunStorageScope.from_record(self.identity, self.record)
+
+    def test_shared_python_rust_storage_vectors(self):
+        vectors = json.loads(Path(__file__).with_name("run_storage_scope_vectors.json").read_text())
+        value = scratch.ScratchIdentity.from_dict(vectors["identity"])
+        scope = scratch.RunStorageScope.from_record(value, vectors["record"])
+        self.assertEqual(scope.as_dict(), vectors["projection"])
+        self.assertEqual(scope.iam_policy(), vectors["policy"])
+        for case in vectors["membership"]:
+            with self.subTest(uri=case["uri"]):
+                if "error" in case:
+                    self.assert_code(case["error"], lambda: scope.belongs(case["uri"]))
+                else:
+                    self.assertEqual(scope.belongs(case["uri"]), case["belongs"])
+        for case in vectors["namespaces"]:
+            self.assertEqual(scope.owns_namespace(case["name"]), case["owned"])
+
+    def test_fixed_projection_is_three_ranges_without_changing_budget_schema(self):
+        value = self.scope.as_dict()
+        self.assertEqual(set(value["ranges"]), {"run_root", "rest", "rest_mv"})
+        self.assertEqual(value["ranges"]["run_root"], self.identity.scope_root + "/")
+        self.assertEqual(value["ranges"]["rest"]["namespace_prefix"], self.identity.run_id + "_")
+        self.assertFalse(value["ranges"]["rest"]["namespace_prefix"].endswith("/"))
+        self.assertEqual(scratch.RunStorageScope.from_dict(value).validate_against(self.identity, self.record), self.scope)
+        for forbidden in ("lease", "deadline", "secret", "enrolled"):
+            self.assertNotIn(forbidden, json.dumps(value))
+
+    def test_namespace_requires_complete_bounded_purpose_and_exact_run(self):
+        run = self.identity.run_id
+        for good in (run + "_a", run + "_a1234"):
+            self.assertEqual(scratch.namespace_run(good), run)
+            self.assertTrue(self.scope.owns_namespace(good))
+        for bad in (run, run + "_", run + "_123", run + "_a12345", run + "_a_b", run + "0_a", run + "_A"):
+            self.assertIsNone(scratch.namespace_run(bad), bad)
+            self.assertFalse(self.scope.owns_namespace(bad), bad)
+        self.assertEqual(scratch.resource_run(run), run)  # IAM/full-root grammar is separate.
+
+    def test_membership_covers_ctas_explicit_rename_and_both_warehouses(self):
+        old_namespace = self.identity.resource_name("from")
+        for uri in (self.identity.scope_root, self.identity.scope_root + "/rest/staged/table",
+                    self.identity.scope_root + "/explicit", "s3://warehouse/service/" + old_namespace + "/table",
+                    "s3a://warehouse/service/" + old_namespace + "/table",
+                    "s3://warehouse/service-mv/" + self.identity.resource_name("mv") + "/view"):
+            self.assertTrue(self.scope.belongs(uri), uri)
+        for uri in (identity(token="b" * 32).scope_root + "/table", self.identity.scope_root + "lookalike/table",
+                    "s3://warehouse/service/" + self.identity.run_id + "/table",
+                    "s3://warehouse/service/" + self.identity.run_id + "_a12345/table",
+                    "s3://warehouse/service2/" + old_namespace + "/table",
+                    "s3://warehouse/service/other/table"):
+            self.assertFalse(self.scope.belongs(uri), uri)
+        for uri in ("s3://warehouse/service//" + old_namespace, self.identity.scope_root + "/../table",
+                    self.identity.scope_root + "/%2e/table", self.identity.scope_root + "/table?", self.identity.scope_root + "/table#",
+                    self.identity.scope_root + "/table*", "https://warehouse/service/table"):
+            self.assert_code("InvalidScratchScope", lambda uri=uri: self.scope.belongs(uri))
+
+    def test_inherited_storage_owner_or_ranges_cannot_change(self):
+        for change in ("machine", "owner", "warehouse", "prefix", "run_root", "schema"):
+            value = self.scope.as_dict()
+            if change == "machine": value["machine"]["generation"] = "next-generation"
+            elif change == "owner": value["storage_owner"]["daemon_id"] = "other-daemon"
+            elif change == "warehouse": value["ranges"]["rest"]["warehouse"] = "s3://warehouse/other/"
+            elif change == "prefix": value["ranges"]["rest"]["namespace_prefix"] += "a"
+            elif change == "run_root": value["ranges"]["run_root"] += "extra/"
+            else: value["schema"] = 2
+            self.assert_code("InvalidScratchScope", lambda value=value:
+                             scratch.RunStorageScope.from_dict(value).validate_against(self.identity, self.record))
+        value = self.scope.as_dict()
+        value["ranges"]["rest_mv"]["warehouse"] = value["ranges"]["rest"]["warehouse"] + "nested/"
+        self.assert_code("InvalidScratchScope", lambda: scratch.RunStorageScope.from_dict(value))
+
+    def test_fixed_iam_policy_has_literal_prefixes_and_no_namespace_enrollment(self):
+        before = self.scope.iam_policy()
+        self.assertTrue(self.scope.owns_namespace(self.identity.resource_name("later")))
+        self.assertEqual(before, self.scope.iam_policy())
+        objects = before["Statement"][-1]["Resource"]
+        self.assertEqual(objects, [self.identity.scope_root.replace("s3://", "arn:aws:s3:::") + "/*",
+                                  "arn:aws:s3:::warehouse/service/" + self.identity.run_id + "_*",
+                                  "arn:aws:s3:::warehouse/service-mv/" + self.identity.run_id + "_*"])
+        self.assertFalse(any("_/*" in uri for uri in objects))
+
+
+class FixedCollectionTests(unittest.TestCase):
+    setUp = SweepTests.setUp
+    sweep = SweepTests.sweep
+    def provision_fixed(self, value, purpose="init"):
+        user, policy = self.backend.provision(value, purpose)
+        self.backend.policy_info[policy]["policyInfo"]["Policy"] = scratch.RunStorageScope.from_record(value, self.record).iam_policy()
+        return user, policy
+
+    @staticmethod
+    def native_fixed_policy(value):
+        # Model MinIO's native marshaled policy independently: statement/set
+        # order differs, singleton sets are strings, and Sid is nonsemantic.
+        root = value.scope_root.removeprefix("s3://novarocks/")
+        namespace_prefix = value.run_id + "_"
+        return {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::warehouse",
+             "Condition": {"StringLike": {"s3:prefix": ["service-mv/" + namespace_prefix + "*",
+                                                         "service/" + namespace_prefix + "*"]}}},
+            {"Sid": "nativeObjectScope", "Effect": "Allow",
+             "Action": ["s3:PutObject", "s3:ListMultipartUploadParts", "s3:GetObjectVersion", "s3:GetObject",
+                        "s3:DeleteObjectVersion", "s3:DeleteObject", "s3:AbortMultipartUpload"],
+             "Resource": ["arn:aws:s3:::warehouse/service-mv/" + namespace_prefix + "*",
+                          "arn:aws:s3:::novarocks/" + root + "/*",
+                          "arn:aws:s3:::warehouse/service/" + namespace_prefix + "*"]},
+            {"Effect": "Allow", "Action": "s3:GetBucketLocation", "Resource": "arn:aws:s3:::novarocks"},
+            {"Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": "arn:aws:s3:::novarocks",
+             "Condition": {"StringLike": {"s3:prefix": root + "/*"}}},
+            {"Sid": "", "Effect": "Allow", "Action": "s3:GetBucketLocation", "Resource": ["arn:aws:s3:::warehouse"]}]}
+
+    def test_native_policy_set_representations_preserve_exact_fixed_authority(self):
+        user, policy = self.backend.provision(self.old)
+        native = self.native_fixed_policy(self.old)
+        self.backend.policy_info[policy]["policyInfo"]["Policy"] = native
+        self.assertEqual(self.sweeper._policy_identity(policy, self.clock.mono() + 100), (self.old, "init"))
+        self.backend.objects = {self.old.scope_root + "/file"}
+        result = self.sweep()
+        self.assertTrue(result["complete"], result)
+        self.assertNotIn(user, self.backend.users)
+        self.assertNotIn(policy, self.backend.policies)
+        self.assertFalse(self.backend.objects)
+
+    def test_native_policy_normalization_never_widens_or_ignores_unknown_authority(self):
+        mutations = ("action", "resource", "prefix", "operator", "condition-key", "condition-shape", "statement-field", "top-field", "sid")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                user, policy = self.backend.provision(self.old)
+                native = self.native_fixed_policy(self.old)
+                if mutation == "action": native["Statement"][1]["Action"].append("s3:PutBucketPolicy")
+                elif mutation == "resource": native["Statement"][1]["Resource"].append("arn:aws:s3:::warehouse/*")
+                elif mutation == "prefix": native["Statement"][0]["Condition"]["StringLike"]["s3:prefix"].append("*")
+                elif mutation == "operator": native["Statement"][0]["Condition"]["StringEquals"] = native["Statement"][0]["Condition"].pop("StringLike")
+                elif mutation == "condition-key": native["Statement"][0]["Condition"]["StringLike"]["s3:delimiter"] = "/"
+                elif mutation == "condition-shape": native["Statement"][1]["Condition"] = []
+                elif mutation == "statement-field": native["Statement"][1]["NotResource"] = "arn:aws:s3:::private/*"
+                elif mutation == "top-field": native["Id"] = "unrecognized-policy-input"
+                else: native["Statement"][1]["Sid"] = {"unexpected": "value"}
+                self.backend.policy_info[policy]["policyInfo"]["Policy"] = native
+                with self.assertRaises(runtime.RuntimeFailure) as caught:
+                    self.sweeper._policy_identity(policy, self.clock.mono() + 100)
+                self.assertEqual(caught.exception.code, "InvalidScratchScope")
+                self.assertIn(user, self.backend.users)
+                self.assertIn(policy, self.backend.policies)
+
+    def test_catalog_barrier_reports_only_completed_child_enumeration(self):
+        for failed_service, failed_suffix in (("rest", "/tables"), ("rest-mv", "/tables/t")):
+            with self.subTest(service=failed_service, path=failed_suffix):
+                self.setUp()
+                name = self.old.resource_name("test")
+                self.sweeper.rest[name] = dict(tables={"t": self.old.scope_root + "/table"}, views={})
+                self.sweeper.rest_mv[name] = dict(tables={"t": self.old.scope_root + "/mv-table"}, views={})
+                self.backend.objects = {self.old.scope_root + "/table/metadata", self.old.scope_root + "/mv-table/metadata"}
+                original = self.sweeper._rest_request
+                def unavailable(service, method, path, deadline, *, absent_ok=False):
+                    if service == failed_service and method == "GET" and path == "namespaces/" + name + failed_suffix:
+                        raise runtime.RuntimeFailure("ScratchRestUnavailable", "private response")
+                    return original(service, method, path, deadline, absent_ok=absent_ok)
+                with patch.object(self.sweeper, "_rest_request", side_effect=unavailable):
+                    result = self.sweep()
+                self.assertFalse(result["complete"])
+                barrier = result["catalog_barrier"][self.old.run_id]
+                self.assertFalse(barrier["complete"])
+                self.assertFalse(barrier["services"][failed_service]["enumeration_complete"])
+                self.assertEqual(barrier["services"]["rest"]["enumeration_complete"], failed_service != "rest")
+                self.assertFalse(barrier["services"]["rest"]["entries_absent"])
+                self.assertFalse(barrier["services"]["rest-mv"]["entries_absent"])
+                self.assertEqual(len(self.backend.objects), 2)
+                self.assertFalse(any(c[1] == "DELETE" for c in self.sweeper.rest_calls))
+
+    def test_fixed_native_policy_reverse_verification_and_iam_failure_keeps_files(self):
+        user, policy = self.provision_fixed(self.old)
+        root = "s3://warehouse/service/" + self.old.resource_name("table")
+        self.backend.objects = {root + "/file", self.old.scope_root + "/ctas/file"}
+        self.backend.fail[("admin", "user", "rm", "store", user)] = "AccessDenied"
+        result = self.sweep()
+        self.assertFalse(result["complete"], result)
+        self.assertEqual(len(self.backend.objects), 2)
+        self.assertIn(policy, self.backend.policies)
+        self.backend.fail.clear()
+        result = self.sweep()
+        self.assertTrue(result["complete"], result)
+        self.assertFalse(self.backend.objects)
+
+    def test_broadened_fixed_native_policy_cannot_mint_an_extra_root(self):
+        user, policy = self.provision_fixed(self.old)
+        self.backend.policy_info[policy]["policyInfo"]["Policy"]["Statement"][-1]["Resource"].append("arn:aws:s3:::warehouse/*")
+        self.backend.objects = {self.old.scope_root + "/file"}
+        self.assertFalse(self.sweep()["complete"])
+        self.assertIn(user, self.backend.users)
+        self.assertTrue(self.backend.objects)
+
+    def test_renamed_table_blocks_all_original_directories_until_both_catalogs_clear(self):
+        old_name, new_name = self.old.resource_name("old"), self.old.resource_name("new")
+        old_root = "s3://warehouse/service/" + old_name
+        self.sweeper.rest[new_name] = dict(tables={"renamed": old_root + "/original"}, views={})
+        self.sweeper.rest_mv[self.old.resource_name("mv")] = dict(tables={}, views={"v": self.old.scope_root + "/mv"})
+        self.backend.objects = {old_root + "/original/metadata", self.old.scope_root + "/mv/metadata"}
+        self.sweeper.rest_fail["DELETE", "namespaces/" + new_name] = "ScratchRestUnavailable"
+        result = self.sweep()
+        self.assertFalse(result["complete"])
+        self.assertEqual(len(self.backend.objects), 2)
+        self.assertFalse(result["catalog_barrier"][self.old.run_id]["complete"])
+        self.sweeper.rest_fail.clear()
+        result = self.sweep()
+        self.assertTrue(result["complete"], result)
+        self.assertTrue(result["catalog_barrier"][self.old.run_id]["complete"])
+        self.assertFalse(self.backend.objects)
+        self.assertFalse(self.sweeper.rest_mv)
+
+    def test_other_run_completes_when_one_run_catalog_deletion_fails(self):
+        peer = identity(604802, token="c" * 32)
+        own, other = self.old.resource_name("bad"), peer.resource_name("good")
+        self.sweeper.rest[own] = dict(tables={}, views={})
+        self.sweeper.rest[other] = dict(tables={}, views={})
+        self.sweeper.rest_fail["DELETE", "namespaces/" + own] = "ScratchRestUnavailable"
+        self.backend.objects = {self.old.scope_root + "/file", peer.scope_root + "/file"}
+        result = self.sweep()
+        self.assertFalse(result["complete"])
+        self.assertEqual(self.backend.objects, {self.old.scope_root + "/file"})
+        self.assertTrue(result["catalog_barrier"][peer.run_id]["complete"])
+
+    def test_metadata_cannot_mint_an_undiscovered_original_run_root(self):
+        name = self.old.resource_name("test")
+        self.sweeper.rest[name] = dict(tables={"t": self.old.scope_root + "/table"}, views={})
+        # No native S3 or IAM fact establishing that original root.
+        result = self.sweep()
+        self.assertFalse(result["complete"])
+        self.assertIn(name, self.sweeper.rest)
+        self.assertFalse(any(call[1] == "DELETE" for call in self.sweeper.rest_calls))
+
+    def test_rest_only_orphan_uses_exact_direct_child_grammar(self):
+        base = "s3://warehouse/service/"
+        valid = base + self.old.resource_name("gone") + "/table/file"
+        unknown = {base + self.old.run_id + "/bare/file", base + self.old.run_id + "_toolong/file",
+                   base + self.old.run_id + "0_test/file", "s3://warehouse/service-mv/ordinary/table/file"}
+        self.backend.objects = {valid, *unknown}
+        self.sweeper.rest["ordinary"] = dict(tables={}, views={})
+        self.sweeper.rest[self.old.run_id] = dict(tables={}, views={})
+        result = self.sweep()
+        self.assertTrue(result["complete"], result)
+        self.assertTrue(result["enumeration_complete"])
+        self.assertEqual(result["unknown_counts"]["rest-namespace"], 2)
+        self.assertEqual(self.backend.objects, unknown)
+        self.assertFalse(any(c[0] == "ls" and self.old.run_id in c[-1] for c in self.backend.calls))
+
+    def test_two_original_roots_with_same_identity_are_rejected(self):
+        foreign_root = identity(604801, worktree="s3://novarocks/worktree-other").scope_root
+        self.backend.objects = {self.old.scope_root + "/file", foreign_root + "/file"}
+        result = self.sweep()
+        self.assertFalse(result["complete"])
+        self.assertEqual(len(self.backend.objects), 2)
+        self.assertFalse(any(c[0] == "rm" for c in self.backend.calls))
+
+    def test_second_catalog_enumeration_failure_is_a_run_wide_object_barrier(self):
+        root = "s3://warehouse/service/" + self.old.resource_name("gone")
+        self.backend.objects = {root + "/file", self.old.scope_root + "/file"}
+        original = self.sweeper._rest_request
+        def unavailable(service, method, path, deadline, *, absent_ok=False):
+            if service == "rest-mv":
+                raise runtime.RuntimeFailure("ScratchRestUnavailable", "private response")
+            return original(service, method, path, deadline, absent_ok=absent_ok)
+        with patch.object(self.sweeper, "_rest_request", side_effect=unavailable):
+            result = self.sweep()
+        self.assertFalse(result["complete"])
+        self.assertFalse(result["enumeration_complete"])
+        self.assertEqual(len(self.backend.objects), 2)
+        self.assertFalse(self.backend.calls)
+
+    def test_offline_purge_requires_exact_original_generation_and_volume_absence_barrier(self):
+        original = copy.deepcopy(self.record["offline_catalog_barrier"])
+        for change in (None, {**original, "generation": "other"}, {**original, "complete": False},
+                       {**original, "volumes": ["other-volume"]}, {**original, "daemon_id": "other"}):
+            self.record["offline_catalog_barrier"] = change
+            self.backend.calls.clear()
+            self.backend.objects = {self.old.scope_root + "/file"}
+            result = self.sweep(False)
+            self.assertFalse(result["complete"])
+            self.assertEqual(result["errors"][0]["code"], "ScratchCatalogBarrierRequired")
+            self.assertFalse(self.backend.calls)
+            self.assertTrue(self.backend.objects)
+        self.record["offline_catalog_barrier"] = original
+        result = self.sweep(False)
+        self.assertTrue(result["complete"], result)
+        self.assertFalse(self.sweeper.rest_calls)
+        self.assertFalse(self.backend.objects)
+
+    def test_normal_cleanup_uses_same_both_service_barrier_and_membership(self):
+        user, policy = self.provision_fixed(self.young)
+        scope = scratch.RunStorageScope.from_record(self.young, self.record)
+        old_name, new_name = self.young.resource_name("old"), self.young.resource_name("new")
+        root = "s3://warehouse/service/" + old_name
+        self.sweeper.rest[new_name] = dict(tables={"renamed": root + "/table"}, views={})
+        self.backend.objects = {root + "/table/metadata", self.young.scope_root + "/ctas/file"}
+        result = self.sweeper.cleanup_run(scope, [{"user": user, "policy": policy}], self.clock.mono() + 100)
+        self.assertTrue(result["complete"], result)
+        self.assertTrue(result["catalog_barrier"][self.young.run_id]["complete"])
+        self.assertFalse(self.backend.objects)
+        self.assertFalse(self.backend.users)
+        self.assertIn(("rest", "DELETE", "namespaces/" + new_name + "/tables/renamed?purgeRequested=false"), self.sweeper.rest_calls)
 
 
 class RestTransportTests(unittest.TestCase):

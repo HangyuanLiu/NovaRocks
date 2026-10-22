@@ -561,6 +561,14 @@ class MachineTests(unittest.TestCase):
     def changed(self):
         return self.definition(ports={"rest": 31002})
 
+    def test_machine_configuration_rejects_protected_and_rest_domain_overlap_before_effects(self):
+        for root in ("s3://warehouse/fixture-machine", "s3://warehouse/fixture-machine/rest/",
+                     "s3://warehouse/fixture-machine/rest/data", "s3://warehouse/fixture-machine/rest-mv"):
+            with self.subTest(root=root):
+                self.assert_code("InvalidConfiguration", lambda: self.definition(benchmark_root=root))
+        self.assertEqual(self.backend.events, [])
+        self.definition(benchmark_root="s3://warehouse/fixture-machine/rest-other")
+
     def assert_code(self, code, operation):
         with self.assertRaises(runtime.RuntimeFailure) as caught:
             operation()

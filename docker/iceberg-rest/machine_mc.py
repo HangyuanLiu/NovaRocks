@@ -25,7 +25,7 @@ import sys
 
 import fixture_runtime as runtime
 import machine_runtime as machine
-from scratch import RunBudget, ScratchIdentity, ScratchSweeper
+from scratch import RUN_STORAGE_ENV, RunBudget, RunStorageScope, ScratchIdentity, ScratchSweeper
 
 
 def main(argv=None):
@@ -61,14 +61,22 @@ def main(argv=None):
             raise runtime.RuntimeFailure('InvalidConfiguration', 'mc script is empty or exceeds its input bound')
         with owner.ready_snapshot({'version': args.expected_version}, deadline=deadline,
                                   expected_generation=args.expected_generation) as snapshot:
+            inherited_storage = os.environ.get(RUN_STORAGE_ENV)
+            if inherited_storage is not None:
+                if len(inherited_storage) > 16384:
+                    raise runtime.RuntimeFailure('RunBudgetRejected', 'run storage exceeds its input bound')
+                RunStorageScope.from_dict(json.loads(inherited_storage)).validate_against(identity, snapshot)
             if args.cleanup_run:
                 if not args.cleanup:
                     raise runtime.RuntimeFailure('RunBudgetRejected', 'exact run cleanup requires the original cleanup phase')
                 request = json.loads(script)
                 if ScratchIdentity.from_dict(request.get('identity')) != identity:
                     raise runtime.RuntimeFailure('RunBudgetRejected', 'cleanup identity differs from original context')
-                report = ScratchSweeper(snapshot, owner.backend).cleanup_run(identity, request.get('users'), deadline=deadline)
+                scope = RunStorageScope.from_dict(request.get('storage'))
+                scope.validate_against(identity, snapshot)
+                report = ScratchSweeper(snapshot, owner.backend).cleanup_run(scope, request.get('users'), deadline=deadline)
                 if not report.get('complete'):
+                    sys.stderr.write(json.dumps(report) + '\n')
                     raise runtime.RuntimeFailure('ScratchCleanupIncomplete', 'exact run cleanup did not complete')
                 output = json.dumps(report) + '\n'
             else:

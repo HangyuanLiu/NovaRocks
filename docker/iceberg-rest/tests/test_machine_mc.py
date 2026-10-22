@@ -29,7 +29,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import machine_mc as adapter
-from scratch import RunBudget, ScratchIdentity
+from scratch import RunBudget, RunStorageScope, ScratchIdentity
 
 
 class AdapterTests(unittest.TestCase):
@@ -39,9 +39,13 @@ class AdapterTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.state = {"policy": {"scratch_ttl_seconds": 2000, "max_run_seconds": 500,
                       "cleanup_grace_seconds": 30}, "protected_benchmark_roots": [],
-                      "config": {"benchmark_root": "s3://novarocks/benchmark"}}
+                      "config": {"benchmark_root": "s3://novarocks/benchmark", "minio_volume": "exact-minio-volume"},
+                      "id": "machine-id", "control_root": "/exact-machine-root", "daemon_id": "daemon-id",
+                      "version": "version-id", "generation": "generation-id",
+                      "server_warehouses": {"rest": "s3://warehouse/machine/rest", "rest-mv": "s3://warehouse/machine/rest-mv"}}
         self.identity = ScratchIdentity.create("s3://novarocks/test-worktree")
         self.context = RunBudget.admit(self.state, self.identity, seconds=400).as_dict()
+        self.storage = RunStorageScope.from_record(self.identity, self.state)
         self.owner = mock.Mock()
         self.owner.read_saved_state.return_value = self.state
         self.calls = []
@@ -54,9 +58,12 @@ class AdapterTests(unittest.TestCase):
         self.args = ['--root', str(self.root), '--daemon', 'daemon-id',
                      '--expected-version', 'version-id', '--expected-generation', 'generation-id']
 
-    def invoke(self, script='private-secret-payload', extra=(), context=None):
+    def invoke(self, script='private-secret-payload', extra=(), context=None, storage=None):
         out, err = io.StringIO(), io.StringIO()
-        with mock.patch.dict(os.environ, {'NOVA_FIXTURE_RUN_CONTEXT': json.dumps(context or self.context)}, clear=True), \
+        environment = {'NOVA_FIXTURE_RUN_CONTEXT': json.dumps(context or self.context)}
+        if storage is not None:
+            environment['NOVA_FIXTURE_RUN_STORAGE'] = json.dumps(storage)
+        with mock.patch.dict(os.environ, environment, clear=True), \
              mock.patch.object(adapter.machine, 'MachineOwner', return_value=self.owner) as constructor, \
              mock.patch.object(adapter.runtime, 'install_signal_handlers'), \
              mock.patch.object(sys, 'stdin', io.StringIO(script)), redirect_stdout(out), redirect_stderr(err):
@@ -97,21 +104,54 @@ class AdapterTests(unittest.TestCase):
 
     def test_exact_cleanup_uses_registered_pairs_and_settles_only_success(self):
         pairs = [{'user': self.identity.iam_name('init'), 'policy': self.identity.resource_name('init')}]
-        request = json.dumps({'identity': self.identity.as_dict(), 'users': pairs})
+        request = json.dumps({'identity': self.identity.as_dict(), 'storage': self.storage.as_dict(), 'users': pairs})
         sweeper = mock.Mock()
         sweeper.cleanup_run.return_value = {'complete': True, 'removed': [], 'errors': []}
         with mock.patch.object(adapter, 'ScratchSweeper', return_value=sweeper):
             status, out, err = self.invoke(request, ['--cleanup', '--cleanup-run'])
         self.assertEqual((status, err), (0, ''))
         self.assertTrue(json.loads(out)['complete'])
-        self.assertEqual(sweeper.cleanup_run.call_args.args, (self.identity, pairs))
+        self.assertEqual(sweeper.cleanup_run.call_args.args[0].as_dict(), self.storage.as_dict())
+        self.assertEqual(sweeper.cleanup_run.call_args.args[1], pairs)
         self.owner.backend.run_mc.assert_not_called()
         sweeper.cleanup_run.return_value = {'complete': False, 'errors': ['denied']}
         with mock.patch.object(adapter, 'ScratchSweeper', return_value=sweeper):
             status, out, err = self.invoke(request, ['--cleanup', '--cleanup-run'])
         self.assertEqual((status, out), (1, ''))
         self.assertIn('ScratchCleanupIncomplete', err)
+        self.assertIn('denied', err)
         self.assertNotIn('private-secret-payload', err)
+
+    def test_foreign_cleanup_storage_never_constructs_sweeper_or_runs_script(self):
+        for field in ('daemon_id', 'version', 'generation', 'control_root', 'id'):
+            with self.subTest(field=field):
+                storage = self.storage.as_dict()
+                storage['machine'][field] = 'foreign-value'
+                request = json.dumps({'identity': self.identity.as_dict(), 'storage': storage, 'users': []})
+                with mock.patch.object(adapter, 'ScratchSweeper') as sweeper:
+                    status, out, _ = self.invoke(request, ['--cleanup', '--cleanup-run'])
+                self.assertNotEqual(status, 0)
+                self.assertEqual(out, '')
+                sweeper.assert_not_called()
+        self.owner.backend.run_mc.assert_not_called()
+
+    def test_missing_cleanup_storage_is_rejected_before_remote_effects(self):
+        request = json.dumps({'identity': self.identity.as_dict(), 'users': []})
+        with mock.patch.object(adapter, 'ScratchSweeper') as sweeper:
+            status, out, _ = self.invoke(request, ['--cleanup', '--cleanup-run'])
+        self.assertNotEqual(status, 0)
+        self.assertEqual(out, '')
+        sweeper.assert_not_called()
+        self.owner.backend.run_mc.assert_not_called()
+
+    def test_inherited_storage_is_rechecked_under_locked_machine_snapshot(self):
+        storage = self.storage.as_dict()
+        storage['storage_owner']['minio_volume'] = 'foreign-volume'
+        status, out, _ = self.invoke(storage=storage)
+        self.assertNotEqual(status, 0)
+        self.assertEqual(out, '')
+        self.assertEqual(len(self.calls), 1)
+        self.owner.backend.run_mc.assert_not_called()
 
     def test_expected_activation_failure_is_not_silently_reattached(self):
         self.owner.ready_snapshot.side_effect = adapter.runtime.RuntimeFailure('MachineVersionMismatch', 'activation changed')
