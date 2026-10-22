@@ -893,10 +893,13 @@ fn replace_references(text: &str, mapping: &BTreeMap<String, String>) -> String 
     }
     text
 }
-fn show_namespace_references(
+fn namespace_observation_references(
     sql: &str,
 ) -> (BTreeMap<usize, (usize, String)>, BTreeMap<usize, usize>) {
-    use novarocks_parser::ast::{MaintenanceStatement, MaterializedViewStatement, Statement};
+    use novarocks_parser::ast::{
+        LiteralKind, MaintenanceStatement, MaintenanceValue, MaterializedViewStatement,
+        ProcedureArgumentMode, Statement,
+    };
     let mut namespaces = BTreeMap::new();
     let mut protected = BTreeMap::new();
     let masked = crate::catalog_symbol::sql_source(sql);
@@ -908,6 +911,45 @@ fn show_namespace_references(
             continue;
         };
         for statement in statements {
+            if let Statement::Maintenance(MaintenanceStatement::Call(call)) = &statement {
+                if call.procedure.parts.last().is_some_and(|part| {
+                    part.value
+                        .eq_ignore_ascii_case("novarocks_mv_management_status")
+                }) {
+                    let supported = call.procedure.parts.len() == 1
+                        && call.argument_mode == ProcedureArgumentMode::Positional
+                        && call.arguments.len() == 3
+                        && call.arguments.iter().all(|argument| {
+                            argument.name.is_none()
+                                && matches!(
+                                    &argument.value,
+                                    MaintenanceValue::Literal(literal)
+                                        if matches!(&literal.kind, LiteralKind::String(_))
+                                )
+                        });
+                    for part in &call.procedure.parts {
+                        protected.insert(
+                            range.start + part.span.start(),
+                            range.start + part.span.end(),
+                        );
+                    }
+                    for (index, argument) in call.arguments.iter().enumerate() {
+                        let span = argument.value.span();
+                        let start = range.start + span.start();
+                        let end = range.start + span.end();
+                        if supported
+                            && index == 1
+                            && let MaintenanceValue::Literal(literal) = &argument.value
+                            && let LiteralKind::String(value) = &literal.kind
+                        {
+                            namespaces.insert(start, (end, value.clone()));
+                        } else {
+                            protected.insert(start, end);
+                        }
+                    }
+                }
+                continue;
+            }
             let (name, qualified) = match &statement {
                 Statement::Maintenance(MaintenanceStatement::ShowOptimize(show)) => {
                     (show.from.as_ref(), true)
@@ -940,7 +982,7 @@ fn show_namespace_references(
 }
 
 fn rewrite_sql_identifiers(line: &str, mapping: &BTreeMap<String, String>) -> String {
-    let (show_namespaces, show_protected) = show_namespace_references(line);
+    let (observed_namespaces, protected_observations) = namespace_observation_references(line);
     let mut result = String::new();
     let bytes = line.as_bytes();
     let mut i = 0;
@@ -948,13 +990,15 @@ fn rewrite_sql_identifiers(line: &str, mapping: &BTreeMap<String, String>) -> St
     let mut previous = String::new();
     let mut last_word = String::new();
     while i < bytes.len() {
-        if let Some((end, name)) = show_namespaces.get(&i) {
+        if let Some((end, name)) = observed_namespaces.get(&i) {
             if let Some(new) = mapping.get(name) {
-                let quote = matches!(bytes[i], b'`' | b'"').then_some(bytes[i] as char);
+                let quote = matches!(bytes[i], b'\'' | b'`' | b'"').then_some(bytes[i] as char);
                 if let Some(quote) = quote {
                     result.push(quote);
+                    result.push_str(&new.replace(quote, &format!("{quote}{quote}")));
+                } else {
+                    result.push_str(new);
                 }
-                result.push_str(new);
                 if let Some(quote) = quote {
                     result.push(quote);
                 }
@@ -964,7 +1008,7 @@ fn rewrite_sql_identifiers(line: &str, mapping: &BTreeMap<String, String>) -> St
             i = *end;
             continue;
         }
-        if let Some(end) = show_protected.get(&i) {
+        if let Some(end) = protected_observations.get(&i) {
             result.push_str(&line[i..*end]);
             i = *end;
             continue;
@@ -1116,6 +1160,70 @@ pub(crate) fn test_variables(cases: &[&str]) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_mv_management_status_cases_use_the_owned_namespace() {
+        for (case, source, catalog) in [
+            (
+                "mv_atomic_repartition",
+                include_str!(
+                    "../../../correctness/lnp-3d-mv-accelerator/sql/mv_atomic_repartition.sql"
+                ),
+                "lnp3d_repart",
+            ),
+            (
+                "mv_retain_restart",
+                include_str!(
+                    "../../../correctness/lnp-3d-mv-accelerator/sql/mv_retain_restart.sql"
+                ),
+                "lnp3d_retain",
+            ),
+        ] {
+            let vars =
+                crate::config::case_placeholder_variables(&test_variables(&[case]), case).unwrap();
+            let rendered = render_expected(source, &vars);
+            let old = format!("ns_{}", vars["uuid0"]);
+            let map = namespace_mapping(&rendered, &vars).unwrap();
+            let expected = &map[&old];
+            let rewritten = rewrite_namespaces(&rendered, &vars).unwrap();
+            assert!(rewritten.contains(&format!(
+                "'{catalog}_{}', '{expected}', 'orders_mv'",
+                vars["uuid0"]
+            )));
+            assert!(!rewritten.contains(&format!("'{old}', 'orders_mv'")));
+            assert!(rewritten.contains(&format!(".{expected}.")));
+        }
+    }
+
+    #[test]
+    fn management_status_rewrites_only_its_positional_namespace_literal() {
+        let mapping = BTreeMap::from([("owned".into(), "mapped'namespace".into())]);
+        let sql = "CALL NoVaRocks_Mv_Management_Status('owned', 'owned', 'owned');";
+        assert_eq!(
+            rewrite_sql_identifiers(sql, &mapping),
+            "CALL NoVaRocks_Mv_Management_Status('owned', 'mapped''namespace', 'owned');"
+        );
+        for unchanged in [
+            "CALL novarocks_mv_management_status(catalog => 'owned', namespace => 'owned', table => 'owned');",
+            "CALL novarocks_mv_management_status('owned', 'owned');",
+            "CALL novarocks_mv_management_status('owned', 'owned', 'owned', 'owned');",
+            "CALL owned.novarocks_mv_management_status('owned', 'owned', 'owned');",
+            "CALL novarocks_mv_management_status('owned', 'owned', 1);",
+            "CALL other_procedure('owned', 'owned', 'owned');",
+            "SELECT 'owned', 'novarocks_mv_management_status', 'CALL other_procedure(owned)';",
+            "-- CALL novarocks_mv_management_status('owned', 'owned', 'owned');\nSELECT 1;",
+        ] {
+            assert_eq!(rewrite_sql_identifiers(unchanged, &mapping), unchanged);
+        }
+        let escaped = BTreeMap::from([("old'namespace".into(), "new'namespace".into())]);
+        assert_eq!(
+            rewrite_sql_identifiers(
+                "CALL novarocks_mv_management_status('old''namespace', 'old''namespace', 'old''namespace');",
+                &escaped,
+            ),
+            "CALL novarocks_mv_management_status('old''namespace', 'new''namespace', 'old''namespace');"
+        );
+    }
+
     #[test]
     fn native_lake_and_mv_show_cases_use_the_owned_namespace() {
         for (case, source, show) in [
