@@ -17,6 +17,8 @@
 
 use std::time::Duration;
 
+use novarocks_coordination_contract::MonotonicInstant;
+
 /// Lease durations requested by query coordination.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct RequestedLeaseDurations {
@@ -44,34 +46,6 @@ impl RequestedLeaseDurations {
 
     pub const fn steady(self) -> Duration {
         self.steady
-    }
-}
-
-/// A reading on the query application's process-local monotonic timeline.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct MonotonicInstant(Duration);
-
-impl MonotonicInstant {
-    pub const ORIGIN: Self = Self(Duration::ZERO);
-
-    pub const fn from_origin(elapsed: Duration) -> Self {
-        Self(elapsed)
-    }
-
-    pub const fn since_origin(self) -> Duration {
-        self.0
-    }
-
-    pub fn saturating_add(self, delta: Duration) -> Self {
-        Self(self.0.saturating_add(delta))
-    }
-
-    pub fn saturating_duration_since(self, earlier: Self) -> Duration {
-        self.0.saturating_sub(earlier.0)
-    }
-
-    pub fn has_reached(self, deadline: Self) -> bool {
-        self >= deadline
     }
 }
 

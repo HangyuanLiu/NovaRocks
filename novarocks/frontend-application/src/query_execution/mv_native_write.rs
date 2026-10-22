@@ -66,8 +66,8 @@ impl PreparedMvNativeWriteAssembly {
                 template.attempt_scheduling_facts()?.fragments.iter()
                     .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan)).collect(),
                 novarocks_query_application::preparation::OutputContract::CompletionOnly,
-                novarocks_query_application::coordination::ExecutionEffect::External,
-                novarocks_query_application::coordination::RecoveryMode::NoRecovery,
+                novarocks_coordination_contract::ExecutionEffect::External,
+                novarocks_coordination_contract::RecoveryMode::NoRecovery,
                 Vec::new(),
                 novarocks_query_application::preparation::FrozenCostEstimate::unknown(
                     novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,

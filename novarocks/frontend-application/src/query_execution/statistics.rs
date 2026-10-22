@@ -406,8 +406,8 @@ pub fn prepare_completed_statistics_collection(
                 .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
                 .collect(),
             output,
-            novarocks_query_application::coordination::ExecutionEffect::None,
-            novarocks_query_application::coordination::RecoveryMode::NoRecovery,
+            novarocks_coordination_contract::ExecutionEffect::None,
+            novarocks_coordination_contract::RecoveryMode::NoRecovery,
             Vec::new(),
             novarocks_query_application::preparation::FrozenCostEstimate::unknown(
                 novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,

@@ -20,6 +20,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::task_execution::operation::OperationDispatchResult;
+use crate::task_protocol_config::DispatchBudget;
 use novarocks_query_application::api::{
     NativeActiveConvergenceClosure, NativeActiveConvergenceRequest,
     NativeAttemptPreparationFailure, NativeAttemptTerminal, StatementNativeHealthFailure,
@@ -37,7 +39,7 @@ use super::attempt_convergence::{
     NativeAttemptConvergenceMode, NativeAttemptConvergenceOwner, NativeAttemptConvergenceTarget,
     advance_task_round,
 };
-use super::clock::{ProcessMonotonicClock, TaskProtocolClock};
+use super::clock::ProcessMonotonicClock;
 #[cfg(test)]
 use super::error::ParticipantObservationFailure;
 use super::error::TaskExecutionError;
@@ -57,6 +59,7 @@ use crate::query_execution::split_assignment::TaskUpdateTransport;
 use crate::query_execution::split_assignment_round::{
     RoundSplitAssignmentPlan, SplitAssignmentRoundGuard,
 };
+use novarocks_coordination_contract::MonotonicClock;
 use novarocks_query_application::api::BackendProcessObservationService;
 
 const STATUS_INTAKE_CAPACITY: usize = 4096;
@@ -164,7 +167,7 @@ pub(crate) fn assemble_manifest_round(
     let sink = split_delivery.sink(Arc::new(actor_sink) as Arc<dyn TaskOperationSink>);
 
     let intake = StatusIntake::new(STATUS_INTAKE_CAPACITY, Arc::clone(&wake));
-    let clock = Arc::new(ProcessMonotonicClock::new()) as Arc<dyn TaskProtocolClock>;
+    let clock = Arc::new(ProcessMonotonicClock::new()) as Arc<dyn MonotonicClock>;
     let observation = Arc::new(
         ObservationIntake::for_task_attempt(Arc::clone(&wake), Arc::clone(&clock)).map_err(
             |error| {
@@ -562,10 +565,8 @@ fn cancellation_failure(reason: CancellationReason) -> NativeAttemptTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_query_application::api::BackendProcessObservation;
-    use novarocks_query_application::{
-        api::QueryExecutionErrorKind, coordination::AttemptFailureClass,
-    };
+    use novarocks_coordination_contract::AttemptFailureClass;
+    use novarocks_query_application::api::{BackendProcessObservation, QueryExecutionErrorKind};
 
     fn protocol_context(
         backend: novarocks_types::BackendProcessId,
@@ -600,7 +601,7 @@ mod tests {
             novarocks_plan_codec::PhysicalEncodeError::Invalid("FULL OUTER hash join".into()),
         ] {
             let fact = original.failure_fact();
-            let selected = novarocks_query_application::coordination::SelectedTaskTermination::new(
+            let selected = novarocks_coordination_contract::SelectedTaskTermination::new(
                 identity,
                 novarocks_execution_contract::TerminationDetail::Failed(
                     novarocks_execution_contract::TaskFailure::new_in_phase(
@@ -662,8 +663,9 @@ mod tests {
         novarocks_workload_control::WorkCancellationRequester,
         super::super::abort_effect::NativeAbortEffectIntake,
     ) {
+        use novarocks_coordination_contract::ExecutionEffect;
         use novarocks_query_application::coordination::{
-            AbortQueryContextEffectPort, ExecutionEffect, LogicalExecutionActorConfig,
+            AbortQueryContextEffectPort, LogicalExecutionActorConfig,
         };
         use novarocks_query_application::test_support::LogicalExecutionTestHarness;
         use novarocks_workload_control::{
@@ -1121,10 +1123,10 @@ mod tests {
             );
             let cancellation_after_gate_closes = if cancel_with_pending_gate {
                 use super::super::intent::{DispatchBatch, OperationIntent, TaskOperationSubmit};
+                use crate::task_protocol_config::DispatchLane;
                 use novarocks_execution::task_execution::{
                     AcquireQueryContextAdmissionTicket, AdmissionEpochCapability, LeaseValidFor,
                 };
-                use novarocks_query_application::coordination::DispatchLane;
                 let operation = OperationIntent::AcquireQueryContextAdmissionTicket(
                     AcquireQueryContextAdmissionTicket::new(
                         TaskOperationId::new_v7(),

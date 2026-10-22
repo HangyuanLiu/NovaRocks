@@ -3765,6 +3765,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-coordination-contract"
+version = "0.1.0"
+dependencies = [
+ "novarocks-execution-contract",
+ "novarocks-types",
+]
+
+[[package]]
 name = "novarocks-datasketches-tck"
 version = "0.1.0"
 dependencies = [
@@ -3801,6 +3809,7 @@ dependencies = [
  "novarocks-arrow-ipc-frame",
  "novarocks-connector-contract",
  "novarocks-connector-iceberg-functions",
+ "novarocks-coordination-contract",
  "novarocks-execution-contract",
  "novarocks-failure-contract",
  "novarocks-functions",
@@ -3879,6 +3888,7 @@ dependencies = [
  "novarocks-catalog-application",
  "novarocks-connector-contract",
  "novarocks-connector-paimon",
+ "novarocks-coordination-contract",
  "novarocks-execution",
  "novarocks-execution-contract",
  "novarocks-failpoint",
@@ -4290,6 +4300,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "novarocks-connector-contract",
+ "novarocks-coordination-contract",
  "novarocks-execution-contract",
  "novarocks-failpoint",
  "novarocks-function-contract",

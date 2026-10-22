@@ -28,8 +28,7 @@ use std::time::{Duration, Instant};
 
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_spi::connector::ConnectorReadWireEncoder;
-use novarocks_spi::connector::read_stack::ConnectorReadColumnHandle;
-use novarocks_spi::connector::read_stack::ConnectorReadSplitSource;
+use novarocks_spi::connector::read_stack::{ConnectorReadColumnHandle, ConnectorReadSplitSource};
 use novarocks_spi::connector::read_stack::{ConnectorSplitBatch, SplitSourceProfile};
 
 use super::driver::{
@@ -37,7 +36,7 @@ use super::driver::{
 };
 use super::transport::TaskUpdateTransport;
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
-use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
+use crate::task_protocol_config::TaskUpdateRetryPolicy;
 
 /// How many splits one batch pulls from a source.
 ///

@@ -27,8 +27,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::task_execution::operation::FrontendAction;
 use novarocks_execution::task_execution::PlanNodeId;
-use novarocks_query_application::coordination::FrontendAction;
 use novarocks_types::UniqueId;
 use novarocks_types::identity::TaskId;
 

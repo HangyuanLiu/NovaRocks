@@ -38,16 +38,15 @@
 //!   then succeed.
 //!
 //! Draining the attempt is a third, separate question owned by
-//! [`AttemptDrainFacts`](novarocks_query_application::coordination::AttemptDrainFacts):
+//! [`AttemptDrainFacts`](crate::task_execution::completion_facts::AttemptDrainFacts):
 //! it closes internal resources and never gates a completion that has already
 //! been linearized.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::task_execution::status_validation::verify_final_info;
+use novarocks_coordination_contract::{ResultPacketVerdict, RootResultStream};
 use novarocks_execution::task_execution::{FinalTaskInfo, TaskIdentity, TaskState, TaskStatus};
-use novarocks_query_application::coordination::{
-    ResultPacketVerdict, RootResultStream, verify_final_info,
-};
 
 use super::error::TaskExecutionError;
 
@@ -325,12 +324,12 @@ pub fn accept_final_info(
 mod tests {
     use super::{ReadCompletionTracker, ReadVerdict, WriteCompletionTracker, WriteVerdict};
     use crate::task_execution::error::TaskExecutionError;
+    use novarocks_coordination_contract::ResultPacketVerdict;
     use novarocks_execution::task_execution::{
         AbortCause, CancelReason, FinalTaskInfo, IdentityField, IdentityMismatch, TaskIdentity,
         TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion, TaskWriterFacts,
         TerminationDetail,
     };
-    use novarocks_query_application::coordination::ResultPacketVerdict;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };

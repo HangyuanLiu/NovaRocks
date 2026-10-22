@@ -109,11 +109,10 @@ use novarocks_type_contract::CompileControlError;
 use novarocks_types::ClusterRole;
 use novarocks_types::naming::normalize_identifier;
 use novarocks_user_error::UserError;
-use novarocks_workload_control::WorkError;
-use novarocks_workload_control::WorkOwner;
 use novarocks_workload_control::{
     ResultWindowAlias, ResultWindowClass, RootAdmissionHandle, WorkClass, WorkRequest,
 };
+use novarocks_workload_control::{WorkError, WorkOwner};
 
 pub(crate) mod compiler;
 
@@ -3429,7 +3428,7 @@ mod tests {
             novarocks_plan_codec::PhysicalEncodeError::Invalid("FULL OUTER hash join".into()),
         ] {
             let fact = original.failure_fact();
-            let selected = novarocks_query_application::coordination::SelectedTaskTermination::new(
+            let selected = novarocks_coordination_contract::SelectedTaskTermination::new(
                 identity,
                 novarocks_execution_contract::TerminationDetail::Failed(
                     novarocks_execution_contract::TaskFailure::new_in_phase(
@@ -3530,8 +3529,7 @@ mod tests {
     };
     use arrow::{array::StringArray, datatypes::DataType};
     use novarocks_query_application::admitted_query_context::QueryExecutionContext;
-    use novarocks_query_application::api::BackendTopologySnapshot;
-    use novarocks_query_application::api::ResultField;
+    use novarocks_query_application::api::{BackendTopologySnapshot, ResultField};
     use novarocks_query_application::cancellation::QueryCancellationSource;
     use novarocks_query_application::sql::{SqlBatchCursor, split_sql_statements};
     use novarocks_query_application::test_support::{
@@ -3540,8 +3538,9 @@ mod tests {
     use novarocks_sql::compiler::SessionOptimizerSettings;
     use novarocks_types::schema::ColumnDef;
     use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
-    use novarocks_workload_control::CancellationReason as WorkCancellationReason;
-    use novarocks_workload_control::ResourceConfig;
+    use novarocks_workload_control::{
+        CancellationReason as WorkCancellationReason, ResourceConfig,
+    };
 
     fn default_query_options() -> QueryOptions {
         QueryOptions::from_proto(novarocks_proto_models::novarocks::QueryOptions::default())

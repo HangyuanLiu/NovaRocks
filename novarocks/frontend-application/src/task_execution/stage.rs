@@ -25,11 +25,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::query_execution::artifact::FragmentId;
+use crate::task_execution::completion_facts::{
+    StageState, derive_stage_state, parent_released_children,
+};
 use novarocks_execution::task_execution::{
     CancelReason, ExchangeEdgeId, StageRef, TaskIdentity, TaskState,
-};
-use novarocks_query_application::coordination::{
-    StageState, derive_stage_state, parent_released_children,
 };
 #[cfg(test)]
 use novarocks_types::identity::StageId;
@@ -367,8 +368,9 @@ mod destination_close_tests {
     /// model: the oracle checks output safety and frozen membership directly.
     #[test]
     fn destination_reducer_bounded_interleavings() {
+        use crate::task_execution::completion_facts::RootReadFacts;
+        use crate::task_execution::conclusion::TerminationLatch;
         use novarocks_execution::task_execution::{SafeDetail, TaskFailure, TerminationDetail};
-        use novarocks_query_application::coordination::{RootReadFacts, TerminationLatch};
 
         #[derive(Clone, Copy, Debug)]
         enum Event {

@@ -54,6 +54,8 @@ use prometheus::{
     HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, Opts, Registry,
 };
 
+use crate::task_execution::operation::{OperationDispatchResult, WorkerReceiptOutcome};
+use crate::task_protocol_config::DispatchLane;
 #[cfg(test)]
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
@@ -68,11 +70,6 @@ use novarocks_proto_codec::native_rpc::NativeEndpointDomain;
 use novarocks_proto_codec::native_rpc::NativeRpcMethod;
 use novarocks_proto_models::catalog::CatalogSet;
 use novarocks_proto_models::novarocks as proto;
-use novarocks_query_application::coordination::{
-    DispatchLane, OperationDispatchResult, WorkerReceiptOutcome,
-};
-use novarocks_task_codec::TransportBudget;
-use novarocks_task_codec::domain as codec_domain;
 use novarocks_task_codec::domain::{stored_credential, stored_message};
 use novarocks_task_codec::operation as codec;
 use novarocks_task_codec::operation::{
@@ -84,6 +81,7 @@ use novarocks_task_codec::operation::{
     encode_covered_subscribe_task_status, encode_create_task, encode_establish_query_context,
     encode_operation_batch, encode_release_query_context, encode_renew_lease, encode_update_task,
 };
+use novarocks_task_codec::{TransportBudget, domain as codec_domain};
 use novarocks_types::identity::BackendProcessId;
 
 use novarocks_execution::task_execution::operation::QueryContextReceipt;
@@ -632,9 +630,11 @@ fn classify_apply_status(status: &tonic::Status) -> OperationDispatchResult {
                 .get("x-novarocks-ingress-rejection")
                 .and_then(|value| value.to_str().ok())
             {
-                Some("waiting_capacity") => novarocks_query_application::coordination::IngressRejection::WaitingCapacity,
-                Some("body_limit") => novarocks_query_application::coordination::IngressRejection::BodyLimit,
-                _ => novarocks_query_application::coordination::IngressRejection::UnclassifiedCapacity,
+                Some("waiting_capacity") => {
+                    crate::task_execution::operation::IngressRejection::WaitingCapacity
+                }
+                Some("body_limit") => crate::task_execution::operation::IngressRejection::BodyLimit,
+                _ => crate::task_execution::operation::IngressRejection::UnclassifiedCapacity,
             },
         ),
         _ => OperationDispatchResult::NonWorkerRejected,
@@ -3013,13 +3013,11 @@ fn observe_dispatch_result(
     let name = match result {
         OperationDispatchResult::WorkerReceipt(receipt) => outcome_name(receipt.outcome()),
         OperationDispatchResult::IngressRejected(kind) => match kind {
-            novarocks_query_application::coordination::IngressRejection::WaitingCapacity => {
+            crate::task_execution::operation::IngressRejection::WaitingCapacity => {
                 "ingress_waiting_capacity"
             }
-            novarocks_query_application::coordination::IngressRejection::BodyLimit => {
-                "ingress_body_limit"
-            }
-            novarocks_query_application::coordination::IngressRejection::UnclassifiedCapacity => {
+            crate::task_execution::operation::IngressRejection::BodyLimit => "ingress_body_limit",
+            crate::task_execution::operation::IngressRejection::UnclassifiedCapacity => {
                 "ingress_capacity_unclassified"
             }
         },
@@ -3098,10 +3096,11 @@ mod tests {
     use crate::task_execution::status_intake::{
         CountingWake, ObservationIntake, ObservationIntakeEntry, StatusIntake,
     };
+    use crate::task_protocol_config::DispatchBudget;
+    use novarocks_coordination_contract::MonotonicInstant;
     use novarocks_native_adapter::generated::nova_rocks_grpc_server::{
         NovaRocksGrpc, NovaRocksGrpcServer,
     };
-    use novarocks_query_application::coordination::{DispatchBudget, MonotonicInstant};
 
     use super::*;
 
@@ -4780,7 +4779,7 @@ mod tests {
         assert_eq!(
             classify_apply_status(&Status::new(tonic::Code::ResourceExhausted, "full")),
             OperationDispatchResult::IngressRejected(
-                novarocks_query_application::coordination::IngressRejection::UnclassifiedCapacity
+                crate::task_execution::operation::IngressRejection::UnclassifiedCapacity
             )
         );
         let mut waiting = Status::resource_exhausted("ignored detail");
@@ -4791,7 +4790,7 @@ mod tests {
         assert_eq!(
             classify_apply_status(&waiting),
             OperationDispatchResult::IngressRejected(
-                novarocks_query_application::coordination::IngressRejection::WaitingCapacity
+                crate::task_execution::operation::IngressRejection::WaitingCapacity
             )
         );
         let mut body = Status::resource_exhausted("ignored detail");
@@ -4802,7 +4801,7 @@ mod tests {
         assert_eq!(
             classify_apply_status(&body),
             OperationDispatchResult::IngressRejected(
-                novarocks_query_application::coordination::IngressRejection::BodyLimit
+                crate::task_execution::operation::IngressRejection::BodyLimit
             )
         );
         for code in [
@@ -5168,8 +5167,8 @@ mod tests {
     /// scripted covered source, so this does not claim a full BE system gate.
     #[tokio::test(flavor = "multi_thread")]
     async fn covered_loopback_backpressure_recovery_quiesce_settles_actual_root_seal() {
-        use crate::task_execution::clock::TaskProtocolClock;
         use crate::task_execution::round::TaskRound;
+        use novarocks_coordination_contract::MonotonicClock;
         use novarocks_execution::task_execution::TerminationDetail;
 
         async fn drive_until(round: &mut TaskRound, ready: impl Fn(&TaskRound) -> bool) {
@@ -5234,7 +5233,7 @@ mod tests {
                 3 * 4096,
                 4096,
                 Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
-                Arc::clone(&clock) as Arc<dyn TaskProtocolClock>,
+                Arc::clone(&clock) as Arc<dyn MonotonicClock>,
             )
             .unwrap(),
         );
@@ -5532,8 +5531,8 @@ mod tests {
     /// owner receives it. This is FE transport/owner integration evidence.
     #[tokio::test(flavor = "multi_thread")]
     async fn covered_foreign_status_process_reaches_actual_round_as_identity_violation() {
-        use crate::task_execution::clock::TaskProtocolClock;
         use crate::task_execution::error::{ParticipantObservationFailure, TaskExecutionError};
+        use novarocks_coordination_contract::MonotonicClock;
 
         let (mut round, clock, context, task) =
             crate::task_execution::tests::covered_loopback_recovery_round();
@@ -5563,7 +5562,7 @@ mod tests {
                 3 * 4096,
                 4096,
                 Arc::new(CountingWake::default()),
-                clock as Arc<dyn TaskProtocolClock>,
+                clock as Arc<dyn MonotonicClock>,
             )
             .unwrap(),
         );
@@ -7029,10 +7028,11 @@ mod tests {
 
     #[tokio::test]
     async fn constructor_refusals_keep_their_actual_producer_facts() {
+        use novarocks_coordination_contract::AttemptFailureClass;
         use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
-        use novarocks_query_application::{
-            coordination::{AttemptFailureClass, ReplacementQualificationFailure},
-            execution_error::{ExecutionFailureInput, ExecutionFailureSite},
+        use novarocks_query_application::coordination::ReplacementQualificationFailure;
+        use novarocks_query_application::execution_error::{
+            ExecutionFailureInput, ExecutionFailureSite,
         };
         let fixture = CoveredRoleFixture::new();
         let acks = TaskAckIntake::new(Arc::new(CountingWake::default()));

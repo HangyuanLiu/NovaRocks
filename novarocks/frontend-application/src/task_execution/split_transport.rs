@@ -54,13 +54,13 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use crate::task_execution::operation::{FrontendAction, frontend_action};
 use novarocks_execution::task_execution::{
     ContentFingerprint, DomainProgression, OperationKind, PlanNodeId, SplitAssignmentIntent,
     SplitSequence, TaskDomainReceipt, TaskDomainUpdate, TaskOperationId, UpdateTaskReceipt,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
-use novarocks_query_application::coordination::{FrontendAction, frontend_action};
 use novarocks_task_codec::domain::{split_offer, wire_split_assignment};
 use novarocks_types::UniqueId;
 use novarocks_types::identity::TaskId;
@@ -777,11 +777,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use crate::task_protocol_config::DispatchLane;
     use novarocks_execution::task_execution::{
         DomainProgression, OperationOutcome, PlanNodeSplitReceipt, SplitOffer, SplitWatermark,
         TaskIdentity, UpdateTask,
     };
-    use novarocks_query_application::coordination::DispatchLane;
     use novarocks_spi::connector::ConnectorReadWireEncoder;
     use novarocks_types::identity::{BackendProcessId, StageId};
     use novarocks_types::{AttemptId, QueryId};

@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use crate::api::QueryExecutionKind;
-use crate::coordination::{ExecutionEffect, RecoveryMode};
+use novarocks_coordination_contract::{ExecutionEffect, RecoveryMode};
 
 use super::CompletedPhysicalPlanCandidate;
 

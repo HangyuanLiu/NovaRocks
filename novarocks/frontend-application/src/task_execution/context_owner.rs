@@ -28,17 +28,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::task_execution::context_state::{
+    ContextTransition, QueryContextEvent, classify_context_transition, context_state_is_closed,
+};
+use crate::task_execution::lease::{RenewSchedule, RequestedLeaseDurations};
+use crate::task_execution::operation::{FrontendAction, OperationDispatchResult, frontend_action};
+use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution::task_execution::{
     AbortCause, AbortQueryContext, AcquireQueryContextAdmissionTicket, AdmissionEpochCapability,
     CodecOwnedContent, CredentialUpdate, EstablishQueryContext, LeaseSequence, LeaseValidFor,
     OperationKind, OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextRef,
     QueryContextState, QuiesceQueryContext, QuiesceQueryContextReceipt, ReleaseOutcome,
     ReleaseQueryContext, RenewQueryExecutionLease, TaskOperationId, UpdateQueryContext,
-};
-use novarocks_query_application::coordination::{
-    ContextTransition, FrontendAction, MonotonicInstant, OperationDispatchResult,
-    QueryContextEvent, RenewSchedule, RequestedLeaseDurations, classify_context_transition,
-    context_state_is_closed, frontend_action,
 };
 
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;

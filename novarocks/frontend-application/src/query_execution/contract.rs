@@ -419,7 +419,7 @@ pub(crate) fn build_request_from_finalized_execution(
     let restartable_read = restartable_read_intent && description.kind()
         == novarocks_query_application::api::QueryExecutionKind::Read
         && description.recovery()
-            == novarocks_query_application::coordination::RecoveryMode::RestartAttemptBeforeVisibility;
+            == novarocks_coordination_contract::RecoveryMode::RestartAttemptBeforeVisibility;
     let payload = if restartable_read {
         DistributedQueryPayload::RestartableRead(Arc::new(RestartableReadExecution {
             description,
@@ -790,7 +790,7 @@ impl DistributedQueryError {
         mut self,
         failure: novarocks_query_application::coordination::RootResultFetchFailure,
     ) -> Self {
-        use novarocks_query_application::coordination::AttemptFailureClass as C;
+        use novarocks_coordination_contract::AttemptFailureClass as C;
         if self.execution_failure().is_some() {
             // This is supplemental transport evidence, not another selection.
             self.root_fetch_failure = Some(failure);
@@ -1039,7 +1039,7 @@ mod tests {
             novarocks_plan_codec::PhysicalEncodeError::Invalid("FULL OUTER hash join".into()),
         ] {
             let fact = original.failure_fact();
-            let selected = novarocks_query_application::coordination::SelectedTaskTermination::new(
+            let selected = novarocks_coordination_contract::SelectedTaskTermination::new(
                 identity,
                 novarocks_execution_contract::TerminationDetail::Failed(
                     novarocks_execution_contract::TaskFailure::new_in_phase(
@@ -1285,8 +1285,8 @@ mod tests {
             candidate,
             Vec::new(),
             OutputContract::CompletionOnly,
-            novarocks_query_application::coordination::ExecutionEffect::None,
-            novarocks_query_application::coordination::RecoveryMode::NoRecovery,
+            novarocks_coordination_contract::ExecutionEffect::None,
+            novarocks_coordination_contract::RecoveryMode::NoRecovery,
             Vec::new(),
             FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
             ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
@@ -1557,7 +1557,7 @@ mod typed_compile_source_tests {
 #[cfg(test)]
 mod pre_ready_failure_fact_tests {
     use super::*;
-    use novarocks_query_application::coordination::AttemptFailureClass;
+    use novarocks_coordination_contract::AttemptFailureClass;
     use novarocks_query_application::execution_error::ExecutionFailureSite;
     #[test]
     fn pre_ready_facts_keep_exact_process_without_minting_transport_loss_or_retry() {

@@ -39,11 +39,11 @@ use novarocks_workload_control::WorkId;
 use super::ExecutionSchedulingFacts;
 use super::{QueryExecutionError, QueryExecutionErrorKind};
 use crate::coordination::{
-    AbortQueryContextEffectPort, AcceptedRootStatusSource, AttemptFailureClass, AttemptSchedule,
-    NativeAttemptDrive, RecoveryMode, ReplacementQualificationEffectPort,
-    ReplacementWorkerAdmissionEvidence,
+    AbortQueryContextEffectPort, AcceptedRootStatusSource, AttemptSchedule, NativeAttemptDrive,
+    ReplacementQualificationEffectPort, ReplacementWorkerAdmissionEvidence,
 };
 use crate::preparation::FrozenExecutionDescription;
+use novarocks_coordination_contract::{AttemptFailureClass, RecoveryMode};
 
 /// Runtime failure while opening the role-local Native execution session.
 ///
@@ -1122,14 +1122,15 @@ mod tests {
         FragmentSchedulingFacts, PlanScanIdentity, QueryExecutionKind, ScanSchedulingFacts,
     };
     use crate::coordination::{
-        ExecutionEffect, PermanentlyBackpressuredAbortEffectPort,
-        ReplacementQualificationEffectAdmission, ReplacementQualificationRequest,
+        PermanentlyBackpressuredAbortEffectPort, ReplacementQualificationEffectAdmission,
+        ReplacementQualificationRequest,
     };
     use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason};
     use crate::preparation::{
         ExecutionResourceRequirements, FrozenCostEstimate, FrozenEstimateUnknownReason,
         OutputContract,
     };
+    use novarocks_coordination_contract::ExecutionEffect;
     use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
     use novarocks_types::identity::{AttemptId, BackendProcessId, QueryId};
     use novarocks_workload_control::{

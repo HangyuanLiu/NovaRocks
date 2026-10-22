@@ -38,10 +38,10 @@ use tokio::task::JoinHandle;
 
 use crate::coordination::{
     AttemptInstantiationPermit, LogicalExecutionActor, LogicalExecutionActorConfig,
-    LogicalExecutionActorError, LogicalExecutionActorId, LogicalExecutionOutputTransfer,
-    RegistryClose, RegistryContextConvergence, assert_shutdown_complete,
-    spawn_logical_execution_actor,
+    LogicalExecutionActorError, LogicalExecutionOutputTransfer, RegistryClose,
+    RegistryContextConvergence, assert_shutdown_complete, spawn_logical_execution_actor,
 };
+use novarocks_coordination_contract::LogicalExecutionActorId;
 
 pub(crate) type StatementNativeResidualTask =
     Pin<Box<dyn Future<Output = Result<(), crate::api::QueryExecutionError>> + Send>>;
@@ -1299,7 +1299,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::coordination::{ExecutionEffect, LogicalConclusion};
+    use crate::coordination::LogicalConclusion;
+    use novarocks_coordination_contract::ExecutionEffect;
 
     fn execution(tag: u64) -> QueryExecutionId {
         QueryExecutionId::new(QueryId::new(91, tag as i64), AttemptId::new(1).unwrap()).unwrap()

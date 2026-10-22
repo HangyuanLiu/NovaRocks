@@ -30,6 +30,9 @@ use novarocks_connector_iceberg::storage_inspector::{
     IcebergStorageInspector, IcebergStoragePartitionTransform,
 };
 use novarocks_execution::runtime::execution_runtime::ExecutionRuntimeConfig;
+use novarocks_frontend_application::task_protocol_config::{
+    CoordinationBudgets, DispatchBudget, TaskUpdateRetryPolicy,
+};
 use novarocks_frontend_application::{
     ClusterBackendOpenConfig, FrontendApplicationOpenConfig, FrontendExecutionConfig,
     FrontendLogicalExecutionRuntimeConfig, FrontendManagementConfig, FrontendQueryControlTimeouts,
@@ -44,8 +47,7 @@ use novarocks_mv_application::scheduler::MvSchedulerConfig;
 use novarocks_native_adapter::FrontendTaskTransportBudget;
 use novarocks_native_adapter::backend_application::BackendServerConfig;
 use novarocks_query_application::coordination::{
-    CoordinationBudgets, DispatchBudget, LogicalExecutionRowsConfig,
-    LogicalExecutionSupervisorConfig, TaskUpdateRetryPolicy,
+    LogicalExecutionRowsConfig, LogicalExecutionSupervisorConfig,
 };
 use novarocks_query_application::cpu::{QueryBlockingExecutorConfig, QueryCpuExecutorConfig};
 use novarocks_query_application::publication::LakePublicationRuntimePolicy;
@@ -1164,8 +1166,8 @@ pub fn state_store_provider_registry(
 mod tests {
     use super::{compose_frontend_workload_runtime, compose_task_execution_budgets};
     use novarocks_execution_contract::{MaxWait, OperationKind};
+    use novarocks_frontend_application::task_protocol_config::DispatchBudget;
     use novarocks_native_adapter::FrontendTaskTransportBudget;
-    use novarocks_query_application::coordination::DispatchBudget;
     use novarocks_worker::LeaseBounds;
     use std::time::Duration;
 

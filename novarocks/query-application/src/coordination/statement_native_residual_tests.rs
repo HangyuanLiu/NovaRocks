@@ -321,7 +321,7 @@ fn registration_metadata_capacity_preserves_workload_fact_and_original_obligatio
     assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
     assert_eq!(
         input.attempt_class(),
-        crate::coordination::AttemptFailureClass::ResourceGovernance
+        novarocks_coordination_contract::AttemptFailureClass::ResourceGovernance
     );
     assert_eq!(
         input.detail().as_str(),

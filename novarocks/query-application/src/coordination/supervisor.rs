@@ -59,9 +59,10 @@ use super::{
     LogicalExecutionActorConfig, LogicalExecutionRuntimeRegistry,
     LogicalExecutionRuntimeRegistryError, LogicalExecutionRuntimeRegistryHandle,
     LogicalExecutionRuntimeShutdownError, NativeAttemptDrive, RecoveryDecision, RecoveryInput,
-    RecoveryMode, ResultPumpFailure, SupervisedActiveNativeOwner, assert_shutdown_complete,
+    ResultPumpFailure, SupervisedActiveNativeOwner, assert_shutdown_complete,
     build_attempt_schedule, evaluate_recovery,
 };
+use novarocks_coordination_contract::RecoveryMode;
 
 static NEXT_PROCESS_QUERY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const NATIVE_CONVERGENCE_PANIC_BACKOFF: Duration = Duration::from_millis(10);
@@ -2419,7 +2420,7 @@ mod tests {
         assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
         assert_eq!(
             input.attempt_class(),
-            super::super::AttemptFailureClass::ExecutionFailure
+            novarocks_coordination_contract::AttemptFailureClass::ExecutionFailure
         );
 
         let source = WorkError::CapacityWaitTimeout;
@@ -2464,18 +2465,20 @@ mod tests {
         NativeAttemptPreparationFuture, NativeAttemptPreparationPort,
         NativeAttemptPreparationRequest, NativeAttemptRunFuture,
     };
-    use crate::coordination::AttemptSchedule;
-    use crate::coordination::ReplacementWorkerAdmissionEvidence;
     use crate::coordination::{
         AdmissionIssueSettlement, EstablishIssueIdentity, EstablishIssueSubmit,
         EstablishTransportAdmission, EstablishTransportReservation, EstablishTransportSink,
         EstablishTransportSubmission,
     };
-    use crate::coordination::{AttemptFailureClass, PermanentlyBackpressuredAbortEffectPort};
+    use crate::coordination::{
+        AttemptSchedule, PermanentlyBackpressuredAbortEffectPort,
+        ReplacementWorkerAdmissionEvidence,
+    };
     use crate::preparation::{
         ExecutionResourceRequirements, FrozenCostEstimate, FrozenEstimateUnknownReason,
         FrozenExecutionDescription, OutputContract,
     };
+    use novarocks_coordination_contract::AttemptFailureClass;
 
     use super::*;
 
@@ -2766,7 +2769,7 @@ mod tests {
             plan.candidate().clone(),
             Vec::new(),
             OutputContract::CompletionOnly,
-            super::super::ExecutionEffect::None,
+            novarocks_coordination_contract::ExecutionEffect::None,
             RecoveryMode::NoRecovery,
             Vec::new(),
             FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
@@ -2821,7 +2824,7 @@ mod tests {
             candidate,
             Vec::new(),
             output,
-            super::super::ExecutionEffect::None,
+            novarocks_coordination_contract::ExecutionEffect::None,
             recovery,
             Vec::new(),
             FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),

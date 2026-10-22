@@ -27,6 +27,9 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use novarocks_execution::task_execution::FetchTaskDynamicFilters;
+use crate::task_execution::operation::{OperationDispatchResult, WorkerReceiptOutcome};
+use crate::task_protocol_config::{DispatchBudget, DispatchLane};
+use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution::task_execution::{
     AbortQueryContext, AcquireQueryContextAdmissionTicket, CancelTask, CreateTaskReceipt,
     EstablishQueryContext, OperationKind, OperationOutcome, OperationShape,
@@ -36,9 +39,6 @@ use novarocks_execution::task_execution::{
     status::SafeDetail,
 };
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
-use novarocks_query_application::coordination::{
-    DispatchBudget, DispatchLane, MonotonicInstant, OperationDispatchResult, WorkerReceiptOutcome,
-};
 use novarocks_types::identity::BackendProcessId;
 
 /// What one queued operation costs in queue bytes on top of its payload.

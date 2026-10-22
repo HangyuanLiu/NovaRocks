@@ -31,8 +31,8 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::query_execution::artifact::FragmentId;
+use crate::task_protocol_config::TaskUpdateRetryPolicy;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
-use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 use novarocks_types::UniqueId;
 
 use novarocks_spi::connector::ConnectorReadWireEncoder;

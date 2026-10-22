@@ -36,10 +36,10 @@ use crate::api::{NativeAttemptTerminal, NativeAttemptTopologyRequirement};
 use crate::api::{QueryExecutionError, QueryExecutionErrorKind};
 
 use super::{
-    AttemptFailureClass, LogicalConclusion, LogicalExecutionActor, LogicalExecutionActorError,
-    ReplacementQualification, RootResultObserver, RootTerminalFailure, RunningAttemptHandoffError,
-    RunningAttemptPermit,
+    LogicalConclusion, LogicalExecutionActor, LogicalExecutionActorError, ReplacementQualification,
+    RootResultObserver, RootTerminalFailure, RunningAttemptHandoffError, RunningAttemptPermit,
 };
+use novarocks_coordination_contract::AttemptFailureClass;
 
 pub(crate) struct NativeAttemptTerminalSender {
     sender: Option<oneshot::Sender<NativeAttemptTerminal>>,
@@ -227,7 +227,7 @@ struct AcceptedRootObservation {
 pub enum AcceptedAttemptFailure {
     None,
     DerivedPending,
-    Authoritative(super::SelectedTaskTermination),
+    Authoritative(novarocks_coordination_contract::SelectedTaskTermination),
 }
 
 #[cfg(test)]
@@ -304,7 +304,7 @@ impl AcceptedRootStatusSender {
     pub fn publish_with_attempt_failure(
         &self,
         status: TaskStatus,
-        authoritative_attempt_failure: super::SelectedTaskTermination,
+        authoritative_attempt_failure: novarocks_coordination_contract::SelectedTaskTermination,
     ) -> Result<(), QueryExecutionError> {
         self.publish_attempt_observation(
             status,
@@ -1542,13 +1542,15 @@ fn cancellation_failure(reason: CancellationReason) -> RootResultFetchFailure {
 }
 fn classify_root_termination(
     status: &TaskStatus,
-    authoritative_attempt_failure: Option<&super::SelectedTaskTermination>,
+    authoritative_attempt_failure: Option<
+        &novarocks_coordination_contract::SelectedTaskTermination,
+    >,
 ) -> Option<RootResultFetchFailure> {
     let selected;
     let original = match authoritative_attempt_failure {
         Some(original) => original,
         None => {
-            selected = super::SelectedTaskTermination::new(
+            selected = novarocks_coordination_contract::SelectedTaskTermination::new(
                 status.identity(),
                 status.termination()?.clone(),
             );
@@ -1612,13 +1614,11 @@ mod tests {
     };
     use tokio::{runtime::Handle, sync::Notify};
 
-    use crate::{
-        api::{ExecutionOutput, ResultDelivery, ResultField, ResultSchema},
-        coordination::{
-            ExecutionEffect, LogicalExecutionActor, LogicalExecutionActorConfig,
-            spawn_logical_execution_actor,
-        },
+    use crate::api::{ExecutionOutput, ResultDelivery, ResultField, ResultSchema};
+    use crate::coordination::{
+        LogicalExecutionActor, LogicalExecutionActorConfig, spawn_logical_execution_actor,
     };
+    use novarocks_coordination_contract::ExecutionEffect;
 
     use super::*;
 
@@ -1757,7 +1757,8 @@ mod tests {
             TaskOutputFacts::default(),
         )
         .unwrap();
-        let authoritative = super::super::SelectedTaskTermination::new(origin, failure);
+        let authoritative =
+            novarocks_coordination_contract::SelectedTaskTermination::new(origin, failure);
         for (decision, identity) in [
             (classify_root_termination(&failed, None).unwrap(), root),
             (
@@ -1946,7 +1947,7 @@ mod tests {
         sender
             .publish_with_attempt_failure(
                 status,
-                super::super::SelectedTaskTermination::new(
+                novarocks_coordination_contract::SelectedTaskTermination::new(
                     root,
                     TerminationDetail::Failed(TaskFailure::new(
                         novarocks_execution_contract::failure::FailureFact::new(
@@ -2107,7 +2108,7 @@ mod tests {
             sender
                 .publish_with_attempt_failure(
                     status.clone(),
-                    super::super::SelectedTaskTermination::new(
+                    novarocks_coordination_contract::SelectedTaskTermination::new(
                         root,
                         status.termination().unwrap().clone(),
                     ),
@@ -2215,7 +2216,7 @@ mod tests {
         sender
             .publish_with_attempt_failure(
                 pending,
-                super::super::SelectedTaskTermination::new(
+                novarocks_coordination_contract::SelectedTaskTermination::new(
                     root,
                     TerminationDetail::Failed(TaskFailure::new(
                         novarocks_execution_contract::failure::FailureFact::new(

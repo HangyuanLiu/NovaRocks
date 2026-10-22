@@ -17,9 +17,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::internal_result::{InternalDomainFailure, InternalDomainSlot, InternalDomainState};
@@ -319,7 +318,7 @@ pub struct FrontendDistributedQueryCoordinator {
     ///
     /// Held rather than read per attempt so a deployment's bounds cannot change
     /// while the process runs.
-    coordination_budgets: novarocks_query_application::coordination::CoordinationBudgets,
+    coordination_budgets: crate::task_protocol_config::CoordinationBudgets,
     transport_budget: novarocks_task_codec::TransportBudget,
     /// This frontend process's own identity, minted once per process.
     ///
@@ -327,7 +326,7 @@ pub struct FrontendDistributedQueryCoordinator {
     /// frontend's contexts from a restarted frontend's. Minting it per process
     /// rather than per query is what makes that distinction meaningful.
     frontend_process_id: FrontendProcessId,
-    task_update_retry_policy: novarocks_query_application::coordination::TaskUpdateRetryPolicy,
+    task_update_retry_policy: crate::task_protocol_config::TaskUpdateRetryPolicy,
     connector_split_initial_dynamic_filter_wait_cap: Duration,
     native_compatibility_id: NativeCompatibilityId,
 }
@@ -355,9 +354,9 @@ impl FrontendDistributedQueryCoordinator {
     pub(crate) fn new(
         runtime_filter_worker_count: NonZeroUsize,
         native_compatibility_id: NativeCompatibilityId,
-        task_update_retry_policy: novarocks_query_application::coordination::TaskUpdateRetryPolicy,
+        task_update_retry_policy: crate::task_protocol_config::TaskUpdateRetryPolicy,
         connector_split_initial_dynamic_filter_wait_cap: Duration,
-        coordination_budgets: novarocks_query_application::coordination::CoordinationBudgets,
+        coordination_budgets: crate::task_protocol_config::CoordinationBudgets,
         transport_budget: novarocks_task_codec::TransportBudget,
         backend_topology: novarocks_query_application::api::BackendTopologyService,
         data_runtime: FrontendDataRuntime,
@@ -435,8 +434,7 @@ impl FrontendDistributedQueryCoordinator {
         backend_topology: novarocks_query_application::api::BackendTopologyService,
     ) -> Self {
         Self {
-            coordination_budgets:
-                novarocks_query_application::coordination::CoordinationBudgets::DEFAULT,
+            coordination_budgets: crate::task_protocol_config::CoordinationBudgets::DEFAULT,
             transport_budget: novarocks_task_codec::TransportBudget::DEFAULT,
             frontend_process_id: FrontendProcessId::new_v7(),
             backend_topology,
@@ -457,8 +455,7 @@ impl FrontendDistributedQueryCoordinator {
             statement_observation: None,
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
             internal_result_cpu: None,
-            task_update_retry_policy:
-                novarocks_query_application::coordination::TaskUpdateRetryPolicy::default(),
+            task_update_retry_policy: crate::task_protocol_config::TaskUpdateRetryPolicy::default(),
             connector_split_initial_dynamic_filter_wait_cap:
                 DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
             native_compatibility_id: NativeCompatibilityId::new([0x71; 32]),
@@ -500,8 +497,7 @@ impl FrontendDistributedQueryCoordinator {
         backend_topology: novarocks_query_application::api::BackendTopologyService,
     ) -> Self {
         Self {
-            coordination_budgets:
-                novarocks_query_application::coordination::CoordinationBudgets::DEFAULT,
+            coordination_budgets: crate::task_protocol_config::CoordinationBudgets::DEFAULT,
             transport_budget: novarocks_task_codec::TransportBudget::DEFAULT,
             frontend_process_id: FrontendProcessId::new_v7(),
             backend_topology,
@@ -524,8 +520,7 @@ impl FrontendDistributedQueryCoordinator {
             statement_observation: None,
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
             internal_result_cpu: None,
-            task_update_retry_policy:
-                novarocks_query_application::coordination::TaskUpdateRetryPolicy::default(),
+            task_update_retry_policy: crate::task_protocol_config::TaskUpdateRetryPolicy::default(),
             connector_split_initial_dynamic_filter_wait_cap:
                 DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
             native_compatibility_id: NativeCompatibilityId::new([0x71; 32]),
@@ -1871,7 +1866,7 @@ impl FrontendDistributedQueryCoordinator {
                                 RootPollControl::AwaitTerminalControl
                             }
                             RelayedRootAnswer::FetchFailure(error) => {
-                                use novarocks_query_application::coordination::AttemptFailureClass as C;
+                                use novarocks_coordination_contract::AttemptFailureClass as C;
                                 let cause = if error.class() == C::RecoverableInfrastructure {
                                     QueryFailureCause::RemoteTransportObservation
                                 } else {
@@ -3061,14 +3056,16 @@ mod tests {
 
     #[test]
     fn foreground_execution_panic_keeps_execution_fact_and_safe_detail_without_recovery() {
+        use novarocks_coordination_contract::{AttemptFailureClass, ExecutionEffect, RecoveryMode};
         use novarocks_execution_contract::failure::{FailureEvidence, FailureProjection};
-        use novarocks_query_application::{
-            api::{NativeAttemptTopologyRequirement, QueryExecutionError, QueryExecutionErrorKind},
-            coordination::{
-                AttemptFailureClass, ExecutionEffect, RecoveryDecision, RecoveryInput,
-                RecoveryMode, RecoveryRefusal, evaluate_recovery,
-            },
-            execution_error::{ExecutionFailureSite, QueryFailureReason},
+        use novarocks_query_application::api::{
+            NativeAttemptTopologyRequirement, QueryExecutionError, QueryExecutionErrorKind,
+        };
+        use novarocks_query_application::coordination::{
+            RecoveryDecision, RecoveryInput, RecoveryRefusal, evaluate_recovery,
+        };
+        use novarocks_query_application::execution_error::{
+            ExecutionFailureSite, QueryFailureReason,
         };
         let input = super::foreground_native_execution_panic_input(QueryExecutionError::new(
             QueryExecutionErrorKind::Failed,

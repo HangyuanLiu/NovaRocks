@@ -24,13 +24,13 @@
 use std::fmt;
 use std::time::Duration;
 
+use crate::task_execution::operation::OperationDispatchResult;
+use crate::task_execution::status_validation::FinalInfoDisagreement;
+use crate::task_protocol_config::DispatchLane;
+use novarocks_coordination_contract::{ResultPacketVerdict, StatusObservation};
 use novarocks_execution::task_execution::{
     DescriptorError, DomainConflict, ExchangeEdgeId, IdentityMismatch, OperationKind,
     OperationOutcome, QueryContextRef, RequestError, TaskOperationId, TaskState,
-};
-use novarocks_query_application::coordination::{
-    DispatchLane, FinalInfoDisagreement, OperationDispatchResult, ResultPacketVerdict,
-    StatusObservation,
 };
 use novarocks_types::identity::{BackendProcessId, TaskId};
 
@@ -892,8 +892,8 @@ mod canonical_input_tests {
     }
     #[test]
     fn only_original_covered_connection_loss_requests_exact_process_recovery() {
+        use novarocks_coordination_contract::AttemptFailureClass;
         use novarocks_query_application::api::NativeAttemptTopologyRequirement;
-        use novarocks_query_application::coordination::AttemptFailureClass;
         let backend = BackendProcessId::new_v7();
         let actual = TaskExecutionError::ParticipantUnobservable {
             backend,
@@ -1101,7 +1101,7 @@ mod actor_gate_failure_carry_tests {
         assert_eq!(input.fact().evidence(), FailureEvidence::StopObservation);
         assert_eq!(
             input.attempt_class(),
-            novarocks_query_application::coordination::AttemptFailureClass::ExecutionFailure
+            novarocks_coordination_contract::AttemptFailureClass::ExecutionFailure
         );
     }
 }

@@ -345,13 +345,12 @@ async fn drive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_coordination_contract::AttemptFailureClass;
     use novarocks_execution_contract::{
         root_lifetime::RootReadSealed,
         root_result::{RootReadOutcome, RootResultData, RootResultReply},
     };
-    use novarocks_query_application::{
-        api::QueryExecutionError, coordination::AttemptFailureClass,
-    };
+    use novarocks_query_application::api::QueryExecutionError;
     use novarocks_result_contract::InternalResultDomain;
     use novarocks_types::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,

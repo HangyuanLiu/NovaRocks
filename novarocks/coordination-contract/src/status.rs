@@ -15,33 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::fmt;
-
-use novarocks_execution_contract::{
-    FinalTaskInfo, IdentityMismatch, TaskIdentity, TaskStatus, TaskStatusCursor, TaskStatusVersion,
-};
-
-/// One event delivered by query coordination's status-observation port.
-///
-/// Losing the observation stream is not an operation receipt and does not
-/// change a Worker task. The coordinator resubscribes from its retained
-/// cursors when it receives `ObservationLost`.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "status events carry the exact TaskStatus inline across the role adapter boundary"
-)]
-pub enum StatusObservationPortEvent {
-    Published(TaskStatus),
-    Gone(TaskIdentity),
-    ObservationLost,
-}
-
-impl StatusObservationPortEvent {
-    pub const fn requires_resubscribe(&self) -> bool {
-        matches!(self, Self::ObservationLost)
-    }
-}
+use novarocks_execution_contract::{IdentityMismatch, TaskStatus, TaskStatusCursor};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatusObservation {
@@ -114,71 +88,6 @@ pub fn classify_observation(
     StatusObservation::Accept
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum GoneObservation {
-    RetentionEnded,
-    TerminalNeverObserved,
-}
-
-pub fn classify_gone(held: Option<&TaskStatus>) -> GoneObservation {
-    if held.is_some_and(TaskStatus::is_terminal) {
-        GoneObservation::RetentionEnded
-    } else {
-        GoneObservation::TerminalNeverObserved
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum FinalInfoDisagreement {
-    Identity(IdentityMismatch),
-    TerminalVersion {
-        observed: TaskStatusVersion,
-        carried: TaskStatusVersion,
-    },
-    SnapshotConflict(TaskStatusVersion),
-}
-
-impl fmt::Display for FinalInfoDisagreement {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Identity(mismatch) => write!(formatter, "final task info {mismatch}"),
-            Self::TerminalVersion { observed, carried } => write!(
-                formatter,
-                "final task info carries terminal version {carried}, but version {observed} was observed"
-            ),
-            Self::SnapshotConflict(version) => write!(
-                formatter,
-                "final task info carries a different snapshot under terminal version {version}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for FinalInfoDisagreement {}
-
-pub fn verify_final_info(
-    observed_terminal: &TaskStatus,
-    info: &FinalTaskInfo,
-) -> Result<(), FinalInfoDisagreement> {
-    let carried = info.final_status();
-    if let Err(mismatch) = observed_terminal
-        .identity()
-        .verify_matches(carried.identity())
-    {
-        return Err(FinalInfoDisagreement::Identity(mismatch));
-    }
-    if carried.version() != observed_terminal.version() {
-        return Err(FinalInfoDisagreement::TerminalVersion {
-            observed: observed_terminal.version(),
-            carried: carried.version(),
-        });
-    }
-    if carried != observed_terminal {
-        return Err(FinalInfoDisagreement::SnapshotConflict(carried.version()));
-    }
-    Ok(())
-}
-
 /// Query-side validation of a newly observed task state.
 ///
 /// This mirrors the protocol state machine but does not authorize Worker
@@ -235,41 +144,11 @@ pub fn classify_observed_task_transition(
 }
 
 #[cfg(test)]
-mod tests {
-    use novarocks_execution_contract::TaskState;
-
-    use super::{
-        ObservedTaskTransition, StatusObservationPortEvent, classify_observed_task_transition,
-    };
-
-    #[test]
-    fn observation_loss_is_a_port_event_that_only_requests_resubscription() {
-        assert!(StatusObservationPortEvent::ObservationLost.requires_resubscribe());
-    }
-
-    #[test]
-    fn observed_transitions_do_not_authorize_worker_mutation() {
-        assert_eq!(
-            classify_observed_task_transition(TaskState::Running, TaskState::Finished),
-            ObservedTaskTransition::Advance
-        );
-        assert_eq!(
-            classify_observed_task_transition(TaskState::Finished, TaskState::Finished),
-            ObservedTaskTransition::TerminalOverwrite
-        );
-        assert_eq!(
-            classify_observed_task_transition(TaskState::Flushing, TaskState::Running),
-            ObservedTaskTransition::Illegal
-        );
-    }
-}
-
-#[cfg(test)]
 mod accepted_cause_observation_tests {
     use super::*;
     use novarocks_execution_contract::{
-        AbortCause, CancelReason, SafeDetail, TaskFailure, TaskOutputFacts, TaskState,
-        TerminationDetail,
+        AbortCause, CancelReason, SafeDetail, TaskFailure, TaskIdentity, TaskOutputFacts,
+        TaskState, TaskStatusVersion, TerminationDetail,
     };
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
@@ -409,6 +288,28 @@ mod accepted_cause_observation_tests {
                 &snapshot(identity, 9, failure.termination().cloned(), true)
             ),
             StatusObservation::TerminalOverwrite
+        );
+    }
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use super::*;
+    use novarocks_execution_contract::TaskState;
+
+    #[test]
+    fn observed_transitions_do_not_authorize_worker_mutation() {
+        assert_eq!(
+            classify_observed_task_transition(TaskState::Running, TaskState::Finished),
+            ObservedTaskTransition::Advance
+        );
+        assert_eq!(
+            classify_observed_task_transition(TaskState::Finished, TaskState::Finished),
+            ObservedTaskTransition::TerminalOverwrite
+        );
+        assert_eq!(
+            classify_observed_task_transition(TaskState::Flushing, TaskState::Running),
+            ObservedTaskTransition::Illegal
         );
     }
 }

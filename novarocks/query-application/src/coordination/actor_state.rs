@@ -29,11 +29,11 @@ use novarocks_execution_contract::{
 use novarocks_types::identity::{QueryExecutionId, QueryId};
 
 use super::{
-    AttemptFailureClass, BeginSchemaDelivery, CompletedDelivery, DeliveryCompletion,
-    DeliveryCompletionError, DeliveryGate, DeliveryGateError, DeliveryPermit, DeliveryPhase,
-    DeliveryRejection, ExecutionEffect, RecoveryDecision, RecoveryInput, RecoveryMode,
-    ResultPacket, SchemaDeliveryPermit, evaluate_recovery,
+    BeginSchemaDelivery, CompletedDelivery, DeliveryCompletion, DeliveryCompletionError,
+    DeliveryGate, DeliveryGateError, DeliveryPermit, DeliveryPhase, DeliveryRejection,
+    RecoveryDecision, RecoveryInput, ResultPacket, SchemaDeliveryPermit, evaluate_recovery,
 };
+use novarocks_coordination_contract::{AttemptFailureClass, ExecutionEffect, RecoveryMode};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AttemptConvergenceFacts {
@@ -90,7 +90,6 @@ pub enum LogicalConclusion {
     Succeeded,
     Failed,
     Cancelled,
-    BusinessDecisionRequired,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -401,16 +400,21 @@ pub enum WakeKey {
 pub struct ScheduledWakeup {
     pub key: WakeKey,
     pub generation: u64,
-    pub deadline: super::MonotonicInstant,
+    pub deadline: novarocks_coordination_contract::MonotonicInstant,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct NextWakeup {
-    deadlines: BTreeMap<(WakeKey, u64), super::MonotonicInstant>,
+    deadlines: BTreeMap<(WakeKey, u64), novarocks_coordination_contract::MonotonicInstant>,
 }
 
 impl NextWakeup {
-    pub fn schedule(&mut self, key: WakeKey, generation: u64, deadline: super::MonotonicInstant) {
+    pub fn schedule(
+        &mut self,
+        key: WakeKey,
+        generation: u64,
+        deadline: novarocks_coordination_contract::MonotonicInstant,
+    ) {
         self.deadlines.insert((key, generation), deadline);
     }
 
@@ -429,7 +433,10 @@ impl NextWakeup {
             })
     }
 
-    pub fn take_due(&mut self, now: super::MonotonicInstant) -> Vec<ScheduledWakeup> {
+    pub fn take_due(
+        &mut self,
+        now: novarocks_coordination_contract::MonotonicInstant,
+    ) -> Vec<ScheduledWakeup> {
         let mut due = self
             .deadlines
             .iter()
@@ -1938,7 +1945,7 @@ mod tests {
     #[test]
     fn exact_timer_keys_do_not_overwrite_attempts() {
         let mut wakeup = NextWakeup::default();
-        let origin = super::super::MonotonicInstant::ORIGIN;
+        let origin = novarocks_coordination_contract::MonotonicInstant::ORIGIN;
         wakeup.schedule(
             WakeKey::AttemptBackoff(execution(1)),
             1,
@@ -1971,7 +1978,7 @@ mod tests {
     #[test]
     fn stale_timer_generation_cannot_replace_or_clear_the_current_generation() {
         let mut wakeup = NextWakeup::default();
-        let origin = super::super::MonotonicInstant::ORIGIN;
+        let origin = novarocks_coordination_contract::MonotonicInstant::ORIGIN;
         let key = WakeKey::Statement;
         wakeup.schedule(key, 2, origin.saturating_add(Duration::from_secs(2)));
         wakeup.schedule(key, 1, origin.saturating_add(Duration::from_secs(1)));

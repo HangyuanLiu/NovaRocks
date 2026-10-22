@@ -29,12 +29,13 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use crate::task_execution::operation::OperationDispatchResult;
 use novarocks_execution::task_execution::{OperationKind, TaskOperationId};
 use novarocks_query_application::coordination::{
     AdmissionIssueReceipt, AdmissionIssueSettlement, EstablishIssueError, EstablishIssueSubmit,
     EstablishTransportAdmission, EstablishTransportReservation, EstablishTransportSink,
     EstablishTransportSubmission, LateEstablishWorkerSettlement, LogicalExecutionActorError,
-    NativeAttemptDrive, OperationDispatchResult,
+    NativeAttemptDrive,
 };
 use novarocks_types::NativeCompatibilityId;
 
@@ -732,6 +733,8 @@ mod tests {
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
+    use crate::task_protocol_config::DispatchLane;
+    use novarocks_coordination_contract::{ExecutionEffect, MonotonicInstant};
     use novarocks_execution::task_execution::{
         AcquireQueryContextAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
         CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch,
@@ -740,8 +743,7 @@ mod tests {
         QueryContextRef, QueryContextState, TaskOperationId,
     };
     use novarocks_query_application::coordination::{
-        AbortQueryContextEffectPort, DispatchLane, ExecutionEffect, LogicalExecutionActorConfig,
-        MonotonicInstant,
+        AbortQueryContextEffectPort, LogicalExecutionActorConfig,
     };
     use novarocks_query_application::test_support::LogicalExecutionTestHarness;
     use novarocks_types::identity::{
@@ -1139,7 +1141,7 @@ mod tests {
             harness.request.envelope().operation_id(),
             OperationKind::UpdateQueryContext,
             OperationDispatchResult::IngressRejected(
-                novarocks_query_application::coordination::IngressRejection::WaitingCapacity,
+                crate::task_execution::operation::IngressRejection::WaitingCapacity,
             ),
             AckPayload::None,
         );
@@ -1196,7 +1198,7 @@ mod tests {
             request.envelope().operation_id(),
             OperationKind::AcquireQueryContextAdmissionTicket,
             OperationDispatchResult::IngressRejected(
-                novarocks_query_application::coordination::IngressRejection::WaitingCapacity,
+                crate::task_execution::operation::IngressRejection::WaitingCapacity,
             ),
             AckPayload::None,
         );

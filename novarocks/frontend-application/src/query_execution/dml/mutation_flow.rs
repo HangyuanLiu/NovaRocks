@@ -16,8 +16,7 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
 use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array, Int64Array, StringArray};
@@ -2220,9 +2219,8 @@ fn build_cow_update_distributed_write(
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
     write_session: Arc<ConnectorWriteSession>,
 ) -> Result<CowUpdateDistributedWrite, crate::dml::error::DmlExecutionError> {
-    use super::cow_closed_ast as closed;
-    use super::cow_closed_route as route_builder;
     use super::cow_compile_receipt::{self as footprint, recipe};
+    use super::{cow_closed_ast as closed, cow_closed_route as route_builder};
     let original = write_session
         .cow_original()
         .ok_or_else(|| "COW compilation requires the original Internal result scope".to_string())?
@@ -3616,8 +3614,8 @@ fn execute_exact_cow_match_query(
                 .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
                 .collect(),
             output,
-            novarocks_query_application::coordination::ExecutionEffect::None,
-            novarocks_query_application::coordination::RecoveryMode::NoRecovery,
+            novarocks_coordination_contract::ExecutionEffect::None,
+            novarocks_coordination_contract::RecoveryMode::NoRecovery,
             Vec::new(),
             novarocks_query_application::preparation::FrozenCostEstimate::unknown(
                 novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,

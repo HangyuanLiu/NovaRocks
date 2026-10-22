@@ -17,7 +17,7 @@
 
 use std::fmt;
 
-use novarocks_execution_contract::{TaskState, TaskStatus};
+use novarocks_execution_contract::TaskState;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum StageState {
@@ -164,49 +164,6 @@ impl AttemptDrainFacts {
     }
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct WriteCompletionFacts {
-    all_writers_finished: bool,
-    root_finish_task_finished: bool,
-    prepared_write_set_complete: bool,
-    external_commit_succeeded: bool,
-    any_writer_canceled: bool,
-}
-
-impl WriteCompletionFacts {
-    pub const fn new(
-        writers: bool,
-        root: bool,
-        prepared: bool,
-        committed: bool,
-        canceled: bool,
-    ) -> Self {
-        Self {
-            all_writers_finished: writers,
-            root_finish_task_finished: root,
-            prepared_write_set_complete: prepared,
-            external_commit_succeeded: committed,
-            any_writer_canceled: canceled,
-        }
-    }
-
-    pub const fn client_visible_completion(self) -> bool {
-        !self.any_writer_canceled
-            && self.all_writers_finished
-            && self.root_finish_task_finished
-            && self.prepared_write_set_complete
-            && self.external_commit_succeeded
-    }
-}
-
-pub fn terminals_are_success_compatible<'a>(
-    statuses: impl IntoIterator<Item = &'a TaskStatus>,
-) -> bool {
-    statuses
-        .into_iter()
-        .all(TaskStatus::is_success_compatible_terminal)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,12 +172,5 @@ mod tests {
     fn read_completion_does_not_wait_for_attempt_drain() {
         assert!(RootReadFacts::new(TaskState::Finished, true, false).client_visible_completion());
         assert!(!AttemptDrainFacts::new(true, false, false).drained());
-    }
-
-    #[test]
-    fn a_cancelled_writer_cannot_be_write_success() {
-        assert!(
-            !WriteCompletionFacts::new(true, true, true, true, true).client_visible_completion()
-        );
     }
 }

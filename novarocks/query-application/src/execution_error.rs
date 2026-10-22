@@ -20,10 +20,8 @@
 //! instruction. Transport loss must be authored where it was actually observed;
 //! capacity, a local timeout and an answered remote refusal cannot manufacture it.
 
-use crate::{
-    api::{NativeAttemptTopologyRequirement, QueryExecutionErrorKind},
-    coordination::AttemptFailureClass,
-};
+use crate::api::{NativeAttemptTopologyRequirement, QueryExecutionErrorKind};
+use novarocks_coordination_contract::AttemptFailureClass;
 use novarocks_execution_contract::{
     QueryContextRef, SafeDetail, TaskFailurePhase, TaskIdentity, TaskOperationId,
     failure::{FailureClass, FailureFact, FailureProjection, FailureReason, domain},
@@ -73,7 +71,7 @@ impl ExecutionFailureInput {
         Self { fact, detail, site }
     }
     pub fn from_selected_task(
-        selected: &crate::coordination::SelectedTaskTermination,
+        selected: &novarocks_coordination_contract::SelectedTaskTermination,
     ) -> Option<Self> {
         use novarocks_execution_contract::{AbortCause, TerminationDetail};
         let identity = selected.identity();
@@ -478,7 +476,7 @@ mod boundary_tests {
             SafeDetail::truncating("finite preparation capacity"),
             TaskFailurePhase::Preparation,
         );
-        let selected = crate::coordination::SelectedTaskTermination::new(
+        let selected = novarocks_coordination_contract::SelectedTaskTermination::new(
             origin,
             TerminationDetail::Failed(failure),
         );

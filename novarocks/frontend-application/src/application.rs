@@ -23,11 +23,12 @@ use tokio::runtime::Handle;
 
 use crate::query_execution::internal_result_cpu::{InternalResultCpu, InternalResultCpuOwner};
 use crate::query_execution::service::QueryExecutionService;
+use crate::task_protocol_config::CoordinationBudgets;
 use novarocks_native_adapter::FrontendTaskTransportBudget;
 use novarocks_query_application::api::QueryExecutionClient;
 use novarocks_query_application::coordination::{
-    CoordinationBudgets, LogicalExecutionRowsConfig, LogicalExecutionSupervisor,
-    LogicalExecutionSupervisorConfig, LogicalExecutionSupervisorShutdownError,
+    LogicalExecutionRowsConfig, LogicalExecutionSupervisor, LogicalExecutionSupervisorConfig,
+    LogicalExecutionSupervisorShutdownError,
 };
 use novarocks_query_application::cpu::{
     QueryBlockingExecutor, QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
@@ -39,11 +40,11 @@ use novarocks_workload_control::{
 };
 
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
+use crate::task_protocol_config::TaskUpdateRetryPolicy;
 use novarocks_catalog_application::CatalogAttachmentRepository;
 use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
 use novarocks_mv_application::scheduler::MvSchedulerConfig;
 use novarocks_native_trust::{NativeProcessIdentity, NativeTrust};
-use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_state_store_api::{StateStore, StateStoreProviderId};
 use novarocks_state_store_runtime::{
@@ -57,8 +58,9 @@ use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogControll
 use crate::catalog_prune::{CatalogPruneConfig, FrontendCatalogPruneService};
 use crate::coordinator::FrontendDistributedQueryCoordinator;
 use crate::native::data_runtime::FrontendDataRuntime;
-use crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics;
-use crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceReader;
+use crate::query_execution::lifecycle_diagnostics::{
+    FrontendLifecycleDiagnostics, QueryLifecycleConvergenceReader,
+};
 use crate::query_execution::logical_read::LogicalReadLauncher;
 use crate::query_execution::native_execution_adapter::{
     FrontendLogicalExecutionNativePort, FrontendNativeLogicalExecutionRuntime,

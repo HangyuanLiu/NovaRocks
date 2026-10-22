@@ -38,9 +38,10 @@ use crate::api::{
 
 use super::{
     AdmissionIssueDisposition, AdmissionIssueReceipt, AdmissionIssueSettlement,
-    AttemptActivationIdentity, EstablishIssuePermit, LogicalExecutionActorError,
-    RunningAttemptDriveAuthority, RunningAttemptPermit,
+    EstablishIssuePermit, LogicalExecutionActorError, RunningAttemptDriveAuthority,
+    RunningAttemptPermit,
 };
+use novarocks_coordination_contract::AttemptActivationIdentity;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AttemptScheduleError(Arc<str>);

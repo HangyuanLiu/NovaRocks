@@ -17,24 +17,7 @@
 
 use novarocks_execution_contract::{TaskIdentity, TerminationDetail};
 
-/// The original Task identity and its selected cause move together. This is
-/// the serialized query owner's projection, not a new Task acceptance point.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SelectedTaskTermination {
-    identity: TaskIdentity,
-    detail: TerminationDetail,
-}
-impl SelectedTaskTermination {
-    pub const fn new(identity: TaskIdentity, detail: TerminationDetail) -> Self {
-        Self { identity, detail }
-    }
-    pub const fn identity(&self) -> TaskIdentity {
-        self.identity
-    }
-    pub const fn detail(&self) -> &TerminationDetail {
-        &self.detail
-    }
-}
+use novarocks_coordination_contract::SelectedTaskTermination;
 
 /// Query coordination's first failure-conclusion latch.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

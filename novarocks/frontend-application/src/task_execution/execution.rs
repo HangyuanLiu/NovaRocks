@@ -29,6 +29,14 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::task_execution::completion_facts::{
+    AttemptDrainFacts, StageState, parent_released_children,
+};
+use crate::task_execution::conclusion::{LatchOutcome, TerminationLatch};
+use crate::task_execution::operation::OperationDispatchResult;
+use crate::task_execution::status_validation::GoneObservation;
+use crate::task_protocol_config::{DispatchBudget, DispatchLane};
+use novarocks_coordination_contract::{MonotonicInstant, StatusObservation};
 use novarocks_execution::task_execution::{
     AbortCause, AdmissionEpochCapability, CancelReason, ExchangeEdgeId, OperationKind,
     QueryContextRef, TaskDomainUpdate, TaskIdentity, TaskOperationId, TaskState, TaskStatus,
@@ -38,11 +46,7 @@ use novarocks_execution::task_execution::{
     QueryContextConvergenceCursor, QueryContextConvergenceReceipt, QuiesceQueryContextReceipt,
     TaskConvergenceCursor, TaskConvergenceReceipt,
 };
-use novarocks_query_application::coordination::{
-    AttemptDrainFacts, DispatchBudget, DispatchLane, GoneObservation, LatchOutcome,
-    MonotonicInstant, OperationDispatchResult, ReplacementWorkerAdmissionEvidence,
-    StatusObservation, TerminationLatch, parent_released_children,
-};
+use novarocks_query_application::coordination::ReplacementWorkerAdmissionEvidence;
 use novarocks_task_codec::TransportBudget;
 use novarocks_task_codec::operation::{
     CoveredStatusStreamEvent, CoveredStatusStreamFact, DecodedCoveredSubscription,
@@ -51,8 +55,8 @@ use novarocks_task_codec::operation::{
 use novarocks_types::NativeCompatibilityId;
 use novarocks_types::identity::{StageId, TaskId};
 
-use super::clock::TaskProtocolClock;
 use super::completion::{ReadCompletionTracker, ReadVerdict};
+use novarocks_coordination_contract::MonotonicClock;
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_query_application::coordination::AcceptedRootControlRequest;
 use novarocks_types::identity::BackendProcessId;
@@ -315,7 +319,7 @@ pub struct QueryTaskExecution {
     owners: BTreeMap<QueryContextRef, QueryContextOwner>,
     dispatcher: OperationDispatcher,
     edges: EdgeOpenTracker,
-    clock: Arc<dyn TaskProtocolClock>,
+    clock: Arc<dyn MonotonicClock>,
     sink: Arc<dyn TaskOperationSink>,
     intake: StatusIntake,
     covered_observation_active: bool,
@@ -459,7 +463,7 @@ impl QueryTaskExecution {
         native_compatibility_id: NativeCompatibilityId,
         admission_epochs: &BTreeMap<BackendProcessId, AdmissionEpochCapability>,
         preparing_positions: &BTreeMap<BackendProcessId, usize>,
-        clock: Arc<dyn TaskProtocolClock>,
+        clock: Arc<dyn MonotonicClock>,
         sink: Arc<dyn TaskOperationSink>,
         intake: StatusIntake,
     ) -> Result<Self, TaskExecutionError> {
@@ -2450,7 +2454,7 @@ impl QueryTaskExecution {
 
     pub(crate) fn selected_task_failure(
         &self,
-    ) -> Option<&novarocks_query_application::coordination::SelectedTaskTermination> {
+    ) -> Option<&novarocks_coordination_contract::SelectedTaskTermination> {
         self.failure.selected()
     }
 
@@ -2470,7 +2474,7 @@ impl QueryTaskExecution {
     fn enqueue_candidates(
         &mut self,
         candidates: VecDeque<AdmissionCandidate>,
-        now: novarocks_query_application::coordination::MonotonicInstant,
+        now: novarocks_coordination_contract::MonotonicInstant,
     ) -> Result<AdmissionPass, TaskExecutionError> {
         let mut pass = AdmissionPass::default();
         for candidate in candidates {
@@ -2596,7 +2600,7 @@ impl QueryTaskExecution {
     fn admit_candidate(
         &mut self,
         candidate: AdmissionCandidate,
-        now: novarocks_query_application::coordination::MonotonicInstant,
+        now: novarocks_coordination_contract::MonotonicInstant,
     ) -> Result<CandidateAdmission, TaskExecutionError> {
         match candidate {
             AdmissionCandidate::Minted { target, intent } => {

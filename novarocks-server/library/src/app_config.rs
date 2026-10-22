@@ -29,14 +29,14 @@ use crate::env_reference::resolve_env_references;
 use crate::state_store_config::{StateStoreAppConfig, StateStoreConfig};
 use crate::state_store_limits::StateStoreLimitOverrides;
 use novarocks_execution_contract::{LeaseValidFor, MaxWait};
+use novarocks_frontend_application::task_protocol_config::{
+    DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET, DispatchBudget,
+};
 use novarocks_memory::{AuthorityConfig, ConfigError as MemoryConfigError};
 use novarocks_native_adapter::{
     FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
 };
 use novarocks_native_trust::NativeTransportMode;
-use novarocks_query_application::coordination::{
-    DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET, DispatchBudget,
-};
 use novarocks_secret::SecretValue;
 use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
 use novarocks_state_store_runtime::StateStoreRunPolicy;

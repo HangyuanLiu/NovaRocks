@@ -2450,7 +2450,7 @@ mod typed_compile_source_tests {
         assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
         assert_eq!(
             input.attempt_class(),
-            novarocks_query_application::coordination::AttemptFailureClass::ResourceGovernance
+            novarocks_coordination_contract::AttemptFailureClass::ResourceGovernance
         );
         let service =
             novarocks_query_application::session_error::QueryServiceError::from_compile_control(

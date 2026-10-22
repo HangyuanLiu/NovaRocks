@@ -28,7 +28,7 @@ use novarocks_execution_contract::{
 use novarocks_types::identity::QueryExecutionId;
 use tokio::sync::{mpsc, watch};
 
-use super::{LogicalExecutionActorId, MonotonicInstant};
+use novarocks_coordination_contract::{LogicalExecutionActorId, MonotonicInstant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplacementQualificationIdentity {
@@ -682,11 +682,10 @@ mod failure_projection_tests {
     #[test]
     fn qualification_outcome_cannot_claim_backend_loss_or_accepted_cancellation() {
         use super::ReplacementQualificationFailure;
-        use crate::{
-            api::NativeAttemptTopologyRequirement,
-            coordination::{AttemptFailureClass, LogicalExecutionActorError},
-            execution_error::{ExecutionFailureInput, ExecutionFailureSite},
-        };
+        use crate::api::NativeAttemptTopologyRequirement;
+        use crate::coordination::LogicalExecutionActorError;
+        use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite};
+        use novarocks_coordination_contract::AttemptFailureClass;
         use novarocks_execution_contract::failure::{
             FailureClass, FailureEvidence, FailureProjection,
         };

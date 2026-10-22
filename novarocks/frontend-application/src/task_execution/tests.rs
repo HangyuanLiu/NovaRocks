@@ -31,6 +31,10 @@ use crate::native::fragment_encoder::frozen::tests as frozen_tests;
 use crate::native::fragment_encoder::frozen::{FragmentArtifact, StaticSinkTarget};
 use crate::query_execution::artifact::{FragmentId, NativePlacementAssignment};
 use crate::query_execution::attempt_plan_facts::AttemptPartitionKind;
+use crate::task_execution::completion_facts::StageState;
+use crate::task_execution::lease::RenewSchedule;
+use crate::task_protocol_config::{DispatchBudget, DispatchLane};
+use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
     AbortCause, AdmissionEpochCapability, AdmissionTicketId, CancelReason, CodecOwnedContent,
@@ -45,9 +49,6 @@ use novarocks_execution::task_execution::{
 };
 use novarocks_physical_plan::PipelineDopDomain;
 use novarocks_proto_models::novarocks as wire;
-use novarocks_query_application::coordination::{
-    DispatchBudget, DispatchLane, MonotonicInstant, RenewSchedule, StageState,
-};
 use novarocks_task_codec::TransportBudget;
 use novarocks_task_codec::descriptor::encode_task_descriptor;
 use novarocks_task_codec::operation::{
@@ -61,7 +62,7 @@ use novarocks_types::{AttemptId, NativeCompatibilityId, QueryId};
 use prost::Message;
 
 use super::blocking_io::ConnectorBlockingIoSupervisor;
-use super::clock::{ManualClock, TaskProtocolClock};
+use super::clock::ManualClock;
 use super::context_owner::{
     ContextEstablishFacts, ContextEstablishSource, QueryContextOwner, ReleaseSettlement,
 };
@@ -85,9 +86,9 @@ use super::status_intake::{
     StatusIntakeAdmission, StatusIntakeWake,
 };
 use crate::query_execution::artifact::fragment_instance_id_for_contract_test;
-use crate::query_execution::schedule::FragmentInstancePlacement;
-use crate::query_execution::schedule::SchedulingPlan;
+use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
 use crate::query_execution::split_assignment::SplitAssignmentDriverError;
+use novarocks_coordination_contract::MonotonicClock;
 
 const LEAF_FRAGMENT: FragmentId = 1;
 const MIDDLE_FRAGMENT: FragmentId = 2;
@@ -1145,7 +1146,7 @@ impl Harness {
                 .keys()
                 .map(|&process| (process, preparing_positions))
                 .collect(),
-            Arc::clone(&clock) as Arc<dyn TaskProtocolClock>,
+            Arc::clone(&clock) as Arc<dyn MonotonicClock>,
             Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
             intake,
         )
@@ -3223,7 +3224,7 @@ fn a_late_establish_receipt_closes_a_queued_exact_replay() {
             .keys()
             .map(|&process| (process, 4096))
             .collect(),
-        clock as Arc<dyn TaskProtocolClock>,
+        clock as Arc<dyn MonotonicClock>,
         Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
         intake,
     )
@@ -5524,7 +5525,7 @@ fn the_split_adapter_addresses_graph_tasks_and_reuses_the_driver_retry_rule() {
             target: legacy_driver_target.clone(),
             detail: "acknowledgement lost".to_owned(),
         }),
-        novarocks_query_application::coordination::FrontendAction::RetryExactRequest
+        crate::task_execution::operation::FrontendAction::RetryExactRequest
     );
     assert_eq!(
         delivery_action(&SplitAssignmentDriverError::Rejected {
@@ -5532,13 +5533,13 @@ fn the_split_adapter_addresses_graph_tasks_and_reuses_the_driver_retry_rule() {
             reason: "watermark".to_owned(),
             detail: "gap".to_owned(),
         }),
-        novarocks_query_application::coordination::FrontendAction::FailAttempt
+        crate::task_execution::operation::FrontendAction::FailAttempt
     );
     assert_eq!(
         delivery_action(&SplitAssignmentDriverError::NoAdmittedTask {
             scan: crate::query_execution::split_assignment::ScanNodeKey::new(1u32, 9,),
         }),
-        novarocks_query_application::coordination::FrontendAction::FailAttempt
+        crate::task_execution::operation::FrontendAction::FailAttempt
     );
 }
 
@@ -6373,8 +6374,8 @@ fn the_two_start_gates_are_observations_of_acknowledgements_not_of_sending() {
 #[test]
 fn remote_task_catch_up_preserves_accepted_causes_and_allows_only_derived_refinement() {
     use super::remote_task::RemoteTask;
+    use novarocks_coordination_contract::StatusObservation;
     use novarocks_execution_contract::{SafeDetail, TaskFailure};
-    use novarocks_query_application::coordination::StatusObservation;
     let original = || {
         TerminationDetail::Failed(TaskFailure::new(
             novarocks_execution_contract::failure::FailureFact::new(
@@ -6764,13 +6765,13 @@ async fn actor_abort_round_at_first_dispatch() -> (
     OperationIntent,
     Arc<ManualClock>,
 ) {
+    use novarocks_coordination_contract::ExecutionEffect;
     use novarocks_execution::task_execution::{
         AcquireQueryContextAdmissionTicket, AdmissionTicketId, LeaseValidFor,
         QueryContextAdmissionTicketReceipt,
     };
     use novarocks_query_application::coordination::{
-        AbortQueryContextEffectPort, AdmissionIssueSettlement, ExecutionEffect,
-        LogicalExecutionActorConfig,
+        AbortQueryContextEffectPort, AdmissionIssueSettlement, LogicalExecutionActorConfig,
     };
     use novarocks_query_application::test_support::LogicalExecutionTestHarness;
     use novarocks_workload_control::{
@@ -6803,7 +6804,7 @@ async fn actor_abort_round_at_first_dispatch() -> (
             .keys()
             .map(|&process| (process, 4096))
             .collect(),
-        Arc::clone(&clock) as Arc<dyn TaskProtocolClock>,
+        Arc::clone(&clock) as Arc<dyn MonotonicClock>,
         Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
         status,
     )
@@ -6984,13 +6985,14 @@ fn terminal_cleanup_dispatches_actor_abort_without_normal_work() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
+    use novarocks_coordination_contract::ExecutionEffect;
     use novarocks_execution::task_execution::{
         AcquireQueryContextAdmissionTicket, AdmissionTicketId, LeaseValidFor,
         QueryContextAdmissionTicketReceipt,
     };
     use novarocks_query_application::coordination::{
         AbortQueryContextEffectPort, AdmissionIssueSettlement, ContextClosureState,
-        ExecutionEffect, LogicalExecutionActorConfig,
+        LogicalExecutionActorConfig,
     };
     use novarocks_query_application::test_support::LogicalExecutionTestHarness;
 

@@ -17,36 +17,6 @@
 
 use std::fmt;
 
-/// Result of delivering work to one frozen destination.
-///
-/// These facts come from exchange/result delivery rather than a Worker
-/// operation receipt. A normal destination withdrawal is settled; a failed
-/// or mismatched destination fails the attempt.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum DestinationDeliveryResult {
-    Delivered,
-    NormalDestinationCanceled,
-    DestinationFailure,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum DestinationDeliveryAction {
-    Settled,
-    FailAttempt,
-}
-
-pub const fn destination_delivery_action(
-    result: DestinationDeliveryResult,
-) -> DestinationDeliveryAction {
-    match result {
-        DestinationDeliveryResult::Delivered
-        | DestinationDeliveryResult::NormalDestinationCanceled => {
-            DestinationDeliveryAction::Settled
-        }
-        DestinationDeliveryResult::DestinationFailure => DestinationDeliveryAction::FailAttempt,
-    }
-}
-
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ResultPacketVerdict {
     Accept,
@@ -147,18 +117,6 @@ mod tests {
         assert_eq!(
             stream.consume(2, false),
             ResultPacketVerdict::AfterEndOfStream
-        );
-    }
-
-    #[test]
-    fn destination_delivery_has_its_own_settlement_policy() {
-        assert_eq!(
-            destination_delivery_action(DestinationDeliveryResult::NormalDestinationCanceled),
-            DestinationDeliveryAction::Settled
-        );
-        assert_eq!(
-            destination_delivery_action(DestinationDeliveryResult::DestinationFailure),
-            DestinationDeliveryAction::FailAttempt
         );
     }
 }

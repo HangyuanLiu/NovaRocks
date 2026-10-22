@@ -791,10 +791,10 @@ impl FrontendQueryCompiler {
                     .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
                     .collect(),
                 output,
-                novarocks_query_application::coordination::ExecutionEffect::None,
+                novarocks_coordination_contract::ExecutionEffect::None,
                 // A sealed, effect-free read may replace its attempt before
                 // output visibility without compiling a different plan.
-                novarocks_query_application::coordination::RecoveryMode::RestartAttemptBeforeVisibility,
+                novarocks_coordination_contract::RecoveryMode::RestartAttemptBeforeVisibility,
                 Vec::new(),
                 novarocks_query_application::preparation::FrozenCostEstimate::unknown(
                     novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
@@ -928,8 +928,8 @@ impl FrontendQueryCompiler {
                 .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
                 .collect(),
             output,
-            novarocks_query_application::coordination::ExecutionEffect::None,
-            novarocks_query_application::coordination::RecoveryMode::RestartAttemptBeforeVisibility,
+            novarocks_coordination_contract::ExecutionEffect::None,
+            novarocks_coordination_contract::RecoveryMode::RestartAttemptBeforeVisibility,
             Vec::new(),
             novarocks_query_application::preparation::FrozenCostEstimate::unknown(
                 novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,

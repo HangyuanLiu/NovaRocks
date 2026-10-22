@@ -22,7 +22,7 @@
 
 use novarocks_types::identity::QueryExecutionId;
 
-use super::{ResultPacketVerdict, RootResultStream};
+use novarocks_coordination_contract::{ResultPacketVerdict, RootResultStream};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeliveryPhase {

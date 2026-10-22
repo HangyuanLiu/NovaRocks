@@ -33,16 +33,20 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 #[cfg(test)]
-use super::clock::ProcessMonotonicClock;
-#[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 
-use novarocks_execution::task_execution::{QueryContextRef, TaskIdentity, TaskStatus};
+use novarocks_coordination_contract::MonotonicInstant;
+use novarocks_execution::task_execution::{
+    QueryContextConvergenceReceipt, QueryContextRef, QuiesceQueryContextReceipt,
+    TaskConvergenceReceipt, TaskIdentity, TaskStatus,
+};
 use novarocks_query_application::coordination::{
-    AcceptedRootControlPort, AcceptedRootControlRequest, MonotonicInstant,
+    AcceptedRootControlPort, AcceptedRootControlRequest,
 };
 
-use super::clock::TaskProtocolClock;
+#[cfg(test)]
+use super::clock::ProcessMonotonicClock;
+use novarocks_coordination_contract::MonotonicClock;
 
 /// One immutable observation the transport published.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -455,7 +459,7 @@ struct ObservationQueue {
 
 #[derive(Debug)]
 struct ObservationIntakeInner {
-    clock: Arc<dyn TaskProtocolClock>,
+    clock: Arc<dyn MonotonicClock>,
     queue: Mutex<ObservationQueue>,
     queue_capacity: usize,
     data_capacity: usize,
@@ -480,7 +484,7 @@ pub(crate) struct ObservationIntake {
 impl ObservationIntake {
     pub(crate) fn for_task_attempt(
         wake: Arc<dyn StatusIntakeWake>,
-        clock: Arc<dyn TaskProtocolClock>,
+        clock: Arc<dyn MonotonicClock>,
     ) -> Result<Self, ObservationIntakeConfigError> {
         let max_frame =
             novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES + 4096;
@@ -518,7 +522,7 @@ impl ObservationIntake {
         total_bytes: usize,
         max_frame_bytes: usize,
         wake: Arc<dyn StatusIntakeWake>,
-        clock: Arc<dyn TaskProtocolClock>,
+        clock: Arc<dyn MonotonicClock>,
     ) -> Result<Self, ObservationIntakeConfigError> {
         if queue_capacity == 0 {
             return Err(ObservationIntakeConfigError::Queue);

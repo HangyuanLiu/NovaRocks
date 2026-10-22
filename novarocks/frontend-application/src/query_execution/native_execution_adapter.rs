@@ -24,6 +24,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::task_protocol_config::CoordinationBudgets;
+use novarocks_coordination_contract::{AttemptFailureClass, RecoveryMode};
 use novarocks_execution_contract::{
     AcquireQueryContextAdmissionTicket, LeaseValidFor, OperationOutcome, QueryContextRef,
     TaskOperationId,
@@ -42,13 +44,11 @@ use novarocks_query_application::api::{
     NativeAttemptRunFuture, QueryExecutionClient, QueryExecutionError, QueryExecutionFuture,
     QueryExecutionRequest,
 };
-#[cfg(test)]
-use novarocks_query_application::coordination::AttemptFailureClass;
 use novarocks_query_application::coordination::{
     AbortQueryContextEffectAdmission, AbortQueryContextEffectPort, AbortQueryContextIssueIdentity,
     AcceptedRootStatusSource, ActiveAttemptIsolationOwner, AttemptIsolationActivationFailure,
-    AttemptIsolationReservation, AttemptSchedule, CoordinationBudgets, NativeAttemptDrive,
-    QualifiedReplacementReservation, QualifiedWorkerAdmission, RecoveryMode,
+    AttemptIsolationReservation, AttemptSchedule, NativeAttemptDrive,
+    QualifiedReplacementReservation, QualifiedWorkerAdmission,
     ReplacementQualificationEffectAdmission, ReplacementQualificationEffectPort,
     ReplacementQualificationEffectReservation, ReplacementQualificationEffectSubmission,
     ReplacementQualificationFailure, ReplacementQualificationIdentity,
@@ -97,8 +97,8 @@ use crate::task_execution::intent::{
 use crate::task_execution::manifest_round::{ManifestAssembledRound, ManifestAttemptCompletion};
 use crate::task_execution::sources::AttemptEstablishFacts;
 use crate::task_execution::status_intake::{NotifyWake, StatusIntakeWake};
+use crate::task_protocol_config::TaskUpdateRetryPolicy;
 use novarocks_query_application::api::{BackendProcessObservationService, BackendTopologyService};
-use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 
 /// One logical execution's Abort port. Every physical attempt installs one
 /// exact route and retains its registration through residual convergence.
@@ -677,7 +677,7 @@ async fn acquire_replacement_admissions(
                 };
                 let batch = DispatchBatch::with_queued_at(
                     context.backend_process_id(),
-                    novarocks_query_application::coordination::DispatchLane::Lifecycle,
+                    crate::task_protocol_config::DispatchLane::Lifecycle,
                     vec![intent.clone()],
                     vec![permit],
                     intent.queued_bytes(),

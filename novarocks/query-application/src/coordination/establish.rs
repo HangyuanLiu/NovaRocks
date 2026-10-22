@@ -26,8 +26,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use novarocks_execution_contract::{
@@ -39,7 +38,8 @@ use novarocks_execution_contract::{
 use novarocks_types::NativeCompatibilityId;
 use tokio::sync::mpsc;
 
-use super::{AttemptActivationIdentity, EstablishStandDownFact, MonotonicInstant};
+use super::EstablishStandDownFact;
+use novarocks_coordination_contract::{AttemptActivationIdentity, MonotonicInstant};
 
 /// Unforgeable actor receipt for the first issue of one exact admission request.
 ///
@@ -1529,9 +1529,9 @@ mod tests {
 
     use super::*;
     use crate::coordination::{
-        ExecutionEffect, LogicalExecutionActorConfig, LogicalExecutionActorError,
-        LogicalExecutionClock, spawn_logical_execution_actor,
+        LogicalExecutionActorConfig, LogicalExecutionActorError, spawn_logical_execution_actor,
     };
+    use novarocks_coordination_contract::{ExecutionEffect, MonotonicClock};
 
     #[derive(Debug)]
     struct FakeContent(ContentFingerprint);
@@ -1611,7 +1611,7 @@ mod tests {
         }
     }
 
-    impl LogicalExecutionClock for ManualActorClock {
+    impl MonotonicClock for ManualActorClock {
         fn now(&self) -> MonotonicInstant {
             *self.now.lock().expect("manual actor clock")
         }
@@ -2505,7 +2505,7 @@ mod tests {
         );
         assert_eq!(
             input.attempt_class(),
-            super::super::AttemptFailureClass::ExecutionFailure
+            novarocks_coordination_contract::AttemptFailureClass::ExecutionFailure
         );
     }
 

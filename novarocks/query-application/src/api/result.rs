@@ -1369,7 +1369,8 @@ mod tests {
 
     #[tokio::test]
     async fn queue_and_consumer_closure_are_distinct_local_stop_observations() {
-        use crate::{coordination::AttemptFailureClass, execution_error::ExecutionFailureSite};
+        use crate::execution_error::ExecutionFailureSite;
+        use novarocks_coordination_contract::AttemptFailureClass;
         use novarocks_execution_contract::failure::{FailureClass, FailureEvidence};
         let id = execution_id(6);
         let (transport, schema_receipt, failure_sender, mut stream) =

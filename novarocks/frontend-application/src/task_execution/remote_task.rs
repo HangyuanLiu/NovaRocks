@@ -36,16 +36,19 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::task_execution::domain_tracker::{
+    TaskDomainIntentTracker, TaskDomainReceiptExpectation, verify_task_domain_receipt,
+};
+use crate::task_execution::operation::{FrontendAction, OperationDispatchResult, frontend_action};
+use crate::task_execution::status_validation::{GoneObservation, classify_gone};
+use novarocks_coordination_contract::{
+    MonotonicInstant, ObservedTaskTransition, StatusObservation, classify_observation,
+    classify_observed_task_transition,
+};
 use novarocks_execution::task_execution::{
     CancelReason, CancelTask, DomainConflict, DomainProgression, ExchangeEdgeId, OperationEnvelope,
     OperationKind, OperationOutcome, QueryContextRef, TaskDomainUpdate, TaskIdentity,
     TaskOperationId, TaskState, TaskStatus, TaskStatusCursor, TerminationDetail, UpdateTask,
-};
-use novarocks_query_application::coordination::{
-    FrontendAction, GoneObservation, MonotonicInstant, ObservedTaskTransition,
-    OperationDispatchResult, StatusObservation, TaskDomainIntentTracker,
-    TaskDomainReceiptExpectation, classify_gone, classify_observation,
-    classify_observed_task_transition, frontend_action, verify_task_domain_receipt,
 };
 
 use super::creation::{
@@ -249,7 +252,7 @@ fn edge_regression(
 /// A split-domain refusal that names the offer it refused.
 fn split_regression(
     intent: &novarocks_execution::task_execution::SplitAssignmentIntent,
-    watermark: novarocks_query_application::coordination::SentSplitWatermark,
+    watermark: crate::task_execution::domain_tracker::SentSplitWatermark,
     conflict: DomainConflict,
 ) -> TaskExecutionError {
     TaskExecutionError::DomainRegression {
@@ -1463,7 +1466,7 @@ mod destination_close_tests {
         assert!(preview.requires_control_progress());
         assert_eq!(
             preview.lane(),
-            novarocks_query_application::coordination::DispatchLane::Update
+            crate::task_protocol_config::DispatchLane::Update
         );
         producer
             .enqueue_update(close, super::super::intent::test_queue_permit())

@@ -25,9 +25,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::task_protocol_config::DispatchBudget;
 use novarocks_execution::task_execution::AdmissionEpochCapability;
 use novarocks_execution_contract::BackendProcessDescriptor;
-use novarocks_query_application::coordination::DispatchBudget;
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId, QueryExecutionId};
 
@@ -38,7 +38,7 @@ use crate::native::task_transport::{
 use crate::query_execution::artifact::ValidatedNativeSubmission;
 use crate::query_execution::schedule::SchedulingPlan;
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
-use crate::task_execution::clock::{ProcessMonotonicClock, TaskProtocolClock};
+use crate::task_execution::clock::ProcessMonotonicClock;
 use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::execution::QueryTaskExecution;
 use crate::task_execution::feedback_pump::{DynamicFilterFeedbackPump, TaskDynamicFilterReads};
@@ -48,6 +48,7 @@ use crate::task_execution::round::{AcknowledgementObserver, TaskRound};
 use crate::task_execution::sources::{AttemptEstablishFacts, SubmissionFragmentPlans};
 use crate::task_execution::split_transport::SplitDeliveryBridge;
 use crate::task_execution::status_intake::{ObservationIntake, StatusIntake, StatusIntakeWake};
+use novarocks_coordination_contract::MonotonicClock;
 
 /// How many status events one attempt may hold before the transport is told it
 /// lost observations.
@@ -167,7 +168,7 @@ pub(crate) fn assemble_round(
     let sink = split_delivery.sink(Arc::new(sink) as Arc<dyn TaskOperationSink>);
 
     let intake = StatusIntake::new(STATUS_INTAKE_CAPACITY, Arc::clone(&wake));
-    let clock = Arc::new(ProcessMonotonicClock::new()) as Arc<dyn TaskProtocolClock>;
+    let clock = Arc::new(ProcessMonotonicClock::new()) as Arc<dyn MonotonicClock>;
     let observation = Arc::new(
         ObservationIntake::for_task_attempt(Arc::clone(&wake), Arc::clone(&clock)).map_err(
             |error| {

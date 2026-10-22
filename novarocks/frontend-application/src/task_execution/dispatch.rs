@@ -32,8 +32,9 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use crate::task_protocol_config::{DispatchBudget, DispatchLane};
+use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution::task_execution::{OperationKind, TaskOperationId};
-use novarocks_query_application::coordination::{DispatchBudget, DispatchLane, MonotonicInstant};
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::identity::BackendProcessId;
 

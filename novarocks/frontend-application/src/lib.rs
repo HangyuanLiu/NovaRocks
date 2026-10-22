@@ -43,6 +43,9 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
     )
 }
 
+/// Native Task protocol bounds frozen by frontend process composition.
+pub mod task_protocol_config;
+
 pub(crate) mod application;
 pub use application::{
     FrontendApplicationError, FrontendApplicationErrorKind, FrontendExecutionConfig,

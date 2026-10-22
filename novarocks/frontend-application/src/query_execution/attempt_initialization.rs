@@ -50,8 +50,8 @@ use crate::task_execution::blocking_io::{
     ConnectorBlockingIoJob, ConnectorBlockingIoJoinPin, ConnectorBlockingIoResponsibility,
     ConnectorBlockingIoSupervisor,
 };
+use crate::task_protocol_config::TaskUpdateRetryPolicy;
 use novarocks_query_application::cancellation::QueryCancellationView;
-use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 use novarocks_workload_control::{ResultWindowAlias, WorkScope};
 
 fn failed(message: impl Into<String>) -> DistributedQueryError {

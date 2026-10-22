@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use novarocks_coordination_contract::{
+    AttemptActivationIdentity, LogicalExecutionActorId, MonotonicClock,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -46,55 +50,31 @@ use novarocks_result_contract::{ClientRowProfile, ClientRowStreamCursor};
 use super::actor_state::{
     ActorStateError, AttemptCapability, LogicalExecutionState, ReplacementFact, ReplacementToken,
 };
+use super::receipt_channel;
 use super::{
     AbortQueryContextEffectPort, AbortQueryContextIssuePermit, AbortQueryContextIssueSubmit,
     ActiveReplacementResources, AdmissionIssueDisposition, AdmissionIssueReceipt,
-    AdmissionIssueSettlement, AttemptFailureClass, BeginSchemaDelivery, ContextStandDownCause,
-    ContextStandDownError, ContextStandDownLedger, ContextStandDownSnapshot, DeliveryPermit,
-    EstablishIssueError, EstablishIssueLedger, EstablishIssuePermit, EstablishIssueSnapshot,
-    ExecutionEffect, ExecutionPhase, LogicalConclusion, LogicalOutputMode, MonotonicInstant,
-    ObservedTaskTransition, RecoveryMode, RecoveryRefusal, RegistryContextConvergence,
+    AdmissionIssueSettlement, BeginSchemaDelivery, ContextStandDownCause, ContextStandDownError,
+    ContextStandDownLedger, ContextStandDownSnapshot, DeliveryPermit, EstablishIssueError,
+    EstablishIssueLedger, EstablishIssuePermit, EstablishIssueSnapshot, ExecutionPhase,
+    LogicalConclusion, LogicalOutputMode, RecoveryRefusal, RegistryContextConvergence,
     ReplacementQualificationEffectAdmission, ReplacementQualificationEffectPort,
     ReplacementQualificationEffectReceipt, ReplacementQualificationEffectSubmission,
     ReplacementQualificationFailure, ReplacementQualificationIdentity,
     ReplacementQualificationRequest, ReplacementQualificationSettlement,
-    ReplacementWorkerAdmissionEvidence, ResultPacket, SchemaDeliveryPermit, StatusObservation,
-    classify_observation, classify_observed_task_transition, receipt_channel,
+    ReplacementWorkerAdmissionEvidence, ResultPacket, SchemaDeliveryPermit,
+};
+use novarocks_coordination_contract::{
+    AttemptFailureClass, ExecutionEffect, MonotonicInstant, ObservedTaskTransition, RecoveryMode,
+    StatusObservation, classify_observation, classify_observed_task_transition,
 };
 
-/// Immutable identity of one actor-owned attempt activation generation.
-///
-/// This value is diagnostic only. State transitions require the corresponding
-/// move-only permit, so copying an identity cannot create authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AttemptActivationIdentity {
-    actor_instance_id: u64,
-    execution: QueryExecutionId,
-    generation: u64,
-}
-
-/// Opaque process-local identity of one logical execution actor instance.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LogicalExecutionActorId(u64);
-
-impl LogicalExecutionActorId {
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-/// Actor-owned monotonic time authority. Callers never provide a current time
-/// or derive an admission-ticket expiry themselves.
-pub trait LogicalExecutionClock: fmt::Debug + Send + Sync {
-    fn now(&self) -> MonotonicInstant;
-}
-
 #[derive(Debug)]
-pub struct ProcessLogicalExecutionClock {
+pub struct ProcessMonotonicClock {
     origin: Instant,
 }
 
-impl ProcessLogicalExecutionClock {
+impl ProcessMonotonicClock {
     pub fn new() -> Self {
         Self {
             origin: Instant::now(),
@@ -102,42 +82,15 @@ impl ProcessLogicalExecutionClock {
     }
 }
 
-impl Default for ProcessLogicalExecutionClock {
+impl Default for ProcessMonotonicClock {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl LogicalExecutionClock for ProcessLogicalExecutionClock {
+impl MonotonicClock for ProcessMonotonicClock {
     fn now(&self) -> MonotonicInstant {
         MonotonicInstant::from_origin(self.origin.elapsed())
-    }
-}
-
-impl AttemptActivationIdentity {
-    #[cfg(test)]
-    pub(crate) const fn from_parts(
-        actor_instance_id: u64,
-        execution: QueryExecutionId,
-        generation: u64,
-    ) -> Self {
-        Self {
-            actor_instance_id,
-            execution,
-            generation,
-        }
-    }
-
-    pub const fn actor(self) -> LogicalExecutionActorId {
-        LogicalExecutionActorId(self.actor_instance_id)
-    }
-
-    pub const fn execution(self) -> QueryExecutionId {
-        self.execution
-    }
-
-    pub const fn generation(self) -> u64 {
-        self.generation
     }
 }
 
@@ -767,11 +720,11 @@ impl Drop for ReplacementQualification {
 }
 
 fn identity_of(capability: &AttemptCapability) -> AttemptActivationIdentity {
-    AttemptActivationIdentity {
-        actor_instance_id: capability.actor_instance_id(),
-        execution: capability.execution(),
-        generation: capability.generation(),
-    }
+    AttemptActivationIdentity::from_parts(
+        capability.actor_instance_id(),
+        capability.execution(),
+        capability.generation(),
+    )
 }
 
 fn attempt_obligation_key(
@@ -805,7 +758,7 @@ pub struct LogicalExecutionActorConfig {
     replacement_effect_port: Option<Arc<dyn ReplacementQualificationEffectPort>>,
     replacement_reservation_valid_for: Option<Duration>,
     max_abort_authorizations_per_context: NonZeroUsize,
-    clock: Arc<dyn LogicalExecutionClock>,
+    clock: Arc<dyn MonotonicClock>,
     work_owner: Option<WorkOwner>,
     execution_stage: Option<StagePermit>,
     result_schema: Option<ResultSchema>,
@@ -889,7 +842,7 @@ impl LogicalExecutionActorConfig {
             replacement_effect_port: None,
             replacement_reservation_valid_for: None,
             max_abort_authorizations_per_context: max_establish_authorizations_per_context,
-            clock: Arc::new(ProcessLogicalExecutionClock::new()),
+            clock: Arc::new(ProcessMonotonicClock::new()),
             work_owner: Some(work_owner),
             execution_stage: Some(initial_execution_stage),
             result_schema: None,
@@ -1007,7 +960,7 @@ impl LogicalExecutionActorConfig {
             replacement_effect_port: Some(replacement_effect_port),
             replacement_reservation_valid_for: Some(replacement_reservation_valid_for),
             max_abort_authorizations_per_context: max_establish_authorizations_per_context,
-            clock: Arc::new(ProcessLogicalExecutionClock::new()),
+            clock: Arc::new(ProcessMonotonicClock::new()),
             work_owner: Some(work_owner),
             execution_stage: Some(initial_execution_stage),
             result_schema: None,
@@ -1087,7 +1040,7 @@ impl LogicalExecutionActorConfig {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_clock(mut self, clock: Arc<dyn LogicalExecutionClock>) -> Self {
+    pub(crate) fn with_clock(mut self, clock: Arc<dyn MonotonicClock>) -> Self {
         self.clock = clock;
         self
     }
@@ -2133,7 +2086,7 @@ pub(crate) fn spawn_logical_execution_actor(
     )?;
     let capability = state.attempt_capability(config.initial_execution)?;
     let capability_identity = identity_of(&capability);
-    let actor_id = LogicalExecutionActorId(capability.actor_instance_id());
+    let actor_id = LogicalExecutionActorId::from_raw(capability.actor_instance_id());
     let (abandoned, abandoned_rx) = watch::channel(false);
     let lifetime = Arc::new(PermitLifetime {
         abandoned,
@@ -2327,7 +2280,7 @@ async fn run_actor(
     max_establish_authorizations_per_context: NonZeroUsize,
     max_abort_authorizations_per_context: NonZeroUsize,
     mut result_runtime: Option<ResultRuntime>,
-    clock: Arc<dyn LogicalExecutionClock>,
+    clock: Arc<dyn MonotonicClock>,
     mut registry_close_requested_rx: watch::Receiver<Option<RegistryClose>>,
     registry_ingress_closed: watch::Sender<bool>,
 ) {
@@ -2705,7 +2658,7 @@ enum AttemptLedgerEvent {
 
 async fn wait_for_attempt_ledger_event(
     attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
-    clock: &dyn LogicalExecutionClock,
+    clock: &dyn MonotonicClock,
 ) -> AttemptLedgerEvent {
     std::future::poll_fn(|context| {
         for (execution, attempt) in attempts.iter_mut() {
@@ -2835,9 +2788,7 @@ fn synchronize_all_stand_down(
                 LogicalConclusion::Cancelled => {
                     Some(ContextStandDownCause::LogicalExecutionCancelled)
                 }
-                LogicalConclusion::Failed | LogicalConclusion::BusinessDecisionRequired => {
-                    Some(ContextStandDownCause::LogicalExecutionFailed)
-                }
+                LogicalConclusion::Failed => Some(ContextStandDownCause::LogicalExecutionFailed),
                 LogicalConclusion::Succeeded => None,
             })
         };
@@ -3096,7 +3047,7 @@ fn try_activate_qualified_replacement(
     max_admission_issues_per_context: NonZeroUsize,
     max_establish_authorizations_per_context: NonZeroUsize,
     max_abort_authorizations_per_context: NonZeroUsize,
-    clock: &dyn LogicalExecutionClock,
+    clock: &dyn MonotonicClock,
     result_runtime: Option<&mut ResultRuntime>,
 ) {
     let Some(active) = replacement.as_mut() else {
@@ -3865,12 +3816,6 @@ fn fail_result_runtime(state: &mut LogicalExecutionState, runtime: Option<&mut R
                         "logical execution failed before success EOF",
                     )));
                 }
-                Some(LogicalConclusion::BusinessDecisionRequired) => {
-                    sender.send_replace(Some(logical_owner_failure(
-                        crate::execution_error::QueryFailureReason::BusinessDecisionUnspecified,
-                        "logical execution requires a business decision before success EOF",
-                    )));
-                }
                 None => {}
             }
         }
@@ -3980,7 +3925,7 @@ fn handle_command(
     stand_down_error: &mut Option<ContextStandDownError>,
     replacement: &mut Option<ReplacementRuntime>,
     replacement_error: &mut Option<ReplacementQualificationFailure>,
-    clock: &dyn LogicalExecutionClock,
+    clock: &dyn MonotonicClock,
     work_cancellation: &CancellationView,
     replacement_reservation_valid_for: Option<Duration>,
     mut result_runtime: Option<&mut ResultRuntime>,
@@ -4854,10 +4799,7 @@ fn new_attempt_ledgers(
         ContextStandDownLedger::new(required_contexts, max_abort_authorizations_per_context)?;
     let attempt_obligation = work
         .register_obligation(
-            attempt_obligation_key(
-                LogicalExecutionActorId(activation.actor_instance_id),
-                activation.execution(),
-            ),
+            attempt_obligation_key(activation.actor(), activation.execution()),
             ObligationKind::RunningWork,
         )
         .map_err(|_| LogicalExecutionActorError::InvariantViolation)?;
@@ -4925,10 +4867,7 @@ fn cancel_pending_abort_issues(
     Ok(())
 }
 
-async fn wait_for_abort_retry(
-    clock: &dyn LogicalExecutionClock,
-    retry_at: Option<MonotonicInstant>,
-) {
+async fn wait_for_abort_retry(clock: &dyn MonotonicClock, retry_at: Option<MonotonicInstant>) {
     if let Some(retry_at) = retry_at {
         tokio::time::sleep(retry_at.saturating_duration_since(clock.now())).await;
     } else {
@@ -4964,10 +4903,7 @@ async fn wait_for_replacement_capacity(
     }
 }
 
-async fn wait_for_replacement_expiry(
-    clock: &dyn LogicalExecutionClock,
-    expiry: Option<MonotonicInstant>,
-) {
+async fn wait_for_replacement_expiry(clock: &dyn MonotonicClock, expiry: Option<MonotonicInstant>) {
     if let Some(expiry) = expiry {
         tokio::time::sleep(expiry.saturating_duration_since(clock.now())).await;
     } else {
@@ -5493,7 +5429,7 @@ mod tests {
         }
     }
 
-    impl LogicalExecutionClock for ManualActorClock {
+    impl MonotonicClock for ManualActorClock {
         fn now(&self) -> MonotonicInstant {
             *self.now.lock().unwrap()
         }

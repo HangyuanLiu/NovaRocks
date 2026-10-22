@@ -39,13 +39,14 @@ use crate::api::{
     ResultSchema,
 };
 use crate::coordination::{
-    AdmissionIssueReceipt, AdmissionIssueSettlement, AttemptActivationIdentity,
-    ContextStandDownSnapshot, LogicalExecutionActor, LogicalExecutionActorConfig,
-    LogicalExecutionActorError, LogicalExecutionActorSnapshot, LogicalExecutionJoinReadiness,
-    LogicalExecutionOutputTransfer, LogicalExecutionRegistration, LogicalExecutionRuntimeRegistry,
+    AdmissionIssueReceipt, AdmissionIssueSettlement, ContextStandDownSnapshot,
+    LogicalExecutionActor, LogicalExecutionActorConfig, LogicalExecutionActorError,
+    LogicalExecutionActorSnapshot, LogicalExecutionJoinReadiness, LogicalExecutionOutputTransfer,
+    LogicalExecutionRegistration, LogicalExecutionRuntimeRegistry,
     LogicalExecutionRuntimeRegistryError, LogicalExecutionRuntimeRegistryHandle,
     LogicalExecutionRuntimeShutdownError, RunningAttemptPermit,
 };
+use novarocks_coordination_contract::AttemptActivationIdentity;
 
 use crate::api::result::{
     EndDelivery, QueryResultTransport, ResultDelivery, ResultDeliveryDisposition,

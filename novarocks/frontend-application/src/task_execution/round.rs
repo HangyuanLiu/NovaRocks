@@ -32,12 +32,13 @@ use std::sync::Arc;
 use novarocks_execution::task_execution::identity::TaskIdentity;
 use novarocks_execution::task_execution::status::TerminationDetail;
 
+use crate::task_execution::operation::OperationDispatchResult;
 use novarocks_execution::task_execution::identity::QueryContextRef;
 use novarocks_execution::task_execution::status::TaskStatusCursor;
 use novarocks_query_application::api::{QueryExecutionError, QueryExecutionErrorKind};
 use novarocks_query_application::coordination::{
     AcceptedAttemptFailure, AcceptedRootStatusSender, AcceptedRootStatusSource,
-    OperationDispatchResult, accepted_root_status_projection_with_control_port,
+    accepted_root_status_projection_with_control_port,
 };
 
 use super::abort_effect::{

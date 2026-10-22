@@ -21,29 +21,7 @@
 //! attempt may enter replacement, then records the required runtime facts in
 //! its own serialized state before it activates a successor.
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RecoveryMode {
-    NoRecovery,
-    RestartAttemptBeforeVisibility,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ExecutionEffect {
-    None,
-    External,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AttemptFailureClass {
-    RecoverableInfrastructure,
-    ExecutionFailure,
-    Unsupported,
-    ResourceGovernance,
-    ContractViolation,
-    Cancelled,
-    DeadlineExceeded,
-    CommitUnknown,
-}
+use novarocks_coordination_contract::{AttemptFailureClass, ExecutionEffect, RecoveryMode};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryRefusal {
