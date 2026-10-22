@@ -21,8 +21,9 @@
 //! real tables on the FE side. NovaRocks delegates their schema and row
 //! materialization to query-application ports.
 //!
-//! The rewriter replaces system-table references with VALUES-backed derived
-//! tables, which the standard SQL pipeline handles like ordinary relations.
+//! The rewriter replaces system-table references with derived tables, which
+//! the standard SQL pipeline handles like ordinary relations, including empty
+//! listings.
 
 use arrow::array::{
     Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
@@ -281,14 +282,8 @@ fn object_name_idents(name: &ast::ObjectName) -> Vec<String> {
     name.parts.iter().map(|part| part.value.clone()).collect()
 }
 
-/// Build a `TableFactor::Derived` whose body is a VALUES expression carrying
-/// `batches` and an alias declaring `columns` as the projected column names.
-///
-/// A provider returning zero rows is currently treated as a programmer error:
-/// the only registered provider (`schemata`) always sees at least the
-/// `default` database, and synthesizing a typed empty VALUES with a
-/// `WHERE FALSE` wrapper is more code than it is worth before the second
-/// provider lands.
+/// Preserve provider column names in a derived relation. Nonempty batches use
+/// VALUES; an empty provider uses a typed, source-free SELECT WHERE FALSE.
 fn derived_values_factor(
     columns: &[ColumnDef],
     batches: &[RecordBatch],
@@ -297,14 +292,6 @@ fn derived_values_factor(
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     let alias_columns: Vec<ast::Ident> = columns.iter().map(|c| ident(&c.name)).collect();
 
-    if total_rows == 0 {
-        return Err(format!(
-            "virtual table `{}` returned zero rows; empty-result rewriting is not yet implemented",
-            alias.name.value
-        ));
-    }
-
-    let mut rows: Vec<Vec<ast::Expr>> = Vec::with_capacity(total_rows);
     for batch in batches {
         if batch.num_columns() != columns.len() {
             return Err(format!(
@@ -313,27 +300,36 @@ fn derived_values_factor(
                 columns.len()
             ));
         }
-        for row_idx in 0..batch.num_rows() {
-            let mut row = Vec::with_capacity(columns.len());
-            for (col_idx, col_def) in columns.iter().enumerate() {
-                let array = batch.column(col_idx);
-                row.push(array_value_to_expr(
-                    array.as_ref(),
-                    row_idx,
-                    &col_def.data_type,
-                )?);
-            }
-            rows.push(row);
-        }
     }
 
-    let values_query = ast::Query {
-        with: None,
-        body: Box::new(ast::SetExpr::Values(ast::Values {
+    let body = if total_rows == 0 {
+        empty_relation_body(columns)?
+    } else {
+        let mut rows: Vec<Vec<ast::Expr>> = Vec::with_capacity(total_rows);
+        for batch in batches {
+            for row_idx in 0..batch.num_rows() {
+                let mut row = Vec::with_capacity(columns.len());
+                for (col_idx, col_def) in columns.iter().enumerate() {
+                    let array = batch.column(col_idx);
+                    row.push(array_value_to_expr(
+                        array.as_ref(),
+                        row_idx,
+                        &col_def.data_type,
+                    )?);
+                }
+                rows.push(row);
+            }
+        }
+        ast::SetExpr::Values(ast::Values {
             explicit_row: false,
             rows,
             span: Span::new(0, 0),
-        })),
+        })
+    };
+
+    let values_query = ast::Query {
+        with: None,
+        body: Box::new(body),
         order_by: Vec::new(),
         limit: None,
         offset: None,
@@ -355,6 +351,59 @@ fn derived_values_factor(
         alias: Some(alias),
         span: Span::new(0, 0),
     })
+}
+
+fn empty_relation_body(columns: &[ColumnDef]) -> Result<ast::SetExpr, String> {
+    if columns.is_empty() {
+        return Err("virtual table must declare at least one column".to_string());
+    }
+    let projection = columns
+        .iter()
+        .map(|column| {
+            // Both registered providers declare plain Utf8. Reject other
+            // declarations until an exact SQL type mapping is implemented.
+            if column.data_type != DataType::Utf8 || column.logical_type.is_some() {
+                return Err(format!(
+                    "empty virtual table column `{}` has unsupported type {:?} / {:?}",
+                    column.name, column.data_type, column.logical_type
+                ));
+            }
+            let expr = if column.nullable {
+                ast::Expr::Cast(ast::CastExpr {
+                    expr: Box::new(literal_expr(ast::LiteralKind::Null)),
+                    data_type: ast::TypeName {
+                        name: ast::ObjectName {
+                            parts: vec![ident("VARCHAR")],
+                            span: Span::new(0, 0),
+                        },
+                        arguments: Vec::new(),
+                        argument_separator_spaces: Vec::new(),
+                        span: Span::new(0, 0),
+                    },
+                    kind: ast::CastKind::Cast,
+                    format: None,
+                    span: Span::new(0, 0),
+                })
+            } else {
+                literal_expr(ast::LiteralKind::String(String::new()))
+            };
+            Ok(ast::SelectItem::UnnamedExpr(expr))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    // These expressions author the declared type and nullability only. The
+    // false predicate removes the source-free row before any consumer sees it.
+    Ok(ast::SetExpr::Select(Box::new(ast::Select {
+        hints: Vec::new(),
+        quantifier: ast::SelectQuantifier::None,
+        projection,
+        from: Vec::new(),
+        selection: Some(literal_expr(ast::LiteralKind::Boolean(false))),
+        group_by: ast::GroupBy::None,
+        having: None,
+        qualify: None,
+        windows: Vec::new(),
+        span: Span::new(0, 0),
+    })))
 }
 
 fn array_value_to_expr(
@@ -643,5 +692,90 @@ mod tests {
             first_factor(&query),
             ast::TableFactor::Table { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn empty_virtual_relation_preserves_declared_names_types_and_nullability() {
+        use arrow::datatypes::{Field, Schema};
+        let columns = vec![
+            ColumnDef {
+                name: "required_value".into(),
+                data_type: DataType::Utf8,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            },
+            ColumnDef {
+                name: "optional_value".into(),
+                data_type: DataType::Utf8,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            },
+        ];
+        let empty_batch = RecordBatch::new_empty(Arc::new(Schema::new(vec![
+            Field::new("required_value", DataType::Utf8, false),
+            Field::new("optional_value", DataType::Utf8, true),
+        ])));
+        for batches in [Vec::new(), vec![empty_batch]] {
+            let mut query = parsed_query("SELECT required_value, optional_value FROM ignored AS q");
+            let ast::SetExpr::Select(select) = query.body.as_mut() else {
+                panic!("select");
+            };
+            select.from[0].relation =
+                derived_values_factor(&columns, &batches, table_alias("q")).unwrap();
+            let sql = novarocks_parser::printer::print_query(&query);
+            let completed =
+                crate::completed_plan_fixture::completed_literal_query([31; 16], &sql).await;
+            let fields = &completed.candidate().plan().result_port().unwrap().fields;
+            assert_eq!(fields.len(), columns.len());
+            for (field, column) in fields.iter().zip(&columns) {
+                assert_eq!(field.name.as_ref(), column.name);
+                assert_eq!(field.ty.data_type(), &column.data_type);
+                assert_eq!(field.ty.nullable(), column.nullable);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_external_tables_rewrite_through_alias_and_cte() {
+        let mut facts = Facts::external();
+        facts.external.as_mut().unwrap().table_names.clear();
+        let catalog = SystemCatalogService::with_defaults();
+        let mut query = parsed_query(
+            "WITH t AS (SELECT x.table_name FROM ice.information_schema.tables AS x) \
+             SELECT table_name FROM t",
+        );
+        rewrite_query(&facts, &catalog, connector_context(), &mut query).unwrap();
+        let sql = novarocks_parser::printer::print_query(&query);
+        let completed =
+            crate::completed_plan_fixture::completed_literal_query([32; 16], &sql).await;
+        let fields = &completed.candidate().plan().result_port().unwrap().fields;
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name.as_ref(), "table_name");
+        assert_eq!(fields[0].ty.data_type(), &DataType::Utf8);
+        assert!(!fields[0].ty.nullable());
+    }
+
+    #[test]
+    fn empty_virtual_relation_validates_batch_shape_and_exact_type_support() {
+        use arrow::datatypes::{Field, Schema};
+        let mut column = ColumnDef {
+            name: "value".into(),
+            data_type: DataType::Utf8,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        };
+        let batch = RecordBatch::new_empty(Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, false),
+            Field::new("b", DataType::Utf8, false),
+        ])));
+        let error =
+            derived_values_factor(&[column.clone()], &[batch], table_alias("q")).unwrap_err();
+        assert!(error.contains("batch column count 2 does not match provider schema 1"));
+        column.data_type = DataType::LargeUtf8;
+        let error = derived_values_factor(&[column], &[], table_alias("q")).unwrap_err();
+        assert!(error.contains("unsupported type LargeUtf8"));
     }
 }
