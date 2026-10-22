@@ -118,6 +118,7 @@ REFRESH MATERIALIZED VIEW orders_mv;
 SELECT k1, v1 FROM lnp3d_retain_${uuid0}.ns_${uuid0}.orders_mv ORDER BY k1;
 
 -- query 11
+-- @cleanup=true
 -- @skip_result_check=true
 SET CATALOG lnp3d_retain_${uuid0};
 USE ns_${uuid0};

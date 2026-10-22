@@ -90,6 +90,7 @@ CALL novarocks_mv_management_status('lnp3d_pkg_${uuid0}', 'ns_${uuid0}', 'a_mv')
 SELECT 1;
 
 -- query 8
+-- @cleanup=true
 -- @skip_result_check=true
 SET CATALOG lnp3d_pkg_${uuid0};
 USE ns_${uuid0};
