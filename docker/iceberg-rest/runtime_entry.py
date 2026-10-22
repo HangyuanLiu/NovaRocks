@@ -717,7 +717,10 @@ def attach_entry(owner, env_id, entry, config, bom):
     with runtime.file_lock(entry / '.entry.lock'):
         try:
             definition = owner.required_definition(owner.load_config(), bom)
-            with owner.ready_snapshot(definition, deadline=time.monotonic() + 2) as snapshot:
+            started = time.monotonic()
+            # Lock contention stays short; full resource validation has its own bounded deadline.
+            with owner.ready_snapshot(definition, deadline=started + owner.timeout,
+                                      lock_deadline=started + 2) as snapshot:
                 if config['benchmark']['shared_root'].rstrip('/') != snapshot['config']['benchmark_root']:
                     raise runtime.RuntimeFailure('MachineVersionMismatch', 'worktree benchmark root differs from machine configuration')
                 return publication.publish(entry, {'worktree': env_id, 'ready': True,

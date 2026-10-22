@@ -95,6 +95,64 @@ class RendererTests(RendererCase):
         self.assertEqual(before, (self.entry / 'env.sh').read_bytes())
         self.assertEqual(self.backend.events, ['ensure'])
 
+    def test_attach_full_validation_can_exceed_short_lock_wait_budget(self):
+        now = [100.0]
+        def pending(base):
+            now[0] += 0.9
+            return []
+        original_volume = self.backend.validate_minio_volume
+        def volume(snapshot):
+            now[0] += 0.9
+            original_volume(snapshot)
+        def healthy(snapshot):
+            self.assertEqual(self.backend.operation_deadline, 190.0)
+            now[0] += 1.2
+            return True
+        with mock.patch.object(entry.time, 'monotonic', side_effect=lambda: now[0]), \
+                mock.patch.object(self.backend, 'unsettled_operations', side_effect=pending), \
+                mock.patch.object(self.backend, 'validate_minio_volume', side_effect=volume), \
+                mock.patch.object(self.backend, 'healthy', side_effect=healthy):
+            result = self.bind()
+        self.assertTrue(result['ready'])
+        self.assertGreater(now[0], 102.0)
+        self.assertIsNone(self.backend.operation_deadline)
+        self.assertTrue(publication.read(self.entry)['ready'])
+
+    def test_attach_machine_lock_wait_remains_two_seconds(self):
+        now = [100.0]
+        other = machine.MachineOwner(self.owner.root, backend=self.backend)
+        def sleep(seconds):
+            now[0] += seconds
+        with other.maintenance_lock(), \
+                mock.patch.object(entry.time, 'monotonic', side_effect=lambda: now[0]), \
+                mock.patch.object(machine.time, 'sleep', side_effect=sleep), \
+                mock.patch.object(self.backend, 'healthy') as healthy:
+            with self.assertRaisesRegex(runtime.RuntimeFailure, 'MachineMaintaining'):
+                self.bind()
+        self.assertAlmostEqual(now[0], 102.0)
+        healthy.assert_not_called()
+        self.assertFalse(publication.read(self.entry)['ready'])
+        self.assertIsNone(self.backend.operation_deadline)
+
+    def test_attach_validation_expiry_invalidates_entry_without_extending_outer_budget(self):
+        for outer, health_end in ((None, 190.0), (104.0, 104.0)):
+            with self.subTest(outer=outer):
+                now = [100.0]
+                self.bind()
+                self.assertTrue(publication.read(self.entry)['ready'])
+                self.backend.operation_deadline = outer
+                def healthy(snapshot):
+                    self.assertEqual(self.backend.operation_deadline, 190.0 if outer is None else outer)
+                    now[0] = health_end
+                    return True
+                with mock.patch.object(entry.time, 'monotonic', side_effect=lambda: now[0]), \
+                        mock.patch.object(self.backend, 'healthy', side_effect=healthy):
+                    with self.assertRaisesRegex(runtime.RuntimeFailure, 'RunBudgetExpired'):
+                        self.bind()
+                self.assertFalse(publication.read(self.entry)['ready'])
+                self.assertEqual(self.backend.operation_deadline, outer)
+                self.backend.operation_deadline = None
+
     def test_server_warehouse_and_storage_owner_are_actual_machine_facts(self):
         first = self.bind()
         directory = Path(first['published_dir'])

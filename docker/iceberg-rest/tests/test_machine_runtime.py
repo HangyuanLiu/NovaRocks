@@ -462,6 +462,46 @@ class CredentialFenceTests(unittest.TestCase):
 
 
 class SnapshotDeadlineTests(unittest.TestCase):
+    def test_short_lock_deadline_does_not_shorten_validation_or_outer_run_clock(self):
+        backend = Backend()
+        with tempfile.TemporaryDirectory() as directory:
+            owner = machine.MachineOwner(directory, backend=backend, daemon="local-daemon")
+            owner._save(dict(schema=machine.PROTOCOL, daemon_id=owner.daemon_id,
+                control_root=str(owner.root), phase="ready", version="v", generation="g"))
+            now = [100.0]
+            backend.operation_deadline = 107.0
+            def healthy(state):
+                self.assertEqual(backend.operation_deadline, 107.0)
+                now[0] = 103.0
+                return True
+            with mock.patch.object(machine.time, "monotonic", side_effect=lambda: now[0]), \
+                    mock.patch.object(backend, "healthy", side_effect=healthy), \
+                    mock.patch.object(backend, "validate_minio_volume"):
+                with owner.ready_snapshot({"version": "v"}, deadline=190.0, lock_deadline=102.0):
+                    self.assertEqual(backend.operation_deadline, 107.0)
+                    self.assertGreater(now[0], 102.0)
+            self.assertEqual(backend.operation_deadline, 107.0)
+
+    def test_validation_still_expires_at_original_outer_deadline_and_restores_it(self):
+        backend = Backend()
+        with tempfile.TemporaryDirectory() as directory:
+            owner = machine.MachineOwner(directory, backend=backend, daemon="local-daemon")
+            owner._save(dict(schema=machine.PROTOCOL, daemon_id=owner.daemon_id,
+                control_root=str(owner.root), phase="ready", version="v", generation="g"))
+            now = [100.0]
+            backend.operation_deadline = 104.0
+            def healthy(state):
+                self.assertEqual(backend.operation_deadline, 104.0)
+                now[0] = 104.0
+                return True
+            with mock.patch.object(machine.time, "monotonic", side_effect=lambda: now[0]), \
+                    mock.patch.object(backend, "healthy", side_effect=healthy), \
+                    mock.patch.object(backend, "validate_minio_volume"):
+                with self.assertRaisesRegex(runtime.RuntimeFailure, "RunBudgetExpired"):
+                    with owner.ready_snapshot({"version": "v"}, deadline=190.0, lock_deadline=102.0):
+                        self.fail("expired outer run budget yielded readiness")
+            self.assertEqual(backend.operation_deadline, 104.0)
+
     def test_expired_admitted_clock_precedes_daemon_probe(self):
         backend = Backend()
         with tempfile.TemporaryDirectory() as directory:
