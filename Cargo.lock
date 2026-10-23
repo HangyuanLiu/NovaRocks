@@ -4408,6 +4408,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "bytes",
+ "futures",
  "novarocks-connector-contract",
  "novarocks-coordination-contract",
  "novarocks-execution-contract",

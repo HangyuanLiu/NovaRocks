@@ -258,6 +258,12 @@ impl fmt::Display for QueryExecutionError {
 
 impl Error for QueryExecutionError {}
 
+pub use crate::coordination::{
+    LocalExecutionDisposition, LogicalActorExitPhase, LogicalExecutionExitObserver,
+    LogicalExecutionExitReceipt, LogicalExecutionExitView, LogicalExecutionStartAttempt,
+    OriginalLogicalStartInput, RemoteExecutionDisposition,
+};
+
 pub type QueryExecutionFuture =
     Pin<Box<dyn Future<Output = Result<ExecutionHandle, QueryExecutionError>> + Send + 'static>>;
 
@@ -310,6 +316,39 @@ impl ReservedExecutionIdentity {
 /// Crate-private process driver behind the bounded client capability.
 pub(crate) trait QueryExecutionDriver: Send + Sync + 'static {
     fn reserve_identity(&self) -> Result<ReservedExecutionIdentity, QueryExecutionError>;
+    fn prepare_observed_start(
+        &self,
+        request: QueryExecutionRequest,
+        reserved: Option<ReservedExecutionIdentity>,
+    ) -> Result<
+        OriginalLogicalStartInput,
+        (
+            QueryExecutionError,
+            QueryExecutionRequest,
+            Option<ReservedExecutionIdentity>,
+        ),
+    > {
+        Err((
+            QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "this driver has no original observed-start source",
+            ),
+            request,
+            reserved,
+        ))
+    }
+    fn start_observed_in(
+        &self,
+        _input: &mut Option<OriginalLogicalStartInput>,
+        _owner: &mut Option<WorkOwner>,
+        _ready: &mut Option<QueryExecutionFuture>,
+        _exit: &mut Option<LogicalExecutionExitObserver>,
+    ) -> Result<LogicalExecutionStartAttempt, QueryExecutionError> {
+        Err(QueryExecutionError::new(
+            QueryExecutionErrorKind::InvalidRequest,
+            "this driver has no original observed-start source",
+        ))
+    }
     fn start(
         &self,
         request: QueryExecutionRequest,
@@ -344,6 +383,33 @@ impl QueryExecutionClient {
         }
     }
 
+    /// Construct the original move-only input header before borrowing a stable
+    /// publisher. Refusal returns the exact request/reservation unchanged.
+    pub fn prepare_observed_start(
+        &self,
+        request: QueryExecutionRequest,
+        reserved: Option<ReservedExecutionIdentity>,
+    ) -> Result<
+        OriginalLogicalStartInput,
+        (
+            QueryExecutionError,
+            QueryExecutionRequest,
+            Option<ReservedExecutionIdentity>,
+        ),
+    > {
+        self.driver.prepare_observed_start(request, reserved)
+    }
+    /// Pass real Pending/LiveJob fields. Complete the returned sender tail only
+    /// after releasing every caller lock. Neither edge grants execution or IO.
+    pub fn start_observed_in(
+        &self,
+        input: &mut Option<OriginalLogicalStartInput>,
+        owner: &mut Option<WorkOwner>,
+        ready: &mut Option<QueryExecutionFuture>,
+        exit: &mut Option<LogicalExecutionExitObserver>,
+    ) -> Result<LogicalExecutionStartAttempt, QueryExecutionError> {
+        self.driver.start_observed_in(input, owner, ready, exit)
+    }
     pub fn start(&self, request: QueryExecutionRequest, owner: WorkOwner) -> QueryExecutionFuture {
         self.driver.start(request, owner, None)
     }
@@ -400,6 +466,7 @@ pub struct ExecutionHandle {
     control: Box<dyn ExecutionControl>,
     output: Option<crate::api::ExecutionOutput>,
     ready: Option<ComputationReadyToken>,
+    original_exit: Option<LogicalExecutionExitObserver>,
 }
 
 impl ExecutionHandle {
@@ -408,6 +475,7 @@ impl ExecutionHandle {
             control: Box::new(control),
             output: Some(output),
             ready: None,
+            original_exit: None,
         }
     }
 
@@ -419,9 +487,18 @@ impl ExecutionHandle {
             control: Box::new(control),
             output: None,
             ready: Some(token),
+            original_exit: None,
         }
     }
 
+    pub(crate) fn retain_original_exit(&mut self, observer: LogicalExecutionExitObserver) {
+        assert!(self.original_exit.is_none());
+        self.original_exit = Some(observer);
+    }
+    /// Move the convenience start's exact observation into a stable receiver.
+    pub fn take_exit_observer(&mut self) -> Option<LogicalExecutionExitObserver> {
+        self.original_exit.take()
+    }
     /// Observes the accepted computation cut without granting publication rights.
     pub const fn ready_token(&self) -> Option<&ComputationReadyToken> {
         self.ready.as_ref()

@@ -65,6 +65,13 @@ struct RegistryState {
     // keeps the original fields together; intake never projects their custody.
     health: Option<OriginalHealth>,
 }
+/// The custody transaction is finished. Deliver only after every caller lock.
+pub(crate) struct StatementNativeHealthNotification(Arc<RegistryInner>);
+impl StatementNativeHealthNotification {
+    pub(crate) fn notify(self) {
+        self.0.changed.notify_one();
+    }
+}
 struct OriginalHealth {
     message: &'static str,
     _panic: Option<Box<dyn Any + Send>>,
@@ -625,6 +632,36 @@ impl StatementNativeResidualRegistry {
             "logical execution supervision task panicked",
             Some(original),
         );
+    }
+
+    /// Silent borrowed intake for the original finite role source. Later
+    /// failures keep their exact source; first-health policy is unchanged.
+    pub(crate) fn record_supervision_panic_in(
+        &self,
+        original: &mut Option<Box<dyn Any + Send>>,
+    ) -> Option<StatementNativeHealthNotification> {
+        if original.is_none() {
+            return None;
+        }
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state
+            .health
+            .as_ref()
+            .is_some_and(|first| first._panic.is_some())
+        {
+            return None;
+        }
+        if let Some(first) = state.health.as_mut() {
+            first._panic = original.take();
+        } else {
+            state.health = Some(OriginalHealth {
+                message: "logical execution supervision task panicked",
+                _panic: original.take(),
+                _cause: None,
+            });
+        }
+        drop(state);
+        Some(StatementNativeHealthNotification(Arc::clone(&self.0)))
     }
 
     pub(crate) fn record_supervision_join_failure(&self, error: tokio::task::JoinError) {

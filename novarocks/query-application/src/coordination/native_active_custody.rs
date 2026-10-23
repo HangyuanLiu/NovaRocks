@@ -67,6 +67,7 @@ struct RetainedNativeActiveOwner {
     failure: StatementNativeHealthFailure,
 }
 struct ActiveSlot {
+    original_exit: Weak<super::original_exit::OriginalLogicalExit>,
     contexts: BTreeSet<QueryContextRef>,
     owner: Mutex<Option<RetainedNativeActiveOwner>>,
     root_ack: Mutex<RootAckTailState>,
@@ -268,11 +269,12 @@ impl NativeActiveCustodyRegistry {
             root_ack_ready: Arc::new(RootAckReadyIndex::default()),
         }
     }
-    pub(crate) fn reserve(
+    pub(super) fn reserve_with_original_exit(
         &self,
         key: NativeActiveCustodyKey,
         contexts: &[QueryContextRef],
         registry: LogicalExecutionRuntimeRegistryHandle,
+        original_exit: Weak<super::original_exit::OriginalLogicalExit>,
     ) -> Option<NativeActiveCustodyReservation> {
         let exact = contexts.iter().copied().collect::<BTreeSet<_>>();
         if exact.is_empty()
@@ -288,6 +290,7 @@ impl NativeActiveCustodyRegistry {
             return None;
         }
         let slot = Arc::new(ActiveSlot {
+            original_exit,
             contexts: exact,
             owner: Mutex::new(None),
             root_ack: Mutex::new(RootAckTailState::default()),
@@ -347,18 +350,30 @@ impl NativeActiveCustodyRegistry {
         self.remove_if_settled(key, slot);
     }
     fn remove_if_settled(&self, key: NativeActiveCustodyKey, slot: &Arc<ActiveSlot>) {
-        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-        if slots
-            .get(&key)
-            .is_some_and(|current| Arc::ptr_eq(current, slot))
-            && slot
-                .root_ack
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .settled()
-        {
-            slots.remove(&key);
-            drop(slots);
+        let removed = {
+            let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+            if slots
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, slot))
+                && slot
+                    .root_ack
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .settled()
+            {
+                slots.remove(&key)
+            } else {
+                None
+            }
+        };
+        if let Some(removed) = removed {
+            if let Some(source) = removed.original_exit.upgrade() {
+                source.native_return_silent(
+                    key,
+                    super::LocalExecutionDisposition::OriginalPaidOwnerReturn,
+                );
+            }
+            drop(removed);
             self.progress.notify_waiters();
         }
     }
@@ -472,11 +487,28 @@ impl NativeActiveCustodyRegistry {
         drop(slots);
     }
     fn remove(&self, key: NativeActiveCustodyKey) {
-        self.slots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&key);
-        self.progress.notify_waiters();
+        let removed = {
+            self.slots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key)
+        };
+        if let Some(removed) = removed {
+            if let Some(source) = removed.original_exit.upgrade() {
+                source.native_return_silent(
+                    key,
+                    super::LocalExecutionDisposition::ActualSourcesExited,
+                );
+            }
+            drop(removed);
+            self.progress.notify_waiters();
+        }
+    }
+    pub(super) fn slot_layout() -> std::alloc::Layout {
+        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
+            ActiveSlot,
+        >())
+        .expect("fixed original Native slot layout")
     }
     pub(crate) fn registration_health(
         &self,
@@ -807,6 +839,7 @@ fn root_ack_test_fixture_in(
         execution: activation.execution(),
     };
     let slot = Arc::new(ActiveSlot {
+        original_exit: Weak::new(),
         contexts: BTreeSet::from([QueryContextRef::new(
             key.execution,
             novarocks_types::FrontendProcessId::new_v7(),
@@ -1196,6 +1229,7 @@ mod tests {
                 slots.insert(
                     key,
                     Arc::new(ActiveSlot {
+                        original_exit: Weak::new(),
                         contexts: BTreeSet::from([QueryContextRef::new(
                             key.execution,
                             FrontendProcessId::new_v7(),
@@ -1309,6 +1343,7 @@ mod tests {
                 slots.insert(
                     key,
                     Arc::new(ActiveSlot {
+                        original_exit: Weak::new(),
                         contexts: BTreeSet::from([QueryContextRef::new(
                             key.execution,
                             FrontendProcessId::new_v7(),

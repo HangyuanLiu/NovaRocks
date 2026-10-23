@@ -20,6 +20,7 @@ mod actor_state;
 mod delivery;
 mod establish;
 mod native_active_custody;
+mod original_exit;
 mod plan_activation;
 mod recovery;
 mod replacement;
@@ -37,6 +38,11 @@ pub use actor_state::*;
 pub use delivery::*;
 pub use establish::*;
 pub(crate) use native_active_custody::*;
+pub use original_exit::{
+    LocalExecutionDisposition, LogicalActorExitPhase, LogicalExecutionExitGeometry,
+    LogicalExecutionExitObserver, LogicalExecutionExitReceipt, LogicalExecutionExitView,
+    RemoteExecutionDisposition,
+};
 pub(crate) use plan_activation::ActiveLogicalPlan;
 pub use recovery::*;
 pub use replacement::*;

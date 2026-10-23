@@ -29,6 +29,7 @@ novarocks-user-error.workspace = true
 novarocks-workload-control.workspace = true
 serde.workspace = true
 bytes.workspace = true
+futures.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
 

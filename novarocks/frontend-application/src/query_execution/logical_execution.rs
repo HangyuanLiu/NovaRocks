@@ -280,10 +280,7 @@ mod initial_reservation_tests {
     use super::*;
     use novarocks_query_application::{
         api::{LogicalExecutionNativePort, LogicalNativeOpenFuture, LogicalNativeOpenRequest},
-        coordination::{
-            LogicalExecutionRowsConfig, LogicalExecutionSupervisor,
-            LogicalExecutionSupervisorConfig,
-        },
+        coordination::{LogicalExecutionRowsConfig, LogicalExecutionSupervisorConfig},
     };
     use novarocks_spi::connector::{
         ConnectorStopOwner, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
@@ -303,10 +300,10 @@ mod initial_reservation_tests {
     }
 
     fn process() -> (
-        LogicalExecutionSupervisor,
+        crate::query_execution::logical_execution_test_profile::IdentityTestOwner,
         novarocks_query_application::api::QueryExecutionClient,
     ) {
-        LogicalExecutionSupervisor::new(
+        crate::query_execution::logical_execution_test_profile::process(
             tokio::runtime::Handle::current(),
             Arc::new(NoNativeStart),
             QueryProcessNamespace::new(0x9b1),

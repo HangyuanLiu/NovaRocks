@@ -18,18 +18,20 @@
 //! Process-owned logical execution supervision.
 //!
 //! The supervisor is the sole constructor of [`QueryExecutionClient`]. A
-//! start mailbox transfers one governed work owner before returning a future to
-//! the caller. Warehouse concurrency admission happened before this handoff,
-//! so the mailbox has no independent capacity policy. Accepted requests remain
-//! in the supervisor's JoinSet even when that caller drops its reply future.
+//! original fixed role cell receives one governed work owner before returning
+//! a future to the caller. The same supervisor task polls every logical role;
+//! dropping a caller reply cannot detach its original frame or input. Actor
+//! and statement Native residual owners retain their existing exit contracts.
 
+use super::LogicalExecutionExitObserver;
+use super::original_exit::OriginalLogicalExit;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -37,9 +39,12 @@ use novarocks_types::identity::{
     AttemptId, FrontendProcessId, LocalQuerySequence, QueryExecutionId, QueryIdAttribution,
     QueryProcessNamespace,
 };
-use novarocks_workload_control::{CancellationReason, Stage, WorkError, WorkOwner};
+use novarocks_workload_control::{
+    CancellationReason, PollCompletion, PollTurnCompletion, RoleBackingRetirementObserver,
+    RoleIngress, RolePollBank, Stage, WorkError, WorkOwner, WorkloadControl,
+};
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::api::{
@@ -192,11 +197,213 @@ impl std::error::Error for LogicalExecutionSupervisorShutdownError {}
 // Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
 pub struct LogicalExecutionSupervisor {
     shutdown: watch::Sender<bool>,
-    join: Option<JoinHandle<Result<(), QueryExecutionError>>>,
+    join: Option<JoinHandle<OriginalRootOutcome>>,
     run_outcome: Option<SupervisorRunOutcome>,
+    original_root_failure: std::mem::ManuallyDrop<Option<Arc<tokio::task::JoinError>>>,
+    original_root_panic: std::mem::ManuallyDrop<Option<OriginalRootPanic>>,
     registry: LogicalExecutionRuntimeRegistry,
     statement_native_residual_port: super::StatementNativeResidualPort,
+    role_retirement: RoleBackingRetirementObserver,
     shutdown_complete: bool,
+}
+
+enum OriginalRootOutcome {
+    Completed(Result<(), QueryExecutionError>),
+    Panicked(OriginalRootPanic),
+}
+#[derive(Clone)]
+struct OriginalRootPanic {
+    // One original root packet shared only by its Supervisor and task guard.
+    // It never points to Registry/health. An unresolved packet's implicit
+    // destruction must not destroy its bank, opaque panic or raw join cause.
+    shared: Arc<OriginalRootRetirement>,
+}
+struct OriginalRootRetirement {
+    custody: std::sync::Mutex<std::mem::ManuallyDrop<Option<OriginalRootPanicCustody>>>,
+    join_failure: std::sync::OnceLock<std::mem::ManuallyDrop<Arc<tokio::task::JoinError>>>,
+}
+struct OriginalRootPanicCustody {
+    _bank: Box<dyn std::any::Any + Send>,
+    bank_layout: std::alloc::Layout,
+    // Cancellation is reported by the genuine original JoinError, not a
+    // synthetic panic payload. A caught service panic remains unchanged here.
+    primary: Option<Box<dyn std::any::Any + Send>>,
+    cleanup: [Option<Box<dyn std::any::Any + Send>>; 2],
+    cancelled: bool,
+}
+impl OriginalRootPanic {
+    fn empty() -> Self {
+        Self {
+            shared: Arc::new(OriginalRootRetirement {
+                custody: std::sync::Mutex::new(std::mem::ManuallyDrop::new(None)),
+                join_failure: std::sync::OnceLock::new(),
+            }),
+        }
+    }
+    fn custody(&self) -> OriginalRootBankView<'_> {
+        OriginalRootBankView {
+            guard: self
+                .shared
+                .custody
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        }
+    }
+    fn has_failure(&self) -> bool {
+        self.shared
+            .custody
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+            || self.shared.join_failure.get().is_some()
+    }
+    fn retain(&self, original: OriginalRootPanicCustody) {
+        let mut original = Some(original);
+        {
+            let mut target = self
+                .shared
+                .custody
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if target.is_none() {
+                **target = original.take();
+            }
+        }
+        // A second bank cannot be normally destroyed on an invariant failure.
+        if let Some(original) = original {
+            std::panic::panic_any(std::mem::ManuallyDrop::new(original));
+        }
+    }
+    fn retain_join_failure(&self, original: Arc<tokio::task::JoinError>) {
+        if let Err(original) = self
+            .shared
+            .join_failure
+            .set(std::mem::ManuallyDrop::new(original))
+        {
+            std::panic::panic_any(original);
+        }
+    }
+    fn dispose_for_process_exit(self) {
+        // The normal joined root leaves only this original Supervisor alias.
+        // If an illegal live alias remains, preserve it to process exit rather
+        // than pretending that the task's actual sources have exited.
+        if let Ok(mut shared) = Arc::try_unwrap(self.shared) {
+            let original = shared
+                .custody
+                .into_inner()
+                .unwrap_or_else(|error| error.into_inner());
+            drop(std::mem::ManuallyDrop::into_inner(original));
+            if let Some(original) = shared.join_failure.take() {
+                drop(std::mem::ManuallyDrop::into_inner(original));
+            }
+        }
+    }
+}
+struct OriginalRootBankView<'a> {
+    guard: std::sync::MutexGuard<'a, std::mem::ManuallyDrop<Option<OriginalRootPanicCustody>>>,
+}
+impl std::ops::Deref for OriginalRootBankView<'_> {
+    type Target = OriginalRootPanicCustody;
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_ref().expect("retained original root")
+    }
+}
+/// A borrow from the original root owner, never a take/projected panic string.
+/// Do not retain this view while requesting the same owner's shutdown.
+pub struct LogicalExecutionRootFailureView<'a> {
+    original: OriginalRootBankView<'a>,
+}
+impl LogicalExecutionRootFailureView<'_> {
+    pub fn primary(&self) -> Option<&(dyn std::any::Any + Send)> {
+        self.original.primary.as_deref()
+    }
+    pub fn cleanup(&self, index: usize) -> Option<&(dyn std::any::Any + Send)> {
+        self.original.cleanup.get(index).and_then(Option::as_deref)
+    }
+    pub fn retained_bank_layout(&self) -> std::alloc::Layout {
+        self.original.bank_layout
+    }
+    pub fn was_cancelled(&self) -> bool {
+        self.original.cancelled
+    }
+}
+
+/// The unique original bank, outside the caught borrowed service. Drop closes
+/// the same ingress even before the root's first poll, then retains the whole
+/// bank in the original Supervisor packet. It never ordinarily drops sources.
+struct OriginalRootBank<F, M>
+where
+    F: Future<Output = Result<(), QueryExecutionError>> + Send + 'static,
+    M: Fn(WorkOwner, LogicalRoleInput) -> F + Send + 'static,
+{
+    bank: std::mem::ManuallyDrop<
+        Option<RolePollBank<LogicalRoleInput, F, M, Arc<OriginalLogicalExit>>>,
+    >,
+    retirement: OriginalRootPanic,
+}
+impl<F, M> OriginalRootBank<F, M>
+where
+    F: Future<Output = Result<(), QueryExecutionError>> + Send + 'static,
+    M: Fn(WorkOwner, LogicalRoleInput) -> F + Send + 'static,
+{
+    fn bank_mut(&mut self) -> &mut RolePollBank<LogicalRoleInput, F, M, Arc<OriginalLogicalExit>> {
+        self.bank.as_mut().expect("original root bank")
+    }
+    fn take(&mut self) -> RolePollBank<LogicalRoleInput, F, M, Arc<OriginalLogicalExit>> {
+        self.bank
+            .take()
+            .expect("original root bank transferred once")
+    }
+}
+impl<F, M> Drop for OriginalRootBank<F, M>
+where
+    F: Future<Output = Result<(), QueryExecutionError>> + Send + 'static,
+    M: Fn(WorkOwner, LogicalRoleInput) -> F + Send + 'static,
+{
+    fn drop(&mut self) {
+        if let Some(bank) = self.bank.take() {
+            // stop_ingress publishes the original State cut; the catch retains
+            // any real exceptional tail without replacing the task JoinError.
+            let closing = catch_unwind(AssertUnwindSafe(|| bank.stop_ingress())).err();
+            self.retirement.retain(OriginalRootPanicCustody {
+                _bank: Box::new(bank),
+                bank_layout: std::alloc::Layout::new::<
+                    RolePollBank<LogicalRoleInput, F, M, Arc<OriginalLogicalExit>>,
+                >(),
+                primary: None,
+                cleanup: [closing, None],
+                cancelled: true,
+            });
+        }
+    }
+}
+
+/// Independent facts; the bank value is moved to the failure Box, not copied.
+/// Task storage, borrowed service frame and opaque pointees are separate owners.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LogicalExecutionRootCustodyGeometry {
+    pub supervisor: std::alloc::Layout,
+    pub failure: std::alloc::Layout,
+    pub join_output: std::alloc::Layout,
+    pub retained_bank: std::alloc::Layout,
+    pub cancellation_guard: std::alloc::Layout,
+    pub shared_retirement_packet: std::alloc::Layout,
+}
+fn root_custody_geometry<F, M>(_: &M) -> LogicalExecutionRootCustodyGeometry
+where
+    F: Future<Output = Result<(), QueryExecutionError>> + Send + 'static,
+    M: Fn(WorkOwner, LogicalRoleInput) -> F + Send + 'static,
+{
+    LogicalExecutionRootCustodyGeometry {
+        supervisor: std::alloc::Layout::new::<LogicalExecutionSupervisor>(),
+        failure: std::alloc::Layout::new::<OriginalRootPanic>(),
+        join_output: std::alloc::Layout::new::<OriginalRootOutcome>(),
+        cancellation_guard: std::alloc::Layout::new::<OriginalRootBank<F, M>>(),
+        shared_retirement_packet: std::alloc::Layout::new::<OriginalRootRetirement>(),
+        retained_bank: std::alloc::Layout::new::<
+            RolePollBank<LogicalRoleInput, F, M, Arc<OriginalLogicalExit>>,
+        >(),
+    }
 }
 
 enum SupervisorRunOutcome {
@@ -218,6 +425,12 @@ impl fmt::Debug for LogicalExecutionSupervisor {
 impl Drop for LogicalExecutionSupervisor {
     fn drop(&mut self) {
         assert_shutdown_complete(self.shutdown_complete, "logical execution supervisor");
+        if self.shutdown_complete {
+            drop(self.original_root_failure.take());
+            drop(self.original_root_panic.take());
+        }
+        // Illegal owner loss leaves the SAME original finite failure custody
+        // intact. This is not successful or normal product shutdown.
     }
 }
 
@@ -229,18 +442,36 @@ impl LogicalExecutionSupervisor {
     pub fn logical_role_poll_geometry()
     -> Result<novarocks_workload_control::PollRoleGeometry, novarocks_workload_control::WorkError>
     {
-        novarocks_workload_control::PollRoleGeometry::for_factory(&make_logical_role)
+        novarocks_workload_control::PollRoleGeometry::for_factory_with_context::<
+            _,
+            _,
+            _,
+            Arc<OriginalLogicalExit>,
+        >(&make_logical_role)
     }
 
-    /// Constructs the sole bounded client together with its process owner.
-    pub fn new(
+    /// Actual factory types only; this does not construct an input or bank.
+    pub fn logical_root_custody_geometry() -> LogicalExecutionRootCustodyGeometry {
+        root_custody_geometry(&make_logical_role)
+    }
+
+    /// Installs the same factory in the original fixed inventory before Ready.
+    /// The composing owner supplies the complete profile and role index. There
+    /// is no counted or per-task fallback when installation is refused.
+    pub fn try_new(
+        control: &mut WorkloadControl,
+        role: usize,
+        turn_budget: NonZeroUsize,
         runtime: Handle,
         native: Arc<dyn LogicalExecutionNativePort>,
         namespace: QueryProcessNamespace,
         frontend_process_id: FrontendProcessId,
         config: LogicalExecutionSupervisorConfig,
-    ) -> (Self, QueryExecutionClient) {
-        Self::with_clock(
+    ) -> Result<(Self, QueryExecutionClient), WorkError> {
+        Self::try_with_clock(
+            control,
+            role,
+            turn_budget,
             runtime,
             native,
             namespace,
@@ -250,19 +481,56 @@ impl LogicalExecutionSupervisor {
         )
     }
 
-    /// Uses the same role-local timeline as the Native attempt owner.
-    pub fn with_clock(
+    /// Uses the original role-local timeline and one bank across all classes.
+    /// turn_budget bounds service work between yields; it grants no capacity.
+    pub fn try_with_clock(
+        control: &mut WorkloadControl,
+        role: usize,
+        turn_budget: NonZeroUsize,
         runtime: Handle,
         native: Arc<dyn LogicalExecutionNativePort>,
         namespace: QueryProcessNamespace,
         frontend_process_id: FrontendProcessId,
         config: LogicalExecutionSupervisorConfig,
         clock: Arc<dyn MonotonicClock>,
-    ) -> (Self, QueryExecutionClient) {
-        // Query admission is the sole warehouse scheduling queue. This
-        // unbounded handoff only transfers already admitted work to the
-        // supervisor; it must never reject a query with a second capacity.
-        let (starts, start_rx) = mpsc::unbounded_channel();
+    ) -> Result<(Self, QueryExecutionClient), WorkError> {
+        // Finish fallible inventory registration before constructing any task
+        // or Registry owner requiring asynchronous shutdown.
+        let bank = RolePollBank::<_, _, _, Arc<OriginalLogicalExit>>::install_with_context(
+            control,
+            role,
+            make_logical_role,
+        )?;
+        Self::start_installed_bank(
+            bank,
+            turn_budget,
+            runtime,
+            native,
+            namespace,
+            frontend_process_id,
+            config,
+            clock,
+        )
+    }
+
+    // Only the original installer or its private unit fixture can provide a
+    // bank. This is not an ownerless registration or public admission API.
+    fn start_installed_bank<F, M>(
+        bank: RolePollBank<LogicalRoleInput, F, M, Arc<OriginalLogicalExit>>,
+        turn_budget: NonZeroUsize,
+        runtime: Handle,
+        native: Arc<dyn LogicalExecutionNativePort>,
+        namespace: QueryProcessNamespace,
+        frontend_process_id: FrontendProcessId,
+        config: LogicalExecutionSupervisorConfig,
+        clock: Arc<dyn MonotonicClock>,
+    ) -> Result<(Self, QueryExecutionClient), WorkError>
+    where
+        F: Future<Output = Result<(), QueryExecutionError>> + Send + 'static,
+        M: Fn(WorkOwner, LogicalRoleInput) -> F + Send + 'static,
+    {
+        let ingress = bank.ingress()?;
+        let role_retirement = bank.retirement_observer();
         let (shutdown, shutdown_rx) = watch::channel(false);
         let registry = LogicalExecutionRuntimeRegistry::new(runtime.clone());
         let statement_native_residual_port =
@@ -270,37 +538,64 @@ impl LogicalExecutionSupervisor {
         let registry_handle = registry.handle();
         let query_ids = Arc::new(ProcessQueryIdAllocator::new(namespace));
         let driver = QueryExecutionDriverHandle {
-            starts,
+            ingress,
             shutdown: shutdown_rx.clone(),
-            query_ids: Arc::clone(&query_ids),
-        };
-        let join = runtime.spawn(run_supervisor(
-            registry_handle,
-            native,
             query_ids,
+            native,
             frontend_process_id,
             config,
             clock,
-            start_rx,
+            registry: registry_handle.clone(),
+        };
+        let original_root = OriginalRootPanic::empty();
+        let join = runtime.spawn(run_supervisor_owned(
+            registry_handle,
+            bank,
+            turn_budget,
             shutdown_rx,
+            original_root.clone(),
         ));
-        (
+        Ok((
             Self {
                 shutdown,
                 join: Some(join),
                 run_outcome: None,
+                original_root_failure: std::mem::ManuallyDrop::new(None),
+                original_root_panic: std::mem::ManuallyDrop::new(Some(original_root)),
                 registry,
                 statement_native_residual_port,
+                role_retirement,
                 shutdown_complete: false,
             },
             QueryExecutionClient::new(driver),
-        )
+        ))
+    }
+
+    /// Observe only original bank retirement after separately joining this root.
+    /// The composing owner keeps the original progress service alive. A packet
+    /// retained by health may keep its footer charged beyond the root's exit.
+    pub fn role_retirement(&self) -> &RoleBackingRetirementObserver {
+        &self.role_retirement
     }
 
     /// Registers only original statement Native responsibility; no actor gate,
     /// logical success, or second business admission is granted by this port.
     pub fn statement_native_residual_port(&self) -> super::StatementNativeResidualPort {
         self.statement_native_residual_port.clone()
+    }
+
+    /// Safe borrow; the original failure remains with the actual root owner.
+    pub fn original_root_join_failure(&self) -> Option<&tokio::task::JoinError> {
+        self.original_root_failure.as_deref()
+    }
+
+    pub fn original_root_panic(&self) -> Option<LogicalExecutionRootFailureView<'_>> {
+        let original = self.original_root_panic.as_ref()?;
+        let view = original.custody();
+        if view.guard.is_none() {
+            return None;
+        }
+        Some(LogicalExecutionRootFailureView { original: view })
     }
 
     pub async fn shutdown_until(
@@ -329,12 +624,17 @@ impl LogicalExecutionSupervisor {
                         None => LogicalExecutionSupervisorShutdownError::DeadlineExceeded,
                     });
                 }
-                Ok(Err(error)) => {
-                    self.registry.record_native_supervision_join_failure(error);
+                Ok(Err(error)) => Some(self.receive_original_root_join_failure(error)),
+                Ok(Ok(OriginalRootOutcome::Completed(Err(error)))) => {
+                    Some(SupervisorRunOutcome::Failed(Box::new(error)))
+                }
+                Ok(Ok(OriginalRootOutcome::Completed(Ok(())))) => {
+                    Some(SupervisorRunOutcome::Completed)
+                }
+                Ok(Ok(OriginalRootOutcome::Panicked(original))) => {
+                    *self.original_root_panic = Some(original);
                     Some(SupervisorRunOutcome::Panicked)
                 }
-                Ok(Ok(Err(error))) => Some(SupervisorRunOutcome::Failed(Box::new(error))),
-                Ok(Ok(Ok(()))) => Some(SupervisorRunOutcome::Completed),
             };
             self.join.take();
         }
@@ -359,6 +659,14 @@ impl LogicalExecutionSupervisor {
         {
             self.run_outcome = Some(SupervisorRunOutcome::Failed(Box::new(error)));
         }
+        if self.original_root_failure.is_some()
+            || self
+                .original_root_panic
+                .as_ref()
+                .is_some_and(OriginalRootPanic::has_failure)
+        {
+            return Err(LogicalExecutionSupervisorShutdownError::SupervisorPanicked);
+        }
         self.shutdown_complete = true;
         match self
             .run_outcome
@@ -375,6 +683,24 @@ impl LogicalExecutionSupervisor {
         }
     }
 
+    fn receive_original_root_join_failure(
+        &mut self,
+        error: tokio::task::JoinError,
+    ) -> SupervisorRunOutcome {
+        let original = Arc::new(error);
+        *self.original_root_failure = Some(Arc::clone(&original));
+        self.original_root_panic
+            .as_ref()
+            .unwrap()
+            .retain_join_failure(Arc::clone(&original));
+        // The original bank and actual raw cause are stable before health can
+        // execute any callback. The health wrapper holds only the same cause,
+        // never this packet or bank (which could form an ownership cycle).
+        self.registry
+            .record_native_supervision_panic(Box::new(original));
+        SupervisorRunOutcome::Panicked
+    }
+
     /// Ends process-local ownership after bounded graceful convergence failed
     /// and the FE runner has irrevocably committed to process exit.
     ///
@@ -387,6 +713,12 @@ impl LogicalExecutionSupervisor {
         self.join.take();
         self.run_outcome.take();
         self.registry.abandon_for_process_exit();
+        // The process owner has irrevocably selected actual process exit.
+        // Dispose whole original packets here, never on a normal health reject.
+        drop(self.original_root_failure.take());
+        if let Some(original) = self.original_root_panic.take() {
+            original.dispose_for_process_exit();
+        }
         self.shutdown_complete = true;
     }
 
@@ -396,16 +728,29 @@ impl LogicalExecutionSupervisor {
     }
 }
 
-#[derive(Debug)]
 struct QueryExecutionDriverHandle {
-    starts: mpsc::UnboundedSender<StartCommand>,
+    ingress: RoleIngress<LogicalRoleInput, Arc<OriginalLogicalExit>>,
     shutdown: watch::Receiver<bool>,
     query_ids: Arc<ProcessQueryIdAllocator>,
+    native: Arc<dyn LogicalExecutionNativePort>,
+    frontend_process_id: FrontendProcessId,
+    config: LogicalExecutionSupervisorConfig,
+    clock: Arc<dyn MonotonicClock>,
+    registry: LogicalExecutionRuntimeRegistryHandle,
+}
+
+impl fmt::Debug for QueryExecutionDriverHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QueryExecutionDriverHandle")
+            .field("shutdown_requested", &*self.shutdown.borrow())
+            .finish_non_exhaustive()
+    }
 }
 
 impl QueryExecutionDriver for QueryExecutionDriverHandle {
     fn reserve_identity(&self) -> Result<ReservedExecutionIdentity, QueryExecutionError> {
-        if *self.shutdown.borrow() || self.starts.is_closed() {
+        if *self.shutdown.borrow() || self.shutdown.has_changed().is_err() {
             return Err(QueryExecutionError::new(
                 QueryExecutionErrorKind::Rejected,
                 "logical execution supervisor is shutting down",
@@ -414,62 +759,209 @@ impl QueryExecutionDriver for QueryExecutionDriverHandle {
         self.query_ids.reserve()
     }
 
+    fn prepare_observed_start(
+        &self,
+        request: QueryExecutionRequest,
+        reserved: Option<ReservedExecutionIdentity>,
+    ) -> Result<
+        OriginalLogicalStartInput,
+        (
+            QueryExecutionError,
+            QueryExecutionRequest,
+            Option<ReservedExecutionIdentity>,
+        ),
+    > {
+        let (reply, response) = oneshot::channel();
+        let internal_cut = request.description().finish_boundary()
+            == crate::preparation::ExecutionFinishBoundary::ComputationReady;
+        let source = OriginalLogicalExit::new();
+        let input = LogicalRoleInput {
+            request,
+            reply,
+            reserved,
+            native: Arc::clone(&self.native),
+            query_ids: Arc::clone(&self.query_ids),
+            frontend_process_id: self.frontend_process_id,
+            config: self.config,
+            clock: Arc::clone(&self.clock),
+            registry: self.registry.clone(),
+            shutdown: self.shutdown.clone(),
+            original_exit: Arc::downgrade(&source),
+        };
+        Ok(OriginalLogicalStartInput {
+            input: Some(input),
+            response: Some(response),
+            context: Some(source),
+            internal_cut,
+            issuer: Arc::clone(&self.query_ids.issuer),
+        })
+    }
+
+    fn start_observed_in(
+        &self,
+        input: &mut Option<OriginalLogicalStartInput>,
+        owner: &mut Option<WorkOwner>,
+        ready: &mut Option<QueryExecutionFuture>,
+        exit: &mut Option<LogicalExecutionExitObserver>,
+    ) -> Result<LogicalExecutionStartAttempt, QueryExecutionError> {
+        if ready.is_some() || exit.is_some() {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "original observed-start receiver is occupied",
+            ));
+        }
+        if *self.shutdown.borrow() || self.shutdown.has_changed().is_err() {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::Rejected,
+                "logical execution supervisor is shutting down",
+            ));
+        }
+        let original = input.as_mut().ok_or_else(|| {
+            QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "original start source is absent",
+            )
+        })?;
+        if !Arc::ptr_eq(&original.issuer, &self.query_ids.issuer) {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "original start source belongs to another supervisor",
+            ));
+        }
+        if original.input.is_none() || original.response.is_none() || original.context.is_none() {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "original start source was already mounted",
+            ));
+        }
+        let work = owner.as_ref().ok_or_else(|| {
+            QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "original work owner is absent",
+            )
+        })?;
+        let cancellation = work.scope().cancellation().map_err(work_error)?;
+        let source = Arc::clone(original.context.as_ref().unwrap());
+        let attempt = self
+            .ingress
+            .try_mount_in(owner, &mut original.input, &mut original.context);
+        if attempt.result().is_err() {
+            // All original sources stay in the caller's stable fields. Carry
+            // the actual sender and cancellation tail out of caller locks.
+            return Ok(LogicalExecutionStartAttempt {
+                attempt: Some(attempt),
+                cancellation: Some(cancellation),
+                header: None,
+            });
+        }
+        let response = original.response.take().unwrap();
+        let internal_cut = original.internal_cut;
+        let future: QueryExecutionFuture = Box::pin(async move {
+            if internal_cut {
+                return response.await.unwrap_or_else(|_| {
+                    Err(QueryExecutionError::new(
+                        QueryExecutionErrorKind::Failed,
+                        "logical execution supervisor closed without an internal verdict",
+                    ))
+                });
+            }
+            tokio::select! {
+                biased;
+                result = response => result.unwrap_or_else(|_| Err(QueryExecutionError::new(
+                    QueryExecutionErrorKind::Failed, "logical execution supervisor closed without a start verdict"))),
+                reason = cancellation.cancelled() => Err(start_cancellation_error(cancellation.reason().unwrap_or(reason))),
+            }
+        });
+        // No foreign callback between actual mount and both stable receivers.
+        *ready = Some(future);
+        *exit = Some(LogicalExecutionExitObserver::new(source));
+        let header = input.take();
+        Ok(LogicalExecutionStartAttempt {
+            attempt: Some(attempt),
+            cancellation: None,
+            header,
+        })
+    }
+
     fn start(
         &self,
         request: QueryExecutionRequest,
         owner: WorkOwner,
         reserved: Option<ReservedExecutionIdentity>,
     ) -> QueryExecutionFuture {
-        if *self.shutdown.borrow() {
-            return rejected_start(owner, "logical execution supervisor is shutting down");
-        }
-        let cancellation = match owner.scope().cancellation() {
-            Ok(cancellation) => cancellation,
-            Err(error) => {
-                let error = work_error(error);
+        let mut source = match self.prepare_observed_start(request, reserved) {
+            Ok(source) => Some(source),
+            Err((error, request, _reserved)) => {
+                drop(request);
                 owner.complete_after_terminal_cancel_settled();
                 return Box::pin(async move { Err(error) });
             }
         };
-        let (reply, response) = oneshot::channel();
-        let internal_cut = request.description().finish_boundary()
-            == crate::preparation::ExecutionFinishBoundary::ComputationReady;
-        let command = StartCommand {
-            request,
-            owner,
-            reply,
-            reserved,
+        let mut owner = Some(owner);
+        let mut ready = None;
+        let mut exit = None;
+        let attempted = self.start_observed_in(&mut source, &mut owner, &mut ready, &mut exit);
+        let result = match attempted {
+            Ok(attempt) => attempt.finish(),
+            Err(error) => Err(error),
         };
-        match self.starts.send(command) {
-            Ok(()) => Box::pin(async move {
-                // Internal start returns an actor-owned computation verdict.
-                // A caller-side cancellation race cannot replace a Ready cut
-                // that the actor has already accepted but not yet delivered.
-                if internal_cut {
-                    return response.await.unwrap_or_else(|_| {
-                        Err(QueryExecutionError::new(
-                            QueryExecutionErrorKind::Failed,
-                            "logical execution supervisor closed without an internal verdict",
-                        ))
-                    });
-                }
-                tokio::select! {
-                    biased;
-                    result = response => result.unwrap_or_else(|_| {
-                        Err(QueryExecutionError::new(
-                            QueryExecutionErrorKind::Failed,
-                            "logical execution supervisor closed without a start verdict",
-                        ))
-                    }),
-                    reason = cancellation.cancelled() => Err(start_cancellation_error(
-                        cancellation.reason().unwrap_or(reason),
-                    )),
-                }
-            }),
-            Err(mpsc::error::SendError(command)) => {
-                rejected_start(command.owner, "logical execution supervisor is closed")
+        if let Err(error) = result {
+            drop(source);
+            if let Some(owner) = owner {
+                owner.complete_after_terminal_cancel_settled();
             }
+            return Box::pin(async move { Err(error) });
         }
+        let ready = ready.unwrap();
+        let observer = exit.unwrap();
+        Box::pin(async move {
+            let result = ready.await;
+            match result {
+                Ok(mut handle) => {
+                    handle.retain_original_exit(observer);
+                    Ok(handle)
+                }
+                Err(error) => {
+                    drop(observer);
+                    Err(error)
+                }
+            }
+        })
+    }
+}
+
+/// Original prepared input; not an identity, quota or execution grant.
+/// Keep this move-only value in the caller's stable original source field.
+pub struct OriginalLogicalStartInput {
+    input: Option<LogicalRoleInput>,
+    response: Option<oneshot::Receiver<Result<ExecutionHandle, QueryExecutionError>>>,
+    context: Option<Arc<OriginalLogicalExit>>,
+    internal_cut: bool,
+    issuer: Arc<()>,
+}
+#[must_use = "Finish the original publication tail after caller locks exit"]
+pub struct LogicalExecutionStartAttempt {
+    attempt: Option<
+        novarocks_workload_control::MountAttempt<LogicalRoleInput, Arc<OriginalLogicalExit>>,
+    >,
+    cancellation: Option<novarocks_workload_control::CancellationView>,
+    header: Option<OriginalLogicalStartInput>,
+}
+impl LogicalExecutionStartAttempt {
+    pub fn result(&self) -> Result<(), QueryExecutionError> {
+        self.attempt
+            .as_ref()
+            .unwrap()
+            .result()
+            .as_ref()
+            .map(|_| ())
+            .map_err(|e| work_error(e.clone()))
+    }
+    pub fn finish(mut self) -> Result<(), QueryExecutionError> {
+        let result = self.attempt.take().unwrap().finish().map_err(work_error);
+        drop(self.cancellation.take());
+        drop(self.header.take());
+        result
     }
 }
 
@@ -502,6 +994,7 @@ fn cancellation_error(reason: CancellationReason, detail: &'static str) -> Query
     ))
 }
 
+#[cfg(test)]
 fn rejected_start(owner: WorkOwner, message: &'static str) -> QueryExecutionFuture {
     owner.complete_after_terminal_cancel_settled();
     Box::pin(async move {
@@ -512,17 +1005,11 @@ fn rejected_start(owner: WorkOwner, message: &'static str) -> QueryExecutionFutu
     })
 }
 
-struct StartCommand {
-    request: QueryExecutionRequest,
-    owner: WorkOwner,
-    reply: oneshot::Sender<Result<ExecutionHandle, QueryExecutionError>>,
-    reserved: Option<ReservedExecutionIdentity>,
-}
-
 /// Input to the one concrete logical role factory. The original WorkOwner is
 /// supplied separately; these aliases retain their existing runtime owners.
 /// This type alone is not a complete byte quote or a startup admission grant.
 struct LogicalRoleInput {
+    original_exit: Weak<OriginalLogicalExit>,
     request: QueryExecutionRequest,
     reply: oneshot::Sender<Result<ExecutionHandle, QueryExecutionError>>,
     reserved: Option<ReservedExecutionIdentity>,
@@ -590,125 +1077,228 @@ impl ProcessQueryIdAllocator {
     }
 }
 
-async fn run_supervisor(
-    registry: LogicalExecutionRuntimeRegistryHandle,
-    native: Arc<dyn LogicalExecutionNativePort>,
-    query_ids: Arc<ProcessQueryIdAllocator>,
-    frontend_process_id: FrontendProcessId,
-    config: LogicalExecutionSupervisorConfig,
-    clock: Arc<dyn MonotonicClock>,
-    mut starts: mpsc::UnboundedReceiver<StartCommand>,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<(), QueryExecutionError> {
-    let mut logical_tasks = JoinSet::new();
-    let mut task_failure = None;
-    loop {
-        if *shutdown.borrow() {
-            break;
+// These are the original statement Native tasks only. Logical roles never
+// enter this JoinSet; they remain in their original bank frame and footer.
+fn observe_residual_join(
+    registry: &LogicalExecutionRuntimeRegistryHandle,
+    result: Result<Result<(), QueryExecutionError>, tokio::task::JoinError>,
+    first: &mut Option<QueryExecutionError>,
+) {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            first.get_or_insert(error);
         }
-        // This fixed-budget turn is independent of which select source wins.
-        // Continuous starts cannot starve already-owned root ACK joins.
-        registry.progress_root_ack_tails();
-        for task in registry.statement_native_ready_tasks() {
-            logical_tasks.spawn(task);
-        }
-        if let Some(error) = registry.statement_native_health() {
-            task_failure.get_or_insert(error);
-        }
-        tokio::select! {
-            biased;
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    break;
-                }
-            }
-            _ = registry.statement_native_changed() => {}
-            command = starts.recv() => {
-                let Some(command) = command else { break };
-                // Shutdown may change after select inspected its higher-priority
-                // branch. Recheck before dispatching this accepted owner.
-                if *shutdown.borrow() {
-                    command.owner.complete_after_terminal_cancel_settled();
-                    let _ = command.reply.send(Err(QueryExecutionError::new(
-                        QueryExecutionErrorKind::Rejected,
-                        "logical execution supervisor shut down before starting the accepted request",
-                    )));
-                    break;
-                }
-                let StartCommand { request, owner, reply, reserved } = command;
-                logical_tasks.spawn(make_logical_role(owner, LogicalRoleInput {
-                    request,
-                    reply,
-                    reserved,
-                    native: Arc::clone(&native),
-                    query_ids: Arc::clone(&query_ids),
-                    frontend_process_id,
-                    config,
-                    clock: Arc::clone(&clock),
-                    registry: registry.clone(),
-                    shutdown: shutdown.clone(),
-                }));
-            }
-            result = logical_tasks.join_next(), if !logical_tasks.is_empty() => {
-                match result {
-                    Some(Ok(Ok(()))) | None => {}
-                    Some(Ok(Err(error))) => {
-                        task_failure.get_or_insert(error);
-                    }
-                    Some(Err(error)) => {
-                        registry.record_native_supervision_join_failure(error);
-                        task_failure.get_or_insert_with(|| QueryExecutionError::new(
-                            QueryExecutionErrorKind::Failed,
-                            "logical execution supervision task panicked",
-                        ));
-                    }
-                }
-            }
-            _ = registry.root_ack_tail_changed() => {}
+        Err(error) => {
+            registry.record_native_supervision_join_failure(error);
+            first.get_or_insert_with(|| {
+                QueryExecutionError::new(
+                    QueryExecutionErrorKind::Failed,
+                    "logical execution supervision task panicked",
+                )
+            });
         }
     }
+}
 
-    registry.close_statement_native_admission();
-    starts.close();
-    while let Ok(command) = starts.try_recv() {
-        command.owner.complete_after_terminal_cancel_settled();
-        let _ = command.reply.send(Err(QueryExecutionError::new(
-            QueryExecutionErrorKind::Rejected,
-            "logical execution supervisor shut down before starting the accepted request",
-        )));
+fn observe_logical_completion<F, M>(
+    registry: &LogicalExecutionRuntimeRegistryHandle,
+    bank: &mut RolePollBank<LogicalRoleInput, F, M, Arc<OriginalLogicalExit>>,
+    completion: PollTurnCompletion<Arc<OriginalLogicalExit>, Result<(), QueryExecutionError>>,
+    first: &mut Option<QueryExecutionError>,
+) where
+    F: Future<Output = Result<(), QueryExecutionError>>,
+    M: Fn(WorkOwner, LogicalRoleInput) -> F,
+{
+    let failed = matches!(completion.completion(), PollCompletion::Panicked(_));
+    if first.is_none() {
+        match completion.completion() {
+            PollCompletion::Ready(output) => {
+                if let Err(error) = output.value() {
+                    *first = Some(error.clone());
+                }
+            }
+            PollCompletion::Panicked(_) => {
+                *first = Some(QueryExecutionError::new(
+                    QueryExecutionErrorKind::Failed,
+                    "logical execution supervision task panicked",
+                ))
+            }
+        }
     }
+    let source = Arc::clone(completion.context());
+    source.role_ended_silent(failed);
+    // An accepted wrapper is installed BEFORE stripping C. Rejection keeps
+    // the unchanged whole packet in its SAME original finite bank position.
+    let notice = if source.has_failure() {
+        registry.publish_original_exit_health_silent(&source)
+    } else {
+        None
+    };
+    if source.has_failure() && !source.health_published() {
+        let mut original = Some(completion);
+        bank.retain_completion_in(&mut original)
+            .expect("same completed original footer must return to its own position");
+        debug_assert!(original.is_none());
+    } else {
+        let (_, completion) = completion.into_parts();
+        let mut packet = Some(completion);
+        source.receive_role_silent(&mut packet);
+    }
+    registry.mark_original_exit_ready();
+    if let Some(notice) = notice {
+        notice.notify();
+    }
+    source.notify();
+}
+
+/// The bank is an original wrapper local OUTSIDE the caught borrowed service.
+/// Generator cleanup inside run_supervisor can never own/drop this bank.
+fn run_supervisor_owned<F, M>(
+    registry: LogicalExecutionRuntimeRegistryHandle,
+    bank: RolePollBank<LogicalRoleInput, F, M, Arc<OriginalLogicalExit>>,
+    turn_budget: NonZeroUsize,
+    shutdown: watch::Receiver<bool>,
+    retirement: OriginalRootPanic,
+) -> impl Future<Output = OriginalRootOutcome> + Send + 'static
+where
+    F: Future<Output = Result<(), QueryExecutionError>> + Send + 'static,
+    M: Fn(WorkOwner, LogicalRoleInput) -> F + Send + 'static,
+{
+    // This guard is constructed before returning the root Future. Ordinary
+    // cancellation/first-poll loss therefore closes ingress too.
+    let mut original_bank = OriginalRootBank {
+        bank: std::mem::ManuallyDrop::new(Some(bank)),
+        retirement,
+    };
+    async move {
+        let (outcome, cleanup) = {
+            let mut service = Box::pin(run_supervisor(
+                registry,
+                original_bank.bank_mut(),
+                turn_budget,
+                shutdown,
+            ));
+            let outcome = std::future::poll_fn(|cx| {
+                match catch_unwind(AssertUnwindSafe(|| service.as_mut().poll(cx))) {
+                    Ok(Poll::Ready(result)) => Poll::Ready(Ok(result)),
+                    Ok(Poll::Pending) => Poll::Pending,
+                    Err(primary) => Poll::Ready(Err(primary)),
+                }
+            })
+            .await;
+            let cleanup = catch_unwind(AssertUnwindSafe(|| drop(service))).err();
+            (outcome, cleanup)
+        };
+        if outcome.is_ok() && cleanup.is_none() {
+            // The original service proved its sources exited. Only this path
+            // ordinarily destroys the same bank and clears the guard.
+            drop(original_bank.take());
+            return OriginalRootOutcome::Completed(outcome.unwrap_or_else(|_| unreachable!()));
+        }
+        let closing =
+            catch_unwind(AssertUnwindSafe(|| original_bank.bank_mut().stop_ingress())).err();
+        let (primary, cleanup) = match outcome {
+            Err(primary) => (primary, [cleanup, closing]),
+            Ok(_) => (
+                cleanup.expect("cleanup is the first failure"),
+                [closing, None],
+            ),
+        };
+        let original = original_bank.retirement.clone();
+        let bank = original_bank.take();
+        original.retain(OriginalRootPanicCustody {
+            _bank: Box::new(bank),
+            bank_layout: std::alloc::Layout::new::<
+                RolePollBank<LogicalRoleInput, F, M, Arc<OriginalLogicalExit>>,
+            >(),
+            primary: Some(primary),
+            cleanup,
+            cancelled: false,
+        });
+        OriginalRootOutcome::Panicked(original)
+    }
+}
+
+async fn run_supervisor<F, M>(
+    registry: LogicalExecutionRuntimeRegistryHandle,
+    bank: &mut RolePollBank<LogicalRoleInput, F, M, Arc<OriginalLogicalExit>>,
+    turn_budget: NonZeroUsize,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), QueryExecutionError>
+where
+    F: Future<Output = Result<(), QueryExecutionError>> + Send + 'static,
+    M: Fn(WorkOwner, LogicalRoleInput) -> F + Send + 'static,
+{
+    let mut residual_tasks = JoinSet::new();
+    let mut task_failure = None;
+    let mut stopping = false;
+    let mut original_exit_cursor = super::runtime_registry::OriginalExitCursor::default();
     loop {
+        if !stopping && (*shutdown.borrow() || shutdown.has_changed().is_err()) {
+            // The original State serializes this cut with publication. Every
+            // already accepted input is visible; later attempts must refuse.
+            bank.stop_ingress();
+            registry.close_statement_native_admission();
+            stopping = true;
+        }
+
         registry.progress_root_ack_tails();
         for task in registry.statement_native_ready_tasks() {
-            logical_tasks.spawn(task);
+            residual_tasks.spawn(task);
         }
+        // Deterministic finite completed-join service precedes event selection.
+        // Continually ready role inputs cannot starve original residual joins.
+        for _ in 0..turn_budget.get() {
+            let Some(joined) = residual_tasks.try_join_next() else {
+                break;
+            };
+            observe_residual_join(&registry, joined, &mut task_failure);
+        }
+        if let Some(completion) = bank.progress_turn(turn_budget) {
+            observe_logical_completion(&registry, bank, completion, &mut task_failure);
+        }
+        std::future::poll_fn(|cx| {
+            let _ = registry.poll_original_exit_turn(&mut original_exit_cursor, turn_budget, cx);
+            Poll::Ready(())
+        })
+        .await;
         if let Some(error) = registry.statement_native_health() {
             task_failure.get_or_insert(error);
         }
-        if logical_tasks.is_empty()
+        if stopping
+            && !bank.has_owned_sources_after_stop().map_err(work_error)?
+            && residual_tasks.is_empty()
             && registry.statement_native_count() == 0
             && registry.root_ack_tail_count() == 0
+            && !registry.original_exit_pending()
         {
             break;
         }
+
+        // Every finite service turn yields, including a continuously ready
+        // FIFO. None from progress_turn is not an idle certificate: poll_ready
+        // registers its original waiter then checks the actual FIFO level.
+        tokio::task::yield_now().await;
         tokio::select! {
+            biased;
+            _ = shutdown.changed(), if !stopping => {}
             _ = registry.statement_native_changed() => {}
-            result = logical_tasks.join_next(), if !logical_tasks.is_empty() => {
-                match result {
-                    Some(Ok(Ok(()))) | None => {}
-                    Some(Ok(Err(error))) => { task_failure.get_or_insert(error); }
-                    Some(Err(error)) => {
-                        registry.record_native_supervision_join_failure(error);
-                        task_failure.get_or_insert_with(|| QueryExecutionError::new(
-                            QueryExecutionErrorKind::Failed,
-                            "logical execution supervision task panicked",
-                        ));
-                    }
+            result = residual_tasks.join_next(), if !residual_tasks.is_empty() => {
+                if let Some(result) = result {
+                    observe_residual_join(&registry, result, &mut task_failure);
                 }
             }
             _ = registry.root_ack_tail_changed() => {}
+            _ = registry.original_exit_changed() => {}
+            _ = std::future::poll_fn(|cx| registry.poll_original_exit_turn(
+                &mut original_exit_cursor, turn_budget, cx)) => {}
+            _ = std::future::poll_fn(|cx| bank.poll_ready(cx)) => {}
         }
     }
+    // Only bank-owned sources were awaited. Health may still hold an original
+    // PollOutput footer; FA observes actual retirement after the real root join
+    // while its original progress service remains alive.
     task_failure.map_or(Ok(()), Err)
 }
 
@@ -720,6 +1310,7 @@ async fn make_logical_role(
     input: LogicalRoleInput,
 ) -> Result<(), QueryExecutionError> {
     let LogicalRoleInput {
+        original_exit,
         request,
         reply,
         reserved,
@@ -732,6 +1323,19 @@ async fn make_logical_role(
         mut shutdown,
     } = input;
     let mut pending_owner = PendingWorkOwner(Some(owner));
+    // A queued, never-polled input must not call Native open during shutdown.
+    // This preserves the old accepted-mailbox drain verdict before any create.
+    if *shutdown.borrow() || shutdown.has_changed().is_err() {
+        drop(request);
+        return fail_uninstalled_start(
+            pending_owner,
+            reply,
+            QueryExecutionError::new(
+                QueryExecutionErrorKind::Rejected,
+                "logical execution supervisor shut down before starting the accepted request",
+            ),
+        );
+    }
     let requester = pending_owner.owner().cancellation_requester();
     let scope = pending_owner.owner().scope();
     let initial_execution = match query_ids.consume(reserved) {
@@ -775,6 +1379,9 @@ async fn make_logical_role(
         cancellation.clone(),
         native_seed,
     );
+    if let Some(source) = original_exit.upgrade() {
+        source.native_pre_actor_started_silent();
+    }
     let opened = match await_before_actor_install(
         native.open(open_request),
         cancellation.clone(),
@@ -855,7 +1462,24 @@ async fn make_logical_role(
         Err(error) => return fail_uninstalled_start(pending_owner, reply, work_error(error)),
     };
     let contexts = schedule.contexts().to_vec();
-    let reservation = match registry.reserve(initial_execution, contexts.clone()) {
+    let original_exit = match original_exit.upgrade() {
+        Some(source) => source,
+        None => {
+            return fail_uninstalled_start(
+                pending_owner,
+                reply,
+                QueryExecutionError::new(
+                    QueryExecutionErrorKind::Failed,
+                    "original fixed role lost its exit source",
+                ),
+            );
+        }
+    };
+    let reservation = match registry.reserve_with_original_exit(
+        initial_execution,
+        contexts.clone(),
+        Some(original_exit),
+    ) {
         Ok(reservation) => reservation,
         Err(error) => {
             drop(stage);
@@ -1179,6 +1803,9 @@ async fn make_logical_role(
                     .await
                     .map(|_| ())
                     .or_else(actor_terminal_refusal);
+                // Publish this already authored startup failure before its
+                // internal stop signal can race the caller's start waiter.
+                let _ = reply.send(Err(error.clone()));
                 let _ = requester.request(CancellationReason::Requested);
                 let convergence = converge_supervised_active(
                     &mut active,
@@ -1196,7 +1823,6 @@ async fn make_logical_role(
                     convergence,
                 )
                 .await;
-                let _ = reply.send(Err(error.clone()));
                 let retire_result = retire_logical(&registry, registration).await;
                 return first_supervision_error(
                     Err(error),
@@ -2900,6 +3526,8 @@ fn native_future_panicked(message: &'static str) -> QueryExecutionError {
 #[cfg(test)]
 mod tests {
     include!("supervisor_internal_tests.rs");
+    include!("supervisor_role_bank_fixture.rs");
+    include!("supervisor_original_exit_tests.rs");
     #[test]
     fn terminal_actor_disposition_does_not_hide_invalid_phase_or_service_invariants() {
         use super::super::{LogicalConclusion, LogicalExecutionActorError};
@@ -3116,57 +3744,69 @@ mod tests {
 
     #[tokio::test]
     async fn active_cleanup_deadline_ends_fe_tracking_without_fabricating_stop_evidence() {
-        let (_control, root) = governance();
-        let cancellation = root.owner.scope().cancellation().unwrap();
-        let requester = root.owner.cancellation_requester();
-        let (_shutdown_sender, mut shutdown) = watch::channel(false);
-        let mut owner = NeverConverges;
+        let mut _control = {
+            let (_control, root) = governance().await;
+            let cancellation = root.owner.scope().cancellation().unwrap();
+            let requester = root.owner.cancellation_requester();
+            let (_shutdown_sender, mut shutdown) = watch::channel(false);
+            let mut owner = NeverConverges;
 
-        let outcome = converge_active(
-            &mut owner,
-            cancellation,
-            &mut shutdown,
-            &requester,
-            Duration::from_millis(1),
-        )
-        .await;
-
-        assert!(matches!(
-            outcome,
-            ActiveAttemptConvergence::RemoteTrackingEnded { .. }
-        ));
-        root.owner.complete();
-        root.business.release();
-    }
-
-    #[tokio::test]
-    async fn supervisor_shutdown_ends_active_remote_tracking_without_waiting_for_cleanup_window() {
-        let (_control, root) = governance();
-        let cancellation = root.owner.scope().cancellation().unwrap();
-        let requester = root.owner.cancellation_requester();
-        let (shutdown_sender, mut shutdown) = watch::channel(false);
-        let mut owner = NeverConverges;
-        shutdown_sender.send_replace(true);
-
-        let outcome = tokio::time::timeout(
-            Duration::from_millis(10),
-            converge_active(
+            let outcome = converge_active(
                 &mut owner,
                 cancellation,
                 &mut shutdown,
                 &requester,
-                Duration::from_secs(30),
-            ),
-        )
-        .await
-        .expect("shutdown must not wait for the normal cleanup window");
+                Duration::from_millis(1),
+            )
+            .await;
 
-        assert!(matches!(
-            outcome,
-            ActiveAttemptConvergence::RemoteTrackingEnded { .. }
-        ));
-        root.owner.complete();
-        root.business.release();
+            assert!(matches!(
+                outcome,
+                ActiveAttemptConvergence::RemoteTrackingEnded { .. }
+            ));
+            root.owner.complete();
+            root.business.release();
+
+            _control
+        };
+        acknowledge_all_control(&_control);
+        _control.finish().await;
+    }
+
+    #[tokio::test]
+    async fn supervisor_shutdown_ends_active_remote_tracking_without_waiting_for_cleanup_window() {
+        let mut _control = {
+            let (_control, root) = governance().await;
+            let cancellation = root.owner.scope().cancellation().unwrap();
+            let requester = root.owner.cancellation_requester();
+            let (shutdown_sender, mut shutdown) = watch::channel(false);
+            let mut owner = NeverConverges;
+            shutdown_sender.send_replace(true);
+
+            let outcome = tokio::time::timeout(
+                Duration::from_millis(10),
+                converge_active(
+                    &mut owner,
+                    cancellation,
+                    &mut shutdown,
+                    &requester,
+                    Duration::from_secs(30),
+                ),
+            )
+            .await
+            .expect("shutdown must not wait for the normal cleanup window");
+
+            assert!(matches!(
+                outcome,
+                ActiveAttemptConvergence::RemoteTrackingEnded { .. }
+            ));
+            root.owner.complete();
+            root.business.release();
+
+            _control
+        };
+        acknowledge_all_control(&_control);
+        _control.finish().await;
     }
 
     #[derive(Debug)]
@@ -3193,93 +3833,107 @@ mod tests {
     }
     #[tokio::test]
     async fn shutdown_remote_budget_never_closes_a_held_original_local_owner() {
-        let (_control, root) = governance();
-        let cancellation = root.owner.scope().cancellation().unwrap();
-        let requester = root.owner.cancellation_requester();
-        let (shutdown_sender, mut shutdown) = watch::channel(false);
-        shutdown_sender.send_replace(true);
-        let release = Arc::new(tokio::sync::Notify::new());
-        let mut owner = HeldLocalConvergence(Arc::clone(&release));
-        let convergence = converge_active(
-            &mut owner,
-            cancellation,
-            &mut shutdown,
-            &requester,
-            Duration::from_secs(30),
-        );
-        tokio::pin!(convergence);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), &mut convergence)
-                .await
-                .is_err()
-        );
-        release.notify_one();
-        assert!(matches!(
-            convergence.await,
-            ActiveAttemptConvergence::RemoteTrackingEnded { .. }
-        ));
-        root.owner.complete_after_terminal_cancel_settled();
-        root.business.release();
+        let mut _control = {
+            let (_control, root) = governance().await;
+            let cancellation = root.owner.scope().cancellation().unwrap();
+            let requester = root.owner.cancellation_requester();
+            let (shutdown_sender, mut shutdown) = watch::channel(false);
+            shutdown_sender.send_replace(true);
+            let release = Arc::new(tokio::sync::Notify::new());
+            let mut owner = HeldLocalConvergence(Arc::clone(&release));
+            let convergence = converge_active(
+                &mut owner,
+                cancellation,
+                &mut shutdown,
+                &requester,
+                Duration::from_secs(30),
+            );
+            tokio::pin!(convergence);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut convergence)
+                    .await
+                    .is_err()
+            );
+            release.notify_one();
+            assert!(matches!(
+                convergence.await,
+                ActiveAttemptConvergence::RemoteTrackingEnded { .. }
+            ));
+            root.owner.complete_after_terminal_cancel_settled();
+            root.business.release();
+
+            _control
+        };
+        acknowledge_all_control(&_control);
+        _control.finish().await;
     }
 
     #[tokio::test]
     async fn accepted_start_returns_on_cancellation_before_supervisor_verdict() {
-        let (starts, mut start_rx) = mpsc::unbounded_channel();
-        let (_shutdown, shutdown) = watch::channel(false);
-        let client = QueryExecutionClient::new(QueryExecutionDriverHandle {
-            starts,
-            shutdown,
-            query_ids: Arc::new(ProcessQueryIdAllocator::new(QueryProcessNamespace::new(
-                0x50,
-            ))),
-        });
-        let (_control, root) = governance();
-        let requester = root.owner.cancellation_requester();
-        let start = client.start(completion_request(UnreachablePreparationPort), root.owner);
-        let command = start_rx
-            .recv()
-            .await
-            .expect("accepted start reaches the supervisor queue");
-
-        requester
-            .request(CancellationReason::DeadlineExceeded)
-            .expect("active root accepts deadline cancellation");
-        let error = match tokio::time::timeout(Duration::from_secs(1), start)
-            .await
-            .expect("accepted start returns after cancellation")
-        {
-            Ok(_) => panic!("cancellation wins before a start verdict"),
-            Err(error) => error,
+        let (control, root) = governance().await;
+        let mut control = {
+            let (mut bank, shutdown, mut registry, client) =
+                unpolled_test_driver(&control, Arc::new(PanickingOpenNativePort));
+            let requester = root.owner.cancellation_requester();
+            let start = client.start(completion_request(UnreachablePreparationPort), root.owner);
+            requester
+                .request(CancellationReason::DeadlineExceeded)
+                .unwrap();
+            let error = match tokio::time::timeout(Duration::from_secs(1), start)
+                .await
+                .expect("accepted start returns after cancellation")
+            {
+                Ok(_) => panic!("cancellation wins before a start verdict"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                QueryExecutionErrorKind::DeadlineExceeded,
+                "{}",
+                error.message()
+            );
+            // The response consumer exited, but the SAME accepted input still
+            // owns its Work until the real factory is polled and dropped.
+            assert_ne!(control.snapshot().root_responsibilities, 0);
+            shutdown.send_replace(true);
+            bank.stop_ingress();
+            let completion = bank.progress_turn(NonZeroUsize::new(7).unwrap()).unwrap();
+            let (_source, completion) = completion.into_parts();
+            assert!(matches!(&completion, PollCompletion::Ready(output) if output.value().is_ok()));
+            drop(completion);
+            drop(bank);
+            registry
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            root.business.release();
+            control
         };
-        // The reason survives the race: this start was cancelled by its own
-        // deadline, and says so rather than reporting the generic outcome
-        // both causes share.
-        assert_eq!(
-            error.kind(),
-            QueryExecutionErrorKind::DeadlineExceeded,
-            "{}",
-            error.message()
-        );
-
-        command.owner.complete_after_terminal_cancel_settled();
-        root.business.release();
+        acknowledge_all_control(&control);
+        control.finish().await;
     }
 
     #[tokio::test]
     async fn uninstalled_failure_settles_its_known_cancel_control() {
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        root.owner.cancel(CancellationReason::Requested);
+        let mut control = {
+            let (control, root) = governance().await;
+            let scope = root.owner.scope();
+            root.owner.cancel(CancellationReason::Requested);
 
-        PendingWorkOwner(Some(root.owner)).complete_uninstalled_failure();
-        root.business.release();
+            PendingWorkOwner(Some(root.owner)).complete_uninstalled_failure();
+            root.business.release();
 
-        scope.wait_released().await;
-        assert_eq!(control.snapshot().root_responsibilities, 0);
-        assert!(
-            control.next_control().is_none(),
-            "a failure before actor installation has no effect owner left to acknowledge"
-        );
+            scope.wait_released().await;
+            assert_eq!(control.snapshot().root_responsibilities, 0);
+            assert!(
+                control.next_control().is_none(),
+                "a failure before actor installation has no effect owner left to acknowledge"
+            );
+
+            control
+        };
+        acknowledge_all_control(&control);
+        control.finish().await;
     }
 
     fn fixture_version() -> [u8; 16] {
@@ -3530,26 +4184,6 @@ mod tests {
         })
     }
 
-    fn governance() -> (WorkloadControl, RootWork) {
-        let control = WorkloadControl::try_new(
-            WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1 << 20,
-                control_bytes: 1 << 12,
-                per_scope_bytes: (1 << 20) - (1 << 12),
-            },
-        )
-        .unwrap();
-        control
-            .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
-            .unwrap();
-        control.mark_ready().unwrap();
-        let root = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        (control, root)
-    }
-
     #[derive(Debug)]
     struct CaptureAdmittedCapacityPort {
         captured: Option<oneshot::Sender<NativeAttemptPreparationRequest>>,
@@ -3573,134 +4207,157 @@ mod tests {
 
     #[tokio::test]
     async fn admitted_capacity_reaches_original_request_and_survives_failed_start() {
-        use crate::admitted_query_context::QueryResultCapacityBinding;
-        use std::future::Future;
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        let capacity = scope.result_capacity().unwrap();
-        let window = capacity
-            .try_acquire(
-                &scope,
-                novarocks_workload_control::ResultWindowClass::Internal,
-            )
+        let mut control = {
+            use crate::admitted_query_context::QueryResultCapacityBinding;
+            use std::future::Future;
+            let (control, root) = governance().await;
+            let scope = root.owner.scope();
+            let capacity = scope.result_capacity().unwrap();
+            let window = capacity
+                .try_acquire(
+                    &scope,
+                    novarocks_workload_control::ResultWindowClass::Internal,
+                )
+                .unwrap();
+            let original =
+                QueryResultCapacityBinding::try_new(&scope, window.retain_alias()).unwrap();
+            let activity = original.begin_result_activity().unwrap();
+            let (captured, received) = oneshot::channel();
+            let request = completion_request(CaptureAdmittedCapacityPort {
+                captured: Some(captured),
+            })
+            .with_result_capacity(original.clone())
             .unwrap();
-        let original = QueryResultCapacityBinding::try_new(&scope, window.retain_alias()).unwrap();
-        let activity = original.begin_result_activity().unwrap();
-        let (captured, received) = oneshot::channel();
-        let request = completion_request(CaptureAdmittedCapacityPort {
-            captured: Some(captured),
-        })
-        .with_result_capacity(original.clone())
-        .unwrap();
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(BindingNativePort),
-            QueryProcessNamespace::new(0x75),
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
-        let result = client.start(request, root.owner).await;
-        assert!(result.is_err());
-        let issued = received.await.unwrap();
-        supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
-        let observed = issued.result_capacity().expect("original admitted binding");
-        assert!(
-            observed
-                .window_alias()
-                .shares_capacity_with(&original.window_alias())
-        );
-        assert!(observed.window_alias().is_for_scope(&scope));
-        // An activity started through the original binding remains visible
-        // through the actual request. Reconstructing from an alias would fail.
-        let mut exited = Box::pin(observed.result_activities_exited());
-        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(exited.as_mut().poll(&mut context).is_pending());
-        drop(activity);
-        exited.await;
-        drop((original, window));
-        assert_eq!(capacity.snapshot().held_positions[2], 1);
-        drop(issued);
-        assert_eq!(capacity.snapshot().held_positions[2], 0);
-        root.business.release();
-        scope.wait_released().await;
-        assert_eq!(control.snapshot().root_responsibilities, 0);
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(0x75),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
+            let result = client.start(request, root.owner).await;
+            assert!(result.is_err());
+            let issued = received.await.unwrap();
+            supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            let observed = issued.result_capacity().expect("original admitted binding");
+            assert!(
+                observed
+                    .window_alias()
+                    .shares_capacity_with(&original.window_alias())
+            );
+            assert!(observed.window_alias().is_for_scope(&scope));
+            // An activity started through the original binding remains visible
+            // through the actual request. Reconstructing from an alias would fail.
+            let mut exited = Box::pin(observed.result_activities_exited());
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(exited.as_mut().poll(&mut context).is_pending());
+            drop(activity);
+            exited.await;
+            drop((original, window));
+            assert_eq!(capacity.snapshot().held_positions[2], 1);
+            drop(issued);
+            assert_eq!(capacity.snapshot().held_positions[2], 0);
+            root.business.release();
+            scope.wait_released().await;
+            assert_eq!(control.snapshot().root_responsibilities, 0);
+
+            control
+        };
+        acknowledge_all_control(&control);
+        control.finish().await;
     }
 
     #[tokio::test]
     async fn foreign_runtime_capacity_is_rejected_before_native_open() {
-        use crate::admitted_query_context::QueryResultCapacityBinding;
-        let (control, root) = governance();
-        let (foreign_control, foreign_root) = governance();
-        let scope = root.owner.scope();
-        let foreign_scope = foreign_root.owner.scope();
-        assert_eq!(
-            scope.id(),
-            foreign_scope.id(),
-            "runtime identity must also be checked"
-        );
-        let capacity = foreign_scope.result_capacity().unwrap();
-        let window = capacity
-            .try_acquire(
-                &foreign_scope,
-                novarocks_workload_control::ResultWindowClass::Internal,
-            )
-            .unwrap();
-        let original =
-            QueryResultCapacityBinding::try_new(&foreign_scope, window.retain_alias()).unwrap();
-        let request = completion_request(UnreachablePreparationPort)
-            .with_result_capacity(original.clone())
-            .unwrap();
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(PanickingOpenNativePort),
-            QueryProcessNamespace::new(0x76),
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
-        let Err(error) = client.start(request, root.owner).await else {
-            panic!("a foreign runtime binding cannot open Native work");
+        let (mut control, mut foreign_control) = {
+            use crate::admitted_query_context::QueryResultCapacityBinding;
+            let (control, root) = governance().await;
+            let (foreign_control, foreign_root) = governance().await;
+            let scope = root.owner.scope();
+            let foreign_scope = foreign_root.owner.scope();
+            assert_eq!(
+                scope.id(),
+                foreign_scope.id(),
+                "runtime identity must also be checked"
+            );
+            let capacity = foreign_scope.result_capacity().unwrap();
+            let window = capacity
+                .try_acquire(
+                    &foreign_scope,
+                    novarocks_workload_control::ResultWindowClass::Internal,
+                )
+                .unwrap();
+            let original =
+                QueryResultCapacityBinding::try_new(&foreign_scope, window.retain_alias()).unwrap();
+            let request = completion_request(UnreachablePreparationPort)
+                .with_result_capacity(original.clone())
+                .unwrap();
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(PanickingOpenNativePort),
+                QueryProcessNamespace::new(0x76),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
+            let Err(error) = client.start(request, root.owner).await else {
+                panic!("a foreign runtime binding cannot open Native work");
+            };
+            assert_eq!(error.kind(), QueryExecutionErrorKind::InvalidRequest);
+            assert_eq!(capacity.snapshot().held_positions[2], 1);
+            drop((original, window));
+            assert_eq!(capacity.snapshot().held_positions[2], 0);
+            root.business.release();
+            foreign_root.owner.complete();
+            foreign_root.business.release();
+            supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            scope.wait_released().await;
+            foreign_scope.wait_released().await;
+            assert_eq!(control.snapshot().root_responsibilities, 0);
+            assert_eq!(foreign_control.snapshot().root_responsibilities, 0);
+
+            (control, foreign_control)
         };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::InvalidRequest);
-        assert_eq!(capacity.snapshot().held_positions[2], 1);
-        drop((original, window));
-        assert_eq!(capacity.snapshot().held_positions[2], 0);
-        root.business.release();
-        foreign_root.owner.complete();
-        foreign_root.business.release();
-        supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
-        scope.wait_released().await;
-        foreign_scope.wait_released().await;
-        assert_eq!(control.snapshot().root_responsibilities, 0);
-        assert_eq!(foreign_control.snapshot().root_responsibilities, 0);
+        acknowledge_all_control(&control);
+        control.finish().await;
+        acknowledge_all_control(&foreign_control);
+        foreign_control.finish().await;
     }
 
     #[tokio::test]
     async fn cancelled_rejected_start_settles_uninstalled_control() {
-        let (control, root) = governance();
-        let cancellation = root.owner.scope().cancellation().unwrap();
-        root.owner.cancel(CancellationReason::DeadlineExceeded);
-        let error = match rejected_start(root.owner, "supervisor closed").await {
-            Err(error) => error,
-            Ok(_) => panic!("closed supervisor cannot accept the start"),
+        let mut control = {
+            let (control, root) = governance().await;
+            let cancellation = root.owner.scope().cancellation().unwrap();
+            root.owner.cancel(CancellationReason::DeadlineExceeded);
+            let error = match rejected_start(root.owner, "supervisor closed").await {
+                Err(error) => error,
+                Ok(_) => panic!("closed supervisor cannot accept the start"),
+            };
+            assert_eq!(error.kind(), QueryExecutionErrorKind::Rejected);
+            assert!(
+                error.execution_failure().is_none(),
+                "local admission is not a Task failure"
+            );
+            assert_eq!(
+                cancellation.reason(),
+                Some(CancellationReason::DeadlineExceeded)
+            );
+            root.business.release();
+            assert_eq!(control.snapshot().root_responsibilities, 0);
+            assert!(control.next_control().is_none());
+
+            control
         };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::Rejected);
-        assert!(
-            error.execution_failure().is_none(),
-            "local admission is not a Task failure"
-        );
-        assert_eq!(
-            cancellation.reason(),
-            Some(CancellationReason::DeadlineExceeded)
-        );
-        root.business.release();
-        assert_eq!(control.snapshot().root_responsibilities, 0);
-        assert!(control.next_control().is_none());
+        acknowledge_all_control(&control);
+        control.finish().await;
     }
 
     fn acknowledge_all_control(control: &WorkloadControl) {
@@ -3819,26 +4476,41 @@ mod tests {
     /// with it.
     #[tokio::test]
     async fn an_owner_abandoned_by_an_unwind_reports_the_original_panic() {
-        let (supervisor, _client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            failing_native().0,
-            QueryProcessNamespace::new(0x4f),
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
+        let mut control = {
+            let control = governance_empty();
+            let (mut supervisor, _client) = test_supervisor(
+                &control,
+                Handle::current(),
+                failing_native().0,
+                QueryProcessNamespace::new(0x4f),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
 
-        let payload = catch_unwind(AssertUnwindSafe(move || {
-            let _abandoned = supervisor;
-            panic!("the assertion that actually failed");
-        }))
-        .expect_err("the closure panics");
+            let mut original_join = supervisor.join.take().unwrap();
+            let payload = catch_unwind(AssertUnwindSafe(move || {
+                let _abandoned = supervisor;
+                panic!("the assertion that actually failed");
+            }))
+            .expect_err("the closure panics");
 
-        assert_eq!(
-            *payload
-                .downcast_ref::<&str>()
-                .expect("the original panic payload survives the unwind"),
-            "the assertion that actually failed"
-        );
+            assert_eq!(
+                *payload
+                    .downcast_ref::<&str>()
+                    .expect("the original panic payload survives the unwind"),
+                "the assertion that actually failed"
+            );
+
+            let joined = tokio::time::timeout(Duration::from_secs(1), &mut original_join)
+                .await
+                .expect("the same abandoned root must actually join")
+                .unwrap();
+            assert!(matches!(joined, OriginalRootOutcome::Completed(Ok(()))));
+
+            control
+        };
+        acknowledge_all_control(&control);
+        control.finish().await;
     }
 
     #[test]
@@ -3873,73 +4545,89 @@ mod tests {
 
     #[tokio::test]
     async fn activation_failure_retains_residual_and_retires_exact_registry_entry() {
-        let (native, attempts, opened, activated, residual) = failing_native();
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            native,
-            QueryProcessNamespace::new(0x45),
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
-        let (control, root) = governance();
-        let scope = root.owner.scope();
+        let mut control = {
+            let (native, attempts, opened, activated, residual) = failing_native();
+            let (control, root) = governance().await;
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                native,
+                QueryProcessNamespace::new(0x45),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
 
-        let error = match client.start(completion_request(attempts), root.owner).await {
-            Ok(_) => panic!("activation failure must not return an execution handle"),
-            Err(error) => error,
+            let scope = root.owner.scope();
+
+            let error = match client.start(completion_request(attempts), root.owner).await {
+                Ok(_) => panic!("activation failure must not return an execution handle"),
+                Err(error) => error,
+            };
+            assert_eq!(error.message(), "injected Native activation failure");
+            assert_eq!(
+                error.execution_failure(),
+                Some(&fixture_execution_input(
+                    "injected Native activation failure"
+                ))
+            );
+            root.business.release();
+            supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            acknowledge_all_control(&control);
+            scope.wait_released().await;
+            assert_ne!(opened.load(Ordering::SeqCst), 0);
+            assert!(activated.load(Ordering::SeqCst));
+            assert!(residual.load(Ordering::SeqCst));
+            assert_eq!(control.snapshot().root_responsibilities, 0);
+
+            control
         };
-        assert_eq!(error.message(), "injected Native activation failure");
-        assert_eq!(
-            error.execution_failure(),
-            Some(&fixture_execution_input(
-                "injected Native activation failure"
-            ))
-        );
-        root.business.release();
-        supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
         acknowledge_all_control(&control);
-        scope.wait_released().await;
-        assert_ne!(opened.load(Ordering::SeqCst), 0);
-        assert!(activated.load(Ordering::SeqCst));
-        assert!(residual.load(Ordering::SeqCst));
-        assert_eq!(control.snapshot().root_responsibilities, 0);
+        control.finish().await;
     }
 
     #[tokio::test]
     async fn dropping_an_accepted_reply_does_not_drop_its_work_owner() {
-        let (native, attempts, _opened, activated, residual) = failing_native();
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            native,
-            QueryProcessNamespace::new(0x46),
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        let future = client.start(completion_request(attempts), root.owner);
-        drop(future);
-        root.business.release();
+        let mut control = {
+            let (native, attempts, _opened, activated, residual) = failing_native();
+            let (control, root) = governance().await;
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                native,
+                QueryProcessNamespace::new(0x46),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !activated.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("accepted request continues after its reply receiver is dropped");
+            let scope = root.owner.scope();
+            let future = client.start(completion_request(attempts), root.owner);
+            drop(future);
+            root.business.release();
 
-        supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !activated.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
-            .unwrap();
+            .expect("accepted request continues after its reply receiver is dropped");
+
+            supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            acknowledge_all_control(&control);
+            scope.wait_released().await;
+            assert!(activated.load(Ordering::SeqCst));
+            assert!(residual.load(Ordering::SeqCst));
+
+            control
+        };
         acknowledge_all_control(&control);
-        scope.wait_released().await;
-        assert!(activated.load(Ordering::SeqCst));
-        assert!(residual.load(Ordering::SeqCst));
+        control.finish().await;
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4323,156 +5011,164 @@ mod tests {
     }
 
     async fn terminal_preparation_exit_fixture(fail: bool) {
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        let signals = Arc::new(PreparationExitSignals::default());
-        let attempts = PreparationExitPort {
-            state: Arc::new(PreparationExitState {
-                window: None,
-                signals: Arc::clone(&signals),
-            }),
-            backend: BackendProcessId::new_v7(),
-        };
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(BindingNativePort),
-            QueryProcessNamespace::new(0x74),
-            FrontendProcessId::new_v7(),
-            supervisor_config().with_remote_cleanup_timeout(Duration::from_secs(10)),
-        );
-        let request = rows_request(&control, &scope, RecoveryMode::NoRecovery, None, attempts);
-        let capacity = scope
-            .result_capacity()
-            .expect("original scope result capacity");
-        let original_client_positions = capacity.snapshot().held_positions[0];
-        // Capture every negative observation without asserting while the actual
-        // convergence owner is blocked. The outer cleanup always releases it.
-        let observations: Result<PreparationExitFacts, &'static str> = async {
-            let mut handle =
-                tokio::time::timeout(Duration::from_secs(1), client.start(request, root.owner))
-                    .await
-                    .map_err(|_| "Rows handle handoff timed out")?
-                    .map_err(|_| "Rows handle handoff failed")?;
-            let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
-                return Err("original request did not hand off Rows");
+        let mut control = {
+            let (control, root) = governance().await;
+            let scope = root.owner.scope();
+            let signals = Arc::new(PreparationExitSignals::default());
+            let attempts = PreparationExitPort {
+                state: Arc::new(PreparationExitState {
+                    window: None,
+                    signals: Arc::clone(&signals),
+                }),
+                backend: BackendProcessId::new_v7(),
             };
-            wait_preparation_exit_fact(&signals.reply_captured).await?;
-            if fail {
-                signals.trigger_failure.notify_one();
-            } else {
-                handle
-                    .request_cancel()
-                    .map_err(|_| "original cancel request failed")?;
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(0x74),
+                FrontendProcessId::new_v7(),
+                supervisor_config().with_remote_cleanup_timeout(Duration::from_secs(10)),
+            );
+            let request = rows_request(&control, &scope, RecoveryMode::NoRecovery, None, attempts);
+            let capacity = scope
+                .result_capacity()
+                .expect("original scope result capacity");
+            let original_client_positions = capacity.snapshot().held_positions[0];
+            // Capture every negative observation without asserting while the actual
+            // convergence owner is blocked. The outer cleanup always releases it.
+            let observations: Result<PreparationExitFacts, &'static str> = async {
+                let mut handle =
+                    tokio::time::timeout(Duration::from_secs(1), client.start(request, root.owner))
+                        .await
+                        .map_err(|_| "Rows handle handoff timed out")?
+                        .map_err(|_| "Rows handle handoff failed")?;
+                let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output()
+                else {
+                    return Err("original request did not hand off Rows");
+                };
+                wait_preparation_exit_fact(&signals.reply_captured).await?;
+                if fail {
+                    signals.trigger_failure.notify_one();
+                } else {
+                    handle
+                        .request_cancel()
+                        .map_err(|_| "original cancel request failed")?;
+                }
+                let terminal = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                    .await
+                    .map_err(|_| "Rows terminal result timed out")?;
+                if terminal.is_ok() {
+                    return Err("terminal Rows result did not preserve a typed error");
+                }
+                drop(stream);
+                drop(handle);
+                wait_preparation_exit_fact(&signals.convergence_entered).await?;
+                let factory_exited = signals.factory_exited.load(Ordering::SeqCst);
+                let held_with_reply_and_transport = capacity.snapshot().held_positions[0];
+                let reply = signals
+                    .reply
+                    .lock()
+                    .map_err(|_| "fixture reply lock poisoned")?
+                    .take();
+                drop(reply);
+                let held_after_reply_exit = capacity.snapshot().held_positions[0];
+                let transport = signals
+                    .transport
+                    .lock()
+                    .map_err(|_| "fixture transport lock poisoned")?
+                    .take();
+                drop(transport);
+                let held_after_last_transport_exit = capacity.snapshot().held_positions[0];
+                let convergence_still_held = !signals.convergence_completed.load(Ordering::SeqCst);
+                Ok(PreparationExitFacts {
+                    factory_exited,
+                    convergence_still_held,
+                    held_with_reply_and_transport,
+                    held_after_reply_exit,
+                    held_after_last_transport_exit,
+                })
             }
-            let terminal = tokio::time::timeout(Duration::from_secs(1), stream.next())
-                .await
-                .map_err(|_| "Rows terminal result timed out")?;
-            if terminal.is_ok() {
-                return Err("terminal Rows result did not preserve a typed error");
-            }
-            drop(stream);
-            drop(handle);
-            wait_preparation_exit_fact(&signals.convergence_entered).await?;
-            let factory_exited = signals.factory_exited.load(Ordering::SeqCst);
-            let held_with_reply_and_transport = capacity.snapshot().held_positions[0];
-            let reply = signals
-                .reply
-                .lock()
-                .map_err(|_| "fixture reply lock poisoned")?
-                .take();
-            drop(reply);
-            let held_after_reply_exit = capacity.snapshot().held_positions[0];
-            let transport = signals
-                .transport
-                .lock()
-                .map_err(|_| "fixture transport lock poisoned")?
-                .take();
-            drop(transport);
-            let held_after_last_transport_exit = capacity.snapshot().held_positions[0];
-            let convergence_still_held = !signals.convergence_completed.load(Ordering::SeqCst);
-            Ok(PreparationExitFacts {
-                factory_exited,
-                convergence_still_held,
-                held_with_reply_and_transport,
-                held_after_reply_exit,
-                held_after_last_transport_exit,
-            })
-        }
-        .await;
-
-        // Preserve cleanup even when an observation failed. Poisoned fixture locks
-        // retain their actual slots until explicitly taken; do not abandon owners.
-        drop(
-            signals
-                .reply
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take(),
-        );
-        drop(
-            signals
-                .transport
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take(),
-        );
-        signals.release_convergence.notify_one();
-        // Process shutdown may legitimately end optional remote tracking.
-        // Observe this original fixture's convergence before requesting it.
-        let convergence_exit = wait_preparation_exit_fact(&signals.convergence_completed).await;
-        root.business.release();
-        let shutdown = supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(2))
             .await;
-        // A timed-out handoff may have continued in the original supervisor.
-        // Once shutdown joins it, drain slots again before checking scope release.
-        drop(
-            signals
-                .reply
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take(),
-        );
-        drop(
-            signals
-                .transport
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take(),
-        );
-        acknowledge_all_control(&control);
-        let settled = tokio::time::timeout(Duration::from_secs(2), scope.wait_released()).await;
 
-        // All assertions happen after the original owner has been released/joined.
-        assert!(
-            shutdown.is_ok(),
-            "original supervisor did not shut down: {shutdown:?}"
-        );
-        assert!(settled.is_ok(), "original scope did not settle");
-        assert!(
-            convergence_exit.is_ok(),
-            "original convergence did not exit"
-        );
-        let facts = observations.expect("all bounded lifetime observations must complete");
-        assert_eq!(original_client_positions, 1);
-        assert!(
-            facts.factory_exited,
-            "terminal supervisor retained its preparation factory: {facts:?}"
-        );
-        assert!(
-            facts.convergence_still_held,
-            "fixture released remote convergence too early"
-        );
-        assert_eq!(facts.held_with_reply_and_transport, 1);
-        assert_eq!(
-            facts.held_after_reply_exit, 1,
-            "actual transport alias must keep the window"
-        );
-        assert_eq!(
-            facts.held_after_last_transport_exit, 0,
-            "last actual alias must return capacity before remote convergence"
-        );
-        assert!(signals.convergence_completed.load(Ordering::SeqCst));
+            // Preserve cleanup even when an observation failed. Poisoned fixture locks
+            // retain their actual slots until explicitly taken; do not abandon owners.
+            drop(
+                signals
+                    .reply
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take(),
+            );
+            drop(
+                signals
+                    .transport
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take(),
+            );
+            signals.release_convergence.notify_one();
+            // Process shutdown may legitimately end optional remote tracking.
+            // Observe this original fixture's convergence before requesting it.
+            let convergence_exit = wait_preparation_exit_fact(&signals.convergence_completed).await;
+            root.business.release();
+            let shutdown = supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(2))
+                .await;
+            // A timed-out handoff may have continued in the original supervisor.
+            // Once shutdown joins it, drain slots again before checking scope release.
+            drop(
+                signals
+                    .reply
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take(),
+            );
+            drop(
+                signals
+                    .transport
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take(),
+            );
+            acknowledge_all_control(&control);
+            let settled = tokio::time::timeout(Duration::from_secs(2), scope.wait_released()).await;
+
+            // All assertions happen after the original owner has been released/joined.
+            assert!(
+                shutdown.is_ok(),
+                "original supervisor did not shut down: {shutdown:?}"
+            );
+            assert!(settled.is_ok(), "original scope did not settle");
+            assert!(
+                convergence_exit.is_ok(),
+                "original convergence did not exit"
+            );
+            let facts = observations.expect("all bounded lifetime observations must complete");
+            assert_eq!(original_client_positions, 1);
+            assert!(
+                facts.factory_exited,
+                "terminal supervisor retained its preparation factory: {facts:?}"
+            );
+            assert!(
+                facts.convergence_still_held,
+                "fixture released remote convergence too early"
+            );
+            assert_eq!(facts.held_with_reply_and_transport, 1);
+            assert_eq!(
+                facts.held_after_reply_exit, 1,
+                "actual transport alias must keep the window"
+            );
+            assert_eq!(
+                facts.held_after_last_transport_exit, 0,
+                "last actual alias must return capacity before remote convergence"
+            );
+            assert!(signals.convergence_completed.load(Ordering::SeqCst));
+
+            control
+        };
+        acknowledge_all_control(&control);
+        control.finish().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4639,142 +5335,151 @@ mod tests {
     }
 
     async fn initial_terminal_preparation_fixture(phase: InitialTerminalPhase) {
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        let capacity = scope
-            .result_capacity()
-            .expect("original scope result capacity");
-        let window = capacity
-            .try_acquire(
-                &scope,
-                novarocks_workload_control::ResultWindowClass::Internal,
-            )
-            .expect("original Internal window admission");
-        let signals = Arc::new(PreparationExitSignals::default());
-        let frontend = FrontendProcessId::new_v7();
-        let attempts = InitialTerminalPreparationPort {
-            state: Arc::new(PreparationExitState {
-                window: Some(TestWindow(window.retain_alias())),
-                signals: Arc::clone(&signals),
-            }),
-            backend: BackendProcessId::new_v7(),
-            frontend,
-            phase,
-        };
-        drop(window);
-        let original_internal_positions = capacity.snapshot().held_positions[2];
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(BindingNativePort),
-            QueryProcessNamespace::new(0x78),
-            frontend,
-            supervisor_config().with_remote_cleanup_timeout(Duration::from_secs(10)),
-        );
-        // Capture failure observations without asserting while a real owner waits.
-        let observations: Result<(bool, bool, usize), &'static str> = async {
-            let reply = tokio::time::timeout(
-                Duration::from_secs(1),
-                client.start(completion_request(attempts), root.owner),
-            )
-            .await
-            .map_err(|_| "initial terminal reply timed out")?;
-            match phase {
-                InitialTerminalPhase::CompletionSuccess => {
-                    let mut handle = reply.map_err(|_| "exact Establish completion failed")?;
-                    if !matches!(
-                        handle.take_output(),
-                        Some(crate::api::ExecutionOutput::Completion)
-                    ) {
-                        return Err("success did not preserve original Completion output");
+        let mut control = {
+            let (control, root) = governance().await;
+            let scope = root.owner.scope();
+            let capacity = scope
+                .result_capacity()
+                .expect("original scope result capacity");
+            let window = capacity
+                .try_acquire(
+                    &scope,
+                    novarocks_workload_control::ResultWindowClass::Internal,
+                )
+                .expect("original Internal window admission");
+            let signals = Arc::new(PreparationExitSignals::default());
+            let frontend = FrontendProcessId::new_v7();
+            let attempts = InitialTerminalPreparationPort {
+                state: Arc::new(PreparationExitState {
+                    window: Some(TestWindow(window.retain_alias())),
+                    signals: Arc::clone(&signals),
+                }),
+                backend: BackendProcessId::new_v7(),
+                frontend,
+                phase,
+            };
+            drop(window);
+            let original_internal_positions = capacity.snapshot().held_positions[2];
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(0x78),
+                frontend,
+                supervisor_config().with_remote_cleanup_timeout(Duration::from_secs(10)),
+            );
+            // Capture failure observations without asserting while a real owner waits.
+            let observations: Result<(bool, bool, usize), &'static str> = async {
+                let reply = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    client.start(completion_request(attempts), root.owner),
+                )
+                .await
+                .map_err(|_| "initial terminal reply timed out")?;
+                match phase {
+                    InitialTerminalPhase::CompletionSuccess => {
+                        let mut handle = reply.map_err(|_| "exact Establish completion failed")?;
+                        if !matches!(
+                            handle.take_output(),
+                            Some(crate::api::ExecutionOutput::Completion)
+                        ) {
+                            return Err("success did not preserve original Completion output");
+                        }
+                        drop(handle);
                     }
-                    drop(handle);
-                }
-                phase => {
-                    let error = match reply {
-                        Err(error) => error,
-                        Ok(handle) => {
-                            drop(handle);
-                            return Err("terminal failure returned success");
+                    phase => {
+                        let error = match reply {
+                            Err(error) => error,
+                            Ok(handle) => {
+                                drop(handle);
+                                return Err("terminal failure returned success");
+                            }
+                        };
+                        let expected = match phase {
+                            InitialTerminalPhase::ActivateFailure => {
+                                "initial terminal fixture activation failure"
+                            }
+                            InitialTerminalPhase::ActivatePanic => {
+                                "Native attempt activation panicked"
+                            }
+                            InitialTerminalPhase::CompletionFailure => {
+                                "initial terminal fixture run failure"
+                            }
+                            InitialTerminalPhase::CompletionPanic => "Native attempt run panicked",
+                            _ => unreachable!(),
+                        };
+                        if error.message() != expected {
+                            return Err("original terminal failure source/order changed");
                         }
-                    };
-                    let expected = match phase {
-                        InitialTerminalPhase::ActivateFailure => {
-                            "initial terminal fixture activation failure"
-                        }
-                        InitialTerminalPhase::ActivatePanic => "Native attempt activation panicked",
-                        InitialTerminalPhase::CompletionFailure => {
-                            "initial terminal fixture run failure"
-                        }
-                        InitialTerminalPhase::CompletionPanic => "Native attempt run panicked",
-                        _ => unreachable!(),
-                    };
-                    if error.message() != expected {
-                        return Err("original terminal failure source/order changed");
                     }
                 }
+                wait_preparation_exit_fact(&signals.convergence_entered).await?;
+                Ok((
+                    signals.factory_exited.load(Ordering::SeqCst),
+                    !signals.convergence_completed.load(Ordering::SeqCst),
+                    capacity.snapshot().held_positions[2],
+                ))
             }
-            wait_preparation_exit_fact(&signals.convergence_entered).await?;
-            Ok((
-                signals.factory_exited.load(Ordering::SeqCst),
-                !signals.convergence_completed.load(Ordering::SeqCst),
-                capacity.snapshot().held_positions[2],
-            ))
-        }
-        .await;
-        // Release and observe the same original convergence before shutdown can
-        // legitimately end its optional remote tracking. Then settle actual scope.
-        signals.release_convergence.notify_one();
-        let convergence_exit = wait_preparation_exit_fact(&signals.convergence_completed).await;
-        root.business.release();
-        let shutdown = supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(2))
             .await;
-        acknowledge_all_control(&control);
-        let settled = tokio::time::timeout(Duration::from_secs(2), scope.wait_released()).await;
-        assert!(
-            convergence_exit.is_ok(),
-            "original convergence did not exit: {phase:?}"
-        );
-        let joined_with_expected_outcome = match (&shutdown, phase) {
-            (
-                Ok(()),
-                InitialTerminalPhase::ActivateFailure
-                | InitialTerminalPhase::CompletionSuccess
-                | InitialTerminalPhase::CompletionFailure,
-            ) => true,
-            (
-                Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)),
-                InitialTerminalPhase::ActivatePanic,
-            ) => error.message() == "Native attempt activation panicked",
-            (
-                Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)),
-                InitialTerminalPhase::CompletionPanic,
-            ) => error.message() == "Native attempt run panicked",
-            _ => false,
+            // Release and observe the same original convergence before shutdown can
+            // legitimately end its optional remote tracking. Then settle actual scope.
+            signals.release_convergence.notify_one();
+            let convergence_exit = wait_preparation_exit_fact(&signals.convergence_completed).await;
+            root.business.release();
+            let shutdown = supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(2))
+                .await;
+            acknowledge_all_control(&control);
+            let settled = tokio::time::timeout(Duration::from_secs(2), scope.wait_released()).await;
+            assert!(
+                convergence_exit.is_ok(),
+                "original convergence did not exit: {phase:?}"
+            );
+            let joined_with_expected_outcome = match (&shutdown, phase) {
+                (
+                    Ok(()),
+                    InitialTerminalPhase::ActivateFailure
+                    | InitialTerminalPhase::CompletionSuccess
+                    | InitialTerminalPhase::CompletionFailure,
+                ) => true,
+                (
+                    Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)),
+                    InitialTerminalPhase::ActivatePanic,
+                ) => error.message() == "Native attempt activation panicked",
+                (
+                    Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)),
+                    InitialTerminalPhase::CompletionPanic,
+                ) => error.message() == "Native attempt run panicked",
+                _ => false,
+            };
+            assert!(
+                joined_with_expected_outcome,
+                "original supervisor owner did not join with its expected outcome: {phase:?} {shutdown:?}"
+            );
+            assert!(settled.is_ok(), "original scope did not settle: {phase:?}");
+            let (factory_exited, convergence_held, held_positions) =
+                observations.expect("bounded terminal facts");
+            assert_eq!(original_internal_positions, 1);
+            assert!(
+                factory_exited,
+                "terminal caller retained preparation state: {phase:?}"
+            );
+            assert!(
+                convergence_held,
+                "original convergence released before observation: {phase:?}"
+            );
+            // The real Dormant/Active guard must remain live even after the unused
+            // factory drops. Zero here would be a false release, not a desired result.
+            assert_eq!(
+                held_positions, 1,
+                "original attempt guard lost its window: {phase:?}"
+            );
+            assert_eq!(capacity.snapshot().held_positions[2], 0);
+
+            control
         };
-        assert!(
-            joined_with_expected_outcome,
-            "original supervisor owner did not join with its expected outcome: {phase:?} {shutdown:?}"
-        );
-        assert!(settled.is_ok(), "original scope did not settle: {phase:?}");
-        let (factory_exited, convergence_held, held_positions) =
-            observations.expect("bounded terminal facts");
-        assert_eq!(original_internal_positions, 1);
-        assert!(
-            factory_exited,
-            "terminal caller retained preparation state: {phase:?}"
-        );
-        assert!(
-            convergence_held,
-            "original convergence released before observation: {phase:?}"
-        );
-        // The real Dormant/Active guard must remain live even after the unused
-        // factory drops. Zero here would be a false release, not a desired result.
-        assert_eq!(
-            held_positions, 1,
-            "original attempt guard lost its window: {phase:?}"
-        );
-        assert_eq!(capacity.snapshot().held_positions[2], 0);
+        acknowledge_all_control(&control);
+        control.finish().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4800,53 +5505,61 @@ mod tests {
 
     #[tokio::test]
     async fn rows_handle_is_handed_off_before_the_attempt_converges() {
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        let converged = Arc::new(AtomicBool::new(false));
-        let attempts = RowsAttemptPreparationPort {
-            relay_window: None,
-            backend: BackendProcessId::new_v7(),
-            converged: Arc::clone(&converged),
-        };
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(BindingNativePort),
-            QueryProcessNamespace::new(0x52),
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
+        let mut control = {
+            let (control, root) = governance().await;
+            let scope = root.owner.scope();
+            let converged = Arc::new(AtomicBool::new(false));
+            let attempts = RowsAttemptPreparationPort {
+                relay_window: None,
+                backend: BackendProcessId::new_v7(),
+                converged: Arc::clone(&converged),
+            };
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(0x52),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
 
-        let mut handle = tokio::time::timeout(
-            Duration::from_secs(1),
-            client.start(
-                rows_request(&control, &scope, RecoveryMode::NoRecovery, None, attempts),
-                root.owner,
-            ),
-        )
-        .await
-        .expect("Rows execution must hand off its bounded result consumer")
-        .unwrap();
-        let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
-            panic!("Rows execution must return its result stream");
-        };
-        assert!(!converged.load(Ordering::SeqCst));
-        handle.request_cancel().unwrap();
-        let Err(error) = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            let mut handle = tokio::time::timeout(
+                Duration::from_secs(1),
+                client.start(
+                    rows_request(&control, &scope, RecoveryMode::NoRecovery, None, attempts),
+                    root.owner,
+                ),
+            )
             .await
-            .expect("scope cancellation must terminate the result stream")
-        else {
-            panic!("cancelled Rows stream must end with a typed error");
-        };
-        assert!(!error.message().is_empty());
-        drop(stream);
-        root.business.release();
-        supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
+            .expect("Rows execution must hand off its bounded result consumer")
             .unwrap();
+            let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
+                panic!("Rows execution must return its result stream");
+            };
+            assert!(!converged.load(Ordering::SeqCst));
+            handle.request_cancel().unwrap();
+            let Err(error) = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("scope cancellation must terminate the result stream")
+            else {
+                panic!("cancelled Rows stream must end with a typed error");
+            };
+            assert!(!error.message().is_empty());
+            drop(stream);
+            root.business.release();
+            supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            acknowledge_all_control(&control);
+            drop(handle);
+            scope.wait_released().await;
+            assert!(converged.load(Ordering::SeqCst));
+
+            control
+        };
         acknowledge_all_control(&control);
-        scope.wait_released().await;
-        assert!(converged.load(Ordering::SeqCst));
+        control.finish().await;
     }
 
     #[derive(Debug)]
@@ -5285,291 +5998,309 @@ mod tests {
         cancel_reason: Option<CancellationReason>,
         release: bool,
     ) {
-        let cancel = cancel_reason.is_some();
-        let prepares = Arc::new(AtomicU64::new(0));
-        let runs = Arc::new(AtomicU64::new(0));
-        let convergences = Arc::new(AtomicU64::new(0));
-        let exits = Arc::new(AtomicU64::new(0));
-        let entered = Arc::new(AtomicU64::new(0));
-        let gate = Arc::new(tokio::sync::Notify::new());
-        let attempts = HeldReplacementPreparationPort {
-            inner: RecoveringRowsPreparationPort {
-                relay_window: None,
-                backends: fixture_recovery_backends(2),
-                prepares: Arc::clone(&prepares),
-                runs: Arc::clone(&runs),
-                convergences: Arc::clone(&convergences),
-                allow_initial_convergence: Arc::new(tokio::sync::Notify::new()),
-                block_initial_convergence: false,
-                replacement_missing_rows: false,
-                failures_before_success: 1,
-            },
-            release: Arc::clone(&gate),
-            exits: Arc::clone(&exits),
-            entered: Arc::clone(&entered),
-        };
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        let requester = root.owner.cancellation_requester();
-        let mut config = supervisor_config();
-        config.rows.replacement_reservation_valid_for = if cancel || release {
-            Duration::from_secs(30)
-        } else {
-            Duration::from_millis(50)
-        };
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(BindingNativePort),
-            QueryProcessNamespace::new(0x59),
-            FrontendProcessId::new_v7(),
-            config,
-        );
-        let mut handle = client
-            .start(
-                rows_request(
-                    &control,
-                    &scope,
-                    RecoveryMode::RestartAttemptBeforeVisibility,
-                    Some(Arc::new(ImmediateReplacementPort::default())),
-                    attempts,
-                ),
-                root.owner,
-            )
+        let mut control = {
+            let cancel = cancel_reason.is_some();
+            let prepares = Arc::new(AtomicU64::new(0));
+            let runs = Arc::new(AtomicU64::new(0));
+            let convergences = Arc::new(AtomicU64::new(0));
+            let exits = Arc::new(AtomicU64::new(0));
+            let entered = Arc::new(AtomicU64::new(0));
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let attempts = HeldReplacementPreparationPort {
+                inner: RecoveringRowsPreparationPort {
+                    relay_window: None,
+                    backends: fixture_recovery_backends(2),
+                    prepares: Arc::clone(&prepares),
+                    runs: Arc::clone(&runs),
+                    convergences: Arc::clone(&convergences),
+                    allow_initial_convergence: Arc::new(tokio::sync::Notify::new()),
+                    block_initial_convergence: false,
+                    replacement_missing_rows: false,
+                    failures_before_success: 1,
+                },
+                release: Arc::clone(&gate),
+                exits: Arc::clone(&exits),
+                entered: Arc::clone(&entered),
+            };
+            let (control, root) = governance().await;
+            let scope = root.owner.scope();
+            let requester = root.owner.cancellation_requester();
+            let mut config = supervisor_config();
+            config.rows.replacement_reservation_valid_for = if cancel || release {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_millis(50)
+            };
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(0x59),
+                FrontendProcessId::new_v7(),
+                config,
+            );
+            let mut handle = client
+                .start(
+                    rows_request(
+                        &control,
+                        &scope,
+                        RecoveryMode::RestartAttemptBeforeVisibility,
+                        Some(Arc::new(ImmediateReplacementPort::default())),
+                        attempts,
+                    ),
+                    root.owner,
+                )
+                .await
+                .unwrap();
+            let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
+                panic!("recoverable Rows execution must retain its result consumer");
+            };
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while entered.load(Ordering::SeqCst) != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
-            .unwrap();
-        let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
-            panic!("recoverable Rows execution must retain its result consumer");
+            .expect("the failed attempt must enter replacement preparation");
+            assert_eq!(runs.load(Ordering::SeqCst), 1);
+            stream.begin_schema().unwrap().complete();
+            if release {
+                gate.notify_one();
+                let crate::api::ResultDelivery::Segment(delivery) =
+                    tokio::time::timeout(Duration::from_secs(1), stream.next())
+                        .await
+                        .expect("replacement released within the budget must deliver")
+                        .unwrap()
+                        .unwrap()
+                else {
+                    panic!("replacement must deliver its actual result batch");
+                };
+                delivery.complete();
+                assert_eq!(runs.load(Ordering::SeqCst), 2);
+            }
+            if let Some(reason) = cancel_reason.clone() {
+                requester.request(reason.clone()).unwrap();
+                requester.request(CancellationReason::Requested).unwrap();
+                assert_eq!(scope.cancellation().unwrap().reason(), Some(reason));
+            } else if release {
+                handle.request_cancel().unwrap();
+            }
+            let terminal = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("bounded preparation or cancellation must terminate the public stream");
+            let Err(error) = terminal else {
+                panic!("the stream must expose the failed logical execution");
+            };
+            if cancel || release {
+                let expected = match cancel_reason.as_ref() {
+                    Some(
+                        CancellationReason::DeadlineExceeded
+                        | CancellationReason::FrontendDrainDeadlineExceeded,
+                    ) => QueryFailureReason::DeadlineExceeded,
+                    _ => QueryFailureReason::Cancelled,
+                };
+                let input = error
+                    .execution_failure()
+                    .expect("public cancellation retains canonical input");
+                assert_eq!(input.fact(), expected.failure_fact());
+                assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+                assert_eq!(
+                    error.kind(),
+                    if matches!(expected, QueryFailureReason::DeadlineExceeded) {
+                        QueryExecutionErrorKind::DeadlineExceeded
+                    } else {
+                        QueryExecutionErrorKind::Cancelled
+                    },
+                );
+                if matches!(expected, QueryFailureReason::Cancelled) {
+                    assert_eq!(
+                        error.to_string(),
+                        "logical execution was cancelled before success EOF"
+                    );
+                }
+            } else {
+                assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+                assert_eq!(
+                    error.to_string(),
+                    "injected pre-visibility infrastructure failure"
+                );
+                let original = error
+                    .execution_failure()
+                    .expect("the originating attempt failure remains canonical");
+                assert_eq!(
+                    original.fact(),
+                    QueryFailureReason::BackendLost.failure_fact()
+                );
+                assert!(matches!(
+                    original.site(),
+                    ExecutionFailureSite::Backend { .. }
+                ));
+            }
+            if !release {
+                assert_eq!(
+                    runs.load(Ordering::SeqCst),
+                    1,
+                    "a held prepare cannot activate"
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while exits.load(Ordering::SeqCst) != 1 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the pending preparation must really exit before shutdown is requested");
+            drop(stream);
+            root.business.release();
+            let shutdown = supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await;
+            if release {
+                shutdown.unwrap();
+            } else if cancel {
+                shutdown.expect("accepted query cancellation is not a supervisor health failure");
+            } else {
+                let Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)) =
+                    shutdown
+                else {
+                    panic!("the supervisor must retain the precise preparation failure");
+                };
+                assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+                assert_eq!(
+                    error.to_string(),
+                    "Native replacement preparation exceeded its recovery budget"
+                );
+                assert_recovery_preparation_budget_input(&error);
+            }
+            acknowledge_all_control(&control);
+            drop(handle);
+            scope.wait_released().await;
+            assert_eq!(exits.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                convergences.load(Ordering::SeqCst),
+                if release { 2 } else { 1 }
+            );
+
+            control
         };
-        tokio::time::timeout(Duration::from_secs(1), async {
+        acknowledge_all_control(&control);
+        control.finish().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_recovery_does_not_refresh_the_preparation_deadline() {
+        let mut control = {
+            let prepares = Arc::new(AtomicU64::new(0));
+            let runs = Arc::new(AtomicU64::new(0));
+            let convergences = Arc::new(AtomicU64::new(0));
+            let exits = Arc::new(AtomicU64::new(0));
+            let entered = Arc::new(AtomicU64::new(0));
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let attempts = HeldReplacementPreparationPort {
+                inner: RecoveringRowsPreparationPort {
+                    relay_window: None,
+                    backends: fixture_recovery_backends(3),
+                    prepares: Arc::clone(&prepares),
+                    runs: Arc::clone(&runs),
+                    convergences: Arc::clone(&convergences),
+                    allow_initial_convergence: Arc::new(tokio::sync::Notify::new()),
+                    block_initial_convergence: false,
+                    replacement_missing_rows: false,
+                    failures_before_success: 2,
+                },
+                release: Arc::clone(&gate),
+                exits: Arc::clone(&exits),
+                entered: Arc::clone(&entered),
+            };
+            let (control, root) = governance().await;
+            let scope = root.owner.scope();
+            let mut config = supervisor_config();
+            config.rows.max_attempts = NonZeroU32::new(3).unwrap();
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(0x5a),
+                FrontendProcessId::new_v7(),
+                config,
+            );
+            let mut handle = client
+                .start(
+                    rows_request(
+                        &control,
+                        &scope,
+                        RecoveryMode::RestartAttemptBeforeVisibility,
+                        Some(Arc::new(ImmediateReplacementPort::default())),
+                        attempts,
+                    ),
+                    root.owner,
+                )
+                .await
+                .unwrap();
+            let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
+                panic!("recovery must retain the public stream");
+            };
+            stream.begin_schema().unwrap().complete();
             while entered.load(Ordering::SeqCst) != 1 {
                 tokio::task::yield_now().await;
             }
-        })
-        .await
-        .expect("the failed attempt must enter replacement preparation");
-        assert_eq!(runs.load(Ordering::SeqCst), 1);
-        stream.begin_schema().unwrap().complete();
-        if release {
+            tokio::time::advance(Duration::from_secs(20)).await;
             gate.notify_one();
-            let crate::api::ResultDelivery::Segment(delivery) =
-                tokio::time::timeout(Duration::from_secs(1), stream.next())
-                    .await
-                    .expect("replacement released within the budget must deliver")
-                    .unwrap()
-                    .unwrap()
-            else {
-                panic!("replacement must deliver its actual result batch");
-            };
-            delivery.complete();
-            assert_eq!(runs.load(Ordering::SeqCst), 2);
-        }
-        if let Some(reason) = cancel_reason.clone() {
-            requester.request(reason.clone()).unwrap();
-            requester.request(CancellationReason::Requested).unwrap();
-            assert_eq!(scope.cancellation().unwrap().reason(), Some(reason));
-        } else if release {
-            handle.request_cancel().unwrap();
-        }
-        let terminal = tokio::time::timeout(Duration::from_secs(1), stream.next())
-            .await
-            .expect("bounded preparation or cancellation must terminate the public stream");
-        let Err(error) = terminal else {
-            panic!("the stream must expose the failed logical execution");
-        };
-        if cancel || release {
-            let expected = match cancel_reason.as_ref() {
-                Some(
-                    CancellationReason::DeadlineExceeded
-                    | CancellationReason::FrontendDrainDeadlineExceeded,
-                ) => QueryFailureReason::DeadlineExceeded,
-                _ => QueryFailureReason::Cancelled,
-            };
-            let input = error
-                .execution_failure()
-                .expect("public cancellation retains canonical input");
-            assert_eq!(input.fact(), expected.failure_fact());
-            assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
-            assert_eq!(
-                error.kind(),
-                if matches!(expected, QueryFailureReason::DeadlineExceeded) {
-                    QueryExecutionErrorKind::DeadlineExceeded
-                } else {
-                    QueryExecutionErrorKind::Cancelled
-                },
-            );
-            if matches!(expected, QueryFailureReason::Cancelled) {
-                assert_eq!(
-                    error.to_string(),
-                    "logical execution was cancelled before success EOF"
-                );
+            while entered.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
             }
-        } else {
+            assert_eq!(runs.load(Ordering::SeqCst), 2);
+            tokio::time::advance(Duration::from_secs(10)).await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while exits.load(Ordering::SeqCst) != 2 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the held third prepare must exit at the original deadline");
+            let terminal = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("the third prepare must expire at the first recovery deadline");
+            let Err(error) = terminal else {
+                panic!("the expired replacement must retain the originating failure");
+            };
             assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
             assert_eq!(
                 error.to_string(),
                 "injected pre-visibility infrastructure failure"
             );
-            let original = error
-                .execution_failure()
-                .expect("the originating attempt failure remains canonical");
-            assert_eq!(
-                original.fact(),
-                QueryFailureReason::BackendLost.failure_fact()
-            );
-            assert!(matches!(
-                original.site(),
-                ExecutionFailureSite::Backend { .. }
-            ));
-        }
-        if !release {
+            assert_eq!(exits.load(Ordering::SeqCst), 2);
             assert_eq!(
                 runs.load(Ordering::SeqCst),
-                1,
-                "a held prepare cannot activate"
+                2,
+                "expired third prepare cannot activate"
             );
-        }
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while exits.load(Ordering::SeqCst) != 1 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("the pending preparation must really exit before shutdown is requested");
-        drop(stream);
-        root.business.release();
-        let shutdown = supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await;
-        if release {
-            shutdown.unwrap();
-        } else if cancel {
-            shutdown.expect("accepted query cancellation is not a supervisor health failure");
-        } else {
+            drop(stream);
+            root.business.release();
+            // shutdown_until converts the supplied std Instant back into Tokio
+            // time. Use the advanced clock so this is a future deadline, rather
+            // than the wall clock's already-past instant in this paused test.
+            let shutdown_deadline = tokio::time::Instant::now().into_std() + Duration::from_secs(1);
+            let shutdown = supervisor.shutdown_until(shutdown_deadline).await;
             let Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)) = shutdown
             else {
-                panic!("the supervisor must retain the precise preparation failure");
+                panic!("the preparation budget failure must survive owned shutdown: {shutdown:?}");
             };
             assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
             assert_eq!(
-                error.to_string(),
+                error.message(),
                 "Native replacement preparation exceeded its recovery budget"
             );
             assert_recovery_preparation_budget_input(&error);
-        }
-        acknowledge_all_control(&control);
-        scope.wait_released().await;
-        assert_eq!(exits.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            convergences.load(Ordering::SeqCst),
-            if release { 2 } else { 1 }
-        );
-    }
+            acknowledge_all_control(&control);
+            drop(handle);
+            scope.wait_released().await;
+            assert_eq!(convergences.load(Ordering::SeqCst), 2);
 
-    #[tokio::test(start_paused = true)]
-    async fn repeated_recovery_does_not_refresh_the_preparation_deadline() {
-        let prepares = Arc::new(AtomicU64::new(0));
-        let runs = Arc::new(AtomicU64::new(0));
-        let convergences = Arc::new(AtomicU64::new(0));
-        let exits = Arc::new(AtomicU64::new(0));
-        let entered = Arc::new(AtomicU64::new(0));
-        let gate = Arc::new(tokio::sync::Notify::new());
-        let attempts = HeldReplacementPreparationPort {
-            inner: RecoveringRowsPreparationPort {
-                relay_window: None,
-                backends: fixture_recovery_backends(3),
-                prepares: Arc::clone(&prepares),
-                runs: Arc::clone(&runs),
-                convergences: Arc::clone(&convergences),
-                allow_initial_convergence: Arc::new(tokio::sync::Notify::new()),
-                block_initial_convergence: false,
-                replacement_missing_rows: false,
-                failures_before_success: 2,
-            },
-            release: Arc::clone(&gate),
-            exits: Arc::clone(&exits),
-            entered: Arc::clone(&entered),
+            control
         };
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        let mut config = supervisor_config();
-        config.rows.max_attempts = NonZeroU32::new(3).unwrap();
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(BindingNativePort),
-            QueryProcessNamespace::new(0x5a),
-            FrontendProcessId::new_v7(),
-            config,
-        );
-        let mut handle = client
-            .start(
-                rows_request(
-                    &control,
-                    &scope,
-                    RecoveryMode::RestartAttemptBeforeVisibility,
-                    Some(Arc::new(ImmediateReplacementPort::default())),
-                    attempts,
-                ),
-                root.owner,
-            )
-            .await
-            .unwrap();
-        let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
-            panic!("recovery must retain the public stream");
-        };
-        stream.begin_schema().unwrap().complete();
-        while entered.load(Ordering::SeqCst) != 1 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::advance(Duration::from_secs(20)).await;
-        gate.notify_one();
-        while entered.load(Ordering::SeqCst) != 2 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(runs.load(Ordering::SeqCst), 2);
-        tokio::time::advance(Duration::from_secs(10)).await;
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while exits.load(Ordering::SeqCst) != 2 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("the held third prepare must exit at the original deadline");
-        let terminal = tokio::time::timeout(Duration::from_secs(1), stream.next())
-            .await
-            .expect("the third prepare must expire at the first recovery deadline");
-        let Err(error) = terminal else {
-            panic!("the expired replacement must retain the originating failure");
-        };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
-        assert_eq!(
-            error.to_string(),
-            "injected pre-visibility infrastructure failure"
-        );
-        assert_eq!(exits.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            runs.load(Ordering::SeqCst),
-            2,
-            "expired third prepare cannot activate"
-        );
-        drop(stream);
-        root.business.release();
-        // shutdown_until converts the supplied std Instant back into Tokio
-        // time. Use the advanced clock so this is a future deadline, rather
-        // than the wall clock's already-past instant in this paused test.
-        let shutdown_deadline = tokio::time::Instant::now().into_std() + Duration::from_secs(1);
-        let shutdown = supervisor.shutdown_until(shutdown_deadline).await;
-        let Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)) = shutdown else {
-            panic!("the preparation budget failure must survive owned shutdown: {shutdown:?}");
-        };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
-        assert_eq!(
-            error.message(),
-            "Native replacement preparation exceeded its recovery budget"
-        );
-        assert_recovery_preparation_budget_input(&error);
         acknowledge_all_control(&control);
-        scope.wait_released().await;
-        assert_eq!(convergences.load(Ordering::SeqCst), 2);
+        control.finish().await;
     }
 
     #[tokio::test]
@@ -5618,251 +6349,296 @@ mod tests {
 
     #[tokio::test]
     async fn recoverable_pre_visibility_failure_activates_a_rows_replacement() {
-        let prepares = Arc::new(AtomicU64::new(0));
-        let runs = Arc::new(AtomicU64::new(0));
-        let convergences = Arc::new(AtomicU64::new(0));
-        let allow_initial_convergence = Arc::new(tokio::sync::Notify::new());
-        let attempts = RecoveringRowsPreparationPort {
-            relay_window: None,
-            backends: fixture_recovery_backends(2),
-            prepares: Arc::clone(&prepares),
-            runs: Arc::clone(&runs),
-            convergences: Arc::clone(&convergences),
-            allow_initial_convergence: Arc::clone(&allow_initial_convergence),
-            block_initial_convergence: true,
-            replacement_missing_rows: false,
-            failures_before_success: 1,
-        };
-        let replacements = Arc::new(ImmediateReplacementPort::default());
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(BindingNativePort),
-            QueryProcessNamespace::new(0x54),
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
-        let mut handle = client
-            .start(
-                rows_request(
-                    &control,
-                    &scope,
-                    RecoveryMode::RestartAttemptBeforeVisibility,
-                    Some(replacements),
-                    attempts,
-                ),
-                root.owner,
-            )
-            .await
-            .unwrap();
-        let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
-            panic!("recoverable Rows execution must keep one result consumer");
-        };
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while runs.load(Ordering::SeqCst) < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("successor activation must not wait for old attempt convergence");
-        assert_eq!(prepares.load(Ordering::SeqCst), 2);
-        assert_eq!(runs.load(Ordering::SeqCst), 2);
-        assert_eq!(convergences.load(Ordering::SeqCst), 0);
-        stream
-            .begin_schema()
-            .expect("replacement Rows execution must retain the frozen schema")
-            .complete();
-        let crate::api::ResultDelivery::Segment(delivery) =
-            tokio::time::timeout(Duration::from_secs(1), stream.next())
+        let mut control = {
+            let prepares = Arc::new(AtomicU64::new(0));
+            let runs = Arc::new(AtomicU64::new(0));
+            let convergences = Arc::new(AtomicU64::new(0));
+            let allow_initial_convergence = Arc::new(tokio::sync::Notify::new());
+            let attempts = RecoveringRowsPreparationPort {
+                relay_window: None,
+                backends: fixture_recovery_backends(2),
+                prepares: Arc::clone(&prepares),
+                runs: Arc::clone(&runs),
+                convergences: Arc::clone(&convergences),
+                allow_initial_convergence: Arc::clone(&allow_initial_convergence),
+                block_initial_convergence: true,
+                replacement_missing_rows: false,
+                failures_before_success: 1,
+            };
+            let replacements = Arc::new(ImmediateReplacementPort::default());
+            let (control, root) = governance().await;
+            let scope = root.owner.scope();
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(0x54),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
+            let mut handle = client
+                .start(
+                    rows_request(
+                        &control,
+                        &scope,
+                        RecoveryMode::RestartAttemptBeforeVisibility,
+                        Some(replacements),
+                        attempts,
+                    ),
+                    root.owner,
+                )
                 .await
-                .expect("replacement must deliver while old convergence is blocked")
-                .unwrap()
-                .unwrap()
-        else {
-            panic!("replacement must deliver a result batch");
+                .unwrap();
+            let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
+                panic!("recoverable Rows execution must keep one result consumer");
+            };
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while runs.load(Ordering::SeqCst) < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("successor activation must not wait for old attempt convergence");
+            assert_eq!(prepares.load(Ordering::SeqCst), 2);
+            assert_eq!(runs.load(Ordering::SeqCst), 2);
+            assert_eq!(convergences.load(Ordering::SeqCst), 0);
+            stream
+                .begin_schema()
+                .expect("replacement Rows execution must retain the frozen schema")
+                .complete();
+            let crate::api::ResultDelivery::Segment(delivery) =
+                tokio::time::timeout(Duration::from_secs(1), stream.next())
+                    .await
+                    .expect("replacement must deliver while old convergence is blocked")
+                    .unwrap()
+                    .unwrap()
+            else {
+                panic!("replacement must deliver a result batch");
+            };
+            delivery.complete();
+            assert_eq!(convergences.load(Ordering::SeqCst), 0);
+            allow_initial_convergence.notify_one();
+            handle.request_cancel().unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("replacement cancellation must terminate the result stream");
+            drop(stream);
+            root.business.release();
+            supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            acknowledge_all_control(&control);
+            drop(handle);
+            scope.wait_released().await;
+            assert_eq!(convergences.load(Ordering::SeqCst), 2);
+
+            control
         };
-        delivery.complete();
-        assert_eq!(convergences.load(Ordering::SeqCst), 0);
-        allow_initial_convergence.notify_one();
-        handle.request_cancel().unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(1), stream.next())
-            .await
-            .expect("replacement cancellation must terminate the result stream");
-        drop(stream);
-        root.business.release();
-        supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
         acknowledge_all_control(&control);
-        scope.wait_released().await;
-        assert_eq!(convergences.load(Ordering::SeqCst), 2);
+        control.finish().await;
     }
 
     #[tokio::test]
     async fn shutdown_finishes_remote_tracking_for_a_lost_residual_attempt() {
-        let prepares = Arc::new(AtomicU64::new(0));
-        let runs = Arc::new(AtomicU64::new(0));
-        let convergences = Arc::new(AtomicU64::new(0));
-        let allow_initial_convergence = Arc::new(tokio::sync::Notify::new());
-        let attempts = RecoveringRowsPreparationPort {
-            relay_window: None,
-            backends: fixture_recovery_backends(2),
-            prepares,
-            runs: Arc::clone(&runs),
-            convergences: Arc::clone(&convergences),
-            allow_initial_convergence: Arc::clone(&allow_initial_convergence),
-            block_initial_convergence: true,
-            replacement_missing_rows: false,
-            failures_before_success: 1,
-        };
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(BindingNativePort),
-            QueryProcessNamespace::new(0x55),
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
-        let mut handle = client
-            .start(
-                rows_request(
-                    &control,
-                    &scope,
-                    RecoveryMode::RestartAttemptBeforeVisibility,
-                    Some(Arc::new(ImmediateReplacementPort::default())),
-                    attempts,
-                ),
-                root.owner,
-            )
-            .await
-            .unwrap();
-        let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
-            panic!("recoverable Rows execution must keep one result consumer");
-        };
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while runs.load(Ordering::SeqCst) < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("successor activation must not wait for the lost residual attempt");
-        stream.begin_schema().unwrap().complete();
-        let crate::api::ResultDelivery::Segment(delivery) =
-            tokio::time::timeout(Duration::from_secs(1), stream.next())
+        let mut control = {
+            let prepares = Arc::new(AtomicU64::new(0));
+            let runs = Arc::new(AtomicU64::new(0));
+            let convergences = Arc::new(AtomicU64::new(0));
+            let allow_initial_convergence = Arc::new(tokio::sync::Notify::new());
+            let attempts = RecoveringRowsPreparationPort {
+                relay_window: None,
+                backends: fixture_recovery_backends(2),
+                prepares,
+                runs: Arc::clone(&runs),
+                convergences: Arc::clone(&convergences),
+                allow_initial_convergence: Arc::clone(&allow_initial_convergence),
+                block_initial_convergence: true,
+                replacement_missing_rows: false,
+                failures_before_success: 1,
+            };
+            let (control, root) = governance().await;
+            let scope = root.owner.scope();
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(0x55),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
+            let mut handle = client
+                .start(
+                    rows_request(
+                        &control,
+                        &scope,
+                        RecoveryMode::RestartAttemptBeforeVisibility,
+                        Some(Arc::new(ImmediateReplacementPort::default())),
+                        attempts,
+                    ),
+                    root.owner,
+                )
                 .await
-                .expect("successor result must remain available")
-                .unwrap()
-                .unwrap()
-        else {
-            panic!("successor must deliver a result batch");
-        };
-        delivery.complete();
-
-        handle.request_cancel().unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(1), stream.next())
-            .await
-            .expect("successor cancellation must terminate the result stream");
-        drop(stream);
-        root.business.release();
-
-        supervisor
-            .shutdown_until(Instant::now() + Duration::from_millis(10))
-            .await
-            .expect("shutdown must end FE tracking without waiting for a lost residual attempt");
-        assert_eq!(convergences.load(Ordering::SeqCst), 1);
-        drop(supervisor);
-
-        // A later worker fact cannot revive the retired FE observation.
-        allow_initial_convergence.notify_one();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                acknowledge_all_control(&control);
-                tokio::select! {
-                    () = scope.wait_released() => break,
-                    () = tokio::time::sleep(Duration::from_millis(1)) => {}
+                .unwrap();
+            let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
+                panic!("recoverable Rows execution must keep one result consumer");
+            };
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while runs.load(Ordering::SeqCst) < 2 {
+                    tokio::task::yield_now().await;
                 }
-            }
-        })
-        .await
-        .expect("detached logical work must release after the late residual fact");
+            })
+            .await
+            .expect("successor activation must not wait for the lost residual attempt");
+            stream.begin_schema().unwrap().complete();
+            let crate::api::ResultDelivery::Segment(delivery) =
+                tokio::time::timeout(Duration::from_secs(1), stream.next())
+                    .await
+                    .expect("successor result must remain available")
+                    .unwrap()
+                    .unwrap()
+            else {
+                panic!("successor must deliver a result batch");
+            };
+            delivery.complete();
+
+            handle.request_cancel().unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("successor cancellation must terminate the result stream");
+            drop(stream);
+            root.business.release();
+
+            supervisor
+                .shutdown_until(Instant::now() + Duration::from_millis(10))
+                .await
+                .expect(
+                    "shutdown must end FE tracking without waiting for a lost residual attempt",
+                );
+            assert_eq!(convergences.load(Ordering::SeqCst), 1);
+            drop(supervisor);
+
+            // A later worker fact cannot revive the retired FE observation.
+            allow_initial_convergence.notify_one();
+            // The convenience handle still owns the original exit observer
+            // and its completion footer until this actual last use finishes.
+            drop(handle);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    acknowledge_all_control(&control);
+                    tokio::select! {
+                        () = scope.wait_released() => break,
+                        () = tokio::time::sleep(Duration::from_millis(1)) => {}
+                    }
+                }
+            })
+            .await
+            .expect("detached logical work must release after the late residual fact");
+
+            control
+        };
+        acknowledge_all_control(&control);
+        control.finish().await;
     }
 
     #[tokio::test]
     async fn replacement_activation_rejects_a_missing_rows_runtime() {
-        let prepares = Arc::new(AtomicU64::new(0));
-        let runs = Arc::new(AtomicU64::new(0));
-        let convergences = Arc::new(AtomicU64::new(0));
-        let attempts = RecoveringRowsPreparationPort {
-            relay_window: None,
-            backends: fixture_recovery_backends(2),
-            prepares: Arc::clone(&prepares),
-            runs,
-            convergences: Arc::clone(&convergences),
-            allow_initial_convergence: Arc::new(tokio::sync::Notify::new()),
-            block_initial_convergence: false,
-            replacement_missing_rows: true,
-            failures_before_success: 1,
-        };
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(BindingNativePort),
-            QueryProcessNamespace::new(0x55),
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
-        let mut handle = client
-            .start(
-                rows_request(
-                    &control,
-                    &scope,
-                    RecoveryMode::RestartAttemptBeforeVisibility,
-                    Some(Arc::new(ImmediateReplacementPort::default())),
-                    attempts,
-                ),
-                root.owner,
-            )
+        let mut control = {
+            let prepares = Arc::new(AtomicU64::new(0));
+            let runs = Arc::new(AtomicU64::new(0));
+            let convergences = Arc::new(AtomicU64::new(0));
+            let attempts = RecoveringRowsPreparationPort {
+                relay_window: None,
+                backends: fixture_recovery_backends(2),
+                prepares: Arc::clone(&prepares),
+                runs,
+                convergences: Arc::clone(&convergences),
+                allow_initial_convergence: Arc::new(tokio::sync::Notify::new()),
+                block_initial_convergence: false,
+                replacement_missing_rows: true,
+                failures_before_success: 1,
+            };
+            let (control, root) = governance().await;
+            let scope = root.owner.scope();
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(0x55),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
+            let mut handle = client
+                .start(
+                    rows_request(
+                        &control,
+                        &scope,
+                        RecoveryMode::RestartAttemptBeforeVisibility,
+                        Some(Arc::new(ImmediateReplacementPort::default())),
+                        attempts,
+                    ),
+                    root.owner,
+                )
+                .await
+                .unwrap();
+            let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
+                panic!("recoverable Rows execution must keep one result consumer");
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            // Reading before schema delivery is a separate local protocol
+            // refusal. Keep the first attempt invisible until this SAME
+            // replacement actually reaches preparation, then observe its
+            // real missing-runtime failure through the valid reader API.
+            tokio::time::timeout_at(deadline, async {
+                while prepares.load(Ordering::SeqCst) < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
-            .unwrap();
-        let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
-            panic!("recoverable Rows execution must keep one result consumer");
+            .expect("the original failed attempt must prepare its replacement");
+            stream.begin_schema().unwrap().complete();
+            let Err(error) = tokio::time::timeout_at(deadline, stream.next())
+                .await
+                .expect("invalid replacement runtime must terminate the stream")
+            else {
+                panic!("invalid replacement runtime must fail the stream");
+            };
+            assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+            let input = error
+                .execution_failure()
+                .expect("the output guard authors an execution contract fact");
+            assert_eq!(
+                input.fact(),
+                QueryFailureReason::ResultProtocol.failure_fact()
+            );
+            assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+            assert_eq!(
+                input.user_error().phase(),
+                novarocks_user_error::ErrorPhase::Execution
+            );
+            assert_eq!(input.user_error().location(), None);
+            assert_eq!(
+                prepares.load(Ordering::SeqCst),
+                2,
+                "actual output failure: {error:?}"
+            );
+            drop(stream);
+            root.business.release();
+            assert!(matches!(
+                supervisor
+                    .shutdown_until(Instant::now() + Duration::from_secs(1))
+                    .await,
+                Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(_))
+            ));
+            acknowledge_all_control(&control);
+            drop(handle);
+            scope.wait_released().await;
+            assert_eq!(convergences.load(Ordering::SeqCst), 2);
+
+            control
         };
-        let Err(error) = tokio::time::timeout(Duration::from_secs(1), stream.next())
-            .await
-            .expect("invalid replacement runtime must terminate the stream")
-        else {
-            panic!("invalid replacement runtime must fail the stream");
-        };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
-        let input = error
-            .execution_failure()
-            .expect("the output guard authors an execution contract fact");
-        assert_eq!(
-            input.fact(),
-            QueryFailureReason::ResultProtocol.failure_fact()
-        );
-        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
-        assert_eq!(
-            input.user_error().phase(),
-            novarocks_user_error::ErrorPhase::Execution
-        );
-        assert_eq!(input.user_error().location(), None);
-        assert_eq!(prepares.load(Ordering::SeqCst), 2);
-        drop(stream);
-        root.business.release();
-        assert!(matches!(
-            supervisor
-                .shutdown_until(Instant::now() + Duration::from_secs(1))
-                .await,
-            Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(_))
-        ));
         acknowledge_all_control(&control);
-        scope.wait_released().await;
-        assert_eq!(convergences.load(Ordering::SeqCst), 2);
+        control.finish().await;
     }
 
     #[derive(Debug)]
@@ -6007,65 +6783,74 @@ mod tests {
 
     #[tokio::test]
     async fn visible_rows_failure_does_not_prepare_a_replacement() {
-        let prepares = Arc::new(AtomicU64::new(0));
-        let fail = Arc::new(tokio::sync::Notify::new());
-        let attempts = VisibleFailurePreparationPort {
-            relay_window: None,
-            backend: BackendProcessId::new_v7(),
-            prepares: Arc::clone(&prepares),
-            fail: Arc::clone(&fail),
+        let mut control = {
+            let prepares = Arc::new(AtomicU64::new(0));
+            let fail = Arc::new(tokio::sync::Notify::new());
+            let attempts = VisibleFailurePreparationPort {
+                relay_window: None,
+                backend: BackendProcessId::new_v7(),
+                prepares: Arc::clone(&prepares),
+                fail: Arc::clone(&fail),
+            };
+            let (control, root) = governance().await;
+            let scope = root.owner.scope();
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(0x56),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
+            let mut handle = client
+                .start(
+                    rows_request(
+                        &control,
+                        &scope,
+                        RecoveryMode::RestartAttemptBeforeVisibility,
+                        Some(Arc::new(ImmediateReplacementPort::default())),
+                        attempts,
+                    ),
+                    root.owner,
+                )
+                .await
+                .unwrap();
+            let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
+                panic!("Rows execution must return one result stream");
+            };
+            stream
+                .begin_schema()
+                .expect("Rows execution must begin with its frozen result schema")
+                .complete();
+            let crate::api::ResultDelivery::Segment(delivery) =
+                stream.next().await.unwrap().unwrap()
+            else {
+                panic!("the first delivery must be a result batch");
+            };
+            delivery.complete();
+            fail.notify_one();
+            let Err(error) = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("visible failure must terminate the stream")
+            else {
+                panic!("visible failure must be caller-visible");
+            };
+            assert_eq!(error.message(), "injected failure after visible output");
+            assert_eq!(prepares.load(Ordering::SeqCst), 1);
+            drop(stream);
+            root.business.release();
+            supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            acknowledge_all_control(&control);
+            drop(handle);
+            scope.wait_released().await;
+
+            control
         };
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(BindingNativePort),
-            QueryProcessNamespace::new(0x56),
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
-        let mut handle = client
-            .start(
-                rows_request(
-                    &control,
-                    &scope,
-                    RecoveryMode::RestartAttemptBeforeVisibility,
-                    Some(Arc::new(ImmediateReplacementPort::default())),
-                    attempts,
-                ),
-                root.owner,
-            )
-            .await
-            .unwrap();
-        let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
-            panic!("Rows execution must return one result stream");
-        };
-        stream
-            .begin_schema()
-            .expect("Rows execution must begin with its frozen result schema")
-            .complete();
-        let crate::api::ResultDelivery::Segment(delivery) = stream.next().await.unwrap().unwrap()
-        else {
-            panic!("the first delivery must be a result batch");
-        };
-        delivery.complete();
-        fail.notify_one();
-        let Err(error) = tokio::time::timeout(Duration::from_secs(1), stream.next())
-            .await
-            .expect("visible failure must terminate the stream")
-        else {
-            panic!("visible failure must be caller-visible");
-        };
-        assert_eq!(error.message(), "injected failure after visible output");
-        assert_eq!(prepares.load(Ordering::SeqCst), 1);
-        drop(stream);
-        root.business.release();
-        supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
         acknowledge_all_control(&control);
-        scope.wait_released().await;
+        control.finish().await;
     }
 
     #[derive(Debug)]
@@ -6188,48 +6973,56 @@ mod tests {
         namespace: u64,
         expected_message: &'static str,
     ) {
-        let convergence_calls = Arc::new(AtomicU64::new(0));
-        let attempts = PanickingAttemptPreparationPort {
-            backend: BackendProcessId::new_v7(),
-            phase,
-            convergence_calls: Arc::clone(&convergence_calls),
-        };
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(BindingNativePort),
-            QueryProcessNamespace::new(namespace),
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
-        let (control, root) = governance();
-        let scope = root.owner.scope();
+        let mut control = {
+            let convergence_calls = Arc::new(AtomicU64::new(0));
+            let attempts = PanickingAttemptPreparationPort {
+                backend: BackendProcessId::new_v7(),
+                phase,
+                convergence_calls: Arc::clone(&convergence_calls),
+            };
+            let (control, root) = governance().await;
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(namespace),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
 
-        let error = match client.start(completion_request(attempts), root.owner).await {
-            Ok(_) => panic!("a panicking Native attempt must not return an execution handle"),
-            Err(error) => error,
+            let scope = root.owner.scope();
+
+            let error = match client.start(completion_request(attempts), root.owner).await {
+                Ok(_) => panic!("a panicking Native attempt must not return an execution handle"),
+                Err(error) => error,
+            };
+            assert_eq!(error.message(), expected_message);
+            let input = error
+                .execution_failure()
+                .expect("real Native future panic retains its input");
+            assert_eq!(
+                input.fact(),
+                QueryFailureReason::NativeFuturePanicked.failure_fact()
+            );
+            assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+            assert_eq!(input.attempt_class(), AttemptFailureClass::ExecutionFailure);
+            root.business.release();
+            let shutdown = supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await;
+            assert!(matches!(
+                shutdown,
+                Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(_))
+            ));
+            assert_eq!(convergence_calls.load(Ordering::SeqCst), 1);
+            acknowledge_all_control(&control);
+            scope.wait_released().await;
+            assert_eq!(control.snapshot().root_responsibilities, 0);
+
+            control
         };
-        assert_eq!(error.message(), expected_message);
-        let input = error
-            .execution_failure()
-            .expect("real Native future panic retains its input");
-        assert_eq!(
-            input.fact(),
-            QueryFailureReason::NativeFuturePanicked.failure_fact()
-        );
-        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
-        assert_eq!(input.attempt_class(), AttemptFailureClass::ExecutionFailure);
-        root.business.release();
-        let shutdown = supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await;
-        assert!(matches!(
-            shutdown,
-            Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(_))
-        ));
-        assert_eq!(convergence_calls.load(Ordering::SeqCst), 1);
         acknowledge_all_control(&control);
-        scope.wait_released().await;
-        assert_eq!(control.snapshot().root_responsibilities, 0);
+        control.finish().await;
     }
 
     #[tokio::test]
@@ -6250,114 +7043,132 @@ mod tests {
 
     #[tokio::test]
     async fn rows_activation_rejects_a_missing_root_result_runtime() {
-        let convergence_calls = Arc::new(AtomicU64::new(0));
-        let attempts = PanickingAttemptPreparationPort {
-            backend: BackendProcessId::new_v7(),
-            phase: AttemptPanicPhase::Run,
-            convergence_calls: Arc::clone(&convergence_calls),
-        };
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(BindingNativePort),
-            QueryProcessNamespace::new(0x53),
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
+        let mut control = {
+            let convergence_calls = Arc::new(AtomicU64::new(0));
+            let attempts = PanickingAttemptPreparationPort {
+                backend: BackendProcessId::new_v7(),
+                phase: AttemptPanicPhase::Run,
+                convergence_calls: Arc::clone(&convergence_calls),
+            };
+            let (control, root) = governance().await;
+            let scope = root.owner.scope();
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(0x53),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
 
-        let error = match client
-            .start(
-                rows_request(&control, &scope, RecoveryMode::NoRecovery, None, attempts),
-                root.owner,
-            )
-            .await
-        {
-            Ok(_) => panic!("Rows activation must transfer its exact pump runtime"),
-            Err(error) => error,
+            let error = match client
+                .start(
+                    rows_request(&control, &scope, RecoveryMode::NoRecovery, None, attempts),
+                    root.owner,
+                )
+                .await
+            {
+                Ok(_) => panic!("Rows activation must transfer its exact pump runtime"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                QueryExecutionErrorKind::Failed,
+                "actual output failure: {error:?}"
+            );
+            let input = error
+                .execution_failure()
+                .expect("the output guard authors an execution contract fact");
+            assert_eq!(
+                input.fact(),
+                QueryFailureReason::ResultProtocol.failure_fact()
+            );
+            assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+            assert_eq!(
+                input.user_error().phase(),
+                novarocks_user_error::ErrorPhase::Execution
+            );
+            assert_eq!(input.user_error().location(), None);
+            assert_eq!(
+                error.message(),
+                "Native activated a row execution without its root result runtime"
+            );
+            root.business.release();
+            assert!(matches!(
+                supervisor
+                    .shutdown_until(Instant::now() + Duration::from_secs(1))
+                    .await,
+                Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(_))
+            ));
+            acknowledge_all_control(&control);
+            scope.wait_released().await;
+            assert_eq!(convergence_calls.load(Ordering::SeqCst), 1);
+
+            control
         };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
-        let input = error
-            .execution_failure()
-            .expect("the output guard authors an execution contract fact");
-        assert_eq!(
-            input.fact(),
-            QueryFailureReason::ResultProtocol.failure_fact()
-        );
-        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
-        assert_eq!(
-            input.user_error().phase(),
-            novarocks_user_error::ErrorPhase::Execution
-        );
-        assert_eq!(input.user_error().location(), None);
-        assert_eq!(
-            error.message(),
-            "Native activated a row execution without its root result runtime"
-        );
-        root.business.release();
-        assert!(matches!(
-            supervisor
-                .shutdown_until(Instant::now() + Duration::from_secs(1))
-                .await,
-            Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(_))
-        ));
         acknowledge_all_control(&control);
-        scope.wait_released().await;
-        assert_eq!(convergence_calls.load(Ordering::SeqCst), 1);
+        control.finish().await;
     }
 
     #[tokio::test]
     async fn convergence_poll_panic_retains_same_owner_and_health_until_process_exit() {
-        let convergence_calls = Arc::new(AtomicU64::new(0));
-        let attempts = PanickingAttemptPreparationPort {
-            backend: BackendProcessId::new_v7(),
-            phase: AttemptPanicPhase::Converge,
-            convergence_calls: Arc::clone(&convergence_calls),
-        };
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(BindingNativePort),
-            QueryProcessNamespace::new(0x50),
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
-        let (control, root) = governance();
-        let scope = root.owner.scope();
+        let mut control = {
+            let convergence_calls = Arc::new(AtomicU64::new(0));
+            let attempts = PanickingAttemptPreparationPort {
+                backend: BackendProcessId::new_v7(),
+                phase: AttemptPanicPhase::Converge,
+                convergence_calls: Arc::clone(&convergence_calls),
+            };
+            let (control, root) = governance().await;
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(0x50),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
 
-        let error = match client.start(completion_request(attempts), root.owner).await {
-            Ok(_) => panic!("a failed Native attempt must not return an execution handle"),
-            Err(error) => error,
+            let scope = root.owner.scope();
+
+            let error = match client.start(completion_request(attempts), root.owner).await {
+                Ok(_) => panic!("a failed Native attempt must not return an execution handle"),
+                Err(error) => error,
+            };
+            assert_eq!(error.message(), "injected Native attempt failure");
+            let input = error
+                .execution_failure()
+                .expect("original injected failure is preserved");
+            assert_eq!(
+                input.fact(),
+                FixtureFailureReason::InjectedExecution.failure_fact()
+            );
+            assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+            assert_eq!(input.attempt_class(), AttemptFailureClass::ExecutionFailure);
+            root.business.release();
+            let shutdown = supervisor
+                .shutdown_until(Instant::now() + Duration::from_millis(10))
+                .await;
+            assert!(matches!(
+                shutdown,
+                Err(LogicalExecutionSupervisorShutdownError::StatementNativeUnresolved(_))
+            ));
+            assert_eq!(
+                convergence_calls.load(Ordering::SeqCst),
+                1,
+                "unproven convergence is never re-polled into fabricated closure"
+            );
+            assert_eq!(supervisor.registry.active_native_custody_count(), 1);
+            assert_eq!(control.snapshot().root_responsibilities, 1);
+            assert!(
+                scope.cancellation().is_ok(),
+                "original actor scope remains present before actual exit"
+            );
+            supervisor.abandon_for_process_exit();
+
+            control
         };
-        assert_eq!(error.message(), "injected Native attempt failure");
-        let input = error
-            .execution_failure()
-            .expect("original injected failure is preserved");
-        assert_eq!(
-            input.fact(),
-            FixtureFailureReason::InjectedExecution.failure_fact()
-        );
-        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
-        assert_eq!(input.attempt_class(), AttemptFailureClass::ExecutionFailure);
-        root.business.release();
-        let shutdown = supervisor
-            .shutdown_until(Instant::now() + Duration::from_millis(10))
-            .await;
-        assert!(matches!(
-            shutdown,
-            Err(LogicalExecutionSupervisorShutdownError::StatementNativeUnresolved(_))
-        ));
-        assert_eq!(
-            convergence_calls.load(Ordering::SeqCst),
-            1,
-            "unproven convergence is never re-polled into fabricated closure"
-        );
-        assert_eq!(supervisor.registry.active_native_custody_count(), 1);
-        assert_eq!(control.snapshot().root_responsibilities, 1);
-        assert!(
-            scope.cancellation().is_ok(),
-            "original actor scope remains present before actual exit"
-        );
-        supervisor.abandon_for_process_exit();
+        control.finish_for_process_exit().await;
     }
 
     #[derive(Debug)]
@@ -6514,77 +7325,86 @@ mod tests {
             CancellationReason::Requested,
             CancellationReason::DeadlineExceeded,
         ] {
-            let frontend = FrontendProcessId::new_v7();
-            let signals = Arc::new(ActivationCancellationSignals::default());
-            let (control, root) = governance();
-            let scope = root.owner.scope();
-            let requester = root.owner.cancellation_requester();
-            let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-                Handle::current(),
-                Arc::new(BindingNativePort),
-                QueryProcessNamespace::new(0x771),
-                frontend,
-                supervisor_config(),
-            );
-            let start = client.start(
-                completion_request(ActivationCancellationPreparationPort {
-                    backend: BackendProcessId::new_v7(),
+            let mut control = {
+                let frontend = FrontendProcessId::new_v7();
+                let signals = Arc::new(ActivationCancellationSignals::default());
+                let (control, root) = governance().await;
+                let scope = root.owner.scope();
+                let requester = root.owner.cancellation_requester();
+                let (mut supervisor, client) = test_supervisor(
+                    &control,
+                    Handle::current(),
+                    Arc::new(BindingNativePort),
+                    QueryProcessNamespace::new(0x771),
                     frontend,
-                    signals: Arc::clone(&signals),
-                }),
-                root.owner,
-            );
-            wait_preparation_exit_fact(&signals.entered).await.unwrap();
-            requester.request(reason.clone()).unwrap();
-            let error = match start.await {
-                Ok(_) => panic!("cancelled start cannot become success"),
-                Err(error) => error,
-            };
-            assert_eq!(
-                error.kind(),
-                if matches!(reason, CancellationReason::DeadlineExceeded) {
-                    QueryExecutionErrorKind::DeadlineExceeded
-                } else {
-                    QueryExecutionErrorKind::Cancelled
-                }
-            );
-            signals.release_activation.notify_one();
-            wait_preparation_exit_fact(&signals.convergence_entered)
-                .await
-                .unwrap();
-            assert!(!signals.converged.load(Ordering::SeqCst));
-            assert_ne!(control.snapshot().root_responsibilities, 0);
-            // A terminal query does not poison the process or block a sibling start.
-            let (sibling_control, sibling) = governance();
-            let sibling_scope = sibling.owner.scope();
-            let mut sibling_handle = client
-                .start(
-                    completion_request(SuccessfulCompletionPreparationPort {
+                    supervisor_config(),
+                );
+                let start = client.start(
+                    completion_request(ActivationCancellationPreparationPort {
                         backend: BackendProcessId::new_v7(),
-                        expected_frontend: frontend,
+                        frontend,
+                        signals: Arc::clone(&signals),
                     }),
-                    sibling.owner,
-                )
-                .await
-                .unwrap();
-            assert!(matches!(
-                sibling_handle.take_output(),
-                Some(crate::api::ExecutionOutput::Completion)
-            ));
-            sibling.business.release();
-            signals.release_convergence.notify_one();
-            wait_preparation_exit_fact(&signals.converged)
-                .await
-                .unwrap();
-            root.business.release();
-            supervisor
-                .shutdown_until(Instant::now() + Duration::from_secs(2))
-                .await
-                .unwrap();
+                    root.owner,
+                );
+                wait_preparation_exit_fact(&signals.entered).await.unwrap();
+                requester.request(reason.clone()).unwrap();
+                let error = match start.await {
+                    Ok(_) => panic!("cancelled start cannot become success"),
+                    Err(error) => error,
+                };
+                assert_eq!(
+                    error.kind(),
+                    if matches!(reason, CancellationReason::DeadlineExceeded) {
+                        QueryExecutionErrorKind::DeadlineExceeded
+                    } else {
+                        QueryExecutionErrorKind::Cancelled
+                    }
+                );
+                signals.release_activation.notify_one();
+                wait_preparation_exit_fact(&signals.convergence_entered)
+                    .await
+                    .unwrap();
+                assert!(!signals.converged.load(Ordering::SeqCst));
+                assert_ne!(control.snapshot().root_responsibilities, 0);
+                // A terminal query does not poison the process or block a sibling start.
+                let sibling_control = &control;
+                let sibling = control.begin_root().await;
+                let sibling_scope = sibling.owner.scope();
+                let mut sibling_handle = client
+                    .start(
+                        completion_request(SuccessfulCompletionPreparationPort {
+                            backend: BackendProcessId::new_v7(),
+                            expected_frontend: frontend,
+                        }),
+                        sibling.owner,
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    sibling_handle.take_output(),
+                    Some(crate::api::ExecutionOutput::Completion)
+                ));
+                sibling.business.release();
+                signals.release_convergence.notify_one();
+                wait_preparation_exit_fact(&signals.converged)
+                    .await
+                    .unwrap();
+                root.business.release();
+                supervisor
+                    .shutdown_until(Instant::now() + Duration::from_secs(2))
+                    .await
+                    .unwrap();
+                acknowledge_all_control(&control);
+                acknowledge_all_control(&sibling_control);
+                drop(sibling_handle);
+                scope.wait_released().await;
+                sibling_scope.wait_released().await;
+
+                control
+            };
             acknowledge_all_control(&control);
-            acknowledge_all_control(&sibling_control);
-            scope.wait_released().await;
-            sibling_scope.wait_released().await;
+            control.finish().await;
         }
     }
 
@@ -6745,35 +7565,44 @@ mod tests {
 
     #[tokio::test]
     async fn completion_becomes_visible_only_after_exact_establish_success() {
-        let frontend = FrontendProcessId::new_v7();
-        let attempts = SuccessfulCompletionPreparationPort {
-            backend: BackendProcessId::new_v7(),
-            expected_frontend: frontend,
+        let mut control = {
+            let frontend = FrontendProcessId::new_v7();
+            let attempts = SuccessfulCompletionPreparationPort {
+                backend: BackendProcessId::new_v7(),
+                expected_frontend: frontend,
+            };
+            let (control, root) = governance().await;
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(0x50),
+                frontend,
+                supervisor_config(),
+            );
+
+            let scope = root.owner.scope();
+            let mut handle = client
+                .start(completion_request(attempts), root.owner)
+                .await
+                .expect("exact Establish success permits completion visibility");
+            assert!(matches!(
+                handle.take_output(),
+                Some(crate::api::ExecutionOutput::Completion)
+            ));
+            root.business.release();
+            supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            acknowledge_all_control(&control);
+            drop(handle);
+            scope.wait_released().await;
+
+            control
         };
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(BindingNativePort),
-            QueryProcessNamespace::new(0x50),
-            frontend,
-            supervisor_config(),
-        );
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        let mut handle = client
-            .start(completion_request(attempts), root.owner)
-            .await
-            .expect("exact Establish success permits completion visibility");
-        assert!(matches!(
-            handle.take_output(),
-            Some(crate::api::ExecutionOutput::Completion)
-        ));
-        root.business.release();
-        supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
         acknowledge_all_control(&control);
-        scope.wait_released().await;
+        control.finish().await;
     }
 
     #[derive(Debug)]
@@ -6853,136 +7682,134 @@ mod tests {
 
     #[tokio::test]
     async fn completion_is_not_visible_without_exact_establish_success() {
-        let attempts = PrematureCompletionPreparationPort {
-            backend: BackendProcessId::new_v7(),
+        let mut control = {
+            let attempts = PrematureCompletionPreparationPort {
+                backend: BackendProcessId::new_v7(),
+            };
+            let (control, root) = governance().await;
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(0x4a),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
+
+            let scope = root.owner.scope();
+            let error = match client.start(completion_request(attempts), root.owner).await {
+                Ok(_) => panic!("Native completion without Establish proof must fail closed"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+            root.business.release();
+            let shutdown = supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await;
+            assert!(matches!(
+                shutdown,
+                Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(_))
+            ));
+            acknowledge_all_control(&control);
+            scope.wait_released().await;
+
+            control
         };
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(BindingNativePort),
-            QueryProcessNamespace::new(0x4a),
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        let error = match client.start(completion_request(attempts), root.owner).await {
-            Ok(_) => panic!("Native completion without Establish proof must fail closed"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
-        root.business.release();
-        let shutdown = supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await;
-        assert!(matches!(
-            shutdown,
-            Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(_))
-        ));
         acknowledge_all_control(&control);
-        scope.wait_released().await;
+        control.finish().await;
     }
 
     #[tokio::test]
     async fn start_handoff_has_no_second_capacity_and_closed_supervisor_rejects_work() {
-        let seed_drops = Arc::new(AtomicU64::new(0));
-        let (starts, mut start_rx) = mpsc::unbounded_channel();
-        let (_shutdown_sender, shutdown) = watch::channel(false);
-        let client = QueryExecutionClient::new(QueryExecutionDriverHandle {
-            starts,
-            shutdown,
-            query_ids: Arc::new(ProcessQueryIdAllocator::new(QueryProcessNamespace::new(
-                0x50,
-            ))),
-        });
-
-        let (first_control, first) = governance();
-        let first_scope = first.owner.scope();
-        let first_start = client.start(drop_tracked_request(&seed_drops), first.owner);
-        let (second_control, second) = governance();
-        let second_scope = second.owner.scope();
-        let second_cancellation = second_scope.cancellation().unwrap();
-        let second_start = client.start(drop_tracked_request(&seed_drops), second.owner);
-
-        let first_command = start_rx
-            .recv()
-            .await
-            .expect("first admitted query reaches the handoff");
-        let second_command = start_rx
-            .recv()
-            .await
-            .expect("second admitted query reaches the same unbounded handoff");
-        assert!(
-            second_control.next_control().is_none(),
-            "handoff must not manufacture cancellation work"
-        );
-        assert_eq!(second_cancellation.reason(), None);
-        assert!(
-            first_control.next_control().is_none(),
-            "handoff must not manufacture cancellation work"
-        );
-
-        let StartCommand {
-            request: first_request,
-            owner: first_owner,
-            reply: first_reply,
-            reserved: first_reserved,
-        } = first_command;
-        let StartCommand {
-            request: second_request,
-            owner: second_owner,
-            reply: second_reply,
-            reserved: second_reserved,
-        } = second_command;
-        assert!(first_reserved.is_none() && second_reserved.is_none());
-        first_owner.complete();
-        second_owner.complete();
-        let start_error = || {
-            QueryExecutionError::new(
-                QueryExecutionErrorKind::Rejected,
-                "injected supervisor handoff completion",
-            )
+        let control = governance_empty();
+        let mut control = {
+            let seed_drops = Arc::new(AtomicU64::new(0));
+            let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (mut bank, shutdown, mut registry, client) = unpolled_test_driver(
+                &control,
+                Arc::new(RecordingRejectedOpen {
+                    opened: Arc::clone(&opened),
+                }),
+            );
+            let first = control.begin_root().await;
+            let second = control.begin_root().await;
+            // Reserve this real owner before the bank's global closing cut.
+            let closed = control.begin_root().await;
+            let first_scope = first.owner.scope();
+            let second_scope = second.owner.scope();
+            let closed_scope = closed.owner.scope();
+            let second_cancellation = second_scope.cancellation().unwrap();
+            let closed_cancellation = closed_scope.cancellation().unwrap();
+            let first_start = client.start(drop_tracked_request(&seed_drops), first.owner);
+            let second_start = client.start(drop_tracked_request(&seed_drops), second.owner);
+            assert!(
+                control.next_control().is_none(),
+                "handoff must not manufacture cancellation work"
+            );
+            assert_eq!(second_cancellation.reason(), None);
+            assert!(
+                opened.lock().unwrap().is_empty(),
+                "queued ordinary starts do not consume identity or open Native before their factory"
+            );
+            assert_eq!(
+                seed_drops.load(Ordering::SeqCst),
+                0,
+                "original accepted requests remain in the actual fixed inputs"
+            );
+            shutdown.send_replace(true);
+            bank.stop_ingress();
+            // The original factory supplies the old accepted-but-not-started
+            // rejection; no manual extraction/completion of an owned Work.
+            for _ in 0..2 {
+                let completion = bank.progress_turn(NonZeroUsize::new(7).unwrap()).unwrap();
+                let (_source, completion) = completion.into_parts();
+                assert!(
+                    matches!(&completion, PollCompletion::Ready(output) if output.value().is_ok())
+                );
+                drop(completion);
+            }
+            let first_error = first_start
+                .await
+                .err()
+                .expect("injected handoff reply must fail");
+            let second_error = second_start
+                .await
+                .err()
+                .expect("injected handoff reply must fail");
+            assert_eq!(first_error.kind(), QueryExecutionErrorKind::Rejected);
+            assert_eq!(second_error.kind(), QueryExecutionErrorKind::Rejected);
+            assert_eq!(seed_drops.load(Ordering::SeqCst), 2);
+            assert!(
+                opened.lock().unwrap().is_empty(),
+                "shutdown drain has no Native effect"
+            );
+            first.business.release();
+            second.business.release();
+            first_scope.wait_released().await;
+            second_scope.wait_released().await;
+            let closed_error = client
+                .start(drop_tracked_request(&seed_drops), closed.owner)
+                .await
+                .err()
+                .expect("a closed supervisor must reject new work");
+            assert_eq!(closed_error.kind(), QueryExecutionErrorKind::Rejected);
+            assert!(
+                control.next_control().is_none(),
+                "closed admission rejection must not manufacture cancellation work"
+            );
+            assert_eq!(closed_cancellation.reason(), None);
+            assert_eq!(seed_drops.load(Ordering::SeqCst), 3);
+            closed.business.release();
+            closed_scope.wait_released().await;
+            drop(bank);
+            registry
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            control
         };
-        assert!(first_reply.send(Err(start_error())).is_ok());
-        assert!(second_reply.send(Err(start_error())).is_ok());
-        let first_error = match first_start.await {
-            Ok(_) => panic!("injected handoff reply must fail"),
-            Err(error) => error,
-        };
-        let second_error = match second_start.await {
-            Ok(_) => panic!("injected handoff reply must fail"),
-            Err(error) => error,
-        };
-        assert_eq!(first_error.kind(), QueryExecutionErrorKind::Rejected);
-        assert_eq!(second_error.kind(), QueryExecutionErrorKind::Rejected);
-        drop(first_request);
-        drop(second_request);
-        assert_eq!(seed_drops.load(Ordering::SeqCst), 2);
-
-        first.business.release();
-        second.business.release();
-        first_scope.wait_released().await;
-        second_scope.wait_released().await;
-
-        drop(start_rx);
-        let (closed_control, closed) = governance();
-        let closed_scope = closed.owner.scope();
-        let closed_cancellation = closed_scope.cancellation().unwrap();
-        let closed_error = match client
-            .start(drop_tracked_request(&seed_drops), closed.owner)
-            .await
-        {
-            Ok(_) => panic!("a closed supervisor must reject new work"),
-            Err(error) => error,
-        };
-        assert_eq!(closed_error.kind(), QueryExecutionErrorKind::Rejected);
-        assert!(
-            closed_control.next_control().is_none(),
-            "closed admission rejection must not manufacture cancellation work"
-        );
-        assert_eq!(closed_cancellation.reason(), None);
-        assert_eq!(seed_drops.load(Ordering::SeqCst), 3);
-        closed.business.release();
-        closed_scope.wait_released().await;
+        acknowledge_all_control(&control);
+        control.finish().await;
     }
 
     #[derive(Debug)]
@@ -7019,118 +7846,148 @@ mod tests {
 
     #[tokio::test]
     async fn one_logical_task_panic_does_not_cancel_or_stop_another_execution() {
-        let frontend = FrontendProcessId::new_v7();
-        let first_opened = Arc::new(AtomicBool::new(false));
-        let second_opened = Arc::new(AtomicBool::new(false));
-        let second_gate = Arc::new(tokio::sync::Notify::new());
-        let native = Arc::new(IsolatedTaskPanicNativePort {
-            opens: AtomicU64::new(0),
-            first_opened: Arc::clone(&first_opened),
-            second_opened: Arc::clone(&second_opened),
-            second_gate: Arc::clone(&second_gate),
-        });
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            native,
-            QueryProcessNamespace::new(0x51),
-            frontend,
-            supervisor_config(),
-        );
-        let (first_control, first) = governance();
-        let first_scope = first.owner.scope();
-        let first_cancellation = first_scope.cancellation().unwrap();
-        let first_result =
-            client.start(completion_request(UnreachablePreparationPort), first.owner);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !first_opened.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the first logical task reached its isolated panic");
+        let mut first_control = {
+            let frontend = FrontendProcessId::new_v7();
+            let first_opened = Arc::new(AtomicBool::new(false));
+            let second_opened = Arc::new(AtomicBool::new(false));
+            let second_gate = Arc::new(tokio::sync::Notify::new());
+            let native = Arc::new(IsolatedTaskPanicNativePort {
+                opens: AtomicU64::new(0),
+                first_opened: Arc::clone(&first_opened),
+                second_opened: Arc::clone(&second_opened),
+                second_gate: Arc::clone(&second_gate),
+            });
+            let (first_control, first) = governance().await;
+            let (mut supervisor, client) = test_supervisor(
+                &first_control,
+                Handle::current(),
+                native,
+                QueryProcessNamespace::new(0x51),
+                frontend,
+                supervisor_config(),
+            );
 
-        let (second_control, second) = governance();
-        let second_scope = second.owner.scope();
-        let second_cancellation = second_scope.cancellation().unwrap();
-        let second_result = client.start(
-            completion_request(SuccessfulCompletionPreparationPort {
-                backend: BackendProcessId::new_v7(),
-                expected_frontend: frontend,
-            }),
-            second.owner,
-        );
-
-        let first_error = match first_result.await {
-            Ok(_) => panic!("the panicking logical task must fail its own request"),
-            Err(error) => error,
-        };
-        assert_eq!(first_error.kind(), QueryExecutionErrorKind::Failed);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !second_opened.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the sibling logical task remains admitted after the panic");
-        assert_eq!(first_cancellation.reason(), None);
-        assert_eq!(second_cancellation.reason(), None);
-        assert!(first_control.next_control().is_none());
-        assert!(second_control.next_control().is_none());
-
-        second_gate.notify_one();
-        let mut second_handle = second_result
+            let first_scope = first.owner.scope();
+            let first_cancellation = first_scope.cancellation().unwrap();
+            let first_result =
+                client.start(completion_request(UnreachablePreparationPort), first.owner);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !first_opened.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
-            .expect("a sibling execution remains supervised after the panic");
-        assert!(matches!(
-            second_handle.take_output(),
-            Some(crate::api::ExecutionOutput::Completion)
-        ));
-        assert_eq!(first_cancellation.reason(), None);
-        assert!(first_control.next_control().is_none());
+            .expect("the first logical task reached its isolated panic");
 
-        first.business.release();
-        second.business.release();
-        assert!(matches!(
-            supervisor
-                .shutdown_until(Instant::now() + Duration::from_secs(1))
-                .await,
-            Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(_))
-        ));
-        assert_eq!(first_cancellation.reason(), None);
+            let second_control = &first_control;
+            let second = first_control.begin_root().await;
+            let second_scope = second.owner.scope();
+            let second_cancellation = second_scope.cancellation().unwrap();
+            let second_result = client.start(
+                completion_request(SuccessfulCompletionPreparationPort {
+                    backend: BackendProcessId::new_v7(),
+                    expected_frontend: frontend,
+                }),
+                second.owner,
+            );
+
+            let first_error = match first_result.await {
+                Ok(_) => panic!("the panicking logical task must fail its own request"),
+                Err(error) => error,
+            };
+            assert_eq!(first_error.kind(), QueryExecutionErrorKind::Failed);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !second_opened.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the sibling logical task remains admitted after the panic");
+            assert_eq!(first_cancellation.reason(), None);
+            assert_eq!(second_cancellation.reason(), None);
+            assert!(first_control.next_control().is_none());
+            assert!(second_control.next_control().is_none());
+
+            second_gate.notify_one();
+            let mut second_handle = second_result
+                .await
+                .expect("a sibling execution remains supervised after the panic");
+            assert!(matches!(
+                second_handle.take_output(),
+                Some(crate::api::ExecutionOutput::Completion)
+            ));
+            assert_eq!(first_cancellation.reason(), None);
+            assert!(first_control.next_control().is_none());
+
+            first.business.release();
+            second.business.release();
+            assert!(matches!(
+                supervisor
+                    .shutdown_until(Instant::now() + Duration::from_secs(1))
+                    .await,
+                Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(_))
+            ));
+            assert_eq!(first_cancellation.reason(), None);
+            assert_ne!(
+                first_control.snapshot().root_responsibilities,
+                0,
+                "the real whole health packet still retains its original footer"
+            );
+            supervisor.abandon_for_process_exit();
+            acknowledge_all_control(&first_control);
+            acknowledge_all_control(&second_control);
+            drop(second_handle);
+            first_scope.wait_released().await;
+            second_scope.wait_released().await;
+
+            first_control
+        };
         acknowledge_all_control(&first_control);
-        acknowledge_all_control(&second_control);
-        first_scope.wait_released().await;
-        second_scope.wait_released().await;
+        first_control.finish().await;
     }
 
     #[tokio::test]
     async fn logical_task_panic_completes_uninstalled_work_and_drains_supervisor() {
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(PanickingOpenNativePort),
-            QueryProcessNamespace::new(0x49),
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        let start = client.start(completion_request(UnreachablePreparationPort), root.owner);
-        let error = match start.await {
-            Ok(_) => panic!("panicking Native open must not return an execution handle"),
-            Err(error) => error,
+        let mut control = {
+            let (control, root) = governance().await;
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(PanickingOpenNativePort),
+                QueryProcessNamespace::new(0x49),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
+
+            let scope = root.owner.scope();
+            let start = client.start(completion_request(UnreachablePreparationPort), root.owner);
+            let error = match start.await {
+                Ok(_) => panic!("panicking Native open must not return an execution handle"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+            root.business.release();
+            let shutdown = supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await;
+            assert!(matches!(
+                shutdown,
+                Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(_))
+            ));
+            assert_ne!(
+                control.snapshot().root_responsibilities,
+                0,
+                "the real whole health packet still retains its original footer"
+            );
+            supervisor.abandon_for_process_exit();
+            acknowledge_all_control(&control);
+            scope.wait_released().await;
+            assert_eq!(control.snapshot().root_responsibilities, 0);
+
+            control
         };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
-        root.business.release();
-        let shutdown = supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await;
-        assert!(matches!(
-            shutdown,
-            Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(_))
-        ));
         acknowledge_all_control(&control);
-        scope.wait_released().await;
-        assert_eq!(control.snapshot().root_responsibilities, 0);
+        control.finish().await;
     }
 
     #[derive(Debug)]
@@ -7167,111 +8024,114 @@ mod tests {
 
     #[tokio::test]
     async fn deadline_before_actor_install_settles_its_cancel_control() {
-        let (control, root) = {
-            let control = WorkloadControl::try_new(
-                WorkloadConfig::default(),
-                ResourceConfig {
-                    total_bytes: 1 << 20,
-                    control_bytes: 1 << 12,
-                    per_scope_bytes: (1 << 20) - (1 << 12),
-                },
-            )
-            .unwrap();
-            control.mark_ready().unwrap();
+        let mut control = {
+            let control = governance_empty();
             let root = control
-                .try_begin_root(WorkRequest {
+                .begin_root_request(WorkRequest {
                     class: WorkClass::Query,
                     deadline: Some((Instant::now() + Duration::from_millis(25)).into()),
                 })
+                .await;
+            let scope = root.owner.scope();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(PendingOpenNativePort {
+                    entered: Arc::clone(&entered),
+                }),
+                QueryProcessNamespace::new(0x4a),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
+
+            let start = client.start(completion_request(UnreachablePreparationPort), root.owner);
+            tokio::time::timeout(Duration::from_secs(1), entered.notified())
+                .await
+                .expect("Native open did not begin");
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            control.expire_deadlines();
+
+            let start = tokio::time::timeout(Duration::from_secs(1), start)
+                .await
+                .expect("deadline must stop a pre-install Native open");
+            let Err(error) = start else {
+                panic!("deadline must not return an execution handle");
+            };
+            assert_eq!(
+                error.kind(),
+                QueryExecutionErrorKind::DeadlineExceeded,
+                "{}",
+                error.message()
+            );
+            let input = error
+                .execution_failure()
+                .expect("pre-install deadline retains canonical input");
+            assert_eq!(
+                input.fact(),
+                QueryFailureReason::DeadlineExceeded.failure_fact()
+            );
+            assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+            assert_eq!(
+                scope.cancellation().unwrap().reason(),
+                Some(CancellationReason::DeadlineExceeded)
+            );
+            root.business.release();
+            supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
                 .unwrap();
-            (control, root)
-        };
-        let scope = root.owner.scope();
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(PendingOpenNativePort {
-                entered: Arc::clone(&entered),
-            }),
-            QueryProcessNamespace::new(0x4a),
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
+            scope.wait_released().await;
+            assert_eq!(control.snapshot().root_responsibilities, 0);
+            assert!(
+                control.next_control().is_none(),
+                "the terminal pre-install failure must settle its cancellation control"
+            );
 
-        let start = client.start(completion_request(UnreachablePreparationPort), root.owner);
-        tokio::time::timeout(Duration::from_secs(1), entered.notified())
-            .await
-            .expect("Native open did not begin");
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        control.expire_deadlines();
-
-        let start = tokio::time::timeout(Duration::from_secs(1), start)
-            .await
-            .expect("deadline must stop a pre-install Native open");
-        let Err(error) = start else {
-            panic!("deadline must not return an execution handle");
+            control
         };
-        assert_eq!(
-            error.kind(),
-            QueryExecutionErrorKind::DeadlineExceeded,
-            "{}",
-            error.message()
-        );
-        let input = error
-            .execution_failure()
-            .expect("pre-install deadline retains canonical input");
-        assert_eq!(
-            input.fact(),
-            QueryFailureReason::DeadlineExceeded.failure_fact()
-        );
-        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
-        assert_eq!(
-            scope.cancellation().unwrap().reason(),
-            Some(CancellationReason::DeadlineExceeded)
-        );
-        root.business.release();
-        supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
-        scope.wait_released().await;
-        assert_eq!(control.snapshot().root_responsibilities, 0);
-        assert!(
-            control.next_control().is_none(),
-            "the terminal pre-install failure must settle its cancellation control"
-        );
+        acknowledge_all_control(&control);
+        control.finish().await;
     }
 
     #[tokio::test]
     async fn shutdown_deadline_keeps_the_same_supervisor_join_for_retry() {
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(DelayedShutdownNativePort),
-            QueryProcessNamespace::new(0x47),
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        let start = client.start(completion_request(UnreachablePreparationPort), root.owner);
-        tokio::task::yield_now().await;
+        let mut control = {
+            let (control, root) = governance().await;
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(DelayedShutdownNativePort),
+                QueryProcessNamespace::new(0x47),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
 
-        assert_eq!(
-            supervisor.shutdown_until(Instant::now()).await,
-            Err(LogicalExecutionSupervisorShutdownError::DeadlineExceeded)
-        );
-        let error = match start.await {
-            Ok(_) => panic!("shutdown during Native open must not return an execution handle"),
-            Err(error) => error,
+            let scope = root.owner.scope();
+            let start = client.start(completion_request(UnreachablePreparationPort), root.owner);
+            tokio::task::yield_now().await;
+
+            assert_eq!(
+                supervisor.shutdown_until(Instant::now()).await,
+                Err(LogicalExecutionSupervisorShutdownError::DeadlineExceeded)
+            );
+            let error = match start.await {
+                Ok(_) => panic!("shutdown during Native open must not return an execution handle"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
+            root.business.release();
+            supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            acknowledge_all_control(&control);
+            scope.wait_released().await;
+
+            control
         };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
-        root.business.release();
-        supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
         acknowledge_all_control(&control);
-        scope.wait_released().await;
+        control.finish().await;
     }
 
     #[test]
@@ -7309,118 +8169,219 @@ mod tests {
 
     #[tokio::test]
     async fn reserved_identity_reaches_native_open_without_reallocation() {
-        let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(RecordingRejectedOpen {
-                opened: Arc::clone(&opened),
-            }),
-            QueryProcessNamespace::new(0x51),
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
-        let reserved = client.reserve_identity().unwrap();
-        let expected = reserved.execution();
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        let result = client
-            .start_reserved(
-                completion_request(UnreachablePreparationPort),
-                root.owner,
-                reserved,
-            )
-            .await;
-        assert!(
-            matches!(result, Err(ref error) if error.kind() == QueryExecutionErrorKind::Rejected)
-        );
-        assert_eq!(*opened.lock().unwrap(), vec![expected]);
-        root.business.release();
-        supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
+        let mut control = {
+            let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (control, root) = governance().await;
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(RecordingRejectedOpen {
+                    opened: Arc::clone(&opened),
+                }),
+                QueryProcessNamespace::new(0x51),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
+            let reserved = client.reserve_identity().unwrap();
+            let expected = reserved.execution();
+
+            let scope = root.owner.scope();
+            let result = client
+                .start_reserved(
+                    completion_request(UnreachablePreparationPort),
+                    root.owner,
+                    reserved,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(ref error) if error.kind() == QueryExecutionErrorKind::Rejected)
+            );
+            assert_eq!(*opened.lock().unwrap(), vec![expected]);
+            root.business.release();
+            supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            acknowledge_all_control(&control);
+            scope.wait_released().await;
+
+            control
+        };
         acknowledge_all_control(&control);
-        scope.wait_released().await;
+        control.finish().await;
     }
 
     #[tokio::test]
     async fn foreign_reservation_is_refused_before_native_side_effects() {
-        let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let namespace = QueryProcessNamespace::new(0x52);
-        let donor = ProcessQueryIdAllocator::new(namespace);
-        let reserved = donor.reserve().unwrap();
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(RecordingRejectedOpen {
-                opened: Arc::clone(&opened),
-            }),
-            namespace,
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        let result = client
-            .start_reserved(
-                completion_request(UnreachablePreparationPort),
-                root.owner,
-                reserved,
-            )
-            .await;
-        assert!(
-            matches!(result, Err(ref error) if error.kind() == QueryExecutionErrorKind::InvalidRequest)
-        );
-        assert!(opened.lock().unwrap().is_empty());
-        root.business.release();
-        supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
+        let mut control = {
+            let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let namespace = QueryProcessNamespace::new(0x52);
+            let donor = ProcessQueryIdAllocator::new(namespace);
+            let reserved = donor.reserve().unwrap();
+            let (control, root) = governance().await;
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(RecordingRejectedOpen {
+                    opened: Arc::clone(&opened),
+                }),
+                namespace,
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
+
+            let scope = root.owner.scope();
+            let result = client
+                .start_reserved(
+                    completion_request(UnreachablePreparationPort),
+                    root.owner,
+                    reserved,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(ref error) if error.kind() == QueryExecutionErrorKind::InvalidRequest)
+            );
+            assert!(opened.lock().unwrap().is_empty());
+            root.business.release();
+            supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            acknowledge_all_control(&control);
+            scope.wait_released().await;
+
+            control
+        };
         acknowledge_all_control(&control);
-        scope.wait_released().await;
+        control.finish().await;
     }
 
     #[tokio::test]
     async fn registry_shutdown_error_retains_owner_and_run_failure_for_retry() {
-        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
-            Handle::current(),
-            Arc::new(PanickingOpenNativePort),
-            QueryProcessNamespace::new(0x4f),
-            FrontendProcessId::new_v7(),
-            supervisor_config(),
-        );
-        let (_control, root) = governance();
-        let scope = root.owner.scope();
-        let error = match client
-            .start(completion_request(UnreachablePreparationPort), root.owner)
-            .await
-        {
-            Ok(_) => panic!("panicking Native open must fail the logical task"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
-        root.business.release();
-        supervisor.inject_registry_shutdown_error_once(
-            LogicalExecutionRuntimeRegistryError::JoinNotReady,
-        );
+        let mut _control = {
+            let (_control, root) = governance().await;
+            let (mut supervisor, client) = test_supervisor(
+                &_control,
+                Handle::current(),
+                Arc::new(PanickingOpenNativePort),
+                QueryProcessNamespace::new(0x4f),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
 
-        assert_eq!(
-            supervisor
-                .shutdown_until(Instant::now() + Duration::from_secs(1))
-                .await,
-            Err(LogicalExecutionSupervisorShutdownError::Registry(
+            let scope = root.owner.scope();
+            let error = match client
+                .start(completion_request(UnreachablePreparationPort), root.owner)
+                .await
+            {
+                Ok(_) => panic!("panicking Native open must fail the logical task"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+            root.business.release();
+            supervisor.inject_registry_shutdown_error_once(
                 LogicalExecutionRuntimeRegistryError::JoinNotReady,
-            ))
-        );
-        assert!(!supervisor.shutdown_complete);
+            );
 
-        assert!(matches!(
+            assert_eq!(
+                supervisor
+                    .shutdown_until(Instant::now() + Duration::from_secs(1))
+                    .await,
+                Err(LogicalExecutionSupervisorShutdownError::Registry(
+                    LogicalExecutionRuntimeRegistryError::JoinNotReady,
+                ))
+            );
+            assert!(!supervisor.shutdown_complete);
+
+            assert!(matches!(
+                supervisor
+                    .shutdown_until(Instant::now() + Duration::from_secs(1))
+                    .await,
+                Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(_))
+            ));
+            assert!(supervisor.shutdown_complete);
+            assert_ne!(
+                _control.snapshot().root_responsibilities,
+                0,
+                "the real whole health packet still retains its original footer"
+            );
+            supervisor.abandon_for_process_exit();
+            scope.wait_released().await;
+
+            _control
+        };
+        acknowledge_all_control(&_control);
+        _control.finish().await;
+    }
+
+    #[tokio::test]
+    async fn one_actual_logical_bank_consumes_original_owners_from_all_five_classes() {
+        let mut control = {
+            let control = governance_empty();
+            let frontend = FrontendProcessId::new_v7();
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(0x9b51),
+                frontend,
+                supervisor_config(),
+            );
+            for class in [
+                WorkClass::Query,
+                WorkClass::MaterializedView,
+                WorkClass::Statistics,
+                WorkClass::TableMaintenance,
+                WorkClass::Management,
+            ] {
+                let root = control.begin_root_request(WorkRequest::new(class)).await;
+                let scope = root.owner.scope();
+                assert_eq!(
+                    control
+                        .snapshot()
+                        .scopes
+                        .iter()
+                        .find(|row| row.id == scope.id())
+                        .unwrap()
+                        .class,
+                    class
+                );
+                let mut handle = client
+                    .start(
+                        completion_request(SuccessfulCompletionPreparationPort {
+                            backend: BackendProcessId::new_v7(),
+                            expected_frontend: frontend,
+                        }),
+                        root.owner,
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    handle.take_output(),
+                    Some(crate::api::ExecutionOutput::Completion)
+                ));
+                assert_eq!(
+                    control
+                        .snapshot()
+                        .scopes
+                        .iter()
+                        .find(|row| row.id == scope.id())
+                        .unwrap()
+                        .class,
+                    class,
+                    "same-bank handoff cannot substitute a Query owner for another class"
+                );
+                root.business.release();
+                drop(handle);
+                scope.wait_released().await;
+            }
             supervisor
-                .shutdown_until(Instant::now() + Duration::from_secs(1))
-                .await,
-            Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(_))
-        ));
-        assert!(supervisor.shutdown_complete);
-        scope.wait_released().await;
+                .shutdown_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap();
+            control
+        };
+        acknowledge_all_control(&control);
+        control.finish().await;
     }
 }

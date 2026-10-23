@@ -42,6 +42,8 @@ pub mod kernels;
 pub(crate) mod lifecycle_diagnostics;
 pub mod lifecycle_plan;
 pub(crate) mod logical_execution;
+#[cfg(test)]
+pub(crate) mod logical_execution_test_profile;
 pub mod maintenance;
 pub mod mv_assembly;
 pub mod mv_native_write;

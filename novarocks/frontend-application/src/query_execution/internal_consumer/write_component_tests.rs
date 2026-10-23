@@ -50,9 +50,7 @@ use novarocks_query_application::{
         LogicalExecutionNativePort, LogicalNativeOpenFuture, LogicalNativeOpenRequest,
         RetainedRootReply,
     },
-    coordination::{
-        LogicalExecutionRowsConfig, LogicalExecutionSupervisor, LogicalExecutionSupervisorConfig,
-    },
+    coordination::{LogicalExecutionRowsConfig, LogicalExecutionSupervisorConfig},
     execution_error::ExecutionFailureInput,
 };
 use novarocks_result_contract::RootProfileId;
@@ -104,22 +102,23 @@ fn original_failure() -> TaskFailure {
     )
 }
 async fn run_case(fail_writer: bool) {
-    let (mut identity_owner, client) = LogicalExecutionSupervisor::new(
-        tokio::runtime::Handle::current(),
-        Arc::new(ReservationOnly),
-        QueryProcessNamespace::new(0x9b7),
-        FrontendProcessId::new_v7(),
-        LogicalExecutionSupervisorConfig::new(
-            NonZeroUsize::new(8).unwrap(),
-            NonZeroUsize::MIN,
-            NonZeroUsize::MIN,
-            LogicalExecutionRowsConfig::new(
+    let (mut identity_owner, client) =
+        crate::query_execution::logical_execution_test_profile::process(
+            tokio::runtime::Handle::current(),
+            Arc::new(ReservationOnly),
+            QueryProcessNamespace::new(0x9b7),
+            FrontendProcessId::new_v7(),
+            LogicalExecutionSupervisorConfig::new(
+                NonZeroUsize::new(8).unwrap(),
                 NonZeroUsize::MIN,
-                NonZeroU32::MIN,
-                Duration::from_secs(1),
+                NonZeroUsize::MIN,
+                LogicalExecutionRowsConfig::new(
+                    NonZeroUsize::MIN,
+                    NonZeroU32::MIN,
+                    Duration::from_secs(1),
+                ),
             ),
-        ),
-    );
+        );
     let initial = InitialComputationReservation::new(client.reserve_identity().unwrap()).unwrap();
     let credentials = initial.credentials();
     let execution = credentials.execution();
