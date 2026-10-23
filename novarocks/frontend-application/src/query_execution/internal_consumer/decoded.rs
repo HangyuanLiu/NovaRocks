@@ -65,6 +65,7 @@ pub(crate) struct DecodedConsumerRuntime {
 pub(crate) struct CowMatchComputationSeed {
     pub(crate) context: novarocks_spi::connector::ConnectorRequestContext,
     pub(crate) signed_schema: arrow::datatypes::SchemaRef,
+    pub(crate) declarations: Vec<novarocks_type_contract::FunctionValueType>,
     pub(crate) contract: novarocks_spi::connector::ConnectorMutationMatchContract,
     pub(crate) intent: novarocks_spi::connector::ConnectorRowMutationIntent,
 }
@@ -308,9 +309,10 @@ pub(crate) fn cow_computation_consumer(
     ),
     QueryExecutionError,
 > {
-    let original = CowMatchRootConsumer::try_new_with_capacity(
+    let original = CowMatchRootConsumer::try_new_declared_with_capacity(
         original.context,
         original.signed_schema,
+        original.declarations,
         original.contract,
         original.intent,
         &runtime.binding,
