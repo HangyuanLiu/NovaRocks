@@ -615,10 +615,7 @@ pub(crate) fn admitted_connector_service(
                 })?;
             let io = connector.connect().await.map_err(std::io::Error::other)?;
             let io: novarocks_transport_io::BoxedIo = match dial {
-                Some(dial) => Box::new(novarocks_transport_io::OwnedIo::with_guard(
-                    io,
-                    dial.established()?,
-                )),
+                Some(dial) => Box::new(dial.established_io(io)?),
                 None => io,
             };
             Ok(hyper_util::rt::TokioIo::new(io))

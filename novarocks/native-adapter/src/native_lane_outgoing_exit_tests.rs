@@ -812,9 +812,7 @@ async fn public_queue_recipe(ready_only: bool) -> Result<QueueRun, StdError> {
             })
             .await?;
             let io = native.connect().await?;
-            let io: novarocks_transport_io::BoxedIo = Box::new(
-                novarocks_transport_io::OwnedIo::with_guard(io, dial.established()?),
-            );
+            let io: novarocks_transport_io::BoxedIo = Box::new(dial.established_io(io)?);
             Ok(hyper_util::rt::TokioIo::new(io))
         }
     });
