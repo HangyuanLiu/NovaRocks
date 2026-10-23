@@ -181,6 +181,9 @@ struct ElasticPlanningPoolState {
     accepting: bool,
     next_worker_id: WorkerId,
     workers: BTreeMap<WorkerId, ElasticWorkerState>,
+    // Accepted starts stay owed through publication AND the original join,
+    // even when the actual worker already exited and removed its worker row.
+    unjoined_starts: usize,
     joins: BTreeMap<WorkerId, JoinHandle<()>>,
 }
 
@@ -190,6 +193,7 @@ impl Default for ElasticPlanningPoolState {
             accepting: true,
             next_worker_id: 0,
             workers: BTreeMap::new(),
+            unjoined_starts: 0,
             joins: BTreeMap::new(),
         }
     }
@@ -215,6 +219,18 @@ impl ElasticPlanningPool {
         self: &Arc<Self>,
         run: impl FnOnce() -> CpuResult + Send + 'static,
     ) -> Result<oneshot::Receiver<Result<CpuResult, String>>, String> {
+        self.submit_with_spawn_gates(run, || {}, |_| {})
+    }
+
+    // Production uses the zero-sized no-op above. Tests can pause this SAME
+    // creator around the real Builder::spawn without substituting a worker or
+    // publishing a synthetic join. Both gates always run outside State.
+    fn submit_with_spawn_gates(
+        self: &Arc<Self>,
+        run: impl FnOnce() -> CpuResult + Send + 'static,
+        before_spawn: impl FnOnce(),
+        before_publication: impl FnOnce(&JoinHandle<()>),
+    ) -> Result<oneshot::Receiver<Result<CpuResult, String>>, String> {
         self.reap_finished();
         let (result, receipt) = oneshot::channel();
         let job = ElasticPlanningJob {
@@ -235,11 +251,16 @@ impl ElasticPlanningPool {
                 state.workers.insert(id, ElasticWorkerState::Assigned);
                 ElasticAssignment::Idle { id, sender }
             } else {
-                state.next_worker_id = state
+                let id = state
                     .next_worker_id
                     .checked_add(1)
                     .ok_or_else(|| "query CPU worker id overflow".to_owned())?;
-                let id = state.next_worker_id;
+                let unjoined_starts = state
+                    .unjoined_starts
+                    .checked_add(1)
+                    .ok_or_else(|| "query CPU worker join obligation count overflow".to_owned())?;
+                state.next_worker_id = id;
+                state.unjoined_starts = unjoined_starts;
                 state.workers.insert(id, ElasticWorkerState::Starting);
                 ElasticAssignment::Start { id }
             }
@@ -261,20 +282,31 @@ impl ElasticPlanningPool {
             ElasticAssignment::Start { id } => {
                 let (sender, receiver) = mpsc::channel();
                 let pool = Arc::clone(self);
-                match std::thread::Builder::new()
+                before_spawn();
+                let spawned = std::thread::Builder::new()
                     .name(format!("novarocks-query-planning-{id}"))
                     // Planning traverses nested SQL trees on this worker,
                     // outside the runtime's explicitly sized worker threads.
                     .stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
-                    .spawn(move || worker_loop(pool, id, sender, receiver, job))
-                {
+                    .spawn(move || worker_loop(pool, id, sender, receiver, job));
+                if let Ok(join) = &spawned {
+                    before_publication(join);
+                }
+                match spawned {
                     Ok(join) => {
-                        self.state.lock().unwrap().joins.insert(id, join);
+                        let mut state = self.state.lock().unwrap();
+                        state.joins.insert(id, join);
+                        drop(state);
                         Ok(receipt)
                     }
                     Err(error) => {
-                        self.state.lock().unwrap().workers.remove(&id);
-                        Err(format!("create query CPU worker: {error}"))
+                        let detail = format!("create query CPU worker: {error}");
+                        drop(error);
+                        let mut state = self.state.lock().unwrap();
+                        state.workers.remove(&id);
+                        state.unjoined_starts -= 1;
+                        drop(state);
+                        Err(detail)
                     }
                 }
             }
@@ -307,7 +339,11 @@ impl ElasticPlanningPool {
         self.request_close();
         loop {
             self.reap_finished();
-            if self.state.lock().unwrap().joins.is_empty() {
+            let drained = {
+                let state = self.state.lock().unwrap();
+                state.unjoined_starts == 0 && state.joins.is_empty()
+            };
+            if drained {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -318,6 +354,12 @@ impl ElasticPlanningPool {
     }
 
     fn reap_finished(&self) {
+        self.reap_finished_with_join_gate(|_| {});
+    }
+
+    // The production gate is a zero-sized no-op. Tests may retain the actual
+    // original handle between taking it from State and the same lock-free join.
+    fn reap_finished_with_join_gate(&self, mut before_join: impl FnMut(&JoinHandle<()>)) {
         let joins = {
             let mut state = self.state.lock().unwrap();
             let completed = state
@@ -331,7 +373,11 @@ impl ElasticPlanningPool {
                 .collect::<Vec<_>>()
         };
         for join in joins {
+            before_join(&join);
+            // The original outcome (including a panic payload's destruction)
+            // is consumed outside State before this accepted start retires.
             let _ = join.join();
+            self.state.lock().unwrap().unjoined_starts -= 1;
         }
     }
 
@@ -340,6 +386,8 @@ impl ElasticPlanningPool {
         let state = self.state.lock().unwrap();
         ElasticPlanningPoolSnapshot {
             workers: state.workers.len(),
+            unjoined_starts: state.unjoined_starts,
+            joins: state.joins.len(),
             idle: state
                 .workers
                 .values()
@@ -369,6 +417,8 @@ enum ElasticAssignment {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ElasticPlanningPoolSnapshot {
     workers: usize,
+    unjoined_starts: usize,
+    joins: usize,
     idle: usize,
     running: usize,
     accepting: bool,
@@ -1064,6 +1114,136 @@ mod tests {
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await
             .expect("planning worker actually exits");
+    }
+
+    #[test]
+    fn shutdown_retains_a_start_until_its_real_worker_join_is_published_and_observed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut owner = executor(Duration::from_secs(1));
+        let pool = Arc::clone(&owner.pool);
+        let main_thread = std::thread::current().id();
+        std::thread::scope(|scope| {
+            // Senders live INSIDE this scope closure. Assertion unwind closes
+            // the receivers before scoped joins; every wait is also bounded.
+            let (at_spawn, spawn_reached) = std::sync::mpsc::sync_channel(1);
+            let (allow_spawn, spawn_allowed) = std::sync::mpsc::sync_channel(0);
+            let (at_work, work_reached) = std::sync::mpsc::sync_channel(1);
+            let (allow_exit, exit_allowed) = std::sync::mpsc::sync_channel(0);
+            let (at_publication, publication_reached) = std::sync::mpsc::sync_channel(1);
+            let (exited, worker_exited) = std::sync::mpsc::sync_channel(1);
+            let (allow_publication, publication_allowed) = std::sync::mpsc::sync_channel(0);
+            let submitter = scope.spawn(move || {
+                pool.submit_with_spawn_gates(
+                    move || {
+                        at_work.send(()).unwrap();
+                        exit_allowed.recv_timeout(Duration::from_secs(5)).unwrap();
+                        Box::new(std::thread::current().id()) as super::CpuResult
+                    },
+                    move || {
+                        at_spawn.send(()).unwrap();
+                        spawn_allowed.recv_timeout(Duration::from_secs(5)).unwrap();
+                    },
+                    move |join| {
+                        at_publication.send(()).unwrap();
+                        // Observe the SAME real thread's public exit, rather
+                        // than treating closure return or an empty worker map
+                        // as its actual exit. It is still not joined here.
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while !join.is_finished() {
+                            assert!(Instant::now() < deadline, "original worker did not exit");
+                            std::thread::yield_now();
+                        }
+                        exited.send(()).unwrap();
+                        publication_allowed
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                    },
+                )
+            });
+            spawn_reached.recv_timeout(Duration::from_secs(5)).unwrap();
+            let before = owner.pool.snapshot();
+            assert_eq!(before.unjoined_starts, 1);
+            assert_eq!(before.joins, 0);
+            let first =
+                runtime.block_on(owner.shutdown_until(Instant::now() + Duration::from_millis(20)));
+            assert!(
+                first.is_err(),
+                "accepted unpublished start is not a joined worker"
+            );
+            assert_eq!(owner.pool.snapshot().unjoined_starts, 1);
+
+            allow_spawn.send(()).unwrap();
+            publication_reached
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            work_reached.recv_timeout(Duration::from_secs(5)).unwrap();
+            let running = owner.pool.snapshot();
+            assert_eq!(running.unjoined_starts, 1);
+            assert_eq!(running.joins, 0);
+            assert_eq!(running.running, 1);
+            let held =
+                runtime.block_on(owner.shutdown_until(Instant::now() + Duration::from_millis(20)));
+            assert!(
+                held.is_err(),
+                "the same actual worker is still inside its call"
+            );
+
+            allow_exit.send(()).unwrap();
+            worker_exited.recv_timeout(Duration::from_secs(5)).unwrap();
+            let unpublished_exit = owner.pool.snapshot();
+            assert_eq!(unpublished_exit.workers, 0);
+            assert_eq!(unpublished_exit.joins, 0);
+            assert_eq!(unpublished_exit.unjoined_starts, 1);
+            let exited_but_unjoined =
+                runtime.block_on(owner.shutdown_until(Instant::now() + Duration::from_millis(20)));
+            assert!(
+                exited_but_unjoined.is_err(),
+                "actual exit still owes its original join"
+            );
+
+            allow_publication.send(()).unwrap();
+            let receipt = submitter.join().unwrap().unwrap();
+            let worker_thread = runtime
+                .block_on(receipt)
+                .unwrap()
+                .unwrap()
+                .downcast::<std::thread::ThreadId>()
+                .unwrap();
+            assert_ne!(*worker_thread, main_thread);
+            let (at_join, join_reached) = std::sync::mpsc::sync_channel(1);
+            let (allow_join, join_allowed) = std::sync::mpsc::sync_channel(0);
+            let joining_pool = Arc::clone(&owner.pool);
+            let reaper = scope.spawn(move || {
+                joining_pool.reap_finished_with_join_gate(|join| {
+                    assert!(join.is_finished());
+                    at_join.send(()).unwrap();
+                    join_allowed.recv_timeout(Duration::from_secs(5)).unwrap();
+                });
+            });
+            join_reached.recv_timeout(Duration::from_secs(5)).unwrap();
+            let joining = owner.pool.snapshot();
+            assert_eq!(joining.joins, 0);
+            assert_eq!(joining.workers, 0);
+            assert_eq!(joining.unjoined_starts, 1);
+            let taken_but_unjoined =
+                runtime.block_on(owner.shutdown_until(Instant::now() + Duration::from_millis(20)));
+            assert!(
+                taken_but_unjoined.is_err(),
+                "the original join is still in progress"
+            );
+            allow_join.send(()).unwrap();
+            reaper.join().unwrap();
+            runtime
+                .block_on(owner.shutdown_until(Instant::now() + Duration::from_secs(5)))
+                .unwrap();
+            let joined = owner.pool.snapshot();
+            assert_eq!(joined.unjoined_starts, 0);
+            assert_eq!(joined.workers, 0);
+            assert_eq!(joined.joins, 0);
+        });
     }
 
     #[tokio::test]
