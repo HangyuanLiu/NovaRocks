@@ -17,7 +17,7 @@
 
 //! The original State's backing inventory, not another Work registry.
 //! Fixed storage is an internal substrate only. Paid role requests,
-//! PoolFree proposals and production composition remain unimplemented.
+//! Complete role geometry and production composition remain unimplemented.
 
 use crate::{
     WorkClass, WorkError, WorkId,
@@ -40,6 +40,11 @@ pub(crate) enum SlotPhase {
     Vacant,
     Free,
     Node(WorkId),
+    /// A real committed reply, not a published Work or a free slot.
+    ChildGranted {
+        parent: WorkId,
+        ticket: u64,
+    },
     Retired,
 }
 
@@ -258,8 +263,8 @@ impl CancellationStorage {
         Ok(free)
     }
 
-    /// Fixed mode supports only same-key empty-D child storage here. The State
-    /// author rejects bound parents until the original PoolFree proof is wired.
+    /// Migration convenience for same-key empty-D children only. Bound parents
+    /// enter through the original proof and install_granted_child author.
     pub(crate) fn take_child(
         &mut self,
         parent: SlotId,
@@ -309,12 +314,51 @@ impl CancellationStorage {
         Ok(slot)
     }
 
+    /// The original committed reply owns this exact position. Registration
+    /// failure keeps that reply charged; only its actual exit may retire it.
+    pub(crate) fn install_granted_child(
+        &mut self,
+        slot: SlotId,
+        parent: SlotId,
+        id: WorkId,
+        deadline: Option<Instant>,
+    ) -> Result<(), WorkError> {
+        assert!(matches!(
+            self.slots[slot.0].phase,
+            SlotPhase::ChildGranted { .. }
+        ));
+        let generation = self.slots[slot.0]
+            .generation
+            .checked_add(1)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        let parent_cell = Arc::clone(self.cell(parent));
+        Cancellation::reuse_child(
+            self.slots[slot.0].cell.as_mut().unwrap(),
+            &parent_cell,
+            deadline,
+            id,
+        )?;
+        self.slots[slot.0].parent = Some(parent);
+        if let Some(reason) = self.cell(slot).check_reason() {
+            // The reply remains ChildGranted until its original holder exits.
+            // A reentrant driver must not reset a still-pending claim.
+            self.cell(slot).detach();
+            return Err(WorkError::Cancelled(reason));
+        }
+        self.slots[slot.0].generation = generation;
+        self.slots[slot.0].phase = SlotPhase::Node(id);
+        Ok(())
+    }
+
     pub(crate) fn retire(&mut self, id: SlotId) {
         self.cell(id).detach();
         let slot = &mut self.slots[id.0];
         assert!(
-            matches!(slot.phase, SlotPhase::Node(_)),
-            "retire exactly one bound slot"
+            matches!(
+                slot.phase,
+                SlotPhase::Node(_) | SlotPhase::ChildGranted { .. }
+            ),
+            "retire exactly one assigned slot"
         );
         assert!(
             slot.next_free.is_none(),

@@ -19,7 +19,7 @@
 
 use super::*;
 use crate::{
-    WorkId, WorkOwner, WorkScope, WorkloadControl,
+    WorkId, WorkOwner, WorkRequest, WorkScope, WorkloadControl,
     control_storage::{CancellationStorage, ControlSlot, ControlStorageConfig, SlotId, SlotPhase},
     scope::{Inner, State},
 };
@@ -104,6 +104,21 @@ enum ClaimSource {
         slot: SlotId,
         generation: u64,
     },
+    PoolFree {
+        slot: SlotId,
+        generation: u64,
+        parent: ParentControlFence,
+        deadline: Option<tokio::time::Instant>,
+    },
+}
+#[derive(Clone, Copy)]
+struct ParentControlFence {
+    work: WorkId,
+    slot: SlotId,
+    generation: u64,
+    claim: u64,
+    structure_revision: u64,
+    release_revision: u64,
 }
 #[derive(Clone)]
 pub struct JointClaimView {
@@ -327,6 +342,110 @@ impl JointAdmissionHandle {
         })
     }
 
+    /// Propose a same-class child using an observed free position. Waiting
+    /// does not reserve that position or block another root from taking it.
+    pub fn request_child(
+        &self,
+        owner: &WorkOwner,
+        request: WorkRequest,
+    ) -> Result<JointAdmission, JointAdmissionFailure> {
+        self.prepare_child(owner, request)
+            .and_then(|prepared| self.queue_request(prepared))
+            .map_err(|error| JointAdmissionFailure { error })
+    }
+
+    fn prepare_child(
+        &self,
+        owner: &WorkOwner,
+        request: WorkRequest,
+    ) -> Result<PreparedRequest, WorkError> {
+        let scope = owner.scope();
+        if !Arc::ptr_eq(&self.inner, &scope.inner) {
+            return Err(WorkError::ForeignAuthority);
+        }
+        let (source, from, base, to, work_limit) = {
+            let state = self.inner.state.lock().unwrap();
+            let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
+            if state.closed || ledger.driver_closed {
+                return Err(WorkError::Closed);
+            }
+            if !state.cancellations.fixed {
+                return Err(WorkError::NotReady);
+            }
+            let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
+            node.check(&state.cancellations)?;
+            if node.class != request.class {
+                return Err(WorkError::Conflict);
+            }
+            let parent_slot = &state.cancellations.slots[node.cancellation.0];
+            let parent_claim = parent_slot.claim.ok_or(WorkError::NotReady)?;
+            let parent = &ledger.claims[&parent_claim];
+            if parent.pending.is_some()
+                || parent.active_facts.dependencies.is_empty()
+                || parent.amounts != parent.active_amounts
+                || parent.facts.key != parent.active_facts.key
+            {
+                return Err(WorkError::Conflict);
+            }
+            let slot = state.cancellations.free_heads[class_index(node.class)]
+                .ok_or(WorkError::Capacity("fixed control slots"))?;
+            let cell = &state.cancellations.slots[slot.0];
+            let claim = cell.claim.ok_or(WorkError::NotReady)?;
+            let old = &ledger.claims[&claim];
+            cell.generation
+                .checked_add(2)
+                .ok_or(WorkError::ArithmeticOverflow)?;
+            old.structure_revision
+                .checked_add(2)
+                .ok_or(WorkError::ArithmeticOverflow)?;
+            let source = JointClaimView {
+                inner: Arc::downgrade(&self.inner),
+                id: claim,
+                source: ClaimSource::PoolFree {
+                    slot,
+                    generation: cell.generation,
+                    parent: ParentControlFence {
+                        work: scope.id,
+                        slot: node.cancellation,
+                        generation: parent_slot.generation,
+                        claim: parent_claim,
+                        structure_revision: parent.structure_revision,
+                        release_revision: parent.release_revision,
+                    },
+                    deadline: request.deadline,
+                },
+                structure_revision: old.structure_revision,
+                release_revision: old.release_revision,
+            };
+            authenticate_scope(&state, old, &source, scope.id)?;
+            (
+                source,
+                Arc::clone(&old.active_facts),
+                cell.base,
+                Arc::clone(&parent.active_facts),
+                ledger.config.config.max_total_proof_work,
+            )
+        };
+        // No cell Arc escapes: only the existing immutable profile facts do.
+        let change = ChangeRecord {
+            old: Some(source.id),
+            original_amounts: Some(base),
+            original_facts: Some(from),
+            source: Some(source),
+            claim: ProposedClaim {
+                facts: to,
+                amounts: base,
+            },
+        };
+        Ok(PreparedRequest {
+            budget: RequestBudget::Finite {
+                remaining: work_limit,
+            },
+            scope,
+            changes: Arc::from([change]),
+        })
+    }
+
     /// Queue New claims and/or growth of exact stable holders. No physical
     /// holder moves into this future. Growth authority starts only at install.
     pub fn request(
@@ -513,66 +632,71 @@ impl JointAdmissionHandle {
         }
         let scope = &prepared.scope;
         let records = &prepared.changes;
-        let id = self.inner.update(|state| {
-            let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
-            let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
-            if ledger.driver_closed {
-                return Err(WorkError::Closed);
-            }
-            if ledger.requests.len() >= ledger.config.config.max_requests {
-                return Err(WorkError::Capacity("joint request and reply records"));
-            }
-            for change in records.iter() {
-                if change.claim.facts.class != node.class {
-                    return Err(WorkError::Conflict);
-                }
-                if let Some(source) = &change.source {
-                    let old = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
-                    authenticate_scope(state, old, source, scope.id)?;
-                    if old.pending.is_some() {
-                        return Err(WorkError::Conflict);
-                    }
-                }
-            }
-            if records
-                .iter()
-                .any(|record| record.claim.facts.lane != JointLane::Settlement)
-            {
-                node.check(&state.cancellations)?;
-                if state.closed {
+        let id =
+            self.inner.update(|state| {
+                let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
+                let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
+                if ledger.driver_closed {
                     return Err(WorkError::Closed);
                 }
-            }
-            let waiters = node
-                .resource_waiters
-                .checked_add(1)
-                .ok_or(WorkError::ArithmeticOverflow)?;
-            let id = state.next_id()?;
-            state.nodes.get_mut(&scope.id).unwrap().resource_waiters = waiters;
-            let ledger = state.joint.as_mut().unwrap();
-            for record in records.iter() {
-                if let Some(old) = record.old {
-                    ledger.claims.get_mut(&old).unwrap().pending = Some(id);
+                if ledger.requests.len() >= ledger.config.config.max_requests {
+                    return Err(WorkError::Capacity("joint request and reply records"));
                 }
-            }
-            ledger.requests.insert(
-                id,
-                RequestRecord {
-                    budget: match prepared.budget {
-                        RequestBudget::Finite { remaining } => RequestBudget::Finite {
-                            remaining: remaining.min(ledger.config.config.max_total_proof_work),
+                for change in records.iter() {
+                    if change.claim.facts.class != node.class {
+                        return Err(WorkError::Conflict);
+                    }
+                    if let Some(source) = &change.source {
+                        let old = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
+                        authenticate_scope(state, old, source, scope.id)?;
+                        if old.pending.is_some() {
+                            return Err(WorkError::Conflict);
+                        }
+                    }
+                }
+                if records
+                    .iter()
+                    .any(|record| record.claim.facts.lane != JointLane::Settlement)
+                {
+                    node.check(&state.cancellations)?;
+                    if state.closed {
+                        return Err(WorkError::Closed);
+                    }
+                }
+                let waiters = node
+                    .resource_waiters
+                    .checked_add(1)
+                    .ok_or(WorkError::ArithmeticOverflow)?;
+                let id = state.next_id()?;
+                state.nodes.get_mut(&scope.id).unwrap().resource_waiters = waiters;
+                let ledger = state.joint.as_mut().unwrap();
+                for record in records.iter() {
+                    if let Some(old) = record.old {
+                        if !record.source.as_ref().is_some_and(|source| {
+                            matches!(source.source, ClaimSource::PoolFree { .. })
+                        }) {
+                            ledger.claims.get_mut(&old).unwrap().pending = Some(id);
+                        }
+                    }
+                }
+                ledger.requests.insert(
+                    id,
+                    RequestRecord {
+                        budget: match prepared.budget {
+                            RequestBudget::Finite { remaining } => RequestBudget::Finite {
+                                remaining: remaining.min(ledger.config.config.max_total_proof_work),
+                            },
+                            RequestBudget::WaitForCapacity => RequestBudget::WaitForCapacity,
                         },
-                        RequestBudget::WaitForCapacity => RequestBudget::WaitForCapacity,
+                        owner: scope.id,
+                        changes: Arc::clone(records),
+                        phase: RequestPhase::Waiting,
+                        blocked_at: None,
+                        waker: None,
                     },
-                    owner: scope.id,
-                    changes: Arc::clone(records),
-                    phase: RequestPhase::Waiting,
-                    blocked_at: None,
-                    waker: None,
-                },
-            );
-            Ok(id)
-        })?;
+                );
+                Ok(id)
+            })?;
         Ok(JointAdmission {
             inner: Arc::clone(&self.inner),
             id: Some(id),
@@ -625,6 +749,38 @@ fn authenticate(record: &ClaimRecord, source: &JointClaimView) -> Result<(), Wor
     }
     Ok(())
 }
+fn authenticate_parent(
+    state: &State,
+    fence: ParentControlFence,
+    work: WorkId,
+) -> Result<(), WorkError> {
+    let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
+    let node = state.nodes.get(&work).ok_or(WorkError::Released)?;
+    node.check(&state.cancellations)?;
+    let slot = state
+        .cancellations
+        .slots
+        .get(fence.slot.0)
+        .ok_or(WorkError::Released)?;
+    let claim = ledger.claims.get(&fence.claim).ok_or(WorkError::Released)?;
+    if work != fence.work
+        || node.cancellation != fence.slot
+        || slot.phase != SlotPhase::Node(work)
+        || slot.generation != fence.generation
+        || slot.claim != Some(fence.claim)
+        || claim.owner != ClaimOwner::ControlSlot(fence.slot)
+        || claim.structure_revision != fence.structure_revision
+        || claim.release_revision != fence.release_revision
+        || claim.pending.is_some()
+        || claim.active_facts.dependencies.is_empty()
+        || claim.active_amounts != claim.amounts
+        || claim.active_facts.key != claim.facts.key
+    {
+        return Err(WorkError::Conflict);
+    }
+    Ok(())
+}
+
 fn authenticate_scope(
     state: &State,
     record: &ClaimRecord,
@@ -657,6 +813,37 @@ fn authenticate_scope(
             }
             Ok(())
         }
+        ClaimSource::PoolFree {
+            slot,
+            generation,
+            parent,
+            ..
+        } => {
+            authenticate_parent(state, parent, work)?;
+            let ledger = state.joint.as_ref().unwrap();
+            let cell = state
+                .cancellations
+                .slots
+                .get(slot.0)
+                .ok_or(WorkError::Released)?;
+            if !state.cancellations.fixed
+                || cell.phase != SlotPhase::Free
+                || cell.generation != generation
+                || cell.claim != Some(source.id)
+                || cell.parent.is_some()
+                || record.owner != ClaimOwner::ControlSlot(slot)
+                || record.pending.is_some()
+                || record.amounts != cell.base
+                || record.active_amounts != cell.base
+                || !record.facts.dependencies.is_empty()
+                || !record.active_facts.dependencies.is_empty()
+                || state.cancellations.free_heads[class_index(cell.class)] != Some(slot)
+                || ledger.claims[&parent.claim].active_facts.class != cell.class
+            {
+                return Err(WorkError::Conflict);
+            }
+            Ok(())
+        }
         _ => Err(WorkError::Conflict),
     }
 }
@@ -672,7 +859,12 @@ pub(super) fn validate_waiting(
         if let Some(source) = &change.source {
             let record = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
             authenticate_scope(state, record, source, work)?;
-            if record.pending != Some(id) {
+            let expected = if matches!(source.source, ClaimSource::PoolFree { .. }) {
+                None
+            } else {
+                Some(id)
+            };
+            if record.pending != expected {
                 return Err(WorkError::Conflict);
             }
         }
@@ -850,6 +1042,26 @@ fn release_current(state: &mut State, id: u64) -> Option<Waker> {
 }
 fn remove_request(state: &mut State, id: u64) {
     if let Some(request) = state.joint.as_mut().unwrap().requests.remove(&id) {
+        for change in request.changes.iter() {
+            if let Some(source) = &change.source {
+                if let ClaimSource::PoolFree { slot, .. } = source.source {
+                    if matches!(state.cancellations.slots[slot.0].phase,
+                        SlotPhase::ChildGranted { ticket, .. } if ticket == id)
+                    {
+                        let record = state
+                            .joint
+                            .as_mut()
+                            .unwrap()
+                            .claims
+                            .get_mut(&source.id)
+                            .unwrap();
+                        assert_eq!(record.pending, Some(id));
+                        record.pending = None;
+                        state.cancellations.retire(slot);
+                    }
+                }
+            }
+        }
         state
             .nodes
             .get_mut(&request.owner)
@@ -874,6 +1086,15 @@ pub(super) fn fail_request(state: &mut State, id: u64, error: WorkError) -> Opti
         RequestPhase::Granted { .. } | RequestPhase::Delivered
     );
     for change in changes.iter() {
+        if change
+            .source
+            .as_ref()
+            .is_some_and(|source| matches!(source.source, ClaimSource::PoolFree { .. }))
+        {
+            // ChildGranted is an actual committed responsibility. Keep its
+            // active domain fee and pending ticket until this reply exits.
+            continue;
+        }
         let Some(old) = change.old else {
             continue;
         };
@@ -952,6 +1173,17 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
         .profile_layout_revision
         .checked_add(changes.len() as u64)
         .ok_or(WorkError::ArithmeticOverflow)?;
+    for change in changes.iter() {
+        if let Some(source) = &change.source {
+            if let ClaimSource::PoolFree { slot, .. } = source.source {
+                let cell = &mut state.cancellations.slots[slot.0];
+                cell.generation
+                    .checked_add(2)
+                    .ok_or(WorkError::ArithmeticOverflow)?;
+                Arc::get_mut(cell.cell.as_mut().unwrap()).ok_or(WorkError::Conflict)?;
+            }
+        }
+    }
     let mut profiles = BTreeMap::new();
     for change in changes.iter() {
         for facts in change
@@ -1000,6 +1232,22 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
             record.facts = Arc::clone(&change.claim.facts);
             record.amounts = change.claim.amounts;
             record.structure_revision += 1; // Reserved by request preflight.
+            if let Some(source) = &change.source {
+                if let ClaimSource::PoolFree { slot, parent, .. } = source.source {
+                    record.active_facts = Arc::clone(&record.facts);
+                    record.active_amounts = record.amounts;
+                    record.pending = Some(id);
+                    let cell = &mut state.cancellations.slots[slot.0];
+                    let class = class_index(cell.class);
+                    assert_eq!(state.cancellations.free_heads[class], Some(slot));
+                    state.cancellations.free_heads[class] = cell.next_free.take();
+                    cell.generation += 1;
+                    cell.phase = SlotPhase::ChildGranted {
+                        parent: parent.work,
+                        ticket: id,
+                    };
+                }
+            }
             if rekey {
                 ledger.layout_changed();
             }
@@ -1178,6 +1426,91 @@ impl JointAdjustmentReceipt {
         self.install_originals(originals, Some(owner))
     }
 
+    /// Publish the one child already committed by this exact reply. No second
+    /// admission or physical-holder guard is created between grant and Node.
+    pub fn install_child(mut self, owner: &WorkOwner) -> Result<WorkOwner, WorkError> {
+        let parent_scope = owner.scope();
+        if !Arc::ptr_eq(&parent_scope.inner, &self.inner) {
+            return Err(WorkError::ForeignAuthority);
+        }
+        let id = self.id.expect("live child receipt");
+        let result = self.inner.update(|state| {
+            let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
+            let request = ledger.requests.get(&id).ok_or(WorkError::Released)?;
+            match &request.phase {
+                RequestPhase::Failed(error) => return Err(error.clone()),
+                RequestPhase::Delivered => {}
+                _ => return Err(WorkError::Conflict),
+            }
+            if state.closed || ledger.driver_closed {
+                return Err(WorkError::Closed);
+            }
+            if request.changes.len() != 1 || request.owner != parent_scope.id {
+                return Err(WorkError::Conflict);
+            }
+            let change = &request.changes[0];
+            let source = change.source.as_ref().ok_or(WorkError::Conflict)?;
+            let ClaimSource::PoolFree {
+                slot,
+                generation,
+                parent,
+                deadline,
+            } = source.source
+            else {
+                return Err(WorkError::Conflict);
+            };
+            authenticate_parent(state, parent, parent_scope.id)?;
+            let cell = &state.cancellations.slots[slot.0];
+            let claim = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
+            if cell.phase
+                != (SlotPhase::ChildGranted {
+                    parent: parent.work,
+                    ticket: id,
+                })
+                || cell.generation
+                    != generation
+                        .checked_add(1)
+                        .ok_or(WorkError::ArithmeticOverflow)?
+                || cell.claim != Some(source.id)
+                || claim.owner != ClaimOwner::ControlSlot(slot)
+                || claim.pending != Some(id)
+                || claim.structure_revision
+                    != source
+                        .structure_revision
+                        .checked_add(1)
+                        .ok_or(WorkError::ArithmeticOverflow)?
+                || claim.release_revision != source.release_revision
+                || claim.amounts != change.claim.amounts
+                || claim.active_amounts != change.claim.amounts
+                || claim.facts.key != change.claim.facts.key
+                || claim.active_facts.key != change.claim.facts.key
+            {
+                return Err(WorkError::Conflict);
+            }
+            claim
+                .structure_revision
+                .checked_add(1)
+                .ok_or(WorkError::ArithmeticOverflow)?;
+            let claim_id = source.id;
+            let child = state.install_bound_child(&self.inner, parent.work, slot, deadline)?;
+            let claim = state
+                .joint
+                .as_mut()
+                .unwrap()
+                .claims
+                .get_mut(&claim_id)
+                .unwrap();
+            claim.structure_revision += 1;
+            claim.pending = None;
+            remove_request(state, id);
+            Ok(child)
+        });
+        if result.is_ok() {
+            self.id = None;
+        }
+        result
+    }
+
     fn install_originals(
         mut self,
         originals: &[&JointClaim],
@@ -1240,6 +1573,7 @@ impl JointAdjustmentReceipt {
                             return Err(WorkError::Conflict);
                         }
                     }
+                    ClaimSource::PoolFree { .. } => return Err(WorkError::Conflict),
                 }
                 let record = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
                 if record.pending != Some(id) {
@@ -1581,6 +1915,25 @@ impl JointLedger {
             amount,
             bound,
         )
+    }
+
+    pub(crate) fn control_has_domains_for_test(
+        &self,
+        claim: u64,
+        expected: &[SharedDependency],
+    ) -> bool {
+        let record = &self.claims[&claim];
+        [&record.facts, &record.active_facts]
+            .into_iter()
+            .all(|facts| {
+                facts.dependencies.len() == expected.len()
+                    && expected.iter().all(|fact| {
+                        facts
+                            .dependencies
+                            .iter()
+                            .any(|dependency| &dependency.fact == fact)
+                    })
+            })
     }
 
     pub(crate) fn control_revision_for_test(&self, claim: u64) -> u64 {
