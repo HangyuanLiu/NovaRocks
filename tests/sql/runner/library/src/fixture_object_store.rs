@@ -20,8 +20,8 @@
 use anyhow::{Result, ensure};
 use novarocks_fs::{
     FileCancellation, FileIdentity, FileResult, FsAccessHandle, FsAccessResolver,
-    ObjectStoreAccessContext, ObjectStoreConfig, ObjectStoreCredentialProviderIdentity,
-    ObjectStoreProviderPool, ObjectStoreProviderPoolOptions, SecretValue,
+    ObjectStoreAccessContext, ObjectStoreConfig, ObjectStoreProviderPool,
+    ObjectStoreProviderPoolOptions, SecretValue,
 };
 use novarocks_spi::connector::{StaticCredentialReference, StorageAccessDomainId};
 use sha2::{Digest, Sha256};
@@ -79,11 +79,9 @@ impl FixtureObjectStore {
             .resolve_location_async(
                 self.access_domain,
                 location,
-                Some(ObjectStoreAccessContext::new(
+                Some(ObjectStoreAccessContext::for_static(
                     self.config.endpoint_config(),
-                    ObjectStoreCredentialProviderIdentity::Static(
-                        self.credential_reference.clone(),
-                    ),
+                    self.credential_reference.clone(),
                     self.config.secret_material(),
                     &self.pool,
                 )),

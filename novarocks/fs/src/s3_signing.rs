@@ -84,7 +84,9 @@ impl S3RequestSigner {
         denial: Arc<CredentialDenialLatch>,
     ) -> FileResult<Self> {
         let material = match source {
-            ObjectStoreCredentialSource::Static(value) => {
+            ObjectStoreCredentialSource::Static {
+                material: value, ..
+            } => {
                 let access_key_id = value.access_key_id.expose_secret().to_owned();
                 let secret_access_key = value.access_key_secret.expose_secret().to_owned();
                 if access_key_id.is_empty() || secret_access_key.is_empty() {
@@ -527,11 +529,18 @@ mod tests {
         .unwrap()
     }
     fn static_material() -> ObjectStoreCredentialSource {
-        ObjectStoreCredentialSource::Static(ObjectStoreSecretMaterial {
-            access_key_id: SecretValue::new("access-static"),
-            access_key_secret: SecretValue::new("secret-static"),
-            session_token: Some(SecretValue::new("token-static")),
-        })
+        ObjectStoreCredentialSource::Static {
+            reference: novarocks_spi::connector::StaticCredentialReference::try_new(
+                "signing-fixture",
+                "v1",
+            )
+            .unwrap(),
+            material: ObjectStoreSecretMaterial {
+                access_key_id: SecretValue::new("access-static"),
+                access_key_secret: SecretValue::new("secret-static"),
+                session_token: Some(SecretValue::new("token-static")),
+            },
+        }
     }
     fn sdk_operator(
         endpoint: &ObjectStoreEndpointIdentity,

@@ -1385,8 +1385,12 @@ impl ObjectStoreProviderPool {
     }
 
     fn start(options: ObjectStoreProviderPoolOptions) -> FileResult<Self> {
+        // Build both transport policies once, before publishing the pool or
+        // starting its janitor. Operators clone these clients, not their pools.
+        let http_clients = ObjectStoreHttpClients::try_new()?;
         let state = Arc::new(ObjectStoreProviderPoolState {
             options,
+            http_clients,
             inner: Mutex::new(ObjectStoreProviderPoolInner::default()),
             wake: Condvar::new(),
         });
@@ -1411,6 +1415,20 @@ impl ObjectStoreProviderPool {
         self.state.options
     }
 
+    // Invoked only by the original single-flight construction owner, after
+    // claim released the pool mutex. Client selection performs no I/O.
+    fn build_operator(
+        &self,
+        endpoint: &ObjectStoreEndpointIdentity,
+        credentials: &ObjectStoreCredentialSource,
+    ) -> FileResult<Operator> {
+        build_object_store_operator(
+            endpoint,
+            credentials,
+            self.state.http_clients.select(endpoint),
+        )
+    }
+
     pub fn metrics_snapshot(&self) -> FileResult<ObjectStoreProviderPoolMetrics> {
         let inner = self.state.lock_inner()?;
         Ok(inner.metrics())
@@ -1421,7 +1439,6 @@ impl ObjectStoreProviderPool {
         access_domain: StorageAccessDomainId,
         bucket: &str,
         endpoint_config: &ObjectStoreEndpointConfig,
-        credential_identity: &ObjectStoreCredentialProviderIdentity,
         credentials: &ObjectStoreCredentialSource,
         builder: F,
     ) -> FileResult<Operator>
@@ -1431,8 +1448,7 @@ impl ObjectStoreProviderPool {
             &ObjectStoreCredentialSource,
         ) -> FileResult<Operator>,
     {
-        let (endpoint, key) =
-            provider_key(access_domain, bucket, endpoint_config, credential_identity)?;
+        let (endpoint, key) = provider_key(access_domain, bucket, endpoint_config, credentials)?;
         match self.claim(key)? {
             ProviderAcquisition::Ready(operator) => Ok(operator),
             ProviderAcquisition::Build(claim) => claim.build(&endpoint, credentials, builder),
@@ -1451,8 +1467,9 @@ impl ObjectStoreProviderPool {
     /// can never leave a construction without an owner.
     async fn acquire_async<F>(
         &self,
-        endpoint: ObjectStoreEndpointIdentity,
-        key: ObjectStoreProviderKey,
+        access_domain: StorageAccessDomainId,
+        bucket: &str,
+        endpoint_config: &ObjectStoreEndpointConfig,
         credentials: &ObjectStoreCredentialSource,
         cancellation: &FileCancellation,
         builder: F,
@@ -1463,6 +1480,7 @@ impl ObjectStoreProviderPool {
             &ObjectStoreCredentialSource,
         ) -> FileResult<Operator>,
     {
+        let (endpoint, key) = provider_key(access_domain, bucket, endpoint_config, credentials)?;
         cancellation.check()?;
         match self.claim(key)? {
             ProviderAcquisition::Ready(operator) => Ok(operator),
@@ -1600,13 +1618,13 @@ fn provider_key(
     access_domain: StorageAccessDomainId,
     bucket: &str,
     endpoint_config: &ObjectStoreEndpointConfig,
-    credential_identity: &ObjectStoreCredentialProviderIdentity,
+    credentials: &ObjectStoreCredentialSource,
 ) -> FileResult<(ObjectStoreEndpointIdentity, ObjectStoreProviderKey)> {
     let endpoint = ObjectStoreEndpointIdentity::try_new(bucket, endpoint_config)?;
     let key = ObjectStoreProviderKey {
         endpoint: endpoint.clone(),
         access_domain,
-        credential_identity: credential_identity.clone(),
+        credential_identity: credentials.identity(),
     };
     Ok((endpoint, key))
 }
@@ -1631,8 +1649,45 @@ impl Debug for ObjectStoreProviderPool {
     }
 }
 
+// HTTP policy belongs to the process FS pool, independently of the operator
+// cache key, bucket, access domain, or credential provider identity.
+struct ObjectStoreHttpClients {
+    local: reqwest::Client,
+    remote: reqwest::Client,
+}
+
+impl ObjectStoreHttpClients {
+    fn try_new() -> FileResult<Self> {
+        let build = |builder: reqwest::ClientBuilder| {
+            builder
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|error| {
+                    FileError::with_source(
+                        FileErrorKind::Internal,
+                        "build object-store pool HTTP client",
+                        error,
+                    )
+                })
+        };
+        Ok(Self {
+            local: build(reqwest::Client::builder().no_proxy())?,
+            remote: build(reqwest::Client::builder())?,
+        })
+    }
+
+    fn select(&self, endpoint: &ObjectStoreEndpointIdentity) -> reqwest::Client {
+        if is_local_endpoint(&endpoint.endpoint) {
+            self.local.clone()
+        } else {
+            self.remote.clone()
+        }
+    }
+}
+
 struct ObjectStoreProviderPoolState {
     options: ObjectStoreProviderPoolOptions,
+    http_clients: ObjectStoreHttpClients,
     inner: Mutex<ObjectStoreProviderPoolInner>,
     wake: Condvar,
 }
@@ -1966,13 +2021,10 @@ impl ObjectStoreBuildReservation {
 ///
 /// Secret material remains outside this type and outside all pool keys.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-#[non_exhaustive]
-pub enum ObjectStoreCredentialProviderIdentity {
+enum ObjectStoreCredentialProviderIdentity {
     /// Startup-composed material named by an exact static reference.
     Static(StaticCredentialReference),
-    /// Material owned by a consumer-side [`StorageAuthority`]. Mint this only
-    /// through [`ObjectStoreAccessContext::for_authority`], which takes the
-    /// identity from the authority that will actually sign the requests.
+    /// Identity derived from the authority that will sign the request.
     Vended(StorageAuthorityId),
 }
 
@@ -1985,14 +2037,37 @@ pub enum ObjectStoreCredentialProviderIdentity {
 /// operator outlive the rotation and the expiry of any single credential.
 #[derive(Clone)]
 enum ObjectStoreCredentialSource {
-    Static(ObjectStoreSecretMaterial),
+    Static {
+        reference: StaticCredentialReference,
+        material: ObjectStoreSecretMaterial,
+    },
     Authority(Arc<StorageAuthority>),
+}
+
+impl ObjectStoreCredentialSource {
+    fn identity(&self) -> ObjectStoreCredentialProviderIdentity {
+        match self {
+            Self::Static { reference, .. } => {
+                ObjectStoreCredentialProviderIdentity::Static(reference.clone())
+            }
+            Self::Authority(authority) => {
+                ObjectStoreCredentialProviderIdentity::Vended(authority.id().clone())
+            }
+        }
+    }
 }
 
 impl Debug for ObjectStoreCredentialSource {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Static(material) => f.debug_tuple("Static").field(material).finish(),
+            Self::Static {
+                reference,
+                material,
+            } => f
+                .debug_struct("Static")
+                .field("reference", reference)
+                .field("material", material)
+                .finish(),
             Self::Authority(authority) => f.debug_tuple("Authority").field(authority).finish(),
         }
     }
@@ -2000,23 +2075,24 @@ impl Debug for ObjectStoreCredentialSource {
 
 pub struct ObjectStoreAccessContext<'a> {
     endpoint_config: ObjectStoreEndpointConfig,
-    credential_identity: ObjectStoreCredentialProviderIdentity,
     credentials: ObjectStoreCredentialSource,
     provider_pool: &'a ObjectStoreProviderPool,
 }
 
 impl<'a> ObjectStoreAccessContext<'a> {
     /// Bind startup-composed static material to its exact reference.
-    pub fn new(
+    pub fn for_static(
         endpoint_config: ObjectStoreEndpointConfig,
-        credential_identity: ObjectStoreCredentialProviderIdentity,
+        credential_reference: StaticCredentialReference,
         secret_material: ObjectStoreSecretMaterial,
         provider_pool: &'a ObjectStoreProviderPool,
     ) -> Self {
         Self {
             endpoint_config,
-            credential_identity,
-            credentials: ObjectStoreCredentialSource::Static(secret_material),
+            credentials: ObjectStoreCredentialSource::Static {
+                reference: credential_reference,
+                material: secret_material,
+            },
             provider_pool,
         }
     }
@@ -2032,9 +2108,6 @@ impl<'a> ObjectStoreAccessContext<'a> {
     ) -> Self {
         Self {
             endpoint_config,
-            credential_identity: ObjectStoreCredentialProviderIdentity::Vended(
-                authority.id().clone(),
-            ),
             credentials: ObjectStoreCredentialSource::Authority(authority),
             provider_pool,
         }
@@ -2045,7 +2118,6 @@ impl Debug for ObjectStoreAccessContext<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ObjectStoreAccessContext")
             .field("endpoint_config", &self.endpoint_config)
-            .field("credential_identity", &self.credential_identity)
             .field("credentials", &self.credentials)
             .field("provider_pool", &self.provider_pool)
             .finish_non_exhaustive()
@@ -2146,20 +2218,17 @@ impl FsAccessResolver {
             FsScheme::Local => resolve_local_locations(access_domain, locations),
             FsScheme::ObjectStore => {
                 let (access, bucket) = object_store_target(&locations, object_store_access)?;
-                let (endpoint, key) = provider_key(
-                    access_domain,
-                    &bucket,
-                    &access.endpoint_config,
-                    &access.credential_identity,
-                )?;
                 let operator = access
                     .provider_pool
                     .acquire_async(
-                        endpoint,
-                        key,
+                        access_domain,
+                        &bucket,
+                        &access.endpoint_config,
                         &access.credentials,
                         cancellation,
-                        build_object_store_operator,
+                        |endpoint, credentials| {
+                            access.provider_pool.build_operator(endpoint, credentials)
+                        },
                     )
                     .await?;
                 object_store_handle(access_domain, locations, bucket, operator)
@@ -2303,9 +2372,12 @@ fn resolve_object_store_locations(
         access_domain,
         &bucket,
         &object_store_access.endpoint_config,
-        &object_store_access.credential_identity,
         &object_store_access.credentials,
-        build_object_store_operator,
+        |endpoint, credentials| {
+            object_store_access
+                .provider_pool
+                .build_operator(endpoint, credentials)
+        },
     )?;
     object_store_handle(access_domain, locations, bucket, operator)
 }
@@ -2360,6 +2432,7 @@ fn object_store_handle(
 fn build_object_store_operator(
     endpoint: &ObjectStoreEndpointIdentity,
     credentials: &ObjectStoreCredentialSource,
+    client: reqwest::Client,
 ) -> FileResult<Operator> {
     // Signing belongs to the Provider transport, after it sees the actual
     // SDK-selected request URI. The SDK must not load credentials first.
@@ -2373,17 +2446,6 @@ fn build_object_store_operator(
     if !endpoint.use_path_style {
         builder = builder.enable_virtual_host_style();
     }
-    let mut client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
-    if is_local_endpoint(&endpoint.endpoint) {
-        client = client.no_proxy();
-    }
-    let client = client.build().map_err(|error| {
-        FileError::with_source(
-            FileErrorKind::Internal,
-            "build Provider S3 signing HTTP client",
-            error,
-        )
-    })?;
     let denial = Arc::new(CredentialDenialLatch::default());
     let signer = Arc::new(S3RequestSigner::new(
         endpoint,
@@ -3688,14 +3750,24 @@ mod tests {
         );
     }
 
-    fn credential_identity(generation: &str) -> ObjectStoreCredentialProviderIdentity {
-        ObjectStoreCredentialProviderIdentity::Static(
-            StaticCredentialReference::try_new("warehouse-data", generation).unwrap(),
-        )
+    // Explicit fixture policy for tests that deliberately bypass the pool.
+    fn test_s3_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    fn static_reference(generation: &str) -> StaticCredentialReference {
+        StaticCredentialReference::try_new("warehouse-data", generation).unwrap()
     }
 
     fn static_source(secret_suffix: &str) -> ObjectStoreCredentialSource {
-        ObjectStoreCredentialSource::Static(secret_material(secret_suffix))
+        ObjectStoreCredentialSource::Static {
+            reference: static_reference("blue"),
+            material: secret_material(secret_suffix),
+        }
     }
 
     fn authority_id(scope: &str) -> StorageAuthorityId {
@@ -4478,12 +4550,10 @@ mod tests {
     fn provider_pool_reuses_static_reference_without_secret_keys() {
         let pool = ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions::default()).unwrap();
         let endpoint = endpoint_config("http://localhost:9000");
-        let identity = credential_identity("blue");
         pool.acquire(
             domain(1),
             "warehouse",
             &endpoint,
-            &identity,
             &static_source("first"),
             |_, _| memory_operator(),
         )
@@ -4492,7 +4562,6 @@ mod tests {
             domain(1),
             "warehouse",
             &endpoint,
-            &identity,
             &static_source("different-value-same-reference"),
             |_, _| -> FileResult<Operator> {
                 panic!("secret material must not participate in the provider key")
@@ -4512,26 +4581,11 @@ mod tests {
     fn provider_pool_reuses_one_authority_identity_across_credential_rotations() {
         let pool = ObjectStoreProviderPool::new_for_test(4, Duration::from_secs(60)).unwrap();
         let endpoint = endpoint_config("http://localhost:9000");
-        let orders = ObjectStoreCredentialProviderIdentity::Vended(authority_id(
-            "s3://warehouse/sales/orders/",
-        ));
-        let returns = ObjectStoreCredentialProviderIdentity::Vended(authority_id(
-            "s3://warehouse/sales/returns/",
-        ));
         let first = seeded_authority(
             "s3://warehouse/sales/orders/",
             Some(vended_material(
                 "first",
                 Instant::now() + Duration::from_secs(900),
-            )),
-        );
-        // A later resolution of the same authorized scope brings rotated
-        // material. CAD-1 D0: that must be a cache hit, not a rebuild.
-        let rotated = seeded_authority(
-            "s3://warehouse/sales/orders/",
-            Some(vended_material(
-                "rotated",
-                Instant::now() + Duration::from_secs(1800),
             )),
         );
         let other_scope = seeded_authority("s3://warehouse/sales/returns/", None);
@@ -4540,17 +4594,27 @@ mod tests {
             domain(1),
             "warehouse",
             &endpoint,
-            &orders,
-            &ObjectStoreCredentialSource::Authority(first),
-            |_, _| memory_operator(),
+            &ObjectStoreCredentialSource::Authority(Arc::clone(&first)),
+            |_, source| {
+                assert!(
+                    matches!(source, ObjectStoreCredentialSource::Authority(owner)
+                    if Arc::ptr_eq(owner, &first))
+                );
+                memory_operator()
+            },
         )
         .unwrap();
+        // Rotate the original authority, not another Arc with
+        // the same identity. The resident signer must keep this exact owner.
+        first.install_material(vended_material(
+            "rotated",
+            Instant::now() + Duration::from_secs(1800),
+        ));
         pool.acquire(
             domain(1),
             "warehouse",
             &endpoint,
-            &orders,
-            &ObjectStoreCredentialSource::Authority(rotated),
+            &ObjectStoreCredentialSource::Authority(Arc::clone(&first)),
             |_, _| -> FileResult<Operator> {
                 panic!("rotated credential material must not rebuild the operator")
             },
@@ -4560,7 +4624,6 @@ mod tests {
             domain(1),
             "warehouse",
             &endpoint,
-            &returns,
             &ObjectStoreCredentialSource::Authority(other_scope),
             |_, _| memory_operator(),
         )
@@ -4573,6 +4636,103 @@ mod tests {
     }
 
     #[test]
+    fn provider_pool_keeps_static_and_authority_sources_separate_in_both_orders() {
+        for authority_first in [false, true] {
+            let pool = ObjectStoreProviderPool::new_for_test(8, Duration::from_secs(60)).unwrap();
+            let endpoint = endpoint_config("http://localhost:9000");
+            let authority = seeded_authority("s3://warehouse/sales/orders/", None);
+            let static_context = ObjectStoreAccessContext::for_static(
+                endpoint.clone(),
+                static_reference("blue"),
+                secret_material("static"),
+                &pool,
+            );
+            let authority_context = ObjectStoreAccessContext::for_authority(
+                endpoint.clone(),
+                Arc::clone(&authority),
+                &pool,
+            );
+            let acquire = |context: &ObjectStoreAccessContext<'_>| {
+                context.provider_pool.acquire(
+                    domain(1),
+                    "warehouse",
+                    &context.endpoint_config,
+                    &context.credentials,
+                    |_, _| memory_operator(),
+                )
+            };
+            let (static_operator, authority_operator) = if authority_first {
+                let authority_operator = acquire(&authority_context).unwrap();
+                let static_operator = acquire(&static_context).unwrap();
+                (static_operator, authority_operator)
+            } else {
+                let static_operator = acquire(&static_context).unwrap();
+                let authority_operator = acquire(&authority_context).unwrap();
+                (static_operator, authority_operator)
+            };
+            assert!(
+                !Arc::ptr_eq(
+                    static_operator.base_service(),
+                    authority_operator.base_service()
+                ),
+                "a static context cannot hit an authority-backed operator or poison its key"
+            );
+
+            let repeated_static = ObjectStoreAccessContext::for_static(
+                endpoint.clone(),
+                static_reference("blue"),
+                secret_material("same-reference-ignored-material"),
+                &pool,
+            );
+            let repeated_authority = ObjectStoreAccessContext::for_authority(
+                endpoint.clone(),
+                Arc::clone(&authority),
+                &pool,
+            );
+            let static_hit = acquire(&repeated_static).unwrap();
+            let authority_hit = acquire(&repeated_authority).unwrap();
+            assert!(Arc::ptr_eq(
+                static_operator.base_service(),
+                static_hit.base_service()
+            ));
+            assert!(Arc::ptr_eq(
+                authority_operator.base_service(),
+                authority_hit.base_service()
+            ));
+
+            let next_generation = ObjectStoreAccessContext::for_static(
+                endpoint.clone(),
+                static_reference("green"),
+                secret_material("static"),
+                &pool,
+            );
+            let next_operator = acquire(&next_generation).unwrap();
+            assert!(!Arc::ptr_eq(
+                static_operator.base_service(),
+                next_operator.base_service()
+            ));
+            let other_domain = pool
+                .acquire(
+                    domain(2),
+                    "warehouse",
+                    &static_context.endpoint_config,
+                    &static_context.credentials,
+                    |_, _| memory_operator(),
+                )
+                .unwrap();
+            assert!(!Arc::ptr_eq(
+                static_operator.base_service(),
+                other_domain.base_service()
+            ));
+            let metrics = pool.metrics_snapshot().unwrap();
+            assert_eq!(metrics.operator_constructions, 4);
+            assert_eq!(metrics.cache_hits, 2);
+            assert_eq!(metrics.cache_misses, 4);
+            assert_eq!(metrics.resident_entries, 4);
+        }
+    }
+
+    #[test]
     fn provider_pool_capacity_evicts_the_oldest_access_domain() {
         let pool = ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions {
             capacity: 1,
@@ -4580,25 +4740,14 @@ mod tests {
         })
         .unwrap();
         let endpoint = endpoint_config("http://localhost:9000");
-        let identity = credential_identity("blue");
         let secrets = static_source("one");
-        pool.acquire(
-            domain(1),
-            "warehouse",
-            &endpoint,
-            &identity,
-            &secrets,
-            |_, _| memory_operator(),
-        )
+        pool.acquire(domain(1), "warehouse", &endpoint, &secrets, |_, _| {
+            memory_operator()
+        })
         .unwrap();
-        pool.acquire(
-            domain(2),
-            "warehouse",
-            &endpoint,
-            &identity,
-            &secrets,
-            |_, _| memory_operator(),
-        )
+        pool.acquire(domain(2), "warehouse", &endpoint, &secrets, |_, _| {
+            memory_operator()
+        })
         .unwrap();
 
         let metrics = pool.metrics_snapshot().unwrap();
@@ -4615,7 +4764,6 @@ mod tests {
             domain(1),
             "warehouse",
             &endpoint_config("http://localhost:9000"),
-            &credential_identity("blue"),
             &static_source("one"),
             |_, _| memory_operator(),
         )
@@ -4649,21 +4797,13 @@ mod tests {
             let constructions = Arc::clone(&constructions);
             workers.push(std::thread::spawn(move || {
                 let endpoint = endpoint_config("http://localhost:9000");
-                let identity = credential_identity("blue");
                 let secrets = static_source("one");
                 barrier.wait();
-                pool.acquire(
-                    domain(1),
-                    "warehouse",
-                    &endpoint,
-                    &identity,
-                    &secrets,
-                    |_, _| {
-                        constructions.fetch_add(1, Ordering::SeqCst);
-                        std::thread::sleep(Duration::from_millis(50));
-                        memory_operator()
-                    },
-                )
+                pool.acquire(domain(1), "warehouse", &endpoint, &secrets, |_, _| {
+                    constructions.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(50));
+                    memory_operator()
+                })
                 .unwrap();
             }));
         }
@@ -4695,7 +4835,7 @@ mod tests {
             domain(1),
             "warehouse",
             &endpoint_config("http://localhost:9000"),
-            &credential_identity("blue"),
+            &static_source("one"),
         )
         .expect("provider key")
     }
@@ -4705,11 +4845,11 @@ mod tests {
         cancellation: FileCancellation,
     ) -> tokio::task::JoinHandle<FileResult<Operator>> {
         let pool = Arc::clone(pool);
-        let (endpoint, key) = waiting_key();
         tokio::spawn(async move {
             pool.acquire_async(
-                endpoint,
-                key,
+                domain(1),
+                "warehouse",
+                &endpoint_config("http://localhost:9000"),
                 &static_source("one"),
                 &cancellation,
                 |_, _| -> FileResult<Operator> { panic!("a waiter never constructs") },
@@ -4734,7 +4874,6 @@ mod tests {
                     domain(1),
                     "warehouse",
                     &endpoint_config("http://localhost:9000"),
-                    &credential_identity("blue"),
                     &static_source("one"),
                     |_, _| {
                         constructions.fetch_add(1, Ordering::SeqCst);
@@ -4811,7 +4950,6 @@ mod tests {
             domain(1),
             "warehouse",
             &endpoint_config("http://localhost:9000"),
-            &credential_identity("blue"),
             &static_source("one"),
             |_, _| memory_operator(),
         )
@@ -4863,7 +5001,6 @@ mod tests {
                     domain(1),
                     "warehouse",
                     &endpoint_config("http://localhost:9000"),
-                    &credential_identity("blue"),
                     &static_source("one"),
                     |_, _| -> FileResult<Operator> {
                         entered.send(()).expect("entered");
@@ -4896,7 +5033,6 @@ mod tests {
             domain(1),
             "warehouse",
             &endpoint_config("http://localhost:9000"),
-            &credential_identity("blue"),
             &static_source("one"),
             |_, _| memory_operator(),
         )
@@ -4915,9 +5051,9 @@ mod tests {
                     .resolve_location_async(
                         domain(1),
                         "s3://warehouse/sales/part-0.parquet",
-                        Some(ObjectStoreAccessContext::new(
+                        Some(ObjectStoreAccessContext::for_static(
                             endpoint_config("http://localhost:9000"),
-                            credential_identity("blue"),
+                            static_reference("blue"),
                             secret_material("one"),
                             &pool,
                         )),
@@ -4938,9 +5074,9 @@ mod tests {
             .resolve_location(
                 domain(1),
                 "s3://warehouse/sales/part-1.parquet",
-                Some(ObjectStoreAccessContext::new(
+                Some(ObjectStoreAccessContext::for_static(
                     endpoint_config("http://localhost:9000"),
-                    credential_identity("blue"),
+                    static_reference("blue"),
                     secret_material("one"),
                     &pool,
                 )),
@@ -4955,38 +5091,24 @@ mod tests {
     fn failed_construction_does_not_evict_a_healthy_entry() {
         let pool = ObjectStoreProviderPool::new_for_test(1, Duration::from_secs(1)).unwrap();
         let endpoint = endpoint_config("http://localhost:9000");
-        let identity = credential_identity("blue");
         let secrets = static_source("one");
-        pool.acquire(
-            domain(1),
-            "warehouse",
-            &endpoint,
-            &identity,
-            &secrets,
-            |_, _| memory_operator(),
-        )
+        pool.acquire(domain(1), "warehouse", &endpoint, &secrets, |_, _| {
+            memory_operator()
+        })
         .unwrap();
         let error = pool
-            .acquire(
-                domain(2),
-                "warehouse",
-                &endpoint,
-                &identity,
-                &secrets,
-                |_, _| {
-                    Err(FileError::new(
-                        FileErrorKind::Invalid,
-                        "injected construction failure",
-                    ))
-                },
-            )
+            .acquire(domain(2), "warehouse", &endpoint, &secrets, |_, _| {
+                Err(FileError::new(
+                    FileErrorKind::Invalid,
+                    "injected construction failure",
+                ))
+            })
             .unwrap_err();
         assert_eq!(error.kind(), FileErrorKind::Invalid);
         pool.acquire(
             domain(1),
             "warehouse",
             &endpoint,
-            &identity,
             &secrets,
             |_, _| -> FileResult<Operator> { panic!("healthy entry must remain resident") },
         )
@@ -5035,13 +5157,11 @@ mod tests {
     #[test]
     fn canonical_equivalent_endpoints_share_one_provider_key() {
         let pool = ObjectStoreProviderPool::new_for_test(2, Duration::from_secs(1)).unwrap();
-        let identity = credential_identity("blue");
         let secrets = static_source("one");
         pool.acquire(
             domain(1),
             "warehouse",
             &endpoint_config("HTTPS://EXAMPLE.COM:443/a/../api//"),
-            &identity,
             &secrets,
             |_, _| memory_operator(),
         )
@@ -5050,7 +5170,6 @@ mod tests {
             domain(1),
             "warehouse",
             &endpoint_config("https://example.com/api"),
-            &identity,
             &secrets,
             |_, _| -> FileResult<Operator> {
                 panic!("canonical equivalent endpoint must reuse the resident provider")
@@ -5161,6 +5280,7 @@ mod tests {
         let operator = build_object_store_operator(
             &endpoint,
             &ObjectStoreCredentialSource::Authority(Arc::clone(&authority)),
+            test_s3_http_client(),
         )
         .unwrap();
 
@@ -5200,6 +5320,7 @@ mod tests {
         let operator = build_object_store_operator(
             &endpoint,
             &ObjectStoreCredentialSource::Authority(Arc::clone(&authority)),
+            test_s3_http_client(),
         )
         .unwrap();
 
@@ -5340,6 +5461,7 @@ mod tests {
         let operator = build_object_store_operator(
             &endpoint,
             &ObjectStoreCredentialSource::Authority(authority.clone()),
+            test_s3_http_client(),
         )
         .unwrap();
         (operator, authority, source)
@@ -5532,6 +5654,210 @@ mod tests {
         assert!(mapped.authority_cause().is_none());
     }
 
+    // One finite server owner multiplexes every accepted socket, so an
+    // accidental per-operator client produces a count failure, not a hang
+    // waiting for a second connection behind the first keepalive socket.
+    struct S3KeepaliveObservation {
+        accepted: usize,
+        targets: Vec<String>,
+    }
+
+    struct S3KeepaliveFixture {
+        address: std::net::SocketAddr,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        server: Option<JoinHandle<std::io::Result<S3KeepaliveObservation>>>,
+    }
+
+    impl S3KeepaliveFixture {
+        fn start() -> Self {
+            use std::io::{Error, ErrorKind, Read, Write};
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_stop = Arc::clone(&stop);
+            let server = std::thread::spawn(move || {
+                struct Connection {
+                    stream: std::net::TcpStream,
+                    request: Vec<u8>,
+                    response_offset: Option<usize>,
+                }
+                const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"fixture\"\r\nLast-Modified: Mon, 01 Jan 2024 00:00:00 GMT\r\nConnection: keep-alive\r\n\r\n";
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let mut connections = Vec::<Connection>::new();
+                let mut accepted = 0;
+                let mut targets = Vec::new();
+                while !server_stop.load(Ordering::Acquire) {
+                    if Instant::now() >= deadline {
+                        return Err(Error::new(
+                            ErrorKind::TimedOut,
+                            "keepalive fixture deadline",
+                        ));
+                    }
+                    loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                if accepted == 8 {
+                                    return Err(Error::other("too many fixture connections"));
+                                }
+                                stream.set_nonblocking(true)?;
+                                accepted += 1;
+                                connections.push(Connection {
+                                    stream,
+                                    request: Vec::new(),
+                                    response_offset: None,
+                                });
+                            }
+                            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    let mut index = 0;
+                    while index < connections.len() {
+                        let connection = &mut connections[index];
+                        let mut closed = false;
+                        if connection.response_offset.is_none() {
+                            let mut bytes = [0; 4096];
+                            match connection.stream.read(&mut bytes) {
+                                Ok(0) => closed = true,
+                                Ok(count) => {
+                                    connection.request.extend_from_slice(&bytes[..count]);
+                                    if connection.request.len() > 8192 {
+                                        return Err(Error::other("oversized fixture request"));
+                                    }
+                                    if connection.request.windows(4).any(|w| w == b"\r\n\r\n") {
+                                        let line = connection
+                                            .request
+                                            .split(|b| *b == b'\n')
+                                            .next()
+                                            .unwrap();
+                                        let line = std::str::from_utf8(line).map_err(|error| {
+                                            Error::new(ErrorKind::InvalidData, error)
+                                        })?;
+                                        if !line.starts_with("HEAD ") || targets.len() == 8 {
+                                            return Err(Error::other("unexpected fixture request"));
+                                        }
+                                        targets.push(line.trim_end().to_string());
+                                        connection.request.clear();
+                                        connection.response_offset = Some(0);
+                                    }
+                                }
+                                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        if let Some(offset) = connection.response_offset {
+                            match connection.stream.write(&RESPONSE[offset..]) {
+                                Ok(0) => {
+                                    return Err(Error::new(
+                                        ErrorKind::WriteZero,
+                                        "fixture response",
+                                    ));
+                                }
+                                Ok(count) => {
+                                    connection.response_offset = if offset + count == RESPONSE.len()
+                                    {
+                                        None
+                                    } else {
+                                        Some(offset + count)
+                                    };
+                                }
+                                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        if closed {
+                            connections.swap_remove(index);
+                        } else {
+                            index += 1;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(S3KeepaliveObservation { accepted, targets })
+            });
+            Self {
+                address,
+                stop,
+                server: Some(server),
+            }
+        }
+
+        fn finish(mut self) -> std::io::Result<S3KeepaliveObservation> {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            self.server
+                .take()
+                .unwrap()
+                .join()
+                .map_err(|_| std::io::Error::other("keepalive fixture panicked"))?
+        }
+    }
+
+    impl Drop for S3KeepaliveFixture {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(server) = self.server.take() {
+                // Also runs after a failed client assertion, without a second panic.
+                let _ = server.join();
+            }
+        }
+    }
+
+    #[test]
+    fn pool_http_client_reuses_one_connection_across_bucket_and_credential_operators() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = S3KeepaliveFixture::start();
+        let pool = ObjectStoreProviderPool::new_for_test(8, Duration::from_secs(60)).unwrap();
+        let mut config = endpoint_config(&format!("http://{}", server.address));
+        config.retry_max_times = Some(0);
+        config.timeout_ms = Some(5_000);
+        config.io_timeout_ms = Some(5_000);
+        let acquire = |bucket: &str, generation: &str| {
+            pool.acquire(
+                domain(77),
+                bucket,
+                &config,
+                &ObjectStoreCredentialSource::Static {
+                    reference: static_reference(generation),
+                    material: secret_material(generation),
+                },
+                |endpoint, credentials| pool.build_operator(endpoint, credentials),
+            )
+            .unwrap()
+        };
+        let one = acquire("one", "first");
+        let two = acquire("two", "first");
+        let alias = acquire("one", "second");
+        runtime.block_on(async {
+            one.stat("object").await.unwrap();
+            two.stat("object").await.unwrap();
+        });
+        let constructions = pool.metrics_snapshot().unwrap().operator_constructions;
+        // An external operator alias retains the client after the original
+        // pool owner exits. Pool destruction is not an HTTP-exit proof.
+        drop(pool);
+        runtime.block_on(alias.stat("object")).unwrap();
+        drop((one, two, alias));
+        let S3KeepaliveObservation { accepted, targets } = server.finish().unwrap();
+        assert_eq!(constructions, 3);
+        assert_eq!(
+            targets,
+            [
+                "HEAD /one/object HTTP/1.1",
+                "HEAD /two/object HTTP/1.1",
+                "HEAD /one/object HTTP/1.1",
+            ]
+        );
+        assert_eq!(
+            accepted, 1,
+            "bucket and credential aliases share the pool client"
+        );
+    }
+
     #[test]
     fn real_s3_http_failures_keep_their_generic_connector_facts() {
         use novarocks_failure_contract::FailureProjection;
@@ -5586,6 +5912,7 @@ mod tests {
             let operator = build_object_store_operator(
                 &endpoint,
                 &ObjectStoreCredentialSource::Authority(authority.clone()),
+                test_s3_http_client(),
             )
             .unwrap();
             let result = runtime.block_on(operator.stat("sales/orders/part-0.parquet"));

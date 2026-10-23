@@ -153,8 +153,7 @@ pub(super) async fn immutable_artifacts(
 ) -> Result<novarocks_connector_iceberg::iceberg::io::FileIO> {
     use novarocks_fs::{
         FileCancellation, FileIdentity, FileReadRange, FsAccessResolver, ObjectStoreAccessContext,
-        ObjectStoreConfig, ObjectStoreCredentialProviderIdentity, ObjectStoreProviderPool,
-        ObjectStoreProviderPoolOptions, SecretValue,
+        ObjectStoreConfig, ObjectStoreProviderPool, ObjectStoreProviderPoolOptions, SecretValue,
     };
     use novarocks_spi::connector::{StaticCredentialReference, StorageAccessDomainId};
     let access = env::var("AWS_S3_ACCESS_KEY_ID").context("missing fixture access credential")?;
@@ -175,9 +174,7 @@ pub(super) async fn immutable_artifacts(
         timeout_ms: None,
         io_timeout_ms: None,
     };
-    let identity = ObjectStoreCredentialProviderIdentity::Static(
-        StaticCredentialReference::try_new("uea4g-immutable-fixture", "v1")?,
-    );
+    let credential_reference = StaticCredentialReference::try_new("uea4g-immutable-fixture", "v1")?;
     // Fixture access identity is independent of execution fault-domain admission.
     let domain = StorageAccessDomainId::from_bytes(
         Sha256::digest(fixture.manifest.s3_endpoint.as_bytes()).into(),
@@ -214,9 +211,9 @@ pub(super) async fn immutable_artifacts(
         let file = FsAccessResolver::new().resolve_location(
             domain,
             path,
-            Some(ObjectStoreAccessContext::new(
+            Some(ObjectStoreAccessContext::for_static(
                 config.endpoint_config(),
-                identity.clone(),
+                credential_reference.clone(),
                 config.secret_material(),
                 &provider_pool,
             )),

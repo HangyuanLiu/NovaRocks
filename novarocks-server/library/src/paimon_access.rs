@@ -24,7 +24,7 @@ use novarocks_connector_paimon::io::{PaimonFsAuthorizedListing, PaimonHostFileIo
 use novarocks_connector_paimon::role_binding::PaimonRoleFileIoFactory;
 use novarocks_fs::{
     FileCancellation, FileError, FileRangeScope, FileRangeService, FsAccessResources, FsScheme,
-    ObjectStoreAccessContext, ObjectStoreCredentialProviderIdentity, ObjectStoreSecretMaterial,
+    ObjectStoreAccessContext, ObjectStoreSecretMaterial,
     object_store_endpoint_config_from_aws_s3_catalog_property_pairs,
 };
 use novarocks_spi::connector::{
@@ -163,9 +163,9 @@ impl PaimonRoleFileIoFactory for ServerPaimonRoleFileIoFactory {
             .ok_or_else(|| {
                 invalid("role-local registry has no exact S3 object-store credential binding")
             })?;
-        let object_store_access = ObjectStoreAccessContext::new(
+        let object_store_access = ObjectStoreAccessContext::for_static(
             endpoint_config,
-            ObjectStoreCredentialProviderIdentity::Static(credential_reference.clone()),
+            credential_reference.clone(),
             ObjectStoreSecretMaterial {
                 access_key_id: material.access_key_id().clone(),
                 access_key_secret: material.access_key_secret().clone(),

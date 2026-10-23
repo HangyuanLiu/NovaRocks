@@ -28,8 +28,7 @@ use novarocks_fs::{
     AcquisitionFailure, AuthorityCapabilityPath, AuthorityMaterial, AuthorityMaterialSource,
     FileIdentity, FileIoRuntime, FileReadContext, FileTaskSpawner, FsAccessHandle,
     FsAccessResolver, FsAccessResources, FsScheme, ObjectStoreAccessContext,
-    ObjectStoreCredentialProviderIdentity, ObjectStoreEndpointConfig, ObjectStoreSecretMaterial,
-    RefreshExecutor, StorageAuthorityId,
+    ObjectStoreEndpointConfig, ObjectStoreSecretMaterial, RefreshExecutor, StorageAuthorityId,
 };
 use novarocks_spi::connector::{
     CatalogCredentialMode, CatalogCredentialPurpose, CatalogNonSecretProperty, CatalogProperties,
@@ -990,9 +989,9 @@ impl IcebergReadBinding {
                     "Iceberg object-store operation lacks an exact binding",
                 ));
             };
-            return Ok(Some(ObjectStoreAccessContext::new(
+            return Ok(Some(ObjectStoreAccessContext::for_static(
                 endpoint_config,
-                ObjectStoreCredentialProviderIdentity::Static(credential_reference.clone()),
+                credential_reference.clone(),
                 secret_material,
                 self.resources.object_store_provider_pool(),
             )));

@@ -19,7 +19,6 @@ use std::convert::Infallible;
 use std::future;
 use std::mem;
 use std::pin::Pin;
-use std::sync::LazyLock;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -29,18 +28,10 @@ use http_body::{Frame, SizeHint};
 use opendal::raw::{parse_content_encoding, parse_content_length};
 use opendal::{Buffer, Error, ErrorKind, HttpBody, HttpTransport};
 
-static DEFAULT_REQWEST_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
-
 /// Preserve the original reqwest 0.12 bridge at OpenDAL's public transport seam.
 #[derive(Clone)]
 pub(crate) struct Reqwest012Transport {
     client: reqwest::Client,
-}
-
-impl Default for Reqwest012Transport {
-    fn default() -> Self {
-        Self::new(DEFAULT_REQWEST_CLIENT.clone())
-    }
 }
 
 impl Reqwest012Transport {
