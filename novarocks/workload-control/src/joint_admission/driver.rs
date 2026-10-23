@@ -31,7 +31,7 @@ use super::{
 use crate::{WorkId, WorkloadProgressRevision, scope::Inner};
 use std::{
     collections::BTreeMap,
-    ops::Bound::{Excluded, Unbounded},
+    ops::Bound::{Excluded, Included, Unbounded},
     sync::Arc,
     task::Poll,
 };
@@ -51,7 +51,8 @@ pub struct JointProgressDriver {
     active: Option<Turn>,
     cursor: Option<u64>,
     scan_left: usize,
-    observed_release: u64,
+    scan_end: Option<u64>,
+    scan_revision: Option<WorkloadProgressRevision>,
 }
 #[derive(Clone, Copy)]
 enum Preparation {
@@ -90,7 +91,8 @@ impl JointProgressDriver {
             active: None,
             cursor: None,
             scan_left: 0,
-            observed_release: 0,
+            scan_end: None,
+            scan_revision: None,
         }
     }
 
@@ -104,19 +106,34 @@ impl JointProgressDriver {
                 let idle_revision = state.progress_marker();
                 let start = (|| {
                     let ledger = state.joint.as_mut().expect("installed joint driver");
-                    if self.observed_release != ledger.release_epoch || self.scan_left == 0 {
-                        self.observed_release = ledger.release_epoch;
+                    if self.scan_left == 0 {
+                        // New requests join the next finite pass. Releases can
+                        // invalidate a negative certificate, but cannot extend
+                        // this pass or let new IDs perpetually prevent wrap.
                         self.scan_left = ledger.requests.len();
+                        self.scan_end = ledger.requests.last_key_value().map(|(&id, _)| id);
+                        self.scan_revision = Some(idle_revision);
                     }
                     if self.scan_left == 0 {
                         return None;
                     }
+                    let end = self.scan_end.expect("nonempty finite request pass");
+                    let start = self.cursor.filter(|cursor| *cursor <= end);
                     let next = ledger
                         .requests
-                        .range((self.cursor.map_or(Unbounded, Excluded), Unbounded))
+                        .range((start.map_or(Unbounded, Excluded), Included(end)))
                         .next()
-                        .or_else(|| ledger.requests.first_key_value());
-                    let (&id, request) = next?;
+                        .or_else(|| ledger.requests.range(..=end).next());
+                    let Some((&id, request)) = next else {
+                        // Every member of this pass may have exited. A newer
+                        // ticket already present requires another turn, not an
+                        // Idle verdict whose revision would swallow its wake.
+                        self.scan_left = 0;
+                        if ledger.requests.is_empty() {
+                            return None;
+                        }
+                        return Some(Err(true));
+                    };
                     self.cursor = Some(id);
                     self.scan_left -= 1;
                     let cancelled = ledger.driver_closed
@@ -132,7 +149,7 @@ impl JointProgressDriver {
                         || (!matches!(request.phase, RequestPhase::Waiting) && !cancelled)
                         || (request.blocked_at == Some(ledger.release_epoch) && !cancelled)
                     {
-                        return Some(Err(()));
+                        return Some(Err(false));
                     }
                     ledger.active = Some(id);
                     Some(Ok(Turn {
@@ -163,7 +180,16 @@ impl JointProgressDriver {
                     self.active = Some(turn);
                     return JointProgress::More;
                 }
-                Some(Err(())) if self.scan_left != 0 => return JointProgress::More,
+                Some(Err(new_pass))
+                    if new_pass
+                        || self.scan_left != 0
+                        || self.scan_revision != Some(idle_revision) =>
+                {
+                    return JointProgress::More;
+                }
+                // Idle certifies one unchanged finite pass. A newer request,
+                // release or cancellation may invalidate an earlier skip even
+                // when the last examined ticket itself remains blocked.
                 _ => return JointProgress::Idle(idle_revision),
             }
         }
@@ -338,6 +364,12 @@ impl JointProgressDriver {
         JointProgress::More
     }
 
+    #[cfg(test)]
+    pub(super) fn reobserve_active_for_test(&mut self) {
+        let turn = self.active.take().expect("selected original request");
+        self.reobserve(turn);
+    }
+
     fn reobserve(&mut self, turn: Turn) {
         let work = turn.actual_work();
         let waker = self.inner.update(|state| {
@@ -345,12 +377,23 @@ impl JointProgressDriver {
             if ledger.active == Some(turn.id) {
                 ledger.active = None;
             }
-            let Some(request) = ledger.requests.get_mut(&turn.id) else {
+            let Some(request) = ledger.requests.get(&turn.id) else {
                 return None;
             };
-            if !matches!(request.phase, RequestPhase::Waiting) {
+            let waiting = matches!(request.phase, RequestPhase::Waiting);
+            if let Err(error) = validate_turn_stop(state, &turn, waiting) {
+                return fail_request(state, turn.id, error);
+            }
+            if !waiting {
                 return None;
             }
+            let request = state
+                .joint
+                .as_mut()
+                .unwrap()
+                .requests
+                .get_mut(&turn.id)
+                .unwrap();
             if let Err(error) = work.and_then(|work| request.budget.charge(work)) {
                 return fail_request(state, turn.id, error);
             }
@@ -381,32 +424,14 @@ impl JointProgressDriver {
                 return None;
             };
             let waiting = matches!(request.phase, RequestPhase::Waiting);
-            let stopped = (|| {
-                if ledger.driver_closed {
-                    return Err(WorkError::Closed);
-                }
-                if turn
-                    .changes
-                    .iter()
-                    .any(|change| change.claim.facts.lane != JointLane::Settlement)
-                {
-                    state
-                        .nodes
-                        .get(&turn.owner)
-                        .ok_or(WorkError::Released)?
-                        .check()?;
-                }
-                if waiting {
-                    validate_waiting(ledger, turn.id, &turn.changes)?;
-                }
-                Ok(())
-            })();
+            let stopped = validate_turn_stop(state, &turn, waiting);
             if let Err(error) = stopped {
                 return fail_request(state, turn.id, error);
             }
             if !waiting {
                 return None;
             }
+            let ledger = state.joint.as_mut().unwrap();
             let request = ledger.requests.get_mut(&turn.id).unwrap();
             if let Err(error) = work.and_then(|work| request.budget.charge(work)) {
                 return fail_request(state, turn.id, error);
@@ -457,6 +482,34 @@ impl JointProgressDriver {
             waker.wake();
         }
     }
+}
+
+/// Recheck at the transaction that records a verdict. The earlier unlocked
+/// validity observation does not author cancellation, closure or source facts.
+fn validate_turn_stop(
+    state: &crate::scope::State,
+    turn: &Turn,
+    waiting: bool,
+) -> Result<(), WorkError> {
+    let ledger = state.joint.as_ref().unwrap();
+    if ledger.driver_closed {
+        return Err(WorkError::Closed);
+    }
+    if turn
+        .changes
+        .iter()
+        .any(|change| change.claim.facts.lane != JointLane::Settlement)
+    {
+        state
+            .nodes
+            .get(&turn.owner)
+            .ok_or(WorkError::Released)?
+            .check()?;
+    }
+    if waiting {
+        validate_waiting(ledger, turn.id, &turn.changes)?;
+    }
+    Ok(())
 }
 
 impl Turn {

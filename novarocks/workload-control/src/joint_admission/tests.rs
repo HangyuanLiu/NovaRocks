@@ -1723,3 +1723,242 @@ fn finite_proof_budget_survives_actual_layout_reobservations_before_builder_work
     drop(originals);
     assert_eq!(held(&control), (0, 0));
 }
+
+#[test]
+fn continuous_new_requests_cannot_overtake_a_finite_reobservation_forever() {
+    let (control, handle, mut driver) = roomy_control();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let scope = root.owner.scope();
+    let a = dependency(&handle, "a");
+    let b = dependency(&handle, "b");
+    let mut initial = request(&handle, &scope, &[&a], JointLane::Foreground, 10);
+    drive(&mut driver);
+    let original = granted(&mut initial).pop().unwrap();
+    let mut extension = handle
+        .request(
+            &scope,
+            vec![JointClaimChange::grow_by(
+                original.view().unwrap(),
+                bytes(0),
+                vec![b.clone()],
+            )],
+        )
+        .unwrap();
+    drive(&mut driver);
+    let receipt = adjustment(&mut extension);
+    let mut finite = handle
+        .request_finite(
+            &scope,
+            vec![JointClaimChange::New {
+                dependencies: vec![b.clone()],
+                lane: JointLane::Foreground,
+                amounts: bytes(1),
+            }],
+            std::num::NonZeroU64::new(10_000_000).unwrap(),
+        )
+        .unwrap();
+    for _ in 0..100 {
+        driver.step();
+        if control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .joint
+            .as_ref()
+            .unwrap()
+            .active
+            .is_some()
+        {
+            break;
+        }
+    }
+    assert!(
+        control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .joint
+            .as_ref()
+            .unwrap()
+            .active
+            .is_some()
+    );
+    drop(receipt);
+    driver.step();
+    let mut newcomer = request(&handle, &scope, &[&b], JointLane::Foreground, 1);
+    let mut completed_newcomers = 0;
+    let mut delivered = None;
+    // Replace each completed newcomer before the next selector runs. The queue
+    // stays bounded at two requests, but its largest identity keeps increasing.
+    for _ in 0..200_000 {
+        driver.step();
+        if let Poll::Ready(result) = poll(&mut finite) {
+            delivered = Some(result.unwrap().new_claims);
+            break;
+        }
+        if let Poll::Ready(result) = poll(&mut newcomer) {
+            drop(result.unwrap().new_claims);
+            completed_newcomers += 1;
+            if completed_newcomers == 8 {
+                break;
+            }
+            newcomer = request(&handle, &scope, &[&b], JointLane::Foreground, 1);
+        }
+    }
+    assert!(
+        delivered.is_some(),
+        "new arrivals starved the original finite request"
+    );
+    assert_eq!(original.amounts().unwrap(), bytes(10));
+    drop(newcomer);
+    assert_eq!(held(&control), (2, 11));
+    drop(delivered);
+}
+
+#[test]
+fn reobservation_rechecks_actual_stop_and_source_facts_before_budget_failure() {
+    for cancel in [false, true] {
+        let (control, handle, mut driver) = roomy_control();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Management))
+            .unwrap();
+        let scope = root.owner.scope();
+        let a = dependency(&handle, "a");
+        let mut initial = request(&handle, &scope, &[&a], JointLane::Foreground, 10);
+        drive(&mut driver);
+        let mut original = granted(&mut initial).pop().unwrap();
+        let mut finite = handle
+            .request_finite(
+                &scope,
+                vec![JointClaimChange::grow_by(
+                    original.view().unwrap(),
+                    bytes(1),
+                    vec![],
+                )],
+                std::num::NonZeroU64::new(1).unwrap(),
+            )
+            .unwrap();
+        for _ in 0..100 {
+            driver.step();
+            if control
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .joint
+                .as_ref()
+                .unwrap()
+                .active
+                .is_some()
+            {
+                break;
+            }
+        }
+        assert!(
+            control
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .joint
+                .as_ref()
+                .unwrap()
+                .active
+                .is_some()
+        );
+        // This is the real gap after the unlocked validity observation and
+        // before reobserve acquires the final authority transaction.
+        if cancel {
+            root.owner
+                .cancellation_requester()
+                .request(crate::CancellationReason::Requested)
+                .unwrap();
+        } else {
+            original.release_part(bytes(1)).unwrap();
+        }
+        driver.reobserve_active_for_test();
+        let Poll::Ready(Err(failure)) = poll(&mut finite) else {
+            panic!("the original stopped request must finish");
+        };
+        assert_eq!(
+            failure.error,
+            if cancel {
+                WorkError::Cancelled(crate::CancellationReason::Requested)
+            } else {
+                WorkError::Conflict
+            }
+        );
+        assert_eq!(
+            original.amounts().unwrap(),
+            bytes(if cancel { 10 } else { 9 })
+        );
+    }
+}
+
+#[test]
+fn finite_pass_cannot_swallow_new_ticket_or_cancellation_before_its_last_skip() {
+    for cancel_earlier in [false, true] {
+        let (control, handle, mut driver) = control();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Management))
+            .unwrap();
+        let scope = root.owner.scope();
+        let a = dependency(&handle, "a");
+        let mut occupying = request(&handle, &scope, &[&a], JointLane::Foreground, 2);
+        drive(&mut driver);
+        let original = granted(&mut occupying);
+        // Both replies remain resident: an older blocked ticket and a later
+        // granted Settlement ticket that is independent of cancellation.
+        let mut blocked = request(&handle, &scope, &[&a], JointLane::Foreground, 1);
+        let mut delivered_later = request(&handle, &scope, &[], JointLane::Settlement, 0);
+        drive(&mut driver);
+        assert!(poll(&mut blocked).is_pending());
+        assert!(
+            control
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .joint
+                .as_ref()
+                .unwrap()
+                .requests
+                .values()
+                .any(|r| matches!(r.phase, ledger::RequestPhase::Granted { .. }))
+        );
+        // Start a new read-only pass. Its first ticket is blocked at the
+        // current release epoch; leave the granted final ticket to be skipped.
+        assert_eq!(driver.step(), JointProgress::More);
+        let mut newcomer = if cancel_earlier {
+            root.owner
+                .cancellation_requester()
+                .request(crate::CancellationReason::Requested)
+                .unwrap();
+            None
+        } else {
+            Some(request(&handle, &scope, &[], JointLane::Settlement, 0))
+        };
+        assert_eq!(
+            driver.step(),
+            JointProgress::More,
+            "the last skip must not swallow a change to an earlier decision"
+        );
+        drive(&mut driver);
+        if cancel_earlier {
+            assert!(matches!(
+                poll(&mut blocked),
+                Poll::Ready(Err(JointAdmissionFailure {
+                    error: WorkError::Cancelled(crate::CancellationReason::Requested)
+                }))
+            ));
+        } else {
+            drop(granted(newcomer.as_mut().unwrap()));
+        }
+        drop(granted(&mut delivered_later));
+        drop(original);
+    }
+}
