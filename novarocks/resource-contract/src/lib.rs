@@ -20,9 +20,11 @@
 //! Providers and filesystem adapters project the route they actually selected;
 //! governance consumes that fact without resolving catalog names or DNS aliases.
 
-use std::{fmt, sync::Arc};
+use std::{
+    fmt::{self, Write as _},
+    sync::Arc,
+};
 
-const MAX_ENDPOINT_INPUT_BYTES: usize = 16 * 1024;
 const MAX_ORIGIN_BYTES: usize = 1024;
 
 /// A network service's HTTP origin, independent of catalog alias, object path,
@@ -32,21 +34,44 @@ const MAX_ORIGIN_BYTES: usize = 1024;
 pub struct NetworkServiceOrigin(Arc<str>);
 
 impl NetworkServiceOrigin {
-    /// Project an already-selected HTTP(S) route. Path, user information, query
-    /// and fragment are never retained, including in an error or Debug output.
-    pub fn from_selected_url(endpoint: &str) -> Result<Self, DependencyFactError> {
-        if endpoint.len() > MAX_ENDPOINT_INPUT_BYTES {
-            return Err(DependencyFactError::EndpointTooLong);
-        }
-        let selected =
-            url::Url::parse(endpoint).map_err(|_| DependencyFactError::InvalidNetworkOrigin)?;
-        if !matches!(selected.scheme(), "http" | "https") || selected.host().is_none() {
+    /// Project the HTTP(S) URL already parsed by the route's original owner.
+    /// This does not parse, resolve DNS, acquire credentials or authorize I/O.
+    /// Path, user information, query and fragment are never copied or retained.
+    pub fn from_selected_url(selected: &url::Url) -> Result<Self, DependencyFactError> {
+        let scheme = selected.scheme();
+        if !matches!(scheme, "http" | "https") || selected.host().is_none() {
             return Err(DependencyFactError::InvalidNetworkOrigin);
         }
-        let origin = selected.origin().ascii_serialization();
-        if origin.len() > MAX_ORIGIN_BYTES {
-            return Err(DependencyFactError::EndpointTooLong);
+        // Borrow the URL author's canonical ASCII host bytes. This includes
+        // IPv6 brackets and the original parser's IDNA/IP normalization.
+        let host = selected
+            .host_str()
+            .filter(|host| !host.is_empty())
+            .ok_or(DependencyFactError::InvalidNetworkOrigin)?;
+        // Url::port omits the scheme's default port. Do not resolve or guess a
+        // port from a catalog name, warehouse, object path or credential scope.
+        let port = selected.port();
+        let suffix_len = port.map_or(0, |port| {
+            1 + port.checked_ilog10().map_or(1, |log| log as usize + 1)
+        });
+        let origin_len = scheme
+            .len()
+            .checked_add(3)
+            .and_then(|len| len.checked_add(host.len()))
+            .and_then(|len| len.checked_add(suffix_len))
+            .filter(|len| *len <= MAX_ORIGIN_BYTES)
+            .ok_or(DependencyFactError::EndpointTooLong)?;
+        // Reject before allocating any output. String and final Arc backing
+        // coexist during conversion; both have this source-derived byte bound.
+        let mut origin = String::with_capacity(origin_len);
+        origin.push_str(scheme);
+        origin.push_str("://");
+        origin.push_str(host);
+        if let Some(port) = port {
+            write!(&mut origin, ":{port}").expect("writing to a bounded String cannot fail");
         }
+        debug_assert_eq!(origin.len(), origin_len);
+        debug_assert!(origin.is_ascii());
         Ok(Self(Arc::from(origin)))
     }
 
@@ -71,7 +96,7 @@ pub enum DependencyFactError {
 impl fmt::Display for DependencyFactError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::EndpointTooLong => "shared dependency endpoint exceeds its bounded input profile",
+            Self::EndpointTooLong => "shared dependency origin exceeds its bounded output profile",
             Self::InvalidNetworkOrigin => {
                 "shared dependency requires a selected HTTP(S) service origin"
             }
@@ -84,56 +109,126 @@ impl std::error::Error for DependencyFactError {}
 mod tests {
     use super::*;
 
+    // Parsing belongs to the fixture's original route owner, outside the fact
+    // constructor. Production callers must supply their already-selected Url.
+    fn origin(endpoint: &str) -> NetworkServiceOrigin {
+        let selected = url::Url::parse(endpoint).expect("fixture route must parse");
+        NetworkServiceOrigin::from_selected_url(&selected).expect("fixture origin must fit")
+    }
+
     #[test]
     fn selected_routes_share_one_origin_without_retaining_path_or_secrets() {
-        let first = NetworkServiceOrigin::from_selected_url(
-            "HTTPS://user:password@Example.org:443/v1/catalog?credential=secret#private",
-        )
-        .unwrap();
-        let second =
-            NetworkServiceOrigin::from_selected_url("https://example.org/oauth/token").unwrap();
+        let first =
+            origin("HTTPS://user:password@Example.org:443/v1/catalog?credential=secret#private");
+        let second = origin("https://example.org/oauth/token");
         assert_eq!(first, second);
         assert_eq!(first.as_str(), "https://example.org");
         assert_eq!(
             format!("{first:?}"),
             "NetworkServiceOrigin(\"https://example.org\")"
         );
-        assert_ne!(
-            first,
-            NetworkServiceOrigin::from_selected_url("https://example.org:8443").unwrap()
-        );
+        assert_ne!(first, origin("https://example.org:8443"));
+        assert_ne!(first, origin("https://other-alias.example.org"));
     }
 
     #[test]
-    fn ipv6_and_http_default_ports_follow_the_original_url_origin_author() {
-        let a =
-            NetworkServiceOrigin::from_selected_url("http://[0:0:0:0:0:0:0:1]:80/path").unwrap();
-        let b = NetworkServiceOrigin::from_selected_url("http://[::1]").unwrap();
-        assert_eq!(a, b);
-        assert_eq!(a.as_str(), "http://[::1]");
-        assert_ne!(
-            a,
-            NetworkServiceOrigin::from_selected_url("https://[::1]").unwrap()
-        );
-    }
-
-    #[test]
-    fn missing_or_unresolved_routes_are_rejected_without_a_default_domain() {
+    fn original_url_author_controls_host_and_default_port_normalization() {
         for input in [
-            "",
-            "relative/path",
+            "http://EXAMPLE.org:80/path",
+            "https://EXAMPLE.org:443/path",
+            "http://[0:0:0:0:0:0:0:1]:80/path",
+            "https://[2001:0DB8:0:0:0:0:0:1]:8443/path",
+            "http://127.0.0.1:80/path",
+            "https://bücher.example:443/path",
+            "https://example.org:0/path",
+            "https://example.org:65535/path",
+        ] {
+            let selected = url::Url::parse(input).unwrap();
+            let fact = NetworkServiceOrigin::from_selected_url(&selected).unwrap();
+            // The existing URL origin author is the independent semantic
+            // oracle; its allocations are confined to this test.
+            assert_eq!(fact.as_str(), selected.origin().ascii_serialization());
+        }
+        assert_eq!(origin("http://[::1]:80").as_str(), "http://[::1]");
+        assert_eq!(
+            origin("https://bücher.example").as_str(),
+            "https://xn--bcher-kva.example"
+        );
+        assert_ne!(origin("http://[::1]"), origin("https://[::1]"));
+    }
+
+    #[test]
+    fn origin_projection_borrows_the_selected_url_after_original_mutation() {
+        let mut selected = url::Url::parse("https://before.example/path").unwrap();
+        selected.set_host(Some("AFTER.example")).unwrap();
+        selected.set_port(Some(8443)).unwrap();
+        selected.set_username("private-user").unwrap();
+        selected.set_password(Some("private-password")).unwrap();
+        selected.set_query(Some("credential=private-query"));
+        let fact = NetworkServiceOrigin::from_selected_url(&selected).unwrap();
+        assert_eq!(fact.as_str(), "https://after.example:8443");
+        assert!(!format!("{fact:?}").contains("private"));
+    }
+
+    #[test]
+    fn unsupported_parsed_routes_have_no_default_network_domain() {
+        for input in [
             "file:///tmp/table",
             "s3://bucket/key",
-            "https://",
+            "ftp://example.org/path",
+            "data:text/plain,private",
         ] {
+            let selected = url::Url::parse(input).unwrap();
             assert_eq!(
-                NetworkServiceOrigin::from_selected_url(input),
+                NetworkServiceOrigin::from_selected_url(&selected),
                 Err(DependencyFactError::InvalidNetworkOrigin)
             );
         }
+    }
+
+    #[test]
+    fn accepted_origin_limit_includes_every_port_width_before_output_allocation() {
+        for port in [
+            None,
+            Some(0u16),
+            Some(9),
+            Some(10),
+            Some(99),
+            Some(100),
+            Some(999),
+            Some(1000),
+            Some(9999),
+            Some(10000),
+            Some(65535),
+        ] {
+            let suffix = port.map_or_else(String::new, |port| format!(":{port}"));
+            let overhead = "https://".len() + suffix.len();
+            let host = "a".repeat(MAX_ORIGIN_BYTES - overhead);
+            // url 2.5.7 intentionally ignores DNS length in its URL host
+            // parser. No DNS lookup or network operation occurs here.
+            let selected = url::Url::parse(&format!("https://{host}{suffix}/path")).unwrap();
+            let fact = NetworkServiceOrigin::from_selected_url(&selected).unwrap();
+            assert_eq!(fact.as_str().len(), MAX_ORIGIN_BYTES);
+            let too_long = url::Url::parse(&format!("https://{host}a{suffix}/path")).unwrap();
+            assert_eq!(
+                NetworkServiceOrigin::from_selected_url(&too_long),
+                Err(DependencyFactError::EndpointTooLong)
+            );
+        }
+    }
+
+    #[test]
+    fn large_non_origin_parts_remain_with_the_original_url_owner() {
+        let path = "x".repeat(32 * 1024);
+        let selected = url::Url::parse(&format!(
+            "https://user:password@example.org/{path}?credential=secret#private"
+        ))
+        .unwrap();
+        let fact = NetworkServiceOrigin::from_selected_url(&selected).unwrap();
+        assert_eq!(fact.as_str(), "https://example.org");
         assert_eq!(
-            NetworkServiceOrigin::from_selected_url(&"x".repeat(MAX_ENDPOINT_INPUT_BYTES + 1)),
-            Err(DependencyFactError::EndpointTooLong)
+            format!("{fact:?}"),
+            "NetworkServiceOrigin(\"https://example.org\")"
         );
     }
 }

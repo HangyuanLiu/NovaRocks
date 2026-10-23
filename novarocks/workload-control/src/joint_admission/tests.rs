@@ -82,7 +82,10 @@ fn control() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
 fn dependency(handle: &JointAdmissionHandle, name: &str) -> JointDependency {
     handle
         .register_dependency(SharedDependency::Network(
-            NetworkServiceOrigin::from_selected_url(&format!("https://{name}.example")).unwrap(),
+            NetworkServiceOrigin::from_selected_url(
+                &url::Url::parse(&format!("https://{name}.example")).unwrap(),
+            )
+            .unwrap(),
         ))
         .unwrap()
 }

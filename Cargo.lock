@@ -4802,6 +4802,7 @@ dependencies = [
  "novarocks-failure-contract",
  "novarocks-resource-contract",
  "tokio",
+ "url",
 ]
 
 [[package]]
