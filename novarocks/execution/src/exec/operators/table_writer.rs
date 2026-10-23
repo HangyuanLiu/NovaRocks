@@ -362,7 +362,7 @@ impl TableWriterOperatorFactory {
             #[cfg(novarocks_dev_controls)]
             aggregate_guard: Arc::clone(&plan.aggregate_guard),
             state: TableWriterState::Open,
-            logical_rows: 0,
+            physical_rows: 0,
             aggregate_output: None,
             aggregate_output_row: 0,
             writer_completion: None,
@@ -458,7 +458,7 @@ struct TableWriterOperator {
     #[cfg(novarocks_dev_controls)]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
     state: TableWriterState,
-    logical_rows: u64,
+    physical_rows: u64,
     aggregate_output: Option<Chunk>,
     aggregate_output_row: usize,
     writer_completion: Option<WriterCompletion>,
@@ -933,10 +933,10 @@ impl TableWriterOperator {
             && !chunk.is_empty()
         {
             let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
-            let next_rows = self.logical_rows.checked_add(rows).ok_or_else(|| {
+            let next_rows = self.physical_rows.checked_add(rows).ok_or_else(|| {
                 crate::runtime::fragment::ExecutionFailure::from(
                     crate::exec::pipeline::writer_failure::WriterFailure::AcceptedRowsOverflow {
-                        current: self.logical_rows,
+                        current: self.physical_rows,
                         incoming: chunk.len(),
                     },
                 )
@@ -989,7 +989,7 @@ impl TableWriterOperator {
                 });
             } else {
                 reservation.send(append)?;
-                self.logical_rows = next_rows;
+                self.physical_rows = next_rows;
                 self.pending_rows = Some(rows);
             }
         }
@@ -1019,8 +1019,8 @@ impl TableWriterOperator {
                 rows,
             } = self.pending_append.take().unwrap();
             reservation.send(batch)?;
-            self.pending_rows = Some(rows - self.logical_rows);
-            self.logical_rows = rows;
+            self.pending_rows = Some(rows - self.physical_rows);
+            self.physical_rows = rows;
         }
         if self.aggregate_output.is_some() {
             let output = self.take_partial_output()?;
@@ -1037,9 +1037,9 @@ impl TableWriterOperator {
                 self.writer_finish_requested = true;
             }
             if let Some(completion) = self.writer.take_output() {
-                if completion.accepted_rows != self.logical_rows {
+                if completion.accepted_rows != self.physical_rows {
                     return Err(WriterFailure::RowCountDrift {
-                        expected: self.logical_rows,
+                        expected: self.physical_rows,
                         actual: completion.accepted_rows,
                     }
                     .into());
@@ -1056,7 +1056,7 @@ impl TableWriterOperator {
         let output = if self.state == TableWriterState::Producing {
             let output = if !self.emitted_row_count {
                 self.emitted_row_count = true;
-                let output = self.build_prefix_output(Some(self.logical_rows), &[])?;
+                let output = self.build_prefix_output(Some(self.physical_rows), &[])?;
                 let bytes = self.output_size(&output)?;
                 if bytes > MAX_WRITER_MULTIPLEX_ROW_BYTES {
                     return Err(WriterFailure::OutputBytes {

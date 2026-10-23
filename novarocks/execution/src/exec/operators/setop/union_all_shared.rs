@@ -41,6 +41,7 @@ struct UnionAllState {
     buffer: VecDeque<Chunk>,
     remaining_producers: usize,
     consumer_closed: bool,
+    abandoned_producer: bool,
 }
 
 #[derive(Clone)]
@@ -66,6 +67,7 @@ impl UnionAllSharedState {
                 buffer: VecDeque::new(),
                 remaining_producers: producer_count,
                 consumer_closed: false,
+                abandoned_producer: false,
             })),
             observable: Arc::new(Observable::new()),
             label,
@@ -191,10 +193,26 @@ impl UnionAllSharedState {
         }
     }
 
+    /// Normal producer EOS is distinct from lifecycle teardown. Ordinary
+    /// UNION retains its withdrawal behavior; strict writer finish checks it.
+    pub(crate) fn normal_input_exhausted(&self) -> bool {
+        let state = self.inner.lock().expect("union all state lock");
+        state.remaining_producers == 0
+            && state.buffer.is_empty()
+            && !state.consumer_closed
+            && !state.abandoned_producer
+    }
+    pub(crate) fn producer_abandoned(&self) {
+        self.finish_producer(false);
+    }
     pub(crate) fn producer_finished(&self) {
+        self.finish_producer(true);
+    }
+    fn finish_producer(&self, normal: bool) {
         let notify = self.observable.defer_notify();
         {
             let mut guard = self.inner.lock().expect("union all state lock");
+            guard.abandoned_producer |= !normal;
             if guard.remaining_producers > 0 {
                 guard.remaining_producers -= 1;
             }

@@ -125,6 +125,48 @@ pub(crate) fn compiled_table_finish_factory(
     binding: &TableFinishRuntimeBinding,
     error: &Arc<RuntimeErrorState>,
 ) -> ExecutionResult<TableFinishOperatorFactory> {
+    compiled_finish_core(program, id, display_id, binding, error, false)
+}
+
+/// P07 factory only; P09 will install this source over the two exact roles.
+#[expect(
+    dead_code,
+    reason = "P08 binds exact summary sources before P09 opens the builder path."
+)]
+pub(crate) fn compiled_logical_table_finish_factory(
+    program: &Arc<LocalProgram>,
+    id: ProgramNodeId,
+    display_id: i32,
+    binding: &TableFinishRuntimeBinding,
+    error: &Arc<RuntimeErrorState>,
+    writer: crate::exec::operators::setop::union_all_shared::UnionAllSharedState,
+    summary: crate::exec::operators::logical_change_summary::SourceBoundSummaryInput,
+) -> ExecutionResult<impl OperatorFactory> {
+    let factory = compiled_finish_core(program, id, display_id, binding, error, true)?;
+    let ProgramNodeKind::TableFinish {
+        logical_summary_layout: Some(layout),
+        ..
+    } = program.graph().nodes()[id.index()].kind()
+    else {
+        return Err(failure::contract(
+            "logical finish has no summary declaration",
+        ));
+    };
+    if summary.layout().slots() != layout.slots() || summary.layout().schema() != layout.schema() {
+        return Err(failure::contract(
+            "logical finish summary binding differs from its frozen declaration",
+        ));
+    }
+    Ok(factory.with_logical_input(writer, summary))
+}
+fn compiled_finish_core(
+    program: &Arc<LocalProgram>,
+    id: ProgramNodeId,
+    display_id: i32,
+    binding: &TableFinishRuntimeBinding,
+    error: &Arc<RuntimeErrorState>,
+    logical: bool,
+) -> ExecutionResult<TableFinishOperatorFactory> {
     let node = program.graph().nodes().get(id.index()).ok_or_else(|| {
         failure::contract(format_args!(
             "missing compiled table finish node {}",
@@ -133,6 +175,8 @@ pub(crate) fn compiled_table_finish_factory(
     })?;
     let ProgramNodeKind::TableFinish {
         inputs,
+        input_roles,
+        count_mode,
         expected_targets,
         writer_multiplex_layout,
         root_result_layout,
@@ -144,12 +188,14 @@ pub(crate) fn compiled_table_finish_factory(
             id.index()
         )));
     };
-    let [input] = inputs.as_slice() else {
-        return Err(failure::contract(format_args!(
-            "compiled table finish at local node {} reads more than one writer input",
-            id.index()
-        )));
-    };
+    if (*count_mode == novarocks_local_program::FinishCountMode::LogicalChanges) != logical {
+        return Err(failure::contract(
+            "compiled finish factory differs from its explicit count mode",
+        ));
+    }
+    let input = inputs
+        .get(input_roles.writer_results as usize)
+        .ok_or_else(|| failure::contract("compiled finish writer role has no input"))?;
     let input_layout = program
         .graph()
         .nodes()

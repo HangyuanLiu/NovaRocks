@@ -91,24 +91,28 @@ struct QueueInputMemory {
 }
 
 impl UnionAllSinkOperator {
-    fn finish_producer(&mut self) {
+    fn finish_producer(&mut self, normal: bool) {
         if !self.producer_finished {
             self.producer_finished = true;
-            self.state.producer_finished();
+            if normal {
+                self.state.producer_finished();
+            } else {
+                self.state.producer_abandoned();
+            }
         }
     }
 }
 impl OperatorLifecycle for UnionAllSinkOperator {
     fn begin_exit(&mut self) -> ExecutionResult<()> {
-        self.finish_producer();
+        self.finish_producer(false);
         Ok(())
     }
     fn close(&mut self) -> ExecutionResult<()> {
-        self.finish_producer();
+        self.finish_producer(false);
         Ok(())
     }
     fn cancel(&mut self) {
-        self.finish_producer();
+        self.finish_producer(false);
     }
 
     fn name(&self) -> &str {
@@ -126,7 +130,7 @@ impl InputEncodingPolicy for UnionAllSinkOperator {}
 impl SinkKernel for UnionAllSinkOperator {
     fn poll_control(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
         if self.state.consumer_closed() {
-            self.finish_producer();
+            self.finish_producer(false);
             Ok(ControlStep::Withdrawn)
         } else {
             Ok(ControlStep::Active)
@@ -176,7 +180,7 @@ impl SinkKernel for UnionAllSinkOperator {
         Ok(SinkStep::new(NextStep::NeedInput, rows))
     }
     fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
-        self.finish_producer();
+        self.finish_producer(true);
         Ok(SinkStep::new(NextStep::Finished, 0))
     }
 }
