@@ -108,6 +108,7 @@ impl HydrateInput {
     }
     pub(crate) fn prepare_accepted<K: InputEncodingPolicy + ?Sized>(
         &mut self,
+        ctx: &mut StepContext<'_>,
         input: AcceptedInput,
         kernel: &K,
     ) -> Result<PreparationStep, InputPreparationFailure> {
@@ -121,6 +122,7 @@ impl HydrateInput {
                     chunk,
                     kernel,
                     self.construction.as_deref(),
+                    ctx.value_conversions(),
                 )?;
                 if let (Some(profile), Some(stats)) = (&self.profile, stats) {
                     profile.record(stats);
@@ -155,11 +157,11 @@ impl<K: InputEncodingPolicy + TransformKernel> InputPreparation<K> for HydrateIn
     }
     fn prepare(
         &mut self,
-        _: &mut StepContext<'_>,
+        ctx: &mut StepContext<'_>,
         input: AcceptedInput,
         kernel: &K,
     ) -> Result<PreparationStep, InputPreparationFailure> {
-        self.prepare_accepted(input, kernel)
+        self.prepare_accepted(ctx, input, kernel)
     }
     fn creates_typed_storage(&self) -> bool {
         true

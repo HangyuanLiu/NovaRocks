@@ -157,7 +157,8 @@ fn plan_tree_prepared_partial_and_last_independent_schema_keep_actual_creation()
     operator.bind_runtime_state(&source.state).unwrap();
     let error = source.state.error_state();
     let mut work = crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 0);
-    let mut ctx = StepContext::new(&error, &mut work);
+    let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+    let mut ctx = StepContext::new(&error, &mut work, &mut value_conversions);
     let step = operator.as_mut();
     assert!(matches!(step.initial_step(), NextStep::NeedInput));
     step.finish(&mut ctx).unwrap();

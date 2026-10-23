@@ -700,7 +700,11 @@ mod tests {
         let mut work = TurnWork::new(std::num::NonZeroU64::MIN, DEFAULT_TURN_WORK_UNITS);
         source
             .as_mut()
-            .drive(&mut StepContext::new(&control, &mut work))
+            .drive(&mut StepContext::new(
+                &control,
+                &mut work,
+                &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
+            ))
             .expect("source step")
     }
     fn idle_deadline(source: &mut Box<dyn Operator>, state: &RuntimeState) -> DriverBlockDeadline {

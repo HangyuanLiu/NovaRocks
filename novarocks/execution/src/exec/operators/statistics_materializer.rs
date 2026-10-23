@@ -553,11 +553,11 @@ impl InputPreparation<StatisticsInputPolicy> for StatisticsPreparation {
     }
     fn prepare(
         &mut self,
-        _: &mut StepContext<'_>,
+        ctx: &mut StepContext<'_>,
         input: AcceptedInput,
         policy: &StatisticsInputPolicy,
     ) -> Result<PreparationStep, InputPreparationFailure> {
-        self.hydrate.prepare_accepted(input, policy)
+        self.hydrate.prepare_accepted(ctx, input, policy)
     }
 }
 #[derive(Debug)]
@@ -1290,7 +1290,11 @@ mod tests {
         let control = state.error_state();
         let mut work =
             crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        action(&mut StepContext::new(&control, &mut work))
+        action(&mut StepContext::new(
+            &control,
+            &mut work,
+            &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
+        ))
     }
     fn push(
         step: &mut dyn StepOperator,
@@ -1471,7 +1475,14 @@ mod tests {
             crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 0);
         for _ in 0..2 {
             let result = source
-                .drive_with_root_input(&mut StepContext::new(&control, &mut work), &grant)
+                .drive_with_root_input(
+                    &mut StepContext::new(
+                        &control,
+                        &mut work,
+                        &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
+                    ),
+                    &grant,
+                )
                 .unwrap();
             assert!(matches!(result, RootStep::Pending(RootPending::Yield)));
             assert!(source.workspace.is_none());
@@ -1485,7 +1496,14 @@ mod tests {
         work.begin_turn(1).unwrap();
         assert!(matches!(
             source
-                .drive_with_root_input(&mut StepContext::new(&control, &mut work), &grant)
+                .drive_with_root_input(
+                    &mut StepContext::new(
+                        &control,
+                        &mut work,
+                        &mut novarocks_value_arrays::decode::ValueConversionContext::default()
+                    ),
+                    &grant
+                )
                 .unwrap(),
             RootStep::Pending(RootPending::Yield)
         ));
@@ -1496,7 +1514,14 @@ mod tests {
         let offset = original.offset;
         assert!(matches!(
             source
-                .drive_with_root_input(&mut StepContext::new(&control, &mut work), &grant)
+                .drive_with_root_input(
+                    &mut StepContext::new(
+                        &control,
+                        &mut work,
+                        &mut novarocks_value_arrays::decode::ValueConversionContext::default()
+                    ),
+                    &grant
+                )
                 .unwrap(),
             RootStep::Pending(RootPending::Yield)
         ));

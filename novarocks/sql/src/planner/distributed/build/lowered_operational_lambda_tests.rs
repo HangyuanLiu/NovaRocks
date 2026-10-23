@@ -42,15 +42,6 @@ fn array_map_source(
         .expect("actual nonfolded ARRAY_MAP source with a Lambda argument")
 }
 
-fn real_lambda_owner() -> SqlAuthoredPhysicalPlan {
-    // The real completion fixture requires a catalog/statistics/provider round.
-    // FROM orders retains that route; the Lambda parameter prevents its LOWER
-    // body from being a constant-foldable scalar expression.
-    crate::compiler::compile_authored_aggregate_for_test(
-        "SELECT ARRAY_MAP(x -> LOWER(x), ['AA','BB']) AS mapped FROM orders",
-    )
-}
-
 fn assert_lambda_projection(
     owner: &SqlAuthoredPhysicalPlan,
     fragment: &Fragment,
@@ -143,10 +134,10 @@ fn assert_lambda_projection(
 }
 
 #[test]
-fn operational_lambda_real_sql_loans_original_parameters_and_actual_body_scope() {
-    // This tests real analyzer/optimizer/completion publication plus request
-    // projection. It does not prepare a HOF kernel or manufacture effect facts.
-    let owner = real_lambda_owner();
+fn operational_lambda_analyzed_source_loans_original_parameters_and_actual_body_scope() {
+    // The analyzer and actual emitter author the source and request projection.
+    // This does not certify public completion or prepare a HOF kernel.
+    let owner = authored_lambda_source_for_test();
     let cloned_owner = owner.clone();
     let (fragment, source) = array_map_source(&owner);
     let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
@@ -283,7 +274,7 @@ fn operational_lambda_actual_catalog_typed_emitter_preserves_nested_parameter_me
 
 #[test]
 fn operational_lambda_projector_preserves_every_actual_small_control_prefix() {
-    let owner = real_lambda_owner();
+    let owner = authored_lambda_source_for_test();
     let (fragment, source) = array_map_source(&owner);
     // Setup, validation and source loan use a separate unrefused control. Only
     // the real Lambda projection plus its caller footer enters the trace.

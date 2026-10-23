@@ -626,7 +626,12 @@ pub(crate) fn project_chunk_with_source_observer(
     let control = RuntimeErrorState::default();
     let mut turn =
         crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-    let mut ctx = crate::exec::pipeline::step_context::StepContext::new(&control, &mut turn);
+    let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+    let mut ctx = crate::exec::pipeline::step_context::StepContext::new(
+        &control,
+        &mut turn,
+        &mut value_conversions,
+    );
     processor
         .apply(
             &mut ctx,

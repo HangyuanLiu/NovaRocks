@@ -510,15 +510,12 @@ pub(crate) fn materialize_project_output_owned<'a>(
         if column.data_type() != declared.slots()[ordinal].data_type()
             && matches!(encoding_at(ordinal)?, ProjectEncodingSource::Plain)
         {
-            *column = novarocks_functions::array_projection::rebuild_array_mode::<
+            *column = novarocks_functions::array_projection::rebuild_array_observed::<
                 ConstructionFailure,
                 _,
-            >(
-                column,
-                declared.slots()[ordinal].data_type(),
-                &mut |step| owner.observe(ordinal, &[], step),
-                false,
-            )?;
+            >(column, declared.slots()[ordinal].data_type(), &mut |step| {
+                owner.observe(ordinal, &[], step)
+            })?;
         }
         changed |= column.data_type() != declared.slots()[ordinal].data_type();
     }
@@ -1775,12 +1772,15 @@ mod owned_project_tests {
                 _,
                 _,
                 _,
+                _,
             >(
                 source,
                 owner.storage_lifetime(),
+                &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
                 |_, _, _, _| false,
                 |ordinal, path, step| owner.observe(ordinal, path, step),
                 |layout| owner.request(layout),
+                |_| Ok(()),
             )
             .unwrap()
         };

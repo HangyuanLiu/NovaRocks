@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use arrow_array::StructArray;
 use arrow_array::{ArrayRef, Int32Array};
 use arrow_schema::Field;
 use std::sync::{Arc, Mutex};

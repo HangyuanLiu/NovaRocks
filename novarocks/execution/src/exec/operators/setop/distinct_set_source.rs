@@ -283,7 +283,9 @@ mod tests {
         let max_turns = count.div_ceil(interval) + expected.len().div_ceil(3);
         for turn in 1..=max_turns {
             let mut work = TurnWork::new(NonZeroU64::new(turn as u64).unwrap(), 1);
-            let mut context = StepContext::new(&control, &mut work);
+            let mut value_conversions =
+                novarocks_value_arrays::decode::ValueConversionContext::default();
+            let mut context = StepContext::new(&control, &mut work, &mut value_conversions);
             let step = source.as_mut().drive(&mut context).unwrap();
             if let Some(output) = step.output {
                 assert!(output.len() <= 3);
@@ -317,7 +319,11 @@ mod tests {
         let mut work = TurnWork::new(NonZeroU64::MIN, 1);
         let step = inactive
             .as_mut()
-            .drive(&mut StepContext::new(&control, &mut work))
+            .drive(&mut StepContext::new(
+                &control,
+                &mut work,
+                &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
+            ))
             .unwrap();
         assert!(step.output.is_none());
         assert!(matches!(step.next, NextStep::Finished));

@@ -289,9 +289,7 @@ fn neutral_sql_scalar_none_folded_constants_and_nonzero_cv_keep_original_identit
 
 #[test]
 fn neutral_sql_lambda_window_order_and_left_table_keep_distinct_original_channels() {
-    let owner = crate::compiler::compile_authored_aggregate_for_test(
-        "SELECT ARRAY_MAP(x -> LOWER(x), ['AA','BB']) AS mapped FROM orders",
-    );
+    let owner = scalar::authored_lambda_source_for_test();
     assert_expression_requests(&owner);
     assert!(owner.plan().fragments().values().any(|fragment| {
         fragment.call_requests().entries().values().any(|request| {

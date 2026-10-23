@@ -3740,7 +3740,6 @@ name = "novarocks-connector-starrocks"
 version = "0.1.0"
 dependencies = [
  "arrow",
- "base64 0.22.1",
  "bytes",
  "futures",
  "novarocks-connector-contract",
@@ -3816,6 +3815,7 @@ dependencies = [
  "novarocks-sql",
  "novarocks-type-contract",
  "novarocks-types",
+ "novarocks-value-arrays",
  "novarocks-workload-control",
  "once_cell",
  "parquet",
@@ -3910,6 +3910,7 @@ dependencies = [
  "novarocks-type-contract",
  "novarocks-types",
  "novarocks-user-error",
+ "novarocks-value-arrays",
  "novarocks-workload-control",
  "once_cell",
  "parquet",
@@ -3997,6 +3998,7 @@ dependencies = [
  "novarocks-failure-contract",
  "novarocks-function-contract",
  "novarocks-type-contract",
+ "novarocks-value-arrays",
  "num-traits",
  "openssl",
  "rand 0.8.5",
@@ -4160,6 +4162,7 @@ dependencies = [
  "novarocks-task-codec",
  "novarocks-type-contract",
  "novarocks-types",
+ "novarocks-value-arrays",
  "novarocks-worker",
  "once_cell",
  "prometheus",
@@ -4715,7 +4718,6 @@ dependencies = [
  "novarocks-failure-contract",
  "novarocks-functions",
  "novarocks-type-contract",
- "num-traits",
  "serde",
  "serde_json",
  "toml",
@@ -4725,6 +4727,19 @@ dependencies = [
 [[package]]
 name = "novarocks-user-error"
 version = "0.1.0"
+
+[[package]]
+name = "novarocks-value-arrays"
+version = "0.1.0"
+dependencies = [
+ "allocator-api2",
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-schema",
+ "novarocks-failure-contract",
+ "novarocks-type-contract",
+]
 
 [[package]]
 name = "novarocks-version"

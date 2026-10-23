@@ -1737,7 +1737,11 @@ pub(crate) mod tests {
         let error = state.error_state();
         let mut turn =
             crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        action(&mut StepContext::new(&error, &mut turn))
+        action(&mut StepContext::new(
+            &error,
+            &mut turn,
+            &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
+        ))
     }
     fn complete_native_input(
         operator: &mut dyn Operator,

@@ -25,15 +25,8 @@ use crate::source_custody_resources::{
     RequestSourceNode, RequestSummary, SourceCustodyRequestFacts, SourceNodeRole,
     SourceRequestPricing, summarize_source_node,
 };
-use arrow_array::types::{
-    Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
-};
-use arrow_array::{
-    Array, BinaryViewArray, DictionaryArray, FixedSizeListArray, LargeListArray,
-    LargeListViewArray, ListArray, ListViewArray, MapArray, RunArray, StringViewArray, StructArray,
-    UnionArray,
-};
-use arrow_schema::{DataType, UnionMode};
+use arrow_array::{Array, MapArray};
+use arrow_schema::DataType;
 use std::alloc::Layout;
 
 fn concrete<T: Array + 'static>(array: &dyn Array) -> Result<&T, KernelFailure> {
@@ -183,8 +176,10 @@ fn source_metadata_graph<'source, W: MetadataWork>(
     } else {
         None
     };
-    let buffers;
-    let children;
+    let node = novarocks_value_arrays::storage::borrowed_node(array)
+        .map_err(|source| W::Error::from(KernelFailure::from_domain(source)))?;
+    let buffers = node.data_buffers();
+    let children = node.child_count();
     macro_rules! accumulate {
         ($result:expr) => {{
             let result = $result;
@@ -203,179 +198,55 @@ fn source_metadata_graph<'source, W: MetadataWork>(
             }
         }};
     }
-    macro_rules! child {
-        ($array:expr) => {{
-            accumulate!(source_metadata_graph(
-                $array.as_ref(),
-                work,
-                copy_nulls,
-                observer,
-                pricing,
-                SourceNodeRole::Rebox,
-            )?);
-        }};
-    }
-    macro_rules! dictionary {
-        ($key:ty) => {{
-            child!(concrete::<DictionaryArray<$key>>(array)?.values());
-        }};
-    }
-    match array.data_type() {
-        DataType::Null => {
-            buffers = 0;
-            children = 0;
-        }
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
-            buffers = 2;
-            children = 0;
-        }
-        DataType::Utf8View => {
-            buffers = plus(1, concrete::<StringViewArray>(array)?.data_buffers().len())?;
-            children = 0;
-        }
-        DataType::BinaryView => {
-            buffers = plus(1, concrete::<BinaryViewArray>(array)?.data_buffers().len())?;
-            children = 0;
-        }
-        DataType::List(_) => {
-            buffers = 1;
-            children = 1;
-            child!(concrete::<ListArray>(array)?.values());
-        }
-        DataType::LargeList(_) => {
-            buffers = 1;
-            children = 1;
-            child!(concrete::<LargeListArray>(array)?.values());
-        }
-        DataType::ListView(_) => {
-            buffers = 2;
-            children = 1;
-            child!(concrete::<ListViewArray>(array)?.values());
-        }
-        DataType::LargeListView(_) => {
-            buffers = 2;
-            children = 1;
-            child!(concrete::<LargeListViewArray>(array)?.values());
-        }
-        DataType::FixedSizeList(_, _) => {
-            buffers = 0;
-            children = 1;
-            child!(concrete::<FixedSizeListArray>(array)?.values());
-        }
-        DataType::Struct(_) => {
-            let columns = concrete::<StructArray>(array)?.columns();
-            buffers = 0;
-            children = columns.len();
-            for column in columns {
-                child!(column);
-            }
-        }
-        DataType::Map(_, _) => {
-            buffers = 1;
-            children = 1;
-            accumulate!(source_metadata_graph(
-                concrete::<MapArray>(array)?.entries(),
-                work,
-                copy_nulls,
-                observer,
-                pricing,
-                SourceNodeRole::MapEntries,
-            )?);
-        }
-        DataType::Dictionary(key, _) => {
-            buffers = 1;
-            children = 1;
-            match key.as_ref() {
-                DataType::Int8 => dictionary!(Int8Type),
-                DataType::Int16 => dictionary!(Int16Type),
-                DataType::Int32 => dictionary!(Int32Type),
-                DataType::Int64 => dictionary!(Int64Type),
-                DataType::UInt8 => dictionary!(UInt8Type),
-                DataType::UInt16 => dictionary!(UInt16Type),
-                DataType::UInt32 => dictionary!(UInt32Type),
-                DataType::UInt64 => dictionary!(UInt64Type),
-                _ => {
-                    return Err(W::Error::from(invalid(
-                        "source dictionary has no actual Arrow key carrier",
-                    )));
-                }
-            }
-        }
-        DataType::Union(fields, mode) => {
-            let array = concrete::<UnionArray>(array)?;
-            buffers = if *mode == UnionMode::Dense { 2 } else { 1 };
-            children = fields.len();
-            for (id, _) in fields.iter() {
-                child!(array.child(id));
-            }
-        }
-        DataType::RunEndEncoded(ends, _) => {
-            buffers = 0;
-            children = 2;
-            // The implicit run-end primitive child always has a data Buffer.
-            descendant_has_custody_buffer = true;
-            // Arrow's run-end child is a primitive array with one data buffer
-            // and no null bitmap. Values use their own actual dynamic structure.
-            if let Some(bytes) = &mut child_bytes {
-                *bytes =
-                    crate::arrow_result_custody::custody_node_metadata_upper_bound(1, false, 0)?;
-            }
-            if let (Some(pricing), Some(requests)) = (pricing, child_requests.as_mut()) {
-                // This implicit primitive child is part of the original Run
-                // construction, not a temporary Array or additional decoder.
-                let ends = summarize_source_node(
-                    RequestSourceNode {
-                        data_type: ends.data_type(),
-                        data_buffers: 1,
-                        child_count: 0,
-                        nulls: None,
-                        header_fields: 0,
-                        body: None,
-                        role: SourceNodeRole::RunEnds,
-                    },
-                    RequestSummary::empty(),
-                    pricing,
+    for index in 0..children {
+        let child = novarocks_value_arrays::storage::borrowed_child(array, index)
+            .map_err(|source| W::Error::from(KernelFailure::from_domain(source)))?;
+        match child {
+            novarocks_value_arrays::storage::BorrowedNode::Array { array: child, .. } => {
+                accumulate!(source_metadata_graph(
+                    child,
                     work,
-                )?;
-                *requests = requests.plus(ends)?;
+                    copy_nulls,
+                    observer,
+                    pricing,
+                    if matches!(array.data_type(), DataType::Map(..)) {
+                        SourceNodeRole::MapEntries
+                    } else {
+                        SourceNodeRole::Rebox
+                    }
+                )?);
             }
-            match ends.data_type() {
-                DataType::Int16 => child!(concrete::<RunArray<Int16Type>>(array)?.values()),
-                DataType::Int32 => child!(concrete::<RunArray<Int32Type>>(array)?.values()),
-                DataType::Int64 => child!(concrete::<RunArray<Int64Type>>(array)?.values()),
-                _ => {
-                    return Err(W::Error::from(invalid(
-                        "source run-end has no actual Arrow index carrier",
-                    )));
+            novarocks_value_arrays::storage::BorrowedNode::RunEnds { data_type, .. } => {
+                // Borrow the real implicit primitive Buffer. The existing
+                // numerical author still prices its single construction; no
+                // temporary RunEndArray or second metadata authority is added.
+                descendant_has_custody_buffer = true;
+                if let Some(bytes) = &mut child_bytes {
+                    *bytes = plus(
+                        *bytes,
+                        crate::arrow_result_custody::custody_node_metadata_upper_bound(
+                            1, false, 0,
+                        )?,
+                    )?;
+                }
+                if let (Some(pricing), Some(requests)) = (pricing, child_requests.as_mut()) {
+                    let ends = summarize_source_node(
+                        RequestSourceNode {
+                            data_type,
+                            data_buffers: 1,
+                            child_count: 0,
+                            nulls: None,
+                            header_fields: 0,
+                            body: None,
+                            role: SourceNodeRole::RunEnds,
+                        },
+                        RequestSummary::empty(),
+                        pricing,
+                        work,
+                    )?;
+                    *requests = requests.plus(ends)?;
                 }
             }
-        }
-        DataType::Boolean
-        | DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64
-        | DataType::Float16
-        | DataType::Float32
-        | DataType::Float64
-        | DataType::Timestamp(..)
-        | DataType::Date32
-        | DataType::Date64
-        | DataType::Time32(..)
-        | DataType::Time64(..)
-        | DataType::Duration(..)
-        | DataType::Interval(..)
-        | DataType::FixedSizeBinary(_)
-        | DataType::Decimal32(..)
-        | DataType::Decimal64(..)
-        | DataType::Decimal128(..)
-        | DataType::Decimal256(..) => {
-            buffers = 1;
-            children = 0;
         }
     }
     {

@@ -15,249 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Required encoded children use logical NULL on active ancestor rows.
-//! Arrow's safe ArrayData validation checks physical child masks, whereas its
-//! high-level container constructors also check dictionary value NULLs.
-
-use arrow_array::types::Int32Type;
-use arrow_array::{
-    Array, ArrayRef, DictionaryArray, FixedSizeListArray, LargeListArray, ListArray, MapArray,
-    StructArray,
-};
-use arrow_schema::DataType;
-use novarocks_type_contract::{MAX_VALUE_TYPE_DEPTH, ValueKind, ValueTypeRef};
-
-use super::{
-    ArrayNormalizationStep, ArrayPathStep, ArrayProjectionFailure, ArrayProjectionViolation,
-};
-
+//! Typed ingress delegates active-ancestor and key validation to the value owner.
+use super::{ArrayNormalizationStep, ArrayProjectionFailure};
+use arrow_array::ArrayRef;
+use novarocks_type_contract::TypedValueBinding;
 pub fn validate_required_dictionary_children<E, F>(
     source: &ArrayRef,
-    value: &ValueTypeRef,
+    binding: &TypedValueBinding,
     observe: &mut F,
 ) -> Result<(), E>
 where
     E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
-    // Root dictionaries were checked independently with every visible key.
-    // Ordinary scalar batches require neither paths nor another row scan.
-    if !matches!(
-        source.data_type(),
-        DataType::Struct(_)
-            | DataType::List(_)
-            | DataType::LargeList(_)
-            | DataType::FixedSizeList(_, _)
-            | DataType::Map(_, _)
-    ) {
-        return Ok(());
-    }
-    let mut path = [ArrayPathStep::ListItem; MAX_VALUE_TYPE_DEPTH];
-    visit_required_paths(source, source, value, &mut path, 0, observe)
-}
-
-fn physical<T: 'static, E: From<ArrayProjectionFailure>>(source: &ArrayRef) -> Result<&T, E> {
-    source.as_any().downcast_ref::<T>().ok_or_else(|| {
-        E::from(ArrayProjectionFailure::Contract(
-            ArrayProjectionViolation::PhysicalWrapper,
-        ))
-    })
-}
-
-fn visit_required_paths<E, F>(
-    root: &ArrayRef,
-    source: &ArrayRef,
-    value: &ValueTypeRef,
-    path: &mut [ArrayPathStep; MAX_VALUE_TYPE_DEPTH],
-    depth: usize,
-    observe: &mut F,
-) -> Result<(), E>
-where
-    E: From<ArrayProjectionFailure>,
-    F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
-{
-    observe(ArrayNormalizationStep::InspectType(source.data_type()))?;
-    if depth >= MAX_VALUE_TYPE_DEPTH {
-        return Err(E::from(ArrayProjectionFailure::ValueType(
-            novarocks_type_contract::ValueTypeError::TooDeep,
-        )));
-    }
-    if matches!(source.data_type(), DataType::Dictionary(_, _)) {
-        if !value.nullable() && !source.is_empty() {
-            let mut pending = 0;
-            for start in (0..root.len()).step_by(1024) {
-                let end = root.len().min(start.saturating_add(1024));
-                observe(ArrayNormalizationStep::InspectConstructionWork { units: end - start })?;
-                for row in start..end {
-                    validate_active_path(root, &path[..depth], row, &mut pending, observe)?;
-                }
-            }
-            if pending != 0 {
-                observe(ArrayNormalizationStep::InspectConstructionWork { units: pending })?;
-            }
-        }
-        return Ok(());
-    }
-    match value.kind() {
-        ValueKind::Struct(fields) => {
-            let array = physical::<StructArray, E>(source)?;
-            for (index, field) in fields.iter().enumerate() {
-                path[depth] = ArrayPathStep::StructField(index);
-                visit_required_paths(
-                    root,
-                    array.column(index),
-                    field.value_type(),
-                    path,
-                    depth + 1,
-                    observe,
-                )?;
-            }
-        }
-        ValueKind::List(item) => {
-            path[depth] = ArrayPathStep::ListItem;
-            let values = match source.data_type() {
-                DataType::List(_) => physical::<ListArray, E>(source)?.values(),
-                DataType::LargeList(_) => physical::<LargeListArray, E>(source)?.values(),
-                _ => {
-                    return Err(E::from(ArrayProjectionFailure::Contract(
-                        ArrayProjectionViolation::ListCarrier,
-                    )));
-                }
-            };
-            visit_required_paths(root, values, item, path, depth + 1, observe)?;
-        }
-        ValueKind::FixedSizeList { item, .. } => {
-            path[depth] = ArrayPathStep::ListItem;
-            visit_required_paths(
-                root,
-                physical::<FixedSizeListArray, E>(source)?.values(),
-                item,
-                path,
-                depth + 1,
-                observe,
-            )?;
-        }
-        ValueKind::Map { key, value } => {
-            let array = physical::<MapArray, E>(source)?;
-            path[depth] = ArrayPathStep::MapKey;
-            visit_required_paths(root, array.keys(), key, path, depth + 1, observe)?;
-            path[depth] = ArrayPathStep::MapValue;
-            visit_required_paths(root, array.values(), value, path, depth + 1, observe)?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn validate_active_path<E, F>(
-    source: &ArrayRef,
-    path: &[ArrayPathStep],
-    row: usize,
-    pending: &mut usize,
-    observe: &mut F,
-) -> Result<(), E>
-where
-    E: From<ArrayProjectionFailure>,
-    F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
-{
-    *pending += 1;
-    if *pending == 1024 {
-        observe(ArrayNormalizationStep::InspectConstructionWork { units: *pending })?;
-        *pending = 0;
-    }
-    if path.is_empty() {
-        let dictionary = physical::<DictionaryArray<Int32Type>, E>(source)?;
-        // The independent all-keys pass has already checked these indices,
-        // including keys in masked rows. This pass only checks active NULLs.
-        if dictionary.keys().is_null(row)
-            || dictionary
-                .values()
-                .is_null(dictionary.keys().value(row) as usize)
-        {
-            return Err(E::from(ArrayProjectionFailure::Contract(
-                ArrayProjectionViolation::UnmaskedRequiredNull,
-            )));
-        }
-        return Ok(());
-    }
-    if source.is_null(row) {
-        return Ok(());
-    }
-    let rest = &path[1..];
-    match path[0] {
-        ArrayPathStep::StructField(index) => {
-            validate_active_path(
-                physical::<StructArray, E>(source)?.column(index),
-                rest,
-                row,
-                pending,
-                observe,
-            )?;
-        }
-        ArrayPathStep::ListItem => {
-            let (values, start, end) = match source.data_type() {
-                DataType::List(_) => {
-                    let array = physical::<ListArray, E>(source)?;
-                    (
-                        array.values(),
-                        array.value_offsets()[row] as usize,
-                        array.value_offsets()[row + 1] as usize,
-                    )
-                }
-                DataType::LargeList(_) => {
-                    let array = physical::<LargeListArray, E>(source)?;
-                    (
-                        array.values(),
-                        array.value_offsets()[row] as usize,
-                        array.value_offsets()[row + 1] as usize,
-                    )
-                }
-                DataType::FixedSizeList(_, _) => {
-                    let array = physical::<FixedSizeListArray, E>(source)?;
-                    let start =
-                        row.checked_mul(array.value_length() as usize)
-                            .ok_or_else(|| {
-                                E::from(ArrayProjectionFailure::Contract(
-                                    ArrayProjectionViolation::ChildRange,
-                                ))
-                            })?;
-                    let end = start
-                        .checked_add(array.value_length() as usize)
-                        .ok_or_else(|| {
-                            E::from(ArrayProjectionFailure::Contract(
-                                ArrayProjectionViolation::ChildRange,
-                            ))
-                        })?;
-                    (array.values(), start, end)
-                }
-                _ => {
-                    return Err(E::from(ArrayProjectionFailure::Contract(
-                        ArrayProjectionViolation::ListCarrier,
-                    )));
-                }
-            };
-            for index in start..end {
-                validate_active_path(values, rest, index, pending, observe)?;
-            }
-        }
-        ArrayPathStep::MapKey | ArrayPathStep::MapValue => {
-            let array = physical::<MapArray, E>(source)?;
-            let values = if path[0] == ArrayPathStep::MapKey {
-                array.keys()
-            } else {
-                array.values()
-            };
-            for index in
-                array.value_offsets()[row] as usize..array.value_offsets()[row + 1] as usize
-            {
-                validate_active_path(values, rest, index, pending, observe)?;
-            }
-        }
-        _ => {
-            return Err(E::from(ArrayProjectionFailure::Contract(
-                ArrayProjectionViolation::UnsupportedPath,
-            )));
-        }
-    }
-    Ok(())
+    // This ingress has only a structural control port. It performs no payload
+    // construction; row checks use the existing caller observation as before.
+    let observer = std::cell::RefCell::new(observe);
+    novarocks_value_arrays::hydrate::validate_required_observed(
+        source,
+        binding,
+        &mut |units| observer.borrow_mut()(ArrayNormalizationStep::ValueWork { units }),
+        &mut |event| super::observe_value_hydration(event, &mut **observer.borrow_mut()),
+    )
+    .map_err(super::value_hydration::value_failure)
 }

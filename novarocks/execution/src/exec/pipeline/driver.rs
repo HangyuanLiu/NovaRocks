@@ -223,6 +223,8 @@ pub struct PipelineDriver {
     driver_id: i32,
     operators: Vec<OperatorInstance>,
     turn_work: TurnWork,
+    // Design: ADR-0195 (docs/adr/ADR-0195-public-value-access-and-construction.md)
+    value_conversions: novarocks_value_arrays::decode::ValueConversionContext,
     profiler: Option<Profiler>,
     driver_total_time: Option<CounterRef>,
     driver_blocked_time: Option<CounterRef>,
@@ -491,6 +493,7 @@ impl PipelineDriver {
             driver_id,
             operators,
             turn_work,
+            value_conversions: novarocks_value_arrays::decode::ValueConversionContext::default(),
             profiler,
             driver_total_time,
             driver_blocked_time,
@@ -988,7 +991,8 @@ impl PipelineDriver {
 
     fn poll_operator_controls(&mut self) -> ExecutionResult<()> {
         let control = self.runtime_state.error_state();
-        let mut context = StepContext::new(&control, &mut self.turn_work);
+        let mut context =
+            StepContext::new(&control, &mut self.turn_work, &mut self.value_conversions);
         for operator in &mut self.operators {
             operator.poll_control(&mut context)?;
         }
@@ -1332,6 +1336,7 @@ impl PipelineDriver {
         self.finish_blocked_interval();
         if !self.exit_started {
             self.exit_started = true;
+            self.value_conversions.clear();
             // No data work remains after accepting this terminal transition.
             // Retire its edge custody and data-only wake registrations before
             // starting physical exits; control/exit observation stays active.
@@ -1605,7 +1610,8 @@ impl PipelineDriver {
             return Ok(false);
         }
         let control = self.runtime_state.error_state();
-        let mut context = StepContext::new(&control, &mut self.turn_work);
+        let mut context =
+            StepContext::new(&control, &mut self.turn_work, &mut self.value_conversions);
         let step = terminal
             .drive(&mut context)
             .map_err(|error| error.at_operator(idx, PipelineOperation::Pull))?;
@@ -1650,7 +1656,8 @@ impl PipelineDriver {
             };
             let start = Instant::now();
             let control = self.runtime_state.error_state();
-            let mut context = StepContext::new(&control, &mut self.turn_work);
+            let mut context =
+                StepContext::new(&control, &mut self.turn_work, &mut self.value_conversions);
             let result = self.operators[downstream_idx].try_push(&mut context, input);
             let accepted = matches!(result, InputResult::Accepted(_));
             let elapsed = start.elapsed();
@@ -1730,7 +1737,8 @@ impl PipelineDriver {
             // complete Chunk before that continuation can run.
             let has_output = retained_root_input || upstream.has_continuation();
             let control = self.runtime_state.error_state();
-            let mut context = StepContext::new(&control, &mut self.turn_work);
+            let mut context =
+                StepContext::new(&control, &mut self.turn_work, &mut self.value_conversions);
             let admission = if !has_output {
                 UpstreamPull::Busy
             } else if retained_root_input {
@@ -1785,7 +1793,11 @@ impl PipelineDriver {
             };
             let start = Instant::now();
             let control = self.runtime_state.error_state();
-            let mut context = super::step_context::StepContext::new(&control, &mut self.turn_work);
+            let mut context = super::step_context::StepContext::new(
+                &control,
+                &mut self.turn_work,
+                &mut self.value_conversions,
+            );
             let step = match self.edge_root_input.as_ref() {
                 Some((edge, input)) if *edge == e => upstream.drive_precovered(&mut context, input),
                 _ => upstream.drive(&mut context).map(RootStep::Complete),
@@ -1978,7 +1990,8 @@ impl PipelineDriver {
             let op_name = op.name().to_string();
             let start = Instant::now();
             let control = self.runtime_state.error_state();
-            let mut context = StepContext::new(&control, &mut self.turn_work);
+            let mut context =
+                StepContext::new(&control, &mut self.turn_work, &mut self.value_conversions);
             let result = op.finish(&mut context);
             let elapsed = start.elapsed();
             if self.profiler.is_some() {
@@ -2003,6 +2016,7 @@ impl PipelineDriver {
 
 impl Drop for PipelineDriver {
     fn drop(&mut self) {
+        self.value_conversions.clear();
         self.finish_blocked_interval();
         if !self.exit_started {
             self.exit_started = true;
@@ -2235,6 +2249,239 @@ mod tests {
                 "EOS is signaled only once; later steps resume the continuation"
             );
             Ok(self.advance_finalization())
+        }
+    }
+
+    struct HeldExitSource(Arc<std::sync::atomic::AtomicBool>);
+    impl OperatorLifecycle for HeldExitSource {
+        fn name(&self) -> &str {
+            "HeldExitSource"
+        }
+        fn observe_exit(&mut self) -> super::super::operator::ExitObservation {
+            if self.0.load(Ordering::SeqCst) {
+                super::super::operator::ExitObservation::exited()
+            } else {
+                super::super::operator::ExitObservation::pending(FinishWatch::RecheckAfter(
+                    Duration::ZERO,
+                ))
+            }
+        }
+    }
+    impl SourceKernel for HeldExitSource {
+        fn start(&self) -> SourceStart {
+            SourceStart::Finished
+        }
+        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            panic!("already finished source")
+        }
+    }
+    #[test]
+    fn actual_driver_conversion_cache_survives_backpressure_and_clears_before_every_pending_exit() {
+        use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+        use crate::exec::pipeline::operator::{
+            hydrate_for_downstream_with_factory,
+            input_construction::try_runtime_input_construction_factory,
+        };
+        use arrow::array::{
+            Array, ArrayRef, DictionaryArray, Int32Array, StringArray, StringViewArray,
+        };
+        use arrow::datatypes::{DataType, Field, Int32Type};
+        use novarocks_type_contract::{
+            FunctionValueType, ValueTypeStorageHold, ValueTypeStorageLifetime,
+        };
+        use novarocks_types::SlotId;
+        struct SourceHold;
+        impl ValueTypeStorageHold for SourceHold {}
+        struct PlainReceiver;
+        impl InputEncodingPolicy for PlainReceiver {}
+        for terminal in 0..3 {
+            let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let wait = Arc::new(Mutex::new(FinalizationState::ExternalEvent));
+            let runtime = Arc::new(RuntimeState::default());
+            let sink = ScriptedSink::new(wait.clone());
+            let sink_ready = sink.observable.clone();
+            let mut driver = PipelineDriver::new(
+                1,
+                vec![
+                    Box::new(Source::new(HeldExitSource(exited.clone()))),
+                    Box::new(Transform::hydrating(sink)),
+                ],
+                None,
+                Vec::new(),
+                runtime.clone(),
+                None,
+            );
+            let hold = Arc::new(SourceHold);
+            let weak_hold = Arc::downgrade(&hold);
+            let storage = ValueTypeStorageLifetime::held(hold);
+            let values: ArrayRef = Arc::new(StringArray::from(vec![
+                "the actual shared external payload",
+            ]));
+            let weak_values = Arc::downgrade(&values);
+            let dictionary: ArrayRef = Arc::new(
+                DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0, 0]), values.clone())
+                    .unwrap(),
+            );
+            let declaration = FunctionValueType::new(DataType::Utf8View, false);
+            let slot = ChunkSlotSchema::try_new_typed(
+                SlotId::new(1),
+                Arc::new(Field::new("payload", dictionary.data_type().clone(), false)),
+                declaration.typed_binding().clone(),
+                None,
+                storage.clone(),
+            )
+            .unwrap();
+            let source = Chunk::try_new_typed_with_columns_owned_observed::<
+                crate::runtime::fragment::ExecutionFailure,
+                _,
+            >(
+                Arc::new(ChunkSchema::try_new_typed(vec![slot], storage.clone()).unwrap()),
+                vec![dictionary],
+                2,
+                storage.clone(),
+                |_| Ok(()),
+            )
+            .unwrap();
+            let factory = try_runtime_input_construction_factory(
+                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                crate::runtime::mem_tracker::MemTracker::new_root("driver conversion cache"),
+                runtime.error_state(),
+            )
+            .unwrap();
+            driver.value_conversions =
+                novarocks_value_arrays::decode::ValueConversionContext::new(0);
+            let bypassed = hydrate_for_downstream_with_factory(
+                &source,
+                &PlainReceiver,
+                Some(factory.as_ref()),
+                &mut driver.value_conversions,
+            )
+            .unwrap();
+            assert_eq!(driver.value_conversions.stats().cache_skips, 1);
+            assert_eq!(
+                driver
+                    .value_conversions
+                    .storage_facts()
+                    .owned_descriptor_bytes,
+                0
+            );
+            assert_eq!(
+                bypassed.columns()[0]
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .unwrap()
+                    .value(1),
+                "the actual shared external payload"
+            );
+            drop(bypassed);
+            driver.value_conversions =
+                novarocks_value_arrays::decode::ValueConversionContext::default();
+            let output = hydrate_for_downstream_with_factory(
+                &source,
+                &PlainReceiver,
+                Some(factory.as_ref()),
+                &mut driver.value_conversions,
+            )
+            .unwrap();
+            let repeated = hydrate_for_downstream_with_factory(
+                &source,
+                &PlainReceiver,
+                Some(factory.as_ref()),
+                &mut driver.value_conversions,
+            )
+            .unwrap();
+            assert_eq!(driver.value_conversions.stats().converted_values, 1);
+            assert_eq!(driver.value_conversions.stats().cache_hits, 1);
+            let other_values: ArrayRef = Arc::new(StringArray::from(vec![
+                "the actual shared external payload",
+            ]));
+            let other_dictionary: ArrayRef = Arc::new(
+                DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0, 0]), other_values)
+                    .unwrap(),
+            );
+            let other = Chunk::try_new_typed_with_columns_owned_observed::<
+                crate::runtime::fragment::ExecutionFailure,
+                _,
+            >(
+                source.chunk_schema_ref(),
+                vec![other_dictionary],
+                2,
+                storage.clone(),
+                |_| Ok(()),
+            )
+            .unwrap();
+            let independent = hydrate_for_downstream_with_factory(
+                &other,
+                &PlainReceiver,
+                Some(factory.as_ref()),
+                &mut driver.value_conversions,
+            )
+            .unwrap();
+            assert_eq!(
+                driver.value_conversions.stats().cache_hits,
+                1,
+                "equal bytes from another storage must not hit"
+            );
+            assert_eq!(driver.value_conversions.stats().converted_values, 2);
+            drop(independent);
+            drop(other);
+            drop(repeated);
+            drop(source);
+            drop(values);
+            drop(storage);
+            assert!(weak_values.upgrade().is_some());
+            assert_eq!(
+                driver.process(Duration::from_millis(10)),
+                DriverState::Blocked(BlockedReason::OutputFull)
+            );
+            assert!(
+                driver
+                    .value_conversions
+                    .storage_facts()
+                    .owned_descriptor_bytes
+                    > 0
+            );
+            let state = match terminal {
+                0 => {
+                    *wait.lock().unwrap() = FinalizationState::Complete;
+                    sink_ready.notify_observers();
+                    driver.set_ready();
+                    driver.process(Duration::from_millis(10))
+                }
+                1 => driver.finish_with_state(DriverState::Canceled),
+                _ => driver.finish_with_state(DriverState::Failed(
+                    novarocks_functions::KernelFailure::ResourceExhausted.into(),
+                )),
+            };
+            assert_eq!(state, DriverState::PendingFinish);
+            assert!(
+                weak_values.upgrade().is_none(),
+                "cache source Arc retires before actual exit"
+            );
+            assert_eq!(
+                driver
+                    .value_conversions
+                    .storage_facts()
+                    .owned_descriptor_bytes,
+                0
+            );
+            assert!(
+                weak_hold.upgrade().is_some(),
+                "published alias keeps actual source custody"
+            );
+            let view = output.columns()[0]
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            assert_eq!(view.value(1), "the actual shared external payload");
+            drop(output);
+            assert!(
+                weak_hold.upgrade().is_none(),
+                "last published alias releases source custody"
+            );
+            exited.store(true, Ordering::SeqCst);
+            let final_state = driver.process(Duration::from_millis(10));
+            assert!(!matches!(final_state, DriverState::PendingFinish));
         }
     }
 
@@ -4237,7 +4484,14 @@ mod terminal_signal_tests {
         #[test]
         fn required_dictionary_active_null_is_rejected_before_driver_hydration() {
             let failure = required_list_source(2, 1).unwrap_err();
-            assert!(failure.to_string().contains("unmasked logical null"));
+            use novarocks_failure_contract::FailureProjection;
+            assert_eq!(
+                failure.failure_fact(),
+                novarocks_value_arrays::ValueError::Invariant(
+                    novarocks_value_arrays::ValueViolation::RequiredNull,
+                )
+                .failure_fact(),
+            );
         }
         fn factory(
             tracker: &Arc<MemTracker>,

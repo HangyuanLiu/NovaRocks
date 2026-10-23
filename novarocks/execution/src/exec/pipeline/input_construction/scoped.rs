@@ -288,6 +288,12 @@ impl InputConstructionOwner for Scope {
         path: &[ArrayPathStep],
         step: ArrayNormalizationStep<'_>,
     ) -> Result<(), ConstructionFailure> {
+        if let ArrayNormalizationStep::InspectDictionaryRows { row_count, .. } = step {
+            return self.control.checkpoint(row_count);
+        }
+        if let ArrayNormalizationStep::ValueWork { units } = step {
+            return self.control.checkpoint(units);
+        }
         if path.len() > self.guard.profile.max_depth {
             return Err(exhausted());
         }
@@ -338,6 +344,47 @@ mod tests {
             |_| Ok(()),
         )
         .unwrap()
+    }
+    #[test]
+    fn value_work_uses_original_control_without_spending_structural_work_quota() {
+        use novarocks_failure_contract::FailureProjection;
+        let tracker = MemTracker::new_root("separate value work");
+        let error = Arc::new(RuntimeErrorState::default());
+        let mut limits = profile();
+        limits.max_work = 1;
+        let factory = ObservedInputConstructionFactory::try_new(
+            limits,
+            Arc::new(TrackedInputConstructionHost::new(tracker)),
+            Arc::new(RuntimeInputConstructionControl::new(error.clone())),
+            Arc::new(LockedArrowInputConstructionModel),
+        )
+        .unwrap();
+        let owner = factory.begin_input_construction(&source()).unwrap();
+        owner
+            .observe(0, &[], ArrayNormalizationStep::ValueWork { units: 65_536 })
+            .unwrap();
+        owner
+            .observe(0, &[], ArrayNormalizationStep::ValueWork { units: 65_536 })
+            .unwrap();
+        assert!(
+            owner
+                .observe(
+                    0,
+                    &[],
+                    ArrayNormalizationStep::InspectConstructionWork { units: 2 }
+                )
+                .is_err()
+        );
+        let original = crate::runtime::fragment::ExecutionFailure::from(
+            novarocks_functions::KernelFailure::Cancelled,
+        );
+        error.set_error(original.clone());
+        let refusal = owner
+            .observe(0, &[], ArrayNormalizationStep::ValueWork { units: 0 })
+            .unwrap_err();
+        assert!(
+            matches!(refusal, ConstructionFailure::Caller(source) if source.failure_fact() == original.failure_fact())
+        );
     }
     #[test]
     fn actual_tracker_requests_survive_scope_and_control_until_final_creation_hold_drop() {

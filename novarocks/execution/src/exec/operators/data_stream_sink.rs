@@ -2501,7 +2501,9 @@ impl DataStreamSinkOperator {
             .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
         let mut work =
             crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        let ctx = StepContext::new(&control, &mut work);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let ctx = StepContext::new(&control, &mut work, &mut value_conversions);
         self.buffer_chunk_with_keys(&ctx, chunk, None)
     }
 

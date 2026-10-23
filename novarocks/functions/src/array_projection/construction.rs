@@ -24,9 +24,7 @@
 //! arrow-data/data.rs::{ArrayData,ArrayDataBuilder}. The shared private-buffer
 //! owner bound is the existing root_array_storage contract, not a new mirror.
 
-use super::{
-    ArrayNormalizationStep, ArrayProjectionFailure, ArrayProjectionViolation, StringOffsetWidth,
-};
+use super::{ArrayNormalizationStep, ArrayProjectionFailure, ArrayProjectionViolation};
 
 fn dictionary_values(source: &dyn Array) -> Option<&ArrayRef> {
     use arrow_array::types::{
@@ -56,7 +54,7 @@ fn dictionary_values(source: &dyn Array) -> Option<&ArrayRef> {
     }
 }
 use arrow_array::types::Int32Type;
-use arrow_array::{Array, ArrayRef, DictionaryArray, LargeStringArray, StringArray};
+use arrow_array::{Array, ArrayRef, DictionaryArray};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, FieldRef};
 use std::alloc::Layout;
@@ -140,6 +138,34 @@ pub fn observe_array_normalization_construction<E: From<ArrayProjectionFailure>>
     work: &mut Work<'_, E>,
 ) -> Result<(), E> {
     match step {
+        ArrayNormalizationStep::ValueWork { units } => work(units),
+        ArrayNormalizationStep::ValueStructure { event, .. } => {
+            use novarocks_value_arrays::{ByteLayout, control::ValueStructure};
+            match event {
+                ValueStructure::SharedOwner(layout) => request(layout),
+                ValueStructure::ByteArray {
+                    layout,
+                    new_buffer_owners,
+                } => {
+                    match layout {
+                        ByteLayout::Utf8 => arc::<arrow_array::StringArray, E>(request)?,
+                        ByteLayout::LargeUtf8 => arc::<arrow_array::LargeStringArray, E>(request)?,
+                        ByteLayout::Binary => arc::<arrow_array::BinaryArray, E>(request)?,
+                        ByteLayout::LargeBinary => {
+                            arc::<arrow_array::LargeBinaryArray, E>(request)?
+                        }
+                        ByteLayout::Utf8View => arc::<arrow_array::StringViewArray, E>(request)?,
+                        ByteLayout::BinaryView => arc::<arrow_array::BinaryViewArray, E>(request)?,
+                    }
+                    opaque(ArrayProjectionOpaqueBound {
+                        requests_upper: new_buffer_owners,
+                        bytes_upper: mul(new_buffer_owners, ARROW_BUFFER_OWNER_METADATA_BOUND)?,
+                        work_upper: new_buffer_owners,
+                    })
+                }
+            }
+        }
+
         ArrayNormalizationStep::OpaqueOperationFinished => work(0),
         ArrayNormalizationStep::InspectType(_) => work(1),
         ArrayNormalizationStep::InspectConstructionWork { units } => work(units),
@@ -164,53 +190,6 @@ pub fn observe_array_normalization_construction<E: From<ArrayProjectionFailure>>
         ArrayNormalizationStep::RebuildType { source } => type_bound(source, opaque, work),
         ArrayNormalizationStep::RebuildArray { source, target, .. } => {
             array_bound(source, target, request, opaque, work, false)
-        }
-        ArrayNormalizationStep::DecodeDictionary { source, target, .. } => {
-            decode(source, target, request, opaque, work)
-        }
-        ArrayNormalizationStep::ValidateStringWrapper { source, .. } => {
-            // arrow-array 58.4 GenericStringType::validate scans the complete
-            // visible value buffer and checks each offset's UTF-8 boundary.
-            // Buffer clones share their existing owner; only the public Arc
-            // wrapper is a new exact request. Validation has no allocation on
-            // this already-valid success path and is an opaque work bound.
-            work(0)?;
-            let (bytes, offsets) = match source.data_type() {
-                DataType::Utf8 => {
-                    let array = source
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .ok_or_else(|| {
-                            E::from(ArrayProjectionFailure::Contract(
-                                ArrayProjectionViolation::PhysicalWrapper,
-                            ))
-                        })?;
-                    arc::<StringArray, E>(request)?;
-                    (array.values().len(), array.offsets().len())
-                }
-                DataType::LargeUtf8 => {
-                    let array = source
-                        .as_any()
-                        .downcast_ref::<LargeStringArray>()
-                        .ok_or_else(|| {
-                            E::from(ArrayProjectionFailure::Contract(
-                                ArrayProjectionViolation::PhysicalWrapper,
-                            ))
-                        })?;
-                    arc::<LargeStringArray, E>(request)?;
-                    (array.values().len(), array.offsets().len())
-                }
-                _ => {
-                    return Err(E::from(ArrayProjectionFailure::Contract(
-                        ArrayProjectionViolation::StringOffsets,
-                    )));
-                }
-            };
-            opaque(ArrayProjectionOpaqueBound {
-                requests_upper: 0,
-                bytes_upper: 0,
-                work_upper: add(bytes, offsets)?,
-            })
         }
         ArrayNormalizationStep::SliceArray { source, .. } => {
             array_bound(source, source.data_type(), request, opaque, work, true)
@@ -509,240 +488,10 @@ fn borrowed_array_span<E: From<ArrayProjectionFailure>>(
     Ok(span)
 }
 
-fn decoded_string_bytes(
-    required: u128,
-    width: StringOffsetWidth,
-) -> Result<usize, ArrayProjectionFailure> {
-    if required > u128::from(width.limit()) {
-        return Err(ArrayProjectionFailure::DecodedStringExtent {
-            required: u64::try_from(required).ok(),
-            width,
-        });
-    }
-    usize::try_from(required).map_err(|_| ArrayProjectionFailure::RequestArithmetic)
-}
-
-fn decode<E: From<ArrayProjectionFailure>>(
-    source: &ArrayRef,
-    target: &DataType,
-    request: &mut Request<'_, E>,
-    opaque: &mut Opaque<'_, E>,
-    work: &mut Work<'_, E>,
-) -> Result<(), E> {
-    let dict = source
-        .as_any()
-        .downcast_ref::<DictionaryArray<Int32Type>>()
-        .ok_or_else(|| {
-            E::from(ArrayProjectionFailure::Contract(
-                ArrayProjectionViolation::NonInt32Dictionary,
-            ))
-        })?;
-    let mut bytes = 0u128;
-    // Offsets remain borrowed. Do not collect an auxiliary length vector.
-    let (width, wrapper) = match (dict.values().data_type(), target) {
-        (DataType::Utf8, DataType::Utf8) => (StringOffsetWidth::I32, 0),
-        (DataType::LargeUtf8, DataType::LargeUtf8) => (StringOffsetWidth::I64, 1),
-        _ => {
-            return Err(E::from(ArrayProjectionFailure::Contract(
-                ArrayProjectionViolation::DecodeEncoding,
-            )));
-        }
-    };
-    // The direct loop duplicates the finite take_bytes sizing pass, preserving
-    // NULL keys and referenced value NULLs, including sliced key coordinates.
-    for at in 0..dict.len() {
-        if at % 256 == 0 {
-            work((dict.len() - at).min(256))?;
-        }
-        if dict.keys().is_null(at) {
-            continue;
-        }
-        let key = usize::try_from(dict.keys().value(at)).map_err(|_| {
-            E::from(ArrayProjectionFailure::Contract(
-                ArrayProjectionViolation::NegativeDictionaryKey,
-            ))
-        })?;
-        if key >= dict.values().len() {
-            return Err(E::from(ArrayProjectionFailure::Contract(
-                ArrayProjectionViolation::DictionaryKeyBounds,
-            )));
-        }
-        if dict.values().is_null(key) {
-            continue;
-        }
-        let length =
-            if wrapper == 0 {
-                let values = dict
-                    .values()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        E::from(ArrayProjectionFailure::Contract(
-                            ArrayProjectionViolation::PhysicalWrapper,
-                        ))
-                    })?;
-                usize::try_from(values.value_offsets()[key + 1] - values.value_offsets()[key])
-                    .map_err(|_| {
-                        E::from(ArrayProjectionFailure::Contract(
-                            ArrayProjectionViolation::InvalidStringOffsets,
-                        ))
-                    })?
-            } else {
-                let values = dict
-                    .values()
-                    .as_any()
-                    .downcast_ref::<LargeStringArray>()
-                    .ok_or_else(|| {
-                        E::from(ArrayProjectionFailure::Contract(
-                            ArrayProjectionViolation::PhysicalWrapper,
-                        ))
-                    })?;
-                usize::try_from(values.value_offsets()[key + 1] - values.value_offsets()[key])
-                    .map_err(|_| {
-                        E::from(ArrayProjectionFailure::Contract(
-                            ArrayProjectionViolation::InvalidStringOffsets,
-                        ))
-                    })?
-            };
-        bytes = bytes.checked_add(length as u128).ok_or_else(|| {
-            E::from(ArrayProjectionFailure::DecodedStringExtent {
-                required: None,
-                width,
-            })
-        })?;
-    }
-    let bytes = decoded_string_bytes(bytes, width)?;
-    if width == StringOffsetWidth::I32 {
-        array::<i32, E>(add(dict.len(), 1)?, request)?;
-    } else {
-        array::<i64, E>(add(dict.len(), 1)?, request)?;
-    }
-    array::<u8, E>(bytes, request)?;
-    if wrapper == 0 {
-        arc::<StringArray, E>(request)?;
-    } else {
-        arc::<LargeStringArray, E>(request)?;
-    }
-    // take_nulls can create validity scratch; Buffer::from_vec creates private
-    // Bytes owners. Cast may also rebuild the existing dictionary value wrapper.
-    opaque(ArrayProjectionOpaqueBound {
-        requests_upper: 12,
-        bytes_upper: add(
-            mul(ARROW_BUFFER_OWNER_METADATA_BOUND, 12)?,
-            mul(bitmap_bound(dict.len())?, 4)?,
-        )?,
-        work_upper: add(mul(dict.len(), 4)?, bytes)?,
-    })
-}
-
-#[cfg(test)]
-mod validated_string_tests {
-    use super::*;
-    use std::sync::Arc;
-
-    #[test]
-    fn validation_model_covers_whole_buffer_and_offsets_but_only_new_wrapper_storage() {
-        for large in [false, true] {
-            let string: ArrayRef = Arc::new(StringArray::from(vec!["prefix", "é", "suffix"]));
-            let string = if large {
-                arrow_cast::cast(string.as_ref(), &DataType::LargeUtf8).unwrap()
-            } else {
-                string
-            };
-            let source = string.slice(1, 1);
-            let mut requests = Vec::new();
-            let mut bounds = Vec::new();
-            let mut work_units = Vec::new();
-            observe_array_normalization_construction::<crate::KernelFailure>(
-                ArrayNormalizationStep::ValidateStringWrapper {
-                    path: &[],
-                    source: &source,
-                },
-                &mut |layout| {
-                    requests.push(layout);
-                    Ok(())
-                },
-                &mut |bound| {
-                    bounds.push(bound);
-                    Ok(())
-                },
-                &mut |units| {
-                    work_units.push(units);
-                    Ok(())
-                },
-            )
-            .unwrap();
-            let (bytes, offsets, layout) = if large {
-                let a = source.as_any().downcast_ref::<LargeStringArray>().unwrap();
-                (
-                    a.values().len(),
-                    a.offsets().len(),
-                    Layout::new::<LargeStringArray>(),
-                )
-            } else {
-                let a = source.as_any().downcast_ref::<StringArray>().unwrap();
-                (
-                    a.values().len(),
-                    a.offsets().len(),
-                    Layout::new::<StringArray>(),
-                )
-            };
-            assert!(bytes > "é".len());
-            assert_eq!(
-                requests,
-                vec![novarocks_type_contract::owned_resources::layout::arc_layout(layout).unwrap()]
-            );
-            assert_eq!(
-                bounds,
-                vec![ArrayProjectionOpaqueBound {
-                    requests_upper: 0,
-                    bytes_upper: 0,
-                    work_upper: bytes + offsets
-                }]
-            );
-            assert_eq!(work_units, vec![0]);
-            let mut called = false;
-            let error = observe_array_normalization_construction::<crate::KernelFailure>(
-                ArrayNormalizationStep::ValidateStringWrapper {
-                    path: &[],
-                    source: &source,
-                },
-                &mut |_| Err(crate::KernelFailure::ResourceExhausted),
-                &mut |_| {
-                    called = true;
-                    Ok(())
-                },
-                &mut |_| Ok(()),
-            )
-            .unwrap_err();
-            assert_eq!(error, crate::KernelFailure::ResourceExhausted);
-            assert!(!called);
-        }
-    }
-}
-
 #[cfg(test)]
 mod extent_failure_tests {
     use super::*;
     use novarocks_failure_contract::{FailureClass, FailureProjection};
-    #[test]
-    fn decoded_bytes_check_the_complete_output_before_any_request() {
-        for width in [StringOffsetWidth::I32, StringOffsetWidth::I64] {
-            let limit = u128::from(width.limit());
-            assert_eq!(decoded_string_bytes(limit, width).unwrap(), limit as usize);
-            let failure = decoded_string_bytes(limit + 1, width).unwrap_err();
-            assert_eq!(failure.failure_fact().class(), FailureClass::Representation);
-            let facts = failure.failure_fact().representation().unwrap();
-            assert_eq!(facts.required, Some((limit + 1) as u64));
-            assert_eq!(facts.extent_limit, Some(limit as u64));
-        }
-        let failure =
-            decoded_string_bytes(u64::MAX as u128 + 1, StringOffsetWidth::I64).unwrap_err();
-        assert_eq!(
-            failure.failure_fact().representation().unwrap().required,
-            None
-        );
-    }
     #[test]
     fn impossible_array_backing_preserves_geometry_and_never_calls_the_host() {
         for count in [usize::MAX, isize::MAX as usize / 8 + 1] {

@@ -207,7 +207,7 @@ pub(crate) enum ExecutionReason {
     ChunkColumnRows = 252,
     ChunkColumnLayout = 253,
     ChunkColumnBinding = 254,
-    ChunkRequiredNull = 255,
+    // 255 retired: required values are authored by the shared value domain.
     ChunkBatchOccurrence = 256,
     ChunkSlice = 257,
     ChunkBatchLabels = 258,
@@ -218,8 +218,7 @@ pub(crate) enum ExecutionReason {
     ChunkHydrationBinding = 263,
     ChunkHydrationMapEntries = 264,
     ChunkHydrationMapArity = 265,
-    ChunkHydrationContainer = 266,
-    ChunkFlatDictionary = 267,
+    // 266..=267 retired with the legacy hydration helpers.
     #[cfg(test)]
     RepeatSchemaChannels = 268,
     #[cfg(test)]

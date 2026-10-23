@@ -41,8 +41,6 @@ use super::ArrayNormalizationStep;
 #[cfg(test)]
 use super::ArrayPathStep;
 
-pub(super) use novarocks_functions::array_projection::normalize_inactive_nulls;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,36 +137,39 @@ mod tests {
     }
 
     #[test]
-    fn required_hydrated_strings_share_payload_and_offsets_and_retain_real_creator() {
+    fn required_hydrated_strings_publish_once_share_clone_slice_and_retain_real_creator() {
         for large in [false, true] {
             let source = encoded_source(large, false);
             let tracker = MemTracker::new_root("inactive required strings");
             let factory = factory(&tracker);
             let scope = factory.begin_input_construction(&source).unwrap();
-            let mut pointers = None;
+            let mut publications = 0;
             let output = hydrate_dictionary_columns_owned_observed(
                 &source,
                 scope.storage_lifetime(),
+                &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
                 |_, _, _, _| false,
                 |occurrence, path, step| {
-                    if let ArrayNormalizationStep::ValidateStringWrapper { source, .. } = step {
+                    if let ArrayNormalizationStep::ValueStructure {
+                        event:
+                            novarocks_value_arrays::control::ValueStructure::ByteArray {
+                                new_buffer_owners,
+                                ..
+                            },
+                        ..
+                    } = step
+                    {
                         assert_eq!(path, &[ArrayPathStep::ListItem]);
-                        assert_eq!(source.null_count(), 2);
-                        pointers = Some(match source.data_type() {
-                            DataType::Utf8 => {
-                                let a = source.as_any().downcast_ref::<StringArray>().unwrap();
-                                (a.values().as_ptr(), a.offsets().as_ptr() as *const u8)
-                            }
-                            DataType::LargeUtf8 => {
-                                let a = source.as_any().downcast_ref::<LargeStringArray>().unwrap();
-                                (a.values().as_ptr(), a.offsets().as_ptr() as *const u8)
-                            }
-                            _ => unreachable!(),
-                        });
+                        assert_eq!(
+                            new_buffer_owners, 2,
+                            "only actual offsets and payload Buffer owners"
+                        );
+                        publications += 1;
                     }
                     scope.observe(occurrence, path, step)
                 },
                 |layout| scope.request(layout),
+                |_| Ok(()),
             )
             .unwrap();
             let list = output.columns()[0]
@@ -199,7 +200,31 @@ mod tests {
                 assert_eq!(a.value(2), "");
                 (a.values().as_ptr(), a.offsets().as_ptr() as *const u8)
             };
-            assert_eq!(Some(actual), pointers);
+            assert_eq!(publications, 1);
+            let cloned = output.clone();
+            let sliced = output
+                .slice_typed_observed::<ConstructionFailure, _>(
+                    1,
+                    1,
+                    scope.storage_lifetime(),
+                    |step| scope.observe(0, &[], step),
+                )
+                .unwrap();
+            for alias in [&cloned, &sliced] {
+                let values = alias.columns()[0]
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .unwrap()
+                    .values();
+                let alias = if large {
+                    let a = values.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                    (a.values().as_ptr(), a.offsets().as_ptr() as *const u8)
+                } else {
+                    let a = values.as_any().downcast_ref::<StringArray>().unwrap();
+                    (a.values().as_ptr(), a.offsets().as_ptr() as *const u8)
+                };
+                assert_eq!(alias, actual);
+            }
             assert_eq!(
                 output.chunk_schema().slots()[0]
                     .typed_binding()
@@ -213,12 +238,18 @@ mod tests {
             drop(factory);
             assert!(tracker.current() > 0);
             drop(output);
+            drop(cloned);
+            assert!(
+                tracker.current() > 0,
+                "the final slice still holds its real creator"
+            );
+            drop(sliced);
             assert_eq!(tracker.current(), 0);
         }
     }
 
     #[test]
-    fn nullable_decoded_leaf_keeps_null_mask_without_required_wrapper_event() {
+    fn nullable_decoded_leaf_publishes_actual_validity_owner_and_keeps_null_mask() {
         let source = encoded_source(false, true);
         let tracker = MemTracker::new_root("nullable hydrated strings");
         let factory = factory(&tracker);
@@ -226,15 +257,27 @@ mod tests {
         let output = hydrate_dictionary_columns_owned_observed(
             &source,
             scope.storage_lifetime(),
+            &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
             |_, _, _, _| false,
             |occurrence, path, step| {
-                assert!(!matches!(
-                    step,
-                    ArrayNormalizationStep::ValidateStringWrapper { .. }
-                ));
+                if let ArrayNormalizationStep::ValueStructure {
+                    event:
+                        novarocks_value_arrays::control::ValueStructure::ByteArray {
+                            new_buffer_owners,
+                            ..
+                        },
+                    ..
+                } = step
+                {
+                    assert_eq!(
+                        new_buffer_owners, 3,
+                        "nullable publication also creates its actual validity owner"
+                    );
+                }
                 scope.observe(occurrence, path, step)
             },
             |layout| scope.request(layout),
+            |_| Ok(()),
         )
         .unwrap();
         let list = output.columns()[0]
@@ -264,14 +307,22 @@ mod tests {
         let failure = hydrate_dictionary_columns_owned_observed(
             &source,
             scope.storage_lifetime(),
+            &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
             |_, _, _, _| false,
             |occurrence, path, step| {
-                if matches!(step, ArrayNormalizationStep::ValidateStringWrapper { .. }) {
+                if matches!(
+                    step,
+                    ArrayNormalizationStep::ValueStructure {
+                        event: novarocks_value_arrays::control::ValueStructure::ByteArray { .. },
+                        ..
+                    }
+                ) {
                     return Err(ConstructionFailure::Caller(Box::new(original.clone())));
                 }
                 scope.observe(occurrence, path, step)
             },
             |layout| scope.request(layout),
+            |_| Ok(()),
         )
         .unwrap_err();
         assert_eq!(ExecutionFailure::from(failure), original);
@@ -293,9 +344,6 @@ mod tests {
     #[test]
     fn hydration_preserves_ancestor_mask_required_strings_and_rejects_visible_dictionary_null() {
         use novarocks_failure_contract::{FailureClass, FailureProjection};
-        use novarocks_functions::array_projection::{
-            ArrayProjectionFailure, ArrayProjectionViolation,
-        };
         use std::error::Error;
 
         // This fixture protects hydration and typed ingress only. The retired
@@ -333,9 +381,11 @@ mod tests {
         let hydrated = hydrate_dictionary_columns_owned_observed(
             &source,
             scope.storage_lifetime(),
+            &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
             |_, _, _, _| false,
             |occurrence, path, step| scope.observe(occurrence, path, step),
             |layout| scope.request(layout),
+            |_| Ok(()),
         )
         .unwrap();
         let plain_array: ArrayRef = Arc::new(
@@ -470,21 +520,22 @@ mod tests {
             |_| Ok(()),
         )
         .unwrap_err();
-        let expected =
-            ArrayProjectionFailure::Contract(ArrayProjectionViolation::UnmaskedRequiredNull);
+        let expected = novarocks_value_arrays::ValueError::Invariant(
+            novarocks_value_arrays::ValueViolation::RequiredNull,
+        );
         assert_eq!(failure.failure_fact(), expected.failure_fact());
         assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
         assert_eq!(
             failure.detail(),
-            "typed required dictionary child contains an unmasked logical null"
+            "value array contract violated: RequiredNull"
         );
         let mut cause: &(dyn Error + 'static) = &failure;
         loop {
-            if let Some(original) = cause.downcast_ref::<ArrayProjectionFailure>() {
+            if let Some(original) = cause.downcast_ref::<novarocks_value_arrays::ValueError>() {
                 assert!(matches!(
                     original,
-                    ArrayProjectionFailure::Contract(
-                        ArrayProjectionViolation::UnmaskedRequiredNull
+                    novarocks_value_arrays::ValueError::Invariant(
+                        novarocks_value_arrays::ValueViolation::RequiredNull
                     )
                 ));
                 break;

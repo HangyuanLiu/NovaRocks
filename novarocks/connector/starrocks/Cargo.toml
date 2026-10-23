@@ -12,7 +12,6 @@ doctest = false
 
 [dependencies]
 arrow.workspace = true
-base64.workspace = true
 bytes.workspace = true
 futures.workspace = true
 novarocks-spi.workspace = true

@@ -47,8 +47,6 @@ pub use compiled_layout_metadata_request::{
 };
 pub(crate) use filtered_output::normalize_filter_mask_observed;
 pub use hydrate::dictionary_hydration_required_observed;
-pub use hydrate::hydrate_dictionary_columns_except;
-pub use hydrate::hydrate_dictionary_columns_observed;
 pub use hydrate::hydrate_dictionary_columns_owned_observed;
 pub use memory::record_batch_bytes;
 pub(crate) use memory::{
@@ -71,3 +69,5 @@ pub use typed_array_normalization::{
 };
 
 pub(crate) use schema::validate_chunk_carrier_encoding_observed;
+
+pub(crate) use hydrate::contains_dictionary;

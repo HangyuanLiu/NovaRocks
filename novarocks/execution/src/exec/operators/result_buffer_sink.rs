@@ -135,11 +135,11 @@ impl InputPreparation<ResultEncoding> for ResultPreparation {
     }
     fn prepare(
         &mut self,
-        _: &mut StepContext<'_>,
+        ctx: &mut StepContext<'_>,
         input: AcceptedInput,
         encoding: &ResultEncoding,
     ) -> Result<PreparationStep, InputPreparationFailure> {
-        self.hydrate.prepare_accepted(input, encoding)
+        self.hydrate.prepare_accepted(ctx, input, encoding)
     }
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
         self.hydrate.install_tracker(tracker);
@@ -741,7 +741,11 @@ mod tests {
         let control = crate::runtime::runtime_state::RuntimeErrorState::default();
         let mut turn =
             crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        action(&mut StepContext::new(&control, &mut turn))
+        action(&mut StepContext::new(
+            &control,
+            &mut turn,
+            &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
+        ))
     }
     fn push(operator: &mut dyn Operator, input: RawInput) -> InputResult {
         with_context(|ctx| operator.try_push(ctx, input))
@@ -870,7 +874,9 @@ mod tests {
         let control = crate::runtime::runtime_state::RuntimeErrorState::default();
         let mut turn =
             crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 0);
-        let mut ctx = StepContext::new(&control, &mut turn);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
         let step = operator.as_mut().drive(&mut ctx).unwrap();
         assert!(matches!(step.next, NextStep::Yield));
         operator.as_mut().finish(&mut ctx).unwrap();
