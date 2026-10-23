@@ -96,9 +96,9 @@ pub use scope::{
     BusinessPermit, CountedWorkloadControlParts, DeadlineExpiryHandle, PendingQueryRoot,
     QueryConcurrencyPermit, RootAdmissionHandle, RootWork, ServingState,
     WorkCancellationRequestOutcome, WorkCancellationRequester, WorkClass, WorkId, WorkOwner,
-    WorkRequest, WorkScope, WorkSuccessSealOutcome, WorkSuccessSealer, WorkloadConfig,
-    WorkloadControl, WorkloadControlParts, WorkloadProgress, WorkloadProgressRevision,
-    WorkloadShutdown, WorkloadShutdownError, WorkloadShutdownFailure,
+    WorkRequest, WorkRetirementObserver, WorkScope, WorkSuccessSealOutcome, WorkSuccessSealer,
+    WorkloadConfig, WorkloadControl, WorkloadControlParts, WorkloadProgress,
+    WorkloadProgressRevision, WorkloadShutdown, WorkloadShutdownError, WorkloadShutdownFailure,
 };
 
 mod failure_projection;

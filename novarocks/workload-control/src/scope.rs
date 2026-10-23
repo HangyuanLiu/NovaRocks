@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod retirement;
+pub use retirement::WorkRetirementObserver;
+
 #[cfg(test)]
 use crate::cancellation::Cancellation;
 use crate::control_storage::{CancellationStorage, SlotId};
