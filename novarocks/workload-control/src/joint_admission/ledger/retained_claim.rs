@@ -34,14 +34,29 @@ pub(crate) struct OwnerRetainedClaimReceipt {
     release_revision: u64,
 }
 
+/// A committed transition has already updated the original level facts. The
+/// receiver carries this notification out of its own locks before waking any
+/// callback. Dropping it supplies no release, rollback or completion fact.
+#[must_use = "Notify committed progress after releasing the receiving owner's locks"]
+pub(crate) struct RetainedClaimProgress {
+    inner: Arc<Inner>,
+}
+
+impl RetainedClaimProgress {
+    pub(crate) fn notify(self) {
+        self.inner.notify_reclaim_progress();
+    }
+}
+
 /// Both slots belong to a stable receiver before this call. Refusal leaves
 /// them untouched and invokes no callbacks. Successful handoff installs the
 /// receipt and disarms the original guard under the same original State lock.
+/// No callback runs here; notify the returned progress after all receiver locks exit.
 pub(crate) fn retain_claim_in(
     owner: &WorkOwner,
     source: &mut Option<JointClaim>,
     target: &mut Option<OwnerRetainedClaimReceipt>,
-) -> Result<(), WorkError> {
+) -> Result<RetainedClaimProgress, WorkError> {
     if target.is_some() {
         return Err(WorkError::Conflict);
     }
@@ -95,17 +110,17 @@ pub(crate) fn retain_claim_in(
     };
     // This guard is inert; its Inner alias leaves only after State unlocks.
     drop(retired);
-    inner.notify_reclaim_progress();
-    Ok(())
+    Ok(RetainedClaimProgress { inner })
 }
 
 /// The receipt itself supplies the unique settlement capability. Cancellation,
 /// logical completion, closure and driver exit do not prevent real release.
 /// The domain receiver validates and stores its original evidence first; WC
 /// validates only this exact original capacity record and consumes its slot.
+/// Carry the returned progress out of every receiver lock before notifying.
 pub(crate) fn settle_retained_claim_in(
     slot: &mut Option<OwnerRetainedClaimReceipt>,
-) -> Result<(), WorkError> {
+) -> Result<RetainedClaimProgress, WorkError> {
     let receipt = slot.as_ref().ok_or(WorkError::Released)?;
     let inner = receipt.inner.upgrade().ok_or(WorkError::Released)?;
     let retired = {
@@ -134,8 +149,7 @@ pub(crate) fn settle_retained_claim_in(
         retired
     };
     drop(retired);
-    inner.notify_reclaim_progress();
-    Ok(())
+    Ok(RetainedClaimProgress { inner })
 }
 
 #[cfg(test)]
@@ -174,7 +188,9 @@ mod tests {
             )
         };
         let mut receipt = None;
-        retain_claim_in(&work.owner, &mut source, &mut receipt).unwrap();
+        retain_claim_in(&work.owner, &mut source, &mut receipt)
+            .unwrap()
+            .notify();
         assert!(source.is_none());
         assert_eq!(held(&control), (2, 17));
         {
@@ -207,7 +223,7 @@ mod tests {
                 .nodes
                 .contains_key(&scope.id())
         );
-        settle_retained_claim_in(&mut receipt).unwrap();
+        settle_retained_claim_in(&mut receipt).unwrap().notify();
         assert!(receipt.is_none());
         assert_eq!(held(&control), (1, 7));
         assert_eq!(peer.amounts().unwrap(), bytes(7));
@@ -265,9 +281,11 @@ mod tests {
             drop(delivered);
             drop(pending);
             drive(&mut driver);
-            retain_claim_in(&work.owner, &mut source, &mut receipt).unwrap();
+            retain_claim_in(&work.owner, &mut source, &mut receipt)
+                .unwrap()
+                .notify();
             assert_eq!(held(&control), (1, 10));
-            settle_retained_claim_in(&mut receipt).unwrap();
+            settle_retained_claim_in(&mut receipt).unwrap().notify();
             work.business.release();
             work.owner.complete();
         }
@@ -327,7 +345,9 @@ mod tests {
             .get_mut(&id)
             .unwrap()
             .structure_revision = original_revision;
-        retain_claim_in(&work.owner, &mut source, &mut receipt).unwrap();
+        retain_claim_in(&work.owner, &mut source, &mut receipt)
+            .unwrap()
+            .notify();
         let mut another = request(&handle, &scope, &[], JointLane::Foreground, 3);
         drive(&mut driver);
         let mut another = granted(&mut another).pop();
@@ -336,7 +356,7 @@ mod tests {
             Err(WorkError::Conflict)
         ));
         assert_eq!(another.as_ref().unwrap().amounts().unwrap(), bytes(3));
-        settle_retained_claim_in(&mut receipt).unwrap();
+        settle_retained_claim_in(&mut receipt).unwrap().notify();
         drop(another);
         for work in [work, other, foreign] {
             work.business.release();
@@ -375,11 +395,11 @@ mod tests {
                 .is_pending()
         );
         assert!(
-            catch_unwind(AssertUnwindSafe(|| retain_claim_in(
-                &work.owner,
-                &mut source,
-                &mut receipt
-            )))
+            catch_unwind(AssertUnwindSafe(|| {
+                retain_claim_in(&work.owner, &mut source, &mut receipt)
+                    .unwrap()
+                    .notify()
+            }))
             .is_err()
         );
         drop(waiter);
@@ -392,7 +412,12 @@ mod tests {
                 .poll(&mut Context::from_waker(&waker))
                 .is_pending()
         );
-        assert!(catch_unwind(AssertUnwindSafe(|| settle_retained_claim_in(&mut receipt))).is_err());
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                settle_retained_claim_in(&mut receipt).unwrap().notify()
+            }))
+            .is_err()
+        );
         drop(waiter);
         assert!(receipt.is_none());
         assert_eq!(held(&control), (0, 0));
@@ -412,14 +437,18 @@ mod tests {
             drive(&mut driver);
             let mut source = granted(&mut initial).pop();
             let mut lost = None;
-            retain_claim_in(&work.owner, &mut source, &mut lost).unwrap();
+            retain_claim_in(&work.owner, &mut source, &mut lost)
+                .unwrap()
+                .notify();
             drop(lost);
             assert_eq!(held(&control), (1, 10));
             let mut next = request(&handle, &scope, &[], JointLane::Foreground, 3);
             drive(&mut driver);
             let mut source = granted(&mut next).pop();
             let mut receipt = None;
-            retain_claim_in(&work.owner, &mut source, &mut receipt).unwrap();
+            retain_claim_in(&work.owner, &mut source, &mut receipt)
+                .unwrap()
+                .notify();
             work.business.release();
             work.owner.complete();
             assert_eq!(held(&control), (2, 13));
@@ -446,11 +475,13 @@ mod tests {
         work.owner.cancel(crate::CancellationReason::Requested);
         control.close_admission();
         let mut receipt = None;
-        retain_claim_in(&work.owner, &mut source, &mut receipt).unwrap();
+        retain_claim_in(&work.owner, &mut source, &mut receipt)
+            .unwrap()
+            .notify();
         work.business.release();
         drop(work.owner);
         drop(driver);
-        settle_retained_claim_in(&mut receipt).unwrap();
+        settle_retained_claim_in(&mut receipt).unwrap().notify();
         {
             let state = control.inner.state.lock().unwrap();
             let node = &state.nodes[&scope.id()];
@@ -471,5 +502,150 @@ mod tests {
                 .nodes
                 .contains_key(&scope.id())
         );
+    }
+
+    #[test]
+    fn stable_receiver_unlocks_before_callbacks_and_notification_drop_is_not_release() {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Slots {
+            source: Option<JointClaim>,
+            receipt: Option<OwnerRetainedClaimReceipt>,
+        }
+        struct ReceiverWake {
+            slots: Weak<Mutex<Slots>>,
+            inner: Weak<Inner>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl std::task::Wake for ReceiverWake {
+            fn wake(self: Arc<Self>) {
+                assert!(
+                    self.slots.upgrade().unwrap().try_lock().is_ok(),
+                    "the stable receiver must be unlocked before notification"
+                );
+                assert!(self.inner.upgrade().unwrap().state.try_lock().is_ok());
+                self.calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let (control, handle, mut driver) = roomy_control();
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Management))
+            .unwrap();
+        let scope = work.owner.scope();
+        let mut initial = request(&handle, &scope, &[], JointLane::Foreground, 10);
+        drive(&mut driver);
+        let slots = Arc::new(Mutex::new(Slots {
+            source: granted(&mut initial).pop(),
+            receipt: None,
+        }));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(ReceiverWake {
+            slots: Arc::downgrade(&slots),
+            inner: Arc::downgrade(&control.inner),
+            calls: Arc::clone(&calls),
+        }));
+        let mut waiter = Box::pin(control.wait_progress(control.progress_revision()));
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let progress = {
+            let mut guard = slots.lock().unwrap();
+            let Slots { source, receipt } = &mut *guard;
+            let progress = retain_claim_in(&work.owner, source, receipt).unwrap();
+            assert!(source.is_none() && receipt.is_some());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            progress
+        };
+        progress.notify();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(held(&control), (1, 10));
+        drop(waiter);
+        let mut waiter = Box::pin(control.wait_progress(control.progress_revision()));
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let progress = {
+            let mut guard = slots.lock().unwrap();
+            let progress = settle_retained_claim_in(&mut guard.receipt).unwrap();
+            assert!(guard.receipt.is_none());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            progress
+        };
+        progress.notify();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(held(&control), (0, 0));
+        drop(waiter);
+
+        let mut another = request(&handle, &scope, &[], JointLane::Foreground, 3);
+        drive(&mut driver);
+        let progress = {
+            let mut guard = slots.lock().unwrap();
+            guard.source = granted(&mut another).pop();
+            let Slots { source, receipt } = &mut *guard;
+            retain_claim_in(&work.owner, source, receipt).unwrap()
+        };
+        drop(progress);
+        assert_eq!(
+            held(&control),
+            (1, 3),
+            "dropping a notification cannot release its committed charge"
+        );
+        let progress = settle_retained_claim_in(&mut slots.lock().unwrap().receipt).unwrap();
+        drop(progress);
+        assert_eq!(held(&control), (0, 0));
+        work.business.release();
+        work.owner.complete();
+    }
+
+    #[test]
+    fn retained_bad_domains_preserve_healthy_and_settlement_progress_after_owner_completion() {
+        let (control, handle, mut driver) = control();
+        let producing = control
+            .try_begin_root(WorkRequest::new(WorkClass::Management))
+            .unwrap();
+        let scope = producing.owner.scope();
+        let a = dependency(&handle, "a");
+        let b = dependency(&handle, "b");
+        let c = dependency(&handle, "c");
+        // A two-domain charge of two cannot fit this fixture's protected
+        // progress cut. Start with the admissible complete one-unit vector.
+        let mut initial = request(&handle, &scope, &[&a, &b], JointLane::Foreground, 1);
+        drive(&mut driver);
+        let mut source = granted(&mut initial).pop();
+        let mut receipt = None;
+        retain_claim_in(&producing.owner, &mut source, &mut receipt)
+            .unwrap()
+            .notify();
+        producing.business.release();
+        producing.owner.complete();
+        let consuming = control
+            .try_begin_root(WorkRequest::new(WorkClass::Management))
+            .unwrap();
+        let consumer = consuming.owner.scope();
+        let mut blocked = request(&handle, &consumer, &[&a], JointLane::Foreground, 2);
+        let mut healthy = request(&handle, &consumer, &[&c], JointLane::Foreground, 1);
+        let mut settlement = request(&handle, &consumer, &[&a], JointLane::Settlement, 1);
+        drive(&mut driver);
+        assert!(crate::joint_admission::tests::poll(&mut blocked).is_pending());
+        let healthy = granted(&mut healthy);
+        let settlement = granted(&mut settlement);
+        assert_eq!(held(&control), (3, 3));
+        drop(healthy);
+        settle_retained_claim_in(&mut receipt).unwrap().notify();
+        drive(&mut driver);
+        let released = granted(&mut blocked);
+        assert_eq!(held(&control), (2, 3));
+        drop((released, settlement));
+        consuming.business.release();
+        consuming.owner.complete();
+        assert_eq!(held(&control), (0, 0));
     }
 }
