@@ -509,6 +509,22 @@ struct StartCommand {
     reserved: Option<ReservedExecutionIdentity>,
 }
 
+/// Input to the one concrete logical role factory. The original WorkOwner is
+/// supplied separately; these aliases retain their existing runtime owners.
+/// This type alone is not a complete byte quote or a startup admission grant.
+struct LogicalRoleInput {
+    request: QueryExecutionRequest,
+    reply: oneshot::Sender<Result<ExecutionHandle, QueryExecutionError>>,
+    reserved: Option<ReservedExecutionIdentity>,
+    native: Arc<dyn LogicalExecutionNativePort>,
+    query_ids: Arc<ProcessQueryIdAllocator>,
+    frontend_process_id: FrontendProcessId,
+    config: LogicalExecutionSupervisorConfig,
+    clock: Arc<dyn MonotonicClock>,
+    registry: LogicalExecutionRuntimeRegistryHandle,
+    shutdown: watch::Receiver<bool>,
+}
+
 #[derive(Debug)]
 struct ProcessQueryIdAllocator {
     namespace: QueryProcessNamespace,
@@ -609,16 +625,19 @@ async fn run_supervisor(
                     )));
                     break;
                 }
-                logical_tasks.spawn(run_logical_execution(
-                    command,
-                    Arc::clone(&native),
-                    Arc::clone(&query_ids),
+                let StartCommand { request, owner, reply, reserved } = command;
+                logical_tasks.spawn(make_logical_role(owner, LogicalRoleInput {
+                    request,
+                    reply,
+                    reserved,
+                    native: Arc::clone(&native),
+                    query_ids: Arc::clone(&query_ids),
                     frontend_process_id,
                     config,
-                    Arc::clone(&clock),
-                    registry.clone(),
-                    shutdown.clone(),
-                ));
+                    clock: Arc::clone(&clock),
+                    registry: registry.clone(),
+                    shutdown: shutdown.clone(),
+                }));
             }
             result = logical_tasks.join_next(), if !logical_tasks.is_empty() => {
                 match result {
@@ -683,22 +702,25 @@ async fn run_supervisor(
     task_failure.map_or(Ok(()), Err)
 }
 
-async fn run_logical_execution(
-    command: StartCommand,
-    native: Arc<dyn LogicalExecutionNativePort>,
-    query_ids: Arc<ProcessQueryIdAllocator>,
-    frontend_process_id: FrontendProcessId,
-    config: LogicalExecutionSupervisorConfig,
-    clock: Arc<dyn MonotonicClock>,
-    registry: super::LogicalExecutionRuntimeRegistryHandle,
-    mut shutdown: watch::Receiver<bool>,
+// This noncapturing function item is the actual production future factory.
+// Its concrete input, future and output can be quoted and installed together;
+// no dummy future type or caller-provided async closure describes this role.
+async fn make_logical_role(
+    owner: WorkOwner,
+    input: LogicalRoleInput,
 ) -> Result<(), QueryExecutionError> {
-    let StartCommand {
+    let LogicalRoleInput {
         request,
-        owner,
         reply,
         reserved,
-    } = command;
+        native,
+        query_ids,
+        frontend_process_id,
+        config,
+        clock,
+        registry,
+        mut shutdown,
+    } = input;
     let mut pending_owner = PendingWorkOwner(Some(owner));
     let requester = pending_owner.owner().cancellation_requester();
     let scope = pending_owner.owner().scope();
