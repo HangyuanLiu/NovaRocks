@@ -109,6 +109,7 @@ fn internal_description_with_policy(
                 max: 1,
                 requires_power_of_two: true,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([151; 16]).unwrap());
