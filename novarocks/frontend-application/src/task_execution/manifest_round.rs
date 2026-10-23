@@ -113,10 +113,9 @@ pub(crate) fn assemble_manifest_round(
     let wake = Arc::new(NotifyWake::new(Arc::clone(&notify))) as Arc<dyn StatusIntakeWake>;
     // Freeze declaration before submissions are consumed; never infer writers
     // from the subset of Task statuses that happens to report writer facts.
-    let writer_fragments = submissions
-        .iter()
-        .filter(|submission| submission.declares_table_writer())
-        .map(ValidatedNativeSubmission::fragment_id)
+    let writer_fragments = manifest
+        .writer_cohorts()
+        .map(|cohort| cohort.fragment())
         .collect::<std::collections::BTreeSet<_>>();
     let mut plans = SubmissionFragmentPlans::index_manifest(submissions, manifest)?;
     let graph = build_task_graph_from_manifest(manifest, &mut plans, transport.transport_budget)?;

@@ -79,6 +79,31 @@ impl BoundManifestBackend {
     }
 }
 
+/// An exact attempt Task's declared writer/target occurrence, read from the
+/// immutable template this manifest retained. It grants no deletion authority
+/// and does not enumerate unknown BE-local driver/object identities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BoundWriterCohort {
+    plan: novarocks_query_application::api::PlanSeal,
+    task: TaskIdentity,
+    fragment: FragmentId,
+    writer: crate::native::fragment_encoder::frozen::StaticTableWriter,
+}
+impl BoundWriterCohort {
+    pub(crate) const fn plan(self) -> novarocks_query_application::api::PlanSeal {
+        self.plan
+    }
+    pub(crate) const fn task(self) -> TaskIdentity {
+        self.task
+    }
+    pub(crate) const fn fragment(self) -> FragmentId {
+        self.fragment
+    }
+    pub(crate) const fn writer(self) -> crate::native::fragment_encoder::frozen::StaticTableWriter {
+        self.writer
+    }
+}
+
 /// One exact scheduled context and its complete frozen backend facts.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct BoundManifestContext {
@@ -633,6 +658,38 @@ impl TaskManifestBinding {
         self.topology_revision
     }
 
+    /// Borrow the existing frozen occurrence list; no per-Task list is cloned.
+    /// Binding already proved that every Task's fragment is in this template.
+    pub(crate) fn writer_cohorts(&self) -> impl Iterator<Item = BoundWriterCohort> + '_ {
+        let template = &self.native_template.template;
+        bound_writer_cohorts(template.plan(), &self.tasks, &template.native_template)
+    }
+
+    pub(crate) fn validate_submission_fragment(
+        &self,
+        execution: QueryExecutionId,
+        fragment: &std::sync::Arc<crate::native::fragment_encoder::frozen::FragmentArtifact>,
+    ) -> Result<(), DistributedQueryError> {
+        validate_schedule_execution(self.execution, execution)?;
+        let id = fragment.facts().fragment_id();
+        let original = self
+            .native_template
+            .template
+            .native_template
+            .get(id)
+            .ok_or_else(|| {
+                contract_error(format!(
+                    "submission fragment {id} is absent from its retained Native template"
+                ))
+            })?;
+        if !std::sync::Arc::ptr_eq(original, fragment) {
+            return Err(contract_error(format!(
+                "submission fragment {id} belongs to another frozen Native artifact"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn tasks(&self) -> &[BoundManifestTask] {
         &self.tasks
     }
@@ -654,6 +711,28 @@ impl TaskManifestBinding {
 enum ProjectedScanAssignment {
     RuntimeSplits,
     FrozenUnits(BoundManifestFrozenUnits),
+}
+
+fn bound_writer_cohorts<'a>(
+    plan: novarocks_query_application::api::PlanSeal,
+    tasks: &'a [BoundManifestTask],
+    fragments: &'a crate::query_execution::native_fragment::NativeFragmentAttachment,
+) -> impl Iterator<Item = BoundWriterCohort> + 'a {
+    tasks.iter().flat_map(move |task| {
+        fragments
+            .get(task.fragment_id)
+            .expect("bound Task fragment belongs to its retained Native template")
+            .facts()
+            .table_writers()
+            .iter()
+            .copied()
+            .map(move |writer| BoundWriterCohort {
+                plan,
+                task: task.identity,
+                fragment: task.fragment_id,
+                writer,
+            })
+    })
 }
 
 impl ProjectedScanAssignment {
@@ -2259,5 +2338,118 @@ mod tests {
         let error = derive_and_record_fragment_instance_id(&mut seen, || Ok(collision))
             .expect_err("a repeated derived identity must fail closed");
         assert!(error.message().contains("identity collision"));
+    }
+
+    #[test]
+    fn frozen_writer_cohorts_bind_each_exact_task_to_its_original_node_and_target() {
+        let (plan, fragments) =
+            crate::query_execution::package_writes::tests::frozen_write_fragments();
+        let seal = PlanSeal::Version(plan.version());
+        let execution = execution();
+        let mut expected = Vec::new();
+        let mut tasks = Vec::new();
+        let mut ordinal = 1;
+        for fragment in plan.fragments().values() {
+            // Two placements deliberately share static facts but never Task identity.
+            for instance in 0..2 {
+                let (identity, context) = task(
+                    execution,
+                    fragment.id().get(),
+                    ordinal,
+                    BackendProcessId::new_v7(),
+                );
+                ordinal += 1;
+                tasks.push(super::BoundManifestTask {
+                    identity,
+                    context,
+                    fragment_id: fragment.id().get(),
+                    instance_index: instance,
+                    fragment_instance_id: UniqueId::new(1, ordinal as i64),
+                    scan_work: Box::default(),
+                });
+                for node in fragment.nodes().values() {
+                    if let novarocks_physical_plan::NodeKind::TableWriter { target } = &node.kind {
+                        expected.push((
+                            identity,
+                            fragment.id().get(),
+                            node.id,
+                            target.write_target_ordinal,
+                        ));
+                    }
+                }
+            }
+        }
+        let cohorts = super::bound_writer_cohorts(seal, &tasks, &fragments).collect::<Vec<_>>();
+        assert_eq!(cohorts.len(), 2, "finish placements are not writer cohorts");
+        assert_eq!(
+            cohorts
+                .iter()
+                .map(|cohort| (
+                    cohort.task(),
+                    cohort.fragment(),
+                    cohort.writer().node(),
+                    cohort.writer().target()
+                ))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(cohorts.iter().all(|cohort| cohort.plan() == seal));
+        assert_ne!(cohorts[0].task(), cohorts[1].task());
+        assert_eq!(cohorts[0].writer(), cohorts[1].writer());
+    }
+
+    #[test]
+    fn manifest_submission_requires_the_original_attempt_and_frozen_artifact() {
+        let execution = execution();
+        let template = full_bind_native_template(execution, FullBindPurpose::ClientRows);
+        let fragment = std::sync::Arc::clone(
+            template
+                .template
+                .native_template
+                .get(template.template.native_template.root())
+                .unwrap(),
+        );
+        let supported = full_bind_supported(live_target(0, BackendProcessId::new_v7(), 19010));
+        let process = supported.descriptor().process_id();
+        let schedule = full_bind_schedule(execution, process, &template);
+        let (revision, backends) = FrozenAttemptTopology::capture(
+            BackendTopologySnapshot::try_new(86, vec![supported]).unwrap(),
+        )
+        .unwrap()
+        .into_parts();
+        let manifest = super::TaskManifestBinding::bind_facts(
+            template, execution, schedule, revision, backends,
+        )
+        .unwrap();
+        manifest
+            .validate_submission_fragment(execution, &fragment)
+            .unwrap();
+        let foreign_execution =
+            QueryExecutionId::new(execution.query_id(), AttemptId::new(2).unwrap()).unwrap();
+        assert!(
+            manifest
+                .validate_submission_fragment(foreign_execution, &fragment)
+                .is_err()
+        );
+        // Freeze the exact same valid bytes into a distinct original artifact.
+        let other = full_bind_native_template(execution, FullBindPurpose::ClientRows);
+        let other_fragment = other
+            .template
+            .native_template
+            .get(fragment.facts().fragment_id())
+            .unwrap();
+        assert_eq!(fragment.content().bytes(), other_fragment.content().bytes());
+        assert!(
+            manifest
+                .validate_submission_fragment(execution, other_fragment)
+                .unwrap_err()
+                .message()
+                .contains("another frozen Native artifact")
+        );
+        assert_eq!(
+            manifest.writer_cohorts().count(),
+            0,
+            "ordinary read tasks cannot become writers from statuses"
+        );
     }
 }

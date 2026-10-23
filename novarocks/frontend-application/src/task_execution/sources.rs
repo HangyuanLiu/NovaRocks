@@ -96,7 +96,11 @@ impl SubmissionFragmentPlans {
                     "manifest instance {finst} belongs to fragment {scheduled_fragment} but its submission names {fragment_id}"
                 )));
             }
+            let execution = submission.execution_id();
             let (fragment, assignment) = submission.into_creation_parts();
+            manifest
+                .validate_submission_fragment(execution, &fragment)
+                .map_err(|error| TaskExecutionError::Schedule(error.to_string()))?;
             if plans
                 .insert(
                     (fragment_id, instance_index),
