@@ -3566,7 +3566,7 @@ mod tests {
                 CatalogVersion::from_bytes([0x11; 32]),
             ),
             StorageCredentialScopePrefix::try_from_normalized(scope).unwrap(),
-            AuthorityCapabilityPath::SeededWithoutRenewal,
+            AuthorityCapabilityPath::SeededWithoutRenewal { grant: None },
         )
     }
 
@@ -5068,7 +5068,7 @@ mod tests {
         failure: AcquisitionFailure,
     ) -> (Operator, Arc<StorageAuthority>, Arc<FixedAuthorityFailure>) {
         let capability = if matches!(&failure, AcquisitionFailure::NoRenewalCapability) {
-            AuthorityCapabilityPath::SeededWithoutRenewal
+            AuthorityCapabilityPath::SeededWithoutRenewal { grant: None }
         } else {
             AuthorityCapabilityPath::CredentialsEndpoint {
                 principal: StaticCredentialReference::try_new("executor", "v1").unwrap(),

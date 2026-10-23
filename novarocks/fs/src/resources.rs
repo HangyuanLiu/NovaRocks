@@ -298,7 +298,7 @@ mod tests {
         });
         let read_authority =
             read.storage_authority_registry()
-                .authority(&id, Instant::now(), || source.clone());
+                .authority(&id, Instant::now(), || (source.clone(), None));
         let write_authority =
             write
                 .storage_authority_registry()

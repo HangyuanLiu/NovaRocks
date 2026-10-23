@@ -656,13 +656,14 @@ impl IcebergMetadataContext {
                 )?;
                 seed.into_vended_s3_credential_lease_contribution()
                     .and_then(|contribution| {
-                        contribution.with_refresher(Arc::new(
-                            IcebergRestVendedS3LeaseRefresher::new(
+                        contribution.with_refresher(
+                            catalog.acquisition_owner(),
+                            Arc::new(IcebergRestVendedS3LeaseRefresher::new(
                                 catalog,
                                 self.resources.catalog_runtime().clone(),
                                 attempt_scope,
-                            ),
-                        ))
+                            )),
+                        )
                     })
                     .map(|contribution| contribution.with_renewal_path(announcement))
                     .map_err(|error| (error.kind(), error.to_string()))?
@@ -1070,6 +1071,7 @@ impl IcebergMetadataContext {
         // for itself is told exactly the path this coordinator would have used
         // (CAD-1 D2), on this generation's one session (D15).
         let announcement = self.vended_renewal_path(&renewal, &table, expected_table_uuid)?;
+        let acquisition_owner = catalog.acquisition_owner();
         let refresher: Arc<dyn ConnectorVendedS3CredentialLeaseRefresher> = match renewal {
             IcebergVendedS3RenewalCapability::CredentialsEndpoint(scope) => {
                 Arc::new(IcebergRestVendedS3LeaseRefresher::new(
@@ -1089,7 +1091,7 @@ impl IcebergMetadataContext {
             }
         };
         contribution
-            .with_refresher(refresher)
+            .with_refresher(acquisition_owner, refresher)
             .map(|contribution| contribution.with_renewal_path(announcement))
             .map_err(|error| (error.kind(), error.to_string()))
     }

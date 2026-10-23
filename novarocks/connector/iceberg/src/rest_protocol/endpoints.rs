@@ -64,6 +64,7 @@ struct LoadViewResult {
 
 /// One catalog generation's REST session authority and read endpoints.
 pub(crate) struct RestEndpoints {
+    acquisition_owner: novarocks_spi::connector::CredentialAcquisitionOwnerId,
     pub(crate) publication_generation: crate::catalog::publication::PublicationGeneration,
     properties: Arc<std::collections::HashMap<String, String>>,
     owner: Arc<RestAuthOwner>,
@@ -125,6 +126,12 @@ enum Answer {
 }
 
 impl RestEndpoints {
+    pub(crate) const fn acquisition_owner(
+        &self,
+    ) -> novarocks_spi::connector::CredentialAcquisitionOwnerId {
+        self.acquisition_owner
+    }
+
     pub(crate) fn new(
         properties: Arc<std::collections::HashMap<String, String>>,
         owner: Arc<RestAuthOwner>,
@@ -134,6 +141,7 @@ impl RestEndpoints {
         vending_declared: bool,
     ) -> Self {
         Self {
+            acquisition_owner: novarocks_spi::connector::CredentialAcquisitionOwnerId::new(),
             publication_generation: Default::default(),
             properties,
             owner,

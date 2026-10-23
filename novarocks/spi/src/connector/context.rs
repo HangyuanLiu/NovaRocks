@@ -27,8 +27,7 @@ use super::read_stack::ConnectorSourceOperations;
 use super::{
     CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind, ConnectorStopView,
     ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
-    ConnectorVendedS3CredentialLeaseRefresher, CredentialLeaseId,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    CredentialLeaseId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES, StorageAccessDomainId, StorageCredentialScopePrefix,
 };
 
@@ -306,6 +305,7 @@ pub struct ResolvedVendedS3Access {
     /// path. Absent means this lease cannot renew (CAD-1 D11).
     renewal_path: Option<crate::connector::CredentialRenewalPath>,
     /// Present only when the resolver is in the consumer's own process.
+    seed_grant: Option<super::VendedS3SeedGrantId>,
     seed: Option<VendedS3SeedMaterial>,
     /// The provider capability this consumer already holds, when the resolver
     /// and the consumer share a process.
@@ -315,7 +315,7 @@ pub struct ResolvedVendedS3Access {
     /// authenticating an announced path. An execution node never has one --
     /// it is a capability, not a value, and capabilities do not travel
     /// (CAD-1 D1).
-    provider: Option<Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>>,
+    provider: Option<super::VendedS3InProcessAcquisition>,
 }
 
 impl ResolvedVendedS3Access {
@@ -325,6 +325,7 @@ impl ResolvedVendedS3Access {
         epoch: u64,
         matched_prefix: StorageCredentialScopePrefix,
         renewal_path: Option<crate::connector::CredentialRenewalPath>,
+        seed_grant: Option<super::VendedS3SeedGrantId>,
         seed: Option<VendedS3SeedMaterial>,
     ) -> Self {
         Self {
@@ -333,6 +334,7 @@ impl ResolvedVendedS3Access {
             epoch,
             matched_prefix,
             renewal_path,
+            seed_grant,
             seed,
             provider: None,
         }
@@ -341,10 +343,7 @@ impl ResolvedVendedS3Access {
     /// Attach the in-process provider capability this consumer already holds.
     ///
     /// Only a resolver running in the consumer's own process may call this.
-    pub fn with_provider(
-        mut self,
-        provider: Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>,
-    ) -> Self {
+    pub fn with_provider(mut self, provider: super::VendedS3InProcessAcquisition) -> Self {
         self.provider = Some(provider);
         self
     }
@@ -373,14 +372,19 @@ impl ResolvedVendedS3Access {
         self.renewal_path.as_ref()
     }
 
-    /// Material handed over with this selection, when the resolver is in the
-    /// consumer's own process.
+    /// The original local seed authorization, retained even after its material
+    /// expires. This identity grants no signing or acquisition capability.
+    pub const fn seed_grant(&self) -> Option<super::VendedS3SeedGrantId> {
+        self.seed_grant
+    }
+
+    /// Usable material handed over with this selection, when present.
     pub const fn seed(&self) -> Option<&VendedS3SeedMaterial> {
         self.seed.as_ref()
     }
 
     /// The in-process provider capability, when this consumer holds one.
-    pub fn provider(&self) -> Option<&Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>> {
+    pub fn provider(&self) -> Option<&super::VendedS3InProcessAcquisition> {
         self.provider.as_ref()
     }
 }
@@ -989,6 +993,7 @@ mod tests {
             1,
             StorageCredentialScopePrefix::try_from_normalized("s3://bucket/table").expect("prefix"),
             None,
+            Some(crate::connector::VendedS3SeedGrantId::new()),
             Some(VendedS3SeedMaterial::new(
                 42,
                 SecretValue::new("access-canary"),

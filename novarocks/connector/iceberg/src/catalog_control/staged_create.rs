@@ -414,7 +414,7 @@ pub(crate) fn prepare_rest_staged_table(
                 novarocks_spi::connector::CredentialRenewalPath::CredentialsEndpoint(announcement),
             );
         let contribution = contribution
-            .with_refresher(Arc::new(IcebergRestVendedS3LeaseRefresher::new(
+            .with_refresher(endpoints.acquisition_owner(), Arc::new(IcebergRestVendedS3LeaseRefresher::new(
                 runtime
                     .novarocks_catalog()
                     .vended_credential_refresh_catalog()

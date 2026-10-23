@@ -2173,6 +2173,70 @@ mod tests {
         }
 
         #[test]
+        fn separate_refresher_instances_keep_the_original_generation_acquisition_identity() {
+            let server = TestServer::start(Script::new().on(
+                "GET",
+                "/v1/config",
+                Reply::config(&[], &[], None),
+            ));
+            let endpoint = format!("{}/credentials", server.url());
+            let (owner, runtime) = super::catalog_runtime();
+            let endpoints = generation(&owner, &server);
+            // A production lease follows a read on this original session.
+            // Establish that same session in the fixture before routing its lease.
+            let binding = owner
+                .block_on(endpoints.binding())
+                .expect("original REST session");
+            let routed = crate::rest_protocol::routing::route_for_lease(
+                &binding,
+                &endpoints.route_admission(),
+                crate::rest_protocol::routing::RouteTarget::CredentialsEndpoint(&endpoint),
+            )
+            .unwrap();
+            let original_path =
+                novarocks_spi::connector::CredentialRenewalPath::CredentialsEndpoint(routed);
+            let make = || {
+                let observed = seed(Some(&endpoint));
+                let scope = observed.refresh_scope().unwrap();
+                let contribution = observed
+                    .into_vended_s3_credential_lease_contribution()
+                    .unwrap()
+                    .with_renewal_path(original_path.clone())
+                    .with_refresher(
+                        endpoints.acquisition_owner(),
+                        Arc::new(IcebergRestVendedS3LeaseRefresher::new(
+                            Arc::clone(&endpoints),
+                            runtime.clone(),
+                            scope,
+                        )),
+                    )
+                    .unwrap();
+                contribution.into_parts_with_refresher().2.unwrap()
+            };
+            let first = make();
+            let second = make();
+            assert!(!Arc::ptr_eq(first.refresher(), second.refresher()));
+            assert_eq!(first.identity(), second.identity());
+            assert_eq!(first.identity().renewal_path(), Some(&original_path));
+            assert_eq!(first.identity().prefixes().len(), 1);
+            assert_eq!(first.identity().prefixes()[0].as_str(), PREFIX);
+            assert_eq!(
+                endpoints.acquisition_owner(),
+                Arc::clone(&endpoints).acquisition_owner()
+            );
+            let another_generation_owner = generation(&owner, &server);
+            assert_ne!(
+                endpoints.acquisition_owner(),
+                another_generation_owner.acquisition_owner()
+            );
+            assert_eq!(
+                server.count("GET", "/credentials"),
+                0,
+                "forming keys does not acquire"
+            );
+        }
+
+        #[test]
         fn credentials_endpoint_renewal_uses_the_generation_session() {
             let server = TestServer::start(
                 Script::new()

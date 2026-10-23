@@ -104,16 +104,19 @@ pub enum AuthorityCapabilityPath {
     /// has it and always names a principal and a path instead, which is what
     /// keeps the two roles' authorities apart even in a single process
     /// (CAD-1 D0 with D9).
-    InProcessProvider,
+    InProcessProvider(novarocks_spi::connector::VendedS3InProcessAcquisitionIdentity),
     /// Material was obtained once and this catalog offers no renewal path at
     /// all. A first-class shape, not a degraded fallback (CAD-1 D11).
-    SeededWithoutRenewal,
+    SeededWithoutRenewal {
+        /// None names a seedless, non-acquiring capability and grants no access.
+        grant: Option<novarocks_spi::connector::VendedS3SeedGrantId>,
+    },
 }
 
 impl AuthorityCapabilityPath {
     /// Whether this path can produce new material at all.
     pub const fn can_renew(&self) -> bool {
-        !matches!(self, Self::SeededWithoutRenewal)
+        !matches!(self, Self::SeededWithoutRenewal { .. })
     }
 
     /// Where and with which public headers a refresh along this path is sent,
@@ -122,7 +125,7 @@ impl AuthorityCapabilityPath {
         match self {
             Self::CredentialsEndpoint { routing, .. }
             | Self::LoadTableDelegation { routing, .. } => Some(routing),
-            Self::InProcessProvider | Self::SeededWithoutRenewal => None,
+            Self::InProcessProvider(_) | Self::SeededWithoutRenewal { .. } => None,
         }
     }
 
@@ -133,7 +136,7 @@ impl AuthorityCapabilityPath {
         match self {
             Self::CredentialsEndpoint { principal, .. }
             | Self::LoadTableDelegation { principal, .. } => Some(principal),
-            Self::InProcessProvider | Self::SeededWithoutRenewal => None,
+            Self::InProcessProvider(_) | Self::SeededWithoutRenewal { .. } => None,
         }
     }
 }
@@ -143,7 +146,9 @@ impl AuthorityCapabilityPath {
 /// It is both the provider's cache key and the credential dimension of the
 /// object-store operator pool key. Nothing in it is derived from a query
 /// attempt: an identity that carried `QueryExecutionId` would rebuild every
-/// operator on every query and defeat CAD-1 D0.
+/// operator on every query and defeat CAD-1 D0. A nonrenewing seed is instead
+/// scoped to its original grant instance: a later authorization must not reuse
+/// an expired authority that cannot acquire new material.
 ///
 /// The five dimensions CAD-1 D7 requires before an in-flight refresh may be
 /// shared map onto this type as follows:

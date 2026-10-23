@@ -2052,6 +2052,7 @@ pub(crate) mod tests {
                 1,
                 prefix,
                 None,
+                Some(novarocks_spi::connector::VendedS3SeedGrantId::new()),
                 Some(novarocks_spi::connector::VendedS3SeedMaterial::new(
                     u64::MAX,
                     novarocks_secret::SecretValue::new("access"),

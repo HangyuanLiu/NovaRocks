@@ -124,17 +124,19 @@ pub use credential::{
 };
 pub use credential_lease::{
     ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
-    ConnectorVendedS3CredentialLeaseRefresher, CredentialLeaseDescriptor, CredentialLeaseId,
-    CredentialLeaseProvider, CredentialLeaseSecretEnvelope, CredentialLoadTableDelegation,
-    CredentialRenewalPath, CredentialRoutingContext, CredentialRoutingHeader,
-    MAX_CREDENTIAL_IDENTIFIER_BYTES, MAX_CREDENTIAL_LEASE_ID_BYTES, MAX_CREDENTIAL_LEASE_PREFIXES,
+    ConnectorVendedS3CredentialLeaseRefresher, CredentialAcquisitionOwnerId,
+    CredentialLeaseDescriptor, CredentialLeaseId, CredentialLeaseProvider,
+    CredentialLeaseSecretEnvelope, CredentialLoadTableDelegation, CredentialRenewalPath,
+    CredentialRoutingContext, CredentialRoutingHeader, MAX_CREDENTIAL_IDENTIFIER_BYTES,
+    MAX_CREDENTIAL_LEASE_ID_BYTES, MAX_CREDENTIAL_LEASE_PREFIXES,
     MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES, MAX_CREDENTIAL_LEASE_SECRET_SCALAR_BYTES,
     MAX_CREDENTIAL_LEASES_PER_QUERY, MAX_CREDENTIAL_NAMESPACE_LEVELS,
     MAX_CREDENTIAL_ROUTING_HEADER_BYTES, MAX_CREDENTIAL_ROUTING_HEADERS,
     MAX_CREDENTIALS_ENDPOINT_BYTES, VendedS3CredentialLeaseContribution,
     VendedS3CredentialLeaseEntry, VendedS3CredentialLeaseRefresh,
     VendedS3CredentialRefreshCallPolicy, VendedS3CredentialRefreshDispatch,
-    VendedS3CredentialRefreshDispatchGuard,
+    VendedS3CredentialRefreshDispatchGuard, VendedS3InProcessAcquisition,
+    VendedS3InProcessAcquisitionIdentity, VendedS3SeedGrantId,
 };
 pub use data_mutation::{
     CONNECTOR_DATA_MUTATION_CONTRACT_VERSION, CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION,

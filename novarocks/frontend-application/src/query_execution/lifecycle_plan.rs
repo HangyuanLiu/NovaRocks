@@ -30,10 +30,10 @@ use novarocks_spi::connector::{
     CatalogCredentialMode, CatalogCredentialPurpose, CatalogNonSecretProperty, CatalogProperties,
     CatalogStorageAccessDomainInput, ConnectorControlPlanningLease, ConnectorError,
     ConnectorErrorKind, ConnectorProviderId, ConnectorStorageResolver,
-    ConnectorVendedCredentialLeaseSink, ConnectorVendedS3CredentialLeaseRefresher,
-    CredentialConsumerRole, CredentialLeaseDescriptor, CredentialLeaseId, CredentialLeaseProvider,
-    CredentialLeaseSecretEnvelope, ResolvedVendedS3Access, StorageAccessRequest,
-    StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution, VendedS3SeedMaterial,
+    ConnectorVendedCredentialLeaseSink, CredentialConsumerRole, CredentialLeaseDescriptor,
+    CredentialLeaseId, CredentialLeaseProvider, CredentialLeaseSecretEnvelope,
+    ResolvedVendedS3Access, StorageAccessRequest, StorageCredentialScopePrefix,
+    VendedS3CredentialLeaseContribution, VendedS3SeedMaterial,
 };
 use novarocks_types::NativeCompatibilityId;
 use sha2::{Digest, Sha256};
@@ -473,12 +473,13 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
 pub(crate) struct QueryCredentialLease {
     descriptor: CredentialLeaseDescriptor,
     envelope: CredentialLeaseSecretEnvelope,
+    seed_grant: novarocks_spi::connector::VendedS3SeedGrantId,
     /// How this consumer renews.
     ///
     /// The coordinator is a consumer of this material too, and its own storage
     /// authority acquires through this. It is the only refresh path left: the
     /// rotation this used to sit beside is gone (CAD-1 C14).
-    provider: Option<Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>>,
+    provider: Option<novarocks_spi::connector::VendedS3InProcessAcquisition>,
 }
 
 impl QueryCredentialLease {
@@ -494,6 +495,9 @@ impl QueryCredentialLease {
         Ok(Self {
             descriptor,
             envelope,
+            // One admitted seed envelope authorizes this exact grant instance.
+            // Resolver calls copy the identity; they never mint another grant.
+            seed_grant: novarocks_spi::connector::VendedS3SeedGrantId::new(),
             provider: None,
         })
     }
@@ -501,7 +505,7 @@ impl QueryCredentialLease {
     /// Retain the provider capability this lease's rotation adapter wraps.
     pub(crate) fn with_provider(
         mut self,
-        provider: Option<Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>>,
+        provider: Option<novarocks_spi::connector::VendedS3InProcessAcquisition>,
     ) -> Self {
         self.provider = provider;
         self
@@ -515,7 +519,9 @@ impl QueryCredentialLease {
         &self.envelope
     }
 
-    pub(crate) fn provider(&self) -> Option<&Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>> {
+    pub(crate) fn provider(
+        &self,
+    ) -> Option<&novarocks_spi::connector::VendedS3InProcessAcquisition> {
         self.provider.as_ref()
     }
 }
@@ -660,7 +666,6 @@ pub(crate) fn resolve_vended_s3_access(
         let descriptor = lease.descriptor();
         if descriptor.provider() != CredentialLeaseProvider::S3
             || descriptor.owner() != request.owner()
-            || lease.envelope().session_token_expires_at_unix_ms() <= now
         {
             continue;
         }
@@ -680,21 +685,24 @@ pub(crate) fn resolve_vended_s3_access(
         lease.envelope().epoch(),
         matched_prefix.clone(),
         lease.descriptor().renewal_path().cloned(),
-        // The coordinator resolves against leases its own provider produced,
-        // so it is seeded rather than acquiring (CAD-1 D1 puts acquisition on
-        // the consuming node; here the resolver *is* the consumer).
-        Some(VendedS3SeedMaterial::new(
-            lease.envelope().session_token_expires_at_unix_ms(),
-            lease.envelope().access_key_id().clone(),
-            lease.envelope().secret_access_key().clone(),
-            lease.envelope().session_token().clone(),
-        )),
+        Some(lease.seed_grant),
+        // Scope and acquisition capability survive material expiry. Retain
+        // the original selection; never try a broader or another source's
+        // scope merely because this seed can no longer sign a request.
+        (lease.envelope().session_token_expires_at_unix_ms() > now).then(|| {
+            VendedS3SeedMaterial::new(
+                lease.envelope().session_token_expires_at_unix_ms(),
+                lease.envelope().access_key_id().clone(),
+                lease.envelope().secret_access_key().clone(),
+                lease.envelope().session_token().clone(),
+            )
+        }),
     );
     // ... and it renews through that same provider rather than waiting for the
     // rotation the pump drives, so removing the pump takes nothing away from
     // this side (CAD-1 C13).
     let selected = match lease.provider() {
-        Some(provider) => selected.with_provider(Arc::clone(provider)),
+        Some(provider) => selected.with_provider(provider.clone()),
         None => selected,
     };
     Ok(selected)
@@ -985,6 +993,106 @@ mod tests {
     }
 
     #[test]
+    fn expired_original_material_retains_renewal_after_each_real_collection_cut() {
+        for native_drained in [false, true] {
+            let collector = AttemptCredentialLeaseCollector::new(execution_id());
+            let terminal = collector.terminal_storage_resolver();
+            let planning = collector.storage_resolver();
+            let properties = vended_catalog_properties();
+            let provider: Arc<dyn ConnectorVendedS3CredentialLeaseRefresher> =
+                Arc::new(ProviderLocalRefresher);
+            let path = novarocks_spi::connector::CredentialRenewalPath::CredentialsEndpoint(
+                novarocks_spi::connector::CredentialRoutingContext::try_new(
+                    "https://catalog.example/credentials",
+                    [],
+                )
+                .unwrap(),
+            );
+            // A fresh, broader grant must not replace this exact expired
+            // selection. Both enter through the real contribution receiver.
+            collector
+                .offer_vended_s3_credential_lease(&properties, vended_contribution("broader"))
+                .unwrap();
+            let contribution = VendedS3CredentialLeaseContribution::try_new(
+                vec![
+                    VendedS3CredentialLeaseEntry::try_new(
+                        StorageCredentialScopePrefix::try_from_normalized(
+                            "s3://warehouse/data/exact",
+                        )
+                        .unwrap(),
+                        1,
+                        SecretValue::new("expired-access"),
+                        SecretValue::new("expired-secret"),
+                        SecretValue::new("expired-token"),
+                    )
+                    .unwrap(),
+                ],
+                Some(path.clone()),
+            )
+            .unwrap()
+            .with_refresher(
+                novarocks_spi::connector::CredentialAcquisitionOwnerId::new(),
+                Arc::clone(&provider),
+            )
+            .unwrap();
+            collector
+                .offer_vended_s3_credential_lease(&properties, contribution)
+                .unwrap();
+            let request = StorageAccessRequest::try_new(
+                properties.handle().clone(),
+                "s3://warehouse/data/exact/file.parquet",
+            )
+            .unwrap();
+            let collecting = planning.resolve_vended_s3(&request).unwrap();
+            assert!(collecting.seed().is_none());
+            assert!(Arc::ptr_eq(
+                collecting.provider().unwrap().refresher(),
+                &provider
+            ));
+            let storage = if native_drained {
+                collector.into_credential_leases().unwrap().into_storage()
+            } else {
+                terminal.seal_for_terminal().unwrap()
+            };
+            assert_eq!(
+                terminal
+                    .verify_native_storage(execution_id(), &storage)
+                    .is_ok(),
+                native_drained,
+                "terminal retirement must not mint a Native handoff"
+            );
+            drop(collector);
+            for resolver in [
+                &planning,
+                &(terminal.clone() as Arc<dyn ConnectorStorageResolver>),
+            ] {
+                let resolved = resolver.resolve_vended_s3(&request).unwrap();
+                assert!(resolved.seed().is_none());
+                assert_eq!(
+                    resolved.matched_prefix().as_str(),
+                    "s3://warehouse/data/exact"
+                );
+                assert_eq!(resolved.lease_id(), collecting.lease_id());
+                assert_eq!(resolved.seed_grant(), collecting.seed_grant());
+                assert!(resolved.seed_grant().is_some());
+                assert_eq!(
+                    resolved.provider().unwrap().identity(),
+                    collecting.provider().unwrap().identity()
+                );
+                assert_eq!(resolved.renewal_path(), Some(&path));
+                assert!(Arc::ptr_eq(
+                    resolved.provider().unwrap().refresher(),
+                    &provider
+                ));
+            }
+            assert!(Arc::ptr_eq(
+                &storage,
+                &terminal.seal_for_terminal().unwrap()
+            ));
+        }
+    }
+
+    #[test]
     fn attempt_collector_deduplicates_scope_and_drains_once() {
         let collector = AttemptCredentialLeaseCollector::new(execution_id());
         let properties = vended_catalog_properties();
@@ -1011,9 +1119,12 @@ mod tests {
         let sink = collector.sink();
         let refresher_dropped = Arc::new(AtomicBool::new(false));
         let contribution = vended_contribution("accepted-before-cancel")
-            .with_refresher(Arc::new(DropTrackedRefresher {
-                dropped: Arc::clone(&refresher_dropped),
-            }))
+            .with_refresher(
+                novarocks_spi::connector::CredentialAcquisitionOwnerId::new(),
+                Arc::new(DropTrackedRefresher {
+                    dropped: Arc::clone(&refresher_dropped),
+                }),
+            )
             .expect("drop-tracked provider refresher");
         sink.offer_vended_s3_credential_lease(&vended_catalog_properties(), contribution)
             .expect("credential is collected before cancellation");
@@ -1041,7 +1152,10 @@ mod tests {
         let collector = AttemptCredentialLeaseCollector::new(execution_id());
         let properties = vended_catalog_properties();
         let contribution = vended_contribution("load-table")
-            .with_refresher(Arc::new(ProviderLocalRefresher))
+            .with_refresher(
+                novarocks_spi::connector::CredentialAcquisitionOwnerId::new(),
+                Arc::new(ProviderLocalRefresher),
+            )
             .expect("provider-local refresher");
         collector
             .offer_vended_s3_credential_lease(&properties, contribution)
@@ -1169,9 +1283,12 @@ mod tests {
             .offer_vended_s3_credential_lease(
                 &properties,
                 vended_contribution("native-same-original")
-                    .with_refresher(Arc::new(DropTrackedRefresher {
-                        dropped: Arc::clone(&dropped),
-                    }))
+                    .with_refresher(
+                        novarocks_spi::connector::CredentialAcquisitionOwnerId::new(),
+                        Arc::new(DropTrackedRefresher {
+                            dropped: Arc::clone(&dropped),
+                        }),
+                    )
                     .unwrap(),
             )
             .unwrap();
