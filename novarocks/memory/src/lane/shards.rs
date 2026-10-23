@@ -16,7 +16,7 @@
 // under the License.
 
 //! Owner-level observation access, atomically published as a complete group.
-// Design: ADR-0196 (docs/adr/ADR-0196-observation-owner-shards-and-coverage-shadow.md)
+// Design: ADR-0197 (docs/adr/ADR-0197-observation-owner-shards-and-coverage-shadow.md)
 use super::{
     CoverageError, LANE_SHARDS, LaneHandle, ProductionState, RecordRef, RecordRegion,
     RecordSnapshot, ResponsibilityClass,

@@ -6,7 +6,7 @@ status: active
 supersedes: [ADR-0166]
 partially-supersedes: [ADR-0148, ADR-0163]
 superseded-by: null
-partially-superseded-by: [ADR-0196]
+partially-superseded-by: [ADR-0197]
 date: 2026-10-03
 provenance:
   - "discussion: 2026-09-30 allocation attribution, observation boundaries and lifetime publication"

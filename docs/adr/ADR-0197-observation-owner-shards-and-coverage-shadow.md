@@ -1,5 +1,5 @@
 ---
-id: ADR-0196
+id: ADR-0197
 title: "Observation owners publish shards atomically and shadow unavailable coverage"
 domain: [memory-governance]
 status: active

@@ -180,7 +180,7 @@ MIRI_TOOLCHAIN=nightly-YYYY-MM-DD tools/ci/memory-model-checks.sh --miri
 
 ## M02c：owner 作用域、记录容量与角色诊断
 
-本节列出行为与原生入口，运行结论仍由本轮执行记录保存；不把历史收据当作当前源码通过。长期合同由 [ADR-0196](../../../docs/adr/ADR-0196-observation-owner-shards-and-coverage-shadow.md) 部分替代 ADR-0167，尺寸段、token、资金资格与真实释放规则保留。
+本节列出行为与原生入口，运行结论仍由本轮执行记录保存；不把历史收据当作当前源码通过。长期合同由 [ADR-0197](../../../docs/adr/ADR-0197-observation-owner-shards-and-coverage-shadow.md) 部分替代 ADR-0167，尺寸段、token、资金资格与真实释放规则保留。
 
 | 验收面 | 目标 | 独立预期与边界 |
 |---|---|---|

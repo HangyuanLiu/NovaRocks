@@ -16,7 +16,7 @@
 // under the License.
 
 //! Construction, every poll, and in-place destruction share one owner policy.
-// Design: ADR-0196 (docs/adr/ADR-0196-observation-owner-shards-and-coverage-shadow.md)
+// Design: ADR-0197 (docs/adr/ADR-0197-observation-owner-shards-and-coverage-shadow.md)
 use crate::lane::LaneShards;
 use std::{
     future::Future,
