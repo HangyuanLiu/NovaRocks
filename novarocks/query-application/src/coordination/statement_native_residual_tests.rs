@@ -803,3 +803,160 @@ async fn held_original_local_close_does_not_block_another_ready_native_handoff()
     drain.await;
     assert_eq!(control1.snapshot().root_responsibilities, 0);
 }
+
+struct IntakeFooter {
+    components: Arc<AtomicUsize>,
+    drops: Arc<AtomicUsize>,
+}
+impl Drop for IntakeFooter {
+    fn drop(&mut self) {
+        assert_eq!(self.components.load(Ordering::SeqCst), 3);
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+// Tests the health receiver's whole-box custody. Real WC PollOutput/PollFailure
+// and mount-footer behavior remain covered by the WC original-owner tests.
+struct IntakePacket {
+    _primary: PanicPayload,
+    _cleanup: PanicPayload,
+    _ready_output: PanicPayload,
+    _footer: IntakeFooter,
+}
+fn intake_packet(components: &Arc<AtomicUsize>, footers: &Arc<AtomicUsize>) -> Box<IntakePacket> {
+    Box::new(IntakePacket {
+        _primary: PanicPayload(Arc::clone(components)),
+        _cleanup: PanicPayload(Arc::clone(components)),
+        _ready_output: PanicPayload(Arc::clone(components)),
+        _footer: IntakeFooter {
+            components: Arc::clone(components),
+            drops: Arc::clone(footers),
+        },
+    })
+}
+struct RejectedIntakeProbe {
+    registry: StatementNativeResidualRegistry,
+    drops: Arc<AtomicUsize>,
+}
+impl Drop for RejectedIntakeProbe {
+    fn drop(&mut self) {
+        assert!(self.registry.0.state.try_lock().is_ok());
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn supervision_intake_retains_whole_packet_and_drops_later_custody_outside_lock() {
+    let registry = StatementNativeResidualRegistry::new(800);
+    let components = Arc::new(AtomicUsize::new(0));
+    let footers = Arc::new(AtomicUsize::new(0));
+    let packet = intake_packet(&components, &footers);
+    let address = packet.as_ref() as *const IntakePacket as usize;
+    registry.record_supervision_panic(packet);
+    assert_eq!(components.load(Ordering::SeqCst), 0);
+    assert_eq!(footers.load(Ordering::SeqCst), 0);
+    {
+        let state = registry.0.state.lock().unwrap();
+        let retained = state
+            .health
+            .as_ref()
+            .unwrap()
+            ._panic
+            .as_ref()
+            .unwrap()
+            .downcast_ref::<IntakePacket>()
+            .unwrap();
+        assert_eq!(retained as *const IntakePacket as usize, address);
+    }
+    let rejected_drops = Arc::new(AtomicUsize::new(0));
+    registry.record_supervision_panic(Box::new(RejectedIntakeProbe {
+        registry: registry.clone(),
+        drops: Arc::clone(&rejected_drops),
+    }));
+    assert_eq!(rejected_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(components.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        registry.health().unwrap().message(),
+        "logical execution supervision task panicked"
+    );
+    registry.abandon_for_process_exit();
+    assert_eq!(components.load(Ordering::SeqCst), 3);
+    assert_eq!(footers.load(Ordering::SeqCst), 1);
+}
+
+struct IntakeNotifyPanic(AtomicBool);
+impl std::task::Wake for IntakeNotifyPanic {
+    fn wake(self: Arc<Self>) {
+        if !self.0.swap(true, Ordering::SeqCst) {
+            panic!("intake notification panic");
+        }
+    }
+}
+
+#[test]
+fn supervision_intake_owns_packet_before_the_real_notify_waker_panics() {
+    let registry = StatementNativeResidualRegistry::new(801);
+    let components = Arc::new(AtomicUsize::new(0));
+    let footers = Arc::new(AtomicUsize::new(0));
+    {
+        let mut waiter = std::pin::pin!(registry.0.changed.notified());
+        let waker = std::task::Waker::from(Arc::new(IntakeNotifyPanic(AtomicBool::new(false))));
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(waiter.as_mut().poll(&mut context).is_pending());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.record_supervision_panic(intake_packet(&components, &footers));
+        }));
+        assert!(result.is_err());
+    }
+    assert_eq!(components.load(Ordering::SeqCst), 0);
+    assert_eq!(footers.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        registry.health().unwrap().message(),
+        "logical execution supervision task panicked"
+    );
+    registry.abandon_for_process_exit();
+    assert_eq!(components.load(Ordering::SeqCst), 3);
+    assert_eq!(footers.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn supervision_join_error_reuses_the_original_panic_intake() {
+    let registry = StatementNativeResidualRegistry::new(802);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let original = Arc::clone(&drops);
+    let error = tokio::spawn(async move {
+        std::panic::panic_any(PanicPayload(original));
+    })
+    .await
+    .unwrap_err();
+    registry.record_supervision_join_failure(error);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        registry.health().unwrap().message(),
+        "logical execution supervision task panicked"
+    );
+    registry.abandon_for_process_exit();
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn supervision_panic_keeps_an_earlier_original_cause_and_message() {
+    let registry = StatementNativeResidualRegistry::new(803);
+    let cause: Arc<dyn std::error::Error + Send + Sync> =
+        Arc::new(std::io::Error::other("original cause"));
+    registry.record_unproven_exit(StatementNativeHealthFailure::actual_exit_unproven(
+        "original local closure is unproven",
+        Arc::clone(&cause),
+    ));
+    let drops = Arc::new(AtomicUsize::new(0));
+    registry.record_supervision_panic(Box::new(PanicPayload(Arc::clone(&drops))));
+    {
+        let state = registry.0.state.lock().unwrap();
+        let first = state.health.as_ref().unwrap();
+        assert_eq!(first.message, "original local closure is unproven");
+        assert!(Arc::ptr_eq(first._cause.as_ref().unwrap(), &cause));
+        assert!(first._panic.is_some());
+    }
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    registry.abandon_for_process_exit();
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}

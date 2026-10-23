@@ -690,10 +690,22 @@ impl LogicalExecutionRuntimeRegistryHandle {
             .registration_health(registration.initial_execution, registration.generation)
     }
 
-    pub(crate) fn record_native_supervision_join_failure(&self, error: tokio::task::JoinError) {
+    /// Forward the original whole packet to the existing process health owner.
+    /// No field projection, formatting or replacement owner is introduced here.
+    pub(crate) fn record_native_supervision_panic(&self, original: Box<dyn std::any::Any + Send>) {
         self.inner
             .statement_native
-            .record_supervision_join_failure(error);
+            .record_supervision_panic(original);
+    }
+
+    pub(crate) fn record_native_supervision_join_failure(&self, error: tokio::task::JoinError) {
+        if error.is_panic() {
+            self.record_native_supervision_panic(error.into_panic());
+        } else {
+            self.inner
+                .statement_native
+                .record_supervision_join_failure(error);
+        }
     }
 
     #[cfg(test)]

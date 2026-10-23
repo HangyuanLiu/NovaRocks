@@ -60,8 +60,9 @@ struct RegistryState {
     accepting: bool,
     next_generation: u64,
     entries: BTreeMap<QueryExecutionId, Entry>,
-    // Original panic payload is retained independently of task/entry retirement.
-    // Any is Rust's catch_unwind payload type, never an arbitrary parked owner.
+    // Original panic payload or its complete poll-failure custody packet is
+    // retained independently of task/entry retirement. This private Any carrier
+    // keeps the original fields together; intake never projects their custody.
     health: Option<OriginalHealth>,
 }
 struct OriginalHealth {
@@ -616,12 +617,19 @@ impl StatementNativeResidualRegistry {
         drop(rejected);
         self.0.changed.notify_one();
     }
+    /// Accept the original boxed panic payload or whole poll-failure packet.
+    /// The health transaction takes custody before any notification callback.
+    /// Rejected later custody is destroyed only after the health lock exits.
+    pub(crate) fn record_supervision_panic(&self, original: Box<dyn Any + Send>) {
+        self.record_health(
+            "logical execution supervision task panicked",
+            Some(original),
+        );
+    }
+
     pub(crate) fn record_supervision_join_failure(&self, error: tokio::task::JoinError) {
         if error.is_panic() {
-            self.record_health(
-                "logical execution supervision task panicked",
-                Some(error.into_panic()),
-            );
+            self.record_supervision_panic(error.into_panic());
         } else {
             self.record_unproven_exit(StatementNativeHealthFailure::actual_exit_unproven(
                 "logical execution supervision task exited before actual local closure",
