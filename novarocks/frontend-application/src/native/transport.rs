@@ -27,6 +27,9 @@ use novarocks_native_adapter::native_lane::{
     NativeLane, NativeLaneChannel, configure_native_endpoint, frontend_lane_connector,
 };
 
+mod cold_dial;
+pub(super) use cold_dial::{NativeChannelSource, NativeDialAttempt, NativeDialHandoff};
+
 const MAX_MESSAGE_BYTES: usize =
     novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
 

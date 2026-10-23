@@ -49,6 +49,10 @@ pub(super) struct CachedNativeChannel {
 }
 
 impl CachedNativeChannel {
+    pub(super) fn is_retired(&self) -> bool {
+        self.generation.retired.load(Ordering::Acquire)
+    }
+
     /// Read-only component identity; grants no selection or dial authority.
     #[cfg(test)]
     pub(super) fn same_generation_for_test(&self, other: &Self) -> bool {
@@ -154,6 +158,14 @@ pub(super) struct NativeDialReservation {
 }
 
 impl NativeDialReservation {
+    pub(super) fn data_runtime(&self) -> &FrontendDataRuntime {
+        &self.runtime
+    }
+
+    pub(super) fn lane(&self) -> FrontendNativeLane {
+        self.slot.key.lane
+    }
+
     pub(super) fn is_retired(&self) -> bool {
         self.generation.retired.load(Ordering::Acquire)
     }
@@ -246,7 +258,7 @@ pub(crate) struct FrontendDataRuntime {
     native_transport: FrontendNativeTransport,
     transport_admission: NativeTransportAdmission,
     channels: Arc<Mutex<ChannelPools>>,
-    dial_gates: Arc<[tokio::sync::Mutex<()>; 4]>,
+    dial_gates: [Arc<tokio::sync::Mutex<()>>; 4],
     task_transport_supervisor: NativeTransportSupervisor,
     connector_blocking_io: ConnectorBlockingIoSupervisor,
     apply_send_port: ApplySendPort,
@@ -264,7 +276,7 @@ impl Clone for FrontendDataRuntime {
             native_transport: self.native_transport.clone(),
             transport_admission: self.transport_admission.clone(),
             channels: Arc::clone(&self.channels),
-            dial_gates: Arc::clone(&self.dial_gates),
+            dial_gates: self.dial_gates.clone(),
             task_transport_supervisor: self.task_transport_supervisor.clone(),
             connector_blocking_io: self.connector_blocking_io.clone(),
             apply_send_port: self.apply_send_port.clone(),
@@ -310,7 +322,7 @@ impl FrontendDataRuntime {
         let task_transport_supervisor =
             NativeTransportSupervisor::from_transport(task_transport_budget)?;
         let channels = Arc::new(Mutex::new(ChannelPools::default()));
-        let dial_gates = Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(())));
+        let dial_gates = std::array::from_fn(|_| Arc::new(tokio::sync::Mutex::new(())));
         let connector_blocking_io = ConnectorBlockingIoSupervisor::new(handle.clone());
         let (original_apply_owner, apply_send_port) =
             ApplySendOwner::new(handle.clone(), task_transport_budget)
@@ -715,6 +727,21 @@ impl FrontendDataRuntime {
             }
             false
         });
+    }
+
+    /// Try the original lane's existing dial position. The owned guard can
+    /// enter the original stable input without borrowing a movable runtime.
+    pub(super) fn try_dial_lane(
+        &self,
+        lane: FrontendNativeLane,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let index = match lane {
+            FrontendNativeLane::ResultData => 0,
+            FrontendNativeLane::Submission => 1,
+            FrontendNativeLane::Observation => 2,
+            FrontendNativeLane::LifecycleControl => 3,
+        };
+        Arc::clone(&self.dial_gates[index]).try_lock_owned().ok()
     }
 
     pub(super) async fn dial_lane(

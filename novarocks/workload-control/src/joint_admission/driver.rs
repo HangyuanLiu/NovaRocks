@@ -57,6 +57,9 @@ pub struct JointProgressDriver {
     scan_left: usize,
     scan_end: Option<u64>,
     scan_revision: Option<WorkloadProgressRevision>,
+    local_cursor: Option<u64>,
+    local_left: usize,
+    local_end: Option<u64>,
     proposal_cursor: usize,
     proposal_left: usize,
     proposal_revision: Option<WorkloadProgressRevision>,
@@ -210,6 +213,9 @@ impl JointProgressDriver {
             scan_left: 0,
             scan_end: None,
             scan_revision: None,
+            local_cursor: None,
+            local_left: 0,
+            local_end: None,
             proposal_cursor: 0,
             proposal_left: 0,
             proposal_revision: None,
@@ -228,6 +234,7 @@ impl JointProgressDriver {
     /// At most one snapshot record or one configured solver budget is processed
     /// per call. Never call repeatedly without yielding the role's executor.
     pub fn step(&mut self) -> JointProgress {
+        let local_more = self.reobserve_local_one();
         let proposal_more = self.reclaim_proposal_one();
         let reclaim_more = self.reclaim_one();
         // One canonical zero row per fair turn. Final graph exit is published
@@ -243,7 +250,7 @@ impl JointProgressDriver {
             }
             reclaimed
         };
-        self.step_after_reclaim(proposal_more, reclaim_more, dependency_more)
+        self.step_after_reclaim(proposal_more, reclaim_more, dependency_more || local_more)
     }
 
     fn step_after_reclaim(
@@ -327,11 +334,53 @@ impl JointProgressDriver {
     }
 
     /// The role service's prepaid timer requests a new finite pass after silent
-    /// Arc/Waker exits. This changes only the driver's cache, never source facts
-    /// or revision. The production timer/source profile is composed separately.
+    /// Arc/Waker exits and local physical refusals. This only arms finite
+    /// original-inventory passes; it never resets a request's proof budget.
+    /// The production timer/source profile is composed separately.
     pub fn recheck_retired_backing(&mut self) {
         self.reclaim_idle = None;
         self.reclaim_left = 0;
+        if self.local_left == 0 {
+            let state = self.inner.state.lock().unwrap();
+            let ledger = state.joint.as_ref().unwrap();
+            self.local_left = if ledger.local_waiters == 0 {
+                0
+            } else {
+                ledger.requests.len()
+            };
+            self.local_end = ledger.requests.last_key_value().map(|(&id, _)| id);
+            self.local_cursor = None;
+        }
+    }
+
+    /// One original request per timer-armed finite pass. New arrivals cannot
+    /// extend it. No physical source, callback or new request is created here.
+    fn reobserve_local_one(&mut self) -> bool {
+        if self.local_left == 0 {
+            return false;
+        }
+        let mut state = self.inner.state.lock().unwrap();
+        let ledger = state.joint.as_mut().unwrap();
+        let end = self.local_end.expect("nonempty original local pass");
+        let next = ledger
+            .requests
+            .range((self.local_cursor.map_or(Unbounded, Excluded), Included(end)))
+            .next()
+            .map(|(&id, _)| id);
+        let Some(id) = next else {
+            self.local_left = 0;
+            return false;
+        };
+        self.local_cursor = Some(id);
+        self.local_left -= 1;
+        let request = ledger.requests.get_mut(&id).unwrap();
+        let unblocked = request.local_blocked && matches!(request.phase, RequestPhase::Waiting);
+        if unblocked {
+            request.local_blocked = false;
+            ledger.local_waiters -= 1;
+            state.advance_progress_revision();
+        }
+        unblocked || self.local_left != 0
     }
 
     /// One cell at most, alongside the original proof step. A successful leaf
@@ -439,6 +488,7 @@ impl JointProgressDriver {
 
     fn step_proof(&mut self) -> JointProgress {
         if self.active.is_none() {
+            let mut local_waker = None;
             let (start, idle_revision) = {
                 let mut guard = self.inner.state.lock().unwrap();
                 let state = &mut *guard;
@@ -484,9 +534,27 @@ impl JointProgressDriver {
                                 .nodes
                                 .get(&request.owner)
                                 .is_none_or(|node| node.check(&state.cancellations).is_err());
+                    if matches!(request.phase, RequestPhase::LocalOffered { .. }) {
+                        if cancelled {
+                            let error = if ledger.driver_closed {
+                                WorkError::Closed
+                            } else {
+                                state
+                                    .nodes
+                                    .get(&request.owner)
+                                    .ok_or(WorkError::Released)
+                                    .and_then(|node| node.check(&state.cancellations))
+                                    .unwrap_err()
+                            };
+                            local_waker = fail_request(state, id, error);
+                        }
+                        return Some(Err(false));
+                    }
                     if matches!(request.phase, RequestPhase::Failed(_))
                         || (!matches!(request.phase, RequestPhase::Waiting) && !cancelled)
-                        || (request.blocked_at == Some(ledger.release_epoch) && !cancelled)
+                        || ((request.local_blocked
+                            || request.blocked_at == Some(ledger.release_epoch))
+                            && !cancelled)
                     {
                         return Some(Err(false));
                     }
@@ -517,6 +585,9 @@ impl JointProgressDriver {
                 })();
                 (start, idle_revision)
             };
+            if let Some(waker) = local_waker {
+                waker.wake();
+            }
             match start {
                 Some(Ok(turn)) => {
                     self.active = Some(turn);

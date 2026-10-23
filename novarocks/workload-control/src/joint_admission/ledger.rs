@@ -27,6 +27,7 @@ use novarocks_resource_contract::SharedDependency;
 use std::{
     collections::BTreeMap,
     future::Future,
+    mem::ManuallyDrop,
     pin::Pin,
     sync::{Arc, Weak},
     task::{Context, Poll, Waker},
@@ -168,6 +169,14 @@ pub(super) enum RequestPhase {
     Granted {
         new_ids: Vec<u64>,
     },
+    /// The original reply retains these claims while its sole caller tries the
+    /// selected local physical owner. Implicit Drop must never release them.
+    LocalOffered {
+        new_ids: Vec<u64>,
+        failure: Option<WorkError>,
+        // Set before arbitrary physical Drop; an unwind cannot be retried.
+        exiting: bool,
+    },
     /// New claims have crossed to their physical recipients. Withdrawal must
     /// never release them. Only the batch adjustment receipt remains here.
     Delivered,
@@ -208,6 +217,8 @@ pub(super) struct RequestRecord {
     proposal: Option<ProposalKey>,
     pub(super) phase: RequestPhase,
     pub(super) blocked_at: Option<u64>,
+    /// Only the original service timer arms a new local observation pass.
+    pub(super) local_blocked: bool,
     pub(super) waker: Option<Waker>,
 }
 pub(crate) struct JointLedger {
@@ -222,6 +233,8 @@ pub(crate) struct JointLedger {
     pub(super) profile_layout_revision: u64,
     pub(super) active: Option<u64>,
     pub(super) driver_closed: bool,
+    /// Count of local_blocked flags in this same original request inventory.
+    pub(super) local_waiters: usize,
     control_empty_facts: [Option<Arc<ProfileFacts>>; 5],
 }
 impl JointLedger {
@@ -237,6 +250,7 @@ impl JointLedger {
     }
     pub(crate) fn is_drained(&self, storage: &CancellationStorage) -> bool {
         if !self.requests.is_empty()
+            || self.local_waiters != 0
             || self.active.is_some()
             || self
                 .dependencies
@@ -330,6 +344,7 @@ impl WorkloadControl {
                 profile_layout_revision: 0,
                 active: None,
                 driver_closed: false,
+                local_waiters: 0,
                 control_empty_facts: std::array::from_fn(|_| None),
             });
             Ok((
@@ -745,6 +760,7 @@ impl JointAdmissionHandle {
                     proposal,
                     phase: RequestPhase::Waiting,
                     blocked_at: None,
+                    local_blocked: false,
                     waker: None,
                 },
             );
@@ -1140,6 +1156,9 @@ fn release_current(state: &mut State, id: u64) -> Option<Waker> {
 }
 fn remove_request(state: &mut State, id: u64) {
     if let Some(request) = state.joint.as_mut().unwrap().requests.remove(&id) {
+        if request.local_blocked {
+            state.joint.as_mut().unwrap().local_waiters -= 1;
+        }
         for change in request.changes.iter() {
             if let Some(source) = &change.source {
                 if let ClaimSource::PoolFree { slot, .. } = source.source {
@@ -1176,8 +1195,20 @@ fn remove_request(state: &mut State, id: u64) {
 pub(super) fn fail_request(state: &mut State, id: u64, error: WorkError) -> Option<Waker> {
     let ledger = state.joint.as_mut().unwrap();
     let request = ledger.requests.get_mut(&id)?;
+    if let RequestPhase::LocalOffered { failure, .. } = &mut request.phase {
+        // An external physical try may already own original resources. Record
+        // cancellation, but retain the same ticket/Q/new_ids until real exit.
+        if failure.is_none() {
+            *failure = Some(error);
+        }
+        return request.waker.take();
+    }
     if matches!(request.phase, RequestPhase::Failed(_)) {
         return request.waker.take();
+    }
+    if request.local_blocked {
+        request.local_blocked = false;
+        ledger.local_waiters -= 1;
     }
     let phase = std::mem::replace(&mut request.phase, RequestPhase::Failed(error));
     let changes = request.changes.clone();
@@ -1234,7 +1265,16 @@ pub(super) fn fail_request(state: &mut State, id: u64, error: WorkError) -> Opti
 }
 fn withdraw_request(state: &mut State, id: u64) -> Option<Waker> {
     let waker = fail_request(state, id, WorkError::Released);
-    remove_request(state, id);
+    if !state
+        .joint
+        .as_ref()
+        .unwrap()
+        .requests
+        .get(&id)
+        .is_some_and(|request| matches!(request.phase, RequestPhase::LocalOffered { .. }))
+    {
+        remove_request(state, id);
+    }
     waker
 }
 
@@ -1446,6 +1486,11 @@ impl Future for JointAdmission {
                     remove_request(state, id);
                     return Some(Err(error));
                 }
+                RequestPhase::LocalOffered { .. } => {
+                    // The original offer may still own physical resources.
+                    // Do not convert its claims through the ordinary reply API.
+                    return Some(Err(WorkError::Conflict));
+                }
                 RequestPhase::Delivered => unreachable!("one reply consumer"),
                 RequestPhase::Granted { .. } => {}
             }
@@ -1526,6 +1571,344 @@ impl Future for JointAdmission {
             new_claims,
             adjustment,
         }))
+    }
+}
+
+/// One observation of the same finite all-New request. This is a loan of the
+/// original reply, not a grant and not another capacity or identity author.
+///
+/// No WC/Core/physical-owner mutex may be held while trying the real local
+/// reservation. Dropping this loan does not undo its original claims: an
+/// unwinding caller may still retain the physical value. Its original owner
+/// must retain the admission and raw cause until explicit actual cleanup.
+#[must_use = "Accept into the original stable receiver or explicitly dispose and reobserve"]
+pub struct JointLocalOffer<'a> {
+    admission: &'a mut JointAdmission,
+    id: u64,
+}
+
+/// A stable receiver for the same physical holder and its original claims.
+/// The physical holder must cover the entire admitted all-New batch. This
+/// wrapper supplies no new capacity and grants no right to dispatch by itself.
+/// Actual service/response/body ownership must continue this same custody.
+#[must_use = "Retain the original physical holder through its actual exit"]
+pub struct JointLocalGrant<P> {
+    physical: ManuallyDrop<P>,
+    claims: ManuallyDrop<JointGrantedClaims>,
+}
+impl<P> JointLocalGrant<P> {
+    pub fn physical_mut(&mut self) -> &mut P {
+        &mut self.physical
+    }
+
+    pub fn claims(&self) -> &JointGrantedClaims {
+        &self.claims
+    }
+
+    /// Move both original values into empty slots of the same stable first-party
+    /// physical owner. This calls no foreign code and performs no notification.
+    /// That owner must continue the same claims through its response/body/actual
+    /// physical exit, with explicit physical-before-claims destruction. A client
+    /// or Endpoint return alone is not source exit. This transfer grants no new
+    /// backing for input/future/pointees and is not an execution capability.
+    pub fn transfer_in(
+        self,
+        physical: &mut Option<P>,
+        claims: &mut Option<JointGrantedClaims>,
+    ) -> Result<(), Self> {
+        if physical.is_some() || claims.is_some() {
+            return Err(self);
+        }
+        let mut original = ManuallyDrop::new(self);
+        // SAFETY: both destinations were checked empty; moves execute no user
+        // code, and the suppressed source destructor cannot read either field.
+        *physical = Some(unsafe { ManuallyDrop::take(&mut original.physical) });
+        *claims = Some(unsafe { ManuallyDrop::take(&mut original.claims) });
+        Ok(())
+    }
+}
+impl<P> Drop for JointLocalGrant<P> {
+    fn drop(&mut self) {
+        // SAFETY: each field is dropped once, in explicit custody order. If P's
+        // real destructor unwinds, ManuallyDrop keeps all original claims
+        // charged. No later field cleanup silently declares physical exit.
+        unsafe {
+            ManuallyDrop::drop(&mut self.physical);
+            ManuallyDrop::drop(&mut self.claims);
+        }
+    }
+}
+
+impl JointAdmission {
+    /// Observe the original finite all-New batch without releasing any physical
+    /// claims to the caller. Existing adjustment requests use their original
+    /// receipt path. The selected local try happens only after Ready(Ok).
+    /// Waiting installs a Waker; local Pending is retried only by the original
+    /// service's finite timer pass, using the remaining original proof budget.
+    pub fn poll_local_offer(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<JointLocalOffer<'_>, JointAdmissionFailure>> {
+        let Some(id) = self.id else {
+            return Poll::Ready(Err(JointAdmissionFailure {
+                error: WorkError::Released,
+            }));
+        };
+        let inner = Arc::clone(&self.inner);
+        // Both clone and destruction of a foreign Waker are outside State.
+        let mut incoming = Some(cx.waker().clone());
+        let mut outgoing = None;
+        let result = inner.update_facts_silent(|state| {
+            let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
+            let request = ledger.requests.get(&id).ok_or(WorkError::Released)?;
+            if !request.budget.is_finite()
+                || request.changes.iter().any(|change| change.old.is_some())
+            {
+                return Err(WorkError::Conflict);
+            }
+            match &request.phase {
+                RequestPhase::Waiting => {
+                    let request = state.joint.as_mut().unwrap().requests.get_mut(&id).unwrap();
+                    if request
+                        .waker
+                        .as_ref()
+                        .is_none_or(|waker| !waker.will_wake(incoming.as_ref().unwrap()))
+                    {
+                        outgoing = request.waker.replace(incoming.take().unwrap());
+                    }
+                    return Ok(false);
+                }
+                RequestPhase::Failed(error) => {
+                    let error = error.clone();
+                    // Keep the original typed refusal and Q in the caller's
+                    // stable admission until its ordinary Drop/withdraw path.
+                    return Err(error);
+                }
+                RequestPhase::Granted { .. } => {}
+                RequestPhase::LocalOffered { .. } | RequestPhase::Delivered => {
+                    return Err(WorkError::Conflict);
+                }
+            }
+            if ledger.driver_closed || state.closed {
+                return Err(WorkError::Closed);
+            }
+            if request
+                .changes
+                .iter()
+                .any(|change| change.claim.facts.lane != JointLane::Settlement)
+            {
+                state
+                    .nodes
+                    .get(&request.owner)
+                    .ok_or(WorkError::Released)?
+                    .check(&state.cancellations)?;
+            }
+            let request = state.joint.as_mut().unwrap().requests.get_mut(&id).unwrap();
+            let RequestPhase::Granted { new_ids } =
+                std::mem::replace(&mut request.phase, RequestPhase::Delivered)
+            else {
+                unreachable!("validated original grant")
+            };
+            request.phase = RequestPhase::LocalOffered {
+                new_ids,
+                failure: None,
+                exiting: false,
+            };
+            Ok(true)
+        });
+        drop(outgoing);
+        drop(incoming);
+        match result {
+            Ok(false) => Poll::Pending,
+            Ok(true) => Poll::Ready(Ok(JointLocalOffer {
+                admission: self,
+                id,
+            })),
+            Err(error) => Poll::Ready(Err(JointAdmissionFailure { error })),
+        }
+    }
+}
+impl JointLocalOffer<'_> {
+    /// Dispose the original local physical attempt outside State, then return
+    /// the same request/body/Q to Waiting. A Native Pending attempt passes None
+    /// only after its original try has really dropped every partial holder.
+    /// A destructor unwind leaves this original offer and its claims charged.
+    /// No caller may retain an alias of P's reservation beyond this operation.
+    /// Notify the returned token only after original source phase is stable.
+    pub fn reobserve_after_drop<P>(
+        &mut self,
+        physical: &mut Option<P>,
+    ) -> Result<crate::WorkloadProgressNotification, WorkError> {
+        let inner = Arc::clone(&self.admission.inner);
+        inner.update_facts_silent(|state| {
+            let request = state
+                .joint
+                .as_mut()
+                .ok_or(WorkError::NotReady)?
+                .requests
+                .get_mut(&self.id)
+                .ok_or(WorkError::Released)?;
+            let RequestPhase::LocalOffered { exiting, .. } = &mut request.phase else {
+                return Err(WorkError::Conflict);
+            };
+            if *exiting {
+                return Err(WorkError::Conflict);
+            }
+            // Publish the no-repoll fence before entering foreign destruction.
+            *exiting = true;
+            Ok(())
+        })?;
+        drop(physical.take());
+        inner.update_facts_silent(|state| {
+            let request = state
+                .joint
+                .as_mut()
+                .ok_or(WorkError::NotReady)?
+                .requests
+                .get_mut(&self.id)
+                .ok_or(WorkError::Released)?;
+            if !matches!(request.phase, RequestPhase::LocalOffered { .. }) {
+                return Err(WorkError::Conflict);
+            }
+            let RequestPhase::LocalOffered {
+                new_ids, failure, ..
+            } = std::mem::replace(&mut request.phase, RequestPhase::Delivered)
+            else {
+                unreachable!()
+            };
+            // These were never exported. Roll back only the original New IDs;
+            // there is no old-source mutation or second request/proof budget.
+            for id in new_ids {
+                remove_claim(state, id);
+            }
+            let request = state
+                .joint
+                .as_mut()
+                .unwrap()
+                .requests
+                .get_mut(&self.id)
+                .unwrap();
+            let failure = failure.or_else(|| {
+                request
+                    .budget
+                    .exhausted()
+                    .then_some(WorkError::Capacity("joint finite proof work"))
+            });
+            request.phase = failure.map_or(RequestPhase::Waiting, RequestPhase::Failed);
+            request.local_blocked = matches!(request.phase, RequestPhase::Waiting);
+            request.blocked_at = None;
+            if request.local_blocked {
+                // Bounded by max_requests; this flag was false in LocalOffered.
+                state.joint.as_mut().unwrap().local_waiters += 1;
+            }
+            Ok(())
+        })?;
+        Ok(crate::WorkloadProgressNotification::new(inner))
+    }
+
+    /// Publish into the original stable receiver before any Drop or wake can
+    /// run. A nonempty destination, stopped Work or failed offer leaves the
+    /// original physical Option and the entire provisional reply unchanged.
+    /// This performs only checked internal moves under State, never user code.
+    pub fn accept_in<P>(
+        &mut self,
+        physical: &mut Option<P>,
+        destination: &mut Option<JointLocalGrant<P>>,
+    ) -> Result<crate::WorkloadProgressNotification, WorkError> {
+        if destination.is_some() || physical.is_none() {
+            return Err(WorkError::Conflict);
+        }
+        let inner = Arc::clone(&self.admission.inner);
+        let count = {
+            let state = inner.state.lock().unwrap();
+            let request = state
+                .joint
+                .as_ref()
+                .ok_or(WorkError::NotReady)?
+                .requests
+                .get(&self.id)
+                .ok_or(WorkError::Released)?;
+            let RequestPhase::LocalOffered { new_ids, .. } = &request.phase else {
+                return Err(WorkError::Conflict);
+            };
+            new_ids.len()
+        };
+        // Uses the original quoted reply envelope. The empty vector cannot
+        // execute any foreign destructor, including on a validation refusal.
+        let mut claims = Vec::with_capacity(count);
+        let mut outgoing = None;
+        let result = inner.update_facts_silent(|state| {
+            let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
+            let request = ledger.requests.get(&self.id).ok_or(WorkError::Released)?;
+            let RequestPhase::LocalOffered {
+                new_ids,
+                failure,
+                exiting,
+            } = &request.phase
+            else {
+                return Err(WorkError::Conflict);
+            };
+            if *exiting {
+                return Err(WorkError::Conflict);
+            }
+            if let Some(error) = failure {
+                return Err(error.clone());
+            }
+            if state.closed || ledger.driver_closed {
+                return Err(WorkError::Closed);
+            }
+            if new_ids.len() != count
+                || !request.budget.is_finite()
+                || request.changes.iter().any(|change| change.old.is_some())
+            {
+                return Err(WorkError::Conflict);
+            }
+            if request
+                .changes
+                .iter()
+                .any(|change| change.claim.facts.lane != JointLane::Settlement)
+            {
+                state
+                    .nodes
+                    .get(&request.owner)
+                    .ok_or(WorkError::Released)?
+                    .check(&state.cancellations)?;
+            }
+            // No fallible/foreign operation occurs after the first guard move.
+            // The reserved Vec has exact space for every original New guard.
+            for &id in new_ids {
+                claims.push(JointClaim {
+                    inner: Arc::clone(&inner),
+                    id: Some(id),
+                });
+            }
+            let body = request.changes.clone();
+            let request = state
+                .joint
+                .as_mut()
+                .unwrap()
+                .requests
+                .get_mut(&self.id)
+                .unwrap();
+            outgoing = request.waker.take();
+            request.phase = RequestPhase::Delivered;
+            *destination = Some(JointLocalGrant {
+                physical: ManuallyDrop::new(physical.take().unwrap()),
+                claims: ManuallyDrop::new(JointGrantedClaims::new(
+                    std::mem::take(&mut claims),
+                    body,
+                    &inner,
+                )),
+            });
+            self.admission.id = None;
+            remove_request(state, self.id);
+            Ok(())
+        });
+        // On success the exact physical/claim bundle is already in its original
+        // receiver before arbitrary Waker destruction or later notification.
+        drop(outgoing);
+        result?;
+        Ok(crate::WorkloadProgressNotification::new(inner))
     }
 }
 

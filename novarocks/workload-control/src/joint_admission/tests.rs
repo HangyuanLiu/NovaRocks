@@ -2263,3 +2263,546 @@ fn shared_class_lane_keeps_bad_domain_out_of_healthy_and_settlement_progress() {
     drive(&mut driver);
     drop(granted(&mut blocked));
 }
+
+fn finite_local_request(
+    handle: &JointAdmissionHandle,
+    scope: &WorkScope,
+    dep: &JointDependency,
+) -> JointAdmission {
+    handle
+        .request_finite(
+            scope,
+            vec![JointClaimChange::New {
+                dependencies: vec![dep.clone()],
+                lane: JointLane::Foreground,
+                amounts: bytes(1),
+            }],
+            std::num::NonZeroU64::new(10_000_000).unwrap(),
+        )
+        .unwrap()
+}
+fn local_request_state(control: &WorkloadControl) -> (u64, u64, bool) {
+    let state = control.inner.state.lock().unwrap();
+    let (&id, request) = state
+        .joint
+        .as_ref()
+        .unwrap()
+        .requests
+        .first_key_value()
+        .unwrap();
+    let ledger::RequestBudget::Finite { remaining } = request.budget else {
+        panic!("finite original request")
+    };
+    (id, remaining, request.local_blocked)
+}
+struct LocalPhysicalDrop {
+    control: std::sync::Arc<crate::scope::Inner>,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<(bool, usize)>>>,
+}
+impl Drop for LocalPhysicalDrop {
+    fn drop(&mut self) {
+        // This is the actual physical destructor. Its observation proves that
+        // State was not held and the original claim had not yet been refunded.
+        let fact = match self.control.state.try_lock() {
+            Ok(state) => (
+                true,
+                state.joint.as_ref().map_or(0, |ledger| ledger.claims.len()),
+            ),
+            Err(_) => (false, usize::MAX),
+        };
+        // Never assert while another physical destructor is already unwinding.
+        if let Ok(mut seen) = self.seen.lock() {
+            seen.push(fact);
+        }
+    }
+}
+
+#[test]
+fn local_refusal_keeps_original_ticket_budget_and_waits_for_original_timer_pass() {
+    let (control, handle, mut driver) = control();
+    let work = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let dep = dependency(&handle, "local");
+    let mut request = finite_local_request(&handle, &work.owner.scope(), &dep);
+    let (ticket, initial, _) = local_request_state(&control);
+    drive(&mut driver);
+    let (_, first, _) = local_request_state(&control);
+    assert!(first < initial);
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut physical = Some(LocalPhysicalDrop {
+        control: std::sync::Arc::clone(&control.inner),
+        seen: seen.clone(),
+    });
+    let mut offer = match request.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(offer)) => offer,
+        _ => panic!("original finite grant"),
+    };
+    offer.reobserve_after_drop(&mut physical).unwrap().notify();
+    drop(offer);
+    assert_eq!(seen.lock().unwrap().as_slice(), &[(true, 1)]);
+    assert!(physical.is_none());
+    assert_eq!(held(&control), (0, 0));
+    assert_eq!(local_request_state(&control), (ticket, first, true));
+    drive(&mut driver);
+    assert_eq!(local_request_state(&control), (ticket, first, true));
+    assert!(
+        request
+            .poll_local_offer(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    driver.recheck_retired_backing();
+    drive(&mut driver);
+    let (same, second, blocked) = local_request_state(&control);
+    assert_eq!(same, ticket);
+    assert!(second < first, "same finite budget was charged again");
+    assert!(!blocked);
+    let mut offer = match request.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(offer)) => offer,
+        _ => panic!("same ticket granted again"),
+    };
+    let mut physical = Some(LocalPhysicalDrop {
+        control: std::sync::Arc::clone(&control.inner),
+        seen: seen.clone(),
+    });
+    let mut destination = None;
+    offer
+        .accept_in(&mut physical, &mut destination)
+        .unwrap()
+        .notify();
+    drop(offer);
+    assert!(physical.is_none());
+    assert!(
+        control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .joint
+            .as_ref()
+            .unwrap()
+            .requests
+            .is_empty()
+    );
+    assert_eq!(destination.as_ref().unwrap().claims().len(), 1);
+    drop(destination);
+    assert_eq!(seen.lock().unwrap().as_slice(), &[(true, 1), (true, 1)]);
+    assert_eq!(held(&control), (0, 0));
+    work.business.release();
+    work.owner.complete();
+}
+
+#[test]
+fn local_accept_stable_destination_survives_real_post_state_wake_panic() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let (control, handle, mut driver) = control();
+    let work = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let dep = dependency(&handle, "local");
+    let mut request = finite_local_request(&handle, &work.owner.scope(), &dep);
+    drive(&mut driver);
+    let mut offer = match request.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(offer)) => offer,
+        _ => panic!("original finite grant"),
+    };
+    let wake = Waker::from(std::sync::Arc::new(QueueHandoffPanicWake(
+        std::sync::atomic::AtomicBool::new(true),
+    )));
+    let mut progress = Box::pin(control.wait_progress(control.progress_revision()));
+    assert!(
+        progress
+            .as_mut()
+            .poll(&mut Context::from_waker(&wake))
+            .is_pending()
+    );
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut physical = Some(LocalPhysicalDrop {
+        control: control.inner.clone(),
+        seen: seen.clone(),
+    });
+    let mut destination = None;
+    let notification = offer.accept_in(&mut physical, &mut destination).unwrap();
+    drop(offer);
+    assert!(catch_unwind(AssertUnwindSafe(|| notification.notify())).is_err());
+    assert!(physical.is_none());
+    assert!(seen.lock().unwrap().is_empty());
+    assert_eq!(destination.as_ref().unwrap().claims().len(), 1);
+    assert_eq!(held(&control), (1, 1));
+    drop(progress);
+    // A second accept cannot overwrite the exact original receiver.
+    let mut second = finite_local_request(&handle, &work.owner.scope(), &dep);
+    drive(&mut driver);
+    let mut offer = match second.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(offer)) => offer,
+        _ => panic!("second finite grant"),
+    };
+    let mut rejected = Some(LocalPhysicalDrop {
+        control: control.inner.clone(),
+        seen: seen.clone(),
+    });
+    assert!(matches!(
+        offer.accept_in(&mut rejected, &mut destination),
+        Err(WorkError::Conflict)
+    ));
+    assert!(rejected.is_some());
+    assert!(seen.lock().unwrap().is_empty());
+    offer.reobserve_after_drop(&mut rejected).unwrap().notify();
+    drop(offer);
+    drop(second);
+    // Both originals move without callbacks into the original first-party
+    // physical owner's stable slots. Its explicit cleanup is physical first.
+    let mut physical_owner = None;
+    let mut claim_owner = None;
+    assert!(
+        destination
+            .take()
+            .unwrap()
+            .transfer_in(&mut physical_owner, &mut claim_owner)
+            .is_ok()
+    );
+    assert_eq!(claim_owner.as_ref().unwrap().len(), 1);
+    assert_eq!(held(&control), (1, 1));
+    drop(physical_owner.take());
+    assert_eq!(held(&control), (1, 1));
+    drop(claim_owner.take());
+    assert_eq!(held(&control), (0, 0));
+    work.business.release();
+    work.owner.complete();
+}
+
+#[test]
+fn local_cancel_records_failure_but_cannot_free_an_in_flight_physical_offer() {
+    let (control, handle, mut driver) = control();
+    let work = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let dep = dependency(&handle, "local");
+    let mut request = finite_local_request(&handle, &work.owner.scope(), &dep);
+    drive(&mut driver);
+    let mut offer = match request.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(offer)) => offer,
+        _ => panic!("original finite grant"),
+    };
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut physical = Some(LocalPhysicalDrop {
+        control: control.inner.clone(),
+        seen: seen.clone(),
+    });
+    work.owner.cancel(crate::CancellationReason::ServerShutdown);
+    drive(&mut driver);
+    assert_eq!(held(&control), (1, 1));
+    let mut destination = None;
+    assert!(matches!(
+        offer.accept_in(&mut physical, &mut destination),
+        Err(WorkError::Cancelled(
+            crate::CancellationReason::ServerShutdown
+        ))
+    ));
+    assert!(destination.is_none());
+    assert!(physical.is_some());
+    offer.reobserve_after_drop(&mut physical).unwrap().notify();
+    drop(offer);
+    assert_eq!(held(&control), (0, 0));
+    assert_eq!(seen.lock().unwrap().as_slice(), &[(true, 1)]);
+    assert!(matches!(
+        request.poll_local_offer(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Err(JointAdmissionFailure {
+            error: WorkError::Cancelled(crate::CancellationReason::ServerShutdown)
+        }))
+    ));
+    drop(request);
+    assert!(
+        control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .joint
+            .as_ref()
+            .unwrap()
+            .requests
+            .is_empty()
+    );
+    work.business.release();
+    work.owner.complete();
+}
+
+#[test]
+fn local_refusal_does_not_replenish_exhausted_proof_or_soften_finite_infeasibility() {
+    let (control, handle, mut driver) = control();
+    let work = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let dep = dependency(&handle, "local");
+    let mut request = finite_local_request(&handle, &work.owner.scope(), &dep);
+    drive(&mut driver);
+    // Inject only the original proof counter boundary; use the real grant,
+    // original local rollback and original typed refusal publication below.
+    {
+        let mut state = control.inner.state.lock().unwrap();
+        state
+            .joint
+            .as_mut()
+            .unwrap()
+            .requests
+            .first_entry()
+            .unwrap()
+            .get_mut()
+            .budget = ledger::RequestBudget::Finite { remaining: 0 };
+    }
+    let mut offer = match request.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(offer)) => offer,
+        _ => panic!("original boundary grant"),
+    };
+    offer
+        .reobserve_after_drop(&mut None::<()>)
+        .unwrap()
+        .notify();
+    drop(offer);
+    assert!(matches!(
+        request.poll_local_offer(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Err(JointAdmissionFailure {
+            error: WorkError::Capacity("joint finite proof work")
+        }))
+    ));
+    drop(request);
+    let mut base_request = handle
+        .request_finite(
+            &work.owner.scope(),
+            vec![JointClaimChange::New {
+                dependencies: vec![dep.clone()],
+                lane: JointLane::Foreground,
+                amounts: bytes(2),
+            }],
+            std::num::NonZeroU64::new(10_000_000).unwrap(),
+        )
+        .unwrap();
+    drive(&mut driver);
+    let base = granted(&mut base_request);
+    let mut infeasible = finite_local_request(&handle, &work.owner.scope(), &dep);
+    drive(&mut driver);
+    assert!(matches!(
+        infeasible.poll_local_offer(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Err(JointAdmissionFailure {
+            error: WorkError::Capacity("joint protected intersections")
+        }))
+    ));
+    drop(infeasible);
+    assert_eq!(held(&control), (1, 2));
+    drop(base);
+    work.business.release();
+    work.owner.complete();
+}
+
+#[test]
+fn local_physical_drop_unwind_keeps_same_offer_and_cannot_retry_or_refund() {
+    use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
+    #[derive(Debug)]
+    struct OriginalPhysicalExitPanic;
+    struct PanickingPhysical {
+        _physical: LocalPhysicalDrop,
+    }
+    impl Drop for PanickingPhysical {
+        fn drop(&mut self) {
+            panic_any(OriginalPhysicalExitPanic)
+        }
+    }
+    let (control, handle, mut driver) = control();
+    let work = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let dep = dependency(&handle, "local");
+    let mut request = finite_local_request(&handle, &work.owner.scope(), &dep);
+    drive(&mut driver);
+    let before = local_request_state(&control);
+    let mut offer = match request.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(offer)) => offer,
+        _ => panic!("original finite grant"),
+    };
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut physical = Some(PanickingPhysical {
+        _physical: LocalPhysicalDrop {
+            control: control.inner.clone(),
+            seen: seen.clone(),
+        },
+    });
+    let primary = catch_unwind(AssertUnwindSafe(|| {
+        let _ = offer.reobserve_after_drop(&mut physical);
+    }))
+    .expect_err("real physical destructor panic");
+    assert!(primary.is::<OriginalPhysicalExitPanic>());
+    assert_eq!(seen.lock().unwrap().as_slice(), &[(true, 1)]);
+    assert!(physical.is_none());
+    assert!(
+        matches!(
+            offer.reobserve_after_drop(&mut physical),
+            Err(WorkError::Conflict)
+        ),
+        "never retry an unwound physical destructor"
+    );
+    drop(offer);
+    assert_eq!(local_request_state(&control), before);
+    assert_eq!(held(&control), (1, 1));
+    drop(request);
+    assert_eq!(
+        held(&control),
+        (1, 1),
+        "implicit admission Drop cannot refund unknown physical exit"
+    );
+    assert_eq!(
+        control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .joint
+            .as_ref()
+            .unwrap()
+            .requests
+            .len(),
+        1
+    );
+    // This is the illegal-exit fail-closed boundary, not normal shutdown. The
+    // same source/cause remains present until this test's whole authority exits.
+    work.business.release();
+    work.owner.complete();
+    drop(primary);
+}
+
+#[test]
+fn fixed_paid_local_offer_retains_original_body_until_physical_and_reply_exit() {
+    let (control, handle, mut driver) =
+        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 1, 1);
+    let work = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let observer = work.owner.retirement_observer().unwrap();
+    let mut bind = handle.begin_paid_proposal(&work.owner).unwrap();
+    bind.begin_first_bind(work.owner.control_claim_view().unwrap())
+        .unwrap();
+    bind.push_dependency(&SharedDependency::LocalHost).unwrap();
+    bind.end_change().unwrap();
+    let mut bind = bind.submit().unwrap();
+    drive(&mut driver);
+    let Poll::Ready(Ok(mut reply)) = poll(&mut bind) else {
+        panic!("paid original FirstBind")
+    };
+    reply
+        .adjustment
+        .take()
+        .unwrap()
+        .install_control(&work.owner, &[])
+        .unwrap();
+    drop(reply);
+    drive(&mut driver);
+    let mut proposal = handle.begin_paid_proposal(&work.owner).unwrap();
+    proposal
+        .begin_new(
+            JointLane::Custody,
+            JointResources::ZERO.with(JointResource::ClaimRecords, 1),
+        )
+        .unwrap();
+    proposal
+        .push_dependency(&SharedDependency::LocalHost)
+        .unwrap();
+    proposal.end_change().unwrap();
+    let mut request = proposal.submit().unwrap();
+    let (ticket, budget, _) = local_request_state(&control);
+    drive(&mut driver);
+    let mut offer = match request.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(offer)) => offer,
+        _ => panic!("original paid all-New offer"),
+    };
+    offer
+        .reobserve_after_drop(&mut None::<()>)
+        .unwrap()
+        .notify();
+    drop(offer);
+    let (same, remaining, blocked) = local_request_state(&control);
+    assert_eq!(same, ticket);
+    assert!(remaining < budget);
+    assert!(blocked);
+    driver.recheck_retired_backing();
+    drive(&mut driver);
+    let mut offer = match request.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(offer)) => offer,
+        _ => panic!("same paid body reoffered"),
+    };
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut physical = Some(LocalPhysicalDrop {
+        control: control.inner.clone(),
+        seen: seen.clone(),
+    });
+    let mut destination = None;
+    offer
+        .accept_in(&mut physical, &mut destination)
+        .unwrap()
+        .notify();
+    drop(offer);
+    assert_eq!(destination.as_ref().unwrap().claims().len(), 1);
+    work.business.release();
+    work.owner.complete();
+    drive(&mut driver);
+    assert_eq!(
+        observer.is_reclaimed(),
+        Ok(false),
+        "real local physical/reply still owns original Work backing"
+    );
+    drop(destination);
+    assert_eq!(seen.lock().unwrap().as_slice(), &[(true, 5)]);
+    drive(&mut driver);
+    assert_eq!(observer.is_reclaimed(), Ok(true));
+    control.close_admission();
+    drive(&mut driver);
+    assert!(control.inner.state.lock().unwrap().is_drained());
+}
+
+#[test]
+fn local_offer_refuses_unbounded_wait_and_old_adjustment_without_mutating_sources() {
+    let (control, handle, mut driver) = control();
+    let work = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let dep = dependency(&handle, "local");
+    let mut waiting = request(
+        &handle,
+        &work.owner.scope(),
+        &[&dep],
+        JointLane::Foreground,
+        1,
+    );
+    assert!(matches!(
+        waiting.poll_local_offer(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Err(JointAdmissionFailure {
+            error: WorkError::Conflict
+        }))
+    ));
+    assert_eq!(held(&control), (0, 0));
+    drive(&mut driver);
+    let original = granted(&mut waiting).pop().unwrap();
+    let mut growth = handle
+        .request_finite(
+            &work.owner.scope(),
+            vec![JointClaimChange::grow_by(
+                original.view().unwrap(),
+                bytes(1),
+                vec![],
+            )],
+            std::num::NonZeroU64::new(10_000_000).unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        growth.poll_local_offer(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Err(JointAdmissionFailure {
+            error: WorkError::Conflict
+        }))
+    ));
+    assert_eq!(original.amounts().unwrap(), bytes(1));
+    drop(growth);
+    assert_eq!(original.amounts().unwrap(), bytes(1));
+    assert_eq!(held(&control), (1, 1));
+    drop(original);
+    work.business.release();
+    work.owner.complete();
+}

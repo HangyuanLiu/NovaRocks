@@ -218,3 +218,114 @@ async fn observer_unwind_destroys_actual_io_before_returning_original_positions(
         );
     }
 }
+
+fn single_frontend_dial_position() -> NativeTransportAdmission {
+    NativeTransportAdmission::with_parts(
+        TransportRole::Frontend,
+        AdmissionDimensions {
+            data_positions: 1,
+            control_positions: 1,
+            data_handshakes: 1,
+            control_handshakes: 1,
+        },
+        None,
+    )
+    .unwrap()
+}
+
+#[test]
+fn reserved_frontend_dial_drop_returns_the_original_pair() {
+    let admission = single_frontend_dial_position();
+    let held = admission
+        .try_reserve_frontend_dial(FrontendNativeLane::Observation)
+        .unwrap();
+    assert_eq!(admission.available_positions(TransportClass::Data), 0);
+    assert_eq!(admission.available_handshakes(TransportClass::Data), 0);
+    assert!(
+        admission
+            .try_reserve_frontend_dial(FrontendNativeLane::ResultData)
+            .is_err()
+    );
+    drop(held);
+    assert_eq!(admission.available_positions(TransportClass::Data), 1);
+    assert_eq!(admission.available_handshakes(TransportClass::Data), 1);
+}
+
+#[tokio::test]
+async fn reserved_connector_consumes_first_pair_once_then_reconnects_with_original_author() {
+    use tower::Service;
+    let admission = single_frontend_dial_position();
+    let listener = bounded(TcpListener::bind("127.0.0.1:0")).await.unwrap();
+    let endpoint = NativeEndpoint::from_socket_addr(listener.local_addr().unwrap());
+    let held = admission
+        .try_reserve_frontend_dial(FrontendNativeLane::Observation)
+        .unwrap();
+    let mut connector = held.into_connector(
+        novarocks_native_trust::NativeEndpointConnector::plaintext(endpoint),
+    );
+    let uri: hyper::http::Uri = "http://original-cold-dial.test".parse().unwrap();
+    // The one original physical position is already held. A second acquire
+    // here would fail: real first IO success is the no-double-acquire witness.
+    let (first, first_peer) =
+        bounded(async { tokio::try_join!(connector.call(uri.clone()), listener.accept()) })
+            .await
+            .unwrap();
+    let mut first_peer = first_peer.0;
+    assert_eq!(admission.available_positions(TransportClass::Data), 0);
+    assert_eq!(admission.available_handshakes(TransportClass::Data), 1);
+    // A reconnect cannot reuse the first qualification while its IO lives.
+    let refused = match bounded(connector.call(uri.clone())).await {
+        Err(error) => error,
+        Ok(io) => {
+            drop(io);
+            panic!("reconnect borrowed an occupied original position");
+        }
+    };
+    assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(admission.available_handshakes(TransportClass::Data), 1);
+    drop(first);
+    assert_eq!(bounded(first_peer.read(&mut [0])).await.unwrap(), 0);
+    assert_eq!(admission.available_positions(TransportClass::Data), 1);
+    // The same nonClone service now takes a fresh pair from the original
+    // author; no new pool/registry or fallback connector exists.
+    let (second, second_peer) =
+        bounded(async { tokio::try_join!(connector.call(uri), listener.accept()) })
+            .await
+            .unwrap();
+    let mut second_peer = second_peer.0;
+    assert_eq!(admission.available_positions(TransportClass::Data), 0);
+    assert_eq!(admission.available_handshakes(TransportClass::Data), 1);
+    drop(second);
+    assert_eq!(bounded(second_peer.read(&mut [0])).await.unwrap(), 0);
+    assert_eq!(admission.available_positions(TransportClass::Data), 1);
+}
+
+#[tokio::test]
+async fn reserved_connector_observes_close_before_starting_first_io() {
+    use tower::Service;
+    let admission = single_frontend_dial_position();
+    let held = admission
+        .try_reserve_frontend_dial(FrontendNativeLane::Observation)
+        .unwrap();
+    admission.close_frontend_outgoing().unwrap();
+    let mut connector =
+        held.into_connector(novarocks_native_trust::NativeEndpointConnector::plaintext(
+            NativeEndpoint::from_socket_addr("127.0.0.1:9".parse().unwrap()),
+        ));
+    let uri: hyper::http::Uri = "http://original-closed-dial.test".parse().unwrap();
+    let error = match bounded(connector.call(uri)).await {
+        Err(error) => error,
+        Ok(io) => {
+            drop(io);
+            panic!("closed frontend started new IO");
+        }
+    };
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+    assert_eq!(admission.available_positions(TransportClass::Data), 1);
+    assert_eq!(admission.available_handshakes(TransportClass::Data), 1);
+    assert!(
+        admission
+            .try_reserve_frontend_dial(FrontendNativeLane::Observation)
+            .is_err()
+    );
+}
