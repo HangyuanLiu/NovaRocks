@@ -213,12 +213,23 @@ fn computation_facts(
     Ok(&row.active_facts)
 }
 
+// Capture alone does not authorize execution. Once the unique WC owner has
+// installed its closed factory, every CPU request must carry that same stamp.
+// An unbound WC remains available for neutral E-source harnesses.
+fn require_registered_factory(state: &State, fence: CpuActionFence) -> Result<(), WorkError> {
+    if state.internal_cpu_factory.is_some() && !fence.has_closed_factory() {
+        return Err(WorkError::Conflict);
+    }
+    Ok(())
+}
+
 pub(in crate::joint_admission::ledger) fn validate_cpu_action(
     state: &State,
     owner: WorkId,
     fence: CpuActionFence,
     changes: &[ChangeRecord],
 ) -> Result<(), WorkError> {
+    require_registered_factory(state, fence)?;
     let original = computation_facts(state, owner, fence)?;
     let [change] = changes else {
         return Err(WorkError::Conflict);
@@ -314,6 +325,12 @@ impl InternalCpuActionSource {
         physical_queue_bytes: NonZeroU64,
     ) -> Result<InternalCpuActionAdmission, WorkError> {
         let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
+        {
+            let state = inner.state.lock().unwrap();
+            // Refuse an unauthorized request before reserving the original Q
+            // cell or retaining any additional profile graph backing.
+            require_registered_factory(&state, self.fence)?;
+        }
         let scope = WorkScope {
             inner: Arc::clone(&inner),
             id: self.owner,
@@ -326,6 +343,7 @@ impl InternalCpuActionSource {
         .begin_paid_proposal_for_scope(scope)?;
         let facts = {
             let state = inner.state.lock().unwrap();
+            require_registered_factory(&state, self.fence)?;
             Arc::clone(computation_facts(&state, self.owner, self.fence)?)
         };
         let amounts = JointResources::ZERO

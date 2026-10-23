@@ -745,12 +745,14 @@ impl JointAdmissionHandle {
             }
             if let Some(fence) = prepared.cpu_action {
                 validate_cpu_action(state, scope.id, fence, records)?;
-            } else if records
-                .iter()
-                .any(|change| !change.claim.facts.key.causal.is_empty())
-            {
+            } else if records.iter().any(|change| {
+                !change.claim.facts.key.causal.is_empty()
+                    || (state.internal_cpu_factory.is_some()
+                        && change.claim.amounts.get(JointResource::InternalCpuJobs) != 0)
+            }) {
                 // Only the authenticated CPU action can publish this causal
-                // exemption. The paid builder rejects ordinary CPU amounts.
+                // exemption. A registered WC also forbids E CPU rows from
+                // other constructors; backing custody is not source authority.
                 return Err(WorkError::Conflict);
             }
             if let Some(fence) = prepared.root_stage {

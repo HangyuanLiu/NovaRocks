@@ -2466,6 +2466,19 @@ mod joint_queue_tests {
         control.mark_ready().unwrap();
         let root = root(&control, &mut driver);
         let computation = positive_computation(&handle, &root.owner, &mut driver);
+        // Pure capture remains available, but cannot create an E CPU request
+        // in this registered WC. The later bound request reuses the same Q=1
+        // original proposal cell and completes on the real worker below.
+        let unbound = computation.cpu_action_source(&root.owner.scope()).unwrap();
+        assert!(matches!(
+            unbound.begin(
+                std::num::NonZeroU64::new(1).unwrap(),
+                std::num::NonZeroU64::new(1).unwrap()
+            ),
+            Err(JointAdmissionFailure {
+                error: WorkError::Conflict
+            })
+        ));
         let runs = Arc::new(AtomicUsize::new(0));
         let wrong_drops = Arc::new(AtomicUsize::new(0));
         let wrong = DropCount(Arc::clone(&wrong_drops));
