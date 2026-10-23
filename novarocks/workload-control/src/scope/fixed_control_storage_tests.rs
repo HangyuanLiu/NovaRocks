@@ -1164,10 +1164,21 @@ fn observing_unset_cached_and_sealed_reasons_does_not_wake_the_reaper() {
         after,
         "cached and sealed reads cannot manufacture progress"
     );
-    // The real cancellation intent is still ready for its dispatcher.
-    // Observe the revision-only waiter, not that independent ready queue.
+    // Inherited cancellation is ready for the expiry owner even when it
+    // predates marker capture. Observing readiness must remain mutation-free.
     let deadlines = control.deadline_expiry_handle();
-    let mut progress = Box::pin(deadlines.wait_state_change(after));
+    let mut ready = Box::pin(deadlines.wait_state_change(after));
+    assert!(
+        ready
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+    );
+    drop(ready);
+    assert_eq!(control.progress_revision(), after);
+    deadlines.expire_deadlines();
+    let settled = drain(&mut driver);
+    let mut progress = Box::pin(deadlines.wait_state_change(settled));
     assert!(
         progress
             .as_mut()

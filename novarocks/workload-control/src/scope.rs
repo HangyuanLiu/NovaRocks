@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod deadline;
 mod retirement;
 pub use retirement::WorkRetirementObserver;
 
@@ -219,6 +220,7 @@ pub(crate) struct Node {
     pub pending_query_window: Option<crate::ResultWindowClass>,
     pub control_pending: ControlIntents,
     pub cancellation_signalled: bool,
+    deadline_notification: deadline::Notification,
     pub terminal_cancel_settled: bool,
     pub control_queued: bool,
     pub control_inflight: bool,
@@ -251,6 +253,7 @@ impl Node {
             pending_query_window: None,
             control_pending: ControlIntents::empty(),
             cancellation_signalled: false,
+            deadline_notification: deadline::Notification::Idle,
             terminal_cancel_settled: false,
             control_queued: false,
             control_inflight: false,
@@ -468,6 +471,7 @@ impl State {
                 || !node.control_pending.is_empty()
                 || node.control_queued
                 || node.control_inflight
+                || !node.deadline_notification.is_idle()
             {
                 return;
             }
@@ -1225,100 +1229,6 @@ impl WorkloadControl {
             }
         };
         result.map_err(|error| WorkloadShutdownFailure { error, owner: self })
-    }
-}
-
-impl DeadlineExpiryHandle {
-    /// Role supervision drives this together with [`Self::next_deadline`]; no
-    /// work owns an OS waiting thread, and timeout only creates cancellation
-    /// intent.
-    pub fn expire_deadlines(&self) {
-        let _reclaim = ReclaimWakeOnExit::new(&self.inner);
-        let notifications = self.inner.update(|state| {
-            let cancelled = state
-                .nodes
-                .iter()
-                .filter_map(|(&id, node)| {
-                    (!node.completed
-                        && !node.cancellation_signalled
-                        && state
-                            .cancellations
-                            .cell(node.cancellation)
-                            .check_reason()
-                            .is_some())
-                    .then_some(id)
-                })
-                .collect::<Vec<_>>();
-            let mut notifications = Vec::new();
-            for id in cancelled {
-                let cancellation =
-                    Arc::clone(state.cancellations.cell(state.nodes[&id].cancellation));
-                let reason = cancellation.check_reason().unwrap();
-                notifications.push((cancellation, reason));
-                state.nodes.get_mut(&id).unwrap().cancellation_signalled = true;
-                crate::observation::queue_control(state, id, crate::ControlIntent::Cancel).unwrap();
-            }
-            notifications
-        });
-        for (cancellation, reason) in notifications {
-            cancellation.request(reason);
-        }
-    }
-
-    pub fn next_deadline(&self) -> Option<Instant> {
-        let state = self.inner.state.lock().unwrap();
-        state
-            .nodes
-            .values()
-            .filter(|node| !node.completed && !node.cancellation_signalled)
-            .filter_map(|node| state.cancellations.cell(node.cancellation).deadline())
-            .chain(
-                state
-                    .requests
-                    .values()
-                    .filter(|request| {
-                        !request.retired
-                            && !matches!(
-                                request.state,
-                                crate::admission::AdmissionState::Rejected(_)
-                            )
-                    })
-                    .map(|request| request.wait_deadline),
-            )
-            .min()
-    }
-
-    /// Capture the current event revision before waiting for a later deadline
-    /// or state transition.
-    pub fn progress_revision(&self) -> WorkloadProgressRevision {
-        self.inner
-            .capture_progress(&self.inner.state.lock().unwrap())
-    }
-
-    /// Wait for any state revision without treating an idle, open authority as
-    /// shutdown-drained. Deadline supervision uses this to learn about a newly
-    /// admitted earlier deadline without polling or spinning while idle.
-    pub async fn wait_state_change(&self, after: WorkloadProgressRevision) {
-        loop {
-            crate::admission::drain_wakes(&self.inner);
-            let changed = self.inner.changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            let advanced = {
-                let state = self.inner.state.lock().unwrap();
-                if self.inner.capture_progress(&state) != after {
-                    true
-                } else if crate::admission::has_pending_wakes(&state) {
-                    continue;
-                } else {
-                    false
-                }
-            };
-            if advanced {
-                return;
-            }
-            changed.await;
-        }
     }
 }
 
