@@ -429,7 +429,11 @@ mod tests {
         use novarocks_memory::lane::{RecordRef, ResponsibilityClass, StoreHandle};
         use std::alloc::{GlobalAlloc, Layout};
         let owner = StoreHandle::global()
-            .acquire(7, ResponsibilityClass::Service)
+            .acquire(
+                7,
+                ResponsibilityClass::Service,
+                novarocks_memory::lane::RecordRegion::Observation,
+            )
             .unwrap();
         for align in [1, 8, 64, 4096] {
             for size in [511, 512, 513, 4096] {
@@ -468,10 +472,18 @@ mod tests {
         use novarocks_memory::lane::{RecordRef, ResponsibilityClass, StoreHandle};
         use std::alloc::{GlobalAlloc, Layout};
         let first = StoreHandle::global()
-            .acquire(7, ResponsibilityClass::Service)
+            .acquire(
+                7,
+                ResponsibilityClass::Service,
+                novarocks_memory::lane::RecordRegion::Observation,
+            )
             .unwrap();
         let second = StoreHandle::global()
-            .acquire(8, ResponsibilityClass::Service)
+            .acquire(
+                8,
+                ResponsibilityClass::Service,
+                novarocks_memory::lane::RecordRegion::Observation,
+            )
             .unwrap();
         let small = Layout::from_size_align(128, 8).unwrap();
         let pointer = unsafe { GLOBAL.alloc(small) };

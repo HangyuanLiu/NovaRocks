@@ -16,6 +16,7 @@
 // under the License.
 
 //! Stable System-backed segments. Only control-plane callers allocate/reclaim.
+// Design: ADR-0197 (docs/adr/ADR-0197-observation-owner-shards-and-coverage-shadow.md)
 use super::{faults::FaultCounters, owner::RecordOwner, record::*, token::RecordRef};
 use crate::sync::{AtomicPtr, AtomicU32, Mutex, Ordering};
 use std::{
@@ -27,6 +28,62 @@ use std::{
 pub const MAX_RECORDS: u32 = 1 << 18;
 pub const UNATTRIBUTED_SHARDS: u32 = 16;
 #[cfg(not(loom))]
+pub const THREAD_ROLE_CAPACITY: u32 = 16;
+#[cfg(loom)]
+pub const THREAD_ROLE_CAPACITY: u32 = 1;
+pub const UNATTRIBUTED_RECORDS: u32 = THREAD_ROLE_CAPACITY * UNATTRIBUTED_SHARDS;
+pub const REGION_LABELS: [&str; 2] = ["funding", "observation"];
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordRegion {
+    Funding,
+    Observation,
+}
+impl RecordRegion {
+    pub const ALL: [Self; 2] = [Self::Funding, Self::Observation];
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegionSnapshot {
+    pub capacity: u32,
+    pub active: u64,
+    pub residual_retained: u64,
+    pub pending_reclaim: u64,
+    pub residual_tagged_bytes: i128,
+    pub residual_r1_small_bytes: i128,
+}
+#[derive(Debug)]
+struct Region {
+    start: u32,
+    end: u32,
+    free: Mutex<Vec<u32>>,
+    published: AtomicU32,
+}
+impl Region {
+    #[cfg(not(loom))]
+    const fn new(start: u32, end: u32) -> Self {
+        Self {
+            start,
+            end,
+            free: Mutex::new(Vec::new()),
+            published: AtomicU32::new(start),
+        }
+    }
+    #[cfg(loom)]
+    fn new(start: u32, end: u32) -> Self {
+        Self {
+            start,
+            end,
+            free: Mutex::new(Vec::new()),
+            published: AtomicU32::new(start),
+        }
+    }
+}
+pub const fn funding_record_capacity(capacity: u32) -> u32 {
+    (capacity - UNATTRIBUTED_RECORDS) / 2
+}
+#[cfg(not(loom))]
 pub const SEGMENT_RECORDS: usize = 4096;
 // Models use the identical protocol with a smaller backing allocation.
 #[cfg(loom)]
@@ -37,7 +94,7 @@ struct Segment {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoverageError {
-    RecordStoreExhausted,
+    RecordStoreExhausted { region: RecordRegion },
     RecordStorageUnavailable,
     AccountClosed,
     ScopeRefused,
@@ -46,10 +103,9 @@ pub enum CoverageError {
 #[derive(Debug)]
 pub struct RecordStore {
     segments: [AtomicPtr<Segment>; SEGMENTS],
-    unattributed: [LaneRecord; UNATTRIBUTED_SHARDS as usize],
-    free: Mutex<Vec<u32>>,
+    unattributed: [LaneRecord; UNATTRIBUTED_RECORDS as usize],
+    regions: [Region; 2],
     draining: Mutex<VecDeque<RecordRef>>,
-    high_water: AtomicU32,
     capacity: u32,
     pub faults: FaultCounters,
 }
@@ -58,9 +114,17 @@ macro_rules! store_initializer {
         Self {
             segments: $segments,
             unattributed: $unattributed,
-            free: Mutex::new(Vec::new()),
+            regions: [
+                Region::new(
+                    UNATTRIBUTED_RECORDS,
+                    UNATTRIBUTED_RECORDS + funding_record_capacity($capacity),
+                ),
+                Region::new(
+                    UNATTRIBUTED_RECORDS + funding_record_capacity($capacity),
+                    $capacity,
+                ),
+            ],
             draining: Mutex::new(VecDeque::new()),
-            high_water: AtomicU32::new(UNATTRIBUTED_SHARDS),
             capacity: $capacity,
             faults: FaultCounters::new(),
         }
@@ -69,16 +133,18 @@ macro_rules! store_initializer {
 impl RecordStore {
     #[cfg(not(loom))]
     pub const fn new(capacity: u32) -> Self {
-        assert!(capacity >= UNATTRIBUTED_SHARDS && capacity <= MAX_RECORDS);
+        assert!(capacity >= UNATTRIBUTED_RECORDS && capacity <= MAX_RECORDS);
         store_initializer!(
             [const { AtomicPtr::new(ptr::null_mut()) }; SEGMENTS],
-            [const { LaneRecord::unattributed() }; UNATTRIBUTED_SHARDS as usize],
+            [const { LaneRecord::unattributed() }; UNATTRIBUTED_RECORDS as usize],
             capacity
         )
     }
     #[cfg(loom)]
     pub fn new(capacity: u32) -> Self {
-        assert!(capacity >= UNATTRIBUTED_SHARDS && capacity as usize <= SEGMENTS * SEGMENT_RECORDS);
+        assert!(
+            capacity >= UNATTRIBUTED_RECORDS && capacity as usize <= SEGMENTS * SEGMENT_RECORDS
+        );
         store_initializer!(
             std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
             std::array::from_fn(|_| LaneRecord::unattributed()),
@@ -86,10 +152,14 @@ impl RecordStore {
         )
     }
     fn record_at(&self, index: u32) -> Option<&LaneRecord> {
-        if index < UNATTRIBUTED_SHARDS {
+        if index < UNATTRIBUTED_RECORDS {
             return Some(&self.unattributed[index as usize]);
         }
-        if index >= self.high_water.load(Ordering::Acquire) || index >= self.capacity {
+        if index >= self.capacity {
+            return None;
+        }
+        let region = &self.regions[self.region_for(index)?.index()];
+        if index >= region.published.load(Ordering::Acquire) {
             return None;
         }
         let segment_index = index as usize / SEGMENT_RECORDS;
@@ -120,9 +190,10 @@ impl RecordStore {
         }
         result
     }
-    pub fn unattributed_ref(&self, shard: usize) -> RecordRef {
+    pub fn unattributed_ref(&self, role: usize, shard: usize) -> RecordRef {
         RecordRef {
-            index: (shard & (UNATTRIBUTED_SHARDS as usize - 1)) as u32,
+            index: (role as u32) * UNATTRIBUTED_SHARDS
+                + (shard & (UNATTRIBUTED_SHARDS as usize - 1)) as u32,
             generation: 0,
         }
     }
@@ -148,29 +219,54 @@ impl RecordStore {
                     .write(LaneRecord::vacant())
             };
         }
-        // The free-list lock serializes segment creation, so no competing
-        // publication can replace this pointer.
-        slot.store(segment, Ordering::Release);
+        // Independent region locks can race at a boundary segment. Publish only
+        // once; every record is subsequently read through the winning slot.
+        if slot
+            .compare_exchange(
+                ptr::null_mut(),
+                segment,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            // SAFETY: the losing segment was never published or used. Its
+            // initialized records and exact System Layout are owned solely here.
+            unsafe {
+                ptr::drop_in_place(segment);
+                System.dealloc(segment.cast(), layout);
+            }
+        }
         Ok(())
     }
     pub(crate) fn acquire_reference(
         &self,
         origin: u64,
         class: ResponsibilityClass,
+        region: RecordRegion,
     ) -> Result<RecordRef, CoverageError> {
         self.reclaim(16);
-        let mut free = self.free.lock().unwrap();
-        let index = if let Some(index) = free.pop() {
-            index
-        } else {
-            let index = self.high_water.load(Ordering::Relaxed);
-            if index >= self.capacity {
-                self.faults.exhausted();
-                return Err(CoverageError::RecordStoreExhausted);
+        let pool = &self.regions[region.index()];
+        let index = loop {
+            let mut free = pool.free.lock().unwrap();
+            if let Some(index) = free.pop() {
+                break index;
             }
-            self.ensure_segment(index)?;
-            self.high_water.store(index + 1, Ordering::Release);
-            index
+            let index = pool.published.load(Ordering::Relaxed);
+            if index >= pool.end {
+                self.faults.exhausted();
+                return Err(CoverageError::RecordStoreExhausted { region });
+            }
+            if self.segments[index as usize / SEGMENT_RECORDS]
+                .load(Ordering::Acquire)
+                .is_null()
+            {
+                drop(free);
+                self.ensure_segment(index)?;
+                continue;
+            }
+            pool.published.store(index + 1, Ordering::Release);
+            break index;
         };
         let record = self.record_at(index).expect("published record segment");
         record.reset_for_owner(origin, class);
@@ -241,7 +337,14 @@ impl RecordStore {
         record.flags.store(0, Ordering::Release);
         record.origin.store(0, Ordering::Release);
         record.generation.store(generation + 1, Ordering::Release);
-        self.free.lock().unwrap().push(reference.index);
+        self.regions[self
+            .region_for(reference.index)
+            .expect("dynamic record region")
+            .index()]
+        .free
+        .lock()
+        .unwrap()
+        .push(reference.index);
         ReclaimResult::Reclaimed
     }
     /// Bounded queue visits. Hooks never call this function or acquire its locks.
@@ -278,25 +381,89 @@ impl RecordStore {
         }
         Some(snapshot)
     }
+    /// Number of positions ever published, including the immortal prefix.
+    /// Region ranges may have a hole; this is not a maximum record index.
     pub fn high_water(&self) -> u32 {
-        self.high_water.load(Ordering::Acquire)
+        UNATTRIBUTED_RECORDS
+            + self
+                .regions
+                .iter()
+                .map(|r| r.published.load(Ordering::Acquire) - r.start)
+                .sum::<u32>()
+    }
+    pub fn region_bounds(&self, region: RecordRegion) -> (u32, u32) {
+        let r = &self.regions[region.index()];
+        (r.start, r.end)
+    }
+    pub fn region_for(&self, index: u32) -> Option<RecordRegion> {
+        RecordRegion::ALL.into_iter().find(|r| {
+            let r = &self.regions[r.index()];
+            index >= r.start && index < r.end
+        })
+    }
+    pub fn published_segment_count(&self) -> usize {
+        self.segments
+            .iter()
+            .filter(|s| !s.load(Ordering::Acquire).is_null())
+            .count()
+    }
+    /// Independent samples. Stopped/sealed records with a live owner or facts
+    /// are retained, including zero-byte strong handles and R1-only facts.
+    /// Draining records with no count/pin are waiting for control-plane reclaim.
+    pub fn region_snapshot(&self, region: RecordRegion) -> RegionSnapshot {
+        let r = &self.regions[region.index()];
+        let mut result = RegionSnapshot {
+            capacity: r.end - r.start,
+            ..RegionSnapshot::default()
+        };
+        for index in r.start..r.published.load(Ordering::Acquire) {
+            let Some(record) = self.record_at(index) else {
+                continue;
+            };
+            let reference = RecordRef {
+                index,
+                generation: record.generation.load(Ordering::Acquire),
+            };
+            let Some(snapshot) = self.snapshot_ref(reference) else {
+                continue;
+            };
+            if snapshot.is_draining() && snapshot.outstanding == 0 && snapshot.slot_pins == 0 {
+                result.pending_reclaim += 1;
+            } else if snapshot.is_draining()
+                || snapshot.flags & PRODUCTION_MASK != 0
+                || snapshot.flags & CLASS_MASK
+                    == (ResponsibilityClass::Residual as u32) << CLASS_SHIFT
+            {
+                result.residual_retained += 1;
+                result.residual_tagged_bytes += i128::from(snapshot.tagged_bytes);
+                result.residual_r1_small_bytes += i128::from(snapshot.r1_small_bytes);
+            } else {
+                result.active += 1;
+            }
+        }
+        result
     }
     /// Samples atomic fields over the occupied prefix; no coherent heap snapshot
     /// is implied. Immortal unattributed records are included exactly once.
     pub fn records(&self) -> impl Iterator<Item = (RecordRef, &LaneRecord)> {
-        (0..self.high_water()).filter_map(|index| {
-            let record = self.record_at(index)?;
-            if record.lifetime().claimed() {
-                return None;
-            }
-            Some((
-                RecordRef {
-                    index,
-                    generation: record.generation.load(Ordering::Acquire),
-                },
-                record,
-            ))
-        })
+        let funding = &self.regions[RecordRegion::Funding.index()];
+        let observation = &self.regions[RecordRegion::Observation.index()];
+        (0..UNATTRIBUTED_RECORDS)
+            .chain(funding.start..funding.published.load(Ordering::Acquire))
+            .chain(observation.start..observation.published.load(Ordering::Acquire))
+            .filter_map(|index| {
+                let record = self.record_at(index)?;
+                if record.lifetime().claimed() {
+                    return None;
+                }
+                Some((
+                    RecordRef {
+                        index,
+                        generation: record.generation.load(Ordering::Acquire),
+                    },
+                    record,
+                ))
+            })
     }
 }
 enum ReclaimResult {
@@ -356,8 +523,9 @@ impl StoreHandle {
         &self,
         origin: u64,
         class: ResponsibilityClass,
+        region: RecordRegion,
     ) -> Result<RecordOwner, CoverageError> {
-        let reference = self.store().acquire_reference(origin, class)?;
+        let reference = self.store().acquire_reference(origin, class, region)?;
         Ok(RecordOwner {
             store: self.clone(),
             reference,
@@ -372,9 +540,15 @@ mod exact_reclaim_tests {
 
     #[test]
     fn exact_reclaim_requires_owner_drop_and_final_real_count() {
-        let handle = StoreHandle::owned(32);
+        let handle = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 32);
         let store = handle.store();
-        let owner = handle.acquire(1, ResponsibilityClass::Query).unwrap();
+        let owner = handle
+            .acquire(
+                1,
+                ResponsibilityClass::Query,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
         let reference = owner.reference();
         assert!(!store.reclaim_exact(reference));
         // SAFETY: owner protects one simulated successful allocation fact.
@@ -393,14 +567,26 @@ mod exact_reclaim_tests {
 
     #[test]
     fn exact_reclaim_accepts_a_completed_collector_reclaim() {
-        let handle = StoreHandle::owned(32);
+        let handle = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 32);
         let store = handle.store();
-        let owner = handle.acquire(1, ResponsibilityClass::Query).unwrap();
+        let owner = handle
+            .acquire(
+                1,
+                ResponsibilityClass::Query,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
         let reference = owner.reference();
         drop(owner);
         assert_eq!(store.reclaim(1), 1);
         assert!(store.reclaim_exact(reference));
-        let replacement = handle.acquire(2, ResponsibilityClass::Service).unwrap();
+        let replacement = handle
+            .acquire(
+                2,
+                ResponsibilityClass::Service,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
         assert_eq!(replacement.reference().index, reference.index);
         assert!(store.reclaim_exact(reference));
         assert_eq!(replacement.record().origin.load(Ordering::Acquire), 2);
@@ -410,23 +596,41 @@ mod exact_reclaim_tests {
 
     #[test]
     fn stale_queue_visit_never_reclaims_a_reused_generation() {
-        let handle = StoreHandle::owned(64);
+        let handle = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 96);
         let store = handle.store();
         let mut blockers = Vec::new();
         for origin in 1..=16 {
-            let owner = handle.acquire(origin, ResponsibilityClass::Query).unwrap();
+            let owner = handle
+                .acquire(
+                    origin,
+                    ResponsibilityClass::Query,
+                    crate::lane::RecordRegion::Observation,
+                )
+                .unwrap();
             let reference = owner.reference();
             // SAFETY: owner protects one simulated outstanding allocation.
             unsafe { SlotCore::direct(store, reference, 1, 0, 1) };
             blockers.push(reference);
             drop(owner);
         }
-        let owner = handle.acquire(17, ResponsibilityClass::Query).unwrap();
+        let owner = handle
+            .acquire(
+                17,
+                ResponsibilityClass::Query,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
         let reference = owner.reference();
         drop(owner);
         assert!(store.reclaim_exact(reference));
         // acquire's sixteen bounded visits cannot reach the stale tail entry.
-        let replacement = handle.acquire(18, ResponsibilityClass::Service).unwrap();
+        let replacement = handle
+            .acquire(
+                18,
+                ResponsibilityClass::Service,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
         let replacement_ref = replacement.reference();
         assert_eq!(replacement_ref.index, reference.index);
         assert!(replacement_ref.generation > reference.generation);
@@ -440,5 +644,84 @@ mod exact_reclaim_tests {
         }
         assert_eq!(store.reclaim(32), 16);
         assert!(store.draining.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod region_tests {
+    use super::*;
+    #[test]
+    fn observation_exhaustion_never_borrows_funding_and_reclaim_preserves_region() {
+        let store = StoreHandle::owned(UNATTRIBUTED_RECORDS + 4);
+        let a = store
+            .acquire(1, ResponsibilityClass::Query, RecordRegion::Observation)
+            .unwrap();
+        let b = store
+            .acquire(2, ResponsibilityClass::Query, RecordRegion::Observation)
+            .unwrap();
+        assert_eq!(
+            store
+                .acquire(3, ResponsibilityClass::Query, RecordRegion::Observation)
+                .unwrap_err(),
+            CoverageError::RecordStoreExhausted {
+                region: RecordRegion::Observation
+            }
+        );
+        let f = store
+            .acquire(4, ResponsibilityClass::Query, RecordRegion::Funding)
+            .unwrap();
+        assert_eq!(
+            store.store().region_snapshot(RecordRegion::Funding).active,
+            1
+        );
+        let old = a.reference();
+        drop(a);
+        assert_eq!(store.store().reclaim(16), 1);
+        let c = store
+            .acquire(5, ResponsibilityClass::Service, RecordRegion::Observation)
+            .unwrap();
+        assert_eq!(c.reference().index, old.index);
+        assert_eq!(c.reference().generation, old.generation + 1);
+        assert_eq!(
+            store.store().region_for(c.reference().index),
+            Some(RecordRegion::Observation)
+        );
+        drop((b, c, f));
+        assert_eq!(store.store().reclaim(16), 3);
+    }
+    #[test]
+    fn boundary_segment_is_shared_without_replacing_issued_record_addresses() {
+        let store = StoreHandle::owned(UNATTRIBUTED_RECORDS + 4);
+        let f = store
+            .acquire(1, ResponsibilityClass::Query, RecordRegion::Funding)
+            .unwrap();
+        let address = std::ptr::from_ref(f.record());
+        let o = store
+            .acquire(2, ResponsibilityClass::Query, RecordRegion::Observation)
+            .unwrap();
+        assert_eq!(store.store().published_segment_count(), 1);
+        assert_eq!(
+            address,
+            std::ptr::from_ref(store.store().resolve(f.reference()).unwrap())
+        );
+        assert_eq!(
+            store.store().region_for(o.reference().index),
+            Some(RecordRegion::Observation)
+        );
+    }
+    #[test]
+    fn active_owner_configuration_fits_only_the_funding_region() {
+        let capacity = funding_record_capacity(MAX_RECORDS);
+        let mut config = crate::AuthorityConfig::new(1024, 1024, 0);
+        config.max_active_owners = capacity;
+        assert!(config.validate().is_ok());
+        config.max_active_owners = capacity + 1;
+        assert_eq!(
+            config.validate(),
+            Err(crate::ConfigError::OwnersExceedFundingRecords {
+                owners: capacity + 1,
+                funding_records: capacity
+            })
+        );
     }
 }

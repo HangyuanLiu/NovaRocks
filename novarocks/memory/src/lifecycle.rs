@@ -77,7 +77,7 @@ impl TeardownEvidence<'_> {
     }
 }
 impl AccountHandle {
-    // Design: ADR-0166 (docs/adr/ADR-0166-hierarchical-funding-and-stable-allocation-origins.md)
+    // Design: ADR-0197 (docs/adr/ADR-0197-observation-owner-shards-and-coverage-shadow.md)
     pub fn retire(
         &self,
         evidence: &TeardownEvidence<'_>,
@@ -88,8 +88,8 @@ impl AccountHandle {
         if self.0.control.load(crate::sync::Ordering::Acquire) != 0 {
             return Err(TeardownError::ProtectedControlOwner);
         }
-        let members = self.close_members();
         evidence.validate()?;
+        let members = self.close_members();
         // Closed membership cannot admit a new producer. Preflight every
         // captured issuing lane before any responsibility or funding handoff.
         for lane in &members.lanes {

@@ -40,6 +40,7 @@ novarocks-cluster-harness.workspace = true
 novarocks-connector-iceberg.workspace = true
 novarocks-fs.workspace = true
 novarocks-functions.workspace = true
+novarocks-memory.workspace = true
 novarocks-physical-plan.workspace = true
 novarocks-plan-codec.workspace = true
 novarocks-type-contract.workspace = true

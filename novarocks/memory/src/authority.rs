@@ -68,6 +68,18 @@ impl AuthorityConfig {
                 registry: MetadataRegistryLabel::Owners,
             });
         }
+        let store_capacity = if cfg!(loom) {
+            256
+        } else {
+            crate::lane::MAX_RECORDS
+        };
+        let funding_capacity = crate::lane::store::funding_record_capacity(store_capacity);
+        if self.max_active_owners > funding_capacity {
+            return Err(ConfigError::OwnersExceedFundingRecords {
+                owners: self.max_active_owners,
+                funding_records: funding_capacity,
+            });
+        }
         if match self.capacity_bytes.checked_add(self.headroom_budget_bytes) {
             Some(total) => total > self.process_bound_bytes,
             None => true,

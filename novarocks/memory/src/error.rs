@@ -80,6 +80,10 @@ impl Error for CapacityError {}
 /// An invalid authority configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
+    OwnersExceedFundingRecords {
+        owners: u32,
+        funding_records: u32,
+    },
     CoreMetadataExceedsCapacity {
         metadata_bytes: u64,
         capacity_bytes: u64,
@@ -109,6 +113,13 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::OwnersExceedFundingRecords {
+                owners,
+                funding_records,
+            } => write!(
+                f,
+                "invalid memory authority configuration: {owners} active owners exceeds {funding_records} funding records"
+            ),
             Self::CoreMetadataExceedsCapacity {
                 metadata_bytes,
                 capacity_bytes,

@@ -14,7 +14,7 @@ F = max(A - L - O, 0)
 C = A + E = L + O + F
 ```
 
-正常 funded 步只结算本域事实。量化 refill、新承诺、真实责任归还和债务变更才进入账户路径。资金 `ScopeLease` 是当前线程的独占 stock writer，其 stock 来自同一域，stock miss 不等于域越界。lease 必须在 await 或迁移线程前退出；free 可以来自其他线程。allocator hook 只发布成功分配或真实释放事实，处置在安全边界进行。独立的观测 lane 与 `LaneHandle::run` 不取得资金资格，也不消费 stock；资金结算读取同一份事实，不能再发布一份。
+正常 funded 步只结算本域事实。量化 refill、新承诺、真实责任归还和债务变更才进入账户路径。资金 `ScopeLease` 是当前线程的独占 stock writer，其 stock 来自同一域，stock miss 不等于域越界。lease 必须在 await 或迁移线程前退出；free 可以来自其他线程。allocator hook 只发布成功分配或真实释放事实，处置在安全边界进行。独立的观测 owner 句柄与 `LaneShards::run` 不取得资金资格，也不消费 stock；资金结算读取同一份事实，不能再发布一份。
 
 `ExplicitGrant` 为可知的大分配提供操作前授权，成功分配不得超过剩余额度。`ExternalBound` 表示尚未能表达为 L 的责任上界，转换成功分配时同步扣 O、加 L；它不建立第二份承诺。`HolderPin` 保活稳定记录并提供曝光样本，不因为增加 holder 或 clone 而再次计 payload。
 
@@ -22,11 +22,11 @@ C = A + E = L + O + F
 
 生产来源以 8 B `RecordRef`（u32 下标 + u32 代次）标识；`FactToken` 也只有这份身份，不含 query/账户指针。稳定 `LaneRecord` 为 64 B，事实、来源、生产状态与当前责任分类分开。来源不变，责任可以在控制面交接。generation 只验证身份；访问必须由强 owner、真实未释放 allocation count 或唯一槽 pin 保活。复制 token 不增加义务，最终释放只做一次，最后减量之后不得再访问。手工 `FactToken` 发布不得与同一物理块的 wrapper/R1 helper 重复发布。
 
-`stop_producing` 封口并结清闲置授权，不改责任分类。仍执行中的 Work 继续承担 Query；子 Task 退出交给同一仍执行的 Work 时也继续属于 Query。真正 Work teardown 才把责任交给同分支存活祖先并转为 Residual。teardown 要求任务退出、算子销毁、自有 I/O 实际退出，且没有活动 scope 或未交接外部责任；timeout、Task terminal 或一次 L=0 不能替代证据。
+`stop_producing` 封口并结清闲置授权，不改责任分类。仍执行中的 Work 继续承担 Query；子 Task 退出交给同一仍执行的 Work 时也继续属于 Query。真正 Work teardown 才把责任交给同分支存活祖先并转为 Residual。teardown 要求任务退出、算子销毁、自有 I/O 实际退出，且没有活动 scope 或未交接外部责任；timeout、Task terminal 或一次 L=0 不能替代证据。`retire` 先拒绝根账户/控制 owner，再校验证据；证据不成立时不关闭、不封口、不交接。证据成立后才关闭成员并继续预检活动 scope/外部责任。
 
 U=ΣC_query，只统计当前执行责任；`residual_query_committed` 只诊断来源。handoff 的重分类部分保持共同祖先/root C 与不可逐出责任 N，U 可以下降。归还闲置授权另行降低 C；真实 free 才降低残留 payload。换 sponsor 仍须在目标作用域复制，本机制不授予任意零复制迁账。
 
-直接成员节点在账户事务外预分配，关闭/退役访问目标子树的成员，收集期间持祖先读 gate。`max_active_owners` 限制资金活动域，历史 residual 不占活动名额。记录存放在 process-lifetime、System-backed 稳定 segments；生产容量 2^18，16 个 immortal unattributed 分片，代次耗尽隔离不回绕。hook 不销毁记录，有预算控制面维护在 draining、count/pin/强句柄责任归零后 exact reclaim。metadata 责任仅在 exact reclaim 完成后退回；retained segment backing 另报。S1 纯观测控制 metadata 是诊断估计，不加入资金 C，也不代表物理驻留。
+直接成员节点在账户事务外预分配，关闭/退役访问目标子树的成员，收集期间持祖先读 gate。`max_active_owners` 限制资金活动域，历史 residual 不占活动名额。记录存放在 process-lifetime、System-backed 稳定 segments；生产容量 2^18；256 条 immortal unattributed 记录由 16 个角色（含 unknown）×16 个栈分片组成，动态位置在资金区与观测区各 130944 条，不互借。`max_active_owners` 不得超过资金区容量；历史残留仍可保留资金区位置，活动数限制不是存储上界。两区各有空闲表并共用 segment 数组；初始化在区锁外，CAS 唯一发布，败者释放未发布 backing，已发出的地址不替换。代次耗尽隔离不回绕。hook 不销毁记录，有预算控制面维护在 draining、count/pin/强句柄责任归零后 exact reclaim。metadata 责任仅在 exact reclaim 完成后退回；retained segment backing 另报。S1 纯观测控制 metadata 是诊断估计，不加入资金 C，也不代表物理驻留。
 
 ## 控制容量与结清
 
@@ -44,13 +44,19 @@ Server 的 `GLOBAL` 已安装 `AttributingAllocator<Jemalloc>`；`--no-default-f
 
 TLS 是无需析构的 const `Cell`，线程只有一个 Q=1 MiB 槽。切槽、同步作用域退出、没有 outer ambient 的显式 helper 退出及达到 Q 时直接发布或 flush。hook 返回后余额 <Q；在途的一笔操作没有先验大小上界。`Q × sampled pins` 排除了在途项，又是独立采样，不能当作瞬时物理峰值上界或结清证明。字节/序号先发布，count/unpin 合成最后一次状态更新。
 
-`LaneHandle::run` 只暴露同步闭包，私有同线程 guard 在正常返回及 unwind flush 并恢复 outer；同 lane 可嵌套/并发观察，资金 writer 仍独占。`AttributedFuture` 持有同一 lane，在每次 poll 安装，Pending/Ready/unwind 都恢复；Drop 没有未退出的 poll 绑定，spawn 不隐式继承。不能用跨 await 的公开 TLS guard。
+`AccountHandle::create_lane_shards` 总返回 owner 句柄：覆盖态带 16 条 lane，未覆盖态带原因。所有记录、成员节点与 Arc 外壳在账户 gate 外准备，在同一段路径共享 gate 内检查关闭并整组发布；发布段不分配。关闭/退役只看到整组或空组。观测不足经有预算追赶仍不足时报告缺口，不挤占资金区。真实分配（含 R1 small）、slot pin 或强句柄都能保留记录；不能从零 tagged 字节推断可回收。
 
-`ExplicitOwner` 持有 R1 容器 lane。成功 small 分配后补一份事实，tagged 只由 wrapper 发布；grow/grow_zeroed/shrink 底层不能递归调用同一 helper。失败不变，跨阈值的强 owner 保活整个两段发布，allocator-api 零尺寸没有物理块、不发布。对同一份 L 另取 A 是授权，不是第二份分配。
+`LaneShards::run` 只暴露同步闭包；线程首次使用顺序取号模 16，之后固定选片，TLS 不可用才按栈选片。私有同线程 guard 在正常返回及 unwind flush 并恢复 outer。未覆盖或所选分片封口时，owner scope 遮蔽外层 ambient，带来源分配落到本线程角色的未归属；合法 explicit 仍优先，遮蔽本身不进槽、不解析、不 pin。资金域 `LaneHandle::run` 保留原有失败回落语义，应用须把它组合在同一 owner 的外层作用域内。资金 writer 仍独占。
 
-进程 small/tagged 计数、三类 tagged/R1 small、unattributed、signed 盲区和对账、metadata 估计、批量估计分列。RSS/cgroup/jemalloc 与请求/责任事实不能相加。S1 尚未把生产 query/R1 调用面接线，零 query lane 指标不能证明查询已被硬治理；driver 安全点与 query 强制属于后续工作。
+`AttributedFuture::new(owner, make)` 在 owner 作用域调用构造闭包；每次 poll 与内部 future 就地 Drop 也安装 owner。Pending/Ready/unwind 后恢复外层，已 pin 的 future 不移动、不重复析构；取消和从未 poll 的 Drop 同样覆盖。spawn 不隐式继承。不能用跨 await 的公开 TLS guard。
 
-完整合同见 [ADR-0167](../../adr/ADR-0167-size-banded-allocation-attribution.md)，验证入口见 [memory tests](../../../novarocks/memory/tests/README.md)。当前阶段仅维护功能与数据正确性，归属/资金测量载体已退出；历史 Linux 成本结论仍只能按其原输入和版本解释，不能补为当前通过。Loom/Miri 与 unsafe 地址、别名和生命周期要求保留；本地 smoke、模型完成及文档检查不代替 Miri 地址验证。
+`LaneShards::explicit_owner` 产生 R1 容器的显式 owner。覆盖态保留当前线程选择的 lane；未覆盖态遮蔽显式层，大块落到按角色的未归属且不发布 R1 small 事实。成功 small 分配后补一份事实，tagged 只由 wrapper 发布；grow/grow_zeroed/shrink 底层不能递归调用同一 helper。失败不变，跨阈值的强 owner 保活整个两段发布，allocator-api 零尺寸没有物理块、不发布。对同一份 L 另取 A 是授权，不是第二份分配。
+
+角色名由应用在控制面登记静态字符串并显式冻结，unknown 编号 0，总容量 16；空名、重名、满表和冻结后登记均拒绝。线程启动时写入数字角色，hook 在选择 explicit/ambient 的同一次 TLS 读取中取得角色，不访问角色表。机制交付不代表生产角色已登记或线程已标记。
+
+进程 small/tagged 计数、三类 tagged/R1 small、按角色的 unattributed、signed 盲区和对账、metadata 估计、批量估计分列。按资金/观测区另报容量、active、residual retained、pending reclaim，残留保留记录上的 tagged 与 R1 small 字节分别展示。RSS/cgroup/jemalloc 与请求/责任事实不能相加。S1 尚未把生产 query/R1 调用面接线，零 query lane 指标不能证明查询已被硬治理；driver 安全点与 query 强制属于后续工作。
+
+完整合同见 [ADR-0167](../../adr/ADR-0167-size-banded-allocation-attribution.md) 与其部分替代 [ADR-0197](../../adr/ADR-0197-observation-owner-shards-and-coverage-shadow.md)，验证入口见 [memory tests](../../../novarocks/memory/tests/README.md)。当前阶段仅维护功能与数据正确性，归属/资金测量载体已退出；历史 Linux 成本结论仍只能按其原输入和版本解释，不能补为当前通过。Loom/Miri 与 unsafe 地址、别名和生命周期要求保留；本地 smoke、模型完成及文档检查不代替 Miri 地址验证。分片的争用收益尚未测量，线程选片正确不证明性能收益。
 
 ## 执行结构的独立持有
 

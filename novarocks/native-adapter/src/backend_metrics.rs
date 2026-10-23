@@ -22,6 +22,7 @@ use crate::management_http::RoleMetricsRenderer;
 use novarocks_memory::attribution::readout::{
     AttributionSnapshot, CLASS_LABELS, PRODUCTION_LABELS,
 };
+use novarocks_memory::lane::REGION_LABELS;
 use novarocks_memory::observe::PhysicalMemoryReading;
 use novarocks_worker::query_context::NativeQueryExecutionResourceSnapshot;
 use once_cell::sync::Lazy;
@@ -93,6 +94,9 @@ struct AttributionGauges {
     blind_spot: IntGaugeVec,
     reconciliation: IntGaugeVec,
     capacity: IntGaugeVec,
+    region_capacity: IntGaugeVec,
+    region_records: IntGaugeVec,
+    region_residual: IntGaugeVec,
     high_water: IntGaugeVec,
     draining: IntGaugeVec,
     segment_requested: IntGaugeVec,
@@ -165,8 +169,8 @@ impl AttributionGauges {
             unattributed: gauge(
                 registry,
                 "novarocks_backend_memory_unattributed_bytes",
-                "Signed tagged bytes in immortal unattributed source records.",
-                &[],
+                "Signed tagged bytes in immortal unattributed source records by registered thread role.",
+                &["role"],
             )?,
             blind_spot: gauge(
                 registry,
@@ -186,10 +190,28 @@ impl AttributionGauges {
                 "Maximum record-store positions, including immortal unattributed records.",
                 &[],
             )?,
+            region_capacity: gauge(
+                registry,
+                "novarocks_backend_memory_lane_record_region_capacity",
+                "Maximum dynamic record-store positions in each isolated region.",
+                &["region"],
+            )?,
+            region_records: gauge(
+                registry,
+                "novarocks_backend_memory_lane_record_region",
+                "Independent record occupancy samples by region and retention state; not a coherent heap snapshot.",
+                &["region", "state"],
+            )?,
+            region_residual: gauge(
+                registry,
+                "novarocks_backend_memory_lane_record_region_residual_bytes",
+                "Signed tagged and R1 small byte samples on retained residual records by isolated region; strong handles can retain records with zero bytes.",
+                &["band", "region"],
+            )?,
             high_water: gauge(
                 registry,
                 "novarocks_backend_memory_lane_record_high_water",
-                "Sampled occupied-prefix bound for record-store observation.",
+                "Sampled total published positions across the immortal prefix and both dynamic regions.",
                 &[],
             )?,
             draining: gauge(
@@ -201,7 +223,7 @@ impl AttributionGauges {
             segment_requested: gauge(
                 registry,
                 "novarocks_backend_memory_lane_record_segment_requested_bytes",
-                "Requested record segment backing represented by sampled high-water; excludes inline/control storage and is not resident memory.",
+                "Requested backing of published record segments; excludes inline/control storage and is not resident memory.",
                 &[],
             )?,
             metadata: gauge(
@@ -316,7 +338,38 @@ impl AttributionGauges {
         ] {
             absolute(&self.faults, &[kind], count);
         }
-        scalar(&self.unattributed, sample.unattributed_tagged_bytes);
+        // This registry's scrape lock also covers collection. Rebuild the
+        // bounded role labels so a later sample cannot retain expired roles.
+        self.unattributed.reset();
+        for (role, bytes) in sample.thread_roles.iter().zip(sample.unattributed_by_role) {
+            if let Some(role) = role {
+                self.unattributed
+                    .with_label_values(&[role])
+                    .set(signed_gauge_value(bytes));
+            }
+        }
+        for (region, facts) in REGION_LABELS.iter().zip(sample.regions) {
+            self.region_capacity
+                .with_label_values(&[region])
+                .set(i64::from(facts.capacity));
+            for (state, count) in [
+                ("active", facts.active),
+                ("residual_retained", facts.residual_retained),
+                ("pending_reclaim", facts.pending_reclaim),
+            ] {
+                self.region_records
+                    .with_label_values(&[region, state])
+                    .set(gauge_value(count));
+            }
+            for (band, bytes) in [
+                ("tagged", facts.residual_tagged_bytes),
+                ("r1_small", facts.residual_r1_small_bytes),
+            ] {
+                self.region_residual
+                    .with_label_values(&[band, region])
+                    .set(signed_gauge_value(bytes));
+            }
+        }
         scalar(&self.blind_spot, sample.ledger_blind_spot_bytes);
         scalar(&self.reconciliation, sample.tagged_reconciliation_bytes);
         scalar(&self.capacity, i128::from(sample.record_capacity));
@@ -1943,6 +1996,7 @@ mod tests {
 
     fn attribution_fixture() -> AttributionSnapshot {
         use novarocks_memory::attribution::readout::ClassFacts;
+        use novarocks_memory::lane::{MAX_RECORDS, RegionSnapshot, UNATTRIBUTED_RECORDS};
         let mut sample = AttributionSnapshot::default();
         sample.process.small.live_bytes = 80;
         sample.process.small.allocated_total_bytes = 100;
@@ -1974,11 +2028,38 @@ mod tests {
             },
         ];
         sample.unattributed_tagged_bytes = 56;
+        sample.thread_roles[1] = Some("driver");
+        sample.unattributed_by_role[0] = 16;
+        sample.unattributed_by_role[1] = 40;
+        let region_capacity = (MAX_RECORDS - UNATTRIBUTED_RECORDS) / 2;
+        sample.regions = [
+            RegionSnapshot {
+                capacity: region_capacity,
+                active: 1,
+                residual_retained: 2,
+                pending_reclaim: 3,
+                residual_tagged_bytes: 1032,
+                residual_r1_small_bytes: 7,
+            },
+            RegionSnapshot {
+                capacity: region_capacity,
+                active: 4,
+                residual_retained: 5,
+                pending_reclaim: 6,
+                residual_tagged_bytes: 2056,
+                residual_r1_small_bytes: 11,
+            },
+        ];
         sample.ledger_blind_spot_bytes = 40;
         sample.tagged_reconciliation_bytes = 0;
-        sample.records = [[1, 2, 3], [4, 5, 6], [7, 8, 9], [16, 0, 0]];
-        sample.record_capacity = 262144;
-        sample.record_high_water = 22;
+        sample.records = [
+            [1, 2, 3],
+            [4, 5, 6],
+            [7, 8, 9],
+            [u64::from(UNATTRIBUTED_RECORDS), 0, 0],
+        ];
+        sample.record_capacity = MAX_RECORDS;
+        sample.record_high_water = UNATTRIBUTED_RECORDS + 45;
         sample.draining_records = 3;
         sample.record_segment_requested_bytes = 262144;
         sample.observation_metadata_bytes = Some(2048);
@@ -2012,6 +2093,7 @@ mod tests {
 
     #[test]
     fn attribution_families_export_all_bounded_dimensions_in_text_and_json() {
+        use novarocks_memory::lane::{MAX_RECORDS, UNATTRIBUTED_RECORDS};
         let backend = attribution_backend(attribution_fixture);
         let rendered = render_metrics(&backend).unwrap();
         let json: serde_json::Value =
@@ -2049,7 +2131,68 @@ mod tests {
                 vec![("band", "tagged"), ("class", "service")],
                 256,
             ),
-            ("memory_unattributed_bytes", vec![], 56),
+            ("memory_unattributed_bytes", vec![("role", "unknown")], 16),
+            ("memory_unattributed_bytes", vec![("role", "driver")], 40),
+            (
+                "memory_lane_record_region_capacity",
+                vec![("region", "funding")],
+                i64::from((MAX_RECORDS - UNATTRIBUTED_RECORDS) / 2),
+            ),
+            (
+                "memory_lane_record_region_capacity",
+                vec![("region", "observation")],
+                i64::from((MAX_RECORDS - UNATTRIBUTED_RECORDS) / 2),
+            ),
+            (
+                "memory_lane_record_region",
+                vec![("region", "funding"), ("state", "active")],
+                1,
+            ),
+            (
+                "memory_lane_record_region",
+                vec![("region", "funding"), ("state", "residual_retained")],
+                2,
+            ),
+            (
+                "memory_lane_record_region",
+                vec![("region", "funding"), ("state", "pending_reclaim")],
+                3,
+            ),
+            (
+                "memory_lane_record_region",
+                vec![("region", "observation"), ("state", "active")],
+                4,
+            ),
+            (
+                "memory_lane_record_region",
+                vec![("region", "observation"), ("state", "residual_retained")],
+                5,
+            ),
+            (
+                "memory_lane_record_region",
+                vec![("region", "observation"), ("state", "pending_reclaim")],
+                6,
+            ),
+            (
+                "memory_lane_record_region_residual_bytes",
+                vec![("band", "tagged"), ("region", "funding")],
+                1032,
+            ),
+            (
+                "memory_lane_record_region_residual_bytes",
+                vec![("band", "r1_small"), ("region", "funding")],
+                7,
+            ),
+            (
+                "memory_lane_record_region_residual_bytes",
+                vec![("band", "tagged"), ("region", "observation")],
+                2056,
+            ),
+            (
+                "memory_lane_record_region_residual_bytes",
+                vec![("band", "r1_small"), ("region", "observation")],
+                11,
+            ),
             ("memory_ledger_blind_spot_bytes", vec![], 40),
             ("memory_attribution_reconcile_bytes", vec![], 0),
             (
@@ -2062,8 +2205,21 @@ mod tests {
                 vec![("class", "residual"), ("production", "stopped")],
                 6,
             ),
-            ("memory_lane_record_capacity", vec![], 262144),
-            ("memory_lane_record_high_water", vec![], 22),
+            (
+                "memory_lane_records",
+                vec![("class", "unattributed"), ("production", "producing")],
+                i64::from(UNATTRIBUTED_RECORDS),
+            ),
+            (
+                "memory_lane_record_capacity",
+                vec![],
+                i64::from(MAX_RECORDS),
+            ),
+            (
+                "memory_lane_record_high_water",
+                vec![],
+                i64::from(UNATTRIBUTED_RECORDS + 45),
+            ),
             ("memory_lane_records_draining", vec![], 3),
             ("memory_lane_record_segment_requested_bytes", vec![], 262144),
             ("memory_observation_metadata_bytes", vec![], 2048),
@@ -2117,6 +2273,10 @@ mod tests {
         let rows = json.as_array().unwrap();
         for (family, count) in [
             ("memory_attributed_bytes", 6),
+            ("memory_unattributed_bytes", 2),
+            ("memory_lane_record_region_capacity", 2),
+            ("memory_lane_record_region", 6),
+            ("memory_lane_record_region_residual_bytes", 4),
             ("memory_lane_records", 12),
             ("memory_attribution_faults_total", 7),
             ("process_counted_operations_total", 8),
@@ -2132,6 +2292,7 @@ mod tests {
         }
         assert!(!rendered.contains("novarocks_backend_process_counted_live_bytes  "));
         assert!(!rendered.contains("novarocks_backend_process_counted_live_bytes 80"));
+        assert!(!rendered.contains("novarocks_backend_memory_unattributed_bytes 56"));
         assert!(rendered.contains("excluding in-flight allocations"));
         assert!(rendered.contains("not an instantaneous or concurrent mathematical upper bound"));
     }
@@ -2144,9 +2305,19 @@ mod tests {
         let backend = attribution_backend(move || *captured.lock().unwrap());
         let initial = render_metrics(&backend).unwrap();
         assert!(initial.contains("novarocks_backend_memory_observation_metadata_bytes 2048"));
+        assert!(
+            initial.contains("novarocks_backend_memory_unattributed_bytes{role=\"driver\"} 40")
+        );
         {
             let mut current = sample.lock().unwrap();
             current.classified[0].tagged_bytes = -5;
+            current.thread_roles[1] = None;
+            current.unattributed_by_role[0] = -13;
+            current.unattributed_by_role[1] = 0;
+            current.unattributed_tagged_bytes = -13;
+            current.regions[1].active = 0;
+            current.regions[1].residual_tagged_bytes = -17;
+            current.regions[1].residual_r1_small_bytes = -19;
             current.ledger_blind_spot_bytes = -7;
             current.tagged_reconciliation_bytes = 8;
             current.observation_metadata_bytes = None;
@@ -2159,6 +2330,22 @@ mod tests {
             ));
             assert!(rendered.contains("novarocks_backend_memory_ledger_blind_spot_bytes -7"));
             assert!(rendered.contains("novarocks_backend_memory_attribution_reconcile_bytes 8"));
+            assert!(
+                rendered
+                    .contains("novarocks_backend_memory_unattributed_bytes{role=\"unknown\"} -13")
+            );
+            assert!(
+                !rendered.contains("novarocks_backend_memory_unattributed_bytes{role=\"driver\"}")
+            );
+            assert!(rendered.contains(
+                "novarocks_backend_memory_lane_record_region{region=\"observation\",state=\"active\"} 0"
+            ));
+            assert!(rendered.contains(
+                "novarocks_backend_memory_lane_record_region_residual_bytes{band=\"tagged\",region=\"observation\"} -17"
+            ));
+            assert!(rendered.contains(
+                "novarocks_backend_memory_lane_record_region_residual_bytes{band=\"r1_small\",region=\"observation\"} -19"
+            ));
             assert!(rendered.contains("novarocks_backend_process_counted_operations_total{band=\"small\",kind=\"dealloc\"} 2"));
             assert!(!rendered.contains("novarocks_backend_memory_observation_metadata_bytes "));
             assert!(
@@ -2182,6 +2369,38 @@ mod tests {
                     == "novarocks_backend_memory_ledger_blind_spot_bytes"
                     && row["value"].as_f64() == Some(-7.0))
         );
+        let rows = rows.as_array().unwrap();
+        assert!(!rows.iter().any(|row| row["tags"]["role"] == "driver"));
+        for (name, labels, value) in [
+            (
+                "novarocks_backend_memory_unattributed_bytes",
+                vec![("role", "unknown")],
+                -13.0,
+            ),
+            (
+                "novarocks_backend_memory_lane_record_region",
+                vec![("region", "observation"), ("state", "active")],
+                0.0,
+            ),
+            (
+                "novarocks_backend_memory_lane_record_region_residual_bytes",
+                vec![("band", "tagged"), ("region", "observation")],
+                -17.0,
+            ),
+            (
+                "novarocks_backend_memory_lane_record_region_residual_bytes",
+                vec![("band", "r1_small"), ("region", "observation")],
+                -19.0,
+            ),
+        ] {
+            assert!(rows.iter().any(|row| {
+                row["tags"]["metric"] == name
+                    && labels
+                        .iter()
+                        .all(|(key, value)| row["tags"][*key] == *value)
+                    && row["value"].as_f64() == Some(value)
+            }));
+        }
     }
 
     #[test]
@@ -2190,9 +2409,20 @@ mod tests {
         assert!(
             render_metrics(&backend)
                 .unwrap()
-                .contains("novarocks_backend_memory_unattributed_bytes 56")
+                .contains("novarocks_backend_memory_unattributed_bytes{role=\"unknown\"} 16")
         );
         let empty = BackendMetricsRegistry::new().unwrap();
+        let empty_text = render_metrics(&empty).unwrap();
+        let empty_json = render_metrics_json(&empty).unwrap();
+        for name in [
+            "novarocks_backend_memory_unattributed_bytes",
+            "novarocks_backend_memory_lane_record_region",
+            "novarocks_backend_memory_lane_record_region_capacity",
+            "novarocks_backend_memory_lane_record_region_residual_bytes",
+        ] {
+            assert!(!empty_text.contains(name));
+            assert!(!empty_json.contains(name));
+        }
         assert!(
             !render_metrics(&empty)
                 .unwrap()

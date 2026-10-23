@@ -391,3 +391,65 @@ fn nested_ancestor_and_child_retirement_cannot_lose_a_moving_lane() {
         assert_empty_registry(&authority);
     });
 }
+
+// Search boundary: one owner group (two model shards), one creation, and one
+// competing close/retire, including an ancestor path. Uses model()'s exhaustive
+// two-preemption search, without permutation or wall-clock truncation.
+#[test]
+fn observation_group_publication_is_atomic_with_close_and_retirement() {
+    for ancestor in [false, true] {
+        for retire in [false, true] {
+            model(move || {
+                let authority = Arc::new(authority(4));
+                let parent = authority
+                    .create_account(AccountKind::ResourceGroup, ExternalRef::NONE)
+                    .unwrap();
+                let account = parent
+                    .create_child(AccountKind::Work, ExternalRef::NONE)
+                    .unwrap();
+                let creating = account.clone();
+                let creation = thread::spawn(move || creating.create_lane_shards());
+                let closing = if ancestor {
+                    parent.clone()
+                } else {
+                    account.clone()
+                };
+                let closure = thread::spawn(move || {
+                    if retire {
+                        closing.retire(&exited()).unwrap().visited_members
+                    } else {
+                        closing.close_members().visited
+                    }
+                });
+                let owner = creation.join().unwrap();
+                let visited = closure.join().unwrap();
+                let snapshot = owner.snapshot();
+                let registry = authority.shared.observation_lanes.lock().unwrap();
+                match owner.coverage() {
+                    Ok(()) => {
+                        assert_eq!(visited, crate::lane::LANE_SHARDS + usize::from(ancestor));
+                        assert_eq!(registry.occupied, crate::lane::LANE_SHARDS);
+                        assert_eq!(
+                            snapshot.records.iter().flatten().count(),
+                            crate::lane::LANE_SHARDS
+                        );
+                        assert!(
+                            snapshot
+                                .records
+                                .iter()
+                                .flatten()
+                                .all(|s| s.production != crate::lane::ProductionState::Producing)
+                        );
+                    }
+                    Err(crate::CoverageGap::AccountClosed) => {
+                        assert_eq!(visited, usize::from(ancestor));
+                        assert_eq!(registry.occupied, 0);
+                        assert!(snapshot.records.iter().all(Option::is_none));
+                    }
+                    Err(gap) => panic!("unexpected model coverage gap: {gap:?}"),
+                }
+                drop(registry);
+            });
+        }
+    }
+}

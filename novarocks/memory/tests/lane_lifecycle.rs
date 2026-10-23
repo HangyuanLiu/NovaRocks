@@ -92,13 +92,19 @@ fn observation_creation_has_no_funding_or_stock_authority() {
     let query = work(&a);
     query.install_policy(0, LimitDimension::Work);
     let before = a.pressure_projection();
-    let lane = query.create_lane().unwrap();
+    let lane = query.create_lane_shards();
     assert_eq!(a.pressure_projection(), before);
-    assert_eq!(lane.responsibility_class(), ResponsibilityClass::Query);
+    assert!(
+        lane.snapshot()
+            .records
+            .iter()
+            .flatten()
+            .all(|s| s.class == ResponsibilityClass::Query)
+    );
     query.close_to_growth();
     assert_eq!(
-        query.create_lane().unwrap_err(),
-        lane::CoverageError::AccountClosed
+        query.create_lane_shards().coverage(),
+        Err(lane::CoverageGap::AccountClosed)
     );
 }
 
@@ -106,8 +112,8 @@ fn observation_creation_has_no_funding_or_stock_authority() {
 fn token_only_observation_retains_teardown_classification_and_real_last_free() {
     let a = authority(65_536);
     let query = work(&a);
-    let lane = query.create_lane().unwrap();
-    let reference = lane.reference();
+    let lane = query.create_lane_shards();
+    let reference = reference(&lane);
     let wrapper = AttributingAllocator::new(System);
     let layout = Layout::from_size_align(600, 8).unwrap();
     // SAFETY: held process-store owner, one matching allocation/release and

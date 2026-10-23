@@ -18,11 +18,16 @@
 //! Constant, destructor-free TLS. Hooks only copy Cells and use lane atomics.
 use crate::lane::{RecordRef, SlotCore, global_store};
 use std::cell::Cell;
+use std::sync::atomic::{AtomicUsize, Ordering};
+static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
+const UNASSIGNED_SHARD: u8 = u8::MAX;
 #[derive(Clone, Copy)]
 struct ThreadState {
     ambient: RecordRef,
     explicit: RecordRef,
     slot: SlotCore,
+    shard: u8,
+    role: u8,
 }
 impl ThreadState {
     const fn new() -> Self {
@@ -30,10 +35,12 @@ impl ThreadState {
             ambient: RecordRef::NONE,
             explicit: RecordRef::NONE,
             slot: SlotCore::new(),
+            shard: UNASSIGNED_SHARD,
+            role: 0,
         }
     }
     fn buffered(self) -> bool {
-        !self.ambient.is_none() || !self.explicit.is_none()
+        self.ambient.is_record() || self.explicit.is_record()
     }
 }
 const _: () = assert!(!std::mem::needs_drop::<ThreadState>());
@@ -51,13 +58,42 @@ pub(crate) fn effective_owner() -> RecordRef {
     STATE
         .try_with(|cell| {
             let state = cell.get();
-            if !state.explicit.is_none() {
+            let owner = if !state.explicit.is_none() {
                 state.explicit
             } else {
                 state.ambient
+            };
+            if owner.is_record() {
+                owner
+            } else {
+                global_store()
+                    .unattributed_ref(usize::from(state.role), crate::lane::faults::stack_shard())
             }
         })
-        .unwrap_or(RecordRef::NONE)
+        .unwrap_or_else(|_| global_store().unattributed_ref(0, crate::lane::faults::stack_shard()))
+}
+/// Stable execution-thread shard. It grants no owner or allocation access.
+pub(crate) fn current_shard() -> usize {
+    STATE
+        .try_with(|cell| {
+            let mut state = cell.get();
+            if state.shard == UNASSIGNED_SHARD {
+                state.shard =
+                    (NEXT_SHARD.fetch_add(1, Ordering::Relaxed) % crate::lane::LANE_SHARDS) as u8;
+                cell.set(state);
+            }
+            usize::from(state.shard)
+        })
+        .unwrap_or_else(|_| crate::lane::faults::stack_shard() % crate::lane::LANE_SHARDS)
+}
+pub(crate) fn set_thread_role(role: u8) -> bool {
+    STATE
+        .try_with(|cell| {
+            let mut state = cell.get();
+            state.role = role;
+            cell.set(state);
+        })
+        .is_ok()
 }
 /// Caller holds a live owner, genuine allocation, or the slot pin; identity alone
 /// is insufficient. The production global store is the only supported store.
@@ -136,7 +172,7 @@ pub(crate) fn try_replace(
             } else {
                 state.ambient = reference;
             }
-            if restoring && (!explicit || state.ambient.is_none()) {
+            if restoring && (!explicit || !state.ambient.is_record()) {
                 // SAFETY: sole slot pin; flush completes before a binding owner drops.
                 unsafe { state.slot.flush(global_store()) };
             }
@@ -172,5 +208,27 @@ mod tests {
             a.dealloc(p, old);
         }
         assert_eq!(ACCESSES.with(Cell::get), before);
+    }
+}
+
+#[cfg(test)]
+mod shard_tests {
+    use super::*;
+    #[test]
+    fn sequential_threads_receive_distinct_stable_shards() {
+        let mut shards = Vec::new();
+        for _ in 0..crate::lane::LANE_SHARDS {
+            shards.push(
+                std::thread::spawn(|| {
+                    let first = current_shard();
+                    assert_eq!(first, current_shard());
+                    first
+                })
+                .join()
+                .unwrap(),
+            );
+        }
+        shards.sort_unstable();
+        assert_eq!(shards, (0..crate::lane::LANE_SHARDS).collect::<Vec<_>>());
     }
 }
