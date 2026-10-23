@@ -19,15 +19,19 @@ use crate::{
     CancellationReason, QueryConcurrencyPermit, ResultWindowClass, ResultWindowGrant, WorkError,
     WorkId, WorkScope,
     result_window::{adopt_window, count_window, uncount_window, window_room},
-    scope::{State, WorkloadConfig},
+    scope::{Inner, State, WorkloadConfig},
 };
 use std::{
     future::Future,
+    ops::Bound::{Excluded, Unbounded},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, Waker},
 };
 use tokio::time::Instant;
+
+mod delivery;
+pub(crate) use delivery::{drain_wakes, has_pending_wakes};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Stage {
@@ -65,6 +69,10 @@ pub(crate) struct PendingAdmission {
     pub wait_deadline: Instant,
     pub state: AdmissionState,
     pub waker: Option<Waker>,
+    // Logical receipt does not reclaim a row whose callback is still alive.
+    pub retired: bool,
+    pub delivery_in_flight: bool,
+    pub registration_in_flight: bool,
     /// The complete result window a query takes together with its permit,
     /// and whether dispatch has counted it.
     pub window: Option<ResultWindowClass>,
@@ -121,26 +129,27 @@ fn remove_queue(state: &mut State, root: WorkId, id: u64, kind: AdmissionKind) {
     }
 }
 
-pub(crate) fn dispatch(state: &mut State, config: &WorkloadConfig) -> Vec<Waker> {
-    let mut wake = Vec::new();
-    let rejected = state
-        .requests
-        .iter()
-        .filter_map(|(&id, request)| {
-            if matches!(request.state, AdmissionState::Rejected(_)) {
-                return None;
-            }
-            state.nodes[&request.work]
-                .check(&state.cancellations)
-                .err()
-                .or_else(|| {
-                    (Instant::now() >= request.wait_deadline)
-                        .then_some(WorkError::CapacityWaitTimeout)
-                })
-                .map(|error| (id, error))
-        })
-        .collect::<Vec<_>>();
-    for (id, error) in rejected {
+pub(crate) fn dispatch(state: &mut State, config: &WorkloadConfig) {
+    // Reject before granting, using the original ordered map rather than a
+    // detached allocation. No callback or row insertion can run under State.
+    let mut after = 0;
+    loop {
+        let Some((&id, request)) = state.requests.range((Excluded(after), Unbounded)).next() else {
+            break;
+        };
+        after = id;
+        if request.retired || matches!(request.state, AdmissionState::Rejected(_)) {
+            continue;
+        }
+        let Some(error) = state.nodes[&request.work]
+            .check(&state.cancellations)
+            .err()
+            .or_else(|| {
+                (Instant::now() >= request.wait_deadline).then_some(WorkError::CapacityWaitTimeout)
+            })
+        else {
+            continue;
+        };
         let request = &state.requests[&id];
         let (work, root, kind, granted, window) = (
             request.work,
@@ -161,9 +170,6 @@ pub(crate) fn dispatch(state: &mut State, config: &WorkloadConfig) -> Vec<Waker>
         }
         let request = state.requests.get_mut(&id).unwrap();
         request.state = AdmissionState::Rejected(error);
-        if let Some(waker) = request.waker.take() {
-            wake.push(waker);
-        }
     }
     for kind in [
         AdmissionKind::Query,
@@ -214,45 +220,62 @@ pub(crate) fn dispatch(state: &mut State, config: &WorkloadConfig) -> Vec<Waker>
             }
             let request = state.requests.get_mut(&id).unwrap();
             request.state = AdmissionState::Granted;
-            if let Some(waker) = request.waker.take() {
-                wake.push(waker);
-            }
         }
     }
-    wake
 }
 
-fn take_request(state: &mut State, id: u64, receive: bool) -> PendingAdmission {
-    let request = state.requests.remove(&id).unwrap();
-    state.waiting_bytes -= request.bytes;
-    let node = state.nodes.get_mut(&request.work).unwrap();
-    node.pending_admissions -= 1;
-    if request.kind == AdmissionKind::Query {
+fn take_request(state: &mut State, id: u64, receive: bool) {
+    let request = state.requests.get_mut(&id).unwrap();
+    assert!(!request.retired, "an admission has one logical receipt");
+    request.retired = true;
+    let (work, root, kind, admission, window) = (
+        request.work,
+        request.root,
+        request.kind,
+        request.state.clone(),
+        request.window.filter(|_| request.window_counted),
+    );
+    let node = state.nodes.get_mut(&work).unwrap();
+    if kind == AdmissionKind::Query {
         node.pending_query = false;
         node.pending_query_window = None;
     }
-    match request.state {
+    match admission {
         AdmissionState::Granted if !receive => {
-            release(state, request.work, request.root, request.kind);
-            if let Some(class) = request.window.filter(|_| request.window_counted) {
-                uncount_window(state, request.root, class);
+            release(state, work, root, kind);
+            if let Some(class) = window {
+                uncount_window(state, root, class);
             }
         }
         AdmissionState::Waiting => {
-            remove_queue(state, request.root, id, request.kind);
-            if let AdmissionKind::Stage(stage) = request.kind {
-                state
-                    .nodes
-                    .get_mut(&request.work)
-                    .unwrap()
-                    .stages
-                    .remove(&stage);
+            remove_queue(state, root, id, kind);
+            if let AdmissionKind::Stage(stage) = kind {
+                state.nodes.get_mut(&work).unwrap().stages.remove(&stage);
             }
         }
         _ => {}
     }
+    finish_retired(state, id);
+}
+
+fn finish_retired(state: &mut State, id: u64) -> bool {
+    let request = &state.requests[&id];
+    if !request.retired
+        || request.delivery_in_flight
+        || request.registration_in_flight
+        || request.waker.is_some()
+    {
+        return false;
+    }
+    let request = state.requests.remove(&id).unwrap();
+    state.waiting_bytes -= request.bytes;
+    state
+        .nodes
+        .get_mut(&request.work)
+        .unwrap()
+        .pending_admissions -= 1;
     state.collect(request.work);
-    request
+    true
 }
 
 impl WorkScope {
@@ -282,7 +305,15 @@ impl WorkScope {
         let wait_deadline = Instant::now()
             .checked_add(self.inner.config.capacity_wait_timeout)
             .ok_or(WorkError::ArithmeticOverflow)?;
-        let id = self.inner.update(|state| {
+        let mut pending = StageAdmission {
+            scope: self.clone(),
+            id: None,
+            cancelled: Box::pin(async move { cancellation.cancelled().await }),
+            capacity_timeout: Box::pin(
+                async move { tokio::time::sleep_until(wait_deadline).await },
+            ),
+        };
+        self.inner.update(|state| {
             let node = state.nodes.get(&self.id).ok_or(WorkError::Released)?;
             node.check(&state.cancellations)?;
             if node.stages.contains(&request.stage) {
@@ -310,6 +341,9 @@ impl WorkScope {
                     wait_deadline,
                     state: AdmissionState::Waiting,
                     waker: None,
+                    retired: false,
+                    delivery_in_flight: false,
+                    registration_in_flight: false,
                     window: None,
                     window_counted: false,
                 },
@@ -325,16 +359,10 @@ impl WorkScope {
                 Stage::Preparation => state.preparation_queue.push(root, id),
                 Stage::Execution => state.execution_queue.push(root, id),
             }
-            Ok(id)
+            pending.id = Some(id);
+            Ok(())
         })?;
-        Ok(StageAdmission {
-            scope: self.clone(),
-            id: Some(id),
-            cancelled: Box::pin(async move { cancellation.cancelled().await }),
-            capacity_timeout: Box::pin(
-                async move { tokio::time::sleep_until(wait_deadline).await },
-            ),
-        })
+        Ok(pending)
     }
 
     /// Non-blocking acquisition never jumps ahead of an existing queue.
@@ -396,18 +424,14 @@ impl Future for StageAdmission {
             return Poll::Ready(Err(WorkError::CapacityWaitTimeout));
         }
         let inner = Arc::clone(&self.scope.inner);
-        let result = inner.update(|state| {
+        let mut registration = delivery::Registration::new(&inner, id, cx.waker());
+        let mut receipt = None;
+        inner.update(|state| {
             let request = state.requests.get_mut(&id).unwrap();
             let result = match &request.state {
                 AdmissionState::Waiting => {
-                    if request
-                        .waker
-                        .as_ref()
-                        .is_none_or(|waker| !waker.will_wake(cx.waker()))
-                    {
-                        request.waker = Some(cx.waker().clone());
-                    }
-                    return None;
+                    registration.install(request);
+                    return;
                 }
                 AdmissionState::Granted => match request.kind {
                     AdmissionKind::Stage(stage) => Ok((request.root, stage)),
@@ -422,21 +446,18 @@ impl Future for StageAdmission {
                 }
                 Ok(grant)
             });
-            // Receipt and cancellation share this lock. A granted request
-            // cannot be revoked between observing it and creating its permit.
             take_request(state, id, result.is_ok());
-            Some(result)
+            self.id = None;
+            // The original permit exists before post-State callbacks. Unwind
+            // destroys it outside State and returns its actual grant once.
+            receipt = Some(result.map(|(root, stage)| StagePermit {
+                scope: Some(self.scope.clone()),
+                root,
+                stage,
+                capacity_admission: true,
+            }));
         });
-        let Some(result) = result else {
-            return Poll::Pending;
-        };
-        self.id = None;
-        Poll::Ready(result.map(|(root, stage)| StagePermit {
-            scope: Some(self.scope.clone()),
-            root,
-            stage,
-            capacity_admission: true,
-        }))
+        receipt.map_or(Poll::Pending, Poll::Ready)
     }
 }
 
@@ -468,7 +489,15 @@ impl WorkScope {
         let wait_deadline = Instant::now()
             .checked_add(self.inner.config.capacity_wait_timeout)
             .ok_or(WorkError::ArithmeticOverflow)?;
-        let id = self.inner.update(|state| {
+        let mut pending = QueryAdmission {
+            scope: self.clone(),
+            id: None,
+            cancelled: Box::pin(async move { cancellation.cancelled().await }),
+            capacity_timeout: Box::pin(
+                async move { tokio::time::sleep_until(wait_deadline).await },
+            ),
+        };
+        self.inner.update(|state| {
             let node = state.nodes.get(&self.id).ok_or(WorkError::Released)?;
             node.check(&state.cancellations)?;
             if node.parent.is_some()
@@ -500,6 +529,9 @@ impl WorkScope {
                     wait_deadline,
                     state: AdmissionState::Waiting,
                     waker: None,
+                    retired: false,
+                    delivery_in_flight: false,
+                    registration_in_flight: false,
                     window,
                     window_counted: false,
                 },
@@ -511,16 +543,10 @@ impl WorkScope {
             node.pending_query = true;
             node.pending_query_window = window;
             state.query_queue.push(self.id, id);
-            Ok(id)
+            pending.id = Some(id);
+            Ok(())
         })?;
-        Ok(QueryAdmission {
-            scope: self.clone(),
-            id: Some(id),
-            cancelled: Box::pin(async move { cancellation.cancelled().await }),
-            capacity_timeout: Box::pin(
-                async move { tokio::time::sleep_until(wait_deadline).await },
-            ),
-        })
+        Ok(pending)
     }
 }
 
@@ -594,19 +620,15 @@ impl QueryAdmission {
             return Poll::Ready(Err(WorkError::CapacityWaitTimeout));
         }
         let inner = Arc::clone(&self.scope.inner);
-        let result = inner.update(|state| {
+        let mut registration = delivery::Registration::new(&inner, id, cx.waker());
+        let mut receipt = None;
+        inner.update(|state| {
             let request = state.requests.get_mut(&id).unwrap();
             let window = request.window.filter(|_| request.window_counted);
             let result = match &request.state {
                 AdmissionState::Waiting => {
-                    if request
-                        .waker
-                        .as_ref()
-                        .is_none_or(|waker| !waker.will_wake(cx.waker()))
-                    {
-                        request.waker = Some(cx.waker().clone());
-                    }
-                    return None;
+                    registration.install(request);
+                    return;
                 }
                 AdmissionState::Granted => Ok(()),
                 AdmissionState::Rejected(error) => Err(error.clone()),
@@ -619,27 +641,20 @@ impl QueryAdmission {
                 Ok(grant)
             });
             take_request(state, id, result.is_ok());
-            // A received grant keeps its counted window; the envelope comes
-            // from the same configuration that counted it.
-            Some(result.map(|()| {
-                window.map(|class| {
+            self.id = None;
+            receipt = Some(result.map(|()| AdmittedQuery {
+                permit: QueryConcurrencyPermit {
+                    scope: Some(self.scope.clone()),
+                },
+                window: window.map(|class| {
                     let config = state
                         .result_capacity
                         .expect("a counted window has its capacity profile");
-                    (class, config.all_objects_bytes[class.index()])
-                })
-            }))
+                    adopt_window(&self.scope, class, config.all_objects_bytes[class.index()])
+                }),
+            }));
         });
-        let Some(result) = result else {
-            return Poll::Pending;
-        };
-        self.id = None;
-        Poll::Ready(result.map(|window| AdmittedQuery {
-            permit: QueryConcurrencyPermit {
-                scope: Some(self.scope.clone()),
-            },
-            window: window.map(|(class, bytes)| adopt_window(&self.scope, class, bytes)),
-        }))
+        receipt.map_or(Poll::Pending, Poll::Ready)
     }
 }
 
@@ -748,3 +763,6 @@ mod tests {
         assert_eq!(control.snapshot().root_responsibilities, 0);
     }
 }
+
+#[cfg(test)]
+mod delivery_tests;

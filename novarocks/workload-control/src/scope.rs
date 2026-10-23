@@ -558,18 +558,16 @@ impl Inner {
     }
 
     pub(crate) fn update<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
-        let (result, wakers) = {
+        let result = {
             let mut state = self.state.lock().unwrap();
             let result = f(&mut state);
-            let wakers = crate::admission::dispatch(&mut state, &self.config);
+            crate::admission::dispatch(&mut state, &self.config);
             crate::observation::fill_control(&mut state, &self.config);
             state.advance_progress_revision();
-            (result, wakers)
+            result
         };
-        // Never invoke arbitrary wake implementations while holding the owner lock.
-        for waker in wakers {
-            waker.wake();
-        }
+        // Original rows retain each callback until its actual lock-free exit.
+        crate::admission::drain_wakes(self);
         self.changed.notify_waiters();
         result
     }
@@ -1176,6 +1174,7 @@ impl WorkloadControl {
     /// equals `after`.
     pub async fn wait_progress(&self, after: WorkloadProgressRevision) -> WorkloadProgress {
         loop {
+            crate::admission::drain_wakes(&self.inner);
             let changed = self.inner.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
@@ -1190,6 +1189,10 @@ impl WorkloadControl {
                     Some(WorkloadProgress::ControlReady(revision))
                 } else if revision != after {
                     Some(WorkloadProgress::StateChanged(revision))
+                } else if crate::admission::has_pending_wakes(&state) {
+                    // Only a real wait needs another finite frontier. Already
+                    // observed progress never waits for global notification drain.
+                    continue;
                 } else {
                     None
                 }
@@ -1271,7 +1274,11 @@ impl DeadlineExpiryHandle {
                     .requests
                     .values()
                     .filter(|request| {
-                        !matches!(request.state, crate::admission::AdmissionState::Rejected(_))
+                        !request.retired
+                            && !matches!(
+                                request.state,
+                                crate::admission::AdmissionState::Rejected(_)
+                            )
                     })
                     .map(|request| request.wait_deadline),
             )
@@ -1290,12 +1297,19 @@ impl DeadlineExpiryHandle {
     /// admitted earlier deadline without polling or spinning while idle.
     pub async fn wait_state_change(&self, after: WorkloadProgressRevision) {
         loop {
+            crate::admission::drain_wakes(&self.inner);
             let changed = self.inner.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
             let advanced = {
                 let state = self.inner.state.lock().unwrap();
-                self.inner.capture_progress(&state) != after
+                if self.inner.capture_progress(&state) != after {
+                    true
+                } else if crate::admission::has_pending_wakes(&state) {
+                    continue;
+                } else {
+                    false
+                }
             };
             if advanced {
                 return;
