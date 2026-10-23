@@ -4046,6 +4046,7 @@ dependencies = [
  "novarocks-failure-contract",
  "novarocks-secret",
  "novarocks-spi",
+ "novarocks-test-support",
  "opendal",
  "orc-rust",
  "parquet",

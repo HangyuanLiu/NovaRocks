@@ -58,11 +58,12 @@ novarocks-secret.workspace = true
 novarocks-spi.workspace = true
 
 [dev-dependencies]
+novarocks-test-support.workspace = true
 novarocks-failpoint = { workspace = true, features = ["typed"] }
 serde_json.workspace = true
 
 [features]
 
 [package.metadata.novarocks.test]
-runtime-inputs = ["novarocks/fs/tests/data/writer-corpus/**"]
-env-inputs = []
+runtime-inputs = ["novarocks/fs/tests/data/writer-corpus/**", "novarocks/fs/tests/fixtures/hdfs/**", "target/hdfs-real-io/java/**", "target/debug/build/novarocks-test-support-*/out/novarocks-test-monitor"]
+env-inputs = [{ name = "NOVA_HDFS_JAVA", kind = "file-content" }]
