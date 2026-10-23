@@ -36,6 +36,7 @@ mod control_storage;
 mod dependency_storage;
 mod metadata_geometry;
 mod paid_proposal;
+pub(crate) mod retained_claim;
 pub use paid_proposal::JointProposal;
 pub(crate) mod proposal_storage;
 #[cfg(test)]
@@ -108,6 +109,7 @@ pub(super) struct ProposedClaim {
 pub(crate) enum ClaimOwner {
     PhysicalWork(WorkId),
     ControlSlot(SlotId),
+    OwnerRetained(WorkId),
 }
 
 pub(super) struct ClaimRecord {
@@ -964,7 +966,7 @@ impl WorkOwner {
 /// Logical completion and adjustment cancellation must not drop this holder.
 pub struct JointClaim {
     inner: Arc<Inner>,
-    id: u64,
+    id: Option<u64>,
 }
 impl std::fmt::Debug for JointClaim {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -975,15 +977,19 @@ impl std::fmt::Debug for JointClaim {
 }
 impl JointClaim {
     pub fn view(&self) -> Result<JointClaimView, WorkError> {
+        let id = self.id.ok_or(WorkError::Released)?;
         let state = self.inner.state.lock().unwrap();
         let record = state
             .joint
             .as_ref()
-            .and_then(|l| l.claims.get(&self.id))
+            .and_then(|l| l.claims.get(&id))
             .ok_or(WorkError::Released)?;
+        if !matches!(record.owner, ClaimOwner::PhysicalWork(_)) {
+            return Err(WorkError::Conflict);
+        }
         Ok(JointClaimView {
             inner: Arc::downgrade(&self.inner),
-            id: self.id,
+            id,
             source: ClaimSource::Physical,
             structure_revision: record.structure_revision,
             release_revision: record.release_revision,
@@ -991,20 +997,31 @@ impl JointClaim {
     }
     /// Only the installed amount is permission to start physical work.
     pub fn amounts(&self) -> Result<JointResources, WorkError> {
+        let id = self.id.ok_or(WorkError::Released)?;
         let state = self.inner.state.lock().unwrap();
         state
             .joint
             .as_ref()
-            .and_then(|l| l.claims.get(&self.id))
-            .map(|record| record.active_amounts)
+            .and_then(|l| l.claims.get(&id))
             .ok_or(WorkError::Released)
+            .and_then(|record| {
+                if matches!(record.owner, ClaimOwner::PhysicalWork(_)) {
+                    Ok(record.active_amounts)
+                } else {
+                    Err(WorkError::Conflict)
+                }
+            })
     }
     /// Report an actual partial release. Granted delta remains separate; a
     /// queued/proving source becomes stale and receives typed Conflict.
     pub fn release_part(&mut self, released: JointResources) -> Result<(), WorkError> {
+        let id = self.id.ok_or(WorkError::Released)?;
         self.inner.update(|state| {
             let ledger = state.joint.as_mut().ok_or(WorkError::NotReady)?;
-            let record = ledger.claims.get_mut(&self.id).ok_or(WorkError::Released)?;
+            let record = ledger.claims.get_mut(&id).ok_or(WorkError::Released)?;
+            if !matches!(record.owner, ClaimOwner::PhysicalWork(_)) {
+                return Err(WorkError::Conflict);
+            }
             let active = record.active_amounts.checked_sub(released)?;
             let charged = record.amounts.checked_sub(released)?;
             let profile = ledger
@@ -1025,7 +1042,10 @@ impl JointClaim {
 }
 impl Drop for JointClaim {
     fn drop(&mut self) {
-        let waker = self.inner.update(|state| release_current(state, self.id));
+        let Some(id) = self.id.take() else {
+            return;
+        };
+        let waker = self.inner.update(|state| release_current(state, id));
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -1069,19 +1089,22 @@ fn remove_claim(state: &mut State, id: u64) {
     let ledger = state.joint.as_mut().unwrap();
     subtract_profile(ledger, &record.facts, record.amounts);
     ledger.released();
-    let ClaimOwner::PhysicalWork(owner) = record.owner else {
-        unreachable!("fixed control claims are released only with their process inventory");
+    let owner = match record.owner {
+        ClaimOwner::PhysicalWork(owner) | ClaimOwner::OwnerRetained(owner) => owner,
+        ClaimOwner::ControlSlot(_) => {
+            unreachable!("fixed control claims are released only with their process inventory")
+        }
     };
     state.nodes.get_mut(&owner).unwrap().resource_holders -= 1;
     state.collect(owner);
 }
 /// Only actual holder Drop or withdrawal of a never-delivered New invokes this.
 fn release_current(state: &mut State, id: u64) -> Option<Waker> {
-    if state
+    if !state
         .joint
         .as_ref()
         .and_then(|ledger| ledger.claims.get(&id))
-        .is_some_and(|record| matches!(record.owner, ClaimOwner::ControlSlot(_)))
+        .is_some_and(|record| matches!(record.owner, ClaimOwner::PhysicalWork(_)))
     {
         return None;
     }
@@ -1462,7 +1485,7 @@ impl Future for JointAdmission {
         while let Some(&id) = delivery.new_ids.last() {
             let claim = JointClaim {
                 inner: Arc::clone(&inner),
-                id,
+                id: Some(id),
             };
             delivery.new_ids.pop();
             claims.push(claim);
@@ -1683,7 +1706,7 @@ impl JointAdjustmentReceipt {
                     ClaimSource::Physical => {
                         let original = originals
                             .iter()
-                            .find(|original| original.id == source.id)
+                            .find(|original| original.id == Some(source.id))
                             .ok_or(WorkError::Conflict)?;
                         if !Arc::ptr_eq(&original.inner, &self.inner) {
                             return Err(WorkError::ForeignAuthority);

@@ -150,7 +150,7 @@ mod tests {
         drive(&mut driver);
         let original = {
             let state = control.inner.state.lock().unwrap();
-            Arc::downgrade(&state.joint.as_ref().unwrap().claims[&a.id].facts)
+            Arc::downgrade(&state.joint.as_ref().unwrap().claims[&a.id.unwrap()].facts)
         };
         let mut b = handle.request(&second.owner.scope(), changes()).unwrap();
         drive(&mut driver);
@@ -164,7 +164,7 @@ mod tests {
             let state = control.inner.state.lock().unwrap();
             assert!(!state.nodes.contains_key(&first_id));
             let ledger = state.joint.as_ref().unwrap();
-            let survivor = &ledger.claims[&b.id].facts;
+            let survivor = &ledger.claims[&b.id.unwrap()].facts;
             let historical = original
                 .upgrade()
                 .expect("aggregate owns the original graph");

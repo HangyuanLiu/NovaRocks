@@ -24,7 +24,7 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-fn bytes(amount: u64) -> JointResources {
+pub(super) fn bytes(amount: u64) -> JointResources {
     JointResources::ZERO.with(JointResource::PayloadBytes, amount)
 }
 fn limits(global: u64, dependency: u64, progress: u64) -> JointResourceLimits {
@@ -68,7 +68,7 @@ fn profile() -> (JointCapacityConfig, RequiredJointProgress) {
         },
     )
 }
-fn control() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+pub(super) fn control() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     let control = WorkloadControl::try_new_counted(WorkloadConfig::default())
         .unwrap()
         .owner;
@@ -79,7 +79,7 @@ fn control() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     control.mark_ready().unwrap();
     (control, handle, driver)
 }
-fn dependency(handle: &JointAdmissionHandle, name: &str) -> JointDependency {
+pub(super) fn dependency(handle: &JointAdmissionHandle, name: &str) -> JointDependency {
     handle
         .register_dependency(SharedDependency::Network(
             NetworkServiceOrigin::from_selected_url(
@@ -89,7 +89,7 @@ fn dependency(handle: &JointAdmissionHandle, name: &str) -> JointDependency {
         ))
         .unwrap()
 }
-fn request(
+pub(super) fn request(
     handle: &JointAdmissionHandle,
     scope: &WorkScope,
     deps: &[&JointDependency],
@@ -107,10 +107,12 @@ fn request(
         )
         .unwrap()
 }
-fn poll(request: &mut JointAdmission) -> Poll<Result<JointGrantedBatch, JointAdmissionFailure>> {
+pub(super) fn poll(
+    request: &mut JointAdmission,
+) -> Poll<Result<JointGrantedBatch, JointAdmissionFailure>> {
     Pin::new(request).poll(&mut Context::from_waker(Waker::noop()))
 }
-fn drive(driver: &mut JointProgressDriver) {
+pub(super) fn drive(driver: &mut JointProgressDriver) {
     for _ in 0..200_000 {
         if matches!(driver.step(), JointProgress::Idle(_)) {
             return;
@@ -118,7 +120,7 @@ fn drive(driver: &mut JointProgressDriver) {
     }
     panic!("joint progression did not become idle");
 }
-fn granted(request: &mut JointAdmission) -> JointGrantedClaims {
+pub(super) fn granted(request: &mut JointAdmission) -> JointGrantedClaims {
     match poll(request) {
         Poll::Ready(Ok(batch)) => {
             assert!(batch.adjustment.is_none());
@@ -127,7 +129,7 @@ fn granted(request: &mut JointAdmission) -> JointGrantedClaims {
         other => panic!("expected original grant: {other:?}"),
     }
 }
-fn held(control: &WorkloadControl) -> (usize, u64) {
+pub(super) fn held(control: &WorkloadControl) -> (usize, u64) {
     let state = control.inner.state.lock().unwrap();
     let ledger = state.joint.as_ref().unwrap();
     (
@@ -730,12 +732,12 @@ fn batch(request: &mut JointAdmission) -> JointGrantedBatch {
         other => panic!("expected granted batch: {other:?}"),
     }
 }
-fn adjustment(request: &mut JointAdmission) -> JointAdjustmentReceipt {
+pub(super) fn adjustment(request: &mut JointAdmission) -> JointAdjustmentReceipt {
     let batch = batch(request);
     assert!(batch.new_claims.is_empty());
     batch.adjustment.expect("adjustment receipt")
 }
-fn roomy_control() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+pub(super) fn roomy_control() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     let control = WorkloadControl::try_new_counted(WorkloadConfig::default())
         .unwrap()
         .owner;
