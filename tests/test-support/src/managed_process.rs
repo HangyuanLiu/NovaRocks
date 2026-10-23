@@ -20,7 +20,7 @@
 mod captured_command;
 use crate::{
     ManagedCommand,
-    monitor_client::{Material, OwnedMonitor},
+    monitor_client::{Final, Material, OwnedMonitor, PayloadLifetimeExpired},
     unix,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -533,10 +533,9 @@ impl ManagedProcess {
             .checked_add(timeout)
             .context("one-shot deadline overflow")?;
         let mut process = Self::spawn_until(label, command, marker, deadline, log_hint, true)?;
-        let final_record = process.owner.wait(deadline);
+        let final_record = process.wait_until(deadline);
         match final_record {
             Ok(final_record) => {
-                process.settled = true;
                 ensure!(
                     final_record.status.success(),
                     "one-shot process did not exit successfully: {}",
@@ -551,13 +550,32 @@ impl ManagedProcess {
         }
     }
 
+    fn wait_until(&mut self, deadline: Instant) -> Result<Final> {
+        let result = self.owner.wait(deadline);
+        // This typed error follows actual monitor exit and a clean Final. The
+        // work failure remains an error even though cleanup has settled.
+        if result.is_ok()
+            || result
+                .as_ref()
+                .is_err_and(|error| error.is::<PayloadLifetimeExpired>())
+        {
+            self.settled = true;
+        }
+        result
+    }
+
+    /// True only after the monitor was actually waited and its clean Final
+    /// was validated. Work failure and the original exit status are separate.
+    pub fn cleanup_settled(&self) -> bool {
+        self.settled
+    }
+
     pub fn stop(&mut self) -> Result<()> {
         if self.settled {
             return Ok(());
         }
         self.owner.send(b'S')?;
-        self.owner.wait(Instant::now() + Duration::from_secs(10))?;
-        self.settled = true;
+        self.wait_until(Instant::now() + Duration::from_secs(10))?;
         Ok(())
     }
     pub fn kill_now(&mut self) -> Result<()> {
@@ -565,8 +583,7 @@ impl ManagedProcess {
             return Ok(());
         }
         self.owner.send(b'K')?;
-        self.owner.wait(Instant::now() + Duration::from_secs(10))?;
-        self.settled = true;
+        self.wait_until(Instant::now() + Duration::from_secs(10))?;
         Ok(())
     }
     pub fn request_termination(&mut self) -> Result<()> {
@@ -582,8 +599,7 @@ impl ManagedProcess {
             Instant::now() < deadline,
             "original successful-exit deadline expired"
         );
-        let final_record = self.owner.wait(deadline)?;
-        self.settled = true;
+        let final_record = self.wait_until(deadline)?;
         ensure!(
             final_record.status.success(),
             "{} did not exit successfully after SIGTERM: {}",
@@ -602,14 +618,13 @@ impl ManagedProcess {
             .checked_add(timeout)
             .context("interrupt deadline overflow")?;
         self.owner.send_until(b'I', deadline)?;
-        let final_record = match self.owner.wait(deadline) {
+        let final_record = match self.wait_until(deadline) {
             Ok(record) => record,
             Err(primary) => {
                 let cleanup = self.kill_now();
                 return Err(primary.context(format!("interrupt timeout cleanup: {cleanup:?}")));
             }
         };
-        self.settled = true;
         ensure!(
             final_record.status.success(),
             "{} did not exit successfully after SIGINT: {}",

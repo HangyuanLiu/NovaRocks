@@ -909,6 +909,7 @@ struct BackendNativeFaultProxies {
     proxies: BTreeMap<usize, NativeFaultProxy>,
     control_proxies: BTreeMap<usize, NativeFaultProxy>,
     root_reply_proxies: BTreeMap<usize, RootReplyFaultProxy>,
+    root_reply_joined: bool,
 }
 
 impl BackendNativeFaultProxies {
@@ -1065,11 +1066,21 @@ impl BackendNativeFaultProxies {
                 ));
             }
         }
+        self.root_reply_joined = failures.is_empty();
         if failures.is_empty() {
             Ok(())
         } else {
             bail!(failures.join("; "))
         }
+    }
+
+    fn writer_exit_observed(&self) -> bool {
+        self.root_reply_joined
+            && self
+                .proxies
+                .values()
+                .chain(self.control_proxies.values())
+                .all(NativeFaultProxy::writer_exit_observed)
     }
 
     fn stop(&mut self) {
@@ -3022,6 +3033,11 @@ pub trait ServerHandle: Send {
     fn residual_process_ids(&self) -> Vec<u32> {
         Vec::new()
     }
+    /// Actual owned writer settlement, independent of a lifecycle error.
+    /// Unsupported owners never authorize scratch reclamation by default.
+    fn writer_exit_observed(&self) -> bool {
+        false
+    }
     /// Preserve original runtime and process diagnostics when the caller's
     /// outcome has failed, even if subsequent process cleanup succeeds.
     fn retain_runtime_artifacts(&mut self) {}
@@ -3580,6 +3596,8 @@ pub struct CrossProcessServerHandle {
     retain_runtime_artifacts: bool,
     test_sessions: Option<ClusterTestSessionPlan>,
     role_build_information: RoleBuildInformationEvidence,
+    role_sessions_joined: bool,
+    unconfirmed_role_launch: bool,
     fixture_budget: Option<fixture_run::RunBudget>,
 }
 
@@ -4346,6 +4364,8 @@ impl CrossProcessServerHandle {
             retain_runtime_artifacts: false,
             test_sessions,
             role_build_information: RoleBuildInformationEvidence::default(),
+            role_sessions_joined: false,
+            unconfirmed_role_launch: false,
             fixture_budget,
         })
     }
@@ -4843,8 +4863,10 @@ impl CrossProcessServerHandle {
             failures[1] = Some(error);
         }
         // Always settle this same FE, including failed/expired successful-exit wait.
+        self.role_sessions_joined = true;
         if let Some(plan) = &mut self.test_sessions {
             if let Err(error) = plan.end_and_join() {
+                self.role_sessions_joined = false;
                 let detail = format!("join exact fixture role sessions: {error:#}");
                 failures[0] = Some(match failures[0].take() {
                     Some(primary) => anyhow::anyhow!("{primary:#}; {detail}"),
@@ -4894,8 +4916,10 @@ impl CrossProcessServerHandle {
             self.retain_runtime_artifacts = true;
             failures.push(format!("retain actual role build information: {error:#}"));
         }
+        self.role_sessions_joined = true;
         if let Some(plan) = &mut self.test_sessions {
             if let Err(error) = plan.end_and_join() {
+                self.role_sessions_joined = false;
                 failures.push(format!("join role test sessions: {error:#}"));
             }
         }
@@ -5808,6 +5832,9 @@ impl ServerHandle for CrossProcessServerHandle {
             "be-{index}-restart-{}.build-info.json",
             next_fragment_failure_token(index)
         ));
+        let previous_unconfirmed_launch = self.unconfirmed_role_launch;
+        self.unconfirmed_role_launch = true;
+        self.role_sessions_joined = false;
         if let Some(plan) = &mut self.test_sessions {
             if let Some(declaration) =
                 plan.prepare_launch(RoleSlot::Backend(index), &binary, &evidence, deadline)?
@@ -5838,6 +5865,7 @@ impl ServerHandle for CrossProcessServerHandle {
             )
             .map_err(|error| map_novarocks_process_error(&binary, "be", marker, error))
             .with_context(|| format!("restart cross-process BE[{index}]"))?;
+        self.unconfirmed_role_launch = previous_unconfirmed_launch;
         let launch_identity = process_resources::capture_process_launch_identity(
             format!("be-{index}"),
             be_process.pid(),
@@ -6010,6 +6038,9 @@ impl ServerHandle for CrossProcessServerHandle {
             "fe-restart-{}.build-info.json",
             next_fragment_failure_token(0)
         ));
+        let previous_unconfirmed_launch = self.unconfirmed_role_launch;
+        self.unconfirmed_role_launch = true;
+        self.role_sessions_joined = false;
         if let Some(plan) = &mut self.test_sessions {
             if let Some(declaration) =
                 plan.prepare_launch(RoleSlot::Frontend, &binary, &evidence, deadline)?
@@ -6035,6 +6066,7 @@ impl ServerHandle for CrossProcessServerHandle {
             )
             .map_err(|error| map_novarocks_process_error(&self.fe_binary, "fe", marker, error))
             .context("restart cross-process FE")?;
+        self.unconfirmed_role_launch = previous_unconfirmed_launch;
         self.fe_launch_identity =
             process_resources::capture_process_launch_identity("fe", self.fe_process.pid())
                 .context("capture FE process identity after restart")?;
@@ -6087,6 +6119,17 @@ impl ServerHandle for CrossProcessServerHandle {
             .with_context(|| format!("execute KILL QUERY {connection_id}"))?;
         println!("executed KILL QUERY {connection_id} through a separate control session");
         Ok(())
+    }
+
+    fn writer_exit_observed(&self) -> bool {
+        !self.unconfirmed_role_launch
+            && self.role_sessions_joined
+            && self.native_fault_proxies.writer_exit_observed()
+            && self.fe_process.cleanup_settled()
+            && self
+                .be_processes
+                .iter()
+                .all(ManagedProcess::cleanup_settled)
     }
 
     fn shutdown(&mut self) -> Result<()> {
