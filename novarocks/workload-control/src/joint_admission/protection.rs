@@ -253,6 +253,37 @@ pub(super) struct ProtectionProof {
     graph_reserved: bool,
 }
 
+/// Actual graph arrays; the inline headers are already inside the driver.
+/// One graph is reused across coordinates, never one graph per coordinate.
+pub(super) fn graph_backing_bytes(
+    profiles: usize,
+    affected: usize,
+    max_arcs: usize,
+) -> Result<usize, crate::WorkError> {
+    use crate::control_storage::{array_bytes, sum_bytes};
+    let overflow = crate::WorkError::ArithmeticOverflow;
+    let nodes = profiles
+        .checked_add(affected)
+        .and_then(|n| n.checked_add(2))
+        .ok_or_else(|| overflow.clone())?;
+    let arcs = profiles
+        .checked_mul(affected.checked_add(1).ok_or_else(|| overflow.clone())?)
+        .and_then(|n| n.checked_add(affected))
+        .and_then(|n| n.checked_mul(2))
+        .ok_or(overflow)?
+        .min(max_arcs);
+    sum_bytes([
+        array_bytes::<u8>(profiles)?,
+        array_bytes::<Edge>(arcs)?,
+        array_bytes::<Option<usize>>(nodes)?
+            .checked_mul(2)
+            .ok_or(crate::WorkError::ArithmeticOverflow)?,
+        array_bytes::<usize>(nodes)?
+            .checked_mul(3)
+            .ok_or(crate::WorkError::ArithmeticOverflow)?,
+    ])
+}
+
 impl ProtectionProof {
     // Ownership transfer only. No input traversal, allocation, or proof runs here.
     pub(super) fn new(input: ProofInput, bounds: SolverBounds) -> Self {

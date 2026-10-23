@@ -67,7 +67,23 @@ pub(crate) fn prototype_profile(
         children_per_slot,
         proposals_per_slot: 2,
     };
-    let base = crate::joint_admission::ledger::control_storage_base(storage).unwrap();
+    let mut config = JointCapacityConfig {
+        global: JointResourceLimits::default(),
+        classes: [JointResourceLimits::default(); 5],
+        lanes: [JointResourceLimits::default(); 3],
+        class_lanes: [[JointResourceLimits::default(); 3]; 5],
+        max_dependencies_per_claim: max_dependencies,
+        max_registered_dependencies: count,
+        max_claims: count * 2,
+        max_requests: count * 2,
+        max_changes_per_request: max_changes,
+        max_snapshot_bytes: 16 * 1024 * 1024,
+        max_scratch_bytes: 16 * 1024 * 1024,
+        max_residual_arcs: 10000,
+        max_total_proof_work: 10000000,
+        work_per_turn: NonZeroUsize::new(7).unwrap(),
+    };
+    let base = crate::joint_admission::ledger::control_storage_base(storage, &config).unwrap();
     let metadata = base.get(JointResource::MetadataBytes);
     let global = JointResources::ZERO
         .with(JointResource::ScopeRecords, count as u64)
@@ -88,22 +104,10 @@ pub(crate) fn prototype_profile(
     lanes[0] = limit;
     let mut class_lanes = [[JointResourceLimits::default(); 3]; 5];
     class_lanes[0][0] = limit;
-    let config = JointCapacityConfig {
-        global: limit,
-        classes,
-        lanes,
-        class_lanes,
-        max_dependencies_per_claim: max_dependencies,
-        max_registered_dependencies: count,
-        max_claims: count * 2,
-        max_requests: count * 2,
-        max_changes_per_request: max_changes,
-        max_snapshot_bytes: 16 * 1024 * 1024,
-        max_scratch_bytes: 16 * 1024 * 1024,
-        max_residual_arcs: 10000,
-        max_total_proof_work: 10000000,
-        work_per_turn: NonZeroUsize::new(7).unwrap(),
-    };
+    config.global = limit;
+    config.classes = classes;
+    config.lanes = lanes;
+    config.class_lanes = class_lanes;
     // This minimum is only the storage substrate, never a complete role.
     let mut required = RequiredJointProgress {
         global: base,
@@ -1738,11 +1742,16 @@ fn storage_fanout_is_finite_configurable_and_charged_from_actual_layout() {
         children_per_slot: 4,
         ..narrow
     };
-    let narrow = crate::joint_admission::ledger::control_storage_base(narrow).unwrap();
-    let wider = crate::joint_admission::ledger::control_storage_base(wider).unwrap();
+    let (control, _, _driver) = prototype_profile(4, 1, 1, 1);
+    let geometry = {
+        let state = control.inner.state.lock().unwrap();
+        state.joint.as_ref().unwrap().config_for_test()
+    };
+    let narrow = crate::joint_admission::ledger::control_storage_base(narrow, &geometry).unwrap();
+    let wider = crate::joint_admission::ledger::control_storage_base(wider, &geometry).unwrap();
     assert!(wider.get(JointResource::MetadataBytes) > narrow.get(JointResource::MetadataBytes));
     assert!(matches!(
-        crate::joint_admission::ledger::control_storage_base(impossible),
+        crate::joint_admission::ledger::control_storage_base(impossible, &geometry),
         Err(WorkError::InvalidConfig("fixed control storage geometry"))
     ));
 }
@@ -2030,5 +2039,69 @@ fn reply_handoff_panic_releases_undelivered_claims_for_new_and_mixed_batches() {
         work.owner.complete();
         drain(&mut driver);
         assert!(control.inner.state.lock().unwrap().cancellations.drained());
+    }
+}
+
+#[test]
+fn metadata_reservation_tracks_actual_service_geometry_and_rejects_overflow_before_build() {
+    let (control, _, _driver) = prototype_profile(4, 1, 1, 1);
+    let geometry = {
+        let state = control.inner.state.lock().unwrap();
+        state.joint.as_ref().unwrap().config_for_test()
+    };
+    let storage = ControlStorageConfig {
+        slots_per_class: [4, 0, 0, 0, 0],
+        children_per_slot: 1,
+        proposals_per_slot: 2,
+    };
+    let quote = |geometry: &JointCapacityConfig| {
+        crate::joint_admission::ledger::control_storage_base(storage, geometry)
+    };
+    let baseline = quote(&geometry).unwrap().get(JointResource::MetadataBytes);
+    for larger in [
+        JointCapacityConfig {
+            max_registered_dependencies: 8,
+            ..geometry.clone()
+        },
+        JointCapacityConfig {
+            max_dependencies_per_claim: 2,
+            ..geometry.clone()
+        },
+        JointCapacityConfig {
+            max_changes_per_request: 2,
+            ..geometry.clone()
+        },
+        JointCapacityConfig {
+            max_claims: 16,
+            ..geometry.clone()
+        },
+    ] {
+        assert!(
+            quote(&larger).unwrap().get(JointResource::MetadataBytes) > baseline,
+            "fixed cells cannot reuse a smaller metadata fee for a larger service"
+        );
+    }
+    for overflow in [
+        JointCapacityConfig {
+            max_dependencies_per_claim: usize::MAX,
+            ..geometry.clone()
+        },
+        JointCapacityConfig {
+            max_registered_dependencies: usize::MAX,
+            ..geometry.clone()
+        },
+        JointCapacityConfig {
+            max_changes_per_request: usize::MAX,
+            ..geometry.clone()
+        },
+        JointCapacityConfig {
+            max_claims: usize::MAX,
+            ..geometry.clone()
+        },
+    ] {
+        assert!(matches!(
+            quote(&overflow),
+            Err(WorkError::ArithmeticOverflow)
+        ));
     }
 }

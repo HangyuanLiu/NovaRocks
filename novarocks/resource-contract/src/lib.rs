@@ -25,8 +25,6 @@ use std::{
     sync::Arc,
 };
 
-const MAX_ORIGIN_BYTES: usize = 1024;
-
 /// A network service's HTTP origin, independent of catalog alias, object path,
 /// credentials and credential epoch. HTTP default ports use the URL author's
 /// origin normalization. Distinct DNS names are not guessed to be equivalent.
@@ -34,6 +32,9 @@ const MAX_ORIGIN_BYTES: usize = 1024;
 pub struct NetworkServiceOrigin(Arc<str>);
 
 impl NetworkServiceOrigin {
+    /// Maximum canonical origin output from this fact author, in bytes.
+    pub const MAX_BYTES: usize = 1024;
+
     /// Project the HTTP(S) URL already parsed by the route's original owner.
     /// This does not parse, resolve DNS, acquire credentials or authorize I/O.
     /// Path, user information, query and fragment are never copied or retained.
@@ -59,7 +60,7 @@ impl NetworkServiceOrigin {
             .checked_add(3)
             .and_then(|len| len.checked_add(host.len()))
             .and_then(|len| len.checked_add(suffix_len))
-            .filter(|len| *len <= MAX_ORIGIN_BYTES)
+            .filter(|len| *len <= Self::MAX_BYTES)
             .ok_or(DependencyFactError::EndpointTooLong)?;
         // Reject before allocating any output. String and final Arc backing
         // coexist during conversion; both have this source-derived byte bound.
@@ -203,12 +204,12 @@ mod tests {
         ] {
             let suffix = port.map_or_else(String::new, |port| format!(":{port}"));
             let overhead = "https://".len() + suffix.len();
-            let host = "a".repeat(MAX_ORIGIN_BYTES - overhead);
+            let host = "a".repeat(NetworkServiceOrigin::MAX_BYTES - overhead);
             // url 2.5.7 intentionally ignores DNS length in its URL host
             // parser. No DNS lookup or network operation occurs here.
             let selected = url::Url::parse(&format!("https://{host}{suffix}/path")).unwrap();
             let fact = NetworkServiceOrigin::from_selected_url(&selected).unwrap();
-            assert_eq!(fact.as_str().len(), MAX_ORIGIN_BYTES);
+            assert_eq!(fact.as_str().len(), NetworkServiceOrigin::MAX_BYTES);
             let too_long = url::Url::parse(&format!("https://{host}a{suffix}/path")).unwrap();
             assert_eq!(
                 NetworkServiceOrigin::from_selected_url(&too_long),

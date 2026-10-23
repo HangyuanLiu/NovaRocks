@@ -33,6 +33,7 @@ use std::{
 };
 
 mod control_storage;
+mod metadata_geometry;
 pub(crate) mod proposal_storage;
 #[cfg(test)]
 pub(crate) use control_storage::control_storage_base;

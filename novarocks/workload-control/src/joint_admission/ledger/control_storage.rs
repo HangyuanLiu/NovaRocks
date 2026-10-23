@@ -21,10 +21,11 @@ use super::*;
 use crate::control_storage::{ControlSlot, ControlStorageConfig};
 
 /// The actual storage envelope used by configuration. This deliberately covers
-/// this substrate only, not queued body graphs, actor mailboxes, Provider parsing
-/// or complete roles. Proposal body geometry remains a separate prerequisite.
+/// fixed joint metadata service, not caller-built vectors, task/Waker graphs,
+/// Provider URL input parsing or complete roles. No production activation.
 pub(crate) fn control_storage_base(
     config: ControlStorageConfig,
+    joint: &JointCapacityConfig,
 ) -> Result<JointResources, WorkError> {
     use crate::control_storage::{
         arc_bytes, btree_peak_bytes, resources_for_bytes, storage_cell_bytes,
@@ -46,21 +47,32 @@ pub(crate) fn control_storage_base(
     let cell = storage_cell_bytes(config.children_per_slot)?
         .checked_add(proposal_bytes)
         .ok_or(WorkError::ArithmeticOverflow)?;
-    let facts = arc_bytes::<ProfileFacts>()?
-        .checked_add(arc_bytes::<ProfileKey>()?)
-        .and_then(|n| n.checked_add(2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()))
+    let proposals = count
+        .checked_mul(config.proposals_per_slot)
         .ok_or(WorkError::ArithmeticOverflow)?;
     let mut bytes = cell
-        .checked_add(facts)
-        .and_then(|n| n.checked_mul(count))
+        .checked_mul(count)
         .and_then(|n| n.checked_add(std::mem::size_of::<CancellationStorage>()))
+        .ok_or(WorkError::ArithmeticOverflow)?;
+    bytes = bytes
+        .checked_add(metadata_geometry::backing_bytes(
+            joint,
+            proposals,
+            config.slots_per_class.iter().filter(|n| **n != 0).count(),
+        )?)
         .ok_or(WorkError::ArithmeticOverflow)?;
     // Fixed inventory reserves the original maps' retained roots and one
     // insertion path peak. These are whole-map amounts, counted exactly once.
     for map in [
         btree_peak_bytes::<WorkId, crate::scope::Node>(count)?,
-        btree_peak_bytes::<u64, ClaimRecord>(count)?,
-        btree_peak_bytes::<Arc<ProfileKey>, ProfileRecord>(count)?,
+        btree_peak_bytes::<u64, ClaimRecord>(joint.max_claims)?,
+        // Sorted commit may install a new key before retiring a zero old key.
+        btree_peak_bytes::<Arc<ProfileKey>, ProfileRecord>(
+            joint
+                .max_claims
+                .checked_add(joint.max_changes_per_request)
+                .ok_or(WorkError::ArithmeticOverflow)?,
+        )?,
         btree_peak_bytes::<u64, RequestRecord>(
             count
                 .checked_mul(config.proposals_per_slot)
@@ -88,7 +100,11 @@ impl WorkloadControl {
         config: ControlStorageConfig,
     ) -> Result<(), WorkError> {
         let count = config.count()?;
-        let base = control_storage_base(config)?;
+        let geometry = {
+            let state = self.inner.state.lock().unwrap();
+            Arc::clone(&state.joint.as_ref().ok_or(WorkError::NotReady)?.config)
+        };
+        let base = control_storage_base(config, &geometry.config)?;
         if count != self.inner.config.scope_records_limit {
             return Err(WorkError::InvalidConfig("fixed control scope inventory"));
         }
@@ -317,6 +333,10 @@ impl JointLedger {
 
 #[cfg(test)]
 impl JointLedger {
+    pub(crate) fn config_for_test(&self) -> JointCapacityConfig {
+        self.config.config.clone()
+    }
+
     pub(crate) fn control_snapshot_for_test(&self) -> (usize, usize, JointResources, usize) {
         let mut amount = JointResources::ZERO;
         let mut records = 0;

@@ -456,6 +456,25 @@ pub(crate) fn arc_bytes<T>() -> Result<usize, WorkError> {
         .map_err(|_| WorkError::ArithmeticOverflow)
 }
 
+pub(crate) fn arc_slice_bytes<T>(count: usize) -> Result<usize, WorkError> {
+    Layout::new::<[AtomicUsize; 2]>()
+        .extend(Layout::array::<T>(count).map_err(|_| WorkError::ArithmeticOverflow)?)
+        .map(|(layout, _)| layout.pad_to_align().size())
+        .map_err(|_| WorkError::ArithmeticOverflow)
+}
+
+pub(crate) fn array_bytes<T>(count: usize) -> Result<usize, WorkError> {
+    Layout::array::<T>(count)
+        .map(|layout| layout.size())
+        .map_err(|_| WorkError::ArithmeticOverflow)
+}
+
+pub(crate) fn sum_bytes(values: impl IntoIterator<Item = usize>) -> Result<usize, WorkError> {
+    values.into_iter().try_fold(0usize, |sum, n| {
+        sum.checked_add(n).ok_or(WorkError::ArithmeticOverflow)
+    })
+}
+
 /// Source-pinned Rust 1.98.1 BTree upper layout: eleven key/value slots,
 /// parent pointer/index/length, and twelve internal child pointers. Every
 /// retained node is conservatively charged as an internal allocation.

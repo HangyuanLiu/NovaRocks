@@ -100,6 +100,106 @@ struct Turn {
     work_limit: u64,
     _exit: crate::scope::ReclaimWakeOnExit,
 }
+// The return type ties this count to the actual closed projection author.
+const PROFILE_PROJECTION_COUNT: usize = 4;
+fn profile_projections(facts: &ProfileFacts) -> [usize; PROFILE_PROJECTION_COUNT] {
+    [
+        0,
+        1 + class_index(facts.class),
+        1 + CLASS_COUNT + facts.lane as usize,
+        1 + CLASS_COUNT + LANE_COUNT + class_index(facts.class) * LANE_COUNT + facts.lane as usize,
+    ]
+}
+
+pub(super) fn profile_checked_coordinates(amounts: &[u128]) -> Result<Vec<usize>, WorkError> {
+    if amounts.len() != COORDINATE_COUNT {
+        return Err(WorkError::Conflict);
+    }
+    let count = amounts.iter().filter(|amount| **amount != 0).count();
+    if count > PROFILE_PROJECTION_COUNT * RESOURCE_COUNT {
+        return Err(WorkError::Conflict);
+    }
+    let mut checked = Vec::new();
+    checked
+        .try_reserve_exact(count)
+        .map_err(|_| WorkError::Capacity("joint checked coordinates"))?;
+    for (index, amount) in amounts.iter().enumerate() {
+        if *amount != 0 {
+            checked.push(index);
+        }
+    }
+    Ok(checked)
+}
+
+/// The one actual process driver pays old snapshots independently of role
+/// recycling. Published facts and registry records are quoted by the ledger.
+pub(super) fn metadata_backing_bytes(
+    config: &JointCapacityConfig,
+    requests: usize,
+) -> Result<usize, WorkError> {
+    use crate::control_storage::{array_bytes, btree_peak_bytes, sum_bytes};
+    let n = config.max_claims;
+    let k = config.max_dependencies_per_claim;
+    let c = config.max_changes_per_request;
+    let d = n
+        .checked_mul(k)
+        .ok_or(WorkError::ArithmeticOverflow)?
+        .min(config.max_registered_dependencies);
+    let build_d = n
+        .checked_add(c)
+        .and_then(|n| n.checked_mul(k))
+        .ok_or(WorkError::ArithmeticOverflow)?
+        .min(
+            config
+                .max_registered_dependencies
+                .checked_add(1)
+                .ok_or(WorkError::ArithmeticOverflow)?,
+        );
+    let per_profile = sum_bytes([
+        array_bytes::<usize>(k)?,
+        array_bytes::<u128>(COORDINATE_COUNT)?,
+    ])?;
+    let numeric = sum_bytes([
+        array_bytes::<ExactProfile>(n)?,
+        n.checked_mul(per_profile)
+            .ok_or(WorkError::ArithmeticOverflow)?,
+        array_bytes::<CoordinateLimit>(COORDINATE_COUNT)?,
+        COORDINATE_COUNT
+            .checked_mul(array_bytes::<u128>(d)?)
+            .ok_or(WorkError::ArithmeticOverflow)?,
+        // Replacing affected and checked-coordinate vectors retains old+new.
+        array_bytes::<usize>(k)?
+            .checked_mul(2)
+            .ok_or(WorkError::ArithmeticOverflow)?,
+        // Exact positive-count reserve; original and replacement coexist.
+        array_bytes::<usize>(PROFILE_PROJECTION_COUNT * RESOURCE_COUNT)?
+            .checked_mul(2)
+            .ok_or(WorkError::ArithmeticOverflow)?,
+    ])?;
+    let graph = protection::graph_backing_bytes(n, k, config.max_residual_arcs)?;
+    // Drop keeps a cancelled active graph while collecting original tickets
+    // and outgoing wakers. Both authors reserve exact request count first.
+    let shutdown = sum_bytes([
+        array_bytes::<u64>(requests)?,
+        array_bytes::<std::task::Waker>(requests)?,
+    ])?;
+    // Granted new_ids stay in their proposal's existing reply envelope.
+    let commit = btree_peak_bytes::<Arc<ProfileKey>, ProfileRecord>(
+        c.checked_mul(2).ok_or(WorkError::ArithmeticOverflow)?,
+    )?;
+    sum_bytes([
+        // active: Option<Turn> already includes all Turn/ProofInput/graph headers.
+        std::mem::size_of::<JointProgressDriver>(),
+        array_bytes::<ProfileRecord>(n)?,
+        btree_peak_bytes::<u64, usize>(build_d)?,
+        numeric,
+        graph
+            .checked_add(shutdown)
+            .ok_or(WorkError::ArithmeticOverflow)?
+            .max(commit),
+    ])
+}
+
 impl JointProgressDriver {
     pub(super) fn new(inner: Arc<Inner>, config: Arc<ValidatedJointCapacityConfig>) -> Self {
         Self {
@@ -534,14 +634,16 @@ impl JointProgressDriver {
             }
             let claim = &turn.changes[turn.next_change].claim;
             let profile = turn.profile(&claim.facts, claim.amounts);
+            let checked = match profile_checked_coordinates(&profile.amounts) {
+                Ok(checked) => checked,
+                Err(error) => {
+                    self.finish(turn, Err(error), false);
+                    return JointProgress::More;
+                }
+            };
             let input = turn.input.as_mut().unwrap();
             input.affected_dependencies = profile.dependencies.clone();
-            input.checked_coordinates = profile
-                .amounts
-                .iter()
-                .enumerate()
-                .filter_map(|(index, amount)| (*amount != 0).then_some(index))
-                .collect();
+            input.checked_coordinates = checked;
             input.profiles.push(profile);
             turn.next_change += 1;
             let mut bounds = self.config.solver_bounds();
@@ -886,15 +988,7 @@ impl Turn {
     }
     fn profile(&self, facts: &ProfileFacts, values: JointResources) -> ExactProfile {
         let mut amounts = vec![0; COORDINATE_COUNT];
-        for projection in [
-            0,
-            1 + class_index(facts.class),
-            1 + CLASS_COUNT + facts.lane as usize,
-            1 + CLASS_COUNT
-                + LANE_COUNT
-                + class_index(facts.class) * LANE_COUNT
-                + facts.lane as usize,
-        ] {
+        for projection in profile_projections(facts) {
             for index in 0..RESOURCE_COUNT {
                 amounts[projection * RESOURCE_COUNT + index] = u128::from(values.0[index]);
             }
@@ -931,10 +1025,16 @@ impl Drop for JointProgressDriver {
             let ledger = state.joint.as_mut().unwrap();
             ledger.driver_closed = true;
             ledger.active = None;
-            let ids: Vec<_> = ledger.requests.keys().copied().collect();
-            ids.into_iter()
-                .filter_map(|id| fail_request(state, id, WorkError::Closed))
-                .collect::<Vec<_>>()
+            let count = ledger.requests.len();
+            let mut ids = Vec::with_capacity(count);
+            ids.extend(ledger.requests.keys().copied());
+            let mut wakers = Vec::with_capacity(count);
+            for id in ids {
+                if let Some(waker) = fail_request(state, id, WorkError::Closed) {
+                    wakers.push(waker);
+                }
+            }
+            wakers
         });
         for waker in wakers {
             waker.wake();

@@ -2098,3 +2098,27 @@ fn reply_handoff_panic_preserves_an_existing_physical_claim() {
     work.owner.complete();
     drive(&mut driver);
 }
+
+#[test]
+fn checked_coordinate_author_has_no_hidden_growth_and_refuses_extra_projections() {
+    let mut amounts = vec![0; COORDINATE_COUNT];
+    for amount in amounts.iter_mut().take(4 * RESOURCE_COUNT) {
+        *amount = 1;
+    }
+    let checked = super::driver::profile_checked_coordinates(&amounts).unwrap();
+    assert_eq!(checked.len(), 4 * RESOURCE_COUNT);
+    assert_eq!(
+        checked.capacity(),
+        checked.len(),
+        "metadata quote requires a single exact allocation"
+    );
+    amounts[4 * RESOURCE_COUNT] = 1;
+    assert!(matches!(
+        super::driver::profile_checked_coordinates(&amounts),
+        Err(WorkError::Conflict)
+    ));
+    assert!(matches!(
+        super::driver::profile_checked_coordinates(&[]),
+        Err(WorkError::Conflict)
+    ));
+}
