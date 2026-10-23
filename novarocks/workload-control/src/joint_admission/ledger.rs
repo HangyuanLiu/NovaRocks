@@ -538,6 +538,11 @@ impl JointAdmissionHandle {
                                     && old.active_amounts
                                         == state.cancellations.slots[slot.0].base
                                     && !dependencies.is_empty() => {}
+                            (ClaimSource::NodeControl { slot, .. }, false)
+                                if delta == JointResources::ZERO
+                                    && !old.active_facts.dependencies.is_empty()
+                                    && old.active_amounts
+                                        == state.cancellations.slots[slot.0].base => {}
                             _ => return Err(WorkError::Conflict),
                         }
                         old.structure_revision
@@ -604,12 +609,14 @@ impl JointAdmissionHandle {
             });
         }
         Ok(PreparedRequest {
-            // Binding the resident base is an exact finite proof, never an
-            // anonymous wait for capacity held by the same root.
-            budget: if changes
-                .iter()
-                .any(|change| matches!(change, JointClaimChange::FirstBind { .. }))
-            {
+            // A resident control rekey uses one cumulative finite proof,
+            // including later full-domain extensions. It cannot self-park.
+            budget: if records.iter().any(|record| {
+                record
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| matches!(source.source, ClaimSource::NodeControl { .. }))
+            }) {
                 RequestBudget::Finite {
                     remaining: config.max_total_proof_work,
                 }

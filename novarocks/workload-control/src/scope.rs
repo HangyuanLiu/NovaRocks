@@ -2658,6 +2658,215 @@ mod fixed_control_storage_tests {
     }
 
     #[test]
+    fn control_domain_extension_preserves_the_union_and_invalidates_an_old_child_receipt() {
+        use crate::joint_admission::JointClaimChange;
+        let (control, handle, mut driver) = prototype_profile(4, 1, 2, 1);
+        let a = selected_dependency(&handle, "a");
+        let b = selected_dependency(&handle, "b");
+        let expected = [a.fact().clone(), b.fact().clone()];
+        let parent = root(&control);
+        let scope = parent.owner.scope();
+        let mut binding = first_bind(&handle, &parent.owner, &a);
+        drain(&mut driver);
+        binding_receipt(&mut binding)
+            .install_control(&parent.owner, &[])
+            .unwrap();
+        let parent_slot = slot(&control, scope.id);
+        let parent_claim = control.inner.state.lock().unwrap().cancellations.slots[parent_slot.0]
+            .claim
+            .unwrap();
+        let mut child_request = handle
+            .request_child(&parent.owner, WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        drain(&mut driver);
+        let old_child = binding_receipt(&mut child_request);
+        let before = snapshot(&control);
+        let stale = parent.owner.control_claim_view().unwrap();
+        let mut extension = handle
+            .request(
+                &scope,
+                vec![JointClaimChange::grow_by(
+                    stale.clone(),
+                    JointResources::ZERO,
+                    vec![b.clone()],
+                )],
+            )
+            .unwrap();
+        drain(&mut driver);
+        binding_receipt(&mut extension)
+            .install_control(&parent.owner, &[])
+            .unwrap();
+        assert_eq!(
+            snapshot(&control),
+            before,
+            "domain union keeps the same original global vector"
+        );
+        assert!(
+            control
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .joint
+                .as_ref()
+                .unwrap()
+                .control_has_domains_for_test(parent_claim, &expected)
+        );
+        assert!(
+            matches!(
+                old_child.install_child(&parent.owner),
+                Err(WorkError::Conflict)
+            ),
+            "a child proved for the old parent cannot adopt the changed domain facts"
+        );
+        assert_eq!(
+            snapshot(&control),
+            before,
+            "a refused reply retains its old D until actual reset"
+        );
+        assert!(
+            handle
+                .request(
+                    &scope,
+                    vec![JointClaimChange::grow_by(
+                        stale,
+                        JointResources::ZERO,
+                        vec![b.clone()]
+                    )]
+                )
+                .is_err()
+        );
+        assert!(matches!(
+            handle.request(
+                &scope,
+                vec![JointClaimChange::grow_by(
+                    parent.owner.control_claim_view().unwrap(),
+                    JointResources::ZERO.with(JointResource::MetadataBytes, 1),
+                    vec![]
+                )]
+            ),
+            Err(crate::joint_admission::JointAdmissionFailure {
+                error: WorkError::Conflict
+            })
+        ));
+        drain(&mut driver);
+        let mut request = handle
+            .request_child(&parent.owner, WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        drain(&mut driver);
+        let child = binding_receipt(&mut request)
+            .install_child(&parent.owner)
+            .unwrap();
+        let child_slot = slot(&control, child.scope().id);
+        {
+            let state = control.inner.state.lock().unwrap();
+            assert!(state.joint.as_ref().unwrap().control_has_domains_for_test(
+                state.cancellations.slots[child_slot.0].claim.unwrap(),
+                &expected
+            ));
+        }
+        child.complete();
+        parent.business.release();
+        parent.owner.complete();
+        drain(&mut driver);
+        assert_eq!(snapshot(&control).3, 0);
+    }
+
+    #[test]
+    fn control_union_refusal_is_finite_and_never_discards_its_old_domain() {
+        use crate::joint_admission::JointClaimChange;
+        let (control, handle, mut driver) = prototype_profile(4, 1, 2, 1);
+        let a = selected_dependency(&handle, "a");
+        let b = selected_dependency(&handle, "b");
+        let parent = root(&control);
+        let mut binding = first_bind(&handle, &parent.owner, &a);
+        drain(&mut driver);
+        binding_receipt(&mut binding)
+            .install_control(&parent.owner, &[])
+            .unwrap();
+        let scope = parent.owner.scope();
+        let parent_slot = slot(&control, scope.id);
+        let claim = control.inner.state.lock().unwrap().cancellations.slots[parent_slot.0]
+            .claim
+            .unwrap();
+        let mut others = Vec::new();
+        for _ in 0..3 {
+            let work = root(&control);
+            let mut binding = first_bind(&handle, &work.owner, &b);
+            drain(&mut driver);
+            binding_receipt(&mut binding)
+                .install_control(&work.owner, &[])
+                .unwrap();
+            others.push(work);
+        }
+        let before = snapshot(&control);
+        let mut extension = handle
+            .request(
+                &scope,
+                vec![JointClaimChange::grow_by(
+                    parent.owner.control_claim_view().unwrap(),
+                    JointResources::ZERO,
+                    vec![b.clone()],
+                )],
+            )
+            .unwrap();
+        drain(&mut driver);
+        assert!(matches!(
+            std::pin::Pin::new(&mut extension).poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(crate::joint_admission::JointAdmissionFailure {
+                error: WorkError::Capacity(_)
+            }))
+        ));
+        assert_eq!(snapshot(&control), before);
+        assert!(
+            control
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .joint
+                .as_ref()
+                .unwrap()
+                .control_has_domains_for_test(claim, &[a.fact().clone()])
+        );
+        let exited = others.pop().unwrap();
+        exited.business.release();
+        exited.owner.complete();
+        drain(&mut driver);
+        let mut extension = handle
+            .request(
+                &scope,
+                vec![JointClaimChange::grow_by(
+                    parent.owner.control_claim_view().unwrap(),
+                    JointResources::ZERO,
+                    vec![b.clone()],
+                )],
+            )
+            .unwrap();
+        drain(&mut driver);
+        binding_receipt(&mut extension)
+            .install_control(&parent.owner, &[])
+            .unwrap();
+        assert!(
+            control
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .joint
+                .as_ref()
+                .unwrap()
+                .control_has_domains_for_test(claim, &[a.fact().clone(), b.fact().clone()])
+        );
+        for work in others.into_iter().chain(std::iter::once(parent)) {
+            work.business.release();
+            work.owner.complete();
+        }
+        drain(&mut driver);
+        assert_eq!(snapshot(&control).3, 0);
+    }
+
+    #[test]
     fn waiting_pool_proposals_do_not_reserve_a_slot_or_block_a_new_root_binding() {
         let (control, handle, mut driver) = prototype_full(4, 1);
         let a = selected_dependency(&handle, "a");
