@@ -192,7 +192,8 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::fragment::sink::{DataStreamPartitionType, DataStreamSinkFactoryInput};
 use crate::exec::operators::compiled_expression::{
-    RuntimeKernelControl, evaluate_all, instances as compiled_instances,
+    RuntimeKernelControl, evaluate_all, evaluate_selected, instances as compiled_instances,
+    root_value_type,
 };
 use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::exchange;
@@ -203,14 +204,14 @@ use crate::runtime::fragment::io::{
 };
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::task_execution::domain::ExchangeEdgeId;
-use arrow::array::ArrayRef;
+use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::datatypes::DataType;
 use novarocks_local_program::{LocalProgram, ProgramExpressionRootSite};
 use novarocks_types::SlotId;
 use novarocks_types::{UniqueId, format_uuid};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
@@ -1329,26 +1330,243 @@ pub(crate) use data_stream_sink_hash_partition::{
     partition_chunk_by_hash_arrays_created, take_partition_rows_created,
 };
 
-/// The partition-key roots of one compiled stream branch, in key order.
-/// They are evaluated through compiled roots over the sink's input port; a
-/// compiled sink retains its frozen root declarations.
+/// The caller freezes the partition algorithm independently of the legacy
+/// carrier spelling. Ordinary keeps the pre-existing exchange mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompiledPartitionRoute {
+    Ordinary,
+    HierarchicalV1,
+    ConditionalKeyV1,
+}
+
+/// The partition and optional applicability roots of one exact stream branch.
 #[derive(Clone)]
 pub(crate) struct CompiledPartitionKeys {
     program: Arc<LocalProgram>,
     sites: Vec<ProgramExpressionRootSite>,
+    route: CompiledPartitionRoute,
+    applies: Option<ProgramExpressionRootSite>,
 }
 
 impl CompiledPartitionKeys {
     pub(crate) fn new(program: Arc<LocalProgram>, sites: Vec<ProgramExpressionRootSite>) -> Self {
-        Self { program, sites }
+        Self {
+            program,
+            sites,
+            route: CompiledPartitionRoute::Ordinary,
+            applies: None,
+        }
+    }
+
+    #[expect(
+        dead_code,
+        reason = "Write-route construction remains closed until Task binding is installed."
+    )]
+    pub(crate) fn hierarchical(
+        program: Arc<LocalProgram>,
+        sites: Vec<ProgramExpressionRootSite>,
+    ) -> Self {
+        Self {
+            program,
+            sites,
+            route: CompiledPartitionRoute::HierarchicalV1,
+            applies: None,
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Write-route construction remains closed until Task binding is installed."
+        )
+    )]
+    pub(crate) fn conditional(
+        program: Arc<LocalProgram>,
+        sites: Vec<ProgramExpressionRootSite>,
+        applies: ProgramExpressionRootSite,
+    ) -> Self {
+        Self {
+            program,
+            sites,
+            route: CompiledPartitionRoute::ConditionalKeyV1,
+            applies: Some(applies),
+        }
     }
 }
 
-/// Per-driver compiled key state: one instance per key root, created on the
-/// driver's first non-empty chunk.
+/// Each driver owns its real compiled root instances. The action root is not
+/// evaluated again while keys and routes consume the selected row mapping.
 struct CompiledPartitionState {
     keys: CompiledPartitionKeys,
     instances: Option<Vec<CompiledExpressionInstance>>,
+    applicability_instances: Option<Vec<CompiledExpressionInstance>>,
+}
+
+/// Conditional arrays have one element per TRUE row; selected_rows maps that
+/// compact domain back to original payload rows. FALSE/NULL rows never enter
+/// a key expression or key decoder. The original creation owner keeps all
+/// temporary vectors charged through routing and publication of the takes.
+struct CompiledPartitionBatch {
+    arrays: Vec<ArrayRef>,
+    types: Vec<novarocks_type_contract::FunctionValueType>,
+    selected_rows: Option<Vec<usize>>,
+    route: CompiledPartitionRoute,
+    owner: Box<dyn crate::exec::pipeline::operator::InputConstructionOwner>,
+}
+
+fn request_partition_vector<T>(
+    owner: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
+    count: usize,
+) -> ExecutionResult<()> {
+    owner.request(std::alloc::Layout::array::<T>(count).map_err(|_| {
+        crate::exec::pipeline::operator::ConstructionFailure::from(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+        )
+    })?)?;
+    Ok(())
+}
+
+/// The SQL action decision has already become one Boolean value per row.
+fn selected_partition_rows(
+    mask: &BooleanArray,
+    payload_rows: usize,
+    owner: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
+    ctx: &StepContext<'_>,
+) -> ExecutionResult<Vec<usize>> {
+    if mask.len() != payload_rows {
+        return Err(stream_contract(
+            "conditional exchange applicability row count differs from payload",
+        ));
+    }
+    request_partition_vector::<usize>(owner, payload_rows)?;
+    let mut rows = Vec::with_capacity(payload_rows);
+    for row in 0..payload_rows {
+        if row.is_multiple_of(256) {
+            ctx.checkpoint()?;
+        }
+        if !mask.is_null(row) && mask.value(row) {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+/// Form disjoint original-row selections using the shared canonical tuple
+/// author and this level's frozen domain. Bypass is per row and per producer,
+/// and advances only for FALSE/NULL applicability rows across batch boundaries.
+fn instance_partition_rows(
+    keys: &CompiledPartitionBatch,
+    source: &Chunk,
+    input_rows: usize,
+    destinations: usize,
+    bypass_cursor: &mut usize,
+    ctx: &mut StepContext<'_>,
+) -> ExecutionResult<Vec<Vec<u32>>> {
+    use crate::exec::hash_table::partition_keys::{
+        native_tuple_hashes_observed, require_non_null_keys,
+    };
+    use novarocks_type_contract::PartitionHashDomain;
+    use novarocks_value_arrays::reachability::ReachableRows;
+    ctx.checkpoint()?;
+    check_partition_row_extent(input_rows)?;
+    if destinations == 0 || keys.route == CompiledPartitionRoute::Ordinary {
+        return Err(stream_contract(
+            "hierarchical exchange requires destinations and an explicit route",
+        ));
+    }
+    let conditional = keys.route == CompiledPartitionRoute::ConditionalKeyV1;
+    if conditional != keys.selected_rows.is_some() {
+        return Err(stream_contract(
+            "conditional exchange selection differs from its route",
+        ));
+    }
+    if let Some(rows) = &keys.selected_rows
+        && (rows.last().is_some_and(|row| *row >= input_rows)
+            || rows.windows(2).any(|pair| pair[0] >= pair[1]))
+    {
+        return Err(stream_contract(
+            "conditional exchange rows must be ordered within the payload",
+        ));
+    }
+    let active_rows = keys.selected_rows.as_ref().map_or(input_rows, Vec::len);
+    if keys.arrays.len() != keys.types.len()
+        || (active_rows != 0 && keys.arrays.is_empty())
+        || keys.arrays.iter().any(|array| array.len() != active_rows)
+    {
+        return Err(stream_contract(
+            "compiled exchange key columns differ from their selected row domain",
+        ));
+    }
+    let source_owner =
+        crate::exec::hash_table::partition_keys::source_key_owner(source, keys.owner.as_ref())?;
+    let owner = source_owner.as_ref();
+    let (control, conversions) = ctx.value_conversion_scope();
+    let checkpoint = || match control.error() {
+        Some(original) => Err(original),
+        None if control.is_stopped() => Err(novarocks_functions::KernelFailure::Cancelled.into()),
+        None => Ok(()),
+    };
+    let hashes = if active_rows == 0 {
+        None
+    } else {
+        let selected = ReachableRows::all(active_rows);
+        if conditional {
+            require_non_null_keys(&keys.arrays, &keys.types, &selected, &checkpoint)?;
+        }
+        Some(native_tuple_hashes_observed(
+            &keys.arrays,
+            &keys.types,
+            &selected,
+            conversions,
+            owner,
+            &checkpoint,
+        )?)
+    };
+    request_partition_vector::<usize>(owner, input_rows)?;
+    request_partition_vector::<usize>(owner, destinations)?;
+    request_partition_vector::<Vec<u32>>(owner, destinations)?;
+    let mut assignment = Vec::with_capacity(input_rows);
+    let mut counts = vec![0usize; destinations];
+    let mut next_selected = 0usize;
+    for row in 0..input_rows {
+        if row.is_multiple_of(256) {
+            checkpoint()?;
+        }
+        let selected_index = match &keys.selected_rows {
+            None => Some(row),
+            Some(rows) if rows.get(next_selected) == Some(&row) => {
+                let selected = next_selected;
+                next_selected += 1;
+                Some(selected)
+            }
+            Some(_) => None,
+        };
+        let destination = if let Some(selected) = selected_index {
+            let hash = hashes
+                .as_ref()
+                .and_then(|batch| batch.as_slice()[selected])
+                .ok_or_else(|| stream_contract("selected exchange key has no canonical hash"))?;
+            (PartitionHashDomain::InstanceV1.mix(hash) % destinations as u64) as usize
+        } else {
+            let destination = *bypass_cursor % destinations;
+            *bypass_cursor = (destination + 1) % destinations;
+            destination
+        };
+        counts[destination] += 1;
+        assignment.push(destination);
+    }
+    let mut rows = Vec::with_capacity(destinations);
+    for count in counts {
+        request_partition_vector::<u32>(owner, count)?;
+        rows.push(Vec::with_capacity(count));
+    }
+    for (row, destination) in assignment.into_iter().enumerate() {
+        rows[destination]
+            .push(u32::try_from(row).map_err(|_| stream_contract("exchange row exceeds UInt32"))?);
+    }
+    checkpoint()?;
+    Ok(rows)
 }
 
 /// Factory for distributed stream sinks that serialize and transmit chunks to remote fragment instances.
@@ -1361,7 +1579,7 @@ pub struct DataStreamSinkFactory {
     transmitter: Arc<dyn ExchangeFrameTransmitter>,
     plan_node_id: i32,
     finish_state: Arc<DataStreamSinkFinishState>,
-    shared_sequence: Arc<AtomicI64>,
+    shared_order: Arc<crate::runtime::fragment::io::exchange_queue::ExchangeSendOrder>,
     edge_gates: Option<Arc<ExchangeEdgeGates>>,
     compiled_partition: Option<CompiledPartitionKeys>,
 }
@@ -1392,7 +1610,7 @@ impl DataStreamSinkFactory {
             transmitter,
             plan_node_id,
             finish_state: Arc::new(DataStreamSinkFinishState::default()),
-            shared_sequence: Arc::new(AtomicI64::new(0)),
+            shared_order: crate::runtime::fragment::io::exchange_queue::ExchangeSendOrder::new(),
             edge_gates: None,
             compiled_partition: None,
         }
@@ -1409,6 +1627,22 @@ impl DataStreamSinkFactory {
                 "compiled partition keys do not match {} partitioning",
                 self.input.output_partition_type.display_name()
             )));
+        }
+        let conditional = keys.route == CompiledPartitionRoute::ConditionalKeyV1;
+        if conditional != keys.applies.is_some()
+            || (keys.route != CompiledPartitionRoute::Ordinary
+                && self.input.output_partition_type != DataStreamPartitionType::HashPartitioned)
+        {
+            return Err(stream_contract(
+                "compiled partition algorithm differs from its declared branch",
+            ));
+        }
+        if let Some(applies) = keys.applies
+            && root_value_type(&keys.program, applies)?.data_type() != &DataType::Boolean
+        {
+            return Err(stream_contract(
+                "conditional partition applicability must be Boolean",
+            ));
         }
         self.compiled_partition = Some(keys);
         Ok(self)
@@ -1515,7 +1749,7 @@ impl OperatorFactory for DataStreamSinkFactory {
             driver_id,
             sender_id,
             be_number,
-            shared_sequence: Arc::clone(&self.shared_sequence),
+            shared_order: Arc::clone(&self.shared_order),
             random_next: 0,
             pending_per_dest: Vec::new(),
             pending_bytes_per_dest: Vec::new(),
@@ -1547,6 +1781,7 @@ impl OperatorFactory for DataStreamSinkFactory {
                 CompiledPartitionState {
                     keys,
                     instances: None,
+                    applicability_instances: None,
                 }
             }),
         }))
@@ -1584,7 +1819,7 @@ struct DataStreamSinkOperator {
     driver_id: i32,
     sender_id: i32,
     be_number: i32,
-    shared_sequence: Arc<AtomicI64>,
+    shared_order: Arc<crate::runtime::fragment::io::exchange_queue::ExchangeSendOrder>,
     random_next: usize,
     pending_per_dest: Vec<VecDeque<Chunk>>,
     pending_bytes_per_dest: Vec<usize>,
@@ -2007,10 +2242,33 @@ impl DataStreamSinkOperator {
     }
 
     fn current_error(&self) -> Option<ExecutionFailure> {
-        self.error_state.as_ref().and_then(|state| state.error())
+        if let Some(error) = self.error_state.as_ref().and_then(|state| state.error()) {
+            return Some(error);
+        }
+        if let Some(error) = self.send_tracker.failure() {
+            return Some(error);
+        }
+        if self.input.delivery
+            == novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+            && !self.aborting.load(Ordering::Acquire)
+            && !self.end_of_stream_sent.load(Ordering::Acquire)
+            && self
+                .destinations()
+                .iter()
+                .enumerate()
+                .any(|(i, d)| !Self::is_pseudo_destination(d) && self.destination_withdrawn(i))
+        {
+            return Some(stream_contract(
+                "required exchange input withdrew before its End was delivered",
+            ));
+        }
+        None
     }
 
     fn maybe_mark_finished(&self) -> bool {
+        if self.current_error().is_some() {
+            return false;
+        }
         if self.finished.load(Ordering::Acquire) {
             return true;
         }
@@ -2105,47 +2363,114 @@ impl DataStreamSinkOperator {
         dest.finst_id().low() == -1
     }
 
-    /// Evaluate a compiled branch's partition keys over the whole chunk.
-    /// A legacy branch returns `None` and evaluates through its arena. Row
-    /// data errors and kernel failures of a key root stay typed.
-    fn compiled_partition_keys(&mut self, chunk: &Chunk) -> ExecutionResult<Option<Vec<ArrayRef>>> {
+    /// Evaluate applicability once over the original payload. Only its TRUE
+    /// rows demand key roots; selected INSERT and no-match rows keep their
+    /// original payload position without reading a target key.
+    fn compiled_partition_keys(
+        &mut self,
+        ctx: &StepContext<'_>,
+        chunk: &Chunk,
+    ) -> ExecutionResult<Option<CompiledPartitionBatch>> {
         let Some(state) = self.compiled_partition.as_mut() else {
             return Ok(None);
         };
-        let control = self.compiled_control.as_ref().ok_or_else(|| {
-            crate::runtime::fragment::ExecutionFailure::from(
-                crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
-            )
-        })?;
-        compiled_instances(
-            &mut state.instances,
-            &state.keys.program,
-            &state.keys.sites,
-            control,
+        ctx.checkpoint()?;
+        let control = self
+            .compiled_control
+            .as_ref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        let owner = self
+            .construction_factory
+            .as_deref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?
+            .begin_input_construction(chunk)?;
+        let selected_rows = if let Some(applies) = state.keys.applies {
+            compiled_instances(
+                &mut state.applicability_instances,
+                &state.keys.program,
+                &[applies],
+                control,
+            )?;
+            let instance = state
+                .applicability_instances
+                .as_mut()
+                .and_then(|items| items.first_mut())
+                .ok_or_else(|| {
+                    stream_contract("conditional exchange applicability instance is absent")
+                })?;
+            let array = evaluate_all(instance, applies, chunk.record_batch(), control)?;
+            let mask = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    stream_contract("conditional exchange applicability is not Boolean")
+                })?;
+            Some(selected_partition_rows(
+                mask,
+                chunk.len(),
+                owner.as_ref(),
+                ctx,
+            )?)
+        } else {
+            None
+        };
+        let active = selected_rows.as_ref().is_none_or(|rows| !rows.is_empty());
+        request_partition_vector::<ArrayRef>(owner.as_ref(), state.keys.sites.len())?;
+        request_partition_vector::<novarocks_type_contract::FunctionValueType>(
+            owner.as_ref(),
+            state.keys.sites.len(),
         )?;
-        let instances = state
-            .instances
-            .as_mut()
-            .ok_or_else(|| stream_contract("compiled partition key instances are absent"))?;
-        let mut arrays = Vec::with_capacity(instances.len());
-        for (instance, site) in instances.iter_mut().zip(&state.keys.sites) {
-            let array = evaluate_all(instance, *site, chunk.record_batch(), control)?;
-            // Same refusal as the legacy sink's partition-key type check.
-            if matches!(array.data_type(), DataType::LargeBinary) {
-                return Err(stream_contract(
-                    "VARIANT is not supported in HASH_PARTITIONED partition keys",
-                ));
+        let mut arrays = Vec::with_capacity(state.keys.sites.len());
+        let mut types = Vec::with_capacity(state.keys.sites.len());
+        if active {
+            compiled_instances(
+                &mut state.instances,
+                &state.keys.program,
+                &state.keys.sites,
+                control,
+            )?;
+            let instances = state
+                .instances
+                .as_mut()
+                .ok_or_else(|| stream_contract("compiled partition key instances are absent"))?;
+            for (instance, site) in instances.iter_mut().zip(&state.keys.sites) {
+                let ty = root_value_type(&state.keys.program, *site)?;
+                let array = match &selected_rows {
+                    Some(rows) => {
+                        evaluate_selected(instance, *site, chunk.record_batch(), rows, control)?
+                    }
+                    None => evaluate_all(instance, *site, chunk.record_batch(), control)?,
+                };
+                // Preserve the ordinary path's exact historical refusal.
+                // New routes use the signed logical type rather than guessing
+                // VARIANT from a plain binary carrier.
+                if (state.keys.route == CompiledPartitionRoute::Ordinary
+                    && matches!(array.data_type(), DataType::LargeBinary))
+                    || ty.logical_type() == novarocks_type_contract::ValueLogicalType::Variant
+                {
+                    return Err(stream_contract(
+                        "VARIANT is not supported in HASH_PARTITIONED partition keys",
+                    ));
+                }
+                arrays.push(array);
+                types.push(ty);
             }
-            arrays.push(array);
         }
-        Ok(Some(arrays))
+        ctx.checkpoint()?;
+        Ok(Some(CompiledPartitionBatch {
+            arrays,
+            types,
+            selected_rows,
+            route: state.keys.route,
+            owner,
+        }))
     }
 
     fn partition_chunk(
         &mut self,
-        ctx: &StepContext<'_>,
+        ctx: &mut StepContext<'_>,
         chunk: &Chunk,
-        compiled_keys: Option<&[ArrayRef]>,
+        compiled_keys: Option<&CompiledPartitionBatch>,
     ) -> ExecutionResult<Vec<Vec<Chunk>>> {
         // Get destinations first to avoid borrowing self
         let dests: Vec<FragmentDestination> = self.destinations().to_vec();
@@ -2158,6 +2483,32 @@ impl DataStreamSinkOperator {
         }
 
         let n = dests.len();
+        if let Some(keys) = compiled_keys
+            && keys.route != CompiledPartitionRoute::Ordinary
+        {
+            let rows =
+                instance_partition_rows(keys, chunk, chunk.len(), n, &mut self.random_next, ctx)?;
+            let factory = self
+                .construction_factory
+                .as_deref()
+                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+            request_partition_vector::<Vec<Chunk>>(keys.owner.as_ref(), n)?;
+            let mut partitioned = Vec::with_capacity(n);
+            for selection in rows {
+                if selection.is_empty() {
+                    partitioned.push(Vec::new());
+                } else {
+                    request_partition_vector::<Chunk>(keys.owner.as_ref(), 1)?;
+                    partitioned.push(vec![take_partition_rows_created(
+                        chunk,
+                        &selection,
+                        factory,
+                        &|| ctx.checkpoint(),
+                    )?]);
+                }
+            }
+            return Ok(partitioned);
+        }
 
         match self.input.output_partition_type {
             DataStreamPartitionType::Unpartitioned => {
@@ -2216,7 +2567,7 @@ impl DataStreamSinkOperator {
                     .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
                 let partition_chunks = partition_chunk_by_hash_arrays_created(
                     chunk,
-                    keys,
+                    &keys.arrays,
                     n,
                     use_crc32,
                     factory,
@@ -2252,6 +2603,30 @@ impl DataStreamSinkOperator {
                 self.fragment_instance_id.low(),
             )));
         }
+        let stream = match (
+            self.error_state.as_ref().and_then(|s| s.task_identity()),
+            dest.task_identity(),
+        ) {
+            (Some(source), Some(target)) => Some(
+                novarocks_execution_contract::ExchangeStreamIdentity::try_new(
+                    novarocks_execution_contract::ExchangeSource::new(
+                        source,
+                        dest.source_finst_id(),
+                        dest.sender_ordinal(),
+                    ),
+                    target,
+                    *dest.finst_id(),
+                    novarocks_execution_contract::FragmentNodeId::new(self.input.dest_node_id),
+                )
+                .map_err(stream_contract)?,
+            ),
+            (None, None) => None,
+            _ => {
+                return Err(stream_contract(
+                    "exchange Task source and destination identities must both be bound",
+                ));
+            }
+        };
         let edge_gate = self.destination_gate(dest)?;
         match edge_gate.as_ref().map(|gate| gate.state()) {
             None | Some(EdgeSendState::Open) => {}
@@ -2264,7 +2639,16 @@ impl DataStreamSinkOperator {
             }
             // The destination left normally, so its frames are dropped here
             // rather than parked or sent.
-            Some(EdgeSendState::NormallyCanceled) => return Ok(PayloadEnqueue::Discarded),
+            Some(EdgeSendState::NormallyCanceled) => {
+                if self.input.delivery
+                    == novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+                {
+                    return Err(stream_contract(
+                        "required exchange destination withdrew before payload admission",
+                    ));
+                }
+                return Ok(PayloadEnqueue::Discarded);
+            }
         }
 
         let allow_overflow =
@@ -2298,6 +2682,7 @@ impl DataStreamSinkOperator {
         }
         let task = self.build_exchange_send_task(
             dest.clone(),
+            stream,
             pending,
             Arc::clone(error_state),
             edge_gate,
@@ -2313,6 +2698,7 @@ impl DataStreamSinkOperator {
     fn build_exchange_send_task(
         &self,
         destination: FragmentDestination,
+        stream: Option<novarocks_execution_contract::ExchangeStreamIdentity>,
         pending: PendingPayload,
         error_state: Arc<RuntimeErrorState>,
         edge_gate: Option<Arc<EdgeSendGate>>,
@@ -2320,7 +2706,10 @@ impl DataStreamSinkOperator {
         #[cfg(test)]
         record_payload_identity_for_test(self.fragment_instance_id, pending.be_number, pending.eos);
         ExchangeSendTask {
+            order: self.shared_order.clone(),
             frame: ExchangeFrame {
+                stream,
+                delivery: self.input.delivery,
                 destination: destination.endpoint().clone(),
                 destination_fragment_instance_id: *destination.finst_id(),
                 destination_task_identity: destination.task_identity(),
@@ -2365,9 +2754,10 @@ impl DataStreamSinkOperator {
         let dest_finst_id = UniqueId::new(dest.finst_id().high(), dest.finst_id().low());
 
         let row_count: usize = chunks.iter().map(|c| c.len()).sum();
-        let sequence = self.shared_sequence.fetch_add(1, Ordering::SeqCst);
+        // The queue assigns the real sequence only when this payload is admitted.
+        let sequence = 0;
         debug!(
-            "DataStreamSink::transmit_partition: dest_finst={} node_id={} sender_id={} chunks={} rows={} eos={} seq={}",
+            "DataStreamSink::transmit_partition: dest_finst={} node_id={} sender_id={} chunks={} rows={} eos={} pending_sequence={}",
             dest_finst_id,
             self.input.dest_node_id,
             self.sender_id,
@@ -2453,14 +2843,14 @@ impl DataStreamSinkOperator {
         match self.try_enqueue_payload(dest, payload, allow_overflow)? {
             PayloadEnqueue::Enqueued => {
                 debug!(
-                    "DataStreamSink::transmit_partition enqueued: dest_finst={} node_id={} eos={} seq={} bytes={}",
+                    "DataStreamSink::transmit_partition enqueued: dest_finst={} node_id={} eos={} pending_sequence={} bytes={}",
                     dest_finst_id, self.input.dest_node_id, eos, sequence, payload_bytes
                 );
                 Ok(PayloadEnqueue::Enqueued)
             }
             PayloadEnqueue::Discarded => {
                 debug!(
-                    "DataStreamSink::transmit_partition discarded: dest_finst={} node_id={} eos={} seq={} bytes={} reason=destination_cancelled_normally",
+                    "DataStreamSink::transmit_partition discarded: dest_finst={} node_id={} eos={} pending_sequence={} bytes={} reason=destination_cancelled_normally",
                     dest_finst_id, self.input.dest_node_id, eos, sequence, payload_bytes
                 );
                 Ok(PayloadEnqueue::Discarded)
@@ -2503,19 +2893,19 @@ impl DataStreamSinkOperator {
             crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let ctx = StepContext::new(&control, &mut work, &mut value_conversions);
-        self.buffer_chunk_with_keys(&ctx, chunk, None)
+        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
+        self.buffer_chunk_with_keys(&mut ctx, chunk, None)
     }
 
     fn buffer_chunk_with_keys(
         &mut self,
-        ctx: &StepContext<'_>,
+        ctx: &mut StepContext<'_>,
         chunk: Chunk,
-        compiled_keys: Option<Vec<ArrayRef>>,
+        compiled_keys: Option<CompiledPartitionBatch>,
     ) -> ExecutionResult<()> {
         self.ensure_pending_buffers_initialized();
         let dests = self.destinations().to_vec();
-        let per_dest_chunks = self.partition_chunk(ctx, &chunk, compiled_keys.as_deref())?;
+        let per_dest_chunks = self.partition_chunk(ctx, &chunk, compiled_keys.as_ref())?;
         for (i, chunks) in per_dest_chunks.into_iter().enumerate() {
             if chunks.is_empty() || Self::is_pseudo_destination(&dests[i]) {
                 continue;
@@ -2610,6 +3000,13 @@ impl DataStreamSinkOperator {
             // A destination that left normally abandons its own edge's frames
             // and nothing else.
             if send_state == Some(EdgeSendState::NormallyCanceled) {
+                if self.input.delivery
+                    == novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+                {
+                    return Err(stream_contract(
+                        "required exchange input withdrew while output was pending",
+                    ));
+                }
                 self.discard_pending_for_dest(i);
                 continue;
             }
@@ -2698,6 +3095,13 @@ impl DataStreamSinkOperator {
                 // A destination that left normally is not owed an
                 // end-of-stream marker either.
                 Some(EdgeSendState::NormallyCanceled) => {
+                    if self.input.delivery
+                        == novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+                    {
+                        return Err(stream_contract(
+                            "required exchange input withdrew before End admission",
+                        ));
+                    }
                     self.discard_pending_for_dest(i);
                     skipped += 1;
                     continue;
@@ -2746,6 +3150,21 @@ impl DataStreamSinkOperator {
 }
 
 impl InputEncodingPolicy for DataStreamSinkOperator {
+    fn retains_encoded_path(
+        &self,
+        value: crate::exec::pipeline::operator::EncodedValueOccurrence<'_>,
+    ) -> bool {
+        if self
+            .compiled_partition
+            .as_ref()
+            .is_some_and(|state| state.keys.route != CompiledPartitionRoute::Ordinary)
+        {
+            // The selected key evaluator and decoder own reachability. Eager
+            // Transform hydration must not inspect excluded dictionary rows.
+            return true;
+        }
+        value.path.is_empty() && self.retains_encoded_column(value.slot, value.carrier)
+    }
     fn retains_encoded_column(&self, _slot_id: SlotId, data_type: &DataType) -> bool {
         is_low_cardinality_exchange_dictionary(data_type)
             && matches!(
@@ -3010,7 +3429,7 @@ impl SinkKernel for DataStreamSinkOperator {
         if chunk.is_empty() {
             return Ok(SinkStep::new(self.next_work(generation), 0));
         }
-        let compiled_keys = self.compiled_partition_keys(&chunk)?;
+        let compiled_keys = self.compiled_partition_keys(_ctx, &chunk)?;
         self.buffer_chunk_with_keys(_ctx, chunk, compiled_keys)?;
         self.flush_pending(false, false)?;
         Ok(SinkStep::new(self.next_work(generation), rows))
@@ -3295,6 +3714,7 @@ mod tests {
             input: DataStreamSinkFactoryInput::try_new(
                 1,
                 DataStreamPartitionType::Unpartitioned,
+                novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
                 Vec::new(),
                 Vec::new(),
             )
@@ -3305,7 +3725,7 @@ mod tests {
             driver_id: 0,
             sender_id: 11,
             be_number: 0,
-            shared_sequence: Arc::new(AtomicI64::new(0)),
+            shared_order: crate::runtime::fragment::io::exchange_queue::ExchangeSendOrder::new(),
             random_next: 0,
             pending_per_dest: Vec::new(),
             pending_bytes_per_dest: Vec::new(),
@@ -3659,6 +4079,7 @@ mod tests {
                 1,
             )
             .expect("destination"),
+            None,
             PendingPayload {
                 be_number: 7,
                 payload: vec![1, 2, 3],
@@ -4078,17 +4499,17 @@ mod tests {
         };
         assert!(matches!(wait.reason, WaitReason::Finish));
         assert!(!op.maybe_mark_finished());
-        assert_eq!(op.shared_sequence.load(Ordering::SeqCst), 0);
+        assert_eq!(op.shared_order.admitted_count(), 0);
         open_edges(&op, &[edge_id(1)]);
         assert!(wait.is_ready());
         assert_eq!(
-            op.shared_sequence.load(Ordering::SeqCst),
+            op.shared_order.admitted_count(),
             0,
             "notification cannot send EOS"
         );
         let completed = SinkKernel::poll_for_test(&mut op, &runtime).expect("resume EOS");
         assert!(matches!(completed.next, NextStep::Finished));
-        assert_eq!(op.shared_sequence.load(Ordering::SeqCst), 1);
+        assert_eq!(op.shared_order.admitted_count(), 1);
         assert!(!op.owes_end_of_stream());
     }
 
@@ -4122,7 +4543,7 @@ mod tests {
             panic!("seal is waiting for its destination")
         };
         assert!(!op.has_pending_data());
-        assert_eq!(op.shared_sequence.load(Ordering::SeqCst), 0);
+        assert_eq!(op.shared_order.admitted_count(), 0);
         open_edges(&op, &[edge_id(1)]);
         assert!(wait.is_ready());
         assert!(matches!(
@@ -4130,27 +4551,19 @@ mod tests {
             NextStep::Runnable
         ));
         assert_eq!(
-            op.shared_sequence.load(Ordering::SeqCst),
+            op.shared_order.admitted_count(),
             0,
             "an opened gate alone cannot satisfy the mandatory marker"
         );
         let completed =
             SinkKernel::poll_for_test(&mut op, &runtime).expect("worker sends the seal");
         assert!(matches!(completed.next, NextStep::Finished));
-        assert_eq!(
-            op.shared_sequence.load(Ordering::SeqCst),
-            1,
-            "one EOS frame"
-        );
+        assert_eq!(op.shared_order.admitted_count(), 1, "one EOS frame");
         assert!(!op.owes_end_of_stream());
         let repeated =
             SinkKernel::poll_for_test(&mut op, &runtime).expect("completed continuation is stable");
         assert!(matches!(repeated.next, NextStep::Finished));
-        assert_eq!(
-            op.shared_sequence.load(Ordering::SeqCst),
-            1,
-            "EOS is never replayed"
-        );
+        assert_eq!(op.shared_order.admitted_count(), 1, "EOS is never replayed");
     }
 
     /// A sink can enter finishing while it still has buffered rows. Once the
@@ -4177,7 +4590,7 @@ mod tests {
         assert!(op.finish_counted.load(Ordering::SeqCst));
         assert!(op.end_of_stream_sent.load(Ordering::SeqCst));
         assert_eq!(op.finish_state.remaining_drivers.load(Ordering::SeqCst), 0);
-        assert_eq!(op.shared_sequence.load(Ordering::SeqCst), 1);
+        assert_eq!(op.shared_order.admitted_count(), 1);
     }
 
     /// The defect this catches: `set_finishing` counted this driver against
@@ -4225,14 +4638,14 @@ mod tests {
             panic!("last driver must wait for the exact edge")
         };
         assert_eq!(state.remaining_drivers.load(Ordering::SeqCst), 0);
-        assert_eq!(second.shared_sequence.load(Ordering::SeqCst), 0);
+        assert_eq!(second.shared_order.admitted_count(), 0);
         open_edges(&second, &[edge_id(1)]);
         assert!(wait.is_ready());
         let completed = SinkKernel::poll_for_test(&mut second, &runtime)
             .expect("resume the last driver's seal");
         assert!(matches!(completed.next, NextStep::Finished));
         assert!(!second.owes_end_of_stream());
-        assert_eq!(second.shared_sequence.load(Ordering::SeqCst), 1);
+        assert_eq!(second.shared_order.admitted_count(), 1);
         assert!(
             !state.force_eos_sent.load(Ordering::SeqCst),
             "no false driver-set accounting failure"
@@ -4897,12 +5310,728 @@ mod tests {
                 ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)
             ));
             assert_eq!(sink.pending_chunk_count_total(), 0);
-            assert_eq!(sink.shared_sequence.load(Ordering::SeqCst), 0);
+            assert_eq!(sink.shared_order.admitted_count(), 0);
             assert!(sink.send_tracker.is_idle());
             assert_eq!(source.len(), 8);
             drop(source);
             drop(factory);
             assert_eq!(tracker.current(), 0);
+        }
+    }
+
+    // This fixture enters through the real frozen-package/local-compiler chain.
+    // Its roots are explicit test-only Project outputs: it opens no production
+    // write router or Task binding constructor.
+    mod conditional_compiled_selection {
+        use super::*;
+        use arrow::{array::Int64Array, record_batch::RecordBatch};
+        use novarocks_connector_contract::PureProviderProgramCatalog;
+        use novarocks_functions::{
+            ConstantPolicy, EngineFunctionCatalogBuilder, FunctionKind, InstalledPureKernel,
+            PureImplementationDeclaration, PureImplementationId, PureKernelAbi,
+        };
+        use novarocks_local_compiler::{
+            LocalCompileOptions, compile_fragment, validate_fragment_providers,
+        };
+        use novarocks_local_program::{KernelAbiVersion, ProgramNodeExpressionRole, ProgramNodeId};
+        use novarocks_physical_plan::{
+            BinaryOperator, ConstantPools, ExprId, ExprKind, Fragment, FragmentBuilder,
+            FragmentCuts, FragmentId, FragmentPackage, FragmentPackageAdmission,
+            FragmentPackageInput, FragmentSink, FrozenFragmentCalls, FrozenFragmentPruning,
+            LiteralValue, NodeId, PhysicalExpressionRoots, PhysicalRootUses, PipelineDopDomain,
+            PlanLimits, PlanVersionId, PropertyProofProjectionLimits, RequiredContracts,
+            ResultField, ResultPort, ResultValueDomain, StagePlacementPolicy, ValueId, ValueOrigin,
+        };
+        use novarocks_type_contract::{
+            CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
+            EvaluationDemand, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
+            ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, FunctionValueType,
+            PureCompileControl, SemanticParameterId, SemanticParameterKey, SemanticParameterRef,
+            SemanticParameterValue, SemanticParameters,
+        };
+        use std::{collections::BTreeMap, num::NonZeroUsize};
+
+        struct FixtureControl;
+        impl PureCompileControl for FixtureControl {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                Ok(())
+            }
+        }
+
+        fn root(expression: u32) -> ProgramExpressionRootSite {
+            ProgramExpressionRootSite::Node {
+                node: ProgramNodeId::new(2),
+                role: ProgramNodeExpressionRole::ProjectOutput { expression },
+            }
+        }
+
+        fn visit(
+            fragment: &Fragment,
+            definition: ExprId,
+            demand: EvaluationDemand,
+            ordered: &mut Vec<ExpressionInvocation<ExprId>>,
+        ) -> ExpressionUseId {
+            let arguments = match &fragment.expressions().get(definition).unwrap().kind {
+                ExprKind::Binary { left, right, .. } => [*left, *right]
+                    .into_iter()
+                    .map(|child| visit(fragment, child, EvaluationDemand::Value, ordered))
+                    .collect::<Vec<_>>(),
+                ExprKind::Value(_) | ExprKind::Literal(LiteralValue::Null) => Vec::new(),
+                other => panic!("unexpected conditional exchange fixture expression: {other:?}"),
+            };
+            let use_id = ExpressionUseId::new(u32::try_from(ordered.len()).unwrap());
+            ordered.push(ExpressionInvocation {
+                context: ExpressionEffectContext {
+                    use_id,
+                    domain: EvaluationDomainId::new(0),
+                    demand,
+                },
+                definition,
+                control: ControlShape::Eager,
+                arguments: arguments.into_boxed_slice(),
+            });
+            use_id
+        }
+
+        fn program() -> Arc<LocalProgram> {
+            let fragment_id = FragmentId::new(219);
+            let source = NodeId::new(10);
+            let input = NodeId::new(20);
+            let output = NodeId::new(30);
+            let integer = FunctionValueType::new(DataType::Int64, true);
+            let boolean = FunctionValueType::new(DataType::Boolean, true);
+            let mut builder = FragmentBuilder::new(fragment_id);
+            builder
+                .add_values(source, Box::from([Box::default()]), Box::default())
+                .unwrap();
+            let mut inputs = Vec::new();
+            for ty in [&integer, &integer, &boolean] {
+                let expr = builder
+                    .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
+                    .unwrap();
+                let value = builder
+                    .add_value(ty.clone(), ValueOrigin::Expr { node: input, expr })
+                    .unwrap();
+                inputs.push((expr, value));
+            }
+            let input_ids = inputs.iter().map(|(_, id)| *id).collect::<Vec<ValueId>>();
+            builder
+                .add_project(
+                    input,
+                    source,
+                    inputs.into_boxed_slice(),
+                    input_ids.clone().into_boxed_slice(),
+                )
+                .unwrap();
+            let left = builder
+                .add_expression(output, integer.clone(), ExprKind::Value(input_ids[0]))
+                .unwrap();
+            let right = builder
+                .add_expression(output, integer.clone(), ExprKind::Value(input_ids[1]))
+                .unwrap();
+            let parameter = SemanticParameterRef {
+                id: SemanticParameterId::new(0),
+                expected_key: SemanticParameterKey::AllowThrowException,
+            };
+            let key = builder
+                .add_expression(
+                    output,
+                    integer.clone(),
+                    ExprKind::Binary {
+                        op: BinaryOperator::Add,
+                        left,
+                        right,
+                        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                        allow_throw_exception: Some(parameter),
+                    },
+                )
+                .unwrap();
+            let applies = builder
+                .add_expression(output, boolean.clone(), ExprKind::Value(input_ids[2]))
+                .unwrap();
+            let mut outputs = Vec::new();
+            let mut fields = Vec::new();
+            for (expr, ty, name) in [(key, integer, "key"), (applies, boolean, "applies")] {
+                let value = builder
+                    .add_value(ty.clone(), ValueOrigin::Expr { node: output, expr })
+                    .unwrap();
+                outputs.push((expr, value));
+                fields.push(ResultField {
+                    domain: ResultValueDomain::Plain,
+                    name: name.into(),
+                    alias: None,
+                    value,
+                    ty,
+                });
+            }
+            let output_ids = outputs.iter().map(|(_, id)| *id).collect::<Vec<_>>();
+            builder
+                .add_project(
+                    output,
+                    input,
+                    outputs.into_boxed_slice(),
+                    output_ids.into_boxed_slice(),
+                )
+                .unwrap();
+            let fragment = builder
+                .finish_definition(
+                    output,
+                    FragmentSink::Result,
+                    PipelineDopDomain {
+                        min: 1,
+                        max: 1,
+                        requires_power_of_two: false,
+                    },
+                    StagePlacementPolicy::Singleton,
+                )
+                .unwrap();
+            let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();
+            let mut ordered = Vec::new();
+            let bindings = roots
+                .sites()
+                .iter()
+                .map(|(site, expression)| {
+                    (
+                        *site,
+                        visit(&fragment, expression.expr, expression.demand, &mut ordered),
+                    )
+                })
+                .collect();
+            let flow = ExpressionControlFlow::try_new(
+                vec![ExpressionEvaluationDomain {
+                    id: EvaluationDomainId::new(0),
+                    parent: None,
+                    guard: None,
+                }],
+                ordered,
+                fragment.expressions(),
+                CompilePhase::Validate,
+                &FixtureControl,
+            )
+            .unwrap();
+            let uses =
+                PhysicalRootUses::try_new(&fragment, flow, bindings, &FixtureControl).unwrap();
+            let calls =
+                FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &FixtureControl).unwrap();
+            let result = ResultPort {
+                scalar_schema: None,
+                fragment: fragment_id,
+                output: fragment.nodes()[&output].output.clone(),
+                fields: fields.into_boxed_slice(),
+            };
+            let package = Arc::new(
+                FragmentPackage::try_new(
+                    FragmentPackageInput {
+                        version: PlanVersionId::try_new([219; 16]).unwrap(),
+                        required: RequiredContracts::default(),
+                        constants: ConstantPools::empty(),
+                        fragment,
+                        expression_uses: uses,
+                        calls,
+                        pruning: FrozenFragmentPruning::try_new(
+                            fragment_id,
+                            vec![],
+                            &FixtureControl,
+                        )
+                        .unwrap(),
+                        cuts: FragmentCuts::default(),
+                        result: Some(result),
+                        parameters: SemanticParameters::try_new([(
+                            parameter.id,
+                            SemanticParameterValue::AllowThrowException(false),
+                        )])
+                        .unwrap(),
+                        scans: BTreeMap::new(),
+                        writes: BTreeMap::new(),
+                        annotations: Box::default(),
+                    },
+                    // Explicit bounded fixture invoices; no production defaults.
+                    FragmentPackageAdmission {
+                        plan_limits: PlanLimits::FROZEN,
+                        source_retained_bytes: 64 * 1024 * 1024,
+                        property_projection_limits: PropertyProofProjectionLimits {
+                            max_request_bytes: 16 * 1024 * 1024,
+                            max_coexisting_bytes: 256 * 1024 * 1024,
+                            max_projection_work: 16 * 1024 * 1024,
+                        },
+                    },
+                    &FixtureControl,
+                )
+                .unwrap(),
+            );
+            let providers =
+                PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &FixtureControl)
+                    .unwrap();
+            // The compiler requires a nonempty sealed catalogue even when all
+            // roots are intrinsic. Seal the real IF owner, never a mock evaluator.
+            let actual = novarocks_functions::builtin::catalogue::builtin_engine_function_catalog();
+            let mut catalogue = EngineFunctionCatalogBuilder::new();
+            catalogue
+                .register(
+                    actual
+                        .definition("if", FunctionKind::Scalar)
+                        .unwrap()
+                        .clone(),
+                )
+                .unwrap();
+            let functions = catalogue
+                .seal_pure([InstalledPureKernel {
+                    function: novarocks_type_contract::FunctionId::try_new("builtin.scalar/if/v1")
+                        .unwrap(),
+                    kind: FunctionKind::Scalar,
+                    implementation: PureImplementationDeclaration {
+                        overload: novarocks_type_contract::FunctionOverloadId::try_new(
+                            "builtin.scalar/if/(bool,any<T>,any<T>)->any<T>;widen;legacy",
+                        )
+                        .unwrap(),
+                        implementation: PureImplementationId::try_new(
+                            "builtin.scalar/if/selected-v1",
+                        )
+                        .unwrap(),
+                        abi: PureKernelAbi::ControlIntrinsicV1,
+                    },
+                    aggregate_state_format: None,
+                }])
+                .unwrap();
+            Arc::new(
+                compile_fragment(
+                    validate_fragment_providers(package, &providers, &FixtureControl).unwrap(),
+                    &functions,
+                    LocalCompileOptions {
+                        pipeline_dop: NonZeroUsize::MIN,
+                        root_sink_dop: Some(NonZeroUsize::MIN),
+                        kernel_abi: KernelAbiVersion::CURRENT,
+                        exchange_wait: Duration::from_secs(120),
+                        constants: ConstantPolicy {
+                            max_rows: 16,
+                            max_array_nodes: 128,
+                            max_logical_elements: 1024,
+                            max_retained_buffer_bytes: 1 << 20,
+                            max_type_depth: 64,
+                            max_type_nodes: 4096,
+                            max_dictionary_depth: 64,
+                            max_metadata_bytes: 1 << 20,
+                            max_library_validation_work: 1 << 20,
+                            max_library_validation_bytes: 1 << 20,
+                        },
+                    },
+                    &FixtureControl,
+                )
+                .unwrap(),
+            )
+        }
+
+        fn input(program: &LocalProgram, applies: Vec<Option<bool>>, left: Vec<i64>) -> Chunk {
+            let rows = applies.len();
+            assert_eq!(left.len(), rows);
+            let layout = program.graph().nodes()[1].output_layout();
+            let batch = RecordBatch::try_new(
+                Arc::clone(layout.schema()),
+                vec![
+                    Arc::new(Int64Array::from(left)),
+                    Arc::new(Int64Array::from(vec![1; rows])),
+                    Arc::new(BooleanArray::from(applies)),
+                ],
+            )
+            .unwrap();
+            Chunk::try_new_with_chunk_schema(
+                batch,
+                ChunkSchema::from_compiled_layout(layout).unwrap(),
+            )
+            .unwrap()
+        }
+
+        fn sink(program: Arc<LocalProgram>) -> DataStreamSinkOperator {
+            let mut sink = make_test_operator();
+            sink.compiled_partition = Some(CompiledPartitionState {
+                keys: CompiledPartitionKeys::conditional(program, vec![root(0)], root(1)),
+                instances: None,
+                applicability_instances: None,
+            });
+            prepare_test_operator(&mut sink);
+            sink
+        }
+
+        fn evaluate(
+            sink: &mut DataStreamSinkOperator,
+            chunk: &Chunk,
+        ) -> ExecutionResult<CompiledPartitionBatch> {
+            let control = RuntimeErrorState::default();
+            let mut work =
+                crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+            let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+            let ctx = StepContext::new(&control, &mut work, &mut conversions);
+            sink.compiled_partition_keys(&ctx, chunk)
+                .map(|batch| batch.expect("compiled partition"))
+        }
+
+        #[test]
+        fn conditional_compiled_keys_skip_false_and_null_overflow_rows() {
+            let program = program();
+            let chunk = input(
+                &program,
+                vec![Some(false), Some(true), None],
+                vec![i64::MAX, 6, i64::MAX],
+            );
+            // Positive control: this real compiled key fails if any excluded
+            // payload row is accidentally evaluated across the original batch.
+            let mut full_sink = sink(program.clone());
+            let mut instances = None;
+            let control = full_sink.compiled_control.as_ref().unwrap();
+            compiled_instances(&mut instances, &program, &[root(0)], control).unwrap();
+            let error = evaluate_all(
+                &mut instances.as_mut().unwrap()[0],
+                root(0),
+                chunk.record_batch(),
+                control,
+            )
+            .expect_err("signed addition must overflow on excluded row 0");
+            assert!(error.to_string().contains("batch row 0"), "{error}");
+            assert!(
+                error.to_string().to_ascii_lowercase().contains("overflow"),
+                "{error}"
+            );
+            // Applicability and key instances are owned by the real sink path.
+            let batch = evaluate(&mut full_sink, &chunk).unwrap();
+            assert_eq!(batch.selected_rows.as_deref(), Some([1].as_slice()));
+            assert_eq!(batch.route, CompiledPartitionRoute::ConditionalKeyV1);
+            assert_eq!(batch.arrays.len(), 1);
+            let keys = batch.arrays[0]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(keys.len(), 1);
+            assert_eq!(keys.value(0), 7);
+            assert_eq!(keys.null_count(), 0);
+            let compiled = full_sink.compiled_partition.as_ref().unwrap();
+            assert_eq!(compiled.applicability_instances.as_ref().unwrap().len(), 1);
+            assert_eq!(compiled.instances.as_ref().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn conditional_compiled_all_false_or_null_skips_key_instantiation() {
+            let program = program();
+            let chunk = input(
+                &program,
+                vec![Some(false), None, Some(false)],
+                vec![i64::MAX; 3],
+            );
+            let mut sink = sink(program);
+            let batch = evaluate(&mut sink, &chunk).unwrap();
+            assert_eq!(batch.selected_rows.as_deref(), Some([].as_slice()));
+            assert!(batch.arrays.is_empty());
+            assert!(batch.types.is_empty());
+            let compiled = sink.compiled_partition.as_ref().unwrap();
+            assert!(compiled.applicability_instances.is_some());
+            assert!(
+                compiled.instances.is_none(),
+                "inactive key must not even be instantiated"
+            );
+        }
+
+        #[test]
+        fn conditional_compiled_true_overflow_remains_a_required_batch_row_error() {
+            let program = program();
+            let chunk = input(
+                &program,
+                vec![Some(false), None, Some(true)],
+                vec![i64::MAX; 3],
+            );
+            let mut sink = sink(program);
+            let error = match evaluate(&mut sink, &chunk) {
+                Ok(_) => panic!("selected overflow must fail"),
+                Err(error) => error,
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains("batch row 2 (selected ordinal 0)"),
+                "{message}"
+            );
+            assert!(
+                message.to_ascii_lowercase().contains("overflow"),
+                "{message}"
+            );
+        }
+    }
+
+    fn routing_batch(
+        source: &Chunk,
+        route: CompiledPartitionRoute,
+        selected_rows: Option<Vec<usize>>,
+        values: Vec<Option<i64>>,
+    ) -> CompiledPartitionBatch {
+        let mut sink = make_test_operator();
+        prepare_test_operator(&mut sink);
+        let owner = sink
+            .construction_factory
+            .as_ref()
+            .unwrap()
+            .begin_input_construction(source)
+            .unwrap();
+        let (arrays, types) = if values.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            (
+                vec![Arc::new(arrow::array::Int64Array::from(values)) as ArrayRef],
+                vec![novarocks_type_contract::FunctionValueType::new(
+                    DataType::Int64,
+                    true,
+                )],
+            )
+        };
+        CompiledPartitionBatch {
+            arrays,
+            types,
+            selected_rows,
+            route,
+            owner,
+        }
+    }
+
+    #[test]
+    fn conditional_network_routes_true_keys_and_round_robins_false_or_null_rows() {
+        let source = typed_int64_chunk(6);
+        let state = RuntimeState::default();
+        let control = state.error_state();
+        let mut work =
+            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut work, &mut conversions);
+        let mask = BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+            Some(true),
+            Some(false),
+            None,
+        ]);
+        let batch = routing_batch(
+            &source,
+            CompiledPartitionRoute::ConditionalKeyV1,
+            Some(vec![0, 3]),
+            vec![Some(7), Some(7)],
+        );
+        assert_eq!(
+            selected_partition_rows(&mask, 6, batch.owner.as_ref(), &ctx).unwrap(),
+            vec![0, 3]
+        );
+        let mut cursor = 0;
+        let rows = instance_partition_rows(&batch, &source, 6, 3, &mut cursor, &mut ctx).unwrap();
+        // Frozen native tuple(7) = 0xba4003266beeb280; InstanceV1 modulo 3 = 0.
+        // TRUE 0/3 share that owner; FALSE/NULL 1/2/4/5 use 0/1/2/0.
+        assert_eq!(rows, vec![vec![0, 1, 3, 5], vec![2], vec![4]]);
+        assert_eq!(cursor, 1);
+        let next = routing_batch(
+            &source,
+            CompiledPartitionRoute::ConditionalKeyV1,
+            Some(Vec::new()),
+            Vec::new(),
+        );
+        assert_eq!(
+            instance_partition_rows(&next, &source, 2, 3, &mut cursor, &mut ctx).unwrap(),
+            vec![vec![], vec![0], vec![1]]
+        );
+        assert_eq!(cursor, 0, "per-producer bypass continues across batches");
+    }
+
+    #[test]
+    fn all_bypass_needs_no_key_column_or_key_decode_and_wraps_its_cursor() {
+        let source = typed_int64_chunk(5);
+        let batch = routing_batch(
+            &source,
+            CompiledPartitionRoute::ConditionalKeyV1,
+            Some(Vec::new()),
+            Vec::new(),
+        );
+        let state = RuntimeState::default();
+        let control = state.error_state();
+        let mut work =
+            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut work, &mut conversions);
+        let mut cursor = 2;
+        assert_eq!(
+            instance_partition_rows(&batch, &source, 5, 3, &mut cursor, &mut ctx).unwrap(),
+            vec![vec![1, 4], vec![2], vec![0, 3]]
+        );
+        assert_eq!(cursor, 1);
+    }
+
+    #[test]
+    fn selected_network_target_key_cannot_acquire_the_null_identity() {
+        use novarocks_failure_contract::FailureProjection;
+        let source = typed_int64_chunk(3);
+        let batch = routing_batch(
+            &source,
+            CompiledPartitionRoute::ConditionalKeyV1,
+            Some(vec![1]),
+            vec![None],
+        );
+        let state = RuntimeState::default();
+        let control = state.error_state();
+        let mut work =
+            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut work, &mut conversions);
+        let failure = instance_partition_rows(&batch, &source, 3, 4, &mut 0, &mut ctx).unwrap_err();
+        let expected =
+            ExecutionFailure::from_domain(novarocks_value_arrays::ValueError::Invariant(
+                novarocks_value_arrays::ValueViolation::RequiredNull,
+            ));
+        assert_eq!(failure.failure_fact(), expected.failure_fact());
+    }
+
+    #[test]
+    fn hierarchical_network_uses_frozen_instance_domain_and_keeps_ordinary_mapping() {
+        let source = typed_int64_chunk(3);
+        let batch = routing_batch(
+            &source,
+            CompiledPartitionRoute::HierarchicalV1,
+            None,
+            vec![Some(1), Some(2), Some(3)],
+        );
+        let state = RuntimeState::default();
+        let control = state.error_state();
+        let mut work =
+            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut work, &mut conversions);
+        assert_eq!(
+            instance_partition_rows(&batch, &source, 3, 4, &mut 0, &mut ctx).unwrap(),
+            vec![vec![], vec![0], vec![1], vec![2]]
+        );
+        // Ordinary FNV modulo 4 remains [2, 1, 0], with no level mixing.
+        let ordinary = partition_chunk_by_hash_arrays(&source, &batch.arrays, 4, false).unwrap();
+        let values = |chunk: &Chunk| {
+            if chunk.is_empty() {
+                vec![]
+            } else {
+                chunk.columns()[0]
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            }
+        };
+        assert_eq!(
+            ordinary.iter().map(values).collect::<Vec<_>>(),
+            vec![vec![2], vec![1], vec![0], vec![]]
+        );
+    }
+
+    #[test]
+    fn network_partition_scope_preserves_the_exact_originating_stop() {
+        let source = typed_int64_chunk(2);
+        let batch = routing_batch(
+            &source,
+            CompiledPartitionRoute::HierarchicalV1,
+            None,
+            vec![Some(1), Some(2)],
+        );
+        let state = RuntimeState::default();
+        let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Operational(
+            novarocks_functions::KernelDiagnostic::new("network partition original failure"),
+        ));
+        let control = state.error_state();
+        control.set_error(original.clone());
+        let mut work =
+            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut work, &mut conversions);
+        assert_eq!(
+            instance_partition_rows(&batch, &source, 2, 3, &mut 0, &mut ctx).unwrap_err(),
+            original
+        );
+    }
+
+    #[test]
+    fn async_send_failure_remains_visible_while_task_conclusion_owner_is_deferred() {
+        use crate::runtime::fragment::io::{
+            ExchangeTransmitRejection, FragmentIoError, FragmentIoErrorKind, FragmentIoOperation,
+        };
+        use crate::runtime::task_control::test_support::DeferredOwner;
+        use novarocks_execution_contract::{TaskConclusionPort, TaskFailurePhase};
+        struct FailedTransmit;
+        impl ExchangeFrameTransmitter for FailedTransmit {
+            fn transmit(&self, _: ExchangeFrame) -> Result<(), ExchangeTransmitRejection> {
+                Err(ExchangeTransmitRejection::Failed(FragmentIoError::new(
+                    FragmentIoOperation::ExchangeTransmit,
+                    FragmentIoErrorKind::Unavailable,
+                    "actual receiver transport failure",
+                )))
+            }
+        }
+        let owner = DeferredOwner::new();
+        let state = Arc::new(RuntimeErrorState::for_task(Arc::new(
+            owner.view(TaskFailurePhase::Execution),
+        )));
+        let mut sink = make_test_operator();
+        sink.error_state = Some(state.clone());
+        sink.end_of_stream_sent.store(true, Ordering::Release);
+        sink.finishing.store(true, Ordering::Release);
+        let mut task = make_test_exchange_send_task();
+        task.error_state = state.clone();
+        task.tracker = sink.send_tracker.clone();
+        task.transmitter = Arc::new(FailedTransmit);
+        sink.exchange_queue().try_submit(task, false).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        while !sink.send_tracker.is_idle() && Instant::now() < until {
+            std::thread::yield_now();
+        }
+        assert!(sink.send_tracker.is_idle());
+        assert!(owner.accepted().is_none());
+        assert!(state.error().is_none());
+        let original = sink
+            .send_tracker
+            .failure()
+            .expect("actual I/O result is retained before proposal acceptance");
+        assert!(sink.current_error().unwrap().same_occurrence(&original));
+        assert!(!sink.maybe_mark_finished());
+        owner.advance_all();
+        assert!(state.error().unwrap().same_occurrence(&original));
+        assert!(!sink.maybe_mark_finished());
+    }
+
+    #[test]
+    fn required_withdrawal_cannot_skip_parked_payload_or_end_even_after_earlier_poll() {
+        for pending in [false, true] {
+            let mut sink = make_test_operator();
+            sink.input.delivery =
+                novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain;
+            let destination = FragmentDestination::new(
+                UniqueId::new(701, 702),
+                RuntimeEndpoint::new("127.0.0.1", 9030).unwrap(),
+                sink.fragment_instance_id,
+                0,
+                1,
+            )
+            .unwrap();
+            gate_destinations(&mut sink, vec![destination]);
+            let gates = sink.edge_gates.as_ref().unwrap().clone();
+            sink.ensure_pending_buffers_initialized();
+            if pending {
+                sink.pending_payloads_per_dest[0] = Some(test_payload(3));
+            }
+            let gate = gates
+                .gate_for_destination(ExchangeDestinationKey::new(
+                    UniqueId::new(701, 702),
+                    sink.input.dest_node_id,
+                ))
+                .unwrap();
+            gate.close_for_normal_cancellation();
+            assert!(
+                if pending {
+                    sink.flush_pending(true, false)
+                } else {
+                    sink.send_eos()
+                }
+                .is_err()
+            );
+            assert!(!sink.end_of_stream_sent.load(Ordering::Acquire));
+            if pending {
+                assert!(sink.pending_payloads_per_dest[0].is_some());
+            }
         }
     }
 }

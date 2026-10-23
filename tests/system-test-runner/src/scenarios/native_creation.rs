@@ -1807,12 +1807,52 @@ fn exchange_probe(
     eos: bool,
     exchange_authorization: &str,
 ) -> Result<proto::ExchangeResponse> {
+    use prost::Message;
+    let Some(proto::task_operation::Operation::CreateTask(request)) = create.operation().operation
+    else {
+        bail!("exchange probe requires its actual frozen Create");
+    };
+    let metadata = proto::CreationMetadata::decode(request.creation_metadata.as_ref())?;
+    let descriptor = metadata
+        .descriptor
+        .context("probe Create omits descriptor")?;
+    let inbound = descriptor
+        .topology
+        .as_ref()
+        .and_then(|topology| topology.inbound.first())
+        .context("probe Create omits frozen input")?;
+    let source = inbound
+        .sources
+        .first()
+        .context("probe input omits source")?;
+    let stream = proto::ExchangeStreamIdentity {
+        source_task: source.task.clone(),
+        destination_task: descriptor.identity.clone(),
+        source_finst_id_hi: source
+            .fragment_instance_id
+            .context("probe source omits kernel")?
+            .hi,
+        source_finst_id_lo: source
+            .fragment_instance_id
+            .context("probe source omits kernel")?
+            .lo,
+        sender_ordinal: source.sender_ordinal,
+        destination_finst_id_hi: descriptor
+            .fragment_instance_id
+            .context("probe destination omits kernel")?
+            .hi,
+        destination_finst_id_lo: descriptor
+            .fragment_instance_id
+            .context("probe destination omits kernel")?
+            .lo,
+        destination_node_id: inbound.destination_node_id,
+    };
     raw_unary(
         session.connector.clone(),
         "/novarocks.NovaRocksGrpc/ExchangeUnary",
         exchange_authorization,
         proto::ExchangeRequest {
-            stream: None,
+            stream: Some(stream),
             finst_id_hi: 0x5b,
             finst_id_lo: create.kernel_key_low,
             node_id: 10,

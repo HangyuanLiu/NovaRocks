@@ -433,8 +433,8 @@ fn plan(rows: &[(Option<i64>, &str)]) -> (PhysicalPlan, NodeId) {
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(Edge {
-        role: novarocks_physical_plan::OutputRole::Relational,
-        delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
+        role: novarocks_physical_plan::OutputRole::WriterResults,
+        delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
         id: EDGE,
         kind: EdgeKind::Stream,
         source: EdgeSource {
@@ -704,6 +704,14 @@ impl ExchangeFrameTransmitter for LoopbackTransmitter {
                     node_id: frame.destination_node_id,
                 },
                 ExchangeReceiverFrame {
+                    stream: frame.stream.unwrap_or_else(|| {
+                        crate::runtime::fragment::io::exchange::fixture_stream(
+                            frame.sender_fragment_instance_id,
+                            frame.destination_fragment_instance_id,
+                            frame.destination_node_id,
+                            frame.sender_ordinal,
+                        )
+                    }),
                     source_fragment_instance_id: frame.sender_fragment_instance_id,
                     sender_ordinal: frame.sender_ordinal,
                     sender_count: frame.sender_count,
@@ -1739,8 +1747,8 @@ mod statistics {
         plan.add_fragment(producer).unwrap();
         plan.add_fragment(consumer).unwrap();
         plan.add_edge(Edge {
-            role: novarocks_physical_plan::OutputRole::Relational,
-            delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
+            role: novarocks_physical_plan::OutputRole::WriterResults,
+            delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
             id: EDGE,
             kind: EdgeKind::Stream,
             source: EdgeSource {

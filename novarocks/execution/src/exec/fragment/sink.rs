@@ -27,6 +27,7 @@ use std::collections::HashSet;
 #[derive(Clone)]
 pub struct DataStreamSinkFactoryInput {
     pub dest_node_id: i32,
+    pub delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
     pub output_partition_type: DataStreamPartitionType,
     pub output_columns: Vec<SlotId>,
     pub destinations: Vec<FragmentDestination>,
@@ -36,6 +37,7 @@ impl DataStreamSinkFactoryInput {
     pub fn try_from_static_program(
         dest_node_id: i32,
         output_partition_type: DataStreamPartitionType,
+        delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
         output_columns: Vec<SlotId>,
         destinations: Vec<FragmentDestination>,
     ) -> ExecutionResult<Self> {
@@ -51,6 +53,7 @@ impl DataStreamSinkFactoryInput {
         Ok(Self {
             dest_node_id,
             output_partition_type,
+            delivery,
             output_columns,
             destinations,
         })
@@ -59,6 +62,7 @@ impl DataStreamSinkFactoryInput {
     pub fn try_new(
         dest_node_id: i32,
         output_partition_type: DataStreamPartitionType,
+        delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
         output_columns: Vec<i32>,
         destinations: Vec<FragmentDestination>,
     ) -> ExecutionResult<Self> {
@@ -78,6 +82,7 @@ impl DataStreamSinkFactoryInput {
         Self::try_from_static_program(
             dest_node_id,
             output_partition_type,
+            delivery,
             parsed_output_columns,
             destinations,
         )
@@ -133,6 +138,7 @@ mod tests {
         let failure = super::DataStreamSinkFactoryInput::try_new(
             17,
             DataStreamPartitionType::Unpartitioned,
+            novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
             vec![-1],
             vec![],
         )

@@ -21,22 +21,16 @@ use std::{fmt, sync::Arc};
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverFrame, ExchangeReceiverKey, ExchangeReceiverPort,
 };
-use novarocks_execution_contract::FragmentNodeId;
+use novarocks_execution_contract::ExchangeStreamIdentity;
 use novarocks_proto_models as proto;
 use novarocks_types::UniqueId;
 use novarocks_worker::{InboundFrameClaim, NormalClosedInbound, TaskInboundCapabilities};
 
-/// Exactly the addressing fields one inbound exchange frame carries.
-///
-/// The frame has no query, attempt, or task identity in it, so every field
-/// here is a kernel key or a wire counter. An authority resolves those against
-/// its own frozen facts; nothing downstream may derive authority from them.
+/// The exact admitted stream and sender-count claim, checked before any live
+/// or closed-route authority is consulted.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ExchangeRouteQuery {
-    pub destination_fragment_instance_id: UniqueId,
-    pub destination_node_id: i32,
-    pub source_fragment_instance_id: UniqueId,
-    pub sender_ordinal: u32,
+    pub stream: ExchangeStreamIdentity,
     pub sender_count: u32,
 }
 
@@ -132,17 +126,26 @@ impl ExchangeRouteAuthority for TaskInboundCapabilitiesRouteAuthority {
     }
 
     fn claim_exchange_route(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim {
-        match self.0.claim_frame(
-            query.destination_fragment_instance_id,
-            FragmentNodeId::new(query.destination_node_id),
-            query.source_fragment_instance_id,
-            query.sender_ordinal,
-            query.sender_count,
-        ) {
-            InboundFrameClaim::NotHeld => ExchangeRouteClaim::NotHeld,
-            InboundFrameClaim::Authorized => ExchangeRouteClaim::Authorized,
-            InboundFrameClaim::NormallyClosed(proof) => ExchangeRouteClaim::NormallyClosed(proof),
-            InboundFrameClaim::Refused(detail) => ExchangeRouteClaim::Refused(detail),
+        match self.0.claim_stream(query.stream) {
+            Ok(admission) if admission.sender_count() == query.sender_count => {
+                ExchangeRouteClaim::Authorized
+            }
+            Ok(_) => ExchangeRouteClaim::Refused(
+                "exchange sender count differs from frozen topology".into(),
+            ),
+            Err(InboundFrameClaim::NotHeld) => ExchangeRouteClaim::NotHeld,
+            Err(InboundFrameClaim::NormallyClosed(proof))
+                if proof.sender_count() == query.sender_count =>
+            {
+                ExchangeRouteClaim::NormallyClosed(proof)
+            }
+            Err(InboundFrameClaim::NormallyClosed(_)) => ExchangeRouteClaim::Refused(
+                "closed exchange sender count differs from frozen topology".into(),
+            ),
+            Err(InboundFrameClaim::Refused(detail)) => ExchangeRouteClaim::Refused(detail),
+            Err(InboundFrameClaim::Authorized) => {
+                unreachable!("successful stream claims return admission")
+            }
         }
     }
 
@@ -153,30 +156,41 @@ impl ExchangeRouteAuthority for TaskInboundCapabilitiesRouteAuthority {
         key: ExchangeReceiverKey,
         frame: ExchangeReceiverFrame,
     ) -> ExchangeRouteDelivery {
-        match self.0.deliver_frame_with_receiver_error(
-            query.destination_fragment_instance_id,
-            FragmentNodeId::new(query.destination_node_id),
-            query.source_fragment_instance_id,
-            query.sender_ordinal,
-            query.sender_count,
-            || receiver_port.push(key, frame),
-        ) {
-            novarocks_worker::InboundFrameDelivery::Claim(InboundFrameClaim::Authorized) => {
-                ExchangeRouteDelivery::Delivered
+        if frame.stream != query.stream
+            || frame.sender_count != query.sender_count
+            || key.fragment_instance_id != query.stream.destination_fragment_instance_id()
+            || key.node_id != query.stream.destination_node().get()
+        {
+            return ExchangeRouteDelivery::Refused(
+                "exchange delivery differs from its claimed stream".into(),
+            );
+        }
+        match self.0.with_claimed_stream(query.stream, |admission| {
+            if admission.sender_count() != query.sender_count {
+                return Err(ExchangeRouteDelivery::Refused(
+                    "exchange sender count differs from frozen topology".into(),
+                ));
             }
-            novarocks_worker::InboundFrameDelivery::Claim(InboundFrameClaim::NormallyClosed(
-                proof,
-            )) => ExchangeRouteDelivery::NormallyClosed(proof),
-            novarocks_worker::InboundFrameDelivery::Claim(InboundFrameClaim::Refused(detail)) => {
-                ExchangeRouteDelivery::Refused(detail)
+            receiver_port
+                .push(key, frame)
+                .map_err(ExchangeRouteDelivery::Receiver)
+        }) {
+            Ok(Ok(())) => ExchangeRouteDelivery::Delivered,
+            Ok(Err(error)) => error,
+            Err(InboundFrameClaim::NormallyClosed(proof))
+                if proof.sender_count() == query.sender_count =>
+            {
+                ExchangeRouteDelivery::NormallyClosed(proof)
             }
-            novarocks_worker::InboundFrameDelivery::Claim(InboundFrameClaim::NotHeld) => {
-                ExchangeRouteDelivery::Refused(
-                    "task destination was withdrawn before delivery".to_owned(),
-                )
-            }
-            novarocks_worker::InboundFrameDelivery::Receiver(error) => {
-                ExchangeRouteDelivery::Receiver(error)
+            Err(InboundFrameClaim::NormallyClosed(_)) => ExchangeRouteDelivery::Refused(
+                "closed exchange sender count differs from frozen topology".into(),
+            ),
+            Err(InboundFrameClaim::Refused(detail)) => ExchangeRouteDelivery::Refused(detail),
+            Err(InboundFrameClaim::NotHeld) => ExchangeRouteDelivery::Refused(
+                "task destination was withdrawn before delivery".into(),
+            ),
+            Err(InboundFrameClaim::Authorized) => {
+                unreachable!("successful stream claims invoke delivery")
             }
         }
     }
@@ -341,11 +355,36 @@ pub fn handle_transmit_chunk(
         ));
         return response;
     }
+    let stream = match params
+        .stream
+        .as_ref()
+        .ok_or_else(|| "exchange ingress requires an exact stream identity".to_owned())
+        .and_then(|wire| {
+            novarocks_task_codec::exchange_flow_codec::decode_stream(
+                wire,
+                novarocks_proto_codec::FieldPath::root("exchange_request").field("stream"),
+            )
+            .map_err(|e| e.to_string())
+        }) {
+        Ok(stream) => stream,
+        Err(error) => {
+            response.status = Some(error_common_status(error));
+            return response;
+        }
+    };
+    if stream.destination_fragment_instance_id() != destination_fragment_instance_id
+        || stream.destination_node().get() != params.node_id
+        || stream.source().fragment_instance_id() != source_fragment_instance_id
+        || stream.source().sender_ordinal() != params.sender_ordinal
+        || params.sequence < 0
+    {
+        response.status = Some(error_common_status(
+            "exchange envelope differs from its exact stream identity or sequence",
+        ));
+        return response;
+    }
     let query = ExchangeRouteQuery {
-        destination_fragment_instance_id,
-        destination_node_id: params.node_id,
-        source_fragment_instance_id,
-        sender_ordinal: params.sender_ordinal,
+        stream,
         sender_count: params.sender_count,
     };
     let owner = match settle_exchange_route(authorities, query) {
@@ -363,6 +402,7 @@ pub fn handle_transmit_chunk(
         node_id: params.node_id,
     };
     let frame = ExchangeReceiverFrame {
+        stream,
         source_fragment_instance_id,
         sender_ordinal: params.sender_ordinal,
         sender_count: params.sender_count,
@@ -375,19 +415,12 @@ pub fn handle_transmit_chunk(
     match authorities[owner].deliver_exchange_route(query, receiver_port, key, frame) {
         ExchangeRouteDelivery::Delivered => {}
         ExchangeRouteDelivery::NormallyClosed(proof) => {
-            response.normal_closed = Some(proto::novarocks::ExchangeNormalClosed {
-            disposition: Some(novarocks_proto_models::novarocks::exchange_normal_closed::Disposition::Withdrawn(novarocks_proto_models::novarocks::ExchangeWithdrawn {})),
-                destination_task: Some(novarocks_task_codec::identity::encode_task_identity(
-                    proof.destination(),
-                )),
-                destination_finst_id_hi: proof.destination_kernel_key().high(),
-                destination_finst_id_lo: proof.destination_kernel_key().low(),
-                destination_node_id: proof.destination_node_id().get(),
-                source_finst_id_hi: proof.source().fragment_instance_id().high(),
-                source_finst_id_lo: proof.source().fragment_instance_id().low(),
-                sender_ordinal: proof.source().sender_ordinal(),
-                sender_count: proof.sender_count(),
-            });
+            response.normal_closed = Some(
+                novarocks_task_codec::exchange_flow_codec::encode_normal_close(
+                    proof.close(),
+                    proof.sender_count(),
+                ),
+            );
         }
         ExchangeRouteDelivery::Receiver(error) => {
             // This is the existing final wire projection, not error classification.
@@ -437,7 +470,24 @@ mod tests {
 
     fn frame() -> proto::novarocks::ExchangeRequest {
         proto::novarocks::ExchangeRequest {
-            stream: None,
+            stream: Some({
+                let mut stream = crate::exchange_transmitter::tests::frame_and_proof()
+                    .0
+                    .stream
+                    .unwrap();
+                stream = novarocks_execution_contract::ExchangeStreamIdentity::try_new(
+                    novarocks_execution_contract::ExchangeSource::new(
+                        stream.source().task(),
+                        novarocks_types::UniqueId::new(3, 4),
+                        0,
+                    ),
+                    stream.destination(),
+                    novarocks_types::UniqueId::new(1, 2),
+                    novarocks_execution_contract::FragmentNodeId::new(7),
+                )
+                .unwrap();
+                novarocks_task_codec::exchange_flow_codec::encode_stream(stream)
+            }),
             finst_id_hi: 1,
             finst_id_lo: 2,
             node_id: 7,
@@ -693,5 +743,31 @@ mod tests {
                 status.message
             );
         }
+    }
+    #[test]
+    fn missing_or_mismatched_exact_stream_is_refused_before_route_authority() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counting(AtomicUsize);
+        impl ExchangeRouteAuthority for Counting {
+            fn authority_name(&self) -> &'static str {
+                "counting"
+            }
+            fn claim_exchange_route(&self, _: ExchangeRouteQuery) -> ExchangeRouteClaim {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                ExchangeRouteClaim::Authorized
+            }
+        }
+        let authority = Counting(AtomicUsize::new(0));
+        for mutation in 0..4 {
+            let mut request = frame();
+            match mutation {
+                0 => request.stream = None,
+                1 => request.stream.as_mut().unwrap().destination_finst_id_lo += 1,
+                2 => request.stream.as_mut().unwrap().sender_ordinal += 1,
+                _ => request.sequence = -1,
+            }
+            assert_ne!(transmit(&[&authority], request).code, 0);
+        }
+        assert_eq!(authority.0.load(Ordering::SeqCst), 0);
     }
 }

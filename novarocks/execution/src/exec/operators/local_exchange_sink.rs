@@ -74,6 +74,7 @@ impl OperatorFactory for LocalExchangeSinkFactory {
             driver_id,
             exchanger: self.exchanger.clone(),
             producer_finished: false,
+            bypass_cursor: 0,
             logged_first_input: false,
             queue_tracker: None,
             construction: None,
@@ -90,6 +91,7 @@ struct LocalExchangeSinkOperator {
     driver_id: i32,
     exchanger: Arc<LocalExchanger>,
     producer_finished: bool,
+    bypass_cursor: usize,
     logged_first_input: bool,
     // Outer Option records installation, including an explicitly untracked
     // kernel-only fixture. Production binding supplies its query owner.
@@ -132,7 +134,14 @@ impl OperatorLifecycle for LocalExchangeSinkOperator {
         self.finish_producer();
     }
 }
-impl InputEncodingPolicy for LocalExchangeSinkOperator {}
+impl InputEncodingPolicy for LocalExchangeSinkOperator {
+    fn retains_encoded_path(
+        &self,
+        _: crate::exec::pipeline::operator::EncodedValueOccurrence<'_>,
+    ) -> bool {
+        self.exchanger.retains_encoded_partition_input()
+    }
+}
 impl SinkKernel for LocalExchangeSinkOperator {
     fn poll_control(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
         if self.exchanger.all_consumers_closed() {
@@ -192,8 +201,13 @@ impl SinkKernel for LocalExchangeSinkOperator {
             .construction
             .as_deref()
             .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
-        self.exchanger
-            .accept_created(tracker.as_ref(), chunk, factory, ctx)?;
+        self.exchanger.accept_created(
+            tracker.as_ref(),
+            chunk,
+            factory,
+            ctx,
+            &mut self.bypass_cursor,
+        )?;
         Ok(SinkStep::new(NextStep::NeedInput, rows))
     }
     fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
@@ -1023,5 +1037,74 @@ mod tests {
         );
         sibling.close().unwrap();
         assert!(exchanger.all_consumers_closed());
+    }
+    #[test]
+    fn conditional_bypass_cursor_is_per_producer_and_persists_across_batches() {
+        use crate::exec::operators::local_exchanger::LocalExchangePartitionSpec;
+        use arrow::array::{ArrayRef, BooleanArray, Int32Array};
+        use arrow::datatypes::DataType;
+        use novarocks_type_contract::FunctionValueType;
+        use novarocks_types::SlotId;
+        fn bypass(values: Vec<i32>) -> Chunk {
+            let count = values.len();
+            crate::exec::chunk::typed_fixture::columns(
+                &["row", "target", "applies"],
+                &[SlotId::new(1), SlotId::new(2), SlotId::new(3)],
+                &[
+                    FunctionValueType::new(DataType::Int32, false),
+                    FunctionValueType::new(DataType::Int32, true),
+                    FunctionValueType::new(DataType::Boolean, true),
+                ],
+                vec![
+                    Arc::new(Int32Array::from(values)) as ArrayRef,
+                    Arc::new(Int32Array::from(vec![None::<i32>; count])),
+                    Arc::new(BooleanArray::from(vec![Some(false); count])),
+                ],
+                count,
+            )
+        }
+        let rt = RuntimeState::default();
+        let exchanger = LocalExchanger::new_with_limits(
+            3,
+            2,
+            LocalExchangePartitionSpec::ConditionalKey {
+                applies: SlotId::new(3),
+                keys: vec![(
+                    SlotId::new(2),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+                )],
+            },
+            1024 * 1024,
+            -1,
+        );
+        let factory = LocalExchangeSinkFactory::new(-1, exchanger.clone());
+        let mut first = factory.create(2, 0);
+        let mut second = factory.create(2, 1);
+        install_actual_creator(first.as_mut(), &rt);
+        install_actual_creator(second.as_mut(), &rt);
+        push_chunk(&mut first, &rt, bypass(vec![0, 1]));
+        push_chunk(&mut second, &rt, bypass(vec![100]));
+        push_chunk(&mut first, &rt, bypass(vec![2, 3]));
+        push_chunk(&mut second, &rt, bypass(vec![101]));
+        finish_sink(&mut first, &rt);
+        finish_sink(&mut second, &rt);
+        let source = LocalExchangeSourceFactory::new(-1, 3, exchanger);
+        let mut found = Vec::new();
+        for partition in 0..3 {
+            let mut consumer = source.create(3, partition);
+            let mut rows = Vec::new();
+            while let Some(chunk) = pull(&mut consumer, &rt) {
+                rows.extend_from_slice(
+                    chunk.columns()[0]
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values(),
+                );
+            }
+            rows.sort_unstable();
+            found.push(rows);
+        }
+        assert_eq!(found, vec![vec![0, 3, 100], vec![1, 101], vec![2]]);
     }
 }

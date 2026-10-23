@@ -168,6 +168,13 @@ impl<'a> StepContext<'a> {
     pub fn value_conversions(&mut self) -> &mut ValueConversionContext {
         self.value_conversions
     }
+    /// Borrow disjoint driver fields for one synchronous value operation.
+    /// The failure port and conversion state keep their original owners.
+    pub(crate) fn value_conversion_scope(
+        &mut self,
+    ) -> (&RuntimeErrorState, &mut ValueConversionContext) {
+        (self.control, self.value_conversions)
+    }
     pub fn work(&mut self) -> &mut TurnWork {
         self.work
     }

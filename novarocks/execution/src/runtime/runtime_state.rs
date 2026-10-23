@@ -120,6 +120,12 @@ impl crate::runtime::fragment::ExecutionFailureReporter for RuntimeErrorState {
     }
 }
 impl RuntimeErrorState {
+    pub(crate) fn task_identity(&self) -> Option<novarocks_execution_contract::TaskIdentity> {
+        match &self.control {
+            RuntimeFailureControl::Task(control) => Some(control.identity()),
+            RuntimeFailureControl::Local(_) => None,
+        }
+    }
     pub fn for_task(
         control: std::sync::Arc<crate::runtime::task_control::TaskExecutionControl>,
     ) -> Self {

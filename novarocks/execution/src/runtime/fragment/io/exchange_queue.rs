@@ -24,6 +24,9 @@ use crate::runtime::io::{IoExecutor, IoTaskHandle};
 use crate::runtime::mem_tracker::TrackedBytes;
 use crate::runtime::profile::{OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
 use crate::runtime::runtime_state::RuntimeErrorState;
+use novarocks_execution_contract::{
+    ExchangeCloseDisposition, ExchangeDeliveryRequirement, ExchangeStreamIdentity,
+};
 use novarocks_types::UniqueId;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
@@ -38,6 +41,9 @@ pub enum ExchangeSendQueueFailure {
     OwnerStopped,
     ObservationPoisoned,
     ObservationRebound,
+    SequenceExhausted,
+    AfterEnd,
+    RequiredInputWithdrawn,
 }
 impl std::fmt::Display for ExchangeSendQueueFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -45,6 +51,11 @@ impl std::fmt::Display for ExchangeSendQueueFailure {
             Self::OwnerStopped => "exchange send owner was cancelled",
             Self::ObservationPoisoned => "exchange tracker observation lock failed",
             Self::ObservationRebound => "exchange tracker already bound to another test observer",
+            Self::SequenceExhausted => "exchange stream sequence domain is exhausted",
+            Self::AfterEnd => "exchange stream cannot enqueue another frame after End",
+            Self::RequiredInputWithdrawn => {
+                "required exchange input was withdrawn before complete delivery"
+            }
         })
     }
 }
@@ -66,6 +77,14 @@ impl novarocks_failure_contract::FailureProjection for ExchangeSendQueueFailure 
                 FailureClass::Invariant,
                 ExecutionReason::ExchangeObservationRebound,
             ),
+            Self::SequenceExhausted => (
+                FailureClass::Resource,
+                ExecutionReason::ExchangeStreamContract,
+            ),
+            Self::AfterEnd | Self::RequiredInputWithdrawn => (
+                FailureClass::Invariant,
+                ExecutionReason::ExchangeStreamContract,
+            ),
         };
         FailureFact::new(class, reason.reason())
     }
@@ -84,6 +103,9 @@ pub struct ExchangeSendTracker {
     active_tasks: AtomicUsize,
     cancelled: CancellationToken,
     handles: Mutex<Vec<IoTaskHandle>>,
+    // The actual I/O result remains observable while its Task proposal awaits
+    // adjudication. This is no Task conclusion or independent acceptance domain.
+    failure: Mutex<Option<crate::runtime::fragment::ExecutionFailure>>,
 }
 
 impl ExchangeSendTracker {
@@ -120,7 +142,34 @@ impl ExchangeSendTracker {
             active_tasks: AtomicUsize::new(0),
             cancelled: CancellationToken::new(),
             handles: Mutex::new(Vec::new()),
+            failure: Mutex::new(None),
         })
+    }
+
+    pub fn failure(&self) -> Option<crate::runtime::fragment::ExecutionFailure> {
+        self.failure
+            .lock()
+            .expect("exchange actual I/O result lock")
+            .clone()
+    }
+    fn report_failure(
+        &self,
+        state: &RuntimeErrorState,
+        failure: impl Into<crate::runtime::fragment::ExecutionFailure>,
+    ) {
+        let failure = failure.into();
+        {
+            let mut result = self
+                .failure
+                .lock()
+                .expect("exchange actual I/O result lock");
+            if result.is_none() {
+                *result = Some(failure.clone());
+            }
+        }
+        // A submit may synchronously notify observers. Retain no queue or result
+        // mutex across this call, and do not interpret its return as settlement.
+        state.set_error(failure);
     }
 
     pub fn on_enqueue(&self, bytes: usize) {
@@ -188,6 +237,9 @@ impl Drop for SendTaskActivity {
 }
 
 pub struct ExchangeSendTask {
+    /// Retained by the sink factory across idle queue gaps and shared by every
+    /// driver producing this frozen set of streams.
+    pub order: Arc<ExchangeSendOrder>,
     pub frame: ExchangeFrame,
     pub transmitter: Arc<dyn ExchangeFrameTransmitter>,
     pub payload_accounting: Option<TrackedBytes>,
@@ -211,6 +263,67 @@ struct ExchangeSendKey {
     finst_id: UniqueId,
     node_id: i32,
     sender_id: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct ExchangeStreamQueueKey {
+    destination: ExchangeSendKey,
+    stream: Option<ExchangeStreamIdentity>,
+    source_kernel: UniqueId,
+    sender_ordinal: u32,
+}
+impl ExchangeStreamQueueKey {
+    fn from_task(task: &ExchangeSendTask) -> Self {
+        Self {
+            destination: ExchangeSendKey::from_task(task),
+            stream: task.frame.stream,
+            source_kernel: task.frame.sender_fragment_instance_id,
+            sender_ordinal: task.frame.sender_ordinal,
+        }
+    }
+}
+
+/// Sequence custody belongs to the finite producer, not to the process queue.
+/// Queue admission serializes allocation with insertion; capacity/permission
+/// waits never consume a sequence and removing an idle queue does not reset it.
+#[derive(Default)]
+pub struct ExchangeSendOrder {
+    streams: Mutex<HashMap<ExchangeStreamQueueKey, (i64, bool)>>,
+}
+impl ExchangeSendOrder {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn admit(
+        &self,
+        key: &ExchangeStreamQueueKey,
+        eos: bool,
+    ) -> Result<i64, ExchangeSendQueueFailure> {
+        let mut streams = self.streams.lock().expect("exchange stream sequence lock");
+        let (next, ended) = streams.entry(key.clone()).or_insert((0, false));
+        if *ended {
+            return Err(ExchangeSendQueueFailure::AfterEnd);
+        }
+        let sequence = *next;
+        if eos {
+            *ended = true;
+        } else {
+            *next = next
+                .checked_add(1)
+                .ok_or(ExchangeSendQueueFailure::SequenceExhausted)?;
+        }
+        Ok(sequence)
+    }
+    #[cfg(test)]
+    pub(crate) fn admitted_count(&self) -> usize {
+        self.streams
+            .lock()
+            .unwrap()
+            .values()
+            .map(|(next, ended)| usize::try_from(*next).unwrap() + usize::from(*ended))
+            .sum()
+    }
 }
 
 impl ExchangeSendKey {
@@ -250,7 +363,7 @@ pub struct ExchangeSendQueue {
     /// not exhaust the shared `inflight_bytes` and stall senders to other destinations.
     per_dest_bytes: Arc<Mutex<HashMap<ExchangeSendKey, usize>>>,
     max_inflight_bytes_per_dest: usize,
-    queues: Arc<Mutex<HashMap<ExchangeSendKey, VecDeque<QueuedSendTask>>>>,
+    queues: Arc<Mutex<HashMap<ExchangeStreamQueueKey, VecDeque<QueuedSendTask>>>>,
     send_observers: Mutex<Vec<std::sync::Weak<Observable>>>,
     io_executor: Arc<IoExecutor>,
 }
@@ -332,7 +445,7 @@ impl ExchangeSendQueue {
     ) -> Result<ExchangeSendEnqueue, ExchangeSendQueueFailure> {
         let reserve_bytes = reserve_bytes.max(1);
         task.tracker.on_enqueue(reserve_bytes);
-        if self.enqueue_task(task, reserve_bytes) {
+        if self.enqueue_task(task, reserve_bytes)? {
             Ok(ExchangeSendEnqueue::Enqueued)
         } else {
             Err(ExchangeSendQueueFailure::OwnerStopped)
@@ -361,7 +474,7 @@ impl ExchangeSendQueue {
         }
 
         task.tracker.on_enqueue(reserve_bytes);
-        if self.enqueue_task(task, reserve_bytes) {
+        if self.enqueue_task(task, reserve_bytes)? {
             Ok(ExchangeSendEnqueue::Enqueued)
         } else {
             Err(ExchangeSendQueueFailure::OwnerStopped)
@@ -457,24 +570,16 @@ impl ExchangeSendQueue {
         true
     }
 
-    fn enqueue_task(self: &Arc<Self>, task: ExchangeSendTask, reserve_bytes: usize) -> bool {
-        let key = ExchangeSendKey::from_task(&task);
+    fn enqueue_task(
+        self: &Arc<Self>,
+        task: ExchangeSendTask,
+        reserve_bytes: usize,
+    ) -> Result<bool, ExchangeSendQueueFailure> {
+        let key = ExchangeStreamQueueKey::from_task(&task);
         #[cfg(novarocks_dev_controls)]
         let test_observer = task.tracker.test_observer();
         #[cfg(novarocks_dev_controls)]
-        let eos_marker = (task.frame.eos
-            && test_observer
-                .as_ref()
-                .is_some_and(|observer| observer.is_active()))
-        .then_some({
-            (
-                task.frame.sender_fragment_instance_id,
-                task.frame.sender_ordinal,
-                task.frame.sender_count,
-                task.frame.backend_number,
-                task.frame.sequence,
-            )
-        });
+        let mut eos_marker = None;
         let mut queued = Some(QueuedSendTask {
             task,
             reserve_bytes,
@@ -490,6 +595,30 @@ impl ExchangeSendQueue {
                     .as_ref()
                     .is_some_and(|gate| gate.is_normally_canceled())
             {
+                let pending = &mut queued.as_mut().expect("queued send exists").task;
+                match pending.order.admit(&key, pending.frame.eos) {
+                    Ok(sequence) => pending.frame.sequence = sequence,
+                    Err(error) => {
+                        let rejected = queued.take().expect("queued send exists");
+                        drop(guard);
+                        rejected
+                            .task
+                            .tracker
+                            .report_failure(&rejected.task.error_state, error);
+                        self.release_discarded(rejected);
+                        return Err(error);
+                    }
+                }
+                #[cfg(novarocks_dev_controls)]
+                if pending.frame.eos && test_observer.as_ref().is_some_and(|o| o.is_active()) {
+                    eos_marker = Some((
+                        pending.frame.sender_fragment_instance_id,
+                        pending.frame.sender_ordinal,
+                        pending.frame.sender_count,
+                        pending.frame.backend_number,
+                        pending.frame.sequence,
+                    ));
+                }
                 if let Some(queue) = guard.get_mut(&key) {
                     queue.push_back(queued.take().expect("queued send exists"));
                 } else {
@@ -501,11 +630,16 @@ impl ExchangeSendQueue {
 
         if let Some(cancelled) = queued {
             let owner_cancelled = cancelled.task.tracker.is_cancelled();
+            let required_withdrawal = !owner_cancelled
+                && cancelled.task.frame.delivery == ExchangeDeliveryRequirement::MustDrain;
             self.release_discarded(cancelled);
+            if required_withdrawal {
+                return Err(ExchangeSendQueueFailure::RequiredInputWithdrawn);
+            }
             // A destination that closed between the sink's gate check and
             // queue admission owes no frame. Its normal close is not a query
             // error; a cancelled owner is still reported to its caller.
-            return !owner_cancelled;
+            return Ok(!owner_cancelled);
         }
 
         #[cfg(novarocks_dev_controls)]
@@ -517,12 +651,12 @@ impl ExchangeSendQueue {
                 || {
                     format!(
                         "event=send_eos_enqueued dest={}:{} dest_finst={} node_id={} sender_finst={} sender_id={} sender_ordinal={} sender_count={} be_number={} seq={} reserve_bytes={} started_immediately={}",
-                        key.dest_host,
-                        key.dest_port,
-                        key.finst_id,
-                        key.node_id,
+                        key.destination.dest_host,
+                        key.destination.dest_port,
+                        key.destination.finst_id,
+                        key.destination.node_id,
                         sender_finst,
-                        key.sender_id,
+                        key.destination.sender_id,
                         sender_ordinal,
                         sender_count,
                         be_number,
@@ -537,7 +671,7 @@ impl ExchangeSendQueue {
         if let Some(queued) = start_now {
             self.spawn_send_task(key, queued);
         }
-        true
+        Ok(true)
     }
 
     fn run_send_task(self: &Arc<Self>, task: ExchangeSendTask, reserve_bytes: usize) {
@@ -568,6 +702,7 @@ impl ExchangeSendQueue {
             error_state,
             tracker,
             edge_gate,
+            order: _,
         } = task;
         #[cfg(novarocks_dev_controls)]
         let test_observer = tracker.test_observer();
@@ -581,7 +716,38 @@ impl ExchangeSendQueue {
         let be_number = frame.backend_number;
         let eos = frame.eos;
         let sequence = frame.sequence;
-        let result = transmitter.transmit_cancellable(frame, tracker.cancelled.clone());
+        let delivery = frame.delivery;
+        let result = match transmitter.transmit_cancellable(frame, tracker.cancelled.clone()) {
+            Err(ExchangeTransmitRejection::NormallyClosed(
+                ExchangeCloseDisposition::Consumed { final_sequence },
+            )) if eos && final_sequence.get() == sequence => Ok(()),
+            Err(ExchangeTransmitRejection::NormallyClosed(ExchangeCloseDisposition::Withdrawn))
+                if delivery == ExchangeDeliveryRequirement::DemandDriven =>
+            {
+                Err(ExchangeTransmitRejection::DestinationCanceled(
+                    crate::task_execution::status::CancelReason::UpstreamNoLongerNeeded,
+                ))
+            }
+            Err(ExchangeTransmitRejection::NormallyClosed(_)) => Err(
+                ExchangeTransmitRejection::Failed(super::FragmentIoError::new(
+                    super::FragmentIoOperation::ExchangeTransmit,
+                    super::FragmentIoErrorKind::InvalidResponse,
+                    "normal close does not prove this exact stream's final End was consumed",
+                )),
+            ),
+            Err(ExchangeTransmitRejection::DestinationCanceled(_))
+                if delivery == ExchangeDeliveryRequirement::MustDrain =>
+            {
+                Err(ExchangeTransmitRejection::Failed(
+                    super::FragmentIoError::new(
+                        super::FragmentIoOperation::ExchangeTransmit,
+                        super::FragmentIoErrorKind::InvalidResponse,
+                        "required exchange input was withdrawn before complete delivery",
+                    ),
+                ))
+            }
+            result => result,
+        };
         let send_ns = send_start.elapsed().as_nanos();
 
         if let Some(profile) = profiles.as_ref() {
@@ -726,13 +892,22 @@ impl ExchangeSendQueue {
                         sequence,
                         message
                     );
-                    error_state.set_error(super::FragmentIoError::new(
-                        super::FragmentIoOperation::ExchangeTransmit,
-                        super::FragmentIoErrorKind::InvalidResponse,
-                        message,
-                    ));
+                    tracker.report_failure(
+                        &error_state,
+                        super::FragmentIoError::new(
+                            super::FragmentIoOperation::ExchangeTransmit,
+                            super::FragmentIoErrorKind::InvalidResponse,
+                            message,
+                        ),
+                    );
                 }
             },
+            Err(ExchangeTransmitRejection::NormallyClosed(_)) => {
+                tracker.report_failure(
+                    &error_state,
+                    ExchangeSendQueueFailure::RequiredInputWithdrawn,
+                );
+            }
             Err(ExchangeTransmitRejection::Failed(err)) => {
                 if eos {
                     #[cfg(novarocks_dev_controls)]
@@ -756,7 +931,7 @@ impl ExchangeSendQueue {
                         },
                     );
                 }
-                error_state.set_error(err.clone());
+                tracker.report_failure(&error_state, err.clone());
                 error!(
                     "exchange send failed: dest={} dest_finst={} sender_finst={} node_id={} sender_id={} seq={} error={}",
                     destination,
@@ -863,6 +1038,18 @@ impl ExchangeSendQueue {
             task,
             reserve_bytes,
         } = queued;
+        if task.frame.delivery == ExchangeDeliveryRequirement::MustDrain
+            && !task.tracker.is_cancelled()
+            && task
+                .edge_gate
+                .as_ref()
+                .is_some_and(|gate| gate.is_normally_canceled())
+        {
+            task.tracker.report_failure(
+                &task.error_state,
+                ExchangeSendQueueFailure::RequiredInputWithdrawn,
+            );
+        }
         let dest_key = ExchangeSendKey::from_task(&task);
         self.inflight_bytes
             .fetch_sub(reserve_bytes, Ordering::AcqRel);
@@ -874,7 +1061,7 @@ impl ExchangeSendQueue {
         self.notify_send_observers();
     }
 
-    fn spawn_send_task(self: &Arc<Self>, key: ExchangeSendKey, queued: QueuedSendTask) {
+    fn spawn_send_task(self: &Arc<Self>, key: ExchangeStreamQueueKey, queued: QueuedSendTask) {
         let queue = Arc::clone(self);
         let tracker = Arc::clone(&queued.task.tracker);
         let activity = tracker.begin_task(Arc::clone(&queued.task.notify));
@@ -897,7 +1084,7 @@ impl ExchangeSendQueue {
         tracker.retain_handle(handle);
     }
 
-    fn on_task_complete(self: &Arc<Self>, key: ExchangeSendKey) {
+    fn on_task_complete(self: &Arc<Self>, key: ExchangeStreamQueueKey) {
         let (next, discarded) = {
             let mut guard = self.queues.lock().expect("exchange send queue lock");
             let Some(queue) = guard.get_mut(&key) else {
@@ -949,8 +1136,9 @@ impl ExchangeSendQueue {
     /// real submit performs, but without starting a send. It lets a test
     /// observe the backlog itself instead of a worker thread's timing.
     fn backlog_for_test(self: &Arc<Self>, task: ExchangeSendTask, reserve_bytes: usize) {
-        let key = ExchangeSendKey::from_task(&task);
-        self.force_add_per_dest(&key, reserve_bytes);
+        let budget_key = ExchangeSendKey::from_task(&task);
+        let key = ExchangeStreamQueueKey::from_task(&task);
+        self.force_add_per_dest(&budget_key, reserve_bytes);
         self.inflight_bytes
             .fetch_add(reserve_bytes, Ordering::AcqRel);
         task.tracker.on_enqueue(reserve_bytes);
@@ -1168,7 +1356,10 @@ mod tests {
         tracker: Arc<ExchangeSendTracker>,
     ) -> ExchangeSendTask {
         ExchangeSendTask {
+            order: ExchangeSendOrder::new(),
             frame: ExchangeFrame {
+                stream: None,
+                delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
                 destination: RuntimeEndpoint::new("be-2", 9060).expect("destination"),
                 destination_fragment_instance_id: UniqueId::new(2, 3),
                 destination_task_identity: None,
@@ -1579,12 +1770,17 @@ mod tests {
         assert_eq!(later.frame_count(), 0);
         assert_eq!(queue.inflight_bytes(), 3);
 
-        queue.on_task_complete(ExchangeSendKey {
-            dest_host: "be-2".to_string(),
-            dest_port: 9060,
-            finst_id: healthy,
-            node_id: 6,
-            sender_id: 7,
+        queue.on_task_complete(ExchangeStreamQueueKey {
+            stream: None,
+            source_kernel: UniqueId::new(4, 5),
+            sender_ordinal: 0,
+            destination: ExchangeSendKey {
+                dest_host: "be-2".to_string(),
+                dest_port: 9060,
+                finst_id: healthy,
+                node_id: 6,
+                sender_id: 7,
+            },
         });
         let deadline = Instant::now() + Duration::from_secs(1);
         while !tracker.is_idle() && Instant::now() < deadline {
@@ -1681,5 +1877,184 @@ mod tests {
         assert!(q.reserve_bytes_for("A", 1, finst(), 0, 0, 100));
         // Once it has a backlog, further tasks are capped.
         assert!(!q.reserve_bytes_for("A", 1, finst(), 0, 0, 1));
+    }
+    fn wait_idle(tracker: &ExchangeSendTracker) {
+        let until = Instant::now() + Duration::from_secs(2);
+        while !tracker.is_idle() && Instant::now() < until {
+            std::thread::yield_now();
+        }
+        assert!(tracker.is_idle(), "actual exchange workers exited");
+    }
+
+    #[test]
+    fn stream_sequence_starts_at_actual_admission_survives_idle_and_is_per_destination() {
+        let queue = Arc::new(ExchangeSendQueue::with_limits(8, 8));
+        let tracker = ExchangeSendTracker::new();
+        let error = Arc::new(RuntimeErrorState::default());
+        let transmitter = Arc::new(RecordingTransmitter::default());
+        let order = ExchangeSendOrder::new();
+        let make = |destination: UniqueId, eos| {
+            let mut task = exchange_task(transmitter.clone(), error.clone(), tracker.clone());
+            task.order = order.clone();
+            task.frame.destination_fragment_instance_id = destination;
+            task.frame.eos = eos;
+            task
+        };
+        assert!(queue.reserve_bytes(8));
+        assert!(matches!(
+            queue
+                .try_submit(make(UniqueId::new(2, 3), false), false)
+                .unwrap(),
+            ExchangeSendEnqueue::NoCapacity
+        ));
+        assert_eq!(order.admitted_count(), 0);
+        queue.inflight_bytes.fetch_sub(8, Ordering::AcqRel);
+        for (destination, eos) in [
+            (UniqueId::new(2, 3), false),
+            (UniqueId::new(7, 8), false),
+            (UniqueId::new(2, 3), false),
+            (UniqueId::new(2, 3), true),
+        ] {
+            queue.try_submit(make(destination, eos), false).unwrap();
+            wait_idle(&tracker);
+        }
+        let frames = transmitter.frames.lock().unwrap();
+        assert_eq!(
+            frames.iter().map(|f| f.sequence).collect::<Vec<_>>(),
+            [0, 0, 1, 2]
+        );
+        assert!(error.error().is_none());
+        drop(frames);
+        assert!(matches!(
+            queue.try_submit(make(UniqueId::new(2, 3), false), false),
+            Err(ExchangeSendQueueFailure::AfterEnd)
+        ));
+        assert_eq!(queue.inflight_bytes(), 0);
+    }
+
+    #[test]
+    fn stream_sequence_exhaustion_rejects_data_but_allows_final_end_without_wrap() {
+        let order = ExchangeSendOrder::new();
+        let task = exchange_task(
+            Arc::new(RecordingTransmitter::default()),
+            Arc::new(RuntimeErrorState::default()),
+            ExchangeSendTracker::new(),
+        );
+        let key = ExchangeStreamQueueKey::from_task(&task);
+        order
+            .streams
+            .lock()
+            .unwrap()
+            .insert(key.clone(), (i64::MAX, false));
+        assert_eq!(
+            order.admit(&key, false),
+            Err(ExchangeSendQueueFailure::SequenceExhausted)
+        );
+        assert_eq!(order.admit(&key, true), Ok(i64::MAX));
+        assert_eq!(
+            order.admit(&key, true),
+            Err(ExchangeSendQueueFailure::AfterEnd)
+        );
+    }
+
+    #[test]
+    fn must_drain_withdrawal_is_an_error_and_consumed_must_match_own_final_end() {
+        for (eos, disposition, success) in [
+            (false, ExchangeCloseDisposition::Withdrawn, false),
+            (true, ExchangeCloseDisposition::Withdrawn, false),
+            (
+                true,
+                ExchangeCloseDisposition::Consumed {
+                    final_sequence: novarocks_execution_contract::ExchangeFrameSequence::try_new(9)
+                        .unwrap(),
+                },
+                true,
+            ),
+            (
+                true,
+                ExchangeCloseDisposition::Consumed {
+                    final_sequence: novarocks_execution_contract::ExchangeFrameSequence::try_new(8)
+                        .unwrap(),
+                },
+                false,
+            ),
+            (
+                false,
+                ExchangeCloseDisposition::Consumed {
+                    final_sequence: novarocks_execution_contract::ExchangeFrameSequence::try_new(9)
+                        .unwrap(),
+                },
+                false,
+            ),
+        ] {
+            let queue = Arc::new(ExchangeSendQueue::with_limits(8, 8));
+            let error = Arc::new(RuntimeErrorState::default());
+            let tracker = ExchangeSendTracker::new();
+            let mut task = exchange_task(
+                Arc::new(RecordingTransmitter::rejecting(
+                    ExchangeTransmitRejection::NormallyClosed(disposition),
+                )),
+                error.clone(),
+                tracker.clone(),
+            );
+            task.frame.delivery = ExchangeDeliveryRequirement::MustDrain;
+            task.frame.eos = eos;
+            assert!(queue.reserve_bytes_for(
+                task.frame.destination.host(),
+                task.frame.destination.port() as u16,
+                task.frame.destination_fragment_instance_id,
+                task.frame.destination_node_id,
+                task.frame.sender_id,
+                2
+            ));
+            tracker.on_enqueue(2);
+            queue.run_send_task(task, 2);
+            assert_eq!(
+                error.error().is_none(),
+                success,
+                "eos={eos} disposition={disposition:?}"
+            );
+            assert!(tracker.is_idle());
+            assert_eq!(queue.inflight_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn strict_queued_withdrawal_fails_and_keeps_live_unary_owned_until_return() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let transmitter = Arc::new(BlockingTransmitter {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            calls: AtomicUsize::new(0),
+        });
+        let queue = Arc::new(ExchangeSendQueue::with_limits(100, 100));
+        let tracker = ExchangeSendTracker::new();
+        let error = Arc::new(RuntimeErrorState::default());
+        let gates = open_gates_for(&[(1, UniqueId::new(2, 3), 6)]);
+        let gate = gates.gate(edge_id(1)).unwrap().clone();
+        let order = ExchangeSendOrder::new();
+        for _ in 0..2 {
+            let mut task = task_on_edge(
+                transmitter.clone(),
+                error.clone(),
+                tracker.clone(),
+                gate.clone(),
+                gate.destination().fragment_instance_id(),
+            );
+            task.order = order.clone();
+            task.frame.eos = false;
+            task.frame.delivery = ExchangeDeliveryRequirement::MustDrain;
+            queue.try_submit(task, false).unwrap();
+        }
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        queue.close_destination_normally(&gate);
+        assert!(error.error().is_some());
+        assert!(!tracker.is_idle());
+        assert_eq!(transmitter.calls.load(Ordering::Acquire), 1);
+        release_tx.send(()).unwrap();
+        wait_idle(&tracker);
+        assert_eq!(transmitter.calls.load(Ordering::Acquire), 1);
+        assert_eq!(queue.inflight_bytes(), 0);
     }
 }

@@ -277,7 +277,11 @@ pub(crate) enum ExecutionReason {
     AssertRowsMismatch = 316,
     AssertRowsDuplicateKey = 317,
     AssertRowsCounter = 318,
+    // Retired production formatting paths; keep their IDs in independent
+    // diagnostic regression fixtures without reassigning either number.
+    #[cfg(test)]
     AssertRowsDisplayMemory = 319,
+    #[cfg(test)]
     AssertRowsDisplay = 320,
     FinalIdentityInput = 321,
     HashJoinExecutionContract = 322,

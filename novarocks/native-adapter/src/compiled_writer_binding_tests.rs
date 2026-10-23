@@ -549,8 +549,8 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(Edge {
-        role: novarocks_physical_plan::OutputRole::Relational,
-        delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
+        role: novarocks_physical_plan::OutputRole::WriterResults,
+        delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
         id: EDGE,
         kind: EdgeKind::Stream,
         source: EdgeSource {

@@ -457,6 +457,7 @@ impl SourceKernel for ExchangeSourceOperator {
                 ))
             }
             Some(exchange::ExchangePopResult::Finished(stats)) => {
+                receiver.complete_input_consumption(self.binding.expected_senders)?;
                 self.idle_deadline.cancel();
                 #[cfg(novarocks_dev_controls)]
                 if let Some(observer) = self

@@ -989,8 +989,39 @@ fn assert_raw_ingress_hard_cuts(context: &mut ScenarioContext) -> Result<()> {
     let connector = context.handle().native_probe_connector(endpoint, mode)?;
     let trust = context.handle().native_backend_probe_trust()?;
     let authorization = authorization_header(&trust)?;
+    // An internally complete fixture identity reaches the unknown-route cut;
+    // malformed payload must still be rejected before any decoder runs.
+    let query = novarocks_types::QueryExecutionId::new(
+        novarocks_types::QueryId::new(11, 12),
+        novarocks_types::AttemptId::new(1)?,
+    )?;
+    let process = BackendProcessId::new_v7();
+    let source = novarocks_execution_contract::TaskIdentity::new(
+        query,
+        novarocks_types::StageId::new(2)?,
+        novarocks_types::TaskId::new(1)?,
+        process,
+    );
+    let destination = novarocks_execution_contract::TaskIdentity::new(
+        query,
+        novarocks_types::StageId::new(1)?,
+        novarocks_types::TaskId::new(1)?,
+        process,
+    );
+    let stream = novarocks_execution_contract::ExchangeStreamIdentity::try_new(
+        novarocks_execution_contract::ExchangeSource::new(
+            source,
+            novarocks_types::UniqueId::new(21, 22),
+            0,
+        ),
+        destination,
+        novarocks_types::UniqueId::new(11, 12),
+        novarocks_execution_contract::FragmentNodeId::new(0),
+    )?;
     let exchange = proto::ExchangeRequest {
-        stream: None,
+        stream: Some(novarocks_task_codec::exchange_flow_codec::encode_stream(
+            stream,
+        )),
         finst_id_hi: 11,
         finst_id_lo: 12,
         node_id: 0,

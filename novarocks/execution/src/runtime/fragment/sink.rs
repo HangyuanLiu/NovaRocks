@@ -83,6 +83,7 @@ pub(crate) fn materialize_compiled_sink(
             let input = DataStreamSinkFactoryInput::try_from_static_program(
                 branch.dest_node_id(),
                 branch.partition_type(),
+                branch.contract().delivery,
                 branch.output_columns().to_vec(),
                 destinations.clone(),
             )

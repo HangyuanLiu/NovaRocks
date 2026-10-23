@@ -511,6 +511,14 @@ impl ExchangeFrameTransmitter for LoopbackTransmitter {
                     node_id: frame.destination_node_id,
                 },
                 ExchangeReceiverFrame {
+                    stream: frame.stream.unwrap_or_else(|| {
+                        crate::runtime::fragment::io::exchange::fixture_stream(
+                            frame.sender_fragment_instance_id,
+                            frame.destination_fragment_instance_id,
+                            frame.destination_node_id,
+                            frame.sender_ordinal,
+                        )
+                    }),
                     source_fragment_instance_id: frame.sender_fragment_instance_id,
                     sender_ordinal: frame.sender_ordinal,
                     sender_count: frame.sender_count,

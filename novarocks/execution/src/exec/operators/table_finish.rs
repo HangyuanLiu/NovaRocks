@@ -5536,8 +5536,8 @@ mod tests {
                     })
                     .unwrap();
                 plan.add_edge(Edge {
-                    role: novarocks_physical_plan::OutputRole::Relational,
-                    delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
+                    role: novarocks_physical_plan::OutputRole::WriterResults,
+                    delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
                     id: edge,
                     kind: EdgeKind::Stream,
                     source: EdgeSource {
