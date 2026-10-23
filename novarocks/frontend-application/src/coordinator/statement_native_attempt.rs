@@ -179,10 +179,10 @@ impl StatementNativeAttempt {
                 true
             }
             Poll::Ready(Err(_)) => {
-                let cause = job.join_failure().expect("original CPU join error");
+                let cause = job.health_failure().expect("original CPU failure");
                 self.health.get_or_insert_with(|| {
                     StatementNativeHealthFailure::actual_exit_unproven(
-                        "Original Internal CPU forwarder exit is unproven",
+                        "Original Internal CPU failure remains in custody",
                         cause,
                     )
                 });
@@ -312,8 +312,8 @@ impl StatementNativeAttempt {
                 Poll::Ready(Ok(())) => true,
                 Poll::Ready(Err(_)) => {
                     let health = StatementNativeHealthFailure::actual_exit_unproven(
-                        "Original Internal CPU forwarder exit is unproven",
-                        job.join_failure().expect("original CPU join error"),
+                        "Original Internal CPU failure remains in custody",
+                        job.health_failure().expect("original CPU failure"),
                     );
                     self.health.get_or_insert(health);
                     true // original unproven receipt stays in this owner
@@ -341,12 +341,12 @@ impl StatementNativeAttempt {
             let cpu_unproven = self
                 .pending_internal
                 .as_ref()
-                .and_then(|job| job.join_failure())
+                .and_then(|job| job.health_failure())
                 .is_some()
                 || self
                     .retiring_internal
                     .as_ref()
-                    .and_then(|job| job.join_failure())
+                    .and_then(|job| job.health_failure())
                     .is_some();
             let healthy_local_done = root_closed
                 && cpu_closed

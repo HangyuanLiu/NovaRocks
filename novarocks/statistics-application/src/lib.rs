@@ -286,6 +286,7 @@ pub struct StatisticsJobAdmission {
     owner: WorkOwner,
     query_concurrency: QueryConcurrencyPermit,
     result_capacity: QueryResultCapacityBinding,
+    root_payload: Option<novarocks_workload_control::joint_admission::RetainedPayloadGrant>,
 }
 impl StatisticsJobAdmission {
     pub fn try_new(
@@ -313,9 +314,65 @@ impl StatisticsJobAdmission {
             owner,
             query_concurrency,
             result_capacity,
+            root_payload: None,
             #[cfg(novarocks_dev_controls)]
             test_statement_nomination: None,
         })
+    }
+
+    /// Adopt the three exact already-paid originals into the stable admission
+    /// receiver. No ledger grant or fallback window is minted here. Both
+    /// refusal and success are callback-free; caller keeps the source slots
+    /// outside any cancellable publisher before exposing the job.
+    pub fn install_internal_in(
+        owner: &mut Option<WorkOwner>,
+        query_concurrency: &mut Option<QueryConcurrencyPermit>,
+        payload: &mut Option<novarocks_workload_control::joint_admission::RetainedPayloadGrant>,
+        destination: &mut Option<Self>,
+    ) -> Result<(), StatisticsRepositoryError> {
+        if destination.is_some() {
+            return Err(StatisticsRepositoryError::new(
+                StatisticsRepositoryErrorKind::Conflict,
+                "statistics admission receiver is occupied",
+            ));
+        }
+        let original = owner.as_ref().ok_or_else(|| {
+            StatisticsRepositoryError::new(
+                StatisticsRepositoryErrorKind::Conflict,
+                "statistics Root owner is absent",
+            )
+        })?;
+        let scope = original.scope();
+        let permit = query_concurrency.as_ref().ok_or_else(|| {
+            StatisticsRepositoryError::new(
+                StatisticsRepositoryErrorKind::Conflict,
+                "statistics query permit is absent",
+            )
+        })?;
+        if !permit.is_for_scope(&scope) {
+            return Err(StatisticsRepositoryError::new(
+                StatisticsRepositoryErrorKind::Conflict,
+                "statistics query permit belongs to a foreign Root",
+            ));
+        }
+        let grant = payload.as_ref().ok_or_else(|| {
+            StatisticsRepositoryError::new(
+                StatisticsRepositoryErrorKind::Conflict,
+                "statistics original Root payload is absent",
+            )
+        })?;
+        let result_capacity =
+            QueryResultCapacityBinding::from_internal_payload(&scope, &scope, grant)
+                .map_err(work_error)?;
+        *destination = Some(Self {
+            owner: owner.take().expect("checked original Root"),
+            query_concurrency: query_concurrency.take().expect("checked original permit"),
+            result_capacity,
+            root_payload: payload.take(),
+            #[cfg(novarocks_dev_controls)]
+            test_statement_nomination: None,
+        });
+        Ok(())
     }
 
     /// Preserve only the explicitly originating ANALYZE statement's evidence.
@@ -395,6 +452,50 @@ struct LiveJob {
     /// permit lasts through actual job convergence, alongside the root owner.
     query_concurrency: Option<QueryConcurrencyPermit>,
     result_capacity: Option<QueryResultCapacityBinding>,
+    // Same original positive capability; stage views carry retention only.
+    root_payload: Option<novarocks_workload_control::joint_admission::RetainedPayloadGrant>,
+    stage_computation:
+        Option<novarocks_workload_control::joint_admission::InternalComputationGrant>,
+}
+
+// The original terminal cut takes these inline values under the repository
+// lock, then performs every actual Drop/complete outside it. This is one
+// record's original custody, not another registry or deferred release queue.
+struct RetiredJobCapacity {
+    query_concurrency: Option<QueryConcurrencyPermit>,
+    result_capacity: Option<QueryResultCapacityBinding>,
+    payload: Option<novarocks_workload_control::joint_admission::RetainedPayloadGrant>,
+    computation: Option<novarocks_workload_control::joint_admission::InternalComputationGrant>,
+    owner: Option<WorkOwner>,
+}
+impl RetiredJobCapacity {
+    fn finish(self) {
+        let Self {
+            query_concurrency,
+            result_capacity,
+            payload,
+            computation,
+            owner,
+        } = self;
+        drop(computation);
+        drop(query_concurrency);
+        drop(result_capacity);
+        drop(payload);
+        if let Some(owner) = owner {
+            owner.complete();
+        }
+    }
+}
+impl LiveJob {
+    fn take_capacity(&mut self) -> RetiredJobCapacity {
+        RetiredJobCapacity {
+            query_concurrency: self.query_concurrency.take(),
+            result_capacity: self.result_capacity.take(),
+            payload: self.root_payload.take(),
+            computation: self.stage_computation.take(),
+            owner: self.owner.take(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -411,9 +512,85 @@ pub struct StatisticsJobRepository {
     changed: Arc<Notify>,
 }
 
+/// Only the original repository notification, not a capacity or release right.
+/// Its Drop is inert; the stable receiver must unlock before calling notify.
+#[must_use = "Notify the original service after releasing receiver locks"]
+pub struct StatisticsJobNotification {
+    changed: Arc<Notify>,
+}
+impl StatisticsJobNotification {
+    pub fn notify(self) {
+        self.changed.notify_waiters();
+    }
+}
+
 impl StatisticsJobRepository {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Synchronously publish an already-paid typed Root into this original
+    /// bounded LiveJob table. Failure leaves the entire source unchanged;
+    /// success has no callback between taking it and installing its receiver.
+    pub fn install_internal_job_in(
+        &self,
+        request: StatisticsJobCreate,
+        source: &mut Option<StatisticsJobAdmission>,
+    ) -> Result<(StatisticsJob, StatisticsJobNotification), StatisticsRepositoryError> {
+        let original = source.as_ref().ok_or_else(|| {
+            StatisticsRepositoryError::new(
+                StatisticsRepositoryErrorKind::Conflict,
+                "statistics admission source is absent",
+            )
+        })?;
+        if original.root_payload.is_none() || !original.result_capacity.is_root_backed_internal() {
+            return Err(StatisticsRepositoryError::new(
+                StatisticsRepositoryErrorKind::Conflict,
+                "stable Root receiver requires its original typed payload",
+            ));
+        }
+        let job = StatisticsJob::new(request);
+        let mut state = self.lock()?;
+        if state.active.len() >= MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS {
+            return Err(StatisticsRepositoryError::new(
+                StatisticsRepositoryErrorKind::Capacity,
+                "statistics runtime active or queued job capacity exhausted",
+            ));
+        }
+        if state.active.contains_key(&job.id)
+            || state.terminal.iter().any(|entry| entry.job.id == job.id)
+        {
+            return Err(StatisticsRepositoryError::new(
+                StatisticsRepositoryErrorKind::Conflict,
+                "statistics job identity is already installed",
+            ));
+        }
+        let StatisticsJobAdmission {
+            owner,
+            query_concurrency,
+            result_capacity,
+            root_payload,
+            #[cfg(novarocks_dev_controls)]
+            test_statement_nomination,
+        } = source.take().expect("checked original admission source");
+        state.active.insert(
+            job.id,
+            LiveJob {
+                job: job.clone(),
+                owner: Some(owner),
+                query_concurrency: Some(query_concurrency),
+                result_capacity: Some(result_capacity),
+                root_payload,
+                stage_computation: None,
+                #[cfg(novarocks_dev_controls)]
+                test_statement_nomination,
+            },
+        );
+        let notification = StatisticsJobNotification {
+            changed: Arc::clone(&self.changed),
+        };
+        drop(state);
+        Ok((job, notification))
     }
 
     /// Submit a statistics job with its exact whole-window admission receipt.
@@ -434,6 +611,7 @@ impl StatisticsJobRepository {
             owner,
             query_concurrency,
             result_capacity,
+            root_payload,
             #[cfg(novarocks_dev_controls)]
             test_statement_nomination,
         } = admission;
@@ -454,11 +632,108 @@ impl StatisticsJobRepository {
                 owner: Some(owner),
                 query_concurrency: Some(query_concurrency),
                 result_capacity: Some(result_capacity),
+                root_payload,
+                stage_computation: None,
             },
         );
         drop(state);
         self.changed.notify_waiters();
         Ok(job)
+    }
+
+    /// Borrow this original stable Root's narrow growth source. Its body/Q
+    /// must be constructed after this repository method returns and unlocks.
+    pub fn root_stage_source(
+        &self,
+        id: StatisticsJobId,
+        stage: &WorkOwner,
+    ) -> Result<
+        novarocks_workload_control::joint_admission::RootStageSource,
+        StatisticsRepositoryError,
+    > {
+        let state = self.lock()?;
+        let entry = state.active.get(&id).ok_or_else(|| Self::not_found(id))?;
+        if entry.job.state.is_terminal() {
+            return Err(Self::not_found(id));
+        }
+        let owner = entry.owner.as_ref().ok_or_else(|| Self::not_found(id))?;
+        let payload = entry.root_payload.as_ref().ok_or_else(|| {
+            StatisticsRepositoryError::new(
+                StatisticsRepositoryErrorKind::Conflict,
+                "statistics job has no original typed Root payload",
+            )
+        })?;
+        payload
+            .root_stage_source(&owner.scope(), stage)
+            .map_err(work_error)
+    }
+
+    /// Both Root grant and compute receiver remain in this exact original job.
+    /// The WC receipt is silent; notify its returned token only after unlock.
+    pub fn install_root_stage_in(
+        &self,
+        id: StatisticsJobId,
+        stage: &WorkOwner,
+        ready: &mut novarocks_workload_control::joint_admission::RootStageReady,
+    ) -> Result<novarocks_workload_control::WorkloadProgressNotification, StatisticsRepositoryError>
+    {
+        let mut state = self.lock()?;
+        let entry = state
+            .active
+            .get_mut(&id)
+            .ok_or_else(|| Self::not_found(id))?;
+        let owner = entry.owner.as_ref().ok_or_else(|| Self::not_found(id))?;
+        let payload = entry.root_payload.as_ref().ok_or_else(|| {
+            StatisticsRepositoryError::new(
+                StatisticsRepositoryErrorKind::Conflict,
+                "statistics original Root payload is absent",
+            )
+        })?;
+        ready
+            .install_in(&owner.scope(), payload, stage, &mut entry.stage_computation)
+            .map_err(work_error)
+    }
+
+    /// Silent move into the caller's already-stable original consumer slot.
+    /// No source is removed on refusal and no callback runs on either outcome.
+    pub fn transfer_stage_computation_in(
+        &self,
+        id: StatisticsJobId,
+        stage: &WorkOwner,
+        destination: &mut Option<
+            novarocks_workload_control::joint_admission::InternalComputationGrant,
+        >,
+    ) -> Result<(), StatisticsRepositoryError> {
+        if destination.is_some() {
+            return Err(StatisticsRepositoryError::new(
+                StatisticsRepositoryErrorKind::Conflict,
+                "statistics stage receiver is occupied",
+            ));
+        }
+        let mut state = self.lock()?;
+        let entry = state
+            .active
+            .get_mut(&id)
+            .ok_or_else(|| Self::not_found(id))?;
+        if entry.stage_computation.is_none() {
+            return Err(StatisticsRepositoryError::new(
+                StatisticsRepositoryErrorKind::Conflict,
+                "statistics stage computation is not installed",
+            ));
+        }
+        if !entry
+            .stage_computation
+            .as_ref()
+            .expect("checked original stage grant")
+            .is_for_scope(&stage.scope())
+        {
+            return Err(StatisticsRepositoryError::new(
+                StatisticsRepositoryErrorKind::Conflict,
+                "statistics computation belongs to another actual stage owner",
+            ));
+        }
+        *destination = entry.stage_computation.take();
+        Ok(())
     }
 
     pub async fn get(
@@ -591,26 +866,22 @@ impl StatisticsJobRepository {
             };
             #[cfg(novarocks_dev_controls)]
             drop(entry.test_statement_nomination.take());
-            drop(entry.query_concurrency.take());
-            drop(entry.result_capacity.take());
-            if let Some(owner) = entry.owner.take() {
-                owner.complete();
-            }
+            let retired = entry.take_capacity();
             let job = entry.job.clone();
             state.terminal.push_back(entry);
             Self::trim_terminal(&mut state);
             drop(state);
+            retired.finish();
             self.changed.notify_waiters();
             return Ok(job);
         }
-        if let Some(owner) = entry.owner.as_ref() {
-            let _ = owner
-                .cancellation_requester()
-                .request(novarocks_workload_control::CancellationReason::Requested);
-        }
+        let requester = entry.owner.as_ref().map(WorkOwner::cancellation_requester);
         let job = entry.job.clone();
         state.active.insert(id, entry);
         drop(state);
+        if let Some(requester) = requester {
+            let _ = requester.request(novarocks_workload_control::CancellationReason::Requested);
+        }
         self.changed.notify_waiters();
         Ok(job)
     }
@@ -624,6 +895,7 @@ impl StatisticsJobRepository {
         at_ms: i64,
     ) -> Result<(), StatisticsRepositoryError> {
         let mut state = self.lock()?;
+        let mut retired = Vec::with_capacity(state.active.len());
         let mut queued = Vec::new();
         let mut cancellation_requesters = Vec::new();
         for (id, entry) in &mut state.active {
@@ -650,15 +922,14 @@ impl StatisticsJobRepository {
             };
             #[cfg(novarocks_dev_controls)]
             drop(entry.test_statement_nomination.take());
-            drop(entry.query_concurrency.take());
-            drop(entry.result_capacity.take());
-            if let Some(owner) = entry.owner.take() {
-                owner.complete();
-            }
+            retired.push(entry.take_capacity());
             state.terminal.push_back(entry);
         }
         Self::trim_terminal(&mut state);
         drop(state);
+        for capacity in retired {
+            capacity.finish();
+        }
         for requester in cancellation_requesters {
             let _ = requester.request(novarocks_workload_control::CancellationReason::Requested);
         }
@@ -766,6 +1037,7 @@ impl StatisticsJobRepository {
         convergence: StatisticsConvergence,
         at_ms: i64,
     ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        let mut retired = None;
         let mut state = self.lock()?;
         let entry = if state.active.contains_key(&id) {
             state
@@ -789,14 +1061,13 @@ impl StatisticsJobRepository {
             drop(entry.test_statement_nomination.take());
         }
         if entry.job.state.is_terminal() && entry.job.convergence.is_complete() {
-            drop(entry.query_concurrency.take());
-            drop(entry.result_capacity.take());
-            if let Some(owner) = entry.owner.take() {
-                owner.complete();
-            }
+            retired = Some(entry.take_capacity());
         }
         let job = entry.job.clone();
         drop(state);
+        if let Some(retired) = retired {
+            retired.finish();
+        }
         self.changed.notify_waiters();
         Ok(job)
     }
@@ -2083,3 +2354,6 @@ mod tests {
     all(not(novarocks_dev_controls), debug_assertions)
 ))]
 compile_error!("novarocks_dev_controls must match debug_assertions");
+
+#[cfg(test)]
+mod internal_root_tests;

@@ -121,6 +121,44 @@ impl Default for RegistryState {
     }
 }
 
+/// Inline facts for one actual original registry record, not a map quote.
+/// Installed and Joined are alternate phases of this same enum. The health
+/// field is diagnostic detail already included in record_layout(), not an
+/// additional allocation or an amount to add to that record a second time.
+/// Independent consumer/cause pointees and BTree backing are not quoted here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LogicalExecutionRegistryEntryGeometry {
+    record: std::alloc::Layout,
+    internal_health_field: std::alloc::Layout,
+}
+impl LogicalExecutionRegistryEntryGeometry {
+    pub const fn record_layout(self) -> std::alloc::Layout {
+        self.record
+    }
+    pub const fn internal_health_field_layout(self) -> std::alloc::Layout {
+        self.internal_health_field
+    }
+    /// The caller supplies its actual bounded original entry inventory.
+    /// This neither establishes that bound nor pays for map nodes/pointees.
+    pub fn inline_bytes_for_entries(
+        self,
+        entries: usize,
+    ) -> Result<usize, novarocks_type_contract::owned_resources::layout::LayoutResourceError> {
+        self.record.size().checked_mul(entries).ok_or(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+        )
+    }
+}
+impl LogicalExecutionRuntimeRegistry {
+    /// No registry, actor, consumer or allocation is created by this getter.
+    pub fn entry_geometry() -> LogicalExecutionRegistryEntryGeometry {
+        LogicalExecutionRegistryEntryGeometry {
+            record: std::alloc::Layout::new::<RegistryEntry>(),
+            internal_health_field: std::alloc::Layout::new::<Option<InternalConsumerHealth>>(),
+        }
+    }
+}
+
 enum RegistryEntry {
     Reserved(ReservedEntry),
     Installed(InstalledEntry),
@@ -139,14 +177,21 @@ struct InstalledEntry {
     actor: LogicalExecutionActor,
     join: JoinHandle<()>,
     ingress_closed: bool,
+    internal_health: Option<InternalConsumerHealth>,
 }
 
-#[derive(Clone, Copy)]
+// The original registration retains its same consumer and complete failure
+// packet. This fixed field is not a second record or a new task/identity.
+struct InternalConsumerHealth {
+    consumer: Arc<dyn crate::api::InternalComputationConsumer>,
+    failure: crate::api::StatementNativeHealthFailure,
+}
 struct JoinedEntry {
     generation: u64,
     initial_execution: QueryExecutionId,
     actor_id: LogicalExecutionActorId,
     outcome: LogicalExecutionJoinOutcome,
+    internal_health: Option<InternalConsumerHealth>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,6 +208,7 @@ pub enum LogicalExecutionRuntimeRegistryError {
     Actor(LogicalExecutionActorError),
     JoinNotReady,
     JoinAlreadyCompleted,
+    InternalConsumerHealthUnresolved,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -224,6 +270,10 @@ impl novarocks_execution_contract::failure::FailureProjection
             Self::ConfigDoesNotMatchReservation => (FailureClass::Invariant, 69, false),
             Self::JoinNotReady => (FailureClass::Control, 70, false),
             Self::JoinAlreadyCompleted => (FailureClass::Control, 71, true),
+            Self::InternalConsumerHealthUnresolved => {
+                return crate::execution_error::QueryFailureReason::InternalConsumerPanicked
+                    .failure_fact();
+            }
             Self::Actor(error) => return FailureProjection::failure_fact(error),
         };
         let reason = FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap());
@@ -260,6 +310,9 @@ impl LogicalExecutionRuntimeRegistryError {
             }
             Self::JoinNotReady => "logical execution runtime join is not ready",
             Self::JoinAlreadyCompleted => "logical execution runtime join already completed",
+            Self::InternalConsumerHealthUnresolved => {
+                "logical execution retains an unresolved internal consumer failure"
+            }
             Self::Actor(error) => return error.safe_detail(),
         };
         novarocks_execution_contract::SafeDetail::truncating(message)
@@ -551,7 +604,74 @@ impl LogicalExecutionRuntimeRegistryHandle {
     }
 
     pub(crate) fn statement_native_health(&self) -> Option<crate::api::QueryExecutionError> {
-        self.inner.statement_native.health()
+        use novarocks_execution_contract::failure::FailureProjection as _;
+        self.inner.statement_native.health().or_else(|| {
+            let state = self.lock();
+            let retained = state.entries.values().any(|entry| match entry {
+                RegistryEntry::Installed(entry) => entry.internal_health.is_some(),
+                RegistryEntry::Joined(entry) => entry.internal_health.is_some(),
+                RegistryEntry::Reserved(_) => false,
+            });
+            retained.then(|| {
+                crate::api::QueryExecutionError::from_execution(
+                    crate::execution_error::ExecutionFailureInput::new(
+                        LogicalExecutionRuntimeRegistryError::InternalConsumerHealthUnresolved
+                            .failure_fact(),
+                        novarocks_execution_contract::SafeDetail::truncating(
+                            "Original Internal CPU failure remains in custody",
+                        ),
+                        crate::execution_error::ExecutionFailureSite::Coordinator,
+                    ),
+                )
+            })
+        })
+    }
+
+    /// Preserve the same NoRecovery consumer in its exact original record.
+    /// All receiver inputs are borrowed until the empty stable field is known.
+    pub(crate) fn retain_internal_consumer_health(
+        &self,
+        registration: &LogicalExecutionRegistration,
+        consumer: &Arc<dyn crate::api::InternalComputationConsumer>,
+        failure: &crate::api::StatementNativeHealthFailure,
+    ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
+        self.validate_registry(registration)?;
+        let mut state = self.lock();
+        let target = match state
+            .entries
+            .get_mut(&registration.initial_execution.query_id())
+        {
+            Some(RegistryEntry::Installed(entry))
+                if entry.generation == registration.generation
+                    && entry.initial_execution == registration.initial_execution =>
+            {
+                &mut entry.internal_health
+            }
+            Some(RegistryEntry::Joined(entry))
+                if entry.generation == registration.generation
+                    && entry.initial_execution == registration.initial_execution =>
+            {
+                &mut entry.internal_health
+            }
+            Some(_) => return Err(LogicalExecutionRuntimeRegistryError::StaleGeneration),
+            None => return Err(LogicalExecutionRuntimeRegistryError::UnknownRegistration),
+        };
+        if let Some(original) = target {
+            if !Arc::ptr_eq(&original.consumer, consumer)
+                || !std::ptr::eq(original.failure.cause(), failure.cause())
+            {
+                return Err(LogicalExecutionRuntimeRegistryError::InternalConsumerHealthUnresolved);
+            }
+        } else {
+            *target = Some(InternalConsumerHealth {
+                consumer: Arc::clone(consumer),
+                failure: failure.clone(),
+            });
+        }
+        state.accepting = false;
+        drop(state);
+        self.inner.progress.notify_one();
+        Ok(())
     }
 
     /// Reserve the exact original registration/attempt custody before Native
@@ -1071,6 +1191,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
                                 initial_execution: entry.initial_execution,
                                 actor_id: entry.actor.id(),
                                 outcome: LogicalExecutionJoinOutcome::Completed,
+                                internal_health: entry.internal_health.take(),
                             };
                             (result, joined)
                         }
@@ -1100,16 +1221,22 @@ impl LogicalExecutionRuntimeRegistryHandle {
                 Err(error) if error.is_cancelled() => LogicalExecutionJoinOutcome::Cancelled,
                 Err(_) => LogicalExecutionJoinOutcome::Panicked,
             };
+            let proof = (
+                joined.initial_execution,
+                joined.generation,
+                joined.actor_id,
+                joined.outcome,
+            );
             state.entries.insert(query, RegistryEntry::Joined(joined));
-            Poll::Ready(Ok(joined))
+            Poll::Ready(Ok(proof))
         })
         .await?;
         Ok(LogicalExecutionJoinReceipt {
             registry_id: self.inner.id,
-            initial_execution: joined.initial_execution,
-            generation: joined.generation,
-            actor_id: joined.actor_id,
-            outcome: joined.outcome,
+            initial_execution: joined.0,
+            generation: joined.1,
+            actor_id: joined.2,
+            outcome: joined.3,
         })
     }
 
@@ -1162,6 +1289,12 @@ impl LogicalExecutionRuntimeRegistryHandle {
                     && entry.actor_id == receipt.actor_id
                     && entry.outcome == receipt.outcome =>
             {
+                if entry.internal_health.is_some() {
+                    return fail(
+                        LogicalExecutionRuntimeRegistryError::InternalConsumerHealthUnresolved,
+                        receipt,
+                    );
+                }
                 state.entries.remove(&query);
                 drop(state);
                 self.inner.progress.notify_one();
@@ -1287,6 +1420,7 @@ impl LogicalExecutionRuntimeReservation {
                     actor,
                     join,
                     ingress_closed: false,
+                    internal_health: None,
                 }),
             );
         }
@@ -2368,5 +2502,136 @@ mod tests {
             .unwrap();
         assert!(handle.lock().entries.is_empty());
         assert_eq!(registry.active_native_custody_count(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn original_worker_cause_survives_joined_registration_until_explicit_disposition() {
+        use crate::cpu::{QueryBlockingExecutorConfig, QueryBlockingExecutorOwner};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct OriginalPanic(Arc<AtomicUsize>);
+        impl Drop for OriginalPanic {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        #[derive(Debug)]
+        struct OriginalConsumer(crate::api::StatementNativeHealthFailure);
+        impl crate::api::InternalComputationConsumer for OriginalConsumer {
+            fn consume(
+                &self,
+                _: crate::api::InternalConsumerActivation,
+            ) -> crate::api::InternalConsumerFuture {
+                Box::pin(async {
+                    panic!("health custody fixture must not dispatch a second consumer")
+                })
+            }
+            fn local_health_failure(&self) -> Option<crate::api::StatementNativeHealthFailure> {
+                Some(self.0.clone())
+            }
+        }
+        let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
+        let exact = execution(95);
+        let installed = registry
+            .reserve(exact, Vec::new())
+            .unwrap()
+            .spawn_and_install(config(exact, Vec::new()))
+            .unwrap();
+        let (mut registration, initial, output) = installed.into_parts();
+        let _output = output.into_output();
+        registry
+            .actor(&registration)
+            .unwrap()
+            .initialization_failed(initial)
+            .await
+            .unwrap();
+        let mut workers = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        ))
+        .unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let original_drops = Arc::clone(&drops);
+        let cause = workers
+            .executor()
+            .execute_preserving::<(), _>(move || {
+                std::panic::panic_any(OriginalPanic(original_drops));
+            })
+            .await
+            .unwrap_err();
+        let original_type = cause.original_payload_is::<OriginalPanic>();
+        let alias = cause.clone();
+        let exact_alias = alias.shares_original_with(&cause);
+        drop(alias);
+        let health = crate::api::StatementNativeHealthFailure::actual_exit_unproven(
+            "Original Internal CPU failure remains in custody",
+            Arc::new(cause),
+        );
+        let consumer: Arc<dyn crate::api::InternalComputationConsumer> =
+            Arc::new(OriginalConsumer(health.clone()));
+        let retained = registry.retain_internal_consumer_health(&registration, &consumer, &health);
+        drop(consumer);
+        drop(health);
+        let before_join = drops.load(Ordering::Acquire);
+        let receipt = registry.join(&mut registration).await.unwrap();
+        let (blocked, receipt) = match registry.retire(receipt) {
+            Err((error, original)) => (
+                error == LogicalExecutionRuntimeRegistryError::InternalConsumerHealthUnresolved,
+                Some(original),
+            ),
+            Ok(()) => (false, None),
+        };
+        let safe_health = registry.statement_native_health().is_some();
+        let after_join = drops.load(Ordering::Acquire);
+        // Test-only explicit disposition takes the original fixed field; no
+        // production recovery/clear API is introduced by this candidate.
+        let disposition = {
+            let mut state = registry.lock();
+            match state.entries.get_mut(&exact.query_id()) {
+                Some(RegistryEntry::Joined(entry)) => entry.internal_health.take(),
+                _ => None,
+            }
+        };
+        let held_by_receiver = drops.load(Ordering::Acquire) == 0 && disposition.is_some();
+        drop(disposition);
+        let disposition_exited = drops.load(Ordering::Acquire);
+        let retired = receipt
+            .map(|original| registry.retire(original).is_ok())
+            .unwrap_or(false);
+        let worker_exit = workers
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await;
+        let registry_exit = registry
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await;
+        if registry_exit.is_err() {
+            registry.abandon_for_process_exit();
+        }
+        assert!(retained.is_ok() && original_type && exact_alias);
+        assert!(blocked && safe_health && held_by_receiver && retired);
+        assert_eq!((before_join, after_join, disposition_exited), (0, 0, 1));
+        assert!(worker_exit.is_ok() && registry_exit.is_ok());
+    }
+
+    #[test]
+    fn registry_health_geometry_is_one_original_phase_record() {
+        let geometry = LogicalExecutionRuntimeRegistry::entry_geometry();
+        assert_eq!(
+            geometry.record_layout(),
+            std::alloc::Layout::new::<RegistryEntry>()
+        );
+        assert_eq!(
+            geometry.internal_health_field_layout(),
+            std::alloc::Layout::new::<Option<InternalConsumerHealth>>()
+        );
+        assert!(geometry.record_layout().size() >= std::mem::size_of::<InstalledEntry>());
+        assert!(geometry.record_layout().size() >= std::mem::size_of::<JoinedEntry>());
+        assert_eq!(
+            geometry.inline_bytes_for_entries(1),
+            Ok(geometry.record_layout().size())
+        );
+        assert_eq!(
+            geometry.inline_bytes_for_entries(usize::MAX),
+            Err(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,)
+        );
     }
 }

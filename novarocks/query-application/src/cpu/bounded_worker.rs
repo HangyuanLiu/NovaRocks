@@ -98,22 +98,8 @@ impl fmt::Display for BoundedWorkerOpenError {
 
 impl std::error::Error for BoundedWorkerOpenError {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BoundedWorkerError {
-    Panicked,
-    ExecutorClosed,
-}
-
-impl fmt::Display for BoundedWorkerError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Panicked => "bounded worker worker panicked",
-            Self::ExecutorClosed => "bounded worker executor closed before completing the job",
-        })
-    }
-}
-
-impl std::error::Error for BoundedWorkerError {}
+// The same receipt carries the original opaque panic to preserving callers.
+pub(crate) use super::QueryBlockingFailure as BoundedWorkerError;
 
 /// A refused submission retains the same move-only job for its original caller.
 /// The queue lock never runs the rejected input's destructor.
@@ -498,7 +484,7 @@ fn run_worker<R: Send + 'static>(shared: Arc<Shared<R>>) {
         // owns the job, its fixed thread is the running bound.
         drop(queue_slot);
         let outcome =
-            catch_unwind(AssertUnwindSafe(|| job.run())).map_err(|_| BoundedWorkerError::Panicked);
+            catch_unwind(AssertUnwindSafe(|| job.run())).map_err(BoundedWorkerError::panicked);
         if let Err(undelivered) = completion.send(outcome) {
             // The result is destroyed here, on the worker, before this job is
             // removed from the running set.

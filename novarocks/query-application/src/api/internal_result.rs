@@ -413,5 +413,10 @@ pub type InternalConsumerFuture =
 /// The registered application owner implements actual decoding, domain proof
 /// and custody. It receives no retry, cancellation or finish-policy callback.
 pub trait InternalComputationConsumer: Send + Sync + std::fmt::Debug + 'static {
+    /// Borrow the original abnormal local custody after its actual consumer
+    /// join. Ordinary domain errors have no process-health projection.
+    fn local_health_failure(&self) -> Option<crate::api::StatementNativeHealthFailure> {
+        None
+    }
     fn consume(&self, activation: InternalConsumerActivation) -> InternalConsumerFuture;
 }

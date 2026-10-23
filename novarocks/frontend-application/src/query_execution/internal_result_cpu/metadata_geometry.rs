@@ -1,0 +1,199 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Known metadata of the same closed Internal CPU factory used in production.
+//! Layouts do not pay for backing, certify a task, or bound opaque pointees.
+
+use super::{
+    ExecutionFailureInput, InternalCpuRetired, InternalCpuRetirement, InternalDomainFailure,
+    InternalDomainSlot, InternalResultCpuJob, InternalResultOperation, InternalResultValue,
+    QueryBlockingExecutor, QueryBlockingFailure, QueryCancellationView, StatusIntakeWake,
+    make_operation_forwarder, oneshot,
+};
+use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
+use std::{alloc::Layout, sync::Arc};
+
+type Output = Result<InternalDomainSlot, InternalDomainFailure>;
+type Completion = oneshot::Sender<Result<InternalResultValue<Output>, ExecutionFailureInput>>;
+
+/// These are known requested or inline layouts only. Caller-owned payload,
+/// closure/input pointees, two oneshot internals, Tokio task/JoinError pointees,
+/// platform Mutex backing, activity/Notify pointees and opaque panic payloads
+/// remain the original creators' responsibility. Reading this is not payment.
+///
+/// The per-job known subtotal conservatively sums the one packet, original live job,
+/// actual forwarder frame, one normal retirement stack value, up to three
+/// opaque carriers (worker + two notification panics), and one Arc<JoinError>.
+/// Handles already contained in those layouts must not be added again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InternalCpuMetadataGeometry {
+    packet: Layout,
+    job: Layout,
+    forwarder_frame: Layout,
+    retired: Layout,
+    opaque_carrier: Layout,
+    forwarder_failure: Layout,
+    // These are explanatory sub-layouts, not extra amounts in the sum.
+    domain_slot: Layout,
+    operation: Layout,
+}
+impl InternalCpuMetadataGeometry {
+    pub const fn packet_layout(self) -> Layout {
+        self.packet
+    }
+    pub const fn job_inline_layout(self) -> Layout {
+        self.job
+    }
+    pub const fn forwarder_frame_layout(self) -> Layout {
+        self.forwarder_frame
+    }
+    pub const fn retired_inline_layout(self) -> Layout {
+        self.retired
+    }
+    pub const fn opaque_carrier_layout(self) -> Layout {
+        self.opaque_carrier
+    }
+    pub const fn maximum_opaque_carriers_per_job(self) -> usize {
+        3
+    }
+    pub const fn forwarder_failure_layout(self) -> Layout {
+        self.forwarder_failure
+    }
+    pub const fn domain_slot_inline_layout(self) -> Layout {
+        self.domain_slot
+    }
+    pub const fn operation_inline_layout(self) -> Layout {
+        self.operation
+    }
+
+    /// Known additive component, not a complete allocation/task/payload quote.
+    /// The diagnostic domain_slot/operation sub-layouts are already represented
+    /// in the real packet/factory frame and are not charged a second time.
+    pub fn known_metadata_bytes_per_job(self) -> Result<usize, LayoutResourceError> {
+        let failures = self
+            .opaque_carrier
+            .size()
+            .checked_mul(3)
+            .ok_or(LayoutResourceError::Arithmetic)?;
+        [
+            self.packet.size(),
+            self.job.size(),
+            self.forwarder_frame.size(),
+            self.retired.size(),
+            failures,
+            self.forwarder_failure.size(),
+        ]
+        .into_iter()
+        .try_fold(0usize, |total, bytes| {
+            total
+                .checked_add(bytes)
+                .ok_or(LayoutResourceError::Arithmetic)
+        })
+    }
+
+    /// Supply a bound from the actual original role/job inventory, including
+    /// waiting forwarders and failed packets until their final real exit.
+    /// Window positions, running workers and queue positions alone do not
+    /// establish that bound. This function does not install or enforce one.
+    pub fn known_metadata_bytes_for_jobs(
+        self,
+        live_jobs: usize,
+    ) -> Result<usize, LayoutResourceError> {
+        self.known_metadata_bytes_per_job()?
+            .checked_mul(live_jobs)
+            .ok_or(LayoutResourceError::Arithmetic)
+    }
+}
+
+// An output type derived from the actual same production function, without
+// constructing any Work, packet, operation, closure, runtime or input graph.
+fn forwarder_layout<F: std::future::Future<Output = ()>>(
+    _: fn(
+        QueryBlockingExecutor,
+        InternalResultValue<InternalDomainSlot>,
+        QueryCancellationView,
+        Arc<dyn StatusIntakeWake>,
+        Arc<InternalCpuRetirement<Output>>,
+        Completion,
+        InternalResultOperation,
+    ) -> F,
+) -> Layout {
+    Layout::new::<F>()
+}
+
+pub(super) fn geometry() -> Result<InternalCpuMetadataGeometry, LayoutResourceError> {
+    Ok(InternalCpuMetadataGeometry {
+        packet: arc_layout(Layout::new::<InternalCpuRetirement<Output>>())?,
+        job: Layout::new::<InternalResultCpuJob<Output>>(),
+        forwarder_frame: forwarder_layout(make_operation_forwarder),
+        retired: Layout::new::<InternalCpuRetired<Output>>(),
+        opaque_carrier: QueryBlockingFailure::payload_holder_layout()?,
+        forwarder_failure: arc_layout(Layout::new::<tokio::task::JoinError>())?,
+        domain_slot: Layout::new::<InternalDomainSlot>(),
+        operation: Layout::new::<InternalResultOperation>(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closed_factory_layout_covers_actual_domain_inline_and_checked_inventory() {
+        let actual = geometry().unwrap();
+        assert_eq!(
+            actual.domain_slot_inline_layout(),
+            Layout::new::<InternalDomainSlot>()
+        );
+        assert!(actual.packet_layout().size() >= std::mem::size_of::<InternalDomainSlot>());
+        assert!(actual.packet_layout().align() >= std::mem::align_of::<InternalDomainSlot>());
+        assert!(
+            actual.forwarder_frame_layout().size()
+                >= std::mem::size_of::<InternalResultOperation>()
+        );
+        let one = actual.known_metadata_bytes_per_job().unwrap();
+        assert!(one > actual.packet_layout().size());
+        assert_eq!(actual.known_metadata_bytes_for_jobs(0), Ok(0));
+        assert_eq!(
+            actual.known_metadata_bytes_for_jobs(2),
+            Ok(one.checked_mul(2).unwrap())
+        );
+        assert_eq!(
+            actual.known_metadata_bytes_for_jobs(usize::MAX),
+            Err(LayoutResourceError::Arithmetic)
+        );
+    }
+
+    #[test]
+    fn failure_carriers_are_one_worker_and_two_wakes_not_three_result_graphs() {
+        let actual = geometry().unwrap();
+        assert_eq!(actual.maximum_opaque_carriers_per_job(), 3);
+        assert_eq!(
+            actual.opaque_carrier_layout(),
+            QueryBlockingFailure::payload_holder_layout().unwrap()
+        );
+        assert!(
+            actual.opaque_carrier_layout().size() >= std::mem::size_of::<QueryBlockingFailure>()
+        );
+        // Opaque Box payload extents are deliberately not inferred from the
+        // small carrier, even though the carrier layout itself is known.
+        assert_eq!(
+            actual.forwarder_frame_layout(),
+            forwarder_layout(make_operation_forwarder)
+        );
+    }
+}

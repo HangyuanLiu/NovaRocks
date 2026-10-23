@@ -343,19 +343,31 @@ impl ResultWindowGrant {
     /// and keeps its position live until the last physical alias exits.
     pub fn retain_alias(&self) -> ResultWindowAlias {
         ResultWindowAlias {
-            holder: Arc::clone(&self.holder),
-            execution_scope: None,
+            backing: AliasBacking::Window {
+                holder: Arc::clone(&self.holder),
+                execution_scope: None,
+            },
         }
     }
 }
-#[derive(Clone)]
+/// A view of one already-paid result backing. Internal Root pins do not
+/// acquire a delegated Node/control holder for the execution scope.
 pub struct ResultWindowAlias {
-    holder: Arc<WindowHolder>,
-    execution_scope: Option<Arc<WindowExecutionScope>>,
+    backing: AliasBacking,
+}
+enum AliasBacking {
+    Window {
+        holder: Arc<WindowHolder>,
+        execution_scope: Option<Arc<WindowExecutionScope>>,
+    },
+    InternalRoot {
+        payload: crate::joint_admission::RetainedPayloadAlias,
+        root: WorkScope,
+        execution: WorkScope,
+    },
 }
 
-// A delegated alias holds the exact child's responsibility through real exit.
-// It consumes no second result position and cannot change the admitted class.
+// Legacy Client/Local/Closing attribution retains its original actual holder.
 struct WindowExecutionScope {
     scope: WorkScope,
 }
@@ -371,38 +383,158 @@ impl Drop for WindowExecutionScope {
         });
     }
 }
+fn internal_pin_error(error: novarocks_resource_contract::RetentionPinError) -> WorkError {
+    use novarocks_resource_contract::RetentionPinError;
+    match error {
+        RetentionPinError::Released => WorkError::Released,
+        RetentionPinError::Conflict => WorkError::Conflict,
+        RetentionPinError::Overflow => WorkError::ArithmeticOverflow,
+    }
+}
 impl ResultWindowAlias {
-    /// Numeric scope identities are local to one host. Capacity must match
-    /// both the exact scope and the runtime that admitted it.
+    /// Project the original Root payload into an actual execution. This is
+    /// retention/attribution only, never a computation or physical grant.
+    pub fn from_internal_payload(
+        root: &WorkScope,
+        execution: &WorkScope,
+        grant: &crate::joint_admission::RetainedPayloadGrant,
+    ) -> Result<Self, WorkError> {
+        // Validate before creating a pin: refusal must not destroy even a
+        // temporary typed alias while an external receiver holds its lock.
+        if !grant.is_for_scope(root) {
+            return Err(WorkError::Conflict);
+        }
+        if !Arc::ptr_eq(&root.inner, &execution.inner) {
+            return Err(WorkError::ForeignAuthority);
+        }
+        {
+            let state = root.inner.state.lock().unwrap();
+            let original = state.nodes.get(&root.id).ok_or(WorkError::Released)?;
+            original.check(&state.cancellations)?;
+            if original.parent.is_some() || original.root != root.id {
+                return Err(WorkError::Conflict);
+            }
+            let current = state.nodes.get(&execution.id).ok_or(WorkError::Released)?;
+            current.check(&state.cancellations)?;
+            if current.class != original.class
+                || (execution.id != root.id && current.parent != Some(root.id))
+            {
+                return Err(WorkError::Conflict);
+            }
+        }
+        let payload = grant.retain_alias().map_err(internal_pin_error)?;
+        Ok(Self {
+            backing: AliasBacking::InternalRoot {
+                payload,
+                root: root.clone(),
+                execution: execution.clone(),
+            },
+        })
+    }
+    pub fn is_root_backed_internal(&self) -> bool {
+        matches!(self.backing, AliasBacking::InternalRoot { .. })
+    }
+    /// The physical payload owner remains the statement/job Root.
+    pub fn root_scope(&self) -> &WorkScope {
+        match &self.backing {
+            AliasBacking::Window { holder, .. } => &holder.scope,
+            AliasBacking::InternalRoot { root, .. } => root,
+        }
+    }
     pub fn is_for_scope(&self, scope: &WorkScope) -> bool {
         self.execution_scope().id == scope.id
             && Arc::ptr_eq(&self.execution_scope().inner, &scope.inner)
     }
-    /// Compare the actual physical allowance, independently of child attribution.
     pub fn shares_capacity_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.holder, &other.holder)
+        match (&self.backing, &other.backing) {
+            (AliasBacking::Window { holder: a, .. }, AliasBacking::Window { holder: b, .. }) => {
+                Arc::ptr_eq(a, b)
+            }
+            (
+                AliasBacking::InternalRoot { payload: a, .. },
+                AliasBacking::InternalRoot { payload: b, .. },
+            ) => a.shares_payload_with(b),
+            _ => false,
+        }
     }
-
     pub fn scope_id(&self) -> WorkId {
         self.execution_scope().id()
     }
     fn execution_scope(&self) -> &WorkScope {
-        self.execution_scope
-            .as_ref()
-            .map_or(&self.holder.scope, |owner| &owner.scope)
+        match &self.backing {
+            AliasBacking::Window {
+                holder,
+                execution_scope,
+            } => execution_scope
+                .as_ref()
+                .map_or(&holder.scope, |value| &value.scope),
+            AliasBacking::InternalRoot { execution, .. } => execution,
+        }
     }
-
-    /// Authorize one live direct child to use this already-admitted window.
-    /// Exact parent/host identity is checked before recording its holder; a
-    /// sibling, foreign host or completed scope cannot obtain this capability.
+    pub fn try_clone(&self) -> Result<Self, WorkError> {
+        let backing = match &self.backing {
+            AliasBacking::Window {
+                holder,
+                execution_scope,
+            } => AliasBacking::Window {
+                holder: Arc::clone(holder),
+                execution_scope: execution_scope.clone(),
+            },
+            AliasBacking::InternalRoot {
+                payload,
+                root,
+                execution,
+            } => AliasBacking::InternalRoot {
+                payload: payload.try_clone().map_err(internal_pin_error)?,
+                root: root.clone(),
+                execution: execution.clone(),
+            },
+        };
+        Ok(Self { backing })
+    }
+    /// Move this exact original payload pin to SPI without allocating a holder.
+    /// A legacy window is returned unchanged instead of erasing its policy.
+    pub fn into_internal_retention(
+        self,
+    ) -> Result<novarocks_resource_contract::ExistingOwnerRetentionLease, Self> {
+        match self.backing {
+            AliasBacking::InternalRoot { payload, .. } => Ok(payload.into_retention()),
+            backing => Err(Self { backing }),
+        }
+    }
     pub fn for_child(&self, child: &WorkScope) -> Result<Self, WorkError> {
         let parent = self.execution_scope();
         if !Arc::ptr_eq(&parent.inner, &child.inner) {
             return Err(WorkError::ForeignAuthority);
         }
-        if self.holder.class == ResultWindowClass::Closing {
+        if self.class() == ResultWindowClass::Closing {
             return Err(WorkError::Conflict);
         }
+        if let AliasBacking::InternalRoot { payload, root, .. } = &self.backing {
+            // Clone while the original alias is borrowed, outside State. On
+            // refusal this cannot be the last payload pin.
+            let payload = payload.try_clone().map_err(internal_pin_error)?;
+            {
+                let state = parent.inner.state.lock().unwrap();
+                let original = state.nodes.get(&parent.id).ok_or(WorkError::Released)?;
+                original.check(&state.cancellations)?;
+                let current = state.nodes.get(&child.id).ok_or(WorkError::Released)?;
+                current.check(&state.cancellations)?;
+                if current.parent != Some(parent.id) || current.class != original.class {
+                    return Err(WorkError::Conflict);
+                }
+            }
+            return Ok(Self {
+                backing: AliasBacking::InternalRoot {
+                    payload,
+                    root: root.clone(),
+                    execution: child.clone(),
+                },
+            });
+        }
+        let AliasBacking::Window { holder, .. } = &self.backing else {
+            unreachable!()
+        };
         child.inner.update(|state| {
             state
                 .nodes
@@ -419,23 +551,41 @@ impl ResultWindowAlias {
                 .checked_add(1)
                 .ok_or(WorkError::ArithmeticOverflow)?;
             Ok(Self {
-                holder: Arc::clone(&self.holder),
-                execution_scope: Some(Arc::new(WindowExecutionScope {
-                    scope: child.clone(),
-                })),
+                backing: AliasBacking::Window {
+                    holder: Arc::clone(holder),
+                    execution_scope: Some(Arc::new(WindowExecutionScope {
+                        scope: child.clone(),
+                    })),
+                },
             })
         })
     }
-
     pub fn class(&self) -> ResultWindowClass {
-        self.holder.class
+        match &self.backing {
+            AliasBacking::Window { holder, .. } => holder.class,
+            AliasBacking::InternalRoot { .. } => ResultWindowClass::Internal,
+        }
     }
     pub fn check_backing_total(&self, simultaneously_live_bytes: u64) -> Result<(), WorkError> {
-        if simultaneously_live_bytes > self.holder.all_objects_bytes {
-            Err(WorkError::Capacity("result backing envelope"))
-        } else {
-            Ok(())
+        match &self.backing {
+            AliasBacking::Window { holder, .. }
+                if simultaneously_live_bytes > holder.all_objects_bytes =>
+            {
+                Err(WorkError::Capacity("result backing envelope"))
+            }
+            AliasBacking::Window { .. } => Ok(()),
+            AliasBacking::InternalRoot { payload, .. } => {
+                payload.check_backing_total(simultaneously_live_bytes)
+            }
         }
+    }
+}
+// Existing callers still have an infallible Clone contract. Typed Internal
+// producers use try_clone; overflow preserves the original pin then fails fast.
+impl Clone for ResultWindowAlias {
+    fn clone(&self) -> Self {
+        self.try_clone()
+            .expect("original result backing pin clone failed")
     }
 }
 
@@ -1072,3 +1222,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod internal_root_tests;

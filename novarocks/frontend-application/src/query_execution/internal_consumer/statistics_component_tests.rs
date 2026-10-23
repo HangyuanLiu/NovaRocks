@@ -187,6 +187,7 @@ async fn run_case(case: Case) {
         plan,
         &program,
         DecodedConsumerRuntime {
+            computation: None,
             binding: binding.clone(),
             cpu: cpu_owner.runtime(),
             runtime,

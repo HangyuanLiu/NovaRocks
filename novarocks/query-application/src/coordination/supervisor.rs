@@ -1730,7 +1730,7 @@ async fn supervise_rows(
     attempt: RowsAttempt,
 ) -> Result<(), QueryExecutionError> {
     let mut consumers = JoinSet::new();
-    let result = supervise_rows_inner(
+    let mut result = supervise_rows_inner(
         actor,
         session,
         description,
@@ -1758,13 +1758,34 @@ async fn supervise_rows(
             }
             Err(error) => {
                 registry.record_native_supervision_join_failure(error);
-                return first_supervision_error(
+                result = first_supervision_error(
                     result,
                     Err(native_future_panicked(
                         "internal consumer supervision failed",
                     )),
                 );
             }
+        }
+    }
+    if let Some(original) = internal.as_ref() {
+        if let Some(failure) = original.consumer.local_health_failure() {
+            if registry
+                .retain_internal_consumer_health(registration, &original.consumer, &failure)
+                .is_err()
+            {
+                // An impossible stale/occupied receiver cannot discard either
+                // original input. Keep this same finite supervisor/consumer,
+                // rather than claiming a successful retirement or reminting.
+                let _original_custody = (Arc::clone(&original.consumer), failure);
+                std::future::pending::<()>().await;
+                unreachable!("original Internal health receiver remains unresolved");
+            }
+            return first_supervision_error(
+                result,
+                Err(internal_consumer_panicked(
+                    "Original Internal CPU failure remains in custody",
+                )),
+            );
         }
     }
     result

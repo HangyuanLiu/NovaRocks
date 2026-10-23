@@ -339,6 +339,10 @@ pub struct RetainedPayloadGrant {
     pin: OriginalPin,
 }
 impl RetainedPayloadGrant {
+    /// Inspect the original paid record without retaining or notifying.
+    pub fn is_for_scope(&self, scope: &WorkScope) -> bool {
+        self.pin.is_for_scope(scope)
+    }
     pub fn adopt_in(
         scope: &WorkScope,
         source: &mut Option<JointClaim>,
@@ -409,6 +413,10 @@ pub struct InternalComputationGrant {
     pin: OriginalPin,
 }
 impl InternalComputationGrant {
+    /// Observe the actual original stage; no pin or callback.
+    pub fn is_for_scope(&self, scope: &WorkScope) -> bool {
+        self.pin.is_for_scope(scope)
+    }
     pub fn adopt_in(
         scope: &WorkScope,
         source: &mut Option<JointClaim>,
@@ -446,5 +454,66 @@ impl InternalComputationAlias {
         self.pin.same(&other.pin)
     }
 }
+
+// Closed Root/stage construction borrows the original positive grant; aliases
+// never gain this view. No pin, backing, owner or epoch is minted by capture.
+pub(super) fn payload_growth_view(
+    grant: &RetainedPayloadGrant,
+    root: &WorkScope,
+    state: &State,
+) -> Result<JointClaimView, WorkError> {
+    if !Arc::ptr_eq(&grant.pin.inner, &root.inner) {
+        return Err(WorkError::ForeignAuthority);
+    }
+    let [id, epoch] = grant.pin.key.ok_or(WorkError::Released)?;
+    let row = state
+        .joint
+        .as_ref()
+        .ok_or(WorkError::NotReady)?
+        .claims
+        .get(&id)
+        .ok_or(WorkError::Released)?;
+    if row.owner != ClaimOwner::PhysicalWork(root.id)
+        || !matches!(row.custody, ClaimCustody::Payload { epoch: original, pins } if original == epoch && pins != 0)
+        || row.pending.is_some()
+        || row.amounts != row.active_amounts
+        || row.facts.key != row.active_facts.key
+    {
+        return Err(WorkError::Conflict);
+    }
+    Ok(JointClaimView {
+        inner: Arc::downgrade(&root.inner),
+        id,
+        source: ClaimSource::Payload { epoch },
+        structure_revision: row.structure_revision,
+        release_revision: row.release_revision,
+    })
+}
+pub(super) fn same_payload_grant(
+    grant: &RetainedPayloadGrant,
+    inner: &Arc<Inner>,
+    id: u64,
+    epoch: u64,
+) -> bool {
+    Arc::ptr_eq(&grant.pin.inner, inner) && grant.pin.key == Some([id, epoch])
+}
+pub(super) fn install_computation_pin(
+    inner: &Arc<Inner>,
+    state: &mut State,
+    id: u64,
+    epoch: u64,
+) -> InternalComputationGrant {
+    let record = state.joint.as_mut().unwrap().claims.get_mut(&id).unwrap();
+    record.structure_revision = epoch;
+    record.custody = ClaimCustody::Computation { epoch, pins: 1 };
+    InternalComputationGrant {
+        pin: OriginalPin {
+            inner: Arc::clone(inner),
+            key: Some([id, epoch]),
+            kind: Kind::Computation,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests;

@@ -51,9 +51,10 @@ use crate::{
 
 /// The stable statement owner retains this exact CPU custody alongside the
 /// concrete output. Neither a result waiter nor a consumer unwind owns its join.
-#[derive(Clone)]
 pub(crate) struct DecodedConsumerRuntime {
     pub(crate) binding: QueryResultCapacityBinding,
+    pub(crate) computation:
+        Option<novarocks_workload_control::joint_admission::InternalComputationGrant>,
     pub(crate) cpu: InternalResultCpu,
     pub(crate) runtime: FrontendDataRuntime,
     pub(crate) cancellation: QueryCancellationView,
@@ -274,13 +275,23 @@ fn construct(
             "decoded computation requires its exact NoRecovery internal contract",
         ));
     }
-    let cpu = DomainCpuCustody::try_new(
-        state,
-        runtime.binding,
-        runtime.cpu,
-        runtime.runtime,
-        runtime.cancellation.clone(),
-    )?;
+    let cpu = match runtime.computation {
+        Some(computation) => DomainCpuCustody::try_new_with_computation(
+            state,
+            runtime.binding,
+            runtime.cpu,
+            runtime.runtime,
+            runtime.cancellation.clone(),
+            computation,
+        )?,
+        None => DomainCpuCustody::try_new(
+            state,
+            runtime.binding,
+            runtime.cpu,
+            runtime.runtime,
+            runtime.cancellation.clone(),
+        )?,
+    };
     let holder = Arc::new(Holder {
         receiving: Mutex::new(Receiving::Vacant),
         cpu,
@@ -431,6 +442,17 @@ pub(crate) fn prepare_statistics_computation(
 }
 
 impl InternalComputationConsumer for DecodedComputationConsumer {
+    fn local_health_failure(
+        &self,
+    ) -> Option<novarocks_query_application::api::StatementNativeHealthFailure> {
+        self.holder.cpu.health_failure().map(|original| {
+            novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
+                "Original Internal CPU failure remains in custody",
+                original,
+            )
+        })
+    }
+
     fn consume(&self, activation: InternalConsumerActivation) -> InternalConsumerFuture {
         let (mut stream, source) = activation.into_parts();
         let binding = Binding::from_source(&source);
@@ -557,6 +579,7 @@ impl InternalComputationConsumer for DecodedComputationConsumer {
                     payload,
                     _credentials: credentials,
                 })?;
+                holder.cpu.finish_computation_after_handoff()?;
                 // The exact receiving owner already holds the complete graph.
                 // The actor remains the sole author of the computation cut.
                 let token = source

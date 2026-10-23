@@ -178,6 +178,7 @@ async fn run_case(fail_writer: bool) {
         plan,
         seed,
         DecodedConsumerRuntime {
+            computation: None,
             binding: capacity_binding.clone(),
             cpu: cpu_owner.runtime(),
             runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),

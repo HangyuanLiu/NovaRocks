@@ -39,6 +39,92 @@ use bounded_worker::{
 
 type CpuResult = Box<dyn Any + Send>;
 
+/// Original opaque failure custody. No formatter or destructor is invoked when
+/// classifying or sharing a worker failure. The real receiver owns disposition.
+pub struct QueryBlockingFailurePayload {
+    original: Mutex<Box<dyn Any + Send>>,
+}
+impl QueryBlockingFailurePayload {
+    fn new(original: Box<dyn Any + Send>) -> Arc<Self> {
+        Arc::new(Self {
+            original: Mutex::new(original),
+        })
+    }
+    fn is<T: Any>(&self) -> bool {
+        self.original
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is::<T>()
+    }
+}
+impl std::fmt::Debug for QueryBlockingFailurePayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("QueryBlockingFailurePayload")
+    }
+}
+
+/// Safe presentation and the same original worker cause remain separate.
+/// Cloning this carrier shares its original payload; it never clones that value.
+#[derive(Clone, Debug)]
+pub enum QueryBlockingFailure {
+    Panicked(Arc<QueryBlockingFailurePayload>),
+    ExecutorClosed,
+    SubmissionClosed,
+    InvalidResultType(Arc<QueryBlockingFailurePayload>),
+}
+impl QueryBlockingFailure {
+    /// Known requested layout of the original opaque-payload carrier only.
+    /// This includes its Arc header and the actual Mutex/Box handle fields.
+    /// It excludes the arbitrary original Box pointee and any platform Mutex
+    /// backing outside its public inline layout. No capacity is granted.
+    pub fn payload_holder_layout() -> Result<
+        std::alloc::Layout,
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+    > {
+        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
+            QueryBlockingFailurePayload,
+        >())
+    }
+    pub fn panicked(original: Box<dyn Any + Send>) -> Self {
+        Self::Panicked(QueryBlockingFailurePayload::new(original))
+    }
+    pub fn is_unexpected(&self) -> bool {
+        !matches!(self, Self::SubmissionClosed)
+    }
+    pub fn original_payload_is<T: Any>(&self) -> bool {
+        match self {
+            Self::Panicked(payload) | Self::InvalidResultType(payload) => payload.is::<T>(),
+            Self::ExecutorClosed | Self::SubmissionClosed => false,
+        }
+    }
+    pub fn shares_original_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Panicked(a), Self::Panicked(b))
+            | (Self::InvalidResultType(a), Self::InvalidResultType(b)) => Arc::ptr_eq(a, b),
+            (Self::ExecutorClosed, Self::ExecutorClosed)
+            | (Self::SubmissionClosed, Self::SubmissionClosed) => true,
+            _ => false,
+        }
+    }
+}
+impl PartialEq for QueryBlockingFailure {
+    fn eq(&self, other: &Self) -> bool {
+        self.shares_original_with(other)
+    }
+}
+impl Eq for QueryBlockingFailure {}
+impl std::fmt::Display for QueryBlockingFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Panicked(_) => "bounded worker worker panicked",
+            Self::ExecutorClosed => "bounded worker executor closed before completing the job",
+            Self::SubmissionClosed => "query blocking executor closed before admitting work",
+            Self::InvalidResultType(_) => "query blocking worker returned an invalid result type",
+        })
+    }
+}
+impl std::error::Error for QueryBlockingFailure {}
+
 /// Reuse window for one idle synchronous-preparation worker. This does not
 /// bound query concurrency or keep a backlog: every admitted job either takes
 /// an idle worker or causes one new worker to be created.
@@ -545,18 +631,41 @@ impl QueryBlockingExecutor {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
+        // Legacy callers retain their original String-only surface. New owners
+        // which must keep opaque causes use the preserving method below.
+        self.execute_preserving(work)
+            .await
+            .map_err(|error| match &error {
+                QueryBlockingFailure::SubmissionClosed
+                | QueryBlockingFailure::InvalidResultType(_) => error.to_string(),
+                _ => format!("query blocking worker failed: {error}"),
+            })
+    }
+
+    /// Uses the same original queue, workers and receipt. Cancellation of a
+    /// waiter is not completion; preserving callers retain and await this F.
+    pub async fn execute_preserving<T, F>(&self, work: F) -> Result<T, QueryBlockingFailure>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
         let receipt = self
             .handle
             .submit(BoundedWorkerJob::new(move || Box::new(work()) as CpuResult))
             .await
-            .map_err(|_| "query blocking executor closed before admitting work".to_owned())?;
+            .map_err(|refused| {
+                // The original unexecuted input exits here, outside queue locks.
+                drop(refused.into_job());
+                QueryBlockingFailure::SubmissionClosed
+            })?;
         receipt
             .complete()
-            .await
-            .map_err(|error| format!("query blocking worker failed: {error}"))?
+            .await?
             .downcast::<T>()
             .map(|result| *result)
-            .map_err(|_| "query blocking worker returned an invalid result type".to_owned())
+            .map_err(|original| {
+                QueryBlockingFailure::InvalidResultType(QueryBlockingFailurePayload::new(original))
+            })
     }
 }
 

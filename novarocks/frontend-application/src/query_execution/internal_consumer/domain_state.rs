@@ -331,9 +331,16 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(result) = job.try_take() {
-                    break result
+                    let result = result
                         .expect("real CPU completion")
                         .try_transform(|slot, _| slot);
+                    // The result alone is not the stable original job's exit.
+                    // Retire its original packet only after the real forwarder
+                    // joins, before asserting complete capacity reclamation.
+                    job.join_closed()
+                        .await
+                        .expect("actual original CPU job exit");
+                    break result;
                 }
                 tokio::task::yield_now().await;
             }

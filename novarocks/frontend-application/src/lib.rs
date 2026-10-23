@@ -66,6 +66,9 @@ pub use mv::management_audit::FileManagementAuditSink;
 pub use mv::startup_isolation_file::StartupIsolationSource;
 mod native;
 pub use query_execution::package_freeze::CompiledPackageCarrier;
+
+/// Known metadata facts of the original closed Internal CPU job factory.
+pub use query_execution::internal_result_cpu::InternalCpuMetadataGeometry;
 #[cfg(novarocks_dev_controls)]
 mod preparation_diagnostics;
 pub(crate) mod query;

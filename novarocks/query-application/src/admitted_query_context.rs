@@ -214,10 +214,12 @@ struct ResultCapacityActivity {
 pub struct ResultCapacityActivityLease {
     activity: std::sync::Arc<ResultCapacityActivity>,
     window: Option<ResultWindowAlias>,
+    computation: Option<novarocks_workload_control::joint_admission::InternalComputationAlias>,
 }
 impl Drop for ResultCapacityActivityLease {
     fn drop(&mut self) {
         drop(self.window.take());
+        drop(self.computation.take());
         let exited = {
             let mut count = self.activity.count.lock().expect("result activity lock");
             *count = count.checked_sub(1).expect("one result activity exit");
@@ -242,8 +244,39 @@ impl QueryResultCapacityBinding {
             activity: std::sync::Arc::new(ResultCapacityActivity::default()),
         })
     }
+    pub fn from_internal_payload(
+        root: &WorkScope,
+        execution: &WorkScope,
+        grant: &novarocks_workload_control::joint_admission::RetainedPayloadGrant,
+    ) -> Result<Self, WorkError> {
+        // WC validates the attribution before creating the checked pin. Do
+        // not repeat a fallible check that could Drop that pin in a receiver
+        // lock on cancellation between the two checks.
+        let window = ResultWindowAlias::from_internal_payload(root, execution, grant)?;
+        Ok(Self {
+            scope: execution.clone(),
+            window,
+            activity: std::sync::Arc::new(ResultCapacityActivity::default()),
+        })
+    }
     pub fn scope(&self) -> &WorkScope {
         &self.scope
+    }
+    pub fn root_scope(&self) -> &WorkScope {
+        self.window.root_scope()
+    }
+    pub fn is_root_backed_internal(&self) -> bool {
+        self.window.is_root_backed_internal()
+    }
+    pub fn try_window_alias(&self) -> Result<ResultWindowAlias, WorkError> {
+        self.window.try_clone()
+    }
+    pub fn try_clone(&self) -> Result<Self, WorkError> {
+        Ok(Self {
+            scope: self.scope.clone(),
+            window: self.window.try_clone()?,
+            activity: std::sync::Arc::clone(&self.activity),
+        })
     }
     pub fn window_alias(&self) -> ResultWindowAlias {
         self.window.clone()
@@ -255,12 +288,36 @@ impl QueryResultCapacityBinding {
     /// Register before dispatch, so cancellation cannot race registration.
     /// This creates no allowance and reuses the original physical window.
     pub fn begin_result_activity(&self) -> Result<ResultCapacityActivityLease, WorkError> {
+        if self.is_root_backed_internal() {
+            return Err(WorkError::Conflict);
+        }
         self.scope.check()?;
         let mut count = self.activity.count.lock().expect("result activity lock");
         *count = count.checked_add(1).expect("bounded result activities");
         Ok(ResultCapacityActivityLease {
             activity: std::sync::Arc::clone(&self.activity),
             window: Some(self.window.clone()),
+            computation: None,
+        })
+    }
+
+    /// The positive stage pin is supplied by the original installed closed
+    /// batch. Payload retention alone never creates execution activity.
+    pub fn begin_internal_result_activity(
+        &self,
+        computation: novarocks_workload_control::joint_admission::InternalComputationAlias,
+    ) -> Result<ResultCapacityActivityLease, WorkError> {
+        if !self.is_root_backed_internal() || !computation.is_for_scope(&self.scope) {
+            return Err(WorkError::Conflict);
+        }
+        self.scope.check()?;
+        let window = self.window.try_clone()?;
+        let mut count = self.activity.count.lock().expect("result activity lock");
+        *count = count.checked_add(1).ok_or(WorkError::ArithmeticOverflow)?;
+        Ok(ResultCapacityActivityLease {
+            activity: std::sync::Arc::clone(&self.activity),
+            window: Some(window),
+            computation: Some(computation),
         })
     }
 
@@ -983,3 +1040,6 @@ mod tests {
         assert_eq!(replacement.execution().sql_semantics(), &mode);
     }
 }
+
+#[cfg(test)]
+mod internal_root_tests;

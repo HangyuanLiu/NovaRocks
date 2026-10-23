@@ -31,6 +31,7 @@ use novarocks_execution_contract::{
 use novarocks_query_application::api::RetainedRootReply;
 use novarocks_query_application::cpu::{
     QueryBlockingExecutor, QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
+    QueryBlockingFailure,
 };
 use novarocks_query_application::{
     cancellation::{QueryCancellationReason, QueryCancellationView},
@@ -44,6 +45,9 @@ use tokio::sync::oneshot;
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::task_execution::status_intake::StatusIntakeWake;
 use std::sync::Arc;
+
+mod metadata_geometry;
+pub use metadata_geometry::InternalCpuMetadataGeometry;
 
 // The whole maximum coexistence envelope is authorized before any domain
 // decoder/collector construction. Nested stages reuse it, never acquire again.
@@ -78,18 +82,37 @@ impl InternalResultRetention {
     pub(crate) fn try_new(
         binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
     ) -> Result<Self, String> {
-        require_internal_result_capacity(binding.scope(), &binding.window_alias())?;
+        let window = binding
+            .try_window_alias()
+            .map_err(|error| error.to_string())?;
+        require_internal_result_capacity(binding.scope(), &window)?;
         Ok(Self {
-            binding: binding.clone(),
+            binding: binding.try_clone().map_err(|error| error.to_string())?,
         })
     }
+    pub(crate) fn try_spi_guard(
+        &self,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorPayloadRetentionGuard,
+        novarocks_workload_control::WorkError,
+    > {
+        let window = self.binding.try_window_alias()?;
+        Ok(match window.into_internal_retention() {
+            Ok(lease) => {
+                novarocks_spi::connector::ConnectorPayloadRetentionGuard::from_existing_lease(lease)
+            }
+            Err(window) => novarocks_spi::connector::ConnectorPayloadRetentionGuard::new(window),
+        })
+    }
+    // Explicit old infallible bridge, as with SPI's existing Clone callers.
     pub(crate) fn spi_guard(&self) -> novarocks_spi::connector::ConnectorPayloadRetentionGuard {
-        novarocks_spi::connector::ConnectorPayloadRetentionGuard::new(self.binding.window_alias())
+        self.try_spi_guard()
+            .expect("original Internal payload retention pin clone failed")
     }
     pub(crate) fn is_same_admission(&self, other: &Self) -> bool {
         let window = self.binding.window_alias();
-        window.is_for_scope(other.binding.scope())
-            && window.shares_capacity_with(&other.binding.window_alias())
+        window.shares_capacity_with(&other.binding.window_alias())
+            && window.root_scope().id() == other.binding.window_alias().root_scope().id()
     }
 }
 impl std::fmt::Debug for InternalResultRetention {
@@ -122,6 +145,19 @@ impl FrontendResultCapacityProfile {
             capacity,
             internal_positions,
         })
+    }
+
+    /// Known metadata from the actual closed production job factory.
+    /// The result is not payment or a complete task/payload quote. In
+    /// particular, Internal window positions do not bound all forwarders
+    /// waiting for queue admission; composition must supply its real job cap.
+    pub fn internal_cpu_metadata_geometry(
+        self,
+    ) -> Result<
+        InternalCpuMetadataGeometry,
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+    > {
+        metadata_geometry::geometry()
     }
 
     pub const fn declared(self) -> ResultCapacityConfig {
@@ -217,6 +253,28 @@ impl<T> InternalResultValue<T> {
         Ok(self)
     }
 
+    pub(crate) fn track_computation_exit(
+        mut self,
+        binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        computation: novarocks_workload_control::joint_admission::InternalComputationAlias,
+    ) -> Result<Self, String> {
+        let original = binding
+            .try_window_alias()
+            .map_err(|error| error.to_string())?;
+        if self.activity.is_some()
+            || !self.window.is_for_scope(binding.scope())
+            || !self.window.shares_capacity_with(&original)
+        {
+            return Err("internal CPU activity differs from its original Root payload".into());
+        }
+        self.activity = Some(
+            binding
+                .begin_internal_result_activity(computation)
+                .map_err(|error| error.to_string())?,
+        );
+        Ok(self)
+    }
+
     pub(crate) fn value(&self) -> &T {
         &self.value
     }
@@ -298,16 +356,118 @@ fn cpu_cancellation_failure(reason: QueryCancellationReason) -> ExecutionFailure
 
 /// At most one result-codec job per serial root consumer. Its forwarder owns
 /// the bounded receipt. Closing its waiter never cancels a running CPU closure:
-/// the same forwarder still awaits its receipt and retires unclaimed output.
+/// the same forwarder still awaits its receipt and keeps unclaimed output.
 /// An unclaimed output contains the same window until its actual destruction.
-pub(crate) struct InternalResultCpuJob<T> {
+/// One fixed retirement packet belongs to this original job and forwarder.
+/// At most one executor result, one early undelivered projection, one worker
+/// failure, two existing notification failures and one true JoinError exist.
+struct InternalCpuRetirement<T> {
+    state: std::sync::Mutex<InternalCpuRetirementState<T>>,
+}
+struct InternalCpuRetirementState<T> {
+    outcome: Option<Result<InternalResultValue<T>, ExecutionFailureInput>>,
+    early: Option<ExecutionFailureInput>,
+    worker: Option<QueryBlockingFailure>,
+    notifications: [Option<QueryBlockingFailure>; 2],
+    forwarder: Option<Arc<tokio::task::JoinError>>,
+    // These original sources never become a worker-unwind local. In the
+    // healthy case they retire after the same actual receipt/forwarder join.
+    window: Option<ResultWindowAlias>,
+    activity:
+        Option<novarocks_query_application::admitted_query_context::ResultCapacityActivityLease>,
+}
+pub(crate) struct InternalCpuRetired<T> {
+    _outcome: Option<Result<InternalResultValue<T>, ExecutionFailureInput>>,
+    _window: Option<ResultWindowAlias>,
+    _activity:
+        Option<novarocks_query_application::admitted_query_context::ResultCapacityActivityLease>,
+}
+impl<T> InternalCpuRetirement<T> {
+    fn new(
+        window: ResultWindowAlias,
+        activity: Option<
+            novarocks_query_application::admitted_query_context::ResultCapacityActivityLease,
+        >,
+    ) -> Self {
+        Self {
+            state: std::sync::Mutex::new(InternalCpuRetirementState {
+                outcome: None,
+                early: None,
+                worker: None,
+                notifications: [None, None],
+                forwarder: None,
+                window: Some(window),
+                activity,
+            }),
+        }
+    }
+    fn has_failure(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .worker
+            .as_ref()
+            .is_some_and(QueryBlockingFailure::is_unexpected)
+            || state.forwarder.is_some()
+            || state.notifications.iter().any(Option::is_some)
+    }
+    /// The original work has actually returned. Restore its same activity to
+    /// a successful output before publication: an unclaimed output must keep
+    /// the existing actual-exit fence until it is claimed or really destroyed.
+    fn receive_work(
+        &self,
+        result: Result<Result<InternalResultValue<T>, ExecutionFailureInput>, QueryBlockingFailure>,
+    ) -> Result<InternalResultValue<T>, ExecutionFailureInput> {
+        match result {
+            Ok(Ok(mut output)) => {
+                output.activity = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .activity
+                    .take();
+                Ok(output)
+            }
+            Ok(Err(error)) => Err(error),
+            Err(original) => {
+                self.state.lock().unwrap_or_else(|e| e.into_inner()).worker = Some(original);
+                Err(cpu_execution_failure("internal result CPU executor failed"))
+            }
+        }
+    }
+    fn notify(&self, index: usize, wake: &dyn StatusIntakeWake) {
+        if let Err(original) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wake.wake()))
+        {
+            // Each branch calls each fixed index once. Stable before any later
+            // callback, and keep awaiting the same work after an early panic.
+            self.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .notifications[index] = Some(QueryBlockingFailure::panicked(original));
+        }
+    }
+}
+impl<T> std::fmt::Debug for InternalCpuRetirement<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InternalCpuRetirement")
+    }
+}
+impl<T> std::fmt::Display for InternalCpuRetirement<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("original Internal CPU failure is retained")
+    }
+}
+impl<T: Send + 'static> std::error::Error for InternalCpuRetirement<T> {}
+
+pub(crate) struct InternalResultCpuJob<T: Send + 'static> {
     completion: oneshot::Receiver<Result<InternalResultValue<T>, ExecutionFailureInput>>,
+    retirement: Arc<InternalCpuRetirement<T>>,
     forwarder: Option<tokio::task::JoinHandle<()>>,
     closing: bool,
     claimed: bool,
     closed: Option<Result<(), Arc<tokio::task::JoinError>>>,
 }
-impl<T> InternalResultCpuJob<T> {
+impl<T: Send + 'static> InternalResultCpuJob<T> {
     /// Refuse further result delivery. Sender::closed wakes the same original
     /// forwarder, which continues awaiting the already-owned CPU receipt.
     pub(crate) fn begin_close(&mut self) {
@@ -328,9 +488,13 @@ impl<T> InternalResultCpuJob<T> {
     pub(crate) fn poll_closed(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), &tokio::task::JoinError>> {
+    ) -> std::task::Poll<Result<(), Arc<dyn std::error::Error + Send + Sync>>> {
         self.begin_close();
-        self.poll_forwarder_closed(cx)
+        let result = self.poll_forwarder_closed(cx);
+        if matches!(result, std::task::Poll::Ready(Ok(()))) {
+            drop(self.take_retired_outcome());
+        }
+        result
     }
 
     /// Observe the original join without destroying delivery output. A stable
@@ -338,7 +502,7 @@ impl<T> InternalResultCpuJob<T> {
     pub(crate) fn poll_forwarder_closed(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), &tokio::task::JoinError>> {
+    ) -> std::task::Poll<Result<(), Arc<dyn std::error::Error + Send + Sync>>> {
         use std::{future::Future, pin::Pin, task::Poll};
         if self.closed.is_none() {
             let result = std::task::ready!(
@@ -352,18 +516,48 @@ impl<T> InternalResultCpuJob<T> {
             self.closed = Some(result.map_err(Arc::new));
             self.forwarder.take();
         }
-        Poll::Ready(
-            self.closed
-                .as_ref()
-                .expect("CPU forwarder joined")
-                .as_ref()
-                .map(|_| ())
-                .map_err(|error| error.as_ref()),
-        )
+        if let Some(Err(original)) = &self.closed {
+            self.retirement
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .forwarder = Some(Arc::clone(original));
+        }
+        match self.health_failure() {
+            Some(original) => Poll::Ready(Err(original)),
+            None => Poll::Ready(Ok(())),
+        }
+    }
+
+    /// A borrowed projection shares the same complete packet. It does not
+    /// release this job, consume an outcome or acknowledge health disposition.
+    pub(crate) fn health_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+        self.retirement
+            .has_failure()
+            .then(|| Arc::clone(&self.retirement) as Arc<dyn std::error::Error + Send + Sync>)
+    }
+
+    /// Only after a successful original join may the caller retire a late
+    /// normal result. Return ownership so destruction occurs outside locks.
+    pub(crate) fn take_retired_outcome(&mut self) -> Option<InternalCpuRetired<T>> {
+        if !matches!(&self.closed, Some(Ok(()))) || self.retirement.has_failure() {
+            return None;
+        }
+        let mut state = self
+            .retirement
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Some(InternalCpuRetired {
+            _outcome: state.outcome.take(),
+            _window: state.window.take(),
+            _activity: state.activity.take(),
+        })
     }
 
     /// Shares the same original join error with health custody. The task's
     /// result was moved into this Arc once; no failure is reconstructed.
+    #[cfg(test)]
     pub(crate) fn join_failure(&self) -> Option<Arc<tokio::task::JoinError>> {
         self.closed
             .as_ref()
@@ -372,14 +566,14 @@ impl<T> InternalResultCpuJob<T> {
     }
 
     #[cfg(test)]
-    pub(crate) async fn join_closed(&mut self) -> Result<(), &tokio::task::JoinError> {
+    pub(crate) async fn join_closed(
+        &mut self,
+    ) -> Result<(), Arc<dyn std::error::Error + Send + Sync>> {
         std::future::poll_fn(|cx| self.poll_closed(cx).map(|_| ())).await;
-        self.closed
-            .as_ref()
-            .expect("CPU forwarder joined")
-            .as_ref()
-            .map(|_| ())
-            .map_err(|error| error.as_ref())
+        match self.health_failure() {
+            Some(original) => Err(original),
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn try_take(
@@ -435,7 +629,7 @@ impl<T> InternalResultCpuJob<T> {
         })
     }
 }
-impl<T> Drop for InternalResultCpuJob<T> {
+impl<T: Send + 'static> Drop for InternalResultCpuJob<T> {
     fn drop(&mut self) {
         // Detached fallback is not exit proof. A Native aggregate retaining
         // this job uses the original join and result activity independently.
@@ -472,9 +666,14 @@ impl InternalResultCpu {
         wake: Arc<dyn StatusIntakeWake>,
         operation: InternalResultOperation,
     ) -> InternalResultCpuJob<Result<InternalDomainSlot, InternalDomainFailure>> {
-        self.submit_with(input, cancellation, data_runtime, wake, move |slot, _| {
-            operation.apply(slot)
-        })
+        self.submit_with(
+            input,
+            cancellation,
+            data_runtime,
+            wake,
+            operation,
+            make_operation_forwarder,
+        )
     }
 
     // The original fault-injection tests require arbitrary jobs, including real
@@ -493,67 +692,147 @@ impl InternalResultCpu {
         O: Send + 'static,
         F: FnOnce(I, &ResultWindowAlias) -> O + Send + 'static,
     {
-        self.submit_with(input, cancellation, data_runtime, wake, apply)
+        self.submit_with(
+            input,
+            cancellation,
+            data_runtime,
+            wake,
+            apply,
+            make_forwarder,
+        )
     }
 
-    fn submit_with<I, O, F>(
+    fn submit_with<I, O, A, M, F>(
         &self,
         input: InternalResultValue<I>,
         cancellation: QueryCancellationView,
         data_runtime: &FrontendDataRuntime,
         wake: Arc<dyn StatusIntakeWake>,
-        apply: F,
+        apply: A,
+        make: M,
     ) -> InternalResultCpuJob<O>
     where
         I: Send + 'static,
         O: Send + 'static,
-        F: FnOnce(I, &ResultWindowAlias) -> O + Send + 'static,
+        F: std::future::Future<Output = ()> + Send + 'static,
+        M: FnOnce(
+            QueryBlockingExecutor,
+            InternalResultValue<I>,
+            QueryCancellationView,
+            Arc<dyn StatusIntakeWake>,
+            Arc<InternalCpuRetirement<O>>,
+            oneshot::Sender<Result<InternalResultValue<O>, ExecutionFailureInput>>,
+            A,
+        ) -> F,
     {
         let executor = self.executor.clone();
-        let (mut completed, completion) = oneshot::channel();
-        let forwarder = data_runtime.spawn(async move {
-            let worker_cancellation = cancellation.clone();
-            let work = executor.execute(move || {
-                if let Some(reason) = worker_cancellation.reason() {
-                    // input and its physical alias exit here, on the worker.
-                    return Err(cpu_cancellation_failure(reason));
-                }
-                Ok(input.transform(apply))
-            });
-            tokio::pin!(work);
-            let early_error = tokio::select! {
-                biased;
-                reason = cancellation.cancelled() => cpu_cancellation_failure(reason),
-                _ = completed.closed() => cpu_execution_failure("internal result CPU consumer closed"),
-                result = &mut work => {
-                    // An unclaimed success still owns its input/output and
-                    // original allowance until it is actually destroyed.
-                    if let Err(unclaimed) = completed.send(result.map_err(|error| {
-                        tracing::debug!(%error, "Internal result CPU executor failed");
-                        cpu_execution_failure("internal result CPU executor failed")
-                    }).and_then(|result| result)) {
-                        drop(unclaimed);
-                    }
-                    wake.wake();
-                    return;
-                }
-            };
-            if let Err(unclaimed) = completed.send(Err(early_error)) {
-                drop(unclaimed);
-            }
-            wake.wake();
-            // Cancellation above is only an early result. Never drop this
-            // executor future before its original receipt resolves.
-            drop(work.await);
-            wake.wake();
-        });
+        let (completed, completion) = oneshot::channel();
+        let mut input = input;
+        let retirement = Arc::new(InternalCpuRetirement::new(
+            input.window.clone(),
+            input.activity.take(),
+        ));
+        let original_retirement = Arc::clone(&retirement);
+        let forwarder = data_runtime.spawn(make(
+            executor,
+            input,
+            cancellation,
+            wake,
+            original_retirement,
+            completed,
+            apply,
+        ));
         InternalResultCpuJob {
             completion,
+            retirement,
             forwarder: Some(forwarder),
             closing: false,
             claimed: false,
             closed: None,
         }
+    }
+}
+
+// Both execution and geometry use this same closed production factory. Merely
+// naming it for its output layout does not construct an input or poll a job.
+fn make_operation_forwarder(
+    executor: QueryBlockingExecutor,
+    input: InternalResultValue<InternalDomainSlot>,
+    cancellation: QueryCancellationView,
+    wake: Arc<dyn StatusIntakeWake>,
+    retirement: Arc<InternalCpuRetirement<Result<InternalDomainSlot, InternalDomainFailure>>>,
+    completed: oneshot::Sender<
+        Result<
+            InternalResultValue<Result<InternalDomainSlot, InternalDomainFailure>>,
+            ExecutionFailureInput,
+        >,
+    >,
+    operation: InternalResultOperation,
+) -> impl std::future::Future<Output = ()> + Send {
+    make_forwarder(
+        executor,
+        input,
+        cancellation,
+        wake,
+        retirement,
+        completed,
+        move |slot, _| operation.apply(slot),
+    )
+}
+
+fn make_forwarder<I, O, F>(
+    executor: QueryBlockingExecutor,
+    input: InternalResultValue<I>,
+    cancellation: QueryCancellationView,
+    wake: Arc<dyn StatusIntakeWake>,
+    original_retirement: Arc<InternalCpuRetirement<O>>,
+    mut completed: oneshot::Sender<Result<InternalResultValue<O>, ExecutionFailureInput>>,
+    apply: F,
+) -> impl std::future::Future<Output = ()> + Send
+where
+    I: Send + 'static,
+    O: Send + 'static,
+    F: FnOnce(I, &ResultWindowAlias) -> O + Send + 'static,
+{
+    async move {
+        let worker_cancellation = cancellation.clone();
+        let work = executor.execute_preserving(move || {
+            if let Some(reason) = worker_cancellation.reason() {
+                return Err(cpu_cancellation_failure(reason));
+            }
+            Ok(input.transform(apply))
+        });
+        tokio::pin!(work);
+        let early_error = tokio::select! {
+            biased;
+            reason = cancellation.cancelled() => cpu_cancellation_failure(reason),
+            _ = completed.closed() => cpu_execution_failure("internal result CPU consumer closed"),
+            result = &mut work => {
+                let result = original_retirement.receive_work(result);
+                if let Err(original) = completed.send(result) {
+                    original_retirement.state.lock().unwrap_or_else(|e| e.into_inner()).outcome = Some(original);
+                }
+                original_retirement.notify(0, wake.as_ref());
+                return;
+            }
+        };
+        if let Err(Err(original)) = completed.send(Err(early_error)) {
+            original_retirement
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .early = Some(original);
+        }
+        original_retirement.notify(0, wake.as_ref());
+        // An early cancellation/closed receiver or notification panic is
+        // not exit. Keep this exact preserving receipt until actual return.
+        let late = original_retirement.receive_work(work.await);
+        original_retirement
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .outcome = Some(late);
+        original_retirement.notify(1, wake.as_ref());
     }
 }
 
@@ -630,7 +909,7 @@ mod tests {
         (control, capacity)
     }
 
-    async fn take<T>(
+    async fn take<T: Send + 'static>(
         job: &mut InternalResultCpuJob<T>,
     ) -> Result<InternalResultValue<T>, ExecutionFailureInput> {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1156,6 +1435,249 @@ mod actual_close_tests {
         assert!(joined && dropped_at_join && no_join_failure);
         // Successful joins have no failure to hand to process health.
         // `job` was already disposed after the actual close above.
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+}
+
+#[cfg(test)]
+mod original_failure_tests {
+    use super::*;
+    use novarocks_query_application::cancellation::{
+        QueryCancellationReason, QueryCancellationSource,
+    };
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        time::Duration,
+    };
+
+    struct OriginalWorkerPanic {
+        drops: Arc<AtomicUsize>,
+        _original_window: ResultWindowAlias,
+    }
+    impl Drop for OriginalWorkerPanic {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    struct OriginalNotificationPanic(Arc<AtomicUsize>);
+    impl Drop for OriginalNotificationPanic {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    #[derive(Debug)]
+    struct Wake {
+        panic: bool,
+        drops: Arc<AtomicUsize>,
+    }
+    impl StatusIntakeWake for Wake {
+        fn wake(&self) {
+            if self.panic {
+                std::panic::panic_any(OriginalNotificationPanic(Arc::clone(&self.drops)));
+            }
+        }
+    }
+    fn original_runtime() -> FrontendDataRuntime {
+        use novarocks_native_trust::{
+            DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust,
+            ValidatedSharedSecret,
+        };
+        let trust = NativeTrust::new(
+            DeploymentId::parse("internal-cpu-original-failure").unwrap(),
+            ValidatedSharedSecret::new(novarocks_secret::SecretValue::new(
+                "0123456789abcdef0123456789abcdef",
+            ))
+            .unwrap(),
+            NativeCallerSubject::parse("fe@127.0.0.1:19040").unwrap(),
+            NativeTransportMode::Disabled,
+        );
+        // No subscription/reaper service and no socket is started by this owner.
+        FrontendDataRuntime::new_with_native_trust(
+            tokio::runtime::Handle::current(),
+            Arc::new(trust),
+            novarocks_native_adapter::FrontendNativeTransport::plaintext(),
+            novarocks_task_codec::TransportBudget::DEFAULT,
+            8,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn original_worker_and_both_actual_notification_causes_reach_health_custody() {
+        for early_cancel in [false, true] {
+            let (_control, root, binding, capacity) = admitted_internal_fixture();
+            let worker_drops = Arc::new(AtomicUsize::new(0));
+            let wake_drops = Arc::new(AtomicUsize::new(0));
+            let input =
+                InternalResultValue::try_produce(binding.scope(), binding.window_alias(), |_| {
+                    Ok(())
+                })
+                .unwrap()
+                .track_actual_exit(&binding)
+                .unwrap();
+            let mut owner = InternalResultCpuOwner::try_new_for_test().unwrap();
+            let runtime = original_runtime();
+            let cancellation = QueryCancellationSource::new();
+            let (entered, started) = mpsc::channel();
+            let (release, blocked) = mpsc::channel();
+            let original_drops = Arc::clone(&worker_drops);
+            let mut job: InternalResultCpuJob<()> = owner.runtime().submit(
+                input,
+                cancellation.view(),
+                &runtime,
+                Arc::new(Wake {
+                    panic: early_cancel,
+                    drops: Arc::clone(&wake_drops),
+                }),
+                move |(), window| {
+                    let _ = entered.send(());
+                    let _ = blocked.recv();
+                    std::panic::panic_any(OriginalWorkerPanic {
+                        drops: original_drops,
+                        _original_window: window.clone(),
+                    });
+                },
+            );
+            let entered = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match started.try_recv() {
+                        Ok(()) => break true,
+                        Err(mpsc::TryRecvError::Disconnected) => break false,
+                        Err(mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                    }
+                }
+            })
+            .await;
+            if early_cancel {
+                cancellation.request(QueryCancellationReason::ExplicitKill {
+                    requester_connection_id: 1,
+                });
+            } else {
+                let _ = release.send(());
+            }
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                std::future::poll_fn(|cx| job.poll_take(cx)),
+            )
+            .await;
+            // Release even if an observation above failed. No assertion can
+            // strand the real worker before its actual receipt/forwarder join.
+            if early_cancel {
+                let _ = release.send(());
+            }
+            drop(release);
+            let joined = tokio::time::timeout(Duration::from_secs(5), job.join_closed()).await;
+            let (worker_is_original, both_wakes, late_retained) = {
+                let packet = job
+                    .retirement
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                (
+                    packet
+                        .worker
+                        .as_ref()
+                        .is_some_and(|cause| cause.original_payload_is::<OriginalWorkerPanic>()),
+                    packet
+                        .notifications
+                        .iter()
+                        .filter(|cause| {
+                            cause.as_ref().is_some_and(|cause| {
+                                cause.original_payload_is::<OriginalNotificationPanic>()
+                            })
+                        })
+                        .count(),
+                    packet.outcome.is_some(),
+                )
+            };
+            let no_forwarder_panic = job.join_failure().is_none();
+            let health = job.health_failure().map(|original|
+                novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
+                    "Original Internal CPU failure remains in custody", original));
+            let abnormal_join = matches!(&joined, Ok(Err(_)));
+            drop(joined);
+            drop(outcome);
+            drop(job);
+            root.owner.complete();
+            root.business.release();
+            drop(binding);
+            let shutdown = owner
+                .shutdown_until(Instant::now() + Duration::from_secs(5))
+                .await;
+            let held_by_health = capacity.snapshot().held_positions == [0, 0, 1, 0]
+                && worker_drops.load(Ordering::Acquire) == 0
+                && wake_drops.load(Ordering::Acquire) == 0;
+            let has_health = health.is_some();
+            // This explicit receiver disposition is the last original cause
+            // alias. Safe error presentation never consumes the packet.
+            drop(health);
+            let retired = capacity.snapshot().held_positions == [0; 4];
+            assert!(matches!(entered, Ok(true)));
+            assert!(shutdown.is_ok());
+            assert!(abnormal_join && no_forwarder_panic && has_health && held_by_health);
+            assert!(worker_is_original && retired);
+            assert_eq!(worker_drops.load(Ordering::Acquire), 1);
+            assert_eq!(both_wakes, if early_cancel { 2 } else { 0 });
+            assert_eq!(
+                wake_drops.load(Ordering::Acquire),
+                if early_cancel { 2 } else { 0 }
+            );
+            assert_eq!(late_retained, early_cancel);
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn unclaimed_success_keeps_original_activity_after_forwarder_join() {
+        use futures::FutureExt;
+        let (_control, root, binding, capacity) = admitted_internal_fixture();
+        let input =
+            InternalResultValue::try_produce(binding.scope(), binding.window_alias(), |_| Ok(()))
+                .unwrap()
+                .track_actual_exit(&binding)
+                .unwrap();
+        let mut owner = InternalResultCpuOwner::try_new_for_test().unwrap();
+        let runtime = original_runtime();
+        let wake_drops = Arc::new(AtomicUsize::new(0));
+        let mut job = owner.runtime().submit(
+            input,
+            QueryCancellationSource::new().view(),
+            &runtime,
+            Arc::new(Wake {
+                panic: false,
+                drops: wake_drops,
+            }),
+            |(), _| (),
+        );
+        // Join without claiming/draining the original oneshot. This is the
+        // explicit poll_forwarder_closed contract, not normal delivery close.
+        let joined = tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| job.poll_forwarder_closed(cx)),
+        )
+        .await;
+        let joined_normally = matches!(&joined, Ok(Ok(())));
+        drop(joined);
+        drop(job.take_retired_outcome());
+        let queued_still_active = binding.result_activities_exited().now_or_never().is_none();
+        let output = job.close_delivery();
+        let original_success = matches!(&output, Some(Ok(_)));
+        drop(job);
+        let drained_still_active = binding.result_activities_exited().now_or_never().is_none();
+        drop(output);
+        let output_exited =
+            tokio::time::timeout(Duration::from_secs(5), binding.result_activities_exited())
+                .await
+                .is_ok();
+        root.owner.complete();
+        root.business.release();
+        drop(binding);
+        let worker_exit = owner
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await;
+        assert!(joined_normally && original_success && worker_exit.is_ok());
+        assert!(queued_still_active && drained_still_active && output_exited);
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
 }

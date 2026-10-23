@@ -254,16 +254,27 @@ pub(crate) fn write_computation_consumer(
     }
     let decoder = RootWriteResultDecoder::new_with_capacity(seed.contract, &runtime.binding)
         .map_err(|_| domain_error("write decoder has no original admitted capacity"))?;
-    let cpu = DomainCpuCustody::try_new(
-        InternalDomainState::WriteComputation {
-            decoder,
-            decode: seed.decode,
-        },
-        runtime.binding,
-        runtime.cpu,
-        runtime.runtime,
-        runtime.cancellation.clone(),
-    )?;
+    let state = InternalDomainState::WriteComputation {
+        decoder,
+        decode: seed.decode,
+    };
+    let cpu = match runtime.computation {
+        Some(computation) => DomainCpuCustody::try_new_with_computation(
+            state,
+            runtime.binding,
+            runtime.cpu,
+            runtime.runtime,
+            runtime.cancellation.clone(),
+            computation,
+        )?,
+        None => DomainCpuCustody::try_new(
+            state,
+            runtime.binding,
+            runtime.cpu,
+            runtime.runtime,
+            runtime.cancellation.clone(),
+        )?,
+    };
     let holder = Arc::new(Holder {
         receiving: Mutex::new(Receiving::Vacant),
         cpu,
@@ -323,6 +334,17 @@ pub(crate) fn prepare_write_computation(
 }
 
 impl InternalComputationConsumer for WriteComputationConsumer {
+    fn local_health_failure(
+        &self,
+    ) -> Option<novarocks_query_application::api::StatementNativeHealthFailure> {
+        self.holder.cpu.health_failure().map(|original| {
+            novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
+                "Original Internal CPU failure remains in custody",
+                original,
+            )
+        })
+    }
+
     fn consume(&self, activation: InternalConsumerActivation) -> InternalConsumerFuture {
         let (mut stream, source) = activation.into_parts();
         let binding = Binding {
@@ -450,6 +472,7 @@ impl InternalComputationConsumer for WriteComputationConsumer {
                     accepted,
                     credentials,
                 })?;
+                holder.cpu.finish_computation_after_handoff()?;
                 let token = source
                     .take()
                     .expect("original write Ready source")

@@ -33,6 +33,7 @@ tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
+novarocks-resource-contract.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-sql = { workspace = true }
 serde_json.workspace = true

@@ -42,6 +42,7 @@ type Job = InternalResultCpuJob<Result<InternalDomainSlot, InternalDomainFailure
 
 struct State {
     value: Option<InternalResultValue<InternalDomainSlot>>,
+    computation: Option<novarocks_workload_control::joint_admission::InternalComputationGrant>,
     job: Option<Job>,
     busy: bool,
     closing: bool,
@@ -70,17 +71,64 @@ impl DomainCpuCustody {
         runtime: FrontendDataRuntime,
         cancellation: QueryCancellationView,
     ) -> Result<Arc<Self>, QueryExecutionError> {
-        let value =
-            InternalResultValue::try_produce(binding.scope(), binding.window_alias(), |_| {
-                Ok(InternalDomainSlot::Collecting {
-                    state: Box::new(domain),
-                    receipt: None,
-                })
+        Self::try_new_stage(domain, binding, cpu, runtime, cancellation, None)
+    }
+
+    pub(crate) fn try_new_with_computation(
+        domain: InternalDomainState,
+        binding: QueryResultCapacityBinding,
+        cpu: InternalResultCpu,
+        runtime: FrontendDataRuntime,
+        cancellation: QueryCancellationView,
+        computation: novarocks_workload_control::joint_admission::InternalComputationGrant,
+    ) -> Result<Arc<Self>, QueryExecutionError> {
+        Self::try_new_stage(
+            domain,
+            binding,
+            cpu,
+            runtime,
+            cancellation,
+            Some(computation),
+        )
+    }
+
+    fn try_new_stage(
+        domain: InternalDomainState,
+        binding: QueryResultCapacityBinding,
+        cpu: InternalResultCpu,
+        runtime: FrontendDataRuntime,
+        cancellation: QueryCancellationView,
+        computation: Option<novarocks_workload_control::joint_admission::InternalComputationGrant>,
+    ) -> Result<Arc<Self>, QueryExecutionError> {
+        if binding.is_root_backed_internal() != computation.is_some() {
+            return Err(domain_error(
+                "Root payload requires its exact independent stage computation",
+            ));
+        }
+        if let Some(grant) = &computation {
+            let alias = grant
+                .retain_alias()
+                .map_err(|_| domain_error("stage computation pin is unavailable"))?;
+            if !alias.is_for_scope(binding.scope()) {
+                return Err(domain_error(
+                    "stage computation belongs to a foreign execution",
+                ));
+            }
+        }
+        let window = binding
+            .try_window_alias()
+            .map_err(|_| domain_error("original payload pin is unavailable"))?;
+        let value = InternalResultValue::try_produce(binding.scope(), window, |_| {
+            Ok(InternalDomainSlot::Collecting {
+                state: Box::new(domain),
+                receipt: None,
             })
-            .map_err(|_| domain_error("internal decoder has no complete admitted capacity"))?;
+        })
+        .map_err(|_| domain_error("internal decoder has no complete admitted capacity"))?;
         Ok(Arc::new(Self {
             state: Mutex::new(State {
                 value: Some(value),
+                computation,
                 job: None,
                 busy: false,
                 closing: false,
@@ -123,22 +171,34 @@ impl DomainCpuCustody {
     }
 
     fn start(&self, operation: Operation) -> Result<(), QueryExecutionError> {
-        let input = {
+        let (input, computation) = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             if state.closing || state.busy || state.job.is_some() {
                 return Err(domain_error(
                     "internal decoder already has an active or closed CPU job",
                 ));
             }
+            // Checked retain is a callback-free original State transaction.
+            // The stable grant remains here until the complete receiving cut.
+            let computation = state
+                .computation
+                .as_ref()
+                .map(|grant| grant.retain_alias())
+                .transpose()
+                .map_err(|_| domain_error("stage computation pin count overflow"))?;
             let input = state
                 .value
                 .take()
                 .ok_or_else(|| domain_error("internal decoder has no serial input"))?;
             state.busy = true;
             state.receipt = None;
-            input
+            (input, computation)
         };
-        let input = match input.track_actual_exit(&self.binding) {
+        let tracked = match computation {
+            Some(computation) => input.track_computation_exit(&self.binding, computation),
+            None => input.track_actual_exit(&self.binding),
+        };
+        let input = match tracked {
             Ok(input) => input,
             Err(_) => {
                 let error =
@@ -216,7 +276,14 @@ impl DomainCpuCustody {
             state.receipt = Some(Err(error.clone()));
             return Poll::Ready(Err(error));
         }
-        state.job.take();
+        let retired = state
+            .job
+            .as_mut()
+            .and_then(|job| job.take_retired_outcome());
+        let original_job = state.job.take();
+        drop(state);
+        drop(retired);
+        drop(original_job);
         Poll::Ready(Ok(()))
     }
 
@@ -241,6 +308,25 @@ impl DomainCpuCustody {
             .ok_or_else(|| domain_error("internal decoder output was already transferred"))
     }
 
+    pub(crate) fn finish_computation_after_handoff(&self) -> Result<(), QueryExecutionError> {
+        let computation = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.closing
+                || state.busy
+                || state.job.is_some()
+                || state.value.is_some()
+                || !matches!(state.receipt, Some(Ok(())))
+            {
+                return Err(domain_error(
+                    "stage computation has not reached its actual receiving cut",
+                ));
+            }
+            state.computation.take()
+        };
+        drop(computation);
+        Ok(())
+    }
+
     pub(crate) fn begin_close(&self) {
         let retired = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -251,7 +337,12 @@ impl DomainCpuCustody {
         drop(retired);
     }
 
-    pub(crate) async fn join_closed(&self) -> Result<(), Arc<tokio::task::JoinError>> {
+    pub(crate) fn health_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.job.as_ref().and_then(|job| job.health_failure())
+    }
+
+    pub(crate) async fn join_closed(&self) -> Result<(), Arc<dyn std::error::Error + Send + Sync>> {
         self.begin_close();
         std::future::poll_fn(|cx| {
             self.registration.register(cx.waker());
@@ -262,23 +353,38 @@ impl DomainCpuCustody {
                 return Poll::Pending;
             }
             let Some(job) = state.job.as_mut() else {
+                let computation = state.computation.take();
+                drop(state);
+                drop(computation);
                 return Poll::Ready(Ok(()));
             };
             let retired = job.close_delivery();
             let result = match job.poll_forwarder_closed(cx) {
-                Poll::Ready(Ok(())) => {
-                    state.job.take();
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Ready(Err(_)) => {
-                    Poll::Ready(Err(job.join_failure().expect("original joined failure")))
-                }
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+                Poll::Ready(Err(original)) => Poll::Ready(Err(original)),
                 Poll::Pending => Poll::Pending,
             };
+            let (original_job, late) = if matches!(result, Poll::Ready(Ok(()))) {
+                let late = state
+                    .job
+                    .as_mut()
+                    .and_then(|job| job.take_retired_outcome());
+                (state.job.take(), late)
+            } else {
+                (None, None)
+            };
+            let computation = if matches!(result, Poll::Ready(Ok(()))) {
+                state.computation.take()
+            } else {
+                None
+            };
             drop(state);
-            // Complete physical destruction is part of this close turn, but
-            // never runs while the serial domain custody lock is held.
+            // Raw failures stay in the same failed job. Ordinary late outcomes
+            // retire only after its real join, outside serial custody locks.
             drop(retired);
+            drop(late);
+            drop(original_job);
+            drop(computation);
             result
         })
         .await

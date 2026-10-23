@@ -1625,7 +1625,7 @@ impl FrontendDistributedQueryCoordinator {
                             }
                             std::task::Poll::Ready(Err(_)) => {
                                 *health = Some(novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
-                            "Original Internal CPU forwarder exit is unproven", job.join_failure().expect("original CPU join error")));
+                            "Original Internal CPU failure remains in custody", job.health_failure().expect("original CPU failure")));
                                 break Err(failed("Internal CPU forwarder did not exit normally"));
                             }
                             std::task::Poll::Pending => {}

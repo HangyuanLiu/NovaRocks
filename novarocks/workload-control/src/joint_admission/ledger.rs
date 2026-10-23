@@ -46,7 +46,10 @@ mod dependency_storage;
 mod metadata_geometry;
 mod paid_proposal;
 pub(crate) mod retained_claim;
-pub use paid_proposal::JointProposal;
+use paid_proposal::validate_root_stage;
+pub use paid_proposal::{
+    JointProposal, RootStageAdmission, RootStageProposal, RootStageReady, RootStageSource,
+};
 pub(crate) mod proposal_storage;
 pub(crate) use control_storage::control_storage_base;
 use dependency_storage::{DependencyRef, DependencyRegistry};
@@ -136,6 +139,9 @@ pub(super) struct ClaimRecord {
 #[derive(Clone, Copy)]
 enum ClaimSource {
     Physical,
+    Payload {
+        epoch: u64,
+    },
     NodeControl {
         work: WorkId,
         slot: SlotId,
@@ -219,7 +225,15 @@ impl RequestBudget {
     }
 }
 
+#[derive(Clone, Copy)]
+struct RootStageFence {
+    stage: WorkId,
+    payload: u64,
+    epoch: u64,
+}
 pub(super) struct RequestRecord {
+    // Restricted only by the closed Root/stage constructor, never a caller ID.
+    root_stage: Option<RootStageFence>,
     pub(super) budget: RequestBudget,
     pub(super) owner: WorkId,
     pub(super) changes: ChangeBody,
@@ -518,6 +532,7 @@ impl JointAdmissionHandle {
             },
         };
         Ok(PreparedRequest {
+            root_stage: None,
             budget: RequestBudget::Finite {
                 remaining: work_limit,
             },
@@ -670,6 +685,7 @@ impl JointAdmissionHandle {
             });
         }
         Ok(PreparedRequest {
+            root_stage: None,
             // A resident control rekey uses one cumulative finite proof,
             // including later full-domain extensions. It cannot self-park.
             budget: if records.iter().any(|record| {
@@ -718,6 +734,13 @@ impl JointAdmissionHandle {
             if control_only {
                 validate_control_binding_shape(state, scope, records)?;
             }
+            if let Some(fence) = prepared.root_stage {
+                validate_root_stage(state, scope.id, fence, records)?;
+                state.nodes[&fence.stage]
+                    .resource_waiters
+                    .checked_add(1)
+                    .ok_or(WorkError::ArithmeticOverflow)?;
+            }
             let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
             let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
             if ledger.driver_closed {
@@ -732,7 +755,12 @@ impl JointAdmissionHandle {
                 }
                 if let Some(source) = &change.source {
                     let old = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
-                    authenticate_scope(state, old, source, scope.id)?;
+                    authenticate_scope(
+                        state,
+                        old,
+                        source,
+                        source_work(scope.id, prepared.root_stage, source),
+                    )?;
                     if old.pending.is_some() {
                         return Err(WorkError::Conflict);
                     }
@@ -754,6 +782,9 @@ impl JointAdmissionHandle {
             let id = state.next_id()?;
             let proposal = queue_proposal(state, &prepared.custody, id)?;
             state.nodes.get_mut(&scope.id).unwrap().resource_waiters = waiters;
+            if let Some(fence) = prepared.root_stage {
+                state.nodes.get_mut(&fence.stage).unwrap().resource_waiters += 1;
+            }
             let ledger = state.joint.as_mut().unwrap();
             for record in records.iter() {
                 if let Some(old) = record.old {
@@ -769,6 +800,7 @@ impl JointAdmissionHandle {
             ledger.requests.insert(
                 id,
                 RequestRecord {
+                    root_stage: prepared.root_stage,
                     budget: match prepared.budget {
                         RequestBudget::Finite { remaining } => RequestBudget::Finite {
                             remaining: remaining.min(ledger.config.config.max_total_proof_work),
@@ -795,6 +827,7 @@ impl JointAdmissionHandle {
 }
 
 pub(super) struct PreparedRequest {
+    root_stage: Option<RootStageFence>,
     budget: RequestBudget,
     scope: WorkScope,
     changes: ChangeBody,
@@ -835,8 +868,26 @@ impl JointClaimChange {
         }
     }
 }
+fn source_work(root: WorkId, fence: Option<RootStageFence>, source: &JointClaimView) -> WorkId {
+    match (fence, source.source) {
+        (Some(fence), ClaimSource::NodeControl { work, .. }) if work == fence.stage => fence.stage,
+        _ => root,
+    }
+}
 fn authenticate(record: &ClaimRecord, source: &JointClaimView) -> Result<(), WorkError> {
-    if !record.custody.is_raw()
+    let custody = match (source.source, record.custody) {
+        (
+            ClaimSource::Payload { epoch },
+            ClaimCustody::Payload {
+                epoch: original,
+                pins,
+            },
+        ) => epoch == original && pins != 0,
+        (ClaimSource::Payload { .. }, _) => false,
+        (_, ClaimCustody::Raw) => true,
+        _ => false,
+    };
+    if !custody
         || record.structure_revision != source.structure_revision
         || record.release_revision != source.release_revision
     {
@@ -887,7 +938,11 @@ fn authenticate_scope(
 ) -> Result<(), WorkError> {
     authenticate(record, source)?;
     match source.source {
-        ClaimSource::Physical if record.owner == ClaimOwner::PhysicalWork(work) => Ok(()),
+        ClaimSource::Physical | ClaimSource::Payload { .. }
+            if record.owner == ClaimOwner::PhysicalWork(work) =>
+        {
+            Ok(())
+        }
         ClaimSource::NodeControl {
             work: original,
             slot,
@@ -952,11 +1007,20 @@ pub(super) fn validate_waiting(
     changes: &[ChangeRecord],
 ) -> Result<(), WorkError> {
     let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
-    let work = ledger.requests.get(&id).ok_or(WorkError::Released)?.owner;
+    let request = ledger.requests.get(&id).ok_or(WorkError::Released)?;
+    let work = request.owner;
+    if let Some(fence) = request.root_stage {
+        validate_root_stage(state, work, fence, changes)?;
+    }
     for change in changes {
         if let Some(source) = &change.source {
             let record = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
-            authenticate_scope(state, record, source, work)?;
+            authenticate_scope(
+                state,
+                record,
+                source,
+                source_work(work, request.root_stage, source),
+            )?;
             let expected = if matches!(source.source, ClaimSource::PoolFree { .. }) {
                 None
             } else {
@@ -1228,6 +1292,10 @@ fn remove_request(state: &mut State, id: u64) {
         if let Some(key) = request.proposal {
             retire_proposal(state, key, Some(id));
         }
+        if let Some(fence) = request.root_stage {
+            state.nodes.get_mut(&fence.stage).unwrap().resource_waiters -= 1;
+            state.collect(fence.stage);
+        }
         state
             .nodes
             .get_mut(&request.owner)
@@ -1338,6 +1406,7 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
     validate_waiting(state, id, &request.changes)?;
     let changes = request.changes.clone();
     let owner = request.owner;
+    let physical_owner = request.root_stage.map_or(owner, |fence| fence.stage);
     let new_count = changes.iter().filter(|c| c.old.is_none()).count();
     if ledger
         .claims
@@ -1348,7 +1417,7 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
     {
         return Err(WorkError::Capacity("joint claim records"));
     }
-    state.nodes[&owner]
+    state.nodes[&physical_owner]
         .resource_holders
         .checked_add(new_count)
         .ok_or(WorkError::ArithmeticOverflow)?;
@@ -1444,7 +1513,7 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
                 new_id,
                 ClaimRecord {
                     custody: ClaimCustody::Raw,
-                    owner: ClaimOwner::PhysicalWork(owner),
+                    owner: ClaimOwner::PhysicalWork(physical_owner),
                     facts: Arc::clone(&change.claim.facts),
                     amounts: change.claim.amounts,
                     active_facts: Arc::clone(&change.claim.facts),
@@ -1454,7 +1523,11 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
                     release_revision: 0,
                 },
             );
-            state.nodes.get_mut(&owner).unwrap().resource_holders += 1;
+            state
+                .nodes
+                .get_mut(&physical_owner)
+                .unwrap()
+                .resource_holders += 1;
             new_ids.push(new_id);
         }
     }
@@ -2214,7 +2287,9 @@ impl JointAdjustmentReceipt {
                         return Err(WorkError::Conflict);
                     }
                 }
-                ClaimSource::PoolFree { .. } => return Err(WorkError::Conflict),
+                ClaimSource::PoolFree { .. } | ClaimSource::Payload { .. } => {
+                    return Err(WorkError::Conflict);
+                }
             }
             let record = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
             if record.pending != Some(id) {

@@ -22,6 +22,9 @@ use super::*;
 use crate::scope::ReclaimWakeOnExit;
 
 use novarocks_resource_contract::SelectedNetworkOrigin;
+mod root_stage;
+pub(super) use root_stage::validate_root_stage;
+pub use root_stage::{RootStageAdmission, RootStageProposal, RootStageReady, RootStageSource};
 
 /// Closed actual authors: a Provider-owned fact or its borrowed selected route.
 /// Neither variant can run an external constructor under the WC mutex.
@@ -74,6 +77,7 @@ struct PendingChange {
 /// ```
 #[must_use = "A proposal must be submitted or dropped"]
 pub struct JointProposal {
+    root_stage: Option<RootStageFence>,
     records: Vec<ChangeRecord>,
     current: Option<PendingChange>,
     custody: Option<ProposalConstruction>,
@@ -93,7 +97,7 @@ impl JointAdmissionHandle {
         self.begin_paid_proposal_for_scope(owner.scope())
     }
 
-    // Scope callers can reach this only through the closed control wrapper.
+    // Scope callers reach this through closed owner-delegated wrappers.
     pub(super) fn begin_paid_proposal_for_scope(
         &self,
         scope: WorkScope,
@@ -112,6 +116,7 @@ impl JointAdmissionHandle {
             (Arc::clone(&ledger.config), node.class)
         };
         let mut proposal = JointProposal {
+            root_stage: None,
             records: Vec::new(),
             current: None,
             custody: Some(custody),
@@ -148,6 +153,12 @@ impl JointAdmissionHandle {
         }
         match (source.source, first_bind) {
             (ClaimSource::Physical, false) => {}
+            (ClaimSource::Payload { .. }, false)
+                if delta
+                    == JointResources::ZERO.with(
+                        JointResource::PayloadBytes,
+                        delta.get(JointResource::PayloadBytes),
+                    ) => {}
             (ClaimSource::NodeControl { slot, .. }, true)
                 if old.active_facts.dependencies.is_empty()
                     && old.active_amounts == state.cancellations.slots[slot.0].base => {}
@@ -205,7 +216,15 @@ impl JointProposal {
                 JointAdmissionHandle {
                     inner: Arc::clone(&self.scope.inner),
                 }
-                .capture_adjustment(&self.scope, source, amounts, first_bind)?,
+                .capture_adjustment(
+                    &WorkScope {
+                        inner: Arc::clone(&self.scope.inner),
+                        id: source_work(self.scope.id, self.root_stage, source),
+                    },
+                    source,
+                    amounts,
+                    first_bind,
+                )?,
             )
         } else {
             None
@@ -432,6 +451,7 @@ impl JointProposal {
             // Its queue author installs the original admission before any wake.
             handle.queue_request_mode(
                 PreparedRequest {
+                    root_stage: self.root_stage,
                     budget: RequestBudget::Finite { remaining: limit },
                     changes,
                     custody: self.custody.take(),
