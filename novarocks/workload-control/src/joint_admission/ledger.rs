@@ -72,9 +72,6 @@ pub(super) struct ProfileRecord {
     pub(super) claims: usize,
 }
 
-/// Plain identity only: dropping this token cannot release a physical claim.
-/// The nonclone JointClaim is the only actual holder; State retains a Weak.
-struct ClaimIdentity;
 #[derive(Clone)]
 pub(super) struct ProposedClaim {
     pub(super) facts: Arc<ProfileFacts>,
@@ -87,7 +84,6 @@ pub(super) struct ClaimRecord {
     pub(super) amounts: JointResources,
     active_facts: Arc<ProfileFacts>,
     active_amounts: JointResources,
-    holder: Weak<ClaimIdentity>,
     pending: Option<u64>,
     structure_revision: u64,
     release_revision: u64,
@@ -95,7 +91,6 @@ pub(super) struct ClaimRecord {
 #[derive(Clone)]
 pub struct JointClaimView {
     inner: Weak<Inner>,
-    holder: Weak<ClaimIdentity>,
     id: u64,
     structure_revision: u64,
     release_revision: u64,
@@ -458,9 +453,6 @@ impl JointClaimChange {
     }
 }
 fn authenticate(record: &ClaimRecord, source: &JointClaimView) -> Result<(), WorkError> {
-    if !Weak::ptr_eq(&record.holder, &source.holder) {
-        return Err(WorkError::Released);
-    }
     if record.structure_revision != source.structure_revision
         || record.release_revision != source.release_revision
     {
@@ -490,7 +482,6 @@ pub(super) fn validate_waiting(
 pub struct JointClaim {
     inner: Arc<Inner>,
     id: u64,
-    identity: Arc<ClaimIdentity>,
 }
 impl std::fmt::Debug for JointClaim {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -509,7 +500,6 @@ impl JointClaim {
             .ok_or(WorkError::Released)?;
         Ok(JointClaimView {
             inner: Arc::downgrade(&self.inner),
-            holder: Arc::downgrade(&self.identity),
             id: self.id,
             structure_revision: record.structure_revision,
             release_revision: record.release_revision,
@@ -774,7 +764,6 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
                     amounts: change.claim.amounts,
                     active_facts: Arc::clone(&change.claim.facts),
                     active_amounts: change.claim.amounts,
-                    holder: Weak::new(),
                     pending: None,
                     structure_revision: 0,
                     release_revision: 0,
@@ -871,27 +860,12 @@ impl Future for JointAdmission {
                 unreachable!()
             };
             let has_adjustment = changes.iter().any(|change| change.old.is_some());
-            // These are plain tokens, never physical Drop implementations. No
-            // last strong physical owner is upgraded or destroyed under State.
-            let identities: Vec<_> = new_ids
-                .into_iter()
-                .map(|claim| {
-                    let token = Arc::new(ClaimIdentity);
-                    state
-                        .joint
-                        .as_mut()
-                        .unwrap()
-                        .claims
-                        .get_mut(&claim)
-                        .unwrap()
-                        .holder = Arc::downgrade(&token);
-                    (claim, token)
-                })
-                .collect();
+            // IDs are checked, monotonic and never reused in this exact
+            // authority. Only this unique reply constructs physical guards.
             if !has_adjustment {
                 remove_request(state, id);
             }
-            Some(Ok((identities, has_adjustment)))
+            Some(Ok((new_ids, has_adjustment)))
         });
         let Some(result) = result else {
             return Poll::Pending;
@@ -899,13 +873,12 @@ impl Future for JointAdmission {
         self.id = None;
         Poll::Ready(
             result
-                .map(|(identities, has_adjustment)| JointGrantedBatch {
-                    new_claims: identities
+                .map(|(new_ids, has_adjustment)| JointGrantedBatch {
+                    new_claims: new_ids
                         .into_iter()
-                        .map(|(id, identity)| JointClaim {
+                        .map(|id| JointClaim {
                             inner: Arc::clone(&self.inner),
                             id,
-                            identity,
                         })
                         .collect(),
                     adjustment: has_adjustment.then(|| JointAdjustmentReceipt {
@@ -975,9 +948,7 @@ impl JointAdjustmentReceipt {
                 else {
                     return Err(WorkError::Conflict);
                 };
-                if !Arc::ptr_eq(&original.inner, &self.inner)
-                    || !Weak::ptr_eq(&source.holder, &Arc::downgrade(&original.identity))
-                {
+                if !Arc::ptr_eq(&original.inner, &self.inner) {
                     return Err(WorkError::ForeignAuthority);
                 }
                 let record = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;

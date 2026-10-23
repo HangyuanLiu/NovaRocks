@@ -1445,3 +1445,131 @@ fn request_publication_preserves_original_cancel_and_drop_errors() {
         );
     }
 }
+
+#[test]
+fn a_late_view_cannot_address_a_later_claim_in_the_same_authority() {
+    let (control, handle, mut driver) = roomy_control();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let scope = root.owner.scope();
+    let a = dependency(&handle, "a");
+    let mut first = request(&handle, &scope, &[&a], JointLane::Foreground, 10);
+    drive(&mut driver);
+    let original = granted(&mut first).pop().unwrap();
+    let stale = original.view().unwrap();
+    let original_id = *control
+        .inner
+        .state
+        .lock()
+        .unwrap()
+        .joint
+        .as_ref()
+        .unwrap()
+        .claims
+        .first_key_value()
+        .unwrap()
+        .0;
+    drop(original);
+    let mut later = request(&handle, &scope, &[&a], JointLane::Foreground, 20);
+    drive(&mut driver);
+    let later = granted(&mut later).pop().unwrap();
+    let later_id = *control
+        .inner
+        .state
+        .lock()
+        .unwrap()
+        .joint
+        .as_ref()
+        .unwrap()
+        .claims
+        .first_key_value()
+        .unwrap()
+        .0;
+    assert!(later_id > original_id);
+    assert!(matches!(
+        handle.request(
+            &scope,
+            vec![JointClaimChange::grow_by(stale, bytes(1), vec![])]
+        ),
+        Err(JointAdmissionFailure {
+            error: WorkError::Released
+        })
+    ));
+    assert_eq!(later.amounts().unwrap(), bytes(20));
+    assert_eq!(held(&control), (1, 20));
+}
+
+#[test]
+fn matching_numeric_claim_ids_do_not_cross_original_authorities() {
+    let (control, handle, mut driver) = roomy_control();
+    let (foreign, foreign_handle, mut foreign_driver) = roomy_control();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let other = foreign
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let scope = root.owner.scope();
+    let a = dependency(&handle, "a");
+    let foreign_a = dependency(&foreign_handle, "a");
+    let mut first = request(&handle, &scope, &[&a], JointLane::Foreground, 10);
+    let mut second = request(
+        &foreign_handle,
+        &other.owner.scope(),
+        &[&foreign_a],
+        JointLane::Foreground,
+        20,
+    );
+    drive(&mut driver);
+    drive(&mut foreign_driver);
+    let original = granted(&mut first).pop().unwrap();
+    let other = granted(&mut second).pop().unwrap();
+    let ids = |control: &WorkloadControl| {
+        control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .joint
+            .as_ref()
+            .unwrap()
+            .claims
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&control), ids(&foreign));
+    assert!(matches!(
+        handle.request(
+            &scope,
+            vec![JointClaimChange::grow_by(
+                other.view().unwrap(),
+                bytes(1),
+                vec![]
+            )]
+        ),
+        Err(JointAdmissionFailure {
+            error: WorkError::ForeignAuthority
+        })
+    ));
+    let mut growth = handle
+        .request(
+            &scope,
+            vec![JointClaimChange::grow_by(
+                original.view().unwrap(),
+                bytes(4),
+                vec![],
+            )],
+        )
+        .unwrap();
+    drive(&mut driver);
+    assert_eq!(
+        adjustment(&mut growth).install(&[&other]),
+        Err(WorkError::ForeignAuthority)
+    );
+    assert_eq!(original.amounts().unwrap(), bytes(10));
+    assert_eq!(other.amounts().unwrap(), bytes(20));
+    assert_eq!(held(&control), (1, 10));
+    assert_eq!(held(&foreign), (1, 20));
+}
