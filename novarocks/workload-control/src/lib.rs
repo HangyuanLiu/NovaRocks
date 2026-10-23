@@ -147,3 +147,4 @@ impl std::fmt::Display for WorkError {
 impl std::error::Error for WorkError {}
 
 mod control_storage;
+mod role_poll;

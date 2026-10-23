@@ -62,10 +62,25 @@ pub(crate) fn prototype_profile(
     crate::joint_admission::JointAdmissionHandle,
     JointProgressDriver,
 ) {
+    prototype_profile_with_roles(count, children_per_slot, max_dependencies, max_changes, &[])
+}
+
+pub(crate) fn prototype_profile_with_roles(
+    count: usize,
+    children_per_slot: usize,
+    max_dependencies: usize,
+    max_changes: usize,
+    poll_roles: &[crate::role_poll::PollRoleGeometry],
+) -> (
+    WorkloadControl,
+    crate::joint_admission::JointAdmissionHandle,
+    JointProgressDriver,
+) {
     let storage = ControlStorageConfig {
         slots_per_class: [count, 0, 0, 0, 0],
         children_per_slot,
         proposals_per_slot: 2,
+        poll_roles,
     };
     let mut config = JointCapacityConfig {
         global: JointResourceLimits::default(),
@@ -136,7 +151,9 @@ pub(crate) fn prototype_profile(
         .configure_joint_capacity(config.validate(&required).unwrap())
         .unwrap();
     control.configure_control_storage(storage).unwrap();
-    control.mark_ready().unwrap();
+    if poll_roles.is_empty() {
+        control.mark_ready().unwrap();
+    }
     (control, handle, driver)
 }
 
@@ -1749,6 +1766,7 @@ fn storage_fanout_is_finite_configurable_and_charged_from_actual_layout() {
         slots_per_class: [4, 0, 0, 0, 0],
         children_per_slot: 1,
         proposals_per_slot: 2,
+        poll_roles: &[],
     };
     let wider = ControlStorageConfig {
         children_per_slot: 2,
@@ -2069,6 +2087,7 @@ fn metadata_reservation_tracks_actual_service_geometry_and_rejects_overflow_befo
         slots_per_class: [4, 0, 0, 0, 0],
         children_per_slot: 1,
         proposals_per_slot: 2,
+        poll_roles: &[],
     };
     let quote = |geometry: &JointCapacityConfig| {
         crate::joint_admission::ledger::control_storage_base(storage, geometry)

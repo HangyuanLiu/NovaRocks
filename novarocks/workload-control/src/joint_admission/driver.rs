@@ -30,7 +30,7 @@ use super::{
 };
 use crate::{
     WorkId, WorkloadProgressRevision,
-    control_storage::{SlotId, SlotPhase},
+    control_storage::{ReapPreparation, SlotId, SlotPhase},
     scope::Inner,
 };
 use std::{
@@ -267,7 +267,7 @@ impl JointProgressDriver {
                 || (state.cancellations.retired_proposals != 0
                     && self.proposal_idle != Some(marker))
                 || (state.cancellations.fixed
-                    && state.cancellations.retired != 0
+                    && (state.cancellations.retired != 0 || state.cancellations.retired_polls != 0)
                     && self.reclaim_idle != Some(marker))
             {
                 return JointProgress::More;
@@ -326,13 +326,23 @@ impl JointProgressDriver {
         false
     }
 
+    /// The role service's prepaid timer requests a new finite pass after silent
+    /// Arc/Waker exits. This changes only the driver's cache, never source facts
+    /// or revision. The production timer/source profile is composed separately.
+    pub(crate) fn recheck_retired_backing(&mut self) {
+        self.reclaim_idle = None;
+        self.reclaim_left = 0;
+    }
+
     /// One cell at most, alongside the original proof step. A successful leaf
     /// gives one parent hint, alternating with the finite fair storage scan.
     fn reclaim_one(&mut self) -> bool {
         let prepared = {
             let mut state = self.inner.state.lock().unwrap();
             let marker = self.inner.capture_progress(&state);
-            if !state.cancellations.fixed || state.cancellations.retired == 0 {
+            if !state.cancellations.fixed
+                || (state.cancellations.retired == 0 && state.cancellations.retired_polls == 0)
+            {
                 self.reclaim_left = 0;
                 self.reclaim_parent = None;
                 self.reclaim_idle = Some(marker);
@@ -369,12 +379,27 @@ impl JointProgressDriver {
             {
                 self.reclaim_checks += 1;
             }
-            state
-                .cancellations
-                .prepare_reap(slot)
-                .map(|(reset, parent, generation)| (slot, reset, parent, generation))
+            state.cancellations.prepare_reap(slot).map(|prepared| {
+                if matches!(prepared, ReapPreparation::PollRole) {
+                    state.advance_progress_revision();
+                }
+                (slot, prepared)
+            })
         };
-        if let Some((id, reset, parent, generation)) = prepared {
+        if matches!(prepared, Some((_, ReapPreparation::PollRole))) {
+            self.reclaim_idle = None;
+            self.inner.notify_reclaim_progress();
+            return true;
+        }
+        if let Some((
+            id,
+            ReapPreparation::Cancellation {
+                reset,
+                parent,
+                generation,
+            },
+        )) = prepared
+        {
             // Parent strong references and obsolete values actually leave here,
             // outside State. Only then may the exact original claim be rekeyed.
             drop(reset);

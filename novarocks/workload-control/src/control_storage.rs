@@ -51,6 +51,7 @@ pub(crate) enum SlotPhase {
 pub(crate) struct ControlSlot {
     pub(crate) cell: Option<Arc<Cancellation>>,
     pub(crate) proposals: Vec<crate::joint_admission::ledger::proposal_storage::ProposalCell>,
+    pub(crate) polls: Vec<crate::role_poll::PollBacking>,
     pub(crate) class: WorkClass,
     pub(crate) phase: SlotPhase,
     pub(crate) generation: u64,
@@ -66,19 +67,21 @@ pub(crate) struct CancellationStorage {
     pub(crate) fixed: bool,
     pub(crate) retired: usize,
     pub(crate) retired_proposals: usize,
+    pub(crate) retired_polls: usize,
     pub(crate) free_heads: [Option<SlotId>; 5],
     pub(crate) legacy_vacant: Option<SlotId>,
 }
 
 /// Crate-private: this is not a public partial-safe admission profile.
 #[derive(Clone, Copy)]
-pub(crate) struct ControlStorageConfig {
+pub(crate) struct ControlStorageConfig<'a> {
     pub(crate) slots_per_class: [usize; 5],
     pub(crate) children_per_slot: usize,
     pub(crate) proposals_per_slot: usize,
+    pub(crate) poll_roles: &'a [crate::role_poll::PollRoleGeometry],
 }
 
-impl ControlStorageConfig {
+impl ControlStorageConfig<'_> {
     pub(crate) fn count(self) -> Result<usize, WorkError> {
         self.slots_per_class.into_iter().try_fold(0usize, |sum, n| {
             sum.checked_add(n).ok_or(WorkError::ArithmeticOverflow)
@@ -97,16 +100,21 @@ impl CancellationStorage {
     pub(crate) fn drained(&self) -> bool {
         self.free_inventory_valid()
             && self.retired_proposals == 0
+            && self.retired_polls == 0
             && self.slots.iter().all(|slot| {
                 slot.proposals.iter().all(|cell| {
                     cell.phase
                         == crate::joint_admission::ledger::proposal_storage::ProposalPhase::Free
-                }) && slot.phase
-                    == if self.fixed {
-                        SlotPhase::Free
-                    } else {
-                        SlotPhase::Vacant
-                    }
+                }) && slot
+                    .polls
+                    .iter()
+                    .all(|role| role.phase == crate::role_poll::PollPhase::Free)
+                    && slot.phase
+                        == if self.fixed {
+                            SlotPhase::Free
+                        } else {
+                            SlotPhase::Vacant
+                        }
             })
     }
 
@@ -118,8 +126,14 @@ impl CancellationStorage {
         let mut expected = 0usize;
         let mut retired = 0usize;
         let mut retired_proposals = 0usize;
+        let mut retired_polls = 0usize;
         for slot in &self.slots {
             if self.fixed {
+                retired_polls += slot
+                    .polls
+                    .iter()
+                    .filter(|role| role.phase == crate::role_poll::PollPhase::Retired)
+                    .count();
                 for cell in &slot.proposals {
                     use crate::joint_admission::ledger::proposal_storage::ProposalPhase;
                     if matches!(
@@ -136,6 +150,13 @@ impl CancellationStorage {
                     return false;
                 }
                 if slot.phase == SlotPhase::Free {
+                    if slot
+                        .polls
+                        .iter()
+                        .any(|role| role.phase != crate::role_poll::PollPhase::Free)
+                    {
+                        return false;
+                    }
                     if slot.parent.is_some() {
                         return false;
                     }
@@ -164,7 +185,10 @@ impl CancellationStorage {
                 }
             }
         }
-        if retired != self.retired || retired_proposals != self.retired_proposals {
+        if retired != self.retired
+            || retired_proposals != self.retired_proposals
+            || retired_polls != self.retired_polls
+        {
             return false;
         }
         if self.fixed {
@@ -237,6 +261,7 @@ impl CancellationStorage {
         self.slots.push(ControlSlot {
             cell: Some(cell),
             proposals: Vec::new(),
+            polls: Vec::new(),
             class,
             phase: SlotPhase::Node(id),
             generation: 1,
@@ -422,12 +447,21 @@ impl CancellationStorage {
         advanced
     }
 
-    pub(crate) fn prepare_reap(
-        &mut self,
-        id: SlotId,
-    ) -> Option<(CancellationReset, Option<SlotId>, u64)> {
+    pub(crate) fn prepare_reap(&mut self, id: SlotId) -> Option<ReapPreparation> {
         let slot = self.slots.get_mut(id.0)?;
+        // This original author remains available after the bank exits. At most
+        // one actual role anchor is reset per turn, including on a live Node.
+        for role in &mut slot.polls {
+            if role.phase == crate::role_poll::PollPhase::Retired && role.try_reap() {
+                self.retired_polls -= 1;
+                return Some(ReapPreparation::PollRole);
+            }
+        }
         if slot.phase != SlotPhase::Retired
+            || slot
+                .polls
+                .iter()
+                .any(|role| role.phase != crate::role_poll::PollPhase::Free)
             || slot.proposals.iter().any(|cell| {
                 cell.phase != crate::joint_admission::ledger::proposal_storage::ProposalPhase::Free
             })
@@ -435,8 +469,22 @@ impl CancellationStorage {
             return None;
         }
         let cell = Arc::get_mut(slot.cell.as_mut()?)?;
-        Some((cell.reset_for_reuse(), slot.parent, slot.generation))
+        Some(ReapPreparation::Cancellation {
+            reset: cell.reset_for_reuse(),
+            parent: slot.parent,
+            generation: slot.generation,
+        })
     }
+}
+
+// A role reset alone never resets the original slot claim or its generation.
+pub(crate) enum ReapPreparation {
+    PollRole,
+    Cancellation {
+        reset: CancellationReset,
+        parent: Option<SlotId>,
+        generation: u64,
+    },
 }
 
 fn free_class_index(class: WorkClass) -> usize {

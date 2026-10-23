@@ -24,7 +24,7 @@ use crate::control_storage::{ControlSlot, ControlStorageConfig};
 /// fixed joint metadata service, not caller-built vectors, task/Waker graphs,
 /// Provider URL input parsing or complete roles. No production activation.
 pub(crate) fn control_storage_base(
-    config: ControlStorageConfig,
+    config: ControlStorageConfig<'_>,
     joint: &JointCapacityConfig,
 ) -> Result<JointResources, WorkError> {
     use crate::control_storage::{
@@ -61,6 +61,11 @@ pub(crate) fn control_storage_base(
             config.slots_per_class.iter().filter(|n| **n != 0).count(),
         )?)
         .ok_or(WorkError::ArithmeticOverflow)?;
+    for role in config.poll_roles {
+        bytes = bytes
+            .checked_add(role.bytes(count)?)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+    }
     // Fixed inventory reserves the original maps' retained roots and one
     // insertion path peak. These are whole-map amounts, counted exactly once.
     for map in [
@@ -97,7 +102,7 @@ impl WorkloadControl {
     /// or public safe-profile API until FirstBind/roles/Provider closure exists.
     pub(crate) fn configure_control_storage(
         &self,
-        config: ControlStorageConfig,
+        config: ControlStorageConfig<'_>,
     ) -> Result<(), WorkError> {
         let count = config.count()?;
         let geometry = {
@@ -234,9 +239,17 @@ impl WorkloadControl {
                     for _ in 0..config.proposals_per_slot {
                         proposals.push(proposal_storage::ProposalCell::new());
                     }
+                    let mut polls = Vec::new();
+                    polls
+                        .try_reserve_exact(config.poll_roles.len())
+                        .map_err(|_| WorkError::Capacity("fixed poll backing inventory"))?;
+                    for &role in config.poll_roles {
+                        polls.push(crate::role_poll::PollBacking::new(role));
+                    }
                     slots.push(ControlSlot {
                         cell: Some(cell),
                         proposals,
+                        polls,
                         class: classes[class],
                         phase: SlotPhase::Free,
                         generation: 0,
@@ -279,6 +292,7 @@ impl WorkloadControl {
                 fixed: true,
                 retired: 0,
                 retired_proposals: 0,
+                retired_polls: 0,
                 free_heads,
                 legacy_vacant: None,
             };

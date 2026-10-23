@@ -472,6 +472,10 @@ impl State {
                 || node.control_queued
                 || node.control_inflight
                 || !node.cancellation_notification.is_idle()
+                || self.cancellations.slots[node.cancellation.0]
+                    .polls
+                    .iter()
+                    .any(|role| role.phase == crate::role_poll::PollPhase::Mounted)
             {
                 return;
             }
@@ -1073,6 +1077,14 @@ impl WorkloadControl {
         self.inner.update(|state| {
             if state.closed {
                 return Err(WorkError::Closed);
+            }
+            if state
+                .cancellations
+                .slots
+                .iter()
+                .any(|slot| slot.polls.iter().any(|role| !role.is_installed()))
+            {
+                return Err(WorkError::NotReady);
             }
             state.ready = true;
             Ok(())
