@@ -18,8 +18,8 @@ PLAN FRAGMENT 1
     PARTITION: UNPARTITIONED
 1:PROJECT [l.payload, r.payload] stats={rows=11212646}
   2:HASH JOIN (BROADCAST, INNER, eq: [r.k = l.k, r.score = l.score]) bcast_verdict=feasible stats={rows=11212646}
-    3:SCAN db_sqlt_53693317611542f0.residual_rng_r (alias=r) stats={rows=20250}
-         TABLE: db_sqlt_53693317611542f0.residual_rng_r
+    3:SCAN ${case_db}.residual_rng_r (alias=r) stats={rows=20250}
+         TABLE: ${case_db}.residual_rng_r
          columns: k, score, payload
          min-max stats
          predicates: CAST(r.score AS Int64) BETWEEN 10 AND 40 AND r.k IS NOT NULL AND r.score IS NOT NULL
@@ -30,8 +30,8 @@ PLAN FRAGMENT 2
   STREAM DATA SINK
     EXCHANGE ID: 4
     PARTITION: BROADCAST
-5:SCAN db_sqlt_53693317611542f0.residual_rng_l (alias=l) stats={rows=8859}
-     TABLE: db_sqlt_53693317611542f0.residual_rng_l
+5:SCAN ${case_db}.residual_rng_l (alias=l) stats={rows=8859}
+     TABLE: ${case_db}.residual_rng_l
      columns: k, score, payload
      min-max stats
      predicates: CAST(l.score AS Int64) BETWEEN 10 AND 40 AND CAST(l.score AS Int64) BETWEEN 10 AND 20 OR CAST(l.score AS Int64) BETWEEN 30 AND 40 AND l.k IS NOT NULL AND l.score IS NOT NULL

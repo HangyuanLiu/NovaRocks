@@ -237,6 +237,17 @@ impl AnalyzeError {
         Self::at(AnalyzeErrorKind::UnsupportedExpression, message, span)
     }
 
+    /// Preserve an owner refusal until its real caller attaches AST context.
+    pub(crate) fn unsupported_expression_without_span(message: impl Into<String>) -> Self {
+        Self {
+            kind: AnalyzeErrorKind::UnsupportedExpression,
+            message: message.into(),
+            span: None,
+            control: None,
+            source: None,
+        }
+    }
+
     pub fn unsupported_query_shape(message: impl Into<String>, span: Span) -> Self {
         Self::at(AnalyzeErrorKind::UnsupportedQueryShape, message, span)
     }
@@ -308,7 +319,10 @@ impl AnalyzeError {
     pub(crate) fn at_type_mismatch(self, span: Span) -> Self {
         if self.control.is_some() {
             self
-        } else if self.kind == AnalyzeErrorKind::UnavailableImplementation {
+        } else if matches!(
+            self.kind,
+            AnalyzeErrorKind::UnavailableImplementation | AnalyzeErrorKind::UnsupportedExpression
+        ) {
             Self {
                 span: Some(span),
                 ..self
@@ -327,7 +341,10 @@ impl AnalyzeError {
     pub(crate) fn at_invalid_argument(self, span: Span) -> Self {
         if self.control.is_some() {
             self
-        } else if self.kind == AnalyzeErrorKind::UnavailableImplementation {
+        } else if matches!(
+            self.kind,
+            AnalyzeErrorKind::UnavailableImplementation | AnalyzeErrorKind::UnsupportedExpression
+        ) {
             Self {
                 span: Some(span),
                 ..self
@@ -420,6 +437,17 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn unsupported_expression_keeps_its_code_through_argument_context() {
+        let error = AnalyzeError::unsupported_expression("unsupported conversion", Span::new(1, 2))
+            .at_type_mismatch(Span::new(7, 8))
+            .at_invalid_argument(Span::new(9, 10));
+        assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
+        assert_eq!(error.code().as_str(), "sql.analyze.unsupported_expression");
+        assert_eq!(error.span(), Some(Span::new(9, 10)));
+        assert!(error.source_failure().is_none());
+    }
 
     #[test]
     fn missing_pure_implementation_keeps_its_own_code_through_argument_context() {

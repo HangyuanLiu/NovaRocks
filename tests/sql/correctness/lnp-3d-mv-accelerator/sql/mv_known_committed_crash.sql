@@ -82,6 +82,7 @@ CALL novarocks_mv_management_status('lnp3d_commit_${uuid0}', 'ns_${uuid0}', 'ord
 SELECT 1;
 
 -- query 6
+-- @cleanup=true
 -- @skip_result_check=true
 SET CATALOG lnp3d_commit_${uuid0};
 USE ns_${uuid0};

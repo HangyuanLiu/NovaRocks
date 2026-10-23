@@ -244,7 +244,17 @@ impl Drop for PendingRecord {
 }
 
 impl OwnedMonitor {
-    pub fn spawn(label: &str, mut request: ManagedCommand, deadline: Instant) -> Result<Self> {
+    pub fn spawn(label: &str, request: ManagedCommand, deadline: Instant) -> Result<Self> {
+        let (mut result, mut ack_read) = Self::spawn_unconfirmed(label, request, deadline)?;
+        result.finish_startup(&mut ack_read, deadline)?;
+        Ok(result)
+    }
+
+    fn spawn_unconfirmed(
+        label: &str,
+        mut request: ManagedCommand,
+        deadline: Instant,
+    ) -> Result<(Self, File)> {
         let absolute = unix::absolute_deadline(deadline)?;
         let lifetime = request
             .lifetime
@@ -315,7 +325,7 @@ impl OwnedMonitor {
             .create_new(true)
             .open(material.path.join("stderr.log"))?;
         let (control_read, control) = unix::fifo_pair(&material.path.join(".control"))?;
-        let (mut ack_read, ack_write) = unix::fifo_pair(&material.path.join(".ack"))?;
+        let (ack_read, ack_write) = unix::fifo_pair(&material.path.join(".ack"))?;
         for file in [
             &stdout,
             &stderr,
@@ -401,7 +411,7 @@ impl OwnedMonitor {
         // Parent only closes shared locked descriptions. It must never unlock.
         drop(record);
         drop(gate);
-        let mut result = Self {
+        let result = Self {
             control: Some(control),
             completion,
             monitor_status: Mutex::new(None),
@@ -411,15 +421,43 @@ impl OwnedMonitor {
             stderr,
             liveness_generation: Mutex::new(Some(0)),
         };
+        Ok((result, ack_read))
+    }
+
+    fn finish_startup(&mut self, ack_read: &mut impl Read, deadline: Instant) -> Result<()> {
+        let mut acknowledged = None;
+        match self.read_startup(ack_read, deadline, &mut acknowledged) {
+            Ok(()) => Ok(()),
+            Err(primary) => {
+                // The original startup verdict is final. Keep both lifelines
+                // until this exact monitor is explicitly settled or cleanup fails.
+                let cleanup_deadline = Instant::now() + std::time::Duration::from_secs(10);
+                match self.settle_startup_failure(ack_read, acknowledged, cleanup_deadline) {
+                    Ok(()) => Err(primary),
+                    Err(secondary) => Err(primary.context(format!(
+                        "monitor startup cleanup also failed: {secondary:#}"
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn read_startup(
+        &mut self,
+        ack_read: &mut impl Read,
+        deadline: Instant,
+        acknowledged: &mut Option<bool>,
+    ) -> Result<()> {
         loop {
             ensure!(
                 Instant::now() < deadline,
                 "monitor startup deadline expired; diagnostics={}",
-                result.material.path.display()
+                self.material.path.display()
             );
             let mut byte = [0u8];
             match ack_read.read(&mut byte) {
                 Ok(1) => {
+                    *acknowledged = Some(byte == *b"R");
                     ensure!(byte == *b"R", "invalid monitor startup acknowledgement");
                     break;
                 }
@@ -428,7 +466,7 @@ impl OwnedMonitor {
                 }
                 _ => {}
             }
-            result.final_record()?;
+            self.final_record()?;
             std::thread::sleep(unix::POLL.min(deadline.saturating_duration_since(Instant::now())));
         }
         let mut pid = [0u8; 4];
@@ -437,7 +475,7 @@ impl OwnedMonitor {
             match ack_read.read(&mut pid[offset..]) {
                 Ok(0) => bail!(
                     "monitor closed startup reply; diagnostics={}",
-                    result.material.path.display()
+                    self.material.path.display()
                 ),
                 Ok(length) => offset += length,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -448,12 +486,75 @@ impl OwnedMonitor {
                 "original deadline expired receiving payload identity"
             );
         }
-        result.pid = u32::from_le_bytes(pid);
+        self.pid = u32::from_le_bytes(pid);
         ensure!(
-            result.pid != 0,
+            self.pid != 0,
             "monitor returned an invalid payload identity"
         );
-        Ok(result)
+        Ok(())
+    }
+
+    fn settle_startup_failure(
+        &mut self,
+        ack_read: &mut impl Read,
+        mut acknowledged: Option<bool>,
+        deadline: Instant,
+    ) -> Result<()> {
+        let mut failures = Vec::new();
+        if acknowledged == Some(false) {
+            failures.push("invalid startup acknowledgement cannot be resumed".into());
+        }
+        while acknowledged != Some(false) {
+            // Final publication alone does not consume the actual wait result.
+            match self.poll_monitor() {
+                Ok(Some(_)) => break,
+                Ok(None) => {}
+                Err(error) => {
+                    failures.push(format!("observe startup monitor completion: {error:#}"));
+                    break;
+                }
+            }
+            if acknowledged == Some(true) {
+                // R proves that the monitor's initial control read has passed.
+                // PID bytes may already have been partly consumed: never reread R.
+                if let Err(error) = self.send_until(b'K', deadline) {
+                    failures.push(format!("explicit startup cleanup control: {error:#}"));
+                }
+                break;
+            }
+            if Instant::now() >= deadline {
+                failures.push("cleanup deadline expired awaiting startup acknowledgement".into());
+                break;
+            }
+            let mut byte = [0u8];
+            match ack_read.read(&mut byte) {
+                Ok(1) if byte == *b"R" => acknowledged = Some(true),
+                Ok(1) => {
+                    failures.push("invalid monitor startup acknowledgement during cleanup".into());
+                    break;
+                }
+                Ok(0) => break,
+                Ok(_) => unreachable!("one-byte acknowledgement read"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(
+                        unix::POLL.min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+                Err(error) => {
+                    failures.push(format!(
+                        "read startup acknowledgement during cleanup: {error}"
+                    ));
+                    break;
+                }
+            }
+        }
+        // Even a failed control/write/read must still consume the actual waiter
+        // completion. wait() also preserves startup/Final/cleanup failures.
+        if let Err(error) = self.wait(deadline) {
+            failures.push(format!("actually settle startup monitor: {error:#}"));
+        }
+        ensure!(failures.is_empty(), "{}", failures.join("; "));
+        Ok(())
     }
 
     pub fn close_control(&mut self) {
@@ -794,6 +895,131 @@ mod tests {
             },
             completion,
         )
+    }
+
+    #[test]
+    fn partial_startup_pid_timeout_keeps_the_owner_until_kill_and_actual_wait() {
+        struct ExpireDuringPid<'a> {
+            inner: &'a mut File,
+            deadline: Instant,
+            acknowledged: bool,
+            pid_bytes: usize,
+        }
+        impl Read for ExpireDuringPid<'_> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                let limit = if self.acknowledged { 1 } else { bytes.len() };
+                let length = self.inner.read(&mut bytes[..limit])?;
+                if length != 0 {
+                    if self.acknowledged {
+                        self.pid_bytes += length;
+                        // Force the actual original clock to expire in the PID
+                        // read, after R and one real PID byte were consumed.
+                        while Instant::now() < self.deadline {
+                            std::thread::sleep(
+                                unix::POLL
+                                    .min(self.deadline.saturating_duration_since(Instant::now())),
+                            );
+                        }
+                    } else {
+                        assert_eq!(bytes, b"R");
+                        self.acknowledged = true;
+                    }
+                }
+                Ok(length)
+            }
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let mut command = ManagedCommand::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let (mut monitor, mut ack) =
+            OwnedMonitor::spawn_unconfirmed("partial startup PID timeout", command, deadline)
+                .unwrap();
+        let mut reader = ExpireDuringPid {
+            inner: &mut ack,
+            deadline,
+            acknowledged: false,
+            pid_bytes: 0,
+        };
+        let error = monitor.finish_startup(&mut reader, deadline).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "original deadline expired receiving payload identity"
+        );
+        assert!(reader.acknowledged);
+        assert_eq!(reader.pid_bytes, 1);
+        assert!(monitor.monitor_status.lock().unwrap().unwrap().success());
+        let final_record = monitor.final_record().unwrap().unwrap();
+        assert_eq!(final_record.status.signal(), Some(9));
+        assert!(!final_record.owner_lost);
+        assert!(final_record.cleanup_complete);
+        assert!(final_record.errors.is_empty());
+    }
+
+    #[test]
+    fn invalid_startup_ack_is_not_reread_as_a_later_r_byte() {
+        let root = std::env::temp_dir().join(format!(
+            "nr-startup-invalid-ack-{}",
+            run_retention::unique()
+        ));
+        let (mut monitor, completion) = monitor_fixture(&root);
+        let final_frame = serde_json::json!({
+            "schema":1, "event":"Final", "status_raw":0,
+            "owner_lost":false, "cleanup_complete":true, "errors":[]
+        });
+        OpenOptions::new()
+            .append(true)
+            .open(root.join("record.jsonl"))
+            .unwrap()
+            .write_all(format!("{final_frame}\n").as_bytes())
+            .unwrap();
+        completion.send(Ok(ExitStatus::from_raw(0))).unwrap();
+        let mut reader = std::io::Cursor::new(vec![b'X', b'R']);
+        let error = monitor
+            .finish_startup(
+                &mut reader,
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("invalid monitor startup acknowledgement"));
+        assert!(message.contains("invalid startup acknowledgement cannot be resumed"));
+        assert_eq!(reader.position(), 1, "the later R is not a fresh ACK");
+        assert!(monitor.monitor_status.lock().unwrap().unwrap().success());
+        // Completion is already available: this fixture checks reply position,
+        // original errors and actual wait; the real-monitor test checks killing.
+        drop(monitor);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_startup_final_still_consumes_wait_and_preserves_primary_and_secondary() {
+        let root =
+            std::env::temp_dir().join(format!("nr-startup-final-wait-{}", run_retention::unique()));
+        let (mut monitor, completion) = monitor_fixture(&root);
+        let final_frame = serde_json::json!({
+            "schema":1, "event":"Final", "status_raw":null,
+            "startup_error":"original startup refused",
+            "owner_lost":true, "cleanup_complete":true, "errors":[]
+        });
+        OpenOptions::new()
+            .append(true)
+            .open(root.join("record.jsonl"))
+            .unwrap()
+            .write_all(format!("{final_frame}\n").as_bytes())
+            .unwrap();
+        completion.send(Ok(ExitStatus::from_raw(256))).unwrap();
+        let error = monitor
+            .finish_startup(&mut std::io::empty(), Instant::now())
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("monitor startup deadline expired"),
+            "{message}"
+        );
+        assert!(message.contains("original startup refused"), "{message}");
+        assert!(monitor.monitor_status.lock().unwrap().is_some());
+        drop(monitor);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

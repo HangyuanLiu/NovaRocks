@@ -10,7 +10,7 @@ PLAN FRAGMENT 1
     EXCHANGE ID: 0
     PARTITION: UNPARTITIONED
 1:PROJECT [payload] stats={rows=3}
-  2:SCAN db_sqlt_58b5d8781cba9ab9.misleading_sales_fact_dim_lineitem stats={rows=3}
-       TABLE: db_sqlt_58b5d8781cba9ab9.misleading_sales_fact_dim_lineitem
+  2:SCAN ${case_db}.misleading_sales_fact_dim_lineitem stats={rows=3}
+       TABLE: ${case_db}.misleading_sales_fact_dim_lineitem
        columns: payload
        min-max stats

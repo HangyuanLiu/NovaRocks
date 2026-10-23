@@ -71,6 +71,30 @@ class Classification(unittest.TestCase):
         self.records[-1]['exit_code']=1
         self.assertEqual(self.evaluate()['status'],'FAIL')
 
+    def test_prelaunch_failure_preserves_selected_but_unexecuted_cases(self):
+        self.records = [record for record in self.records
+                        if record['kind'] not in ('case', 'suite')]
+        self.records[2]['cleanup']['status'] = 'not_launched'
+        self.records[-1].update(exit_code=1, totals={'pass':0, 'fail':0, 'not_run':0})
+        result = self.evaluate()
+        self.assertEqual(result['status'], 'FAIL')
+        self.assertEqual({row['unit'] for row in result['rows']},
+                         {'sql-case:s/a', 'sql-case:s/b'})
+        self.assertTrue(all(row['status'] == 'NOT_RUN' for row in result['rows']))
+        self.assertTrue(all(not row['native_failure'] for row in result['rows']))
+        self.assertFalse(result['composition']['layer_ok'])
+        self.assertTrue(all(row['category'] == 'coverage_gap'
+                            for scope in result['composition']['scopes']
+                            for row in scope['observations']))
+        self.quarantine_a()
+        other = copy.deepcopy(self.dispositions['quarantine'][0])
+        other['unit'] = 'sql-case:s/b'
+        self.dispositions['quarantine'].append(other)
+        admitted = self.evaluate(True)
+        self.assertEqual(admitted['status'], 'FAIL')
+        self.assertTrue(all(row['raw_status'] == 'NOT_RUN' for row in admitted['rows']))
+        self.assertTrue(all(not row['native_failure'] for row in admitted['rows']))
+
     def test_quarantine_changes_only_admission_membership(self):
         self.fail_a(); self.quarantine_a()
         self.assertEqual(self.evaluate()['status'],'FAIL')

@@ -32,8 +32,8 @@ PLAN FRAGMENT 2
   STREAM DATA SINK
     EXCHANGE ID: 5
     PARTITION: HASH_PARTITIONED (p.k)
-7:SCAN db_sqlt_6b466982162196fa.pir8_rf_probe (alias=p) stats={rows=4}
-     TABLE: db_sqlt_6b466982162196fa.pir8_rf_probe
+7:SCAN ${case_db}.pir8_rf_probe (alias=p) stats={rows=4}
+     TABLE: ${case_db}.pir8_rf_probe
      columns: k
      min-max stats
      predicates: p.k IS NOT NULL
@@ -43,8 +43,8 @@ PLAN FRAGMENT 3
   STREAM DATA SINK
     EXCHANGE ID: 6
     PARTITION: HASH_PARTITIONED (b.k)
-8:SCAN db_sqlt_6b466982162196fa.pir8_rf_build (alias=b) stats={rows=4}
-     TABLE: db_sqlt_6b466982162196fa.pir8_rf_build
+8:SCAN ${case_db}.pir8_rf_build (alias=b) stats={rows=4}
+     TABLE: ${case_db}.pir8_rf_build
      columns: k
      min-max stats
      predicates: b.k IS NOT NULL

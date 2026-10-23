@@ -324,6 +324,8 @@ impl LogicalRewriteRule for RewriteTopLevelUnionDeltaRule {
                         union.output_columns.len()
                     ));
                 }
+                let branch_id = i32::try_from(idx)
+                    .map_err(|_| "Iceberg IMV branch ID exceeds its Int32 carrier".to_string())?;
                 let marked = mark_delta_scan(branch, action_column)?;
                 rewritten_inputs.push(normalize_top_level_union_branch_output(
                     marked,
@@ -331,7 +333,7 @@ impl LogicalRewriteRule for RewriteTopLevelUnionDeltaRule {
                     &branch_output_columns,
                     &action_output,
                     &branch_output,
-                    idx,
+                    branch_id,
                 ));
             }
 
@@ -370,7 +372,7 @@ fn normalize_top_level_union_branch_output(
     branch_visible_output: &[crate::analysis::OutputColumn],
     action_output: &crate::analysis::OutputColumn,
     branch_output: &crate::analysis::OutputColumn,
-    branch_idx: usize,
+    branch_id: i32,
 ) -> LogicalPlanNode {
     let mut items = union_visible_output
         .iter()
@@ -402,22 +404,10 @@ fn normalize_top_level_union_branch_output(
     });
     items.push(ProjectItem {
         expr: crate::analysis::TypedExpr {
-            kind: crate::analysis::ExprKind::Cast {
-                expr: Box::new(crate::analysis::TypedExpr {
-                    kind: crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Int(
-                        branch_idx as i64,
-                    )),
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        arrow::datatypes::DataType::Int64,
-                        false,
-                    ),
-                }),
-                target: arrow::datatypes::DataType::Int32,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: (branch_output.value_type.clone())
-                .with_nullable(false)
-                .expect("valid value root nullability transform"),
+            kind: crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Int(
+                i64::from(branch_id),
+            )),
+            value_type: branch_output.value_type.clone(),
         },
         output_name: branch_output.name.clone(),
         output_column_id: branch_output.column_id,
@@ -1054,16 +1044,25 @@ mod tests {
         assert_eq!(branch.output_column_id, branch_column);
         assert_eq!(branch.expr.value_type.data_type().clone(), DataType::Int32);
         assert!(!branch.expr.value_type.nullable());
-        assert!(matches!(
-            &branch.expr.kind,
-            ExprKind::Cast { expr, target , .. }
-                if *target == DataType::Int32
-                    && matches!(
-                        &expr.kind,
-                        ExprKind::Literal(LiteralValue::Int(value))
-                            if *value == expected_branch_id
-                    )
-        ));
+        let ExprKind::Literal(value) = &branch.expr.kind else {
+            panic!("branch identity must be an exact typed constant");
+        };
+        let constant = crate::constant::admit_syntax_constant(
+            value,
+            &branch.expr.value_type,
+            ScalarArena::new().constant_policy(),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .expect("branch identity must admit its declared carrier");
+        let array = constant
+            .pool()
+            .array()
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .expect("branch identity must have real Int32 backing");
+        assert_eq!(array.values().as_ref(), &[expected_branch_id as i32]);
+        assert_eq!(arrow::array::Array::null_count(array), 0);
+        assert_eq!(constant.value_type(), &branch.expr.value_type);
 
         assert!(
             contains_non_root_delta(plan.unary_input(), action_column),

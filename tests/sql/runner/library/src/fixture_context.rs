@@ -893,7 +893,96 @@ fn replace_references(text: &str, mapping: &BTreeMap<String, String>) -> String 
     }
     text
 }
+fn namespace_observation_references(
+    sql: &str,
+) -> (BTreeMap<usize, (usize, String)>, BTreeMap<usize, usize>) {
+    use novarocks_parser::ast::{
+        LiteralKind, MaintenanceStatement, MaintenanceValue, MaterializedViewStatement,
+        ProcedureArgumentMode, Statement,
+    };
+    let mut namespaces = BTreeMap::new();
+    let mut protected = BTreeMap::new();
+    let masked = crate::catalog_symbol::sql_source(sql);
+    let Ok(ranges) = crate::catalog_symbol::ranges(&masked) else {
+        return (namespaces, protected);
+    };
+    for range in ranges {
+        let Ok(statements) = novarocks_parser::parse(&masked[range.clone()]) else {
+            continue;
+        };
+        for statement in statements {
+            if let Statement::Maintenance(MaintenanceStatement::Call(call)) = &statement {
+                if call.procedure.parts.last().is_some_and(|part| {
+                    part.value
+                        .eq_ignore_ascii_case("novarocks_mv_management_status")
+                }) {
+                    let supported = call.procedure.parts.len() == 1
+                        && call.argument_mode == ProcedureArgumentMode::Positional
+                        && call.arguments.len() == 3
+                        && call.arguments.iter().all(|argument| {
+                            argument.name.is_none()
+                                && matches!(
+                                    &argument.value,
+                                    MaintenanceValue::Literal(literal)
+                                        if matches!(&literal.kind, LiteralKind::String(_))
+                                )
+                        });
+                    for part in &call.procedure.parts {
+                        protected.insert(
+                            range.start + part.span.start(),
+                            range.start + part.span.end(),
+                        );
+                    }
+                    for (index, argument) in call.arguments.iter().enumerate() {
+                        let span = argument.value.span();
+                        let start = range.start + span.start();
+                        let end = range.start + span.end();
+                        if supported
+                            && index == 1
+                            && let MaintenanceValue::Literal(literal) = &argument.value
+                            && let LiteralKind::String(value) = &literal.kind
+                        {
+                            namespaces.insert(start, (end, value.clone()));
+                        } else {
+                            protected.insert(start, end);
+                        }
+                    }
+                }
+                continue;
+            }
+            let (name, qualified) = match &statement {
+                Statement::Maintenance(MaintenanceStatement::ShowOptimize(show)) => {
+                    (show.from.as_ref(), true)
+                }
+                Statement::MaterializedView(MaterializedViewStatement::Show(show)) => {
+                    (show.database.as_ref(), false)
+                }
+                _ => continue,
+            };
+            let Some(name) = name else { continue };
+            let namespace = match name.parts.as_slice() {
+                [database] => Some(database),
+                [_, database] if qualified => Some(database),
+                _ => None,
+            };
+            for part in &name.parts {
+                let start = range.start + part.span.start();
+                let end = range.start + part.span.end();
+                if namespace.is_some_and(|database| database.span == part.span) {
+                    namespaces.insert(start, (end, part.value.clone()));
+                } else {
+                    // Catalog slots and unsupported SHOW arities are never
+                    // guessed to be namespace-qualified table references.
+                    protected.insert(start, end);
+                }
+            }
+        }
+    }
+    (namespaces, protected)
+}
+
 fn rewrite_sql_identifiers(line: &str, mapping: &BTreeMap<String, String>) -> String {
+    let (observed_namespaces, protected_observations) = namespace_observation_references(line);
     let mut result = String::new();
     let bytes = line.as_bytes();
     let mut i = 0;
@@ -901,6 +990,29 @@ fn rewrite_sql_identifiers(line: &str, mapping: &BTreeMap<String, String>) -> St
     let mut previous = String::new();
     let mut last_word = String::new();
     while i < bytes.len() {
+        if let Some((end, name)) = observed_namespaces.get(&i) {
+            if let Some(new) = mapping.get(name) {
+                let quote = matches!(bytes[i], b'\'' | b'`' | b'"').then_some(bytes[i] as char);
+                if let Some(quote) = quote {
+                    result.push(quote);
+                    result.push_str(&new.replace(quote, &format!("{quote}{quote}")));
+                } else {
+                    result.push_str(new);
+                }
+                if let Some(quote) = quote {
+                    result.push(quote);
+                }
+            } else {
+                result.push_str(&line[i..*end]);
+            }
+            i = *end;
+            continue;
+        }
+        if let Some(end) = protected_observations.get(&i) {
+            result.push_str(&line[i..*end]);
+            i = *end;
+            continue;
+        }
         if bytes[i..].starts_with(b"--") {
             let end = line[i..].find('\n').map_or(bytes.len(), |n| i + n + 1);
             result.push_str(&line[i..end]);
@@ -1048,6 +1160,140 @@ pub(crate) fn test_variables(cases: &[&str]) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_mv_management_status_cases_use_the_owned_namespace() {
+        for (case, source, catalog) in [
+            (
+                "mv_atomic_repartition",
+                include_str!(
+                    "../../../correctness/lnp-3d-mv-accelerator/sql/mv_atomic_repartition.sql"
+                ),
+                "lnp3d_repart",
+            ),
+            (
+                "mv_retain_restart",
+                include_str!(
+                    "../../../correctness/lnp-3d-mv-accelerator/sql/mv_retain_restart.sql"
+                ),
+                "lnp3d_retain",
+            ),
+        ] {
+            let vars =
+                crate::config::case_placeholder_variables(&test_variables(&[case]), case).unwrap();
+            let rendered = render_expected(source, &vars);
+            let old = format!("ns_{}", vars["uuid0"]);
+            let map = namespace_mapping(&rendered, &vars).unwrap();
+            let expected = &map[&old];
+            let rewritten = rewrite_namespaces(&rendered, &vars).unwrap();
+            assert!(rewritten.contains(&format!(
+                "'{catalog}_{}', '{expected}', 'orders_mv'",
+                vars["uuid0"]
+            )));
+            assert!(!rewritten.contains(&format!("'{old}', 'orders_mv'")));
+            assert!(rewritten.contains(&format!(".{expected}.")));
+        }
+    }
+
+    #[test]
+    fn management_status_rewrites_only_its_positional_namespace_literal() {
+        let mapping = BTreeMap::from([("owned".into(), "mapped'namespace".into())]);
+        let sql = "CALL NoVaRocks_Mv_Management_Status('owned', 'owned', 'owned');";
+        assert_eq!(
+            rewrite_sql_identifiers(sql, &mapping),
+            "CALL NoVaRocks_Mv_Management_Status('owned', 'mapped''namespace', 'owned');"
+        );
+        for unchanged in [
+            "CALL novarocks_mv_management_status(catalog => 'owned', namespace => 'owned', table => 'owned');",
+            "CALL novarocks_mv_management_status('owned', 'owned');",
+            "CALL novarocks_mv_management_status('owned', 'owned', 'owned', 'owned');",
+            "CALL owned.novarocks_mv_management_status('owned', 'owned', 'owned');",
+            "CALL novarocks_mv_management_status('owned', 'owned', 1);",
+            "CALL other_procedure('owned', 'owned', 'owned');",
+            "SELECT 'owned', 'novarocks_mv_management_status', 'CALL other_procedure(owned)';",
+            "-- CALL novarocks_mv_management_status('owned', 'owned', 'owned');\nSELECT 1;",
+        ] {
+            assert_eq!(rewrite_sql_identifiers(unchanged, &mapping), unchanged);
+        }
+        let escaped = BTreeMap::from([("old'namespace".into(), "new'namespace".into())]);
+        assert_eq!(
+            rewrite_sql_identifiers(
+                "CALL novarocks_mv_management_status('old''namespace', 'old''namespace', 'old''namespace');",
+                &escaped,
+            ),
+            "CALL novarocks_mv_management_status('old''namespace', 'new''namespace', 'old''namespace');"
+        );
+    }
+
+    #[test]
+    fn native_lake_and_mv_show_cases_use_the_owned_namespace() {
+        for (case, source, show) in [
+            (
+                "iru5_read_dependency_conflict",
+                include_str!(
+                    "../../../correctness/lake-publication/sql/iru5_read_dependency_conflict.sql"
+                ),
+                "SHOW ALTER TABLE OPTIMIZE FROM lake_publication_${suite_uuid0}.",
+            ),
+            (
+                "mv_catalog_isolation",
+                include_str!(
+                    "../../../correctness/lnp-3d-mv-accelerator/sql/mv_catalog_isolation.sql"
+                ),
+                "SHOW MATERIALIZED VIEWS FROM ",
+            ),
+        ] {
+            let vars =
+                crate::config::case_placeholder_variables(&test_variables(&[case]), case).unwrap();
+            let rendered = render_expected(source, &vars);
+            let old = format!("ns_{}", vars["uuid0"]);
+            let map = namespace_mapping(&rendered, &vars).unwrap();
+            let expected = &map[&old];
+            let rewritten = rewrite_namespaces(&rendered, &vars).unwrap();
+            let show = render_expected(show, &vars);
+            assert!(rewritten.contains(&format!("{show}{expected}")));
+            assert!(!rewritten.contains(&format!("{show}{old}")));
+            assert!(rewritten.contains(&format!(".{expected}.")));
+        }
+    }
+
+    #[test]
+    fn show_namespace_slots_preserve_catalogs_literals_and_rejected_shapes() {
+        let vars =
+            crate::config::case_placeholder_variables(&test_variables(&["case"]), "case").unwrap();
+        let source = "CREATE DATABASE owned.owned;\n\
+            SHOW ALTER TABLE OPTIMIZE FROM `owned`.`owned` WHERE TableName = 'owned';\n\
+            SHOW ALTER TABLE OPTIMIZE FROM owned;\n\
+            SHOW MATERIALIZED VIEWS FROM `owned`;\n\
+            SHOW MATERIALIZED VIEWS FROM owned.owned;\n\
+            SHOW ALTER TABLE OPTIMIZE FROM owned.owned.owned;\n\
+            SELECT owned, 'owned', 'SHOW MATERIALIZED VIEWS FROM owned' FROM ordinary;\n\
+            SELECT * FROM owned.t;\n\
+            SELECT * FROM external.owned;\n\
+            -- SHOW ALTER TABLE OPTIMIZE FROM owned.owned\n";
+        let map = namespace_mapping(source, &vars).unwrap();
+        let expected = &map["owned"];
+        let rewritten = rewrite_namespaces(source, &vars).unwrap();
+        for expected_text in [
+            format!(
+                "SHOW ALTER TABLE OPTIMIZE FROM `owned`.`{expected}` WHERE TableName = 'owned'"
+            ),
+            format!("SHOW ALTER TABLE OPTIMIZE FROM {expected};"),
+            format!("SHOW MATERIALIZED VIEWS FROM `{expected}`;"),
+            format!("SELECT * FROM {expected}.t;"),
+        ] {
+            assert!(rewritten.contains(&expected_text), "{rewritten}");
+        }
+        for unchanged in [
+            "SHOW MATERIALIZED VIEWS FROM owned.owned;",
+            "SHOW ALTER TABLE OPTIMIZE FROM owned.owned.owned;",
+            "SELECT owned, 'owned', 'SHOW MATERIALIZED VIEWS FROM owned' FROM ordinary;",
+            "SELECT * FROM external.owned;",
+            "-- SHOW ALTER TABLE OPTIMIZE FROM owned.owned",
+        ] {
+            assert!(rewritten.contains(unchanged), "{rewritten}");
+        }
+    }
+
     #[test]
     fn exact_hms_pair_and_trino_writer_bind_references_without_new_observer_ownership() {
         let mut vars =

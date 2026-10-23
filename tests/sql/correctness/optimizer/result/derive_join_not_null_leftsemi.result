@@ -15,8 +15,8 @@ PLAN FRAGMENT 1
     PARTITION: UNPARTITIONED
 1:PROJECT [l.v] stats={rows=2000}
   2:HASH JOIN (BROADCAST, LEFT SEMI, eq: [l.k = r.k]) bcast_verdict=feasible stats={rows=2000}
-    3:SCAN db_sqlt_7cd7263e7b7b29cb.t_dnn_sl (alias=l) stats={rows=2000}
-         TABLE: db_sqlt_7cd7263e7b7b29cb.t_dnn_sl
+    3:SCAN ${case_db}.t_dnn_sl (alias=l) stats={rows=2000}
+         TABLE: ${case_db}.t_dnn_sl
          columns: k, v
          min-max stats
     4:BROADCAST EXCHANGE stats={rows=166}
@@ -26,8 +26,8 @@ PLAN FRAGMENT 2
   STREAM DATA SINK
     EXCHANGE ID: 4
     PARTITION: BROADCAST
-5:SCAN db_sqlt_7cd7263e7b7b29cb.t_dnn_sr (alias=r) stats={rows=166}
-     TABLE: db_sqlt_7cd7263e7b7b29cb.t_dnn_sr
+5:SCAN ${case_db}.t_dnn_sr (alias=r) stats={rows=166}
+     TABLE: ${case_db}.t_dnn_sr
      columns: k
      min-max stats
      predicates: r.k IS NOT NULL

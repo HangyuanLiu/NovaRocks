@@ -121,6 +121,7 @@ SELECT k1, v1 FROM lnp3d_runtime_${uuid0}.ns_${uuid0}.orders_mv ORDER BY k1;
 -- query 10
 -- DROP is the final same-target mutation owner.  It must run after the fresh
 -- refresh and leave no process-local gate/runtime state to carry elsewhere.
+-- @cleanup=true
 -- @skip_result_check=true
 SET CATALOG lnp3d_runtime_${uuid0};
 USE ns_${uuid0};

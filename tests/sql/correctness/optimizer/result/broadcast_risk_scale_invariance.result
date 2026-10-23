@@ -24,8 +24,8 @@ PLAN FRAGMENT 1
 3:HASH AGGREGATE (LOCAL) stats={rows=1}
   aggregations: count()
   4:HASH JOIN (BROADCAST, INNER, eq: [p.k = b.k]) bcast_verdict=feasible stats={rows=9000}
-    5:SCAN db_sqlt_91feb4643b0e4106.probe_1x (alias=p) stats={rows=90000}
-         TABLE: db_sqlt_91feb4643b0e4106.probe_1x
+    5:SCAN ${case_db}.probe_1x (alias=p) stats={rows=90000}
+         TABLE: ${case_db}.probe_1x
          columns: k
          min-max stats
          predicates: p.k IS NOT NULL
@@ -36,8 +36,8 @@ PLAN FRAGMENT 2
   STREAM DATA SINK
     EXCHANGE ID: 6
     PARTITION: BROADCAST
-7:SCAN db_sqlt_91feb4643b0e4106.build_1x (alias=b) stats={rows=9000}
-     TABLE: db_sqlt_91feb4643b0e4106.build_1x
+7:SCAN ${case_db}.build_1x (alias=b) stats={rows=9000}
+     TABLE: ${case_db}.build_1x
      columns: k
      min-max stats
      predicates: b.k IS NOT NULL
@@ -68,8 +68,8 @@ PLAN FRAGMENT 1
 3:HASH AGGREGATE (LOCAL) stats={rows=1}
   aggregations: count()
   4:HASH JOIN (BROADCAST, INNER, eq: [p.k = b.k]) bcast_verdict=feasible stats={rows=90000}
-    5:SCAN db_sqlt_91feb4643b0e4106.probe_10x (alias=p) stats={rows=900000}
-         TABLE: db_sqlt_91feb4643b0e4106.probe_10x
+    5:SCAN ${case_db}.probe_10x (alias=p) stats={rows=900000}
+         TABLE: ${case_db}.probe_10x
          columns: k
          min-max stats
          predicates: p.k IS NOT NULL
@@ -80,8 +80,8 @@ PLAN FRAGMENT 2
   STREAM DATA SINK
     EXCHANGE ID: 6
     PARTITION: BROADCAST
-7:SCAN db_sqlt_91feb4643b0e4106.build_10x (alias=b) stats={rows=90000}
-     TABLE: db_sqlt_91feb4643b0e4106.build_10x
+7:SCAN ${case_db}.build_10x (alias=b) stats={rows=90000}
+     TABLE: ${case_db}.build_10x
      columns: k
      min-max stats
      predicates: b.k IS NOT NULL

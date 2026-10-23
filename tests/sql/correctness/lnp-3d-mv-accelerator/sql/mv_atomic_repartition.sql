@@ -122,6 +122,7 @@ FROM lnp3d_repart_${uuid0}.ns_${uuid0}.orders_mv
 ORDER BY k1;
 
 -- query 9
+-- @cleanup=true
 -- @skip_result_check=true
 SET CATALOG lnp3d_repart_${uuid0};
 USE ns_${uuid0};

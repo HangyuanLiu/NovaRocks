@@ -30,8 +30,8 @@ PLAN FRAGMENT 2
     PARTITION: HASH_PARTITIONED (a.k)
 8:HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=100}
   aggregations: sum(a.v)
-  9:SCAN db_sqlt_437af06dfdaad5eb.t_agg_pd_lo_a (alias=a) stats={rows=20000}
-       TABLE: db_sqlt_437af06dfdaad5eb.t_agg_pd_lo_a
+  9:SCAN ${case_db}.t_agg_pd_lo_a (alias=a) stats={rows=20000}
+       TABLE: ${case_db}.t_agg_pd_lo_a
        columns: k, v
        min-max stats
 PLAN FRAGMENT 3
@@ -40,7 +40,7 @@ PLAN FRAGMENT 3
   STREAM DATA SINK
     EXCHANGE ID: 5
     PARTITION: HASH_PARTITIONED (b.k)
-10:SCAN db_sqlt_437af06dfdaad5eb.t_agg_pd_lo_b (alias=b) stats={rows=50}
-     TABLE: db_sqlt_437af06dfdaad5eb.t_agg_pd_lo_b
+10:SCAN ${case_db}.t_agg_pd_lo_b (alias=b) stats={rows=50}
+     TABLE: ${case_db}.t_agg_pd_lo_b
      columns: k
      min-max stats

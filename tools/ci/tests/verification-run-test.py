@@ -177,6 +177,33 @@ class Run(unittest.TestCase):
         native=run.owned_attempt(attempt,[regular])
         self.assertTrue(any(obs.unit==regular.units[0] and obs.result=='pass' for obs in native.observations))
 
+    def test_sql_dataset_launch_uses_native_prepared_fact_without_changing_regular_or_scope(self):
+        self.native['receipt']['novarocks-sql-test']={'path':sys.executable}
+        prepared={'dataset':'ssb','scale':'1'}
+        for label,fact,heavy in [('regular',None,None),('cost-heavy',None,{'reason':'cost'}),
+                                 ('dataset',prepared,{'reason':'dataset'})]:
+            declaration={'name':'fixture-suite','prepared_dataset':fact,'heavy':heavy,
+                         'reuse':{'scope':'suite','env_inputs':[]}}
+            selected=[self.scope('sql-case','fixture-suite/first'),
+                      self.scope('sql-case','fixture-suite/second')]
+            with self.subTest(label=label),mock.patch.dict(os.environ,{'NOVAROCKS_SQL_TEST_CONFIG':'fixture.toml'}),mock.patch.object(run,'invoke',return_value=0) as invoked:
+                value,_,_=run.execute(self.repo,self.base/label,self.native,
+                    dict(self.chosen,sql_suites=[declaration]),selected)
+            invoked.assert_called_once()
+            argv=invoked.call_args[0][5]
+            if fact is not None:
+                self.assertEqual(argv[-2:],['--cluster-launch-profile','performance'])
+                self.assertEqual(argv.count('--cluster-launch-profile'),1)
+            else:
+                self.assertNotIn('--cluster-launch-profile',argv)
+            self.assertEqual(argv[argv.index('--suite')+1],'fixture-suite')
+            self.assertEqual(argv[argv.index('--cluster-mode')+1],'cross-process')
+            self.assertEqual(argv[argv.index('--cluster-size')+1],'3')
+            self.assertNotIn('--only',argv)
+            self.assertNotIn('--query-timeout',argv)
+            self.assertEqual(invoked.call_args[0][4],[unit for scope in selected for unit in scope.units])
+            self.assertFalse(value['layer_ok'],'mocked command exit is not native positive evidence')
+
     def test_doctest_only_gap_does_not_secretly_rerun_satisfied_tests(self):
         doc=self.scope('rust-doctest','workspace')
         with mock.patch.object(run,'_rust_batch') as batch:
