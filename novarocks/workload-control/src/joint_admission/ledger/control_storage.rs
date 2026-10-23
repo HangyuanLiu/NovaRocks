@@ -271,6 +271,7 @@ impl WorkloadControl {
                     claims.insert(
                         claim,
                         ClaimRecord {
+                            custody: ClaimCustody::Raw,
                             owner: ClaimOwner::ControlSlot(id),
                             facts: Arc::clone(&facts),
                             amounts: base,

@@ -28,9 +28,10 @@ mod protection;
 
 pub use driver::{JointProgress, JointProgressDriver};
 pub use ledger::{
-    ControlBindingProposal, JointAdjustmentReceipt, JointAdmission, JointAdmissionFailure,
-    JointAdmissionHandle, JointClaim, JointClaimView, JointGrantedBatch, JointGrantedClaims,
-    JointLocalGrant, JointLocalOffer, JointProposal,
+    ControlBindingProposal, InternalComputationAlias, InternalComputationGrant,
+    JointAdjustmentReceipt, JointAdmission, JointAdmissionFailure, JointAdmissionHandle,
+    JointClaim, JointClaimView, JointGrantedBatch, JointGrantedClaims, JointLocalGrant,
+    JointLocalOffer, JointProposal, RetainedPayloadAlias, RetainedPayloadGrant,
 };
 #[cfg(test)]
 pub use ledger::{JointClaimChange, JointDependency};

@@ -33,6 +33,11 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+mod typed_custody;
+use typed_custody::ClaimCustody;
+pub use typed_custody::{
+    InternalComputationAlias, InternalComputationGrant, RetainedPayloadAlias, RetainedPayloadGrant,
+};
 mod control_binding;
 pub use control_binding::ControlBindingProposal;
 use control_binding::{validate_active_control_node, validate_control_binding_shape};
@@ -116,6 +121,7 @@ pub(crate) enum ClaimOwner {
 }
 
 pub(super) struct ClaimRecord {
+    custody: ClaimCustody,
     pub(super) owner: ClaimOwner,
     /// Charged proposal, including any not-yet-installed delta and DI union.
     pub(super) facts: Arc<ProfileFacts>,
@@ -830,7 +836,8 @@ impl JointClaimChange {
     }
 }
 fn authenticate(record: &ClaimRecord, source: &JointClaimView) -> Result<(), WorkError> {
-    if record.structure_revision != source.structure_revision
+    if !record.custody.is_raw()
+        || record.structure_revision != source.structure_revision
         || record.release_revision != source.release_revision
     {
         return Err(WorkError::Conflict);
@@ -1057,7 +1064,7 @@ impl JointClaim {
             .as_ref()
             .and_then(|l| l.claims.get(&id))
             .ok_or(WorkError::Released)?;
-        if !matches!(record.owner, ClaimOwner::PhysicalWork(_)) {
+        if !record.custody.is_raw() || !matches!(record.owner, ClaimOwner::PhysicalWork(_)) {
             return Err(WorkError::Conflict);
         }
         Ok(JointClaimView {
@@ -1078,7 +1085,7 @@ impl JointClaim {
             .and_then(|l| l.claims.get(&id))
             .ok_or(WorkError::Released)
             .and_then(|record| {
-                if matches!(record.owner, ClaimOwner::PhysicalWork(_)) {
+                if record.custody.is_raw() && matches!(record.owner, ClaimOwner::PhysicalWork(_)) {
                     Ok(record.active_amounts)
                 } else {
                     Err(WorkError::Conflict)
@@ -1092,7 +1099,7 @@ impl JointClaim {
         self.inner.update(|state| {
             let ledger = state.joint.as_mut().ok_or(WorkError::NotReady)?;
             let record = ledger.claims.get_mut(&id).ok_or(WorkError::Released)?;
-            if !matches!(record.owner, ClaimOwner::PhysicalWork(_)) {
+            if !record.custody.is_raw() || !matches!(record.owner, ClaimOwner::PhysicalWork(_)) {
                 return Err(WorkError::Conflict);
             }
             let active = record.active_amounts.checked_sub(released)?;
@@ -1177,7 +1184,10 @@ fn release_current(state: &mut State, id: u64) -> Option<Waker> {
         .joint
         .as_ref()
         .and_then(|ledger| ledger.claims.get(&id))
-        .is_some_and(|record| matches!(record.owner, ClaimOwner::PhysicalWork(_)))
+        .is_some_and(|record| {
+            record.custody.can_release_current()
+                && matches!(record.owner, ClaimOwner::PhysicalWork(_))
+        })
     {
         return None;
     }
@@ -1433,6 +1443,7 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
             state.joint.as_mut().unwrap().claims.insert(
                 new_id,
                 ClaimRecord {
+                    custody: ClaimCustody::Raw,
                     owner: ClaimOwner::PhysicalWork(owner),
                     facts: Arc::clone(&change.claim.facts),
                     amounts: change.claim.amounts,
@@ -2219,7 +2230,9 @@ impl JointAdjustmentReceipt {
                     .checked_add(1)
                     .ok_or(WorkError::ArithmeticOverflow)?;
                 authenticate_scope(state, record, &committed, request.owner)?;
-            } else if record.owner != ClaimOwner::PhysicalWork(request.owner) {
+            } else if !record.custody.is_raw()
+                || record.owner != ClaimOwner::PhysicalWork(request.owner)
+            {
                 return Err(WorkError::Conflict);
             }
             // Physical holders may report an actual partial release after

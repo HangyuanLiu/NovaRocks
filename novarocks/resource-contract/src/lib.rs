@@ -20,10 +20,10 @@
 //! Providers and filesystem adapters project the route they actually selected;
 //! governance consumes that fact without resolving catalog names or DNS aliases.
 
-use std::{
-    fmt::{self, Write as _},
-    sync::Arc,
-};
+mod retention;
+pub use retention::{ExistingOwnerRetentionLease, RetentionOwner, RetentionPinError};
+
+use std::{fmt, sync::Arc};
 
 /// A network service's HTTP origin, independent of catalog alias, object path,
 /// credentials and credential epoch. HTTP default ports use the URL author's
