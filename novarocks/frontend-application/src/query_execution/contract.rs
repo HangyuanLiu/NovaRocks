@@ -416,8 +416,8 @@ pub(crate) fn build_request_from_finalized_execution(
         DistributedQueryIntent::Result => true,
         _ => false,
     };
-    let restartable_read = restartable_read_intent && description.kind()
-        == novarocks_query_application::api::QueryExecutionKind::Read
+    let restartable_read = restartable_read_intent
+        && description.kind() == novarocks_query_application::api::QueryExecutionKind::Read
         && description.recovery()
             == novarocks_coordination_contract::RecoveryMode::RestartAttemptBeforeVisibility;
     let payload = if restartable_read {

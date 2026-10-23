@@ -112,7 +112,7 @@ mod profile_snapshot_tests {
         ) -> futures::future::BoxFuture<'_, Result<FinalTaskInfoRead, String>> {
             if let Some(info) = self.first.lock().unwrap().take() {
                 assert_eq!(info.final_status().identity(), task);
-                return Box::pin(async move { Ok(FinalTaskInfoRead::Available(info)) });
+                return Box::pin(async move { Ok(FinalTaskInfoRead::Available(Box::new(info))) });
             }
             self.pending.final_task_info(task)
         }

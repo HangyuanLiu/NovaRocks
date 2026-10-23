@@ -25,7 +25,7 @@ use crate::query_execution::{
         test_fixture::internal_statistics_description,
     },
     internal_result_cpu::InternalResultCpuOwner,
-    statistics::{StatisticsCollectionProgram, StatisticsExecutionMode, StatisticsExecutionPolicy},
+    statistics::{StatisticsCollectionProgram, StatisticsExecutionPolicy},
 };
 use arrow::{
     array::{ArrayRef, BinaryArray, Int32Builder, ListBuilder, MapBuilder, StringArray},
@@ -47,7 +47,7 @@ use novarocks_query_application::{
 };
 use novarocks_result_contract::{InternalResultDomain, RootOutputKind, RootProfileId};
 use novarocks_spi::connector::{
-    ConnectorInstanceId, ConnectorTableHandle, StatisticsArtifactIdentity, StatisticsDataVersion,
+    ConnectorInstanceId, ConnectorTableHandle, StatisticsArtifactIdentity,
     StatisticsRequiredAggregation, StatisticsScanColumn,
 };
 use novarocks_type_contract::FunctionValueType;
@@ -75,14 +75,9 @@ fn original_program() -> StatisticsCollectionProgram {
             Bytes::from_static(b"table"),
         )
         .unwrap(),
-        StatisticsDataVersion::try_new(Bytes::from_static(b"data-v1")).unwrap(),
         Some(7),
         vec![required],
-        StatisticsExecutionPolicy::try_new(
-            StatisticsExecutionMode::SynchronousWait,
-            Duration::from_secs(30),
-        )
-        .unwrap(),
+        StatisticsExecutionPolicy::try_new(Duration::from_secs(30)).unwrap(),
     )
     .unwrap();
     assert_eq!(program.required_aggregations().len(), 1);

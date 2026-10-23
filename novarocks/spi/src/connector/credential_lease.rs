@@ -42,6 +42,11 @@ impl CredentialAcquisitionOwnerId {
         Self(uuid::Uuid::now_v7())
     }
 }
+impl Default for CredentialAcquisitionOwnerId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl std::fmt::Debug for CredentialAcquisitionOwnerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CredentialAcquisitionOwnerId { .. }")
@@ -55,6 +60,11 @@ pub struct VendedS3SeedGrantId(uuid::Uuid);
 impl VendedS3SeedGrantId {
     pub fn new() -> Self {
         Self(uuid::Uuid::now_v7())
+    }
+}
+impl Default for VendedS3SeedGrantId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 impl std::fmt::Debug for VendedS3SeedGrantId {

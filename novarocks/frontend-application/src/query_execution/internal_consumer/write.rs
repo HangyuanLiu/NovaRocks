@@ -100,7 +100,6 @@ where
     E: std::error::Error + novarocks_failure_contract::FailureProjection + Send + Sync + 'static,
 {
     use novarocks_execution_contract::SafeDetail;
-    use novarocks_failure_contract::FailureProjection;
     use novarocks_query_application::execution_error::{
         ExecutionFailureInput, ExecutionFailureSite,
     };

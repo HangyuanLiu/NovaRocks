@@ -414,19 +414,22 @@ pub(crate) fn prepare_rest_staged_table(
                 novarocks_spi::connector::CredentialRenewalPath::CredentialsEndpoint(announcement),
             );
         let contribution = contribution
-            .with_refresher(endpoints.acquisition_owner(), Arc::new(IcebergRestVendedS3LeaseRefresher::new(
-                runtime
-                    .novarocks_catalog()
-                    .vended_credential_refresh_catalog()
-                    .ok_or_else(|| {
-                        RestStagedPrepareFailure::AppliedButUnusable(
-                            "REST staged create vended refresh has no catalog owner".to_string(),
-                        )
-                    })?,
-                runtime.resources().catalog_runtime().clone(),
-                refresh_scope,
-            ))
-                as Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>)
+            .with_refresher(
+                endpoints.acquisition_owner(),
+                Arc::new(IcebergRestVendedS3LeaseRefresher::new(
+                    runtime
+                        .novarocks_catalog()
+                        .vended_credential_refresh_catalog()
+                        .ok_or_else(|| {
+                            RestStagedPrepareFailure::AppliedButUnusable(
+                                "REST staged create vended refresh has no catalog owner"
+                                    .to_string(),
+                            )
+                        })?,
+                    runtime.resources().catalog_runtime().clone(),
+                    refresh_scope,
+                )) as Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>,
+            )
             .map_err(|error| RestStagedPrepareFailure::AppliedButUnusable(error.to_string()))?;
         collection
             .offer_vended_s3_credential_lease(contribution)

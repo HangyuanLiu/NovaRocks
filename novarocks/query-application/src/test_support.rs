@@ -658,7 +658,13 @@ impl LogicalExecutionTestHarness {
                 .observe_local_root_end(root, end)
                 .await
                 .map_err(actor_error)?;
-            observer.observe_status(status).await.map_err(actor_error)?;
+            observer
+                .observe_status_with_failure(
+                    status,
+                    crate::coordination::RootTerminalFailure::Unspecified,
+                )
+                .await
+                .map_err(actor_error)?;
             let (delivery, decoded) =
                 tokio::join!(running.deliver_internal_end(root, end), async {
                     match stream.next().await? {
@@ -712,7 +718,12 @@ impl LogicalExecutionTestHarness {
         let running = self.running.as_ref().expect("fixture attempt is active");
         let observer = running.bind_root_result(root).await?;
         observer.observe_local_root_end(root, end).await?;
-        observer.observe_status(status).await?;
+        observer
+            .observe_status_with_failure(
+                status,
+                crate::coordination::RootTerminalFailure::Unspecified,
+            )
+            .await?;
         running.deliver_internal_end(root, end).await
     }
 

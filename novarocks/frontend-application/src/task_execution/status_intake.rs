@@ -36,10 +36,7 @@ use std::time::Duration;
 use std::sync::atomic::AtomicUsize;
 
 use novarocks_coordination_contract::MonotonicInstant;
-use novarocks_execution::task_execution::{
-    QueryContextConvergenceReceipt, QueryContextRef, QuiesceQueryContextReceipt,
-    TaskConvergenceReceipt, TaskIdentity, TaskStatus,
-};
+use novarocks_execution::task_execution::{QueryContextRef, TaskIdentity, TaskStatus};
 use novarocks_query_application::coordination::{
     AcceptedRootControlPort, AcceptedRootControlRequest,
 };

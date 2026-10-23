@@ -326,7 +326,7 @@ pub(crate) fn cow_computation_consumer(
         description,
         plan,
         Domain::Cow,
-        InternalDomainState::Cow(original),
+        InternalDomainState::Cow(Box::new(original)),
         runtime,
     )?;
     Ok((consumer, offers, CowComputationOutput { holder }))

@@ -281,7 +281,7 @@ impl NativeAttemptConvergenceOwner {
             ) {
                 // A retained remote fact is not fresh progress while an
                 // independent original diagnostic read still has to exit.
-                Ok(NativeAttemptConvergenceStep::Ready(_)) => false,
+                Ok(NativeAttemptConvergenceStep::Ready) => false,
                 Ok(NativeAttemptConvergenceStep::Pending { moved }) => moved,
                 Err(_) => false,
             };

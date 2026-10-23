@@ -171,7 +171,7 @@ pub(crate) fn statistics_all_success_error(round: &TaskRound) -> Option<Distribu
     })
 }
 
-pub(crate) fn statistics_all_success_failure_message(
+fn statistics_all_success_failure_message(
     facts: &[StatisticsTaskCompletionFact],
     round_failure_cause: Option<&TerminationDetail>,
 ) -> Option<String> {

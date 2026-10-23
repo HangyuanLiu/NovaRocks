@@ -18,7 +18,7 @@
 //! Carrier-neutral coordination facts shared by execution owners.
 //! Runtime capabilities and owner decisions remain with their application owners.
 //!
-//! Design: ADR-0194 (docs/adr/ADR-0194-one-logical-execution-owner-for-every-distributed-intent.md).
+//! Design: ADR-0195 (docs/adr/ADR-0195-one-logical-execution-owner-for-every-distributed-intent.md).
 
 mod clock;
 mod conclusion;

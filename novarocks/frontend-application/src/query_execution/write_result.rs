@@ -69,6 +69,13 @@ use novarocks_spi::connector::{
     StatisticsArtifactIdentity,
 };
 
+pub(crate) type RootWriteResultParts = (
+    u64,
+    Vec<(WriteTargetOrdinal, Vec<u8>)>,
+    Vec<WriteStatisticsArtifact>,
+    Option<InternalResultRetention>,
+);
+
 /// Source-preserving rejection from the original write decoder.
 #[derive(Debug)]
 pub(crate) struct RootWriteDecodeFailure {
@@ -377,6 +384,7 @@ impl RootWriteResultDecoder {
         Ok(decoder)
     }
 
+    #[cfg(test)]
     pub(crate) fn apply_chunk(&mut self, chunk: &Chunk) -> Result<(), RootWriteDecodeFailure> {
         if self.root_eof {
             return Err("write Root emitted a trailing batch after EOF".into());

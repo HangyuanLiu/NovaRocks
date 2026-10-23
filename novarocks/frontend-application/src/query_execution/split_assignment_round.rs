@@ -1133,7 +1133,6 @@ mod tests {
                 vec![source],
                 TaskUpdateRetryPolicy::default(),
                 Duration::ZERO,
-                Vec::new(),
                 supervisor,
             ),
             enumerations,
@@ -1820,15 +1819,16 @@ mod tests {
         if !natural_exhaustion {
             let wake_count_before_stop = wake.count();
             guard.request_stop();
-            assert!(wake.count() > wake_count_before_stop,
-                "requesting source close must wake the round owner");
+            assert!(
+                wake.count() > wake_count_before_stop,
+                "requesting source close must wake the round owner"
+            );
             if terminal_cleanup {
                 round.begin_terminal_cleanup();
             } else {
                 round.begin_normal_drain();
             }
         }
-        let stopped_wake = wake.count();
         let initial_turn = round.turn();
         if natural_exhaustion {
             // Ordinary turns must enumerate, deliver and acknowledge the real

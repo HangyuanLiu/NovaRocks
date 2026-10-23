@@ -198,7 +198,7 @@ impl AttemptCredentialLeaseCollector {
 
     /// Claims the one Native transfer right. A terminal-only seal never
     /// grants that right, even though both paths share the same frozen Arc.
-    pub(crate) fn into_credential_leases(
+    pub(crate) fn drain_credential_leases(
         &self,
     ) -> Result<QueryCredentialLeases, DistributedQueryError> {
         let mut state = self
@@ -1050,7 +1050,7 @@ mod tests {
                 &provider
             ));
             let storage = if native_drained {
-                collector.into_credential_leases().unwrap().into_storage()
+                collector.drain_credential_leases().unwrap().into_storage()
             } else {
                 terminal.seal_for_terminal().unwrap()
             };
@@ -1103,13 +1103,13 @@ mod tests {
             .offer_vended_s3_credential_lease(&properties, vended_contribution("second-canary"))
             .expect("duplicate scope is dropped without retaining its value");
 
-        let leases = collector.into_credential_leases().expect("one-time drain");
+        let leases = collector.drain_credential_leases().expect("one-time drain");
         assert_eq!(leases.leases().len(), 1);
         assert!(
             !leases.leases()[0].descriptor().refresh_capable(),
             "an endpoint-free contribution without a provider source is not refreshable"
         );
-        assert!(collector.into_credential_leases().is_err());
+        assert!(collector.drain_credential_leases().is_err());
     }
 
     #[test]
@@ -1161,7 +1161,7 @@ mod tests {
             .offer_vended_s3_credential_lease(&properties, contribution)
             .expect("provider-local contribution");
 
-        let leases = collector.into_credential_leases().expect("one-time drain");
+        let leases = collector.drain_credential_leases().expect("one-time drain");
         assert!(leases.leases()[0].descriptor().refresh_capable());
         assert!(leases.leases()[0].provider().is_some());
     }
@@ -1185,7 +1185,7 @@ mod tests {
         assert_eq!(resolved.matched_prefix().as_str(), "s3://warehouse/data");
 
         let leases = collector
-            .into_credential_leases()
+            .drain_credential_leases()
             .expect("one-way lifecycle handoff");
         assert!(
             novarocks_spi::connector::ConnectorStorageResolver::resolve_vended_s3(
@@ -1248,7 +1248,7 @@ mod tests {
             .is_err()
         );
         let retained = weak_collector.upgrade().unwrap();
-        assert!(retained.into_credential_leases().is_err());
+        assert!(retained.drain_credential_leases().is_err());
         assert!(retained.resolve_vended_s3(&request).is_err());
         assert!(terminal.resolve_vended_s3(&request).is_ok());
         let foreign_scope = StorageAccessRequest::try_new(
@@ -1297,14 +1297,14 @@ mod tests {
             "s3://warehouse/data/file.parquet",
         )
         .unwrap();
-        let leases = collector.into_credential_leases().unwrap();
+        let leases = collector.drain_credential_leases().unwrap();
         let original = terminal.seal_for_terminal().unwrap();
         assert!(Arc::ptr_eq(&leases.storage, &original));
         assert!(std::ptr::eq(
             leases.leases().as_ptr(),
             original.leases.as_ptr()
         ));
-        assert!(collector.into_credential_leases().is_err());
+        assert!(collector.drain_credential_leases().is_err());
         assert!(collector.resolve_vended_s3(&request).is_err());
         let native = leases.into_attempt_storage_resolver().unwrap();
         assert!(Arc::ptr_eq(&native, &original));
@@ -1338,7 +1338,7 @@ mod tests {
         let second = collector.seal_for_terminal().unwrap();
         assert!(Arc::ptr_eq(&first, &second));
         assert!(first.leases.is_empty());
-        assert!(collector.into_credential_leases().is_err());
+        assert!(collector.drain_credential_leases().is_err());
         assert!(
             collector
                 .sink()
@@ -1349,11 +1349,11 @@ mod tests {
                 .is_err()
         );
         let native_collector = AttemptCredentialLeaseCollector::new(execution_id());
-        let native = native_collector.into_credential_leases().unwrap();
+        let native = native_collector.drain_credential_leases().unwrap();
         let frozen_empty = native_collector.seal_for_terminal().unwrap();
         assert!(Arc::ptr_eq(&native.storage, &frozen_empty));
         assert!(native.into_attempt_storage_resolver().is_none());
-        assert!(native_collector.into_credential_leases().is_err());
+        assert!(native_collector.drain_credential_leases().is_err());
         assert!(Arc::ptr_eq(
             &frozen_empty,
             &native_collector.seal_for_terminal().unwrap()
@@ -1383,7 +1383,7 @@ mod tests {
                     )
                     .unwrap();
             }
-            let original = collector.into_credential_leases().unwrap().into_storage();
+            let original = collector.drain_credential_leases().unwrap().into_storage();
             assert!(Arc::ptr_eq(collector.frozen.get().unwrap(), &original));
             assert!(
                 terminal
@@ -1407,7 +1407,7 @@ mod tests {
             );
             let other_collector = AttemptCredentialLeaseCollector::new(execution_id());
             let foreign = other_collector
-                .into_credential_leases()
+                .drain_credential_leases()
                 .unwrap()
                 .into_storage();
             assert!(
@@ -1433,7 +1433,7 @@ mod tests {
                     .verify_native_storage(execution_id(), &sealed)
                     .is_err()
             );
-            assert!(terminal_only.into_credential_leases().is_err());
+            assert!(terminal_only.drain_credential_leases().is_err());
         }
     }
 
@@ -1450,10 +1450,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            collector.into_credential_leases().unwrap().leases().len(),
+            collector.drain_credential_leases().unwrap().leases().len(),
             1
         );
-        assert!(collector.into_credential_leases().is_err());
+        assert!(collector.drain_credential_leases().is_err());
     }
 
     #[test]
@@ -1471,7 +1471,7 @@ mod tests {
         // Capture exactly what a concurrent resolve upgraded before seal.
         // The real route releases its lock before invoking this projection.
         let selected = collector.route.current_owner().unwrap();
-        let leases = collector.into_credential_leases().unwrap();
+        let leases = collector.drain_credential_leases().unwrap();
         assert!(collector.resolve_vended_s3(&request).is_err());
         assert!(selected.resolve(&request).is_ok());
         let original = leases.into_attempt_storage_resolver().unwrap();
@@ -1492,7 +1492,7 @@ mod tests {
                 .offer_vended_s3_credential_lease(&properties, vended_contribution("duplicate-id"))
                 .unwrap();
         }
-        let material = duplicate.into_credential_leases().unwrap();
+        let material = duplicate.drain_credential_leases().unwrap();
         drop(duplicate);
         let mut material = Arc::try_unwrap(material.storage)
             .ok()
@@ -1503,8 +1503,8 @@ mod tests {
             .unwrap()
             .leases
             .append(&mut material.leases);
-        assert!(collector.into_credential_leases().is_err());
-        assert!(collector.into_credential_leases().is_err());
+        assert!(collector.drain_credential_leases().is_err());
+        assert!(collector.drain_credential_leases().is_err());
         assert!(
             collector
                 .sink()
@@ -1554,7 +1554,7 @@ mod tests {
             })
         };
         barrier.wait();
-        let native = collector.into_credential_leases().unwrap();
+        let native = collector.drain_credential_leases().unwrap();
         resolving
             .join()
             .expect("the original resolver thread actually exits");

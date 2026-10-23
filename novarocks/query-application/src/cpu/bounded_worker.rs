@@ -115,31 +115,17 @@ impl fmt::Display for BoundedWorkerError {
 
 impl std::error::Error for BoundedWorkerError {}
 
-/// A refused submission is reported to the caller; tests can recover the job
-/// to verify retryability before production closes the executor.
+/// A refused submission retains the same move-only job for its original caller.
+/// The queue lock never runs the rejected input's destructor.
 pub(crate) struct BoundedWorkerSubmitError<R> {
-    #[cfg(test)]
     job: BoundedWorkerJob<R>,
-    #[cfg(not(test))]
-    _result: std::marker::PhantomData<fn() -> R>,
 }
 
 impl<R> BoundedWorkerSubmitError<R> {
     fn rejected(job: BoundedWorkerJob<R>) -> Self {
-        #[cfg(test)]
-        {
-            Self { job }
-        }
-        #[cfg(not(test))]
-        {
-            drop(job);
-            Self {
-                _result: std::marker::PhantomData,
-            }
-        }
+        Self { job }
     }
 
-    #[cfg(test)]
     pub(crate) fn into_job(self) -> BoundedWorkerJob<R> {
         self.job
     }

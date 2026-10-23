@@ -25,7 +25,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::query_execution::artifact::FragmentId;
 use crate::task_execution::completion_facts::{
     StageState, derive_stage_state, parent_released_children,
 };

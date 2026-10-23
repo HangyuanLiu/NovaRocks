@@ -90,7 +90,7 @@ impl DomainCpuCustody {
         let value =
             InternalResultValue::try_produce(binding.scope(), binding.window_alias(), |_| {
                 Ok(InternalDomainSlot::Collecting {
-                    state: domain,
+                    state: Box::new(domain),
                     receipt: None,
                 })
             })

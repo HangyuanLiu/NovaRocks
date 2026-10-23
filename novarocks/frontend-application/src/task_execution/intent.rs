@@ -25,11 +25,11 @@
 
 use std::sync::Arc;
 
-#[cfg(test)]
-use novarocks_execution::task_execution::FetchTaskDynamicFilters;
 use crate::task_execution::operation::{OperationDispatchResult, WorkerReceiptOutcome};
 use crate::task_protocol_config::{DispatchBudget, DispatchLane};
 use novarocks_coordination_contract::MonotonicInstant;
+#[cfg(test)]
+use novarocks_execution::task_execution::FetchTaskDynamicFilters;
 use novarocks_execution::task_execution::{
     AbortQueryContext, AcquireQueryContextAdmissionTicket, CancelTask, CreateTaskReceipt,
     EstablishQueryContext, OperationKind, OperationOutcome, OperationShape,

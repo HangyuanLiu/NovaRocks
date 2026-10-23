@@ -17,7 +17,7 @@
 
 //! Attempt-local internal consumption and actor-issued readiness receipts.
 //!
-//! Design: ADR-0194 (docs/adr/ADR-0194-one-logical-execution-owner-for-every-distributed-intent.md).
+//! Design: ADR-0195 (docs/adr/ADR-0195-one-logical-execution-owner-for-every-distributed-intent.md).
 
 use std::{future::Future, num::NonZeroUsize, pin::Pin, sync::Arc, time::Duration};
 
@@ -236,7 +236,8 @@ impl InternalSegmentConsumption {
     }
     pub fn fail(mut self, error: QueryExecutionError) {
         self.resident_window.take();
-        self.signal.finish(ResultDeliveryDisposition::Failed(error));
+        self.signal
+            .finish(ResultDeliveryDisposition::Failed(Box::new(error)));
     }
 }
 
@@ -284,7 +285,8 @@ impl InternalEndDelivery {
             .map_err(|_| ResultOwnerObservation::FailureOwnerClosed.into_error())?
     }
     pub fn fail(mut self, error: QueryExecutionError) {
-        self.signal.finish(ResultDeliveryDisposition::Failed(error));
+        self.signal
+            .finish(ResultDeliveryDisposition::Failed(Box::new(error)));
     }
 }
 

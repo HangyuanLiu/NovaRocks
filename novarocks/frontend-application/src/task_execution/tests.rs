@@ -7831,7 +7831,7 @@ impl ManifestReleaseTail {
     pub(crate) fn publish_original_writer_success(&self, round: &mut TaskRoundForTest) {
         assert!(!self.upstream.is_empty());
         for &identity in &self.upstream {
-            self.status.publish(StatusEvent::Published(
+            self.status.publish(StatusEvent::Published(Box::new(
                 TaskStatus::try_new(
                     identity,
                     TaskStatusVersion::new(3).unwrap(),
@@ -7840,7 +7840,7 @@ impl ManifestReleaseTail {
                     TaskOutputFacts::new(true),
                 )
                 .unwrap(),
-            ));
+            )));
         }
         round
             .turn()
@@ -7897,7 +7897,7 @@ impl ManifestReleaseTail {
         failure: novarocks_execution_contract::TaskFailure,
     ) -> novarocks_coordination_contract::SelectedTaskTermination {
         let identity = self.upstream[0];
-        self.status.publish(StatusEvent::Published(
+        self.status.publish(StatusEvent::Published(Box::new(
             TaskStatus::try_new(
                 identity,
                 TaskStatusVersion::new(3).unwrap(),
@@ -7906,8 +7906,8 @@ impl ManifestReleaseTail {
                 TaskOutputFacts::new(false),
             )
             .unwrap(),
-        ));
-        self.status.publish(StatusEvent::Published(
+        )));
+        self.status.publish(StatusEvent::Published(Box::new(
             TaskStatus::try_new(
                 identity,
                 TaskStatusVersion::new(4).unwrap(),
@@ -7916,7 +7916,7 @@ impl ManifestReleaseTail {
                 TaskOutputFacts::new(false),
             )
             .unwrap(),
-        ));
+        )));
         round
             .turn()
             .expect("the original status owner accepts the Task failure");
@@ -7950,7 +7950,8 @@ impl ManifestReleaseTail {
                 TaskOutputFacts::new(false),
             )
             .expect("a valid canceling upstream task");
-            self.status.publish(StatusEvent::Published(canceling));
+            self.status
+                .publish(StatusEvent::Published(Box::new(canceling)));
             let canceled = TaskStatus::try_new(
                 identity,
                 TaskStatusVersion::new(4).expect("v4"),
@@ -7961,7 +7962,8 @@ impl ManifestReleaseTail {
                 TaskOutputFacts::new(false),
             )
             .expect("a valid canceled upstream task");
-            self.status.publish(StatusEvent::Published(canceled));
+            self.status
+                .publish(StatusEvent::Published(Box::new(canceled)));
         }
 
         let mut releases = Vec::new();
@@ -8670,7 +8672,7 @@ fn input_close_advances_all_original_jobs_while_ack_and_status_remain_live() {
     for create in &creates {
         acks.publish(accepted_create_ack(create));
     }
-    status.publish(StatusEvent::Published(
+    status.publish(StatusEvent::Published(Box::new(
         TaskStatus::try_new(
             round.root_task(),
             TaskStatusVersion::new(2).unwrap(),
@@ -8679,7 +8681,7 @@ fn input_close_advances_all_original_jobs_while_ack_and_status_remain_live() {
             TaskOutputFacts::new(false),
         )
         .unwrap(),
-    ));
+    )));
     // No normal drain, terminal cleanup, or attempt failure starts this close.
     let report = round
         .turn()
@@ -8750,7 +8752,7 @@ fn input_close_progress_precedes_an_unrelated_ack_error() {
 }
 
 #[test]
-fn closing_the_feedback_pump_releases_waiters_and_fences_late_feedback() {
+fn closing_the_feedback_pump_releases_initial_wait_and_fences_late_feedback() {
     use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
     use crate::task_execution::feedback_pump::DynamicFilterFeedbackPump;
     use crate::task_execution::round::TurnPump;
@@ -8780,43 +8782,15 @@ fn closing_the_feedback_pump_releases_waiters_and_fences_late_feedback() {
         )),
     );
     assert!(feedback.is_initial_wait_blocked(SCAN_NODE, [7]));
-    let observed = feedback.generation();
-    let waiting_feedback = Arc::clone(&feedback);
-    let (entered, entry) = std::sync::mpsc::channel();
-    let (finished, finish) = std::sync::mpsc::channel();
-    let waiter = std::thread::spawn(move || {
-        entered.send(()).unwrap();
-        // Recheck the predicate after a spurious wake. A lost close wake must
-        // not leave the split source waiting for this much longer budget.
-        while waiting_feedback.generation() == observed {
-            waiting_feedback.wait_for_change(observed, Duration::from_secs(30));
-        }
-        finished.send(()).unwrap();
-    });
-    let entered = entry.recv_timeout(Duration::from_secs(5));
-    let pending = finish.try_recv();
+    // Split assignment now observes the original snapshot each turn; there
+    // is no feedback Condvar waiter. Closing the same pump must immediately
+    // release that predicate and fence every later original contribution.
     pump.begin_close();
-    let woken = finish.recv_timeout(Duration::from_secs(5));
-    if woken.is_err() {
-        // A regression must still release and join this real fixture waiter.
-        feedback.close();
-    }
-    waiter.join().expect("feedback waiter exits");
-    entered.expect("the feedback waiter entered");
-    assert!(matches!(pending, Err(std::sync::mpsc::TryRecvError::Empty)));
-    woken.expect("pump close must release the original feedback waiter");
-
     assert!(pump.is_closed());
     assert!(!feedback.is_initial_wait_blocked(SCAN_NODE, [7]));
-    let closed_generation = feedback.generation();
-    assert_eq!(closed_generation, observed + 1);
     pump.begin_close();
     pump.close_turn().unwrap();
-    assert_eq!(
-        feedback.generation(),
-        closed_generation,
-        "close is idempotent"
-    );
+    assert!(pump.is_closed());
     assert_eq!(pump.drive(&mut harness.execution).unwrap(), 0);
     assert!(
         reads.requested().is_empty(),
@@ -8825,7 +8799,6 @@ fn closing_the_feedback_pump_releases_waiters_and_fences_late_feedback() {
     feedback
         .admit_task_feedback(&feedback_envelope(7, [9; 32], exact_domain(41)), publisher)
         .expect("closed feedback ignores a late update");
-    assert_eq!(feedback.generation(), closed_generation);
     assert!(!feedback.is_initial_wait_blocked(SCAN_NODE, [7]));
     assert!(feedback.configure(feedback_declaration(publisher)).is_err());
 }
@@ -10843,7 +10816,7 @@ mod accepted_terminal_index_tests {
                 .execution
                 .intake()
                 .handle()
-                .publish(StatusEvent::Published(status)),
+                .publish(StatusEvent::Published(Box::new(status))),
             StatusIntakeAdmission::Enqueued,
         );
         harness
@@ -10888,11 +10861,11 @@ mod accepted_terminal_index_tests {
                 create.operation_id(),
                 OperationKind::CreateTask,
                 OperationOutcome::Accepted,
-                AckPayload::Create(CreateTaskReceipt::new(
+                AckPayload::Create(Box::new(CreateTaskReceipt::new(
                     identity,
                     Vec::new(),
                     original.clone(),
-                )),
+                ))),
             );
             harness.execution.acknowledge(&ack).unwrap();
             assert_eq!(harness.execution.accepted_terminal_tasks(), &[identity]);
@@ -11205,7 +11178,7 @@ fn protocol_owner_revision_tracks_ack_status_and_skips_idempotent_and_idle_folds
         .execution
         .intake()
         .handle()
-        .publish(StatusEvent::Published(original));
+        .publish(StatusEvent::Published(Box::new(original)));
     let report = harness.execution.apply_status(64).unwrap();
     assert_eq!(report.accepted, 0);
     assert_eq!(harness.execution.accepted_protocol_revision(), revision);
@@ -11224,7 +11197,7 @@ fn protocol_owner_revision_keeps_failure_refinement_without_root_status_change()
             .execution
             .intake()
             .handle()
-            .publish(StatusEvent::Published(
+            .publish(StatusEvent::Published(Box::new(
                 TaskStatus::try_new(
                     identity,
                     TaskStatusVersion::new(2).unwrap(),
@@ -11233,7 +11206,7 @@ fn protocol_owner_revision_keeps_failure_refinement_without_root_status_change()
                     TaskOutputFacts::default(),
                 )
                 .unwrap(),
-            ));
+            )));
     };
     publish(&harness, peer, AbortCause::PeerTaskFailed);
     harness.execution.apply_status(64).unwrap();
@@ -11315,12 +11288,12 @@ fn protocol_owner_keeps_one_original_writer_witness_across_a_coalesced_status_fo
         .execution
         .intake()
         .handle()
-        .publish(StatusEvent::Published(original.clone()));
+        .publish(StatusEvent::Published(Box::new(original.clone())));
     harness
         .execution
         .intake()
         .handle()
-        .publish(StatusEvent::Published(later));
+        .publish(StatusEvent::Published(Box::new(later)));
     let report = harness.execution.apply_status(64).unwrap();
     assert_eq!(report.accepted, 2);
     assert!(

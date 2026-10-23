@@ -31,7 +31,7 @@ use crate::task_execution::{
     round::TaskRound,
     status_intake::{CountingWake, ObservationFrame, ObservationIntakeEntry},
 };
-use novarocks_coordination_contract::{ExecutionEffect, MonotonicClock};
+use novarocks_coordination_contract::MonotonicClock;
 use novarocks_execution_contract::root_result::RootResultEnd;
 use novarocks_execution_contract::{
     DomainVersion, OperationKind, OperationOutcome, QueryContextConvergenceReceipt,
@@ -323,7 +323,7 @@ impl OriginalAttempt {
         self.round.turn().unwrap();
         self.round
             .execution_mut()
-            .apply_covered_entries(vec![ObservationIntakeEntry::Frame(
+            .apply_covered_entries(vec![ObservationIntakeEntry::Frame(Box::new(
                 ObservationFrame::Covered {
                     context: self.context,
                     generation: 1,
@@ -338,7 +338,7 @@ impl OriginalAttempt {
                         source_revision: None,
                     },
                 },
-            )])
+            ))])
             .unwrap();
         assert!(self.round.attempt_drained());
         assert!(self.round.pumps_closed());

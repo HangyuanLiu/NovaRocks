@@ -41,9 +41,11 @@ use novarocks_spi::connector::{
 };
 
 use novarocks_execution::runtime::query_options::QueryOptions;
+#[cfg(test)]
+use novarocks_native_adapter::root_cow_selection_codec::CowSelectionCodecError;
 use novarocks_native_adapter::root_cow_selection_codec::{
-    COW_SELECTION_MAX_RECORD_BYTES, CowSelectionCodecError, CowSelectionRecordHeader,
-    CowSelectionRecordKind, CowSelectionStreamDecoder,
+    COW_SELECTION_MAX_RECORD_BYTES, CowSelectionRecordHeader, CowSelectionRecordKind,
+    CowSelectionStreamDecoder,
 };
 use novarocks_native_adapter::root_record_assembly::{
     RootRecordAssembly, RootRecordAssemblyError, RootRecordDomain, RootRecordFramingError,

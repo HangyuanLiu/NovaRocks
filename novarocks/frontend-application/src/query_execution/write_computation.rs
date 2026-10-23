@@ -56,7 +56,6 @@ impl std::error::Error for OriginalFragmentCodecFailure {
 }
 impl novarocks_failure_contract::FailureProjection for OriginalFragmentCodecFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use novarocks_failure_contract::FailureProjection;
         self.0.protocol().failure_fact()
     }
 }

@@ -29,9 +29,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::task_execution::completion_facts::{
-    AttemptDrainFacts, StageState, parent_released_children,
-};
+use crate::task_execution::completion_facts::{AttemptDrainFacts, parent_released_children};
 use crate::task_execution::conclusion::{LatchOutcome, TerminationLatch};
 use crate::task_execution::operation::OperationDispatchResult;
 use crate::task_execution::status_validation::GoneObservation;

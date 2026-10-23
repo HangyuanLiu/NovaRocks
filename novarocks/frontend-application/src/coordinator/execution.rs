@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+#[cfg(test)]
+use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -94,7 +96,6 @@ use crate::task_execution::attempt_convergence::{
 };
 use crate::task_execution::attempt_pumps::{AttemptPumps, install_attempt_pumps};
 use crate::task_execution::completion::{WriteCompletionTracker, WriteVerdict};
-use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::feedback_pump::TaskDynamicFilterReads;
 use crate::task_execution::graph::TaskNode;
 
@@ -2939,7 +2940,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        FrontendBackendSnapshot, FrontendDistributedQueryCoordinator, FrontendFragmentScheduler,
         QueryIdSource, UniqueQueryIdSource, fail_closed_one_shot_topology_retry,
         pre_ready_topology_validation_error,
     };
@@ -2951,8 +2951,7 @@ mod tests {
     use crate::topology::ClusterBackendService;
 
     use novarocks_execution::task_execution::{
-        AbortCause, CancelReason, SafeDetail, TaskFailure, TaskIdentity, TaskState,
-        TerminationDetail,
+        AbortCause, SafeDetail, TaskFailure, TaskIdentity, TaskState, TerminationDetail,
     };
     use novarocks_execution_contract::{
         BackendProcessDescriptor, BackendReportedState, RuntimeEndpoint,

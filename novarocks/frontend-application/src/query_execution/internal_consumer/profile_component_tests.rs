@@ -287,7 +287,7 @@ async fn actual_foreign_old_claim_and_cut_cannot_consume_new_profile_custody() {
         prior.accept_original_end(prior_activation),
     )
     .await;
-    let (mut stale, stale_resources, stale_activation) =
+    let (stale, stale_resources, stale_activation) =
         watchdog("stale actor original Establish", OriginalAttempt::new(1)).await;
     drop(stale_resources);
     let (mut next, resources, activation) =

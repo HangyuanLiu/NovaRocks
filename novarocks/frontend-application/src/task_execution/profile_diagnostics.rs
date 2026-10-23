@@ -349,7 +349,7 @@ impl TaskFinalInfoCollector {
         match result {
             Ok(FinalTaskInfoRead::Available(info)) => match accept_final_info(&job.observed, &info)
             {
-                Ok(()) => self.collected.push(Arc::new(info)),
+                Ok(()) => self.collected.push(Arc::from(info)),
                 Err(error) => {
                     self.missing
                         .insert(identity, ProfileDiagnosticMissing::TerminalMismatch);

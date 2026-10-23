@@ -25,16 +25,18 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::task_protocol_config::CoordinationBudgets;
-use novarocks_coordination_contract::{AttemptFailureClass, RecoveryMode};
+#[cfg(test)]
+use novarocks_coordination_contract::AttemptFailureClass;
+use novarocks_coordination_contract::RecoveryMode;
 use novarocks_execution_contract::{
     AcquireQueryContextAdmissionTicket, LeaseValidFor, OperationOutcome, QueryContextRef,
     TaskOperationId,
 };
 use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
 use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
+use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 #[cfg(test)]
 use novarocks_query_application::api::QueryExecutionErrorKind;
-use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_query_application::api::{
     ActivatedNativeAttempt, ActiveNativeAttemptOwner, CancellationView, DormantNativeAttemptOwner,
     LogicalExecutionNativePort, LogicalNativeOpenFuture, LogicalNativeOpenRequest,

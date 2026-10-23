@@ -393,7 +393,7 @@ async fn queued_root_failure_in_ready_turn_prevents_the_cut() {
             // The reserved ingress refines the root seal with the exact
             // attempt's authoritative failure before readiness is accepted.
             status: root_status(root, 1, TaskState::Finished),
-            terminal_failure: RootTerminalFailure::Authoritative(actual_consumer_body_failure()),
+            terminal_failure: RootTerminalFailure::Authoritative(Box::new(actual_consumer_body_failure())),
             reply,
         }).unwrap();
     });
@@ -553,7 +553,7 @@ fn internal_profile_data_and_end_remain_replaceable_until_ready() {
     state.complete_result_delivery(end).unwrap();
     assert!(!state.output_visible());
     assert!(matches!(state.phase(), ExecutionPhase::Running { .. }));
-    state
+    let _pending_replacement = state
         .begin_replacement(
             &capability,
             replacement(first, 2),
