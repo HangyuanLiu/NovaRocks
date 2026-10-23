@@ -113,7 +113,36 @@ pub(super) enum RequestPhase {
     Delivered,
     Failed(WorkError),
 }
+#[derive(Clone, Copy)]
+pub(super) enum RequestBudget {
+    WaitForCapacity,
+    Finite { remaining: u64 },
+}
+impl RequestBudget {
+    pub(super) fn is_finite(self) -> bool {
+        matches!(self, Self::Finite { .. })
+    }
+    pub(super) fn limit(self, configured: u64) -> u64 {
+        match self {
+            Self::WaitForCapacity => configured,
+            Self::Finite { remaining } => remaining.min(configured),
+        }
+    }
+    pub(super) fn charge(&mut self, work: u64) -> Result<(), WorkError> {
+        if let Self::Finite { remaining } = self {
+            *remaining = remaining
+                .checked_sub(work)
+                .ok_or(WorkError::Capacity("joint finite proof work"))?;
+        }
+        Ok(())
+    }
+    pub(super) fn exhausted(self) -> bool {
+        matches!(self, Self::Finite { remaining: 0 })
+    }
+}
+
 pub(super) struct RequestRecord {
+    pub(super) budget: RequestBudget,
     pub(super) owner: WorkId,
     pub(super) changes: Arc<[ChangeRecord]>,
     pub(super) phase: RequestPhase,
@@ -240,6 +269,26 @@ impl JointAdmissionHandle {
             .map_err(|error| JointAdmissionFailure { error })
     }
 
+    /// Prove within one cumulative work budget, including layout reobservations.
+    /// Infeasible capacity is returned rather than parked for another holder.
+    /// This still awaits the original driver's bounded progression; it grants
+    /// no capacity or metadata funding merely by constructing the request.
+    pub fn request_finite(
+        &self,
+        scope: &WorkScope,
+        changes: Vec<JointClaimChange>,
+        proof_work_limit: std::num::NonZeroU64,
+    ) -> Result<JointAdmission, JointAdmissionFailure> {
+        self.prepare_request(scope, &changes)
+            .and_then(|mut prepared| {
+                prepared.budget = RequestBudget::Finite {
+                    remaining: proof_work_limit.get(),
+                };
+                self.queue_request(prepared)
+            })
+            .map_err(|error| JointAdmissionFailure { error })
+    }
+
     /// Capture only immutable headers under State. Dependency union, sorting
     /// and record allocation occur outside the original authority's mutex.
     pub(super) fn prepare_request(
@@ -345,6 +394,7 @@ impl JointAdmissionHandle {
             });
         }
         Ok(PreparedRequest {
+            budget: RequestBudget::WaitForCapacity,
             scope: scope.clone(),
             changes: records.into(),
         })
@@ -406,6 +456,12 @@ impl JointAdmissionHandle {
             ledger.requests.insert(
                 id,
                 RequestRecord {
+                    budget: match prepared.budget {
+                        RequestBudget::Finite { remaining } => RequestBudget::Finite {
+                            remaining: remaining.min(ledger.config.config.max_total_proof_work),
+                        },
+                        RequestBudget::WaitForCapacity => RequestBudget::WaitForCapacity,
+                    },
                     owner: scope.id,
                     changes: Arc::clone(records),
                     phase: RequestPhase::Waiting,
@@ -423,6 +479,7 @@ impl JointAdmissionHandle {
 }
 
 pub(super) struct PreparedRequest {
+    budget: RequestBudget,
     scope: WorkScope,
     changes: Arc<[ChangeRecord]>,
 }

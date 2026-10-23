@@ -80,6 +80,7 @@ struct Turn {
     proof: Option<ProtectionProof>,
     next_change: usize,
     work: u64,
+    work_limit: u64,
 }
 impl JointProgressDriver {
     pub(super) fn new(inner: Arc<Inner>, config: Arc<ValidatedJointCapacityConfig>) -> Self {
@@ -149,7 +150,10 @@ impl JointProgressDriver {
                         input: None,
                         proof: None,
                         next_change: 0,
-                        work: 0,
+                        work: u64::from(request.budget.is_finite()),
+                        work_limit: request
+                            .budget
+                            .limit(self.config.config.max_total_proof_work),
                     }))
                 })();
                 (start, idle_revision)
@@ -202,7 +206,7 @@ impl JointProgressDriver {
         }
         if turn.proof.is_none() {
             match turn.work.checked_add(1) {
-                Some(work) if work < self.config.config.max_total_proof_work => turn.work = work,
+                Some(work) if work < turn.work_limit => turn.work = work,
                 _ => {
                     self.finish(turn, Err(WorkError::Capacity("joint builder work")), false);
                     return JointProgress::More;
@@ -304,7 +308,7 @@ impl JointProgressDriver {
             }
         }
         if turn.next_change < turn.changes.len() {
-            if turn.work >= self.config.config.max_total_proof_work {
+            if turn.work >= turn.work_limit {
                 self.finish(
                     turn,
                     Err(WorkError::Capacity("joint total proof work")),
@@ -325,7 +329,7 @@ impl JointProgressDriver {
             input.profiles.push(profile);
             turn.next_change += 1;
             let mut bounds = self.config.solver_bounds();
-            bounds.max_total_work -= turn.work;
+            bounds.max_total_work = turn.work_limit - turn.work;
             turn.proof = Some(ProtectionProof::new(turn.input.take().unwrap(), bounds));
             self.active = Some(turn);
             return JointProgress::More;
@@ -335,20 +339,39 @@ impl JointProgressDriver {
     }
 
     fn reobserve(&mut self, turn: Turn) {
-        self.inner.update(|state| {
+        let work = turn.actual_work();
+        let waker = self.inner.update(|state| {
             let ledger = state.joint.as_mut().unwrap();
             if ledger.active == Some(turn.id) {
                 ledger.active = None;
             }
-            if let Some(request) = ledger.requests.get_mut(&turn.id) {
-                request.blocked_at = None;
+            let Some(request) = ledger.requests.get_mut(&turn.id) else {
+                return None;
+            };
+            if !matches!(request.phase, RequestPhase::Waiting) {
+                return None;
             }
+            if let Err(error) = work.and_then(|work| request.budget.charge(work)) {
+                return fail_request(state, turn.id, error);
+            }
+            if request.budget.exhausted() {
+                return fail_request(
+                    state,
+                    turn.id,
+                    WorkError::Capacity("joint finite proof work"),
+                );
+            }
+            request.blocked_at = None;
+            None
         });
-        // The request cursor already points at this ticket. Keep it there so
-        // other queued work gets a turn before this fresh observation.
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        // Keep the original cursor so other queued work gets its next fair turn.
     }
 
     fn finish(&mut self, turn: Turn, verdict: Result<(), WorkError>, infeasible: bool) {
+        let work = turn.actual_work();
         let waker = self.inner.update(|state| {
             let ledger = state.joint.as_mut().unwrap();
             if ledger.active == Some(turn.id) {
@@ -384,14 +407,34 @@ impl JointProgressDriver {
             if !waiting {
                 return None;
             }
+            let request = ledger.requests.get_mut(&turn.id).unwrap();
+            if let Err(error) = work.and_then(|work| request.budget.charge(work)) {
+                return fail_request(state, turn.id, error);
+            }
+            let finite = request.budget.is_finite();
+            let exhausted = request.budget.exhausted();
             // Amount-only frees make a positive proof conservative. Rekeying a
             // live charge can move it behind the snapshot cursor, so layout
             // changes invalidate every verdict and rotate this request fairly.
             if ledger.profile_layout_revision != turn.layout_revision {
+                if exhausted {
+                    return fail_request(
+                        state,
+                        turn.id,
+                        WorkError::Capacity("joint finite proof work"),
+                    );
+                }
                 ledger.requests.get_mut(&turn.id).unwrap().blocked_at = None;
                 return None;
             }
             if infeasible {
+                if finite {
+                    return fail_request(
+                        state,
+                        turn.id,
+                        WorkError::Capacity("joint protected intersections"),
+                    );
+                }
                 let epoch = ledger.release_epoch;
                 ledger.requests.get_mut(&turn.id).unwrap().blocked_at =
                     (turn.release_epoch == epoch).then_some(epoch);
@@ -417,6 +460,12 @@ impl JointProgressDriver {
 }
 
 impl Turn {
+    fn actual_work(&self) -> Result<u64, WorkError> {
+        self.work
+            .checked_add(self.proof.as_ref().map_or(0, ProtectionProof::work_used))
+            .ok_or(WorkError::ArithmeticOverflow)
+    }
+
     fn push_record(
         &mut self,
         record: ProfileRecord,

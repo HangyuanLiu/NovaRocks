@@ -1573,3 +1573,153 @@ fn matching_numeric_claim_ids_do_not_cross_original_authorities() {
     assert_eq!(held(&control), (1, 10));
     assert_eq!(held(&foreign), (1, 20));
 }
+
+#[test]
+fn finite_growth_refuses_self_held_shortage_without_parking_or_releasing_base() {
+    let (control, handle, mut driver) = control();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let scope = root.owner.scope();
+    let a = dependency(&handle, "a");
+    let b = dependency(&handle, "b");
+    let mut initial = request(&handle, &scope, &[&a], JointLane::Foreground, 2);
+    drive(&mut driver);
+    let original = granted(&mut initial).pop().unwrap();
+    let mut growth = handle
+        .request_finite(
+            &scope,
+            vec![JointClaimChange::grow_by(
+                original.view().unwrap(),
+                bytes(1),
+                vec![],
+            )],
+            std::num::NonZeroU64::new(10_000_000).unwrap(),
+        )
+        .unwrap();
+    drive(&mut driver);
+    assert!(matches!(
+        poll(&mut growth),
+        Poll::Ready(Err(JointAdmissionFailure {
+            error: WorkError::Capacity("joint protected intersections")
+        }))
+    ));
+    assert_eq!(original.amounts().unwrap(), bytes(2));
+    assert_eq!(held(&control), (1, 2));
+    let mut healthy = handle
+        .request_finite(
+            &scope,
+            vec![JointClaimChange::New {
+                dependencies: vec![b],
+                lane: JointLane::Foreground,
+                amounts: bytes(1),
+            }],
+            std::num::NonZeroU64::new(10_000_000).unwrap(),
+        )
+        .unwrap();
+    drive(&mut driver);
+    let healthy = granted(&mut healthy);
+    assert_eq!(held(&control), (2, 3));
+    drop((healthy, original));
+}
+
+#[test]
+fn finite_proof_budget_survives_actual_layout_reobservations_before_builder_work() {
+    let (control, handle, mut driver) = roomy_control();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let scope = root.owner.scope();
+    let a = dependency(&handle, "a");
+    let b = dependency(&handle, "b");
+    let mut originals = Vec::new();
+    let mut receipts = Vec::new();
+    for _ in 0..3 {
+        let mut initial = request(&handle, &scope, &[&a], JointLane::Foreground, 10);
+        drive(&mut driver);
+        let original = granted(&mut initial).pop().unwrap();
+        let mut extension = handle
+            .request(
+                &scope,
+                vec![JointClaimChange::grow_by(
+                    original.view().unwrap(),
+                    bytes(0),
+                    vec![b.clone()],
+                )],
+            )
+            .unwrap();
+        drive(&mut driver);
+        receipts.push(adjustment(&mut extension));
+        originals.push(original);
+    }
+    let mut finite = handle
+        .request_finite(
+            &scope,
+            vec![JointClaimChange::New {
+                dependencies: vec![b],
+                lane: JointLane::Foreground,
+                amounts: bytes(1),
+            }],
+            std::num::NonZeroU64::new(3).unwrap(),
+        )
+        .unwrap();
+    let id = {
+        let state = control.inner.state.lock().unwrap();
+        *state
+            .joint
+            .as_ref()
+            .unwrap()
+            .requests
+            .iter()
+            .find(|(_, request)| matches!(request.phase, ledger::RequestPhase::Waiting))
+            .unwrap()
+            .0
+    };
+    for receipt in receipts {
+        for _ in 0..100 {
+            driver.step();
+            if control
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .joint
+                .as_ref()
+                .unwrap()
+                .active
+                == Some(id)
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            control
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .joint
+                .as_ref()
+                .unwrap()
+                .active,
+            Some(id)
+        );
+        // A real granted extension returns to its old DI before the first
+        // builder step. Each reobservation must still debit the same budget.
+        drop(receipt);
+        driver.step();
+    }
+    drive(&mut driver);
+    assert!(matches!(
+        poll(&mut finite),
+        Poll::Ready(Err(JointAdmissionFailure {
+            error: WorkError::Capacity("joint finite proof work")
+        }))
+    ));
+    assert_eq!(held(&control), (3, 30));
+    for original in &originals {
+        assert_eq!(original.amounts().unwrap(), bytes(10));
+    }
+    drop(originals);
+    assert_eq!(held(&control), (0, 0));
+}
