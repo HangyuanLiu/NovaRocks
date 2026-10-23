@@ -26,7 +26,9 @@ struct DependencyCell {
     record: Option<DependencyRecord>,
 }
 struct DependencySlot {
-    cell: Arc<DependencyCell>,
+    // The fixed slot is prepaid at startup. Its original anchor is created
+    // on first use, then retained across every exact reset and generation.
+    cell: Option<Arc<DependencyCell>>,
     next_free: Option<usize>,
     published: bool,
 }
@@ -143,7 +145,7 @@ impl DependencyRegistry {
             .map_err(|_| WorkError::Capacity("joint dependency queue"))?;
         for index in 0..count {
             slots.push(DependencySlot {
-                cell: Arc::new(DependencyCell { record: None }),
+                cell: None,
                 next_free: (index + 1 < count).then_some(index + 1),
                 published: false,
             });
@@ -186,7 +188,12 @@ impl DependencyRegistry {
             .aliases
             .checked_add(1)
             .expect("bounded private dependency aliases");
-        let cell = Arc::clone(&self.slots[index].cell);
+        let cell = Arc::clone(
+            self.slots[index]
+                .cell
+                .as_ref()
+                .expect("canonical occupied cell"),
+        );
         row.aliases = aliases;
         Some(DependencyRef {
             cell: Some(cell),
@@ -216,7 +223,10 @@ impl DependencyRegistry {
         assert_eq!(row.aliases, 0);
         assert!(!row.linked);
         let slot = &mut self.slots[index];
-        let cell = Arc::get_mut(&mut slot.cell).expect("zero aliases exited before reuse");
+        let anchor = slot
+            .cell
+            .get_or_insert_with(|| Arc::new(DependencyCell { record: None }));
+        let cell = Arc::get_mut(anchor).expect("zero aliases exited before reuse");
         assert!(cell.record.is_none());
         self.free = slot.next_free.take();
         cell.record = Some(DependencyRecord {
@@ -228,7 +238,7 @@ impl DependencyRegistry {
         row.aliases = 1;
         self.canonical.insert(fact, index);
         Ok(DependencyRef {
-            cell: Some(Arc::clone(&slot.cell)),
+            cell: Some(Arc::clone(slot.cell.as_ref().unwrap())),
             zero: Arc::clone(&self.zero),
             index,
             generation,
@@ -237,7 +247,10 @@ impl DependencyRegistry {
     pub(super) fn mark_published(&mut self, record: &DependencyRef) {
         assert!(Arc::ptr_eq(&self.zero, &record.zero));
         let slot = &mut self.slots[record.index];
-        assert!(Arc::ptr_eq(&slot.cell, record.cell.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(
+            slot.cell.as_ref().unwrap(),
+            record.cell.as_ref().unwrap()
+        ));
         slot.published = true;
     }
     /// O(1) queue removal plus the original canonical BTree removal. Data
@@ -248,7 +261,8 @@ impl DependencyRegistry {
         let Some(index) = zero.head else { return false };
         assert_eq!(zero.rows[index].aliases, 0);
         let slot = &mut self.slots[index];
-        let cell = Arc::get_mut(&mut slot.cell).expect("all actual data aliases exited");
+        let cell = Arc::get_mut(slot.cell.as_mut().expect("occupied zero cell"))
+            .expect("all actual data aliases exited");
         let record = cell.record.take().expect("occupied zero row");
         let removed = self.canonical.remove(&record.fact);
         assert_eq!(removed, Some(index));
@@ -272,6 +286,8 @@ pub(super) fn backing_bytes(count: usize) -> Result<usize, WorkError> {
         array_bytes::<DependencySlot>(count)?,
         array_bytes::<RowLinks>(count)?,
         arc_bytes::<Mutex<ZeroRows>>()?,
+        // Charge the full original inventory even though unused anchors are
+        // materialized lazily; no capacity is minted on first allocation.
         count
             .checked_mul(sum_bytes([
                 arc_bytes::<DependencyCell>()?,
@@ -299,7 +315,17 @@ mod tests {
     #[test]
     fn canonical_aliases_revive_and_only_actual_exit_allows_reuse() {
         let mut registry = DependencyRegistry::new(1).unwrap();
+        assert!(registry.slots.iter().all(|slot| slot.cell.is_none()));
         let a = registry.insert(SharedDependency::LocalHost, 1).unwrap();
+        let original_anchor = Arc::as_ptr(a.cell.as_ref().unwrap());
+        assert_eq!(
+            registry
+                .slots
+                .iter()
+                .filter(|slot| slot.cell.is_some())
+                .count(),
+            1
+        );
         let alias = a.clone();
         drop(a);
         assert!(!registry.reap_one());
@@ -318,9 +344,53 @@ mod tests {
         assert!(registry.lookup(&SharedDependency::LocalHost).is_none());
         assert_eq!(b.ordinal, 3);
         assert_eq!(b.generation, 2);
+        assert_eq!(Arc::as_ptr(b.cell.as_ref().unwrap()), original_anchor);
         drop(b);
         assert!(registry.reap_one());
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn unused_dependency_slots_do_not_materialize_anchors_or_advance_generation() {
+        let mut registry = DependencyRegistry::new(16).unwrap();
+        assert!(registry.slots.iter().all(|slot| slot.cell.is_none()));
+        registry.zero.lock().unwrap().rows[0].generation = u64::MAX;
+        assert!(matches!(
+            registry.insert(SharedDependency::LocalHost, 1),
+            Err(WorkError::ArithmeticOverflow)
+        ));
+        assert_eq!(registry.free, Some(0));
+        assert!(registry.is_empty());
+        assert!(registry.slots.iter().all(|slot| slot.cell.is_none()));
+        registry.zero.lock().unwrap().rows[0].generation = 0;
+        let a = registry.insert(SharedDependency::LocalHost, 1).unwrap();
+        let b = registry.insert(network(1), 2).unwrap();
+        assert_eq!(
+            registry
+                .slots
+                .iter()
+                .filter(|slot| slot.cell.is_some())
+                .count(),
+            2
+        );
+        assert!(
+            registry.zero.lock().unwrap().rows[2..]
+                .iter()
+                .all(|row| row.generation == 0)
+        );
+        drop(a);
+        drop(b);
+        assert!(registry.reap_one());
+        assert!(registry.reap_one());
+        assert_eq!(
+            registry
+                .slots
+                .iter()
+                .filter(|slot| slot.cell.is_some())
+                .count(),
+            2,
+            "actual original anchors stay prepaid and stable after reset"
+        );
     }
 
     #[test]
