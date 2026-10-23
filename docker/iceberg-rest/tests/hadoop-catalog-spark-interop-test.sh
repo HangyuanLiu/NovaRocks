@@ -50,7 +50,7 @@ novarocks_table="novarocks_created"
 tmp_dir=$(mktemp -d "$NOVA_ENV_RUNTIME_DIR/hadoop-catalog-spark-interop.XXXXXX")
 artifact="$tmp_dir/interop.log"
 server_log="$tmp_dir/novarocks.log"
-server_pid_file="$tmp_dir/server.pid"
+server_stop_file="$tmp_dir/server.stop"
 server_receipt="$tmp_dir/server.process.json"
 server_owner_pid=""
 process_owner="$script_dir/hadoop-catalog-spark-interop-owner.py"
@@ -61,30 +61,18 @@ cleanup() {
     local primary=$? settle=0 cleanup_status=0 owner_status=0
     trap - EXIT INT TERM
     if [[ -n "$server_owner_pid" ]]; then
-        if [[ ! -s "$server_receipt" ]] || ! python3 - "$server_receipt" <<'PYWAITED'
-import json,sys
-raise SystemExit(0 if json.load(open(sys.argv[1])).get("child_waited") is True else 1)
-PYWAITED
-        then
-            if [[ -f "$server_pid_file" ]] && kill -0 "$server_owner_pid" >/dev/null 2>&1; then
-                local child_pid
-                child_pid=$(cat "$server_pid_file")
-                if [[ "$child_pid" =~ ^[1-9][0-9]*$ ]]; then
-                    kill -TERM -- "-$child_pid" >/dev/null 2>&1 || true
-                else
-                    settle=1
-                fi
-            else
-                settle=1
-                kill -TERM "$server_owner_pid" >/dev/null 2>&1 || true
-            fi
-        fi
+        # Only the child owner may signal its still-owned Server process group.
+        # A request file remains harmless after that exact child has exited.
+        : > "$server_stop_file"
         wait "$server_owner_pid" || owner_status=$?
         printf '%s\n' "$owner_status" > "$tmp_dir/server-owner.exit"
+        if (( primary == 0 && owner_status != 0 )); then
+            primary=$owner_status
+        fi
     fi
     python3 "$process_owner" check --directory "$tmp_dir" > "$tmp_dir/writer-exit.log" 2>&1 || settle=$?
     if (( settle != 0 )); then
-        printf '%s\n' 'WriterExitUnknown: run retained; cleanup was not dispatched' > "$tmp_dir/cleanup.log"
+        printf '%s\n' 'WriterCleanupBlocked: run retained; cleanup was not dispatched' > "$tmp_dir/cleanup.log"
         cleanup_status=1
     elif [[ "$owns_fixture_run" != true ]]; then
         printf '%s\n' 'cleanup=deferred owner=inherited-original-run' > "$tmp_dir/cleanup.log"
@@ -244,7 +232,7 @@ cp "$receipt" "$tmp_dir/artifacts-used.json"
 python3 "$fixture_dir/fixture_run.py" command --env-file "$publication/env.sh" -- \
     "$NOVAROCKS_BIN" --build-info > "$tmp_dir/server-build-info.json"
 NO_PROXY=127.0.0.1,localhost python3 "$process_owner" run --kind server \
-    --env-file "$publication/env.sh" --receipt "$server_receipt" --pid-file "$server_pid_file" -- \
+    --env-file "$publication/env.sh" --receipt "$server_receipt" --stop-file "$server_stop_file" -- \
     "$NOVAROCKS_BIN" standalone --role all-in-one \
     --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG" > "$server_log" 2>&1 &
 server_owner_pid=$!
@@ -316,7 +304,9 @@ log "novarocks_created_uuid=$novarocks_uuid"
 log "novarocks_created_location=$novarocks_location"
 log "novarocks_created_v1_sha256=$novarocks_digest"
 
+spark_identity_sentinel="IRU_6C_SPARK_IDENTITY_OK_${run_token}"
 cat > "$tmp_dir/spark-load.scala" <<EOF
+{
 import org.apache.iceberg.spark.Spark3Util
 
 val sparkCreated = Spark3Util.loadIcebergTable(spark, "nr_hadoop.$namespace.$spark_table")
@@ -328,10 +318,14 @@ val novarocksCreated = Spark3Util.loadIcebergTable(spark, "nr_hadoop.$namespace.
 require(novarocksCreated.uuid().toString == "$novarocks_uuid", "NovaRocks-created UUID mismatch")
 require(novarocksCreated.location() == "$novarocks_location", "NovaRocks-created location mismatch")
 println("SPARK_TABLE_FACTS table=$novarocks_table uuid=" + novarocksCreated.uuid() + " location=" + novarocksCreated.location())
+println("$spark_identity_sentinel")
+}
 EOF
 
 log "phase=spark-load-novarocks-table"
-spark_shell "$tmp_dir/spark-load.scala" 2>&1 | tee -a "$artifact"
+spark_shell "$tmp_dir/spark-load.scala" 2>&1 | tee -a "$artifact" "$tmp_dir/spark-load.out"
+grep -Fxq "$spark_identity_sentinel" "$tmp_dir/spark-load.out" || \
+    fail "Spark identity assertions did not reach their completion marker"
 
 log "phase=spark-no-hint-overwrite-probe"
 mc_remove "$novarocks_hint_object"

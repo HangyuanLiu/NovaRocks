@@ -146,10 +146,8 @@ impl PreparedCatalogDispatch for HadoopPreparedCreate {
         if let Err(error) = HadoopFileSystemCatalog::check_publication_budget(Some(context)) {
             return not_dispatched(error);
         }
-        if residual_hint {
-            if let Err(error) = publication::delete_authorized(&binding, &hint).await {
-                return not_dispatched(error);
-            }
+        if residual_hint && let Err(error) = publication::delete_authorized(&binding, &hint).await {
+            return not_dispatched(error);
         }
         let install = FrozenInstallation {
             location: self.attempt.facts.metadata_location.clone(),

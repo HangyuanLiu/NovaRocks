@@ -441,3 +441,128 @@ fn wall_deadline(deadline: Instant) -> Result<u64> {
         )?)
         .context("fencing wall deadline overflow")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sleeping_child(pid_file: &Path) -> ManagedCommand {
+        let mut command = ManagedCommand::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "printf '%s\\n' \"$$\" > \"$1\"; exec /bin/sleep 60",
+                "fencing-timeout-child",
+            ])
+            .arg(pid_file);
+        command
+    }
+
+    fn assert_process_absent(pid: u32, complete_end: Instant) -> Result<()> {
+        let mut probe = ManagedCommand::new("/bin/kill");
+        probe
+            .arg("-0")
+            .arg(pid.to_string())
+            .terminate_at(complete_end - Duration::from_secs(1), complete_end);
+        let outcome = capture_command_until(
+            probe,
+            tempfile::tempfile()?,
+            tempfile::tempfile()?,
+            complete_end,
+        )?;
+        ensure!(
+            !outcome.timed_out && outcome.failures.is_empty(),
+            "process-exit observation did not settle; diagnostics={}",
+            outcome.diagnostic_root().display()
+        );
+        ensure!(
+            !outcome.output.status.success(),
+            "fencing child {pid} still exists after the parent observed clean monitor completion"
+        );
+        outcome.release_diagnostics()?;
+        Ok(())
+    }
+
+    /// The private caller must retain the actual child groups until both
+    /// monitors settle. Work expiry stays failed and cannot authorize a new
+    /// pair, while a separate complete clock permits the local cleanup path.
+    #[test]
+    fn expired_pair_waits_for_actual_children_and_refuses_new_work() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let pid_files = [
+            directory.path().join("first.pid"),
+            directory.path().join("second.pid"),
+        ];
+        let mut owner = RunOwner::local()?;
+        owner.work_end = Instant::now() + Duration::from_secs(2);
+        owner.complete_end = owner.work_end + Duration::from_secs(10);
+        owner.environment.insert(
+            CHILD_WORK_END_ENV.to_owned(),
+            wall_deadline(owner.work_end)?.to_string(),
+        );
+        let original_work = owner.work_end;
+        let original_complete = owner.complete_end;
+        let result =
+            owner.capture_pair([sleeping_child(&pid_files[0]), sleeping_child(&pid_files[1])]);
+        ensure!(
+            result.is_err(),
+            "sleeping children cannot finish within the original work budget"
+        );
+        ensure!(
+            Instant::now() >= original_work,
+            "the original work deadline must actually expire"
+        );
+        ensure!(
+            owner.work_end == original_work && owner.complete_end == original_complete,
+            "child settlement must not renew either original clock"
+        );
+        // capture_pair sets this fact only for captures whose monitor has
+        // actually exited with a validated clean Final, or the typed expiry
+        // emitted after that same validation. Check real process absence as an
+        // independent observation rather than accepting the failure alone.
+        ensure!(
+            owner.writers_settled,
+            "both actual monitor Final records must prove clean settlement"
+        );
+        let pids = pid_files.map(|file| -> Result<u32> {
+            Ok(std::fs::read_to_string(file)
+                .context("the timeout test requires both real sleeping children to have started")?
+                .trim()
+                .parse()?)
+        });
+        let [first, second] = pids;
+        let (first, second) = (first?, second?);
+        ensure!(
+            first != second,
+            "the timeout test requires two independent child processes"
+        );
+        assert_process_absent(first, original_complete)?;
+        assert_process_absent(second, original_complete)?;
+        owner
+            .cleanup()
+            .context("confirmed writer exit permits the local cleanup path")?;
+
+        let forbidden = directory.path().join("must-not-start");
+        let new_child = || {
+            let mut command = ManagedCommand::new("/bin/sh");
+            command
+                .args(["-c", "printf started > \"$1\"", "fencing-forbidden-child"])
+                .arg(&forbidden);
+            command
+        };
+        ensure!(
+            owner.capture_pair([new_child(), new_child()]).is_err(),
+            "an expired run must refuse another pair before either process starts"
+        );
+        ensure!(!forbidden.exists(), "expired work started a new child");
+        ensure!(
+            owner.writers_settled,
+            "refusing new work must preserve the original settlement fact"
+        );
+        ensure!(
+            owner.run(|_| Ok(())).is_err(),
+            "a clean local teardown cannot turn expired work into success"
+        );
+        Ok(())
+    }
+}
