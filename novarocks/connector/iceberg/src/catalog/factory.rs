@@ -276,66 +276,79 @@ mod tests {
     /// Hadoop enumeration has no paging, so its directory listing is bounded
     /// as a whole: an over-bound namespace is refused with its typed bound on
     /// both the generation path and the admitted-read path, never truncated.
-    #[tokio::test]
-    async fn hadoop_table_listing_over_its_bound_is_refused_not_truncated() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        for table in ["a", "b", "c"] {
-            let metadata = warehouse.path().join("db").join(table).join("metadata");
-            std::fs::create_dir_all(&metadata).expect("metadata directory");
-            std::fs::write(metadata.join("version-hint.text"), b"1\n").expect("version hint");
-        }
-        let catalog = adopted(&hadoop_configuration(warehouse.path()))
-            .await
-            .expect("catalog");
-        let runtime = tokio::runtime::Handle::current();
-        let binding = || {
-            crate::access_binding::IcebergReadBinding::new(
-                None,
-                FsAccessResolver::new(),
-                Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-                Arc::new(TokioFileTaskSpawner::new(runtime.clone())),
-            )
-            .for_request(
-                novarocks_spi::connector::ConnectorRequestContext::try_new(
-                    std::time::Instant::now() + std::time::Duration::from_secs(5),
-                    novarocks_spi::connector::ConnectorStopOwner::new().view(),
-                    1024,
-                    4096,
-                )
-                .unwrap(),
-            )
-        };
-        let namespace = || CatalogNamespaceName::new("db");
-        let exact = ConnectorListingBound {
-            entries: 3,
-            ..ConnectorListingBound::V1
-        };
-        let over = ConnectorListingBound {
-            entries: 2,
-            ..exact
-        };
+    #[test]
+    fn hadoop_table_listing_over_its_bound_is_refused_not_truncated() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let bridge = crate::resources::IcebergCatalogRuntime::new(runtime.handle().clone());
+        bridge
+            .block_on(async move {
+                let warehouse = tempfile::tempdir().expect("warehouse");
+                let catalog = adopted(&hadoop_configuration(warehouse.path()))
+                    .await
+                    .expect("catalog");
+                assert!(matches!(
+                    namespace_fixture(Arc::clone(&catalog)).await,
+                    CatalogOutcome::KnownCommitted { .. }
+                ));
+                // A hint alone is no table. Publish real complete versions through
+                // the production owner so this fixture tests the enumeration bound.
+                for table in ["a", "b", "c"] {
+                    assert!(matches!(
+                        create_fixture(Arc::clone(&catalog), "db", table).await,
+                        CatalogOutcome::KnownCommitted { .. }
+                    ));
+                }
+                let runtime = tokio::runtime::Handle::current();
+                let binding = || {
+                    crate::access_binding::IcebergReadBinding::new(
+                        None,
+                        FsAccessResolver::new(),
+                        Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+                        Arc::new(TokioFileTaskSpawner::new(runtime.clone())),
+                    )
+                    .for_request(
+                        novarocks_spi::connector::ConnectorRequestContext::try_new(
+                            std::time::Instant::now() + std::time::Duration::from_secs(5),
+                            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+                            1024,
+                            4096,
+                        )
+                        .unwrap(),
+                    )
+                };
+                let namespace = || CatalogNamespaceName::new("db");
+                let exact = ConnectorListingBound {
+                    entries: 3,
+                    ..ConnectorListingBound::V1
+                };
+                let over = ConnectorListingBound {
+                    entries: 2,
+                    ..exact
+                };
 
-        assert_eq!(
-            catalog.list_tables(namespace(), exact).await.unwrap(),
-            ["a", "b", "c"]
-        );
-        assert_eq!(
-            catalog
-                .list_tables_for_read(namespace(), binding(), exact)
-                .await
-                .unwrap(),
-            ["a", "b", "c"]
-        );
-        for error in [
-            catalog.list_tables(namespace(), over).await.unwrap_err(),
-            catalog
-                .list_tables_for_read(namespace(), binding(), over)
-                .await
-                .unwrap_err(),
-        ] {
-            assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
-            assert!(error.message().contains("entries bound"), "{error}");
-        }
+                assert_eq!(
+                    catalog.list_tables(namespace(), exact).await.unwrap(),
+                    ["a", "b", "c"]
+                );
+                assert_eq!(
+                    catalog
+                        .list_tables_for_read(namespace(), binding(), exact)
+                        .await
+                        .unwrap(),
+                    ["a", "b", "c"]
+                );
+                for error in [
+                    catalog.list_tables(namespace(), over).await.unwrap_err(),
+                    catalog
+                        .list_tables_for_read(namespace(), binding(), over)
+                        .await
+                        .unwrap_err(),
+                ] {
+                    assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+                    assert!(error.message().contains("entries bound"), "{error}");
+                }
+            })
+            .expect("publication bridge must exit before test cleanup");
     }
 
     /// Absence must be readable from the error's kind alone.
@@ -674,11 +687,15 @@ mod tests {
     async fn hadoop_create_freezer_preserves_trailing_slash_protocol_location() {
         use crate::catalog::catalog_request::CatalogCreatePublicationRequest;
         let warehouse = tempfile::tempdir().unwrap();
-        let owner = adopted(&hadoop_configuration(warehouse.path()))
-            .await
-            .unwrap();
+        let configuration = hadoop_configuration(warehouse.path());
+        let owner = adopted(&configuration).await.unwrap();
         let mut request = creation("t");
-        let location = format!("{}/explicit/", warehouse.path().display());
+        // An explicit location may retain a trailing slash, but it must name
+        // this identifier's configured root, including local canonicalization.
+        let location = format!(
+            "{}/db/t/",
+            configuration.warehouse_uri.trim_end_matches('/')
+        );
         request.location = Some(location.clone());
         let frozen = owner
             .freeze_create_publication(CatalogCreatePublicationRequest {

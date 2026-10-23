@@ -455,7 +455,9 @@ fn conditional_rejection_cannot_invent_negative_evidence_after_readback_deadline
         seed(&fixture, &foreign_bytes(&fixture, true));
         let preparation = fixture.binding.request_context().unwrap().clone();
         fixture.evidence = CatalogEvidencePolicy {
-            evidence: Duration::from_millis(50),
+            // Permit ordinary operator setup; the exact post-install fault
+            // expires this grant only after AlreadyExists has been observed.
+            evidence: Duration::from_secs(5),
             ..Default::default()
         }
         .begin_evidence(&preparation)
@@ -475,12 +477,14 @@ fn conditional_rejection_cannot_invent_negative_evidence_after_readback_deadline
             )
             .await;
         assert!(
-            matches!(outcome, DispatchEvidence::Unknown { failure, .. } if failure.kind() == ConnectorMutationFailureKind::DeadlineExceeded)
-        );
-        assert!(
             !fixture
                 .catalog
-                .take_test_fault(HadoopCatalogTestFault::BeforeConditionalReadEvidenceExpiry)
+                .take_test_fault(HadoopCatalogTestFault::BeforeConditionalReadEvidenceExpiry),
+            "the exact post-install readback fault must be reached: {outcome:?}"
+        );
+        assert!(
+            matches!(&outcome, DispatchEvidence::Unknown { failure, .. } if failure.kind() == ConnectorMutationFailureKind::DeadlineExceeded),
+            "expired readback cannot establish NoOp or a definite rejection: {outcome:?}"
         );
     });
 }
