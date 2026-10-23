@@ -352,6 +352,12 @@ async fn factory_panic_does_not_destroy_an_owner_already_received_by_its_stable_
     let PollCompletion::Panicked(failed) = bank.progress_turn(budget()).unwrap() else {
         panic!("factory panic must be isolated");
     };
+    assert_eq!(
+        failed.value().primary().downcast_ref::<&'static str>(),
+        Some(&"intentional role factory panic after original owner handoff")
+    );
+    assert!(failed.value().cleanup().is_none());
+    assert!(failed.value().output().is_none());
     assert_eq!(held.lock().unwrap().as_ref().unwrap().scope().id(), work);
     assert_eq!(
         control.inner.state.lock().unwrap().nodes[&work].owner,
@@ -820,4 +826,158 @@ async fn closed_mount_refusal_never_calls_unrelated_waiter_wakes() {
         "an unpublished refusal must return before any notification callback"
     );
     assert!(bank.ready.is_empty());
+}
+
+struct TrackedRolePanic {
+    stage: &'static str,
+    inner: Arc<Inner>,
+    drops: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl Drop for TrackedRolePanic {
+    fn drop(&mut self) {
+        assert!(
+            self.inner.state.try_lock().is_ok(),
+            "original panic exits outside State"
+        );
+        self.drops.fetch_add(1, Ordering::AcqRel);
+    }
+}
+struct TrackedRoleOutput {
+    inner: Arc<Inner>,
+    drops: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl Drop for TrackedRoleOutput {
+    fn drop(&mut self) {
+        assert!(
+            self.inner.state.try_lock().is_ok(),
+            "original output exits outside State"
+        );
+        self.drops.fetch_add(1, Ordering::AcqRel);
+    }
+}
+struct TrackedFailureInput {
+    poll_panics: bool,
+    cleanup_panics: bool,
+    inner: Arc<Inner>,
+    poll_drops: Arc<std::sync::atomic::AtomicUsize>,
+    cleanup_drops: Arc<std::sync::atomic::AtomicUsize>,
+    output_drops: Arc<std::sync::atomic::AtomicUsize>,
+}
+struct TrackedFailureRole {
+    owner: Option<WorkOwner>,
+    input: TrackedFailureInput,
+}
+fn make_tracked_failure(owner: WorkOwner, input: TrackedFailureInput) -> TrackedFailureRole {
+    TrackedFailureRole {
+        owner: Some(owner),
+        input,
+    }
+}
+impl Future for TrackedFailureRole {
+    type Output = TrackedRoleOutput;
+    fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        self.owner.take().unwrap().complete();
+        if self.input.poll_panics {
+            std::panic::panic_any(TrackedRolePanic {
+                stage: "poll",
+                inner: Arc::clone(&self.input.inner),
+                drops: Arc::clone(&self.input.poll_drops),
+            });
+        }
+        Poll::Ready(TrackedRoleOutput {
+            inner: Arc::clone(&self.input.inner),
+            drops: Arc::clone(&self.input.output_drops),
+        })
+    }
+}
+impl Drop for TrackedFailureRole {
+    fn drop(&mut self) {
+        if self.input.cleanup_panics {
+            std::panic::panic_any(TrackedRolePanic {
+                stage: "cleanup",
+                inner: Arc::clone(&self.input.inner),
+                drops: Arc::clone(&self.input.cleanup_drops),
+            });
+        }
+    }
+}
+
+#[tokio::test]
+async fn original_poll_and_cleanup_causes_and_ready_output_keep_the_same_footer() {
+    use std::sync::atomic::AtomicUsize;
+    for poll_panics in [true, false] {
+        let roles = [PollRoleGeometry::for_factory(&make_tracked_failure).unwrap()];
+        let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
+        let mut bank = RolePollBank::install(&mut control, 0, make_tracked_failure).unwrap();
+        control.mark_ready().unwrap();
+        let failed = new_root(&control);
+        let observer = failed.owner.retirement_observer().unwrap();
+        let peer = new_root(&control);
+        let poll_drops = Arc::new(AtomicUsize::new(0));
+        let cleanup_drops = Arc::new(AtomicUsize::new(0));
+        let output_drops = Arc::new(AtomicUsize::new(0));
+        let input = |poll_panics, cleanup_panics| TrackedFailureInput {
+            poll_panics,
+            cleanup_panics,
+            inner: Arc::clone(&control.inner),
+            poll_drops: Arc::clone(&poll_drops),
+            cleanup_drops: Arc::clone(&cleanup_drops),
+            output_drops: Arc::clone(&output_drops),
+        };
+        failed.business.release();
+        peer.business.release();
+        bank.mount_owned(failed.owner, input(poll_panics, true))
+            .unwrap_or_else(|_| panic!("original failed role"));
+        bank.mount_owned(peer.owner, input(false, false))
+            .unwrap_or_else(|_| panic!("original peer"));
+        let PollCompletion::Panicked(failed) = bank.progress_turn(budget()).unwrap() else {
+            panic!("original failure packet")
+        };
+        let packet = failed.value();
+        let primary = packet.primary().downcast_ref::<TrackedRolePanic>().unwrap();
+        assert_eq!(primary.stage, if poll_panics { "poll" } else { "cleanup" });
+        if poll_panics {
+            assert_eq!(
+                packet
+                    .cleanup()
+                    .unwrap()
+                    .downcast_ref::<TrackedRolePanic>()
+                    .unwrap()
+                    .stage,
+                "cleanup"
+            );
+            assert!(packet.output().is_none());
+        } else {
+            assert!(packet.cleanup().is_none());
+            assert!(
+                packet.output().is_some(),
+                "Ready output survives its frame's failing destructor"
+            );
+        }
+        assert_eq!(poll_drops.load(Ordering::Acquire), 0);
+        assert_eq!(cleanup_drops.load(Ordering::Acquire), 0);
+        assert_eq!(output_drops.load(Ordering::Acquire), 0);
+        let PollCompletion::Ready(peer) = bank.progress_turn(budget()).unwrap() else {
+            panic!("peer still runs")
+        };
+        drop(peer);
+        assert_eq!(output_drops.load(Ordering::Acquire), 1);
+        drain(&mut driver);
+        assert_eq!(
+            observer.is_reclaimed(),
+            Ok(false),
+            "original packet still owns the footer"
+        );
+        drop(failed);
+        assert_eq!(poll_drops.load(Ordering::Acquire), usize::from(poll_panics));
+        assert_eq!(cleanup_drops.load(Ordering::Acquire), 1);
+        assert_eq!(
+            output_drops.load(Ordering::Acquire),
+            if poll_panics { 1 } else { 2 }
+        );
+        control.close_admission();
+        drain(&mut driver);
+        assert_eq!(observer.is_reclaimed(), Ok(true));
+        assert!(control.inner.state.lock().unwrap().is_drained());
+    }
 }

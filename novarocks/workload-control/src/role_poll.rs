@@ -29,6 +29,7 @@ use crate::{
     scope::Inner,
 };
 use std::{
+    any::Any,
     future::Future,
     marker::PhantomData,
     mem::size_of,
@@ -191,9 +192,28 @@ impl<O> PollOutput<O> {
         &self.value
     }
 }
+/// The two real catch sites retain their original payloads. If frame cleanup
+/// fails after Ready, the original output remains under this same footer too.
+/// Borrowing reveals facts; it cannot detach an owned value from its custody.
+pub(crate) struct PollFailure<O> {
+    primary: Box<dyn Any + Send>,
+    cleanup: Option<Box<dyn Any + Send>>,
+    output: Option<O>,
+}
+impl<O> PollFailure<O> {
+    pub(crate) fn primary(&self) -> &(dyn Any + Send) {
+        self.primary.as_ref()
+    }
+    pub(crate) fn cleanup(&self) -> Option<&(dyn Any + Send)> {
+        self.cleanup.as_deref()
+    }
+    pub(crate) fn output(&self) -> Option<&O> {
+        self.output.as_ref()
+    }
+}
 pub(crate) enum PollCompletion<O> {
     Ready(PollOutput<O>),
-    Panicked(PollOutput<()>),
+    Panicked(PollOutput<PollFailure<O>>),
 }
 pub(crate) struct MountRejected<I> {
     pub(crate) owner: WorkOwner,
@@ -433,9 +453,8 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
             } else {
                 Ok(())
             };
-            let mut panicked = construction.is_err();
-            drop(construction);
-            if !panicked {
+            let mut primary = construction.err();
+            if primary.is_none() {
                 let waker = Waker::from(Arc::clone(&position.footer.as_ref().unwrap().wake));
                 let mut context = Context::from_waker(&waker);
                 let polled = catch_unwind(AssertUnwindSafe(|| {
@@ -449,20 +468,25 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
                 match polled {
                     Ok(Poll::Pending) => continue,
                     Ok(Poll::Ready(value)) => position.output = Some(value),
-                    Err(payload) => {
-                        drop(payload);
-                        panicked = true;
-                    }
+                    Err(payload) => primary = Some(payload),
                 }
             }
             // All frame/input temporaries and callbacks leave before the footer.
             let cleared = catch_unwind(AssertUnwindSafe(|| position.frame.as_mut().set(None)));
-            panicked |= cleared.is_err();
-            drop(cleared);
+            let mut cleanup = cleared.err();
+            if primary.is_none() {
+                primary = cleanup.take();
+            }
             let footer = position.footer.take().unwrap();
-            if panicked {
-                drop(position.output.take());
-                return Some(PollCompletion::Panicked(PollOutput { value: (), footer }));
+            if let Some(primary) = primary {
+                return Some(PollCompletion::Panicked(PollOutput {
+                    value: PollFailure {
+                        primary,
+                        cleanup,
+                        output: position.output.take(),
+                    },
+                    footer,
+                }));
             }
             return Some(PollCompletion::Ready(PollOutput {
                 value: position.output.take().unwrap(),
