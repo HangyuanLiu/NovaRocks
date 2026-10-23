@@ -1251,11 +1251,25 @@ impl WorkScope {
     /// Derivation preserves responsibility and the earliest parent deadline.
     /// It does not acquire another business or execution permit.
     pub fn child(&self, request: WorkRequest) -> Result<WorkOwner, WorkError> {
+        self.derive_child(Some(request))
+    }
+
+    /// Derive responsibility for an action of this same workload. Its class
+    /// and earliest deadline remain those of the original parent; no caller
+    /// projection can charge MV, statistics or maintenance work as Query.
+    pub fn child_inherited(&self) -> Result<WorkOwner, WorkError> {
+        self.derive_child(None)
+    }
+
+    fn derive_child(&self, request: Option<WorkRequest>) -> Result<WorkOwner, WorkError> {
         self.inner.update(|state| {
-            let root = {
+            let (root, request) = {
                 let parent = state.nodes.get(&self.id).ok_or(WorkError::Released)?;
                 parent.check(&state.cancellations)?;
-                parent.root
+                (
+                    parent.root,
+                    request.unwrap_or_else(|| WorkRequest::new(parent.class)),
+                )
             };
             if state.nodes.len() >= self.inner.config.scope_records_limit {
                 return Err(WorkError::Capacity("scope records"));

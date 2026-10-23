@@ -18,7 +18,9 @@
 //! Original Tokio task/cause retirement component regressions.
 use super::*;
 use crate::task_execution::status_intake::{ObservationIntake, StatusIntakeWake};
-use novarocks_workload_control::{RootWork, WorkloadConfig, WorkloadControl};
+use novarocks_workload_control::{
+    RootWork, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+};
 use std::sync::{
     Condvar,
     atomic::{AtomicBool, Ordering},
@@ -26,6 +28,9 @@ use std::sync::{
 use std::time::Duration;
 
 fn work(limit: usize) -> (WorkloadControl, RootWork) {
+    work_class(limit, WorkClass::Query)
+}
+fn work_class(limit: usize, class: WorkClass) -> (WorkloadControl, RootWork) {
     let control = WorkloadControl::try_new_counted(WorkloadConfig {
         scope_records_limit: limit,
         root_limit: 1,
@@ -35,9 +40,7 @@ fn work(limit: usize) -> (WorkloadControl, RootWork) {
     .unwrap()
     .owner;
     control.mark_ready().unwrap();
-    let root = control
-        .try_begin_root(WorkRequest::new(WorkClass::Query))
-        .unwrap();
+    let root = control.try_begin_root(WorkRequest::new(class)).unwrap();
     (control, root)
 }
 fn finish_work(control: WorkloadControl, root: RootWork) {
@@ -125,6 +128,34 @@ struct RawPayload {
 impl Drop for RawPayload {
     fn drop(&mut self) {
         self.held.block();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_subscription_responsibility_keeps_the_original_workload_class() {
+    for class in [
+        WorkClass::Query,
+        WorkClass::MaterializedView,
+        WorkClass::Statistics,
+        WorkClass::TableMaintenance,
+        WorkClass::Management,
+    ] {
+        let (control, root) = work_class(2, class);
+        let (mut owner, port) = owner(2);
+        let reserved = port.reserve(&root.owner.scope(), None, None).unwrap();
+        let snapshot = control.snapshot();
+        let child = snapshot
+            .scopes
+            .iter()
+            .find(|s| s.parent == Some(root.owner.scope().id()))
+            .unwrap();
+        assert_eq!(child.class, class);
+        drop(reserved);
+        let actual = owner
+            .drain_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        finish_work(control, root);
+        assert_eq!(actual, DrainObservation::Joined);
     }
 }
 

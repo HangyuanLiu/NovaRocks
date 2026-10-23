@@ -21,7 +21,7 @@
 use super::original_retirement::OriginalRetirement;
 use super::task_transport::SubscriptionState;
 use crate::task_execution::status_intake::ObservationPublisher;
-use novarocks_workload_control::{WorkClass, WorkError, WorkOwner, WorkRequest, WorkScope};
+use novarocks_workload_control::{WorkError, WorkOwner, WorkScope};
 use std::{
     any::Any,
     future::Future,
@@ -511,9 +511,7 @@ impl NativeSubscriptionPort {
                 return Err(RegistrationError::Generation);
             }
         };
-        let owner = scope
-            .child(WorkRequest::new(WorkClass::Query))
-            .map_err(RegistrationError::Work)?;
+        let owner = scope.child_inherited().map_err(RegistrationError::Work)?;
         let backing = Arc::new(Backing {
             owner: Mutex::new(Some(owner)),
             publisher,

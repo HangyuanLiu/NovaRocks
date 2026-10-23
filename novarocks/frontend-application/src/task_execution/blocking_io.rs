@@ -27,9 +27,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use novarocks_workload_control::{
-    ResultWindowAlias, WorkClass, WorkError, WorkOwner, WorkRequest, WorkScope,
-};
+use novarocks_workload_control::{ResultWindowAlias, WorkError, WorkOwner, WorkScope};
 
 use tokio::runtime::Handle;
 
@@ -108,7 +106,7 @@ impl ConnectorBlockingIoResponsibility {
         if !window.is_for_scope(scope) {
             return Err(WorkError::Conflict);
         }
-        let owner = scope.child(WorkRequest::new(WorkClass::Query))?;
+        let owner = scope.child_inherited()?;
         let delegated = match window.for_child(&owner.scope()) {
             Ok(window) => window,
             Err(error) => {
@@ -566,6 +564,7 @@ impl ConnectorBlockingIoSupervisor {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use novarocks_workload_control::{WorkClass, WorkRequest};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -675,7 +674,9 @@ pub(crate) mod tests {
         assert!(
             held.scopes
                 .iter()
-                .any(|child| child.parent == Some(scope.id()) && child.owner == OwnerState::Active)
+                .any(|child| child.parent == Some(scope.id())
+                    && child.owner == OwnerState::Active
+                    && child.class == WorkClass::Management)
         );
         assert!(supervisor.take_original_failure().is_none());
         control.close_admission();
