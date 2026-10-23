@@ -965,72 +965,14 @@ pub(crate) fn validate_chunk_carrier_encoding_observed<E: From<ChunkConstruction
     carrier: &DataType,
     observe: &mut impl FnMut(&DataType) -> Result<(), E>,
 ) -> Result<(), E> {
-    validate_chunk_carrier_encoding_at(carrier, 1, &mut 0, observe)
-}
-fn validate_chunk_carrier_encoding_at<E: From<ChunkConstructionFailure>>(
-    carrier: &DataType,
-    depth: usize,
-    nodes: &mut usize,
-    observe: &mut impl FnMut(&DataType) -> Result<(), E>,
-) -> Result<(), E> {
-    observe(carrier)?;
-    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-        return Err(E::from(ChunkConstructionFailure::from(
-            novarocks_type_contract::ValueTypeError::TooDeep,
-        )));
-    }
-    *nodes = nodes.checked_add(1).ok_or_else(|| {
-        E::from(ChunkConstructionFailure::from(
-            novarocks_type_contract::ValueTypeError::TooManyNodes,
-        ))
-    })?;
-    if *nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
-        return Err(E::from(ChunkConstructionFailure::from(
-            novarocks_type_contract::ValueTypeError::TooManyNodes,
-        )));
-    }
-    match carrier {
-        DataType::Dictionary(keys, values) => {
-            if keys.as_ref() != &DataType::Int32
-                || !matches!(values.as_ref(), DataType::Utf8 | DataType::LargeUtf8)
-            {
-                return Err(E::from(ChunkConstructionFailure::contract(
-                    ChunkSchemaViolation::DictionaryEncoding,
-                )));
+    novarocks_value_arrays::carrier::validate_engine_carrier_observed(carrier, observe).map_err(
+        |failure| match failure {
+            novarocks_value_arrays::ValueFailure::Caller(error) => error,
+            novarocks_value_arrays::ValueFailure::Value(error) => {
+                E::from(ChunkConstructionFailure::source(error))
             }
-        }
-        DataType::RunEndEncoded(_, _) => {
-            return Err(E::from(ChunkConstructionFailure::contract(
-                ChunkSchemaViolation::RunEndUnsupported,
-            )));
-        }
-        DataType::Utf8View
-        | DataType::BinaryView
-        | DataType::ListView(_)
-        | DataType::LargeListView(_) => {
-            return Err(E::from(ChunkConstructionFailure::contract(
-                ChunkSchemaViolation::ViewUnsupported,
-            )));
-        }
-        DataType::List(field)
-        | DataType::LargeList(field)
-        | DataType::FixedSizeList(field, _)
-        | DataType::Map(field, _) => {
-            validate_chunk_carrier_encoding_at(field.data_type(), depth + 1, nodes, observe)?
-        }
-        DataType::Struct(fields) => {
-            for field in fields {
-                validate_chunk_carrier_encoding_at(field.data_type(), depth + 1, nodes, observe)?;
-            }
-        }
-        DataType::Union(fields, _) => {
-            for (_, field) in fields.iter() {
-                validate_chunk_carrier_encoding_at(field.data_type(), depth + 1, nodes, observe)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
+        },
+    )
 }
 
 fn check_chunk_data_type(

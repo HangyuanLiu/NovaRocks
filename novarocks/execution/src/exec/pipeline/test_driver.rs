@@ -43,6 +43,7 @@ pub(crate) struct TestDriver<'a, O: Operator + ?Sized> {
     next: NextStep,
     turn_pending: bool,
     failure: Option<ExecutionFailure>,
+    value_conversions: novarocks_value_arrays::decode::ValueConversionContext,
 }
 impl<'a, O: Operator + ?Sized> TestDriver<'a, O> {
     pub(crate) fn new(operator: &'a mut O, state: &RuntimeState) -> Self {
@@ -57,6 +58,7 @@ impl<'a, O: Operator + ?Sized> TestDriver<'a, O> {
             turn_pending: matches!(next, NextStep::Yield),
             next,
             failure: None,
+            value_conversions: novarocks_value_arrays::decode::ValueConversionContext::default(),
         }
     }
     /// Match the real driver's local failure notification. This stops owned
@@ -66,7 +68,9 @@ impl<'a, O: Operator + ?Sized> TestDriver<'a, O> {
         if let Some(original) = &self.failure {
             return original.clone();
         }
-        StepContext::new(&self.control, &mut self.turn).report_failure(failure.clone());
+        StepContext::new(&self.control, &mut self.turn, &mut self.value_conversions)
+            .report_failure(failure.clone());
+        self.value_conversions.clear();
         self.failure = Some(failure.clone());
         self.operator.on_driver_failure();
         failure
@@ -90,9 +94,10 @@ impl<'a, O: Operator + ?Sized> TestDriver<'a, O> {
         if self.turn_pending {
             self.next_turn();
         }
-        let result = self
-            .operator
-            .try_push(&mut StepContext::new(&self.control, &mut self.turn), input);
+        let result = self.operator.try_push(
+            &mut StepContext::new(&self.control, &mut self.turn, &mut self.value_conversions),
+            input,
+        );
         match &result {
             InputResult::Accepted(Ok(step)) => {
                 self.turn_pending = matches!(step.next, NextStep::Yield);
@@ -113,15 +118,19 @@ impl<'a, O: Operator + ?Sized> TestDriver<'a, O> {
         if self.turn_pending {
             self.next_turn();
         }
-        let result = match self
-            .operator
-            .drive(&mut StepContext::new(&self.control, &mut self.turn))
-        {
+        let result = match self.operator.drive(&mut StepContext::new(
+            &self.control,
+            &mut self.turn,
+            &mut self.value_conversions,
+        )) {
             Ok(result) => result,
             Err(failure) => return Err(self.stop_failed(failure)),
         };
         self.turn_pending = matches!(result.next, NextStep::Yield);
         self.next = result.next.clone();
+        if matches!(self.next, NextStep::Finished) {
+            self.value_conversions.clear();
+        }
         Ok(result)
     }
     pub(crate) fn signal_eos(&mut self) -> ExecutionResult<()> {
@@ -131,10 +140,11 @@ impl<'a, O: Operator + ?Sized> TestDriver<'a, O> {
         if self.turn_pending {
             self.next_turn();
         }
-        if let Err(failure) = self
-            .operator
-            .finish(&mut StepContext::new(&self.control, &mut self.turn))
-        {
+        if let Err(failure) = self.operator.finish(&mut StepContext::new(
+            &self.control,
+            &mut self.turn,
+            &mut self.value_conversions,
+        )) {
             return Err(self.stop_failed(failure));
         }
         if matches!(self.next, NextStep::NeedInput) {

@@ -1938,7 +1938,8 @@ fn compiled_hash_build_prepare_missing_owner_preserves_input_and_first_cause() {
     let state = RuntimeState::default();
     let control = state.error_state();
     let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
-    let mut ctx = StepContext::new(&control, &mut work);
+    let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+    let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
     let original = input.columns()[0].clone();
     let step = build.as_mut();
     let InputResult::Rejected {
@@ -1986,7 +1987,9 @@ fn compiled_nested_loop_step_waits_before_preparation_and_drains_after_eos() {
     let mut turn = TurnWork::new(NonZeroU64::new(1).unwrap(), 0);
     let step = probe.as_mut();
     {
-        let mut ctx = StepContext::new(&error, &mut turn);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&error, &mut turn, &mut value_conversions);
         let allocated = tracker.allocated();
         let InputResult::Deferred {
             input,
@@ -2036,7 +2039,8 @@ fn compiled_nested_loop_step_waits_before_preparation_and_drains_after_eos() {
         assert_eq!(tracker.allocated(), allocated);
     }
     turn.begin_turn(1).unwrap();
-    let mut ctx = StepContext::new(&error, &mut turn);
+    let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+    let mut ctx = StepContext::new(&error, &mut turn, &mut value_conversions);
     let emitted = step.drive(&mut ctx).unwrap();
     assert!(matches!(emitted.next, NextStep::Runnable));
     let output = emitted.output.unwrap();
@@ -2109,7 +2113,9 @@ fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_curs
     let mut turn = TurnWork::new(NonZeroU64::new(1).unwrap(), 0);
     let step = probe.as_mut();
     {
-        let mut ctx = StepContext::new(&error, &mut turn);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&error, &mut turn, &mut value_conversions);
         let allocated = tracker.allocated();
         let original = input.columns()[0].clone();
         let InputResult::Deferred {
@@ -2157,7 +2163,9 @@ fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_curs
         rows.len() * rows.len() - MAX_JOIN_OUTPUT_ROWS_PER_BATCH,
     ] {
         turn.begin_turn(1).unwrap();
-        let mut ctx = StepContext::new(&error, &mut turn);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&error, &mut turn, &mut value_conversions);
         let page = step.drive(&mut ctx).unwrap();
         assert!(matches!(page.next, NextStep::Runnable));
         let page = page.output.unwrap();
@@ -2174,7 +2182,8 @@ fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_curs
         sorted(oracle(spec, &rows, &rows))
     );
     turn.begin_turn(1).unwrap();
-    let mut ctx = StepContext::new(&error, &mut turn);
+    let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+    let mut ctx = StepContext::new(&error, &mut turn, &mut value_conversions);
     let tail = step.drive(&mut ctx).unwrap();
     assert!(tail.output.is_none());
     assert!(matches!(tail.next, NextStep::Runnable));

@@ -30,6 +30,9 @@ use std::{error::Error, fmt};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChunkConstructionFailure(SharedDomainFailure);
 impl ChunkConstructionFailure {
+    pub(crate) fn missing_hydration_binding() -> Self {
+        Self::source(ChunkViolation::HydrationBinding)
+    }
     pub(crate) fn record_batch(source: arrow::error::ArrowError) -> Self {
         Self::source(ChunkRecordBatchFailure(source))
     }
@@ -360,9 +363,6 @@ pub(super) enum ChunkViolation {
     ColumnBinding {
         column: usize,
     },
-    RequiredNull {
-        column: usize,
-    },
     BatchOccurrence {
         column: usize,
     },
@@ -378,11 +378,6 @@ pub(super) enum ChunkViolation {
     HydrationBinding,
     HydrationMapEntries,
     HydrationMapArity,
-    HydrationContainer,
-    FlatDictionary {
-        column: usize,
-        field: novarocks_failure_contract::BoundedDetail,
-    },
 }
 impl fmt::Display for ChunkViolation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -411,9 +406,6 @@ impl fmt::Display for ChunkViolation {
                 f,
                 "typed chunk channel {column} carrier does not match its explicit binding"
             ),
-            Self::RequiredNull { column } => {
-                write!(f, "typed chunk required channel {column} contains nulls")
-            }
             Self::BatchOccurrence { column } => write!(
                 f,
                 "typed chunk batch occurrence {column} differs from its explicit label or nullability"
@@ -445,13 +437,6 @@ impl fmt::Display for ChunkViolation {
             Self::HydrationMapArity => {
                 f.write_str("dictionary hydration Map entries have invalid arity")
             }
-            Self::HydrationContainer => {
-                f.write_str("dictionary hydration encountered an invalid container")
-            }
-            Self::FlatDictionary { column, field } => write!(
-                f,
-                "Dictionary column '{field}' must be hydrated before flat boundary: column {column}"
-            ),
         }
     }
 }
@@ -463,7 +448,6 @@ impl FailureProjection for ChunkViolation {
             Self::ColumnRows { .. } => ExecutionReason::ChunkColumnRows,
             Self::ColumnLayout { .. } => ExecutionReason::ChunkColumnLayout,
             Self::ColumnBinding { .. } => ExecutionReason::ChunkColumnBinding,
-            Self::RequiredNull { .. } => ExecutionReason::ChunkRequiredNull,
             Self::BatchOccurrence { .. } => ExecutionReason::ChunkBatchOccurrence,
             Self::Slice { .. } => ExecutionReason::ChunkSlice,
             Self::BatchLabels => ExecutionReason::ChunkBatchLabels,
@@ -472,8 +456,6 @@ impl FailureProjection for ChunkViolation {
             Self::HydrationBinding => ExecutionReason::ChunkHydrationBinding,
             Self::HydrationMapEntries => ExecutionReason::ChunkHydrationMapEntries,
             Self::HydrationMapArity => ExecutionReason::ChunkHydrationMapArity,
-            Self::HydrationContainer => ExecutionReason::ChunkHydrationContainer,
-            Self::FlatDictionary { .. } => ExecutionReason::ChunkFlatDictionary,
         };
         FailureFact::new(FailureClass::Invariant, reason.reason())
     }

@@ -1508,17 +1508,14 @@ fn validate_exchange_dictionary_batch(batch: &RecordBatch) -> Result<(), Exchang
                 field.name()
             )));
         }
-        match field_type {
-            DataType::Dictionary(key_type, value_type)
-                if key_type.as_ref() == &DataType::Int32
-                    && matches!(value_type.as_ref(), DataType::Utf8 | DataType::LargeUtf8) => {}
-            other => {
-                return Err(exchange_contract(format_args!(
-                    "exchange dictionary column {idx} field {} has unsupported dictionary type {other:?}",
-                    field.name()
-                )));
-            }
-        }
+        novarocks_value_arrays::carrier::validate_engine_carrier_observed(field_type, &mut |_| {
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .map_err(|failure| {
+            ExchangeFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(
+                failure.into_error(),
+            ))
+        })?;
     }
     Ok(())
 }
@@ -3408,6 +3405,27 @@ mod tests {
         cancel_exchange_key(key);
     }
 
+    fn assert_value_dictionary_refusal(error: &super::ExchangeFailure) {
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_value_arrays::{ValueError, ValueViolation};
+        assert_eq!(
+            error.failure_fact(),
+            ValueError::Invariant(ValueViolation::Dictionary).failure_fact()
+        );
+        let mut cause = Some(error as &dyn std::error::Error);
+        while let Some(original) = cause {
+            if let Some(value) = original.downcast_ref::<ValueError>() {
+                assert!(matches!(
+                    value,
+                    ValueError::Invariant(ValueViolation::Dictionary)
+                ));
+                return;
+            }
+            cause = original.source();
+        }
+        panic!("exchange refusal lost its original value error");
+    }
+
     #[test]
     fn encode_chunks_rejects_dictionary_with_non_int32_key() {
         let dict = arrow::array::DictionaryArray::<arrow::datatypes::Int8Type>::new(
@@ -3420,11 +3438,7 @@ mod tests {
 
         let err = encode_chunks(&[chunk], true).expect_err("unsupported key type");
 
-        assert!(
-            err.to_string().contains("unsupported dictionary type"),
-            "err={err}"
-        );
-        assert!(err.to_string().contains("Int8"), "err={err}");
+        assert_value_dictionary_refusal(&err);
     }
 
     #[test]
@@ -3439,11 +3453,7 @@ mod tests {
 
         let err = encode_chunks(&[chunk], true).expect_err("unsupported value type");
 
-        assert!(
-            err.to_string().contains("unsupported dictionary type"),
-            "err={err}"
-        );
-        assert!(err.to_string().contains("Int32"), "err={err}");
+        assert_value_dictionary_refusal(&err);
     }
 
     #[test]

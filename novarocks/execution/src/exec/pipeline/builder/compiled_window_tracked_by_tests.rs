@@ -321,7 +321,9 @@ fn by_window_step_keeps_arrival_boundaries_and_yields_before_output_construction
     let mut turn = TurnWork::new(NonZeroU64::new(1).unwrap(), 0);
     let step = operator.as_mut();
     {
-        let mut context = StepContext::new(&error, &mut turn);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut context = StepContext::new(&error, &mut turn, &mut value_conversions);
         for (offset, rows) in [(0, 1), (1, 2)] {
             assert!(matches!(
                 step.try_push(
@@ -347,7 +349,9 @@ fn by_window_step_keeps_arrival_boundaries_and_yields_before_output_construction
     }
     turn.begin_turn(1).unwrap();
     let first = {
-        let mut context = StepContext::new(&error, &mut turn);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut context = StepContext::new(&error, &mut turn, &mut value_conversions);
         let first = step.drive(&mut context).unwrap();
         assert!(matches!(first.next, NextStep::Runnable));
         let first = first.output.unwrap();
@@ -362,7 +366,9 @@ fn by_window_step_keeps_arrival_boundaries_and_yields_before_output_construction
     };
     turn.begin_turn(1).unwrap();
     let last = {
-        let mut context = StepContext::new(&error, &mut turn);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut context = StepContext::new(&error, &mut turn, &mut value_conversions);
         let last = step.drive(&mut context).unwrap();
         assert!(matches!(last.next, NextStep::Finished));
         let last = last.output.unwrap();

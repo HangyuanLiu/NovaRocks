@@ -130,6 +130,7 @@ impl StringOffsetWidth {
 }
 #[derive(Debug)]
 pub enum ArrayProjectionFailure {
+    Value(novarocks_value_arrays::ValueError),
     ValueType(ValueTypeError),
     Layout(LayoutResourceError),
     Contract(ArrayProjectionViolation),
@@ -151,6 +152,7 @@ pub enum ArrayProjectionFailure {
 impl fmt::Display for ArrayProjectionFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Value(source) => source.fmt(f),
             Self::ValueType(source) => source.fmt(f),
             Self::Layout(source) => write!(f, "array construction layout request: {source:?}"),
             Self::Contract(source) => source.fmt(f),
@@ -174,6 +176,7 @@ impl fmt::Display for ArrayProjectionFailure {
 impl Error for ArrayProjectionFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Value(source) => Some(source),
             Self::ValueType(source) => Some(source),
             Self::ArrayLayout { source, .. } => Some(source),
             Self::Arrow { source, .. } => Some(source),
@@ -207,6 +210,7 @@ fn representation(
 impl FailureProjection for ArrayProjectionFailure {
     fn failure_fact(&self) -> FailureFact {
         match self {
+            Self::Value(source) => source.failure_fact(),
             Self::ValueType(source) => source.failure_fact(),
             Self::Layout(source) => source.failure_fact(),
             Self::Contract(source) => fact(FailureClass::Invariant, *source as u16),

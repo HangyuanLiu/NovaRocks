@@ -143,6 +143,29 @@ pub(in crate::planner::distributed::build) fn authored(
     .finish_observed(&control)
     .unwrap()
 }
+
+pub(in crate::planner::distributed::build) fn authored_lambda_source_for_test()
+-> SqlAuthoredPhysicalPlan {
+    // The real analyzer supplies the selected Lambda and LOWER declarations.
+    // This emitter fixture does not assert an installed ARRAY_MAP pure kernel
+    // or bypass the public compiler's implementation-presence admission.
+    let statements =
+        novarocks_parser::parse("SELECT ARRAY_MAP(x -> LOWER(x), ['AA','BB']) AS mapped").unwrap();
+    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+        panic!("one Lambda query")
+    };
+    let (query, _, _) = crate::analyzer::analyze(
+        query,
+        &crate::catalog::memory::PlannerMemoryCatalog::default(),
+        "default",
+    )
+    .unwrap();
+    let crate::analysis::QueryBody::Select(select) = query.body else {
+        panic!("Lambda projection")
+    };
+    authored(select.projection.into_iter().next().unwrap().expr)
+}
+
 pub(in crate::planner::distributed::build) fn scalar_source(
     owner: &SqlAuthoredPhysicalPlan,
 ) -> (&Fragment, &novarocks_physical_plan::ExprNode) {

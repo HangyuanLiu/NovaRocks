@@ -407,17 +407,109 @@ fn original_receiver_preserves_carrier_schema_and_accounting_with_profiler() {
 
 #[test]
 fn ordinary_receiver_still_hydrates_dictionary_and_records_profile() {
-    let chunk = source_chunk();
+    use novarocks_type_contract::{
+        FunctionValueType, ValueField, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+        ValueTypeStorageLifetime,
+    };
+    // Root's original-carrier fixture above intentionally retains imported
+    // metadata. This ordinary receiver has an explicit complete declaration,
+    // including nested JSON; execution metadata cannot author that domain.
+    let source = source_chunk();
+    let storage = ValueTypeStorageLifetime::pure();
+    let item =
+        ValueTypeRef::try_new(ValueKind::Scalar(DataType::Int32), true, storage.clone()).unwrap();
+    let list = ValueTypeRef::try_new(ValueKind::List(item), true, storage.clone()).unwrap();
+    let json = ValueTypeRef::try_new(
+        ValueKind::Nominal(ValueLogicalType::Json),
+        false,
+        storage.clone(),
+    )
+    .unwrap();
+    let semantic = ValueTypeRef::try_new(
+        ValueKind::Struct(
+            vec![
+                ValueField::new("items", list, storage.clone()),
+                ValueField::new("document", json, storage.clone()),
+            ]
+            .into_boxed_slice(),
+        ),
+        false,
+        storage.clone(),
+    )
+    .unwrap();
+    let nested_layout = DataType::Struct(Fields::from(vec![
+        Field::new(
+            "items",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        ),
+        Field::new("document", DataType::Utf8, false),
+    ]));
+    let declarations = [
+        FunctionValueType::new(DataType::Utf8, true),
+        FunctionValueType::try_from_value(
+            semantic,
+            ValueLayout::try_new(&nested_layout, storage.clone()).unwrap(),
+        )
+        .unwrap(),
+    ];
+    let slots = source
+        .chunk_schema()
+        .slots()
+        .iter()
+        .zip(&declarations)
+        .map(|(source, declaration)| {
+            ChunkSlotSchema::try_new_typed(
+                source.slot_id(),
+                Arc::new(source.field().clone()),
+                declaration.typed_binding().clone(),
+                source.unique_id(),
+                storage.clone(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let schema = Arc::new(ChunkSchema::try_new_typed(slots, storage).unwrap());
+    let factory = novarocks_execution::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+        novarocks_execution::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+        MemTracker::new_root("ordinary receiver typed source"),
+        Arc::new(novarocks_execution::runtime::runtime_state::RuntimeErrorState::default()),
+    ).unwrap();
+    let owner = factory.begin_typed_construction(&schema).unwrap();
+    let chunk = Chunk::try_new_typed_with_columns_owned_observed::<
+        novarocks_execution::exec::pipeline::operator::ConstructionFailure,
+        _,
+    >(
+        schema,
+        source.columns().to_vec(),
+        source.len(),
+        owner.storage_lifetime(),
+        |step| owner.observe(0, &[], step),
+    )
+    .unwrap();
+    drop(source);
     let original_array = Arc::clone(&chunk.columns()[0]);
     let metadata = chunk.schema().metadata().clone();
     let received = Arc::new(Mutex::new(None));
     let sink = OrdinaryReceiver {
         received: Arc::clone(&received),
     };
-    let profiles = run_driver(chunk, Box::new(Transform::hydrating(sink)), None);
+    let mut receiver = Transform::hydrating(sink);
+    receiver.set_construction_factory(factory);
+    let profiles = run_driver(chunk, Box::new(receiver), None);
     let chunk = received.lock().unwrap().take().unwrap();
     assert!(!Arc::ptr_eq(&original_array, &chunk.columns()[0]));
     assert_eq!(chunk.schema().metadata(), &metadata);
+    assert!(metadata.is_empty());
+    assert!(matches!(
+        chunk.chunk_schema().slots()[1]
+            .typed_binding()
+            .value_type()
+            .child_type_at(1)
+            .unwrap()
+            .kind(),
+        ValueKind::Nominal(ValueLogicalType::Json),
+    ));
     let values = chunk.columns()[0]
         .as_any()
         .downcast_ref::<StringArray>()

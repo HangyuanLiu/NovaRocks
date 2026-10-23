@@ -275,9 +275,11 @@ impl SourceCase {
     fn pull(&mut self) -> ExecutionResult<Option<Chunk>> {
         self.turn.begin_turn(DEFAULT_TURN_WORK_UNITS)?;
         let control = self.consumer.state.error_state();
-        let step = self
-            .operator
-            .drive(&mut StepContext::new(&control, &mut self.turn))?;
+        let step = self.operator.drive(&mut StepContext::new(
+            &control,
+            &mut self.turn,
+            &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
+        ))?;
         if self.operator.is_finished() {
             self.poll_exit();
         }

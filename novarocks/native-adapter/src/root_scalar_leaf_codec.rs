@@ -837,15 +837,14 @@ mod tests {
         array: ArrayRef,
         logical: Option<ValueLogicalType>,
         source_annotation: Option<&str>,
-    ) -> Result<Chunk, String> {
+    ) -> Result<Chunk, Box<dyn std::error::Error>> {
         use novarocks_execution::exec::pipeline::operator::input_construction::ConstructionFailure;
         use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
         let value = FunctionValueType::try_with_logical_type(
             array.data_type().clone(),
             true,
             logical.unwrap_or(ValueLogicalType::Physical),
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         let mut field = Field::new("value", array.data_type().clone(), true);
         if let Some(annotation) = source_annotation {
             field = field
@@ -858,23 +857,15 @@ mod tests {
             value.typed_binding().clone(),
             None,
             fixture_storage.clone(),
-        )
-        .map_err(|cause| cause.to_string())?;
-        let schema = Arc::new(
-            ChunkSchema::try_new_typed(vec![slot], fixture_storage)
-                .map_err(|cause| cause.to_string())?,
-        );
+        )?;
+        let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], fixture_storage)?);
         let tracker = novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
             "scalar leaf source fixture",
         );
         let factory = construction_factory(&tracker);
-        let scope = factory
-            .begin_typed_construction(&schema)
-            .map_err(|error| error.to_string())?;
+        let scope = factory.begin_typed_construction(&schema)?;
         let rows = array.len();
-        scope
-            .request(std::alloc::Layout::array::<ArrayRef>(1).unwrap())
-            .map_err(|error| error.to_string())?;
+        scope.request(std::alloc::Layout::array::<ArrayRef>(1).unwrap())?;
         Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
             schema,
             vec![array],
@@ -882,7 +873,7 @@ mod tests {
             scope.storage_lifetime(),
             |step| scope.observe(0, &[], step),
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
     }
     fn chunk(
         array: ArrayRef,
@@ -1372,9 +1363,23 @@ mod tests {
         )
         .unwrap();
         let error = try_chunk(Arc::new(wrong), None, None).unwrap_err();
-        assert!(
-            error.contains("Int32"),
-            "unsupported encoding must fail at typed ingress: {error}"
+        use novarocks_execution_contract::failure::FailureProjection;
+        use novarocks_value_arrays::{ValueError, ValueViolation};
+        let mut cause = Some(error.as_ref() as &dyn std::error::Error);
+        let original = loop {
+            let current = cause.expect("typed ingress must retain the original value error");
+            if let Some(value) = current.downcast_ref::<ValueError>() {
+                break value;
+            }
+            cause = current.source();
+        };
+        assert!(matches!(
+            original,
+            ValueError::Invariant(ValueViolation::Dictionary)
+        ));
+        assert_eq!(
+            original.failure_fact(),
+            ValueError::Invariant(ValueViolation::Dictionary).failure_fact()
         );
         let source = chunk(Arc::new(Int64Array::from(vec![11, -22, 33])), None, None);
         let tracker = novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
@@ -1527,7 +1532,12 @@ mod tests {
             "z".repeat(novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES + 1),
         ));
         let error = try_chunk(array, None, None).unwrap_err();
-        assert!(error.contains("timezone exceeds the byte limit"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("timezone exceeds the byte limit"),
+            "{error}"
+        );
     }
     #[test]
     fn immutable_typed_constructor_refuses_batch_timezone_drift_and_target_stays_exact() {

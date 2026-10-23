@@ -127,6 +127,7 @@ code-anchors:
 领域哲学：编码是执行载体的自描述物理属性，不是 plan 必须背书的正确性契约。correctness 由载体保证——`Dictionary(Int32, Utf8)` 自描述 + 算子入口 hydrate 兜底，算子不认识编码时的默认后果必须是「慢」而非「错」（fail-safe，不是 fail-open）；plan/元数据层只声明快路径资格，误判最坏是少一次加速。lake-native（不拥有数据、无内表）是前提约束：native 侧不建表级全局字典，FE-compatible 全局字典执行是隔离的协议侧支。
 
 - ADR-0005 — 低基数编码为何运行时载体优先：DictionaryArray 是 correctness owner、plan 层只是加速器（active）
+- [ADR-0195](ADR-0195-public-value-access-and-construction.md) — 公共值算法为何分离解码计算与存储、保持原始坐标，并由实际调用 owner 掌握转换生命周期和资源控制（active）
 
 ### provider-spi
 

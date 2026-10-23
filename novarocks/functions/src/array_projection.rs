@@ -44,70 +44,15 @@ pub use construction::{
     observe_array_normalization_construction,
 };
 
-mod hydrated_required_strings;
 mod required_dictionary_nulls;
 mod typed_nulls;
-pub use hydrated_required_strings::normalize_inactive_nulls;
 pub use required_dictionary_nulls::validate_required_dictionary_children;
 pub use typed_nulls::{
     validate_dictionary_rows_observed, validate_encoded_keys_and_root_nulls_observed,
 };
 
-/// Normalize representation under the caller's complete declaration. The
-/// ORIGINAL borrowed key/active-ancestor NULL checks run on this actual compact
-/// carrier before any decoded child is attached. No metadata authors meaning.
-pub fn normalize_typed_array_plain_observed<E, F>(
-    source: &ArrayRef,
-    binding: &novarocks_type_contract::TypedValueBinding,
-    observe: &mut F,
-) -> Result<ArrayRef, E>
-where
-    E: From<ArrayProjectionFailure>,
-    F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
-{
-    enum MatchError<E> {
-        Caller(E),
-        Source(novarocks_type_contract::ValueTypeError),
-    }
-    impl<E> From<novarocks_type_contract::ValueTypeError> for MatchError<E> {
-        fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
-            Self::Source(error)
-        }
-    }
-    let matches = novarocks_type_contract::value_layout_matches_carrier_observed(
-        binding.layout(),
-        source.data_type(),
-        |units| {
-            observe(ArrayNormalizationStep::InspectConstructionWork { units })
-                .map_err(MatchError::Caller)
-        },
-    )
-    .map_err(|error| match error {
-        MatchError::Caller(error) => error,
-        MatchError::Source(error) => E::from(ArrayProjectionFailure::ValueType(error)),
-    })?;
-    if !matches {
-        return Err(E::from(ArrayProjectionFailure::Contract(
-            ArrayProjectionViolation::LayoutMismatch,
-        )));
-    }
-    let root_null = validate_encoded_keys_and_root_nulls_observed(source, observe, 1, &mut 0)?;
-    if !binding.value_type().nullable() && root_null {
-        return Err(E::from(ArrayProjectionFailure::Contract(
-            ArrayProjectionViolation::RequiredRootNull,
-        )));
-    }
-    validate_required_dictionary_children(source, binding.value_type(), observe)?;
-    rebuild_array_mode_with_decoded(
-        source,
-        binding.data_type(),
-        observe,
-        true,
-        &mut |original, path, decoded, observe| {
-            normalize_inactive_nulls(binding.value_type(), original, path, decoded, observe)
-        },
-    )
-}
+mod value_hydration;
+pub use value_hydration::{normalize_typed_array_plain_observed, observe_value_hydration};
 
 /// An accurate structural occurrence within one actual array channel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,6 +73,14 @@ pub enum ArrayPathStep {
 /// Buffer backing is reused, never estimated or re-authorized by these events.
 #[derive(Clone, Copy, Debug)]
 pub enum ArrayNormalizationStep<'a> {
+    /// Value traversal checks control without spending a metadata work quota.
+    ValueWork {
+        units: usize,
+    },
+    ValueStructure {
+        path: &'a [ArrayPathStep],
+        event: novarocks_value_arrays::control::ValueStructure,
+    },
     /// Work on channels; owned hydration admits its Vec separately.
     RebuildChunkScaffolds {
         channels: usize,
@@ -164,18 +117,6 @@ pub enum ArrayNormalizationStep<'a> {
         source: &'a Field,
         target: &'a DataType,
         name: &'a str,
-    },
-    DecodeDictionary {
-        path: &'a [ArrayPathStep],
-        source: &'a ArrayRef,
-        target: &'a DataType,
-    },
-    /// Safe StringArray reconstruction over existing buffers, without a NULL
-    /// bitmap. The caller owns the semantic decision; this event only covers
-    /// its wrapper and Arrow's UTF-8/offset validation operation.
-    ValidateStringWrapper {
-        path: &'a [ArrayPathStep],
-        source: &'a ArrayRef,
     },
     RebuildArray {
         path: &'a [ArrayPathStep],
@@ -222,7 +163,7 @@ where
     let target = normalize_type(array.data_type(), &mut observe)?;
     match target {
         Cow::Borrowed(_) => Ok(Arc::clone(array)),
-        Cow::Owned(target) => rebuild_array(array, &target, &mut observe),
+        Cow::Owned(target) => rebuild_array_observed(array, &target, &mut observe),
     }
 }
 
@@ -512,85 +453,33 @@ fn physical<T: 'static, E: From<ArrayProjectionFailure>>(array: &ArrayRef) -> Re
     })
 }
 
-fn rebuild_array<E, F>(source: &ArrayRef, target: &DataType, observe: &mut F) -> Result<ArrayRef, E>
-where
-    E: From<ArrayProjectionFailure>,
-    F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
-{
-    rebuild_array_mode(source, target, observe, false)
-}
-
-/// Representation rebuilding shared with the explicit flat-boundary decoder.
-/// Normalization calls this with decoding disabled.
-pub fn rebuild_array_mode<E, F>(
+pub fn rebuild_array_observed<E, F>(
     source: &ArrayRef,
     target: &DataType,
     observe: &mut F,
-    hydrate: bool,
 ) -> Result<ArrayRef, E>
 where
     E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
-    rebuild_array_mode_with_decoded(source, target, observe, hydrate, &mut |_, _, array, _| {
-        Ok(array)
-    })
+    rebuild_array_at(source, target, observe, &[])
 }
 
-/// Rebuild with a caller-owned transformation only after an actual Dictionary
-/// decode and before that decoded child is attached to its parent. The default
-/// normalizer uses identity; this hook authors no type or NULL semantics.
-pub fn rebuild_array_mode_with_decoded<E, F, D>(
+fn rebuild_array_at<E, F>(
     source: &ArrayRef,
     target: &DataType,
     observe: &mut F,
-    hydrate: bool,
-    decoded: &mut D,
-) -> Result<ArrayRef, E>
-where
-    E: From<ArrayProjectionFailure>,
-    F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
-    D: FnMut(&ArrayRef, &[ArrayPathStep], ArrayRef, &mut F) -> Result<ArrayRef, E>,
-{
-    rebuild_array_at(source, target, observe, decoded, hydrate, &[])
-}
-
-fn rebuild_array_at<E, F, D>(
-    source: &ArrayRef,
-    target: &DataType,
-    observe: &mut F,
-    decoded: &mut D,
-    hydrate: bool,
     path: &[ArrayPathStep],
 ) -> Result<ArrayRef, E>
 where
     E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
-    D: FnMut(&ArrayRef, &[ArrayPathStep], ArrayRef, &mut F) -> Result<ArrayRef, E>,
 {
     // Arrow equality does not compare backing capacity of empty metadata maps.
     // Reusing such a wrapper would retain the external map allocation even
     // though its entries compare equal to the canonical empty representation.
     if source.data_type() == target && !needs_normalization(source.data_type(), observe)? {
         return Ok(Arc::clone(source));
-    }
-    if hydrate
-        && matches!(source.data_type(), DataType::Dictionary(_, _))
-        && !matches!(target, DataType::Dictionary(_, _))
-    {
-        observe(ArrayNormalizationStep::DecodeDictionary {
-            path,
-            source,
-            target,
-        })?;
-        let array = arrow_cast::cast(source.as_ref(), target).map_err(|error| {
-            E::from(ArrayProjectionFailure::Arrow {
-                operation: ArrayProjectionOperation::DecodeDictionary,
-                source: error,
-            })
-        })?;
-        observe(ArrayNormalizationStep::OpaqueOperationFinished)?;
-        return decoded(source, path, array, observe);
     }
     observe(ArrayNormalizationStep::RebuildArray {
         path,
@@ -602,8 +491,7 @@ where
         // logical NULL rule to a safely validated source representation.
         // The typed ingress owner checks required logical values with all
         // active ancestor masks; this operation authors no semantic promise.
-        let result =
-            rebuild_default_validated_container(source, target, observe, decoded, hydrate, path)?;
+        let result = rebuild_default_validated_container(source, target, observe, path)?;
         observe(ArrayNormalizationStep::OpaqueOperationFinished)?;
         return Ok(result);
     }
@@ -622,8 +510,6 @@ where
                     child,
                     field.data_type(),
                     observe,
-                    decoded,
-                    hydrate,
                     path,
                     ArrayPathStep::StructField(index),
                 )?);
@@ -644,8 +530,6 @@ where
                 source.values(),
                 field.data_type(),
                 observe,
-                decoded,
-                hydrate,
                 path,
                 ArrayPathStep::ListItem,
             )?;
@@ -665,8 +549,6 @@ where
                 source.values(),
                 field.data_type(),
                 observe,
-                decoded,
-                hydrate,
                 path,
                 ArrayPathStep::ListItem,
             )?;
@@ -686,8 +568,6 @@ where
                 source.values(),
                 field.data_type(),
                 observe,
-                decoded,
-                hydrate,
                 path,
                 ArrayPathStep::ListItem,
             )?;
@@ -708,8 +588,6 @@ where
                 source.values(),
                 field.data_type(),
                 observe,
-                decoded,
-                hydrate,
                 path,
                 ArrayPathStep::ListItem,
             )?;
@@ -730,8 +608,6 @@ where
                 source.values(),
                 field.data_type(),
                 observe,
-                decoded,
-                hydrate,
                 path,
                 ArrayPathStep::ListItem,
             )?;
@@ -764,8 +640,6 @@ where
                         child,
                         field.data_type(),
                         observe,
-                        decoded,
-                        hydrate,
                         path,
                         if index == 0 {
                             ArrayPathStep::MapKey
@@ -805,8 +679,6 @@ where
                         source.child(id),
                         field.data_type(),
                         observe,
-                        decoded,
-                        hydrate,
                         path,
                         ArrayPathStep::UnionField(id),
                     )
@@ -825,9 +697,7 @@ where
         DataType::Dictionary(keys, values) => {
             macro_rules! dictionary {
                 ($key:ty) => {
-                    rebuild_dictionary::<$key, E, F, D>(
-                        source, values, observe, decoded, hydrate, path,
-                    )?
+                    rebuild_dictionary::<$key, E, F>(source, values, observe, path)?
                 };
             }
             match keys.as_ref() {
@@ -863,8 +733,6 @@ where
                 &values_array,
                 values.data_type(),
                 observe,
-                decoded,
-                hydrate,
                 path,
                 ArrayPathStep::RunEndValue,
             )?;
@@ -888,40 +756,18 @@ where
 }
 
 pub(crate) fn requires_default_validated_container(target: &DataType) -> bool {
-    let extra_mask = |field: &Field| {
-        !field.is_nullable()
-            && matches!(
-                field.data_type(),
-                DataType::Dictionary(_, _)
-                    | DataType::RunEndEncoded(_, _)
-                    | DataType::Union(_, _)
-                    | DataType::Null
-            )
-    };
-    match target {
-        DataType::Struct(fields) => fields.iter().any(|field| extra_mask(field)),
-        DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
-            extra_mask(field)
-        }
-        DataType::Map(entries, _) => {
-            matches!(entries.data_type(), DataType::Struct(fields) if fields.iter().any(|field| extra_mask(field)))
-        }
-        _ => false,
-    }
+    novarocks_value_arrays::storage::requires_default_validated_container(target)
 }
 
-fn rebuild_default_validated_container<E, F, D>(
+fn rebuild_default_validated_container<E, F>(
     source: &ArrayRef,
     target: &DataType,
     observe: &mut F,
-    decoded: &mut D,
-    hydrate: bool,
     path: &[ArrayPathStep],
 ) -> Result<ArrayRef, E>
 where
     E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
-    D: FnMut(&ArrayRef, &[ArrayPathStep], ArrayRef, &mut F) -> Result<ArrayRef, E>,
 {
     let data = source.to_data();
     let mut children = Vec::with_capacity(data.child_data().len());
@@ -934,8 +780,6 @@ where
                         child,
                         field.data_type(),
                         observe,
-                        decoded,
-                        hydrate,
                         path,
                         ArrayPathStep::StructField(index),
                     )?
@@ -961,8 +805,6 @@ where
                     values,
                     field.data_type(),
                     observe,
-                    decoded,
-                    hydrate,
                     path,
                     ArrayPathStep::ListItem,
                 )?
@@ -984,8 +826,6 @@ where
                         child,
                         field.data_type(),
                         observe,
-                        decoded,
-                        hydrate,
                         path,
                         if index == 0 {
                             ArrayPathStep::MapKey
@@ -1034,19 +874,16 @@ where
     Ok(make_array(data))
 }
 
-fn rebuild_array_child<E, F, D>(
+fn rebuild_array_child<E, F>(
     source: &ArrayRef,
     target: &DataType,
     observe: &mut F,
-    decoded: &mut D,
-    hydrate: bool,
     path: &[ArrayPathStep],
     child: ArrayPathStep,
 ) -> Result<ArrayRef, E>
 where
     E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
-    D: FnMut(&ArrayRef, &[ArrayPathStep], ArrayRef, &mut F) -> Result<ArrayRef, E>,
 {
     let mut next = [ArrayPathStep::ListItem; novarocks_type_contract::MAX_VALUE_TYPE_DEPTH];
     if path.len() >= next.len() {
@@ -1056,37 +893,25 @@ where
     }
     next[..path.len()].copy_from_slice(path);
     next[path.len()] = child;
-    rebuild_array_at(
-        source,
-        target,
-        observe,
-        decoded,
-        hydrate,
-        &next[..path.len() + 1],
-    )
+    rebuild_array_at(source, target, observe, &next[..path.len() + 1])
 }
 
-fn rebuild_dictionary<K, E, F, D>(
+fn rebuild_dictionary<K, E, F>(
     source: &ArrayRef,
     target_values: &DataType,
     observe: &mut F,
-    decoded: &mut D,
-    hydrate: bool,
     path: &[ArrayPathStep],
 ) -> Result<ArrayRef, E>
 where
     K: ArrowDictionaryKeyType,
     E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
-    D: FnMut(&ArrayRef, &[ArrayPathStep], ArrayRef, &mut F) -> Result<ArrayRef, E>,
 {
     let source = physical::<DictionaryArray<K>, E>(source)?;
     let values = rebuild_array_child(
         source.values(),
         target_values,
         observe,
-        decoded,
-        hydrate,
         path,
         ArrayPathStep::DictionaryValue,
     )?;

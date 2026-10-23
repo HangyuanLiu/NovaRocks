@@ -253,7 +253,14 @@ fn typed_chunk_refusal_and_required_null_do_not_widen_or_mutate_source() {
         _,
     >(schema.clone(), vec![nulls], 1, |_| Ok(()))
     .unwrap_err();
-    assert!(error.to_string().contains("contains nulls"));
+    assert_eq!(
+        novarocks_failure_contract::FailureProjection::failure_fact(&error),
+        novarocks_failure_contract::FailureProjection::failure_fact(
+            &novarocks_value_arrays::ValueError::Invariant(
+                novarocks_value_arrays::ValueViolation::RequiredNull
+            )
+        )
+    );
     assert!(!schema.slots()[0].nullable());
 }
 
@@ -398,21 +405,27 @@ fn typed_required_dictionary_uses_referenced_values_nulls_and_slice_coordinates(
     };
     let referenced = encoded(vec![0]);
     assert_eq!(referenced.null_count(), 0);
-    assert!(
-        bind(referenced)
-            .unwrap_err()
-            .to_string()
-            .contains("contains nulls")
+    assert_eq!(
+        novarocks_failure_contract::FailureProjection::failure_fact(&bind(referenced).unwrap_err()),
+        novarocks_failure_contract::FailureProjection::failure_fact(
+            &novarocks_value_arrays::ValueError::Invariant(
+                novarocks_value_arrays::ValueViolation::RequiredNull
+            )
+        )
     );
     let unused_null = encoded(vec![1, 1]);
     assert_eq!(bind(unused_null).unwrap().len(), 2);
     let source = encoded(vec![1, 0, 1]);
     assert_eq!(bind(source.slice(0, 1)).unwrap().len(), 1);
-    assert!(
-        bind(source.slice(1, 1))
-            .unwrap_err()
-            .to_string()
-            .contains("contains nulls")
+    assert_eq!(
+        novarocks_failure_contract::FailureProjection::failure_fact(
+            &bind(source.slice(1, 1)).unwrap_err()
+        ),
+        novarocks_failure_contract::FailureProjection::failure_fact(
+            &novarocks_value_arrays::ValueError::Invariant(
+                novarocks_value_arrays::ValueViolation::RequiredNull
+            )
+        )
     );
     assert_eq!(bind(source.slice(2, 1)).unwrap().len(), 1);
 }

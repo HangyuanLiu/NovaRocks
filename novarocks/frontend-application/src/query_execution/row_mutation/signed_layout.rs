@@ -15,19 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Metadata-only signed COW layout normalization and exact dictionary expansion.
-//! Values are converted by SQL before this boundary. This module never casts.
+//! Shared value planning under the signed complete declaration. SQL already
+//! converted values; this boundary only expands admitted encodings and restores
+//! the signed field metadata after the value layer normalized representation.
 use arrow::{
-    array::{
-        Array, ArrayRef, DictionaryArray, LargeListArray, ListArray, StringArray, StringBuilder,
-        StructArray, make_array,
-    },
-    datatypes::{DataType, Field, Int32Type, SchemaRef},
+    array::{ArrayRef, make_array},
+    datatypes::{DataType, Field, SchemaRef},
     record_batch::RecordBatch,
 };
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+use novarocks_value_arrays::{
+    ValueError, ValueFailure,
+    decode::ValueConversionContext,
+    hydrate::{HydrateOptions, HydratePlan, HydrateProjection},
+};
+#[cfg(test)]
 use std::sync::Arc;
-
 fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message)
 }
@@ -71,236 +75,222 @@ impl novarocks_failure_contract::FailureProjection for ArrowAssemblyFailure {
 fn arrow_assembly(source: arrow::error::ArrowError) -> ConnectorError {
     ConnectorError::from_domain(ConnectorErrorKind::Internal, ArrowAssemblyFailure(source))
 }
-#[derive(Debug)]
-struct DictionaryExtentFailure {
-    required: Option<u64>,
+
+pub(super) fn value_error(source: ValueError) -> ConnectorError {
+    ConnectorError::from_domain(ConnectorErrorKind::InvalidRequest, source)
 }
-impl std::fmt::Display for DictionaryExtentFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "COW dictionary expansion exceeds UTF8 offsets (required {:?})",
-            self.required
-        )
+fn failure(error: ValueFailure<ConnectorError>) -> ConnectorError {
+    match error {
+        ValueFailure::Caller(error) => error,
+        ValueFailure::Value(source) => value_error(source),
     }
-}
-impl std::error::Error for DictionaryExtentFailure {}
-impl novarocks_failure_contract::FailureProjection for DictionaryExtentFailure {
-    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use novarocks_failure_contract::*;
-        FailureFact::new(
-            FailureClass::Representation,
-            FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(6005).unwrap()),
-        )
-        .with_representation(RepresentationFacts {
-            boundary: RepresentationBoundary::SingleOutput,
-            layout: RepresentationLayout {
-                domain: domain::QUERY,
-                code: std::num::NonZeroU16::new(1).unwrap(),
-            },
-            required: self.required,
-            extent_limit: Some(i32::MAX as u64),
-            representable_prefix: None,
-        })
-    }
-}
-fn dictionary_extent(required: Option<u64>) -> ConnectorError {
-    ConnectorError::from_domain(
-        ConnectorErrorKind::ResourceExhausted,
-        DictionaryExtentFailure { required },
-    )
 }
 
+enum MatchFailure {
+    Caller(ConnectorError),
+    Type(novarocks_type_contract::ValueTypeError),
+}
+impl From<novarocks_type_contract::ValueTypeError> for MatchFailure {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::Type(error)
+    }
+}
+fn matches_signed(
+    declaration: &FunctionValueType,
+    field: &Field,
+    work: &mut dyn FnMut(usize) -> Result<(), ConnectorError>,
+) -> Result<bool, ConnectorError> {
+    novarocks_type_contract::value_layout_matches_carrier_observed(
+        declaration.typed_binding().layout(),
+        field.data_type(),
+        |units| work(units).map_err(MatchFailure::Caller),
+    )
+    .map_err(|error| match error {
+        MatchFailure::Caller(error) => error,
+        MatchFailure::Type(error) => {
+            ConnectorError::from_domain(ConnectorErrorKind::InvalidRequest, error)
+        }
+    })
+}
+
+pub(super) fn validate_declarations(
+    schema: &SchemaRef,
+    declarations: &[FunctionValueType],
+    work: &mut dyn FnMut(usize) -> Result<(), ConnectorError>,
+) -> Result<(), ConnectorError> {
+    if declarations.len() != schema.fields().len() {
+        return Err(invalid(
+            "COW output width differs from its complete signed declaration",
+        ));
+    }
+    for (field, declaration) in schema.fields().iter().zip(declarations) {
+        if declaration.nullable() != field.is_nullable()
+            || !matches_signed(declaration, field, work)?
+        {
+            return Err(invalid(
+                "COW signed declaration differs from its output field",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) struct CowSignedLayoutPlan {
+    pub columns: Vec<HydratePlan>,
+    schema: SchemaRef,
+    pub planning_requested_bytes: usize,
+}
+impl CowSignedLayoutPlan {
+    pub fn plan(
+        schema: &SchemaRef,
+        batch: &RecordBatch,
+        declarations: &[FunctionValueType],
+        context: &mut ValueConversionContext,
+        planning_limit: usize,
+        work: &mut dyn FnMut(usize) -> Result<(), ConnectorError>,
+    ) -> Result<Self, ConnectorError> {
+        if batch.num_columns() != schema.fields().len()
+            || declarations.len() != schema.fields().len()
+        {
+            return Err(invalid(
+                "COW output width differs from its complete signed declaration",
+            ));
+        }
+        validate_declarations(schema, declarations, work)?;
+        let mut requested = 0usize;
+        let mut growth = |layout: std::alloc::Layout| {
+            requested = requested
+                .checked_add(layout.size())
+                .ok_or_else(super::cast_footprint::exhausted)?;
+            if requested > planning_limit {
+                return Err(super::cast_footprint::exhausted());
+            }
+            Ok(())
+        };
+        growth(
+            std::alloc::Layout::array::<HydratePlan>(declarations.len())
+                .map_err(|_| super::cast_footprint::exhausted())?,
+        )?;
+        let mut columns = Vec::new();
+        columns
+            .try_reserve_exact(declarations.len())
+            .map_err(allocation)?;
+        for ((array, _field), declaration) in batch
+            .columns()
+            .iter()
+            .zip(schema.fields())
+            .zip(declarations)
+        {
+            let plan = HydratePlan::plan_with_options_and_storage_observed(
+                array,
+                declaration.typed_binding(),
+                HydrateOptions {
+                    dictionary_value_layout: None,
+                    projection: HydrateProjection::FrozenNamesAndNullability,
+                },
+                context,
+                &ValueTypeStorageLifetime::pure(),
+                &mut |_, _| false,
+                &mut growth,
+                work,
+                &mut |_| Ok(()),
+            )
+            .map_err(failure)?;
+            // Representation failure takes precedence over the whole-output
+            // capacity quote. A legal small dictionary may repeat beyond 2GiB.
+            plan.require_complete().map_err(value_error)?;
+            columns.push(plan);
+        }
+        Ok(Self {
+            columns,
+            schema: schema.clone(),
+            planning_requested_bytes: requested,
+        })
+    }
+    pub fn execute(
+        &self,
+        context: &mut ValueConversionContext,
+        work: &mut dyn FnMut(usize) -> Result<(), ConnectorError>,
+    ) -> Result<RecordBatch, ConnectorError> {
+        let mut columns = Vec::new();
+        columns
+            .try_reserve_exact(self.columns.len())
+            .map_err(allocation)?;
+        for (plan, field) in self.columns.iter().zip(self.schema.fields()) {
+            let output = plan
+                .execute_observed(context, &mut |_| Ok(()), work, &mut |_| Ok(()))
+                .map_err(failure)?;
+            columns.push(attach_signed_type(&output, field.data_type(), work)?);
+        }
+        RecordBatch::try_new(self.schema.clone(), columns).map_err(arrow_assembly)
+    }
+}
+
+/// Metadata projection only, after shared validation/materialization proved
+/// every NULL and value parameter. No value or encoding decision occurs here.
+fn attach_signed_type(
+    array: &ArrayRef,
+    target: &DataType,
+    work: &mut dyn FnMut(usize) -> Result<(), ConnectorError>,
+) -> Result<ArrayRef, ConnectorError> {
+    fn project(
+        data: arrow::array::ArrayData,
+        target: &DataType,
+        work: &mut dyn FnMut(usize) -> Result<(), ConnectorError>,
+    ) -> Result<arrow::array::ArrayData, ConnectorError> {
+        work(1)?;
+        let child_types: Vec<&DataType> = match target {
+            DataType::Struct(fields) => fields.iter().map(|f| f.data_type()).collect(),
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::FixedSizeList(field, _)
+            | DataType::Map(field, _) => vec![field.data_type()],
+            _ => Vec::new(),
+        };
+        if child_types.len() != data.child_data().len() {
+            return Err(invalid(
+                "COW normalized child geometry differs from its signed type",
+            ));
+        }
+        let mut children = Vec::new();
+        children
+            .try_reserve_exact(child_types.len())
+            .map_err(allocation)?;
+        for (child, ty) in data.child_data().iter().zip(child_types) {
+            children.push(project(child.clone(), ty, work)?);
+        }
+        data.into_builder()
+            .data_type(target.clone())
+            .child_data(children)
+            .build()
+            .map_err(arrow_assembly)
+    }
+    Ok(make_array(project(array.to_data(), target, work)?))
+}
+
+#[cfg(test)]
+pub(super) fn fixture_declarations(schema: &arrow::datatypes::Schema) -> Vec<FunctionValueType> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| FunctionValueType::new(field.data_type().clone(), field.is_nullable()))
+        .collect()
+}
+#[cfg(test)]
 pub(super) fn normalize(
     schema: &SchemaRef,
     batch: &RecordBatch,
 ) -> Result<RecordBatch, ConnectorError> {
-    if batch.num_columns() != schema.fields().len() {
-        return Err(invalid(
-            "COW match query output width differs from its signed contract",
-        ));
-    }
-    let mut columns = Vec::new();
-    columns
-        .try_reserve_exact(schema.fields().len())
-        .map_err(allocation)?;
-    for (column, field) in batch.columns().iter().zip(schema.fields()) {
-        columns.push(column_to_field(column, field, &|_| true)?);
-    }
-    RecordBatch::try_new(Arc::clone(schema), columns).map_err(arrow_assembly)
+    let mut context = ValueConversionContext::new(0);
+    let plan = CowSignedLayoutPlan::plan(
+        schema,
+        batch,
+        &fixture_declarations(schema),
+        &mut context,
+        super::cast_footprint::TRANSFORM_BYTES,
+        &mut |_| Ok(()),
+    )?;
+    plan.execute(&mut context, &mut |_| Ok(()))
 }
-
-pub(super) fn column_to_field(
-    array: &ArrayRef,
-    field: &Field,
-    visible: &dyn Fn(usize) -> bool,
-) -> Result<ArrayRef, ConnectorError> {
-    let array = if matches!(array.data_type(), DataType::Dictionary(..)) {
-        if field.data_type() != &DataType::Utf8 {
-            return Err(invalid(
-                "COW dictionary carrier differs from its signed string type",
-            ));
-        }
-        decode_dictionary(array)?
-    } else {
-        Arc::clone(array)
-    };
-    if !field.is_nullable() {
-        for row in 0..array.len() {
-            if array.is_null(row) && visible(row) {
-                return Err(invalid(format!(
-                    "signed COW required field contains NULL at row {row}"
-                )));
-            }
-        }
-    }
-    let mut children = Vec::new();
-    match (array.data_type(), field.data_type()) {
-        (DataType::Struct(source), DataType::Struct(target)) if source.len() == target.len() => {
-            let structure = array
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(|| invalid("COW Struct carrier is not a StructArray"))?;
-            children
-                .try_reserve_exact(target.len())
-                .map_err(allocation)?;
-            let child_visible = |row| visible(row) && structure.is_valid(row);
-            for (child, target) in structure.columns().iter().zip(target) {
-                children.push(column_to_field(child, target, &child_visible)?.to_data());
-            }
-        }
-        (DataType::List(_), DataType::List(target)) => {
-            let list = array
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| invalid("COW List carrier is not a ListArray"))?;
-            let offsets = list.value_offsets();
-            let child_visible = |row: usize| {
-                let Some(first) = offsets.first().and_then(|v| usize::try_from(*v).ok()) else {
-                    return false;
-                };
-                let Some(last) = offsets.last().and_then(|v| usize::try_from(*v).ok()) else {
-                    return false;
-                };
-                if row < first || row >= last {
-                    return false;
-                }
-                let parent = offsets
-                    .partition_point(|offset| {
-                        usize::try_from(*offset).is_ok_and(|offset| offset <= row)
-                    })
-                    .saturating_sub(1);
-                parent < list.len() && visible(parent) && list.is_valid(parent)
-            };
-            children.push(column_to_field(list.values(), target, &child_visible)?.to_data());
-        }
-        (DataType::LargeList(_), DataType::LargeList(target)) => {
-            let list = array
-                .as_any()
-                .downcast_ref::<LargeListArray>()
-                .ok_or_else(|| invalid("COW LargeList carrier is not a LargeListArray"))?;
-            let offsets = list.value_offsets();
-            let child_visible = |row: usize| {
-                let Some(first) = offsets.first().and_then(|v| usize::try_from(*v).ok()) else {
-                    return false;
-                };
-                let Some(last) = offsets.last().and_then(|v| usize::try_from(*v).ok()) else {
-                    return false;
-                };
-                if row < first || row >= last {
-                    return false;
-                }
-                let parent = offsets
-                    .partition_point(|offset| {
-                        usize::try_from(*offset).is_ok_and(|offset| offset <= row)
-                    })
-                    .saturating_sub(1);
-                parent < list.len() && visible(parent) && list.is_valid(parent)
-            };
-            children.push(column_to_field(list.values(), target, &child_visible)?.to_data());
-        }
-        (source, target) if source == target => {}
-        _ => {
-            return Err(invalid(
-                "COW root carrier differs from its signed type beyond the admitted layout differences",
-            ));
-        }
-    }
-    let mut data = array
-        .to_data()
-        .into_builder()
-        .data_type(field.data_type().clone());
-    if !children.is_empty() {
-        data = data.child_data(children);
-    }
-    if !field.is_nullable() {
-        // All remaining NULLs were proved invisible beneath a NULL ancestor.
-        // Removing their bitmap preserves the logical value and gives Arrow's
-        // required List element representation its exact non-null contract.
-        data = data.nulls(None);
-    }
-    let data = data.build().map_err(arrow_assembly)?;
-    Ok(make_array(data))
-}
-
-pub(super) fn decoded_dictionary_bytes(array: &ArrayRef) -> Result<usize, ConnectorError> {
-    let dict = array
-        .as_any()
-        .downcast_ref::<DictionaryArray<Int32Type>>()
-        .ok_or_else(|| invalid("COW only admits Dictionary(Int32, Utf8)"))?;
-    let values = dict
-        .values()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| invalid("COW only admits Dictionary(Int32, Utf8)"))?;
-    let mut bytes = 0usize;
-    for row in 0..dict.len() {
-        if dict.keys().is_null(row) {
-            continue;
-        }
-        let key = usize::try_from(dict.keys().value(row))
-            .map_err(|_| invalid("COW dictionary has a negative key"))?;
-        if key >= values.len() {
-            return Err(invalid("COW dictionary key exceeds its values"));
-        }
-        if !values.is_null(key) {
-            bytes = bytes
-                .checked_add(values.value(key).len())
-                .ok_or_else(|| dictionary_extent(None))?;
-        }
-    }
-    if bytes > i32::MAX as usize {
-        return Err(dictionary_extent(u64::try_from(bytes).ok()));
-    }
-    Ok(bytes)
-}
-fn decode_dictionary(array: &ArrayRef) -> Result<ArrayRef, ConnectorError> {
-    let bytes = decoded_dictionary_bytes(array)?;
-    let dict = array
-        .as_any()
-        .downcast_ref::<DictionaryArray<Int32Type>>()
-        .ok_or_else(|| invalid("COW dictionary has a foreign carrier"))?;
-    let values = dict
-        .values()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| invalid("COW dictionary has a foreign value carrier"))?;
-    let mut output = StringBuilder::with_capacity(dict.len(), bytes);
-    for row in 0..dict.len() {
-        if dict.keys().is_null(row) {
-            output.append_null();
-            continue;
-        }
-        let key = usize::try_from(dict.keys().value(row))
-            .map_err(|_| invalid("COW dictionary has a negative key"))?;
-        if values.is_null(key) {
-            output.append_null();
-        } else {
-            output.append_value(values.value(key));
-        }
-    }
-    Ok(Arc::new(output.finish()))
-}
-
 #[cfg(test)]
 mod tests;

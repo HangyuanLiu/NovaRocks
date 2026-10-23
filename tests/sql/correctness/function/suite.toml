@@ -19,6 +19,7 @@ explicit_only = false
 
 [impact]
 paths = [
+    "novarocks/value-arrays/**",
     "novarocks/functions/src/builtin/**",
     "novarocks/functions/src/scalar_*.rs",
     "novarocks/functions/src/scalar_kernel/**",

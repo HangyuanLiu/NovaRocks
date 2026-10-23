@@ -221,7 +221,8 @@ fn compiled_repeat_steps_drain_one_accepted_input_before_eos_without_replaying_s
     let second = input.clone();
     let original = second.columns()[0].clone();
     let mut turn = TurnWork::new(std::num::NonZeroU64::MIN, 64);
-    let mut ctx = StepContext::new(&control, &mut turn);
+    let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+    let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
     let step = operator.as_mut();
     assert!(matches!(
         step.try_push(&mut ctx, RawInput::for_test(input)),
@@ -843,7 +844,8 @@ fn compiled_change_event_steps_keep_one_input_until_each_event_is_delivered() {
     operator.prepare().unwrap();
     operator.bind_runtime_state(&runtime).unwrap();
     let mut turn = TurnWork::new(std::num::NonZeroU64::MIN, 64);
-    let mut ctx = StepContext::new(&control, &mut turn);
+    let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+    let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
     let step = operator.as_mut();
     assert!(matches!(
         step.try_push(&mut ctx, RawInput::for_test(input)),

@@ -703,7 +703,9 @@ mod tests {
         let mut operator = transform(&counts, true, false, false);
         let control = RuntimeErrorState::default();
         let mut work = TurnWork::new(NonZeroU64::MIN, 10);
-        let mut ctx = StepContext::new(&control, &mut work);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
         let original = chunk();
         let address = original.columns()[0].as_ref() as *const _;
         let mut input = RawInput::new(original, None);
@@ -729,7 +731,9 @@ mod tests {
         let mut operator = transform(&counts, false, true, false);
         let control = RuntimeErrorState::default();
         let mut work = TurnWork::new(NonZeroU64::MIN, 10);
-        let mut ctx = StepContext::new(&control, &mut work);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
         assert!(matches!(
             operator.try_push(&mut ctx, RawInput::new(chunk(), None)),
             InputResult::Accepted(Ok(_))
@@ -792,7 +796,9 @@ mod tests {
         let mut operator = transform(&counts, false, false, true);
         let control = RuntimeErrorState::default();
         let mut work = TurnWork::new(NonZeroU64::MIN, 10);
-        let mut ctx = StepContext::new(&control, &mut work);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
         assert!(matches!(
             operator.try_push(&mut ctx, RawInput::new(chunk(), None)),
             InputResult::Accepted(_)
@@ -861,7 +867,9 @@ mod tests {
         );
         let control = RuntimeErrorState::default();
         let mut work = TurnWork::new(NonZeroU64::MIN, 10);
-        let mut ctx = StepContext::new(&control, &mut work);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
         assert!(matches!(
             operator.try_push(&mut ctx, RawInput::new(chunk(), None)),
             InputResult::Accepted(Ok(_))
@@ -934,7 +942,9 @@ mod tests {
         );
         let control = RuntimeErrorState::default();
         let mut turn = TurnWork::new(NonZeroU64::MIN, 10);
-        let mut ctx = StepContext::new(&control, &mut turn);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
         assert!(matches!(
             operator.try_push(&mut ctx, RawInput::new(chunk(), None)),
             InputResult::Accepted(Ok(_))
@@ -1009,7 +1019,9 @@ mod tests {
         );
         let control = RuntimeErrorState::default();
         let mut turn = TurnWork::new(NonZeroU64::MIN, 10);
-        let mut ctx = StepContext::new(&control, &mut turn);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
         assert!(matches!(
             operator.try_push(&mut ctx, RawInput::new(chunk(), None)),
             InputResult::Accepted(Ok(_))
@@ -1076,7 +1088,9 @@ mod tests {
         );
         let control = RuntimeErrorState::default();
         let mut turn = TurnWork::new(NonZeroU64::MIN, 10);
-        let mut ctx = StepContext::new(&control, &mut turn);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
         operator.finish(&mut ctx).unwrap();
         for _ in 0..3 {
             assert!(matches!(

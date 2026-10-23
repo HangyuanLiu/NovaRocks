@@ -249,6 +249,9 @@ impl ExecutionFailure {
                     if let Some(prefix) = representation.extent_limit {
                         write!(f, " extent_limit={prefix}")?;
                     }
+                    if let Some(prefix) = representation.representable_prefix {
+                        write!(f, " representable_prefix={prefix}")?;
+                    }
                 }
                 Ok(())
             }

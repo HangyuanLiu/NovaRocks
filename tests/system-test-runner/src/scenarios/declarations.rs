@@ -116,6 +116,11 @@ pub(super) fn for_module(
         .iter()
         .map(|path| (*path).to_owned())
         .collect::<Vec<_>>();
+    // Public materialization and storage geometry are execution dependencies.
+    // Keep their impact with the same scenario domain, including failure facts.
+    if domains.contains(&"novarocks/execution/**") {
+        paths.push("novarocks/value-arrays/**".into());
+    }
     paths.extend([
         format!("tests/system-test-runner/src/scenarios/{module}.rs"),
         "tests/cluster-harness/**".into(),

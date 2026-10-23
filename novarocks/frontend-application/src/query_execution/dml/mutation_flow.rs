@@ -3477,9 +3477,10 @@ fn execute_exact_cow_match_query(
     let (schema, _) = cow_selection_layout(preparation)?;
     let declaration = cow_selection_execution_types(preparation)?;
     let consumer =
-        crate::query_execution::row_mutation::CowMatchRootConsumer::try_new_with_capacity(
+        crate::query_execution::row_mutation::CowMatchRootConsumer::try_new_declared_with_capacity(
             connector_context.clone(),
             schema,
+            declaration.clone(),
             preparation.match_contract().clone(),
             preparation.intent().clone(),
             capacity,

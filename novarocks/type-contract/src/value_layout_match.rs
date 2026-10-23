@@ -53,6 +53,17 @@ pub fn data_type_layout_matches_carrier_observed<E: From<ValueTypeError>>(
     .ty(expected, actual, 1)
 }
 
+// Design: ADR-0195 (docs/adr/ADR-0195-public-value-access-and-construction.md)
+/// Frozen string layouts have one canonical dictionary-value storage layout.
+/// This is a storage fact, not a local consumer capability or wire identity.
+pub fn dictionary_value_layout(layout: &DataType) -> Option<DataType> {
+    match layout {
+        DataType::Utf8 | DataType::Utf8View => Some(DataType::Utf8),
+        DataType::LargeUtf8 => Some(DataType::LargeUtf8),
+        _ => None,
+    }
+}
+
 enum ParameterFailure<E> {
     Caller(E),
     Carrier(CarrierParameterError),
@@ -130,7 +141,12 @@ impl<E: From<ValueTypeError>, F: FnMut(usize) -> Result<(), E>> Walk<'_, F> {
         match actual {
             DataType::Dictionary(keys, values) => {
                 self.node(keys, depth + 1)?;
-                return self.ty(expected, values, depth + 1);
+                let dictionary_layout = dictionary_value_layout(expected);
+                return self.ty(
+                    dictionary_layout.as_ref().unwrap_or(expected),
+                    values,
+                    depth + 1,
+                );
             }
             DataType::RunEndEncoded(ends, values) => {
                 (self.observe)(1)?;
@@ -456,5 +472,48 @@ mod tests {
             assert_eq!(error, Err(Failure::Refused));
             assert_eq!(calls, stop);
         }
+    }
+}
+
+#[cfg(test)]
+mod dictionary_layout_tests {
+    use super::*;
+    #[test]
+    fn frozen_view_dictionary_matches_canonical_offsets_only() {
+        for (layout, value) in [
+            (DataType::Utf8, DataType::Utf8),
+            (DataType::LargeUtf8, DataType::LargeUtf8),
+            (DataType::Utf8View, DataType::Utf8),
+        ] {
+            assert_eq!(dictionary_value_layout(&layout), Some(value.clone()));
+            let carrier = DataType::Dictionary(Box::new(DataType::Int32), Box::new(value));
+            assert!(
+                data_type_layout_matches_carrier_observed::<ValueTypeError>(
+                    &layout,
+                    &carrier,
+                    |_| Ok(())
+                )
+                .unwrap()
+            );
+        }
+        let unsupported =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8View));
+        assert!(
+            !data_type_layout_matches_carrier_observed::<ValueTypeError>(
+                &DataType::Utf8View,
+                &unsupported,
+                |_| Ok(())
+            )
+            .unwrap()
+        );
+        assert!(
+            !data_type_layout_matches_carrier_observed::<ValueTypeError>(
+                &DataType::Utf8View,
+                &DataType::Utf8,
+                |_| Ok(())
+            )
+            .unwrap()
+        );
+        assert_eq!(dictionary_value_layout(&DataType::BinaryView), None);
     }
 }

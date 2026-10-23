@@ -1446,7 +1446,11 @@ mod failure_latch_tests {
         let error = state.error_state();
         let mut work =
             crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        action(&mut StepContext::new(&error, &mut work))
+        action(&mut StepContext::new(
+            &error,
+            &mut work,
+            &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
+        ))
     }
     impl CompiledAggregateProcessor {
         fn apply_for_test(
@@ -1774,7 +1778,11 @@ mod failure_latch_tests {
         assert!(processor.key_table.is_none());
         let mut work = TurnWork::new(std::num::NonZeroU64::new(41).unwrap(), 1);
         let first = processor
-            .drive(&mut StepContext::new(&error, &mut work))
+            .drive(&mut StepContext::new(
+                &error,
+                &mut work,
+                &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
+            ))
             .unwrap();
         assert!(matches!(first.next, NextStep::Runnable));
         let first = first.output.unwrap();
@@ -1782,7 +1790,11 @@ mod failure_latch_tests {
         let allocated = tracker.allocated();
         let cursor = processor.emission.as_ref().unwrap().offset;
         let yielded = processor
-            .drive(&mut StepContext::new(&error, &mut work))
+            .drive(&mut StepContext::new(
+                &error,
+                &mut work,
+                &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
+            ))
             .unwrap();
         assert!(yielded.output.is_none());
         assert!(matches!(yielded.next, NextStep::Yield));
@@ -1790,7 +1802,11 @@ mod failure_latch_tests {
         assert_eq!(processor.emission.as_ref().unwrap().offset, cursor);
         work.begin_turn(1).unwrap();
         let last = processor
-            .drive(&mut StepContext::new(&error, &mut work))
+            .drive(&mut StepContext::new(
+                &error,
+                &mut work,
+                &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
+            ))
             .unwrap();
         assert!(matches!(last.next, NextStep::Finished));
         let last = last.output.unwrap();

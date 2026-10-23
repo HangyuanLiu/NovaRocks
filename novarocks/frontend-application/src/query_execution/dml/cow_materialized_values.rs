@@ -259,6 +259,9 @@ pub(super) fn build(
     let storage = ValueTypeStorageLifetime::held(Arc::new(ConstantHold {
         _original: original.clone(),
     }));
+    // This ORIGINAL operation owns all temporary conversions. No cross-record
+    // source receipt exists in its fixed budget, so reuse is explicitly off.
+    let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::new(0);
     let effect_type = if effect.is_some() {
         Some(protocol_type(
             arrow::datatypes::DataType::Int8,
@@ -369,6 +372,10 @@ pub(super) fn build(
                 novarocks_functions::array_projection::normalize_typed_array_plain_observed(
                     &compact,
                     value_type.typed_binding(),
+                    &mut value_conversions,
+                    &storage,
+                    &mut |layout| growth.layout(layout),
+                    &mut |_| growth.check(),
                     &mut |step| {
                         novarocks_functions::array_projection::observe_array_normalization_construction(
                         step,

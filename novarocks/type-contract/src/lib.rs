@@ -48,7 +48,8 @@ pub use value_type_identity::{
 };
 mod value_layout_match;
 pub use value_layout_match::{
-    data_type_layout_matches_carrier_observed, value_layout_matches_carrier_observed,
+    data_type_layout_matches_carrier_observed, dictionary_value_layout,
+    value_layout_matches_carrier_observed,
 };
 mod value_identity;
 pub use value_identity::{

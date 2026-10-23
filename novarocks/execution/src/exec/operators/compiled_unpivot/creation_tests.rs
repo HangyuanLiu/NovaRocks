@@ -243,7 +243,8 @@ fn compiled_unpivot_cancel_preserves_original_caller_cause_before_candidate_crea
         step_context::{StepContext, TurnWork},
     };
     let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
-    let mut context = StepContext::new(&error, &mut work);
+    let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+    let mut context = StepContext::new(&error, &mut work, &mut value_conversions);
     let step = operator.as_mut();
     assert!(matches!(
         step.try_push(&mut context, RawInput::for_test(source)),

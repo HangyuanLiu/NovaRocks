@@ -35,102 +35,67 @@ impl InputConstructionOperationModel for LockedArrowInputConstructionModel {
     }
 }
 #[cfg(test)]
-fn decode(
-    source: &arrow::array::ArrayRef,
-    target: &arrow::datatypes::DataType,
-    request: &mut dyn FnMut(Layout) -> Result<(), ConstructionFailure>,
-    opaque: &mut dyn FnMut(OpaqueConstructionBound) -> Result<(), ConstructionFailure>,
-    work: &mut dyn FnMut(usize) -> Result<(), ConstructionFailure>,
-) -> Result<(), ConstructionFailure> {
-    novarocks_functions::array_projection::observe_array_normalization_construction(
-        ArrayNormalizationStep::DecodeDictionary {
-            path: &[],
-            source,
-            target,
-        },
-        request,
-        opaque,
-        work,
-    )
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Int32Array;
-    use arrow::{
-        array::{Array, ArrayRef, DictionaryArray, StringArray},
-        datatypes::{DataType, Int32Type},
-    };
-
+    use arrow::array::ArrayRef;
     #[test]
-    fn dictionary_sizing_reads_actual_sliced_keys_and_referenced_value_nulls() {
-        let source: ArrayRef = std::sync::Arc::new(
-            DictionaryArray::<Int32Type>::try_new(
-                Int32Array::from(vec![Some(0), Some(1), None, Some(0)]),
-                std::sync::Arc::new(StringArray::from(vec![Some("abcd"), None, Some("unused")])),
-            )
-            .unwrap(),
-        );
+    fn value_publication_observes_only_actual_array_and_private_buffer_owners() {
+        use novarocks_value_arrays::{ByteLayout, control::ValueStructure};
+        let model = LockedArrowInputConstructionModel;
         let mut requests = Vec::new();
-        let mut bounds = Vec::new();
-        decode(
-            &source,
-            &DataType::Utf8,
-            &mut |layout| {
-                requests.push(layout);
-                Ok(())
-            },
-            &mut |bound| {
-                bounds.push(bound);
-                Ok(())
-            },
-            &mut |_| Ok(()),
-        )
-        .unwrap();
-        assert_eq!(requests[0], Layout::array::<i32>(5).unwrap());
-        assert_eq!(requests[1], Layout::array::<u8>(8).unwrap());
-        assert_eq!(requests.len(), 3);
-        assert_eq!(bounds.len(), 1);
-        let sliced = source.slice(1, 2);
-        requests.clear();
-        decode(
-            &sliced,
-            &DataType::Utf8,
-            &mut |layout| {
-                requests.push(layout);
-                Ok(())
-            },
-            &mut |_| Ok(()),
-            &mut |_| Ok(()),
-        )
-        .unwrap();
-        assert_eq!(requests[0], Layout::array::<i32>(3).unwrap());
-        assert_eq!(requests.len(), 2);
-    }
-    #[test]
-    fn decode_callback_refusal_is_not_changed_into_a_shape_failure() {
-        let source: ArrayRef = std::sync::Arc::new(
-            vec![Some("a")]
-                .into_iter()
-                .collect::<DictionaryArray<Int32Type>>(),
-        );
-        let error = decode(
-            &source,
-            &DataType::Utf8,
-            &mut |_| {
-                Err(ConstructionFailure::Control(
-                    novarocks_type_contract::CompileControlError::Cancelled,
-                ))
-            },
-            &mut |_| Ok(()),
-            &mut |_| Ok(()),
-        )
-        .unwrap_err();
+        let mut opaque = Vec::new();
+        model
+            .observe(
+                ArrayNormalizationStep::ValueStructure {
+                    path: &[],
+                    event: ValueStructure::ByteArray {
+                        layout: ByteLayout::Utf8,
+                        new_buffer_owners: 2,
+                    },
+                },
+                &mut |layout| {
+                    requests.push(layout);
+                    Ok(())
+                },
+                &mut |bound| {
+                    opaque.push(bound);
+                    Ok(())
+                },
+                &mut |_| Ok(()),
+            )
+            .unwrap();
         assert_eq!(
-            error,
-            ConstructionFailure::Control(novarocks_type_contract::CompileControlError::Cancelled)
+            requests,
+            vec![
+                novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<
+                    arrow::array::StringArray,
+                >())
+                .unwrap()
+            ]
         );
+        assert_eq!(opaque.len(), 1);
+        assert_eq!(opaque[0].requests_upper, 2);
+        assert_eq!(
+            opaque[0].bytes_upper,
+            2 * novarocks_functions::array_projection::ARROW_BUFFER_OWNER_METADATA_BOUND
+        );
+        let original =
+            ConstructionFailure::Control(novarocks_type_contract::CompileControlError::Cancelled);
+        let refusal = model
+            .observe(
+                ArrayNormalizationStep::ValueStructure {
+                    path: &[],
+                    event: ValueStructure::ByteArray {
+                        layout: ByteLayout::Utf8View,
+                        new_buffer_owners: 1,
+                    },
+                },
+                &mut |_| Err(original.clone()),
+                &mut |_| panic!("first refusal stops later observation"),
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+        assert_eq!(refusal, original);
     }
     #[test]
     fn slice_column_vector_requests_are_exact_and_separate_from_hydration_marker_work() {

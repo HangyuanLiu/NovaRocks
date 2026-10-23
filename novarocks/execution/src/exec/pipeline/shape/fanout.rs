@@ -87,11 +87,11 @@ impl<R: FanoutRouter> InputPreparation<R> for FanoutPreparation {
     }
     fn prepare(
         &mut self,
-        _: &mut StepContext<'_>,
+        ctx: &mut StepContext<'_>,
         input: AcceptedInput,
         router: &R,
     ) -> Result<PreparationStep, InputPreparationFailure> {
-        self.0.prepare_accepted(input, router)
+        self.0.prepare_accepted(ctx, input, router)
     }
 }
 struct Branch {
@@ -1246,7 +1246,11 @@ pub(crate) mod test_support {
         let control = RuntimeErrorState::default();
         let mut turn =
             crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        action(&mut StepContext::new(&control, &mut turn))
+        action(&mut StepContext::new(
+            &control,
+            &mut turn,
+            &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
+        ))
     }
     pub(crate) fn prepare<R: FanoutRouter>(fanout: &mut Fanout<R>) -> Arc<MemTracker> {
         prepare_on(fanout, &RuntimeState::default())

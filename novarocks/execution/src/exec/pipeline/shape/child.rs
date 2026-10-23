@@ -810,7 +810,9 @@ mod tests {
             child.prepare().unwrap();
             let control = RuntimeErrorState::default();
             let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 0);
-            let mut ctx = StepContext::new(&control, &mut work);
+            let mut value_conversions =
+                novarocks_value_arrays::decode::ValueConversionContext::default();
+            let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
             assert!(
                 matches!(child.retire(&mut ctx).unwrap(), NextStep::Runnable),
                 "a newly installed exit watch requires a worker recheck"
@@ -1055,7 +1057,9 @@ mod tests {
             );
             let mut work =
                 crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 0);
-            let mut ctx = StepContext::new(&failures, &mut work);
+            let mut value_conversions =
+                novarocks_value_arrays::decode::ValueConversionContext::default();
+            let mut ctx = StepContext::new(&failures, &mut work, &mut value_conversions);
             let first = child.retire(&mut ctx);
             if required {
                 assert!(first.unwrap_err().same_occurrence(&original));
@@ -1189,7 +1193,9 @@ mod tests {
                 exit_child(&runtime, failures.clone(), None, None, None, Some(payload));
             let mut work =
                 crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 0);
-            let mut ctx = StepContext::new(&failures, &mut work);
+            let mut value_conversions =
+                novarocks_value_arrays::decode::ValueConversionContext::default();
+            let mut ctx = StepContext::new(&failures, &mut work, &mut value_conversions);
             assert!(matches!(
                 child.retire(&mut ctx).unwrap(),
                 NextStep::Runnable
@@ -1315,7 +1321,9 @@ mod tests {
         fixture.gate.0.add_permits(1);
         let mut work =
             crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 0);
-        let mut ctx = StepContext::new(&failures, &mut work);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&failures, &mut work, &mut value_conversions);
         wait_until_exit_ready(|| matches!(child.retire(&mut ctx).unwrap(), NextStep::Finished));
         assert!(fixture.joined.load(Ordering::Acquire));
         assert_eq!(fixture.resource_drops.load(Ordering::SeqCst), 1);

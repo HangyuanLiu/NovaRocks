@@ -100,11 +100,13 @@ fn public_sql_map_subscript_preserves_largeint_key_identity() {
 
 #[test]
 fn public_sql_empty_map_lookup_keeps_uninhabited_key_and_actual_probe() {
+    // The installed aggregate emits an empty map for NULL keys while retaining
+    // the uninhabited key type. The scalar map constructor is declaration-only.
     for (ordinal, sql) in [
-        "SELECT map{}",
-        "SELECT map{}['a']",
-        "SELECT element_at(map{}, 'a')",
-        "SELECT m[p] FROM (SELECT map{} AS m, 'a' AS p) q",
+        "SELECT map_agg(NULL,NULL)",
+        "SELECT map_agg(NULL,NULL)['a']",
+        "SELECT element_at(map_agg(NULL,NULL), 'a')",
+        "SELECT m[p] FROM (SELECT map_agg(NULL,NULL) AS m, 'a' AS p) q",
     ]
     .into_iter()
     .enumerate()
