@@ -31,6 +31,60 @@ use std::{
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NetworkServiceOrigin(Arc<str>);
 
+/// A validated, allocation-free view of an already selected route's origin.
+/// Its host borrows the original URL; parsing and input custody stay with that
+/// route owner. Keeping this view grants no resource or execution authority.
+#[derive(Clone, Copy, Debug)]
+pub struct SelectedNetworkOrigin<'a> {
+    scheme: &'a str,
+    host: &'a str,
+    port: Option<u16>,
+    bytes: usize,
+}
+impl<'a> SelectedNetworkOrigin<'a> {
+    pub fn from_selected_url(selected: &'a url::Url) -> Result<Self, DependencyFactError> {
+        let scheme = selected.scheme();
+        if !matches!(scheme, "http" | "https") || selected.host().is_none() {
+            return Err(DependencyFactError::InvalidNetworkOrigin);
+        }
+        let host = selected
+            .host_str()
+            .filter(|host| !host.is_empty())
+            .ok_or(DependencyFactError::InvalidNetworkOrigin)?;
+        let port = selected.port();
+        let suffix = port.map_or(0, |port| {
+            1 + port.checked_ilog10().map_or(1, |log| log as usize + 1)
+        });
+        let bytes = scheme
+            .len()
+            .checked_add(3)
+            .and_then(|len| len.checked_add(host.len()))
+            .and_then(|len| len.checked_add(suffix))
+            .filter(|len| *len <= NetworkServiceOrigin::MAX_BYTES)
+            .ok_or(DependencyFactError::EndpointTooLong)?;
+        Ok(Self {
+            scheme,
+            host,
+            port,
+            bytes,
+        })
+    }
+
+    /// Allocate the canonical output only after its original owner has prepaid
+    /// both the String and final Arc that coexist during this conversion.
+    pub fn into_owned(self) -> NetworkServiceOrigin {
+        let mut origin = String::with_capacity(self.bytes);
+        origin.push_str(self.scheme);
+        origin.push_str("://");
+        origin.push_str(self.host);
+        if let Some(port) = self.port {
+            write!(&mut origin, ":{port}").expect("writing to a bounded String cannot fail");
+        }
+        debug_assert_eq!(origin.len(), self.bytes);
+        debug_assert!(origin.is_ascii());
+        NetworkServiceOrigin(Arc::from(origin))
+    }
+}
 impl NetworkServiceOrigin {
     /// Maximum canonical origin output from this fact author, in bytes.
     pub const MAX_BYTES: usize = 1024;
@@ -39,41 +93,34 @@ impl NetworkServiceOrigin {
     /// This does not parse, resolve DNS, acquire credentials or authorize I/O.
     /// Path, user information, query and fragment are never copied or retained.
     pub fn from_selected_url(selected: &url::Url) -> Result<Self, DependencyFactError> {
-        let scheme = selected.scheme();
-        if !matches!(scheme, "http" | "https") || selected.host().is_none() {
-            return Err(DependencyFactError::InvalidNetworkOrigin);
+        SelectedNetworkOrigin::from_selected_url(selected).map(SelectedNetworkOrigin::into_owned)
+    }
+
+    /// Compare a validated selected origin without allocating another String
+    /// or Arc. Both sides use the same URL author's host/default-port facts.
+    pub fn matches_selected(&self, selected: SelectedNetworkOrigin<'_>) -> bool {
+        if self.0.len() != selected.bytes {
+            return false;
         }
-        // Borrow the URL author's canonical ASCII host bytes. This includes
-        // IPv6 brackets and the original parser's IDNA/IP normalization.
-        let host = selected
-            .host_str()
-            .filter(|host| !host.is_empty())
-            .ok_or(DependencyFactError::InvalidNetworkOrigin)?;
-        // Url::port omits the scheme's default port. Do not resolve or guess a
-        // port from a catalog name, warehouse, object path or credential scope.
-        let port = selected.port();
-        let suffix_len = port.map_or(0, |port| {
-            1 + port.checked_ilog10().map_or(1, |log| log as usize + 1)
-        });
-        let origin_len = scheme
-            .len()
-            .checked_add(3)
-            .and_then(|len| len.checked_add(host.len()))
-            .and_then(|len| len.checked_add(suffix_len))
-            .filter(|len| *len <= Self::MAX_BYTES)
-            .ok_or(DependencyFactError::EndpointTooLong)?;
-        // Reject before allocating any output. String and final Arc backing
-        // coexist during conversion; both have this source-derived byte bound.
-        let mut origin = String::with_capacity(origin_len);
-        origin.push_str(scheme);
-        origin.push_str("://");
-        origin.push_str(host);
-        if let Some(port) = port {
-            write!(&mut origin, ":{port}").expect("writing to a bounded String cannot fail");
+        let Some(suffix) = self
+            .0
+            .strip_prefix(selected.scheme)
+            .and_then(|rest| rest.strip_prefix("://"))
+            .and_then(|rest| rest.strip_prefix(selected.host))
+        else {
+            return false;
+        };
+        match selected.port {
+            None => suffix.is_empty(),
+            // This owned value can only be created by the canonical decimal
+            // author above; length equality also preserves its exact width.
+            Some(port) => {
+                suffix
+                    .strip_prefix(':')
+                    .and_then(|port| port.parse::<u16>().ok())
+                    == Some(port)
+            }
         }
-        debug_assert_eq!(origin.len(), origin_len);
-        debug_assert!(origin.is_ascii());
-        Ok(Self(Arc::from(origin)))
     }
 
     pub fn as_str(&self) -> &str {
@@ -231,5 +278,41 @@ mod tests {
             format!("{fact:?}"),
             "NetworkServiceOrigin(\"https://example.org\")"
         );
+    }
+    #[test]
+    fn borrowed_selected_views_share_the_exact_original_canonical_author() {
+        for input in [
+            "HTTP://user:secret@EXAMPLE.org:80/path?q=secret#private",
+            "https://EXAMPLE.org:443/other",
+            "http://[::1]:65535/path",
+            "https://bücher.example:8443/",
+            "https://example.org:0/",
+        ] {
+            let selected = url::Url::parse(input).unwrap();
+            let view = SelectedNetworkOrigin::from_selected_url(&selected).unwrap();
+            let fact = view.into_owned();
+            assert!(fact.matches_selected(view));
+            assert_eq!(fact.as_str(), selected.origin().ascii_serialization());
+            for different in ["https://different.example", "http://different.example:8443"] {
+                let different = url::Url::parse(different).unwrap();
+                assert!(!fact.matches_selected(
+                    SelectedNetworkOrigin::from_selected_url(&different).unwrap()
+                ));
+            }
+            let detail = format!("{view:?}");
+            assert!(!detail.contains("secret") && !detail.contains("private"));
+        }
+        let owned = origin("https://example.org:8443/path");
+        for input in [
+            "http://example.org:8443/path",
+            "https://example.org/path",
+            "https://example.org.evil:8443/",
+        ] {
+            let selected = url::Url::parse(input).unwrap();
+            assert!(
+                !owned
+                    .matches_selected(SelectedNetworkOrigin::from_selected_url(&selected).unwrap())
+            );
+        }
     }
 }

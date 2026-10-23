@@ -378,6 +378,13 @@ impl std::task::Wake for PanicOnceWake {
 
 #[test]
 fn caught_push_wake_panic_cannot_submit_and_temporary_last_exit_is_observed() {
+    assert_caught_push_exit(false);
+}
+#[test]
+fn selected_route_output_exits_before_wake_even_when_the_builder_survives_panic() {
+    assert_caught_push_exit(true);
+}
+fn assert_caught_push_exit(selected_route: bool) {
     let (control, handle, mut driver) =
         crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 2, 1);
     let work = root(&control);
@@ -400,8 +407,14 @@ fn caught_push_wake_panic_cannot_submit_and_temporary_last_exit_is_observed() {
             .poll(&mut Context::from_waker(&waker))
             .is_pending()
     );
+    let selected = url::Url::parse("https://paid-0.example/selected/path?private=secret").unwrap();
+    let view = SelectedNetworkOrigin::from_selected_url(&selected).unwrap();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        proposal.push_dependency(&fact)
+        if selected_route {
+            proposal.push_selected_network(view)
+        } else {
+            proposal.push_dependency(&fact)
+        }
     }));
     assert!(outcome.is_err());
     assert!(wake.panicked.load(std::sync::atomic::Ordering::SeqCst));
@@ -542,6 +555,77 @@ fn explicit_proof_budget_cannot_raise_the_composed_total_work_ceiling() {
         assert_eq!(remaining, ledger.config.config.max_total_proof_work);
     }
     drop(request);
+    finish(work);
+    drive(&mut driver);
+}
+
+#[test]
+fn paid_selected_origin_deduplicates_before_owned_output_and_preserves_full_union() {
+    let (control, handle, mut driver) =
+        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 2, 1);
+    let work = root(&control);
+    let selected =
+        url::Url::parse("https://user:secret@PAID-0.example:443/current?secret=private").unwrap();
+    let alias = url::Url::parse("https://paid-0.example/other").unwrap();
+    let first = SelectedNetworkOrigin::from_selected_url(&selected).unwrap();
+    let same = SelectedNetworkOrigin::from_selected_url(&alias).unwrap();
+    let mut bind = handle.begin_paid_proposal(&work.owner).unwrap();
+    bind.begin_first_bind(work.owner.control_claim_view().unwrap())
+        .unwrap();
+    bind.push_selected_network(first).unwrap();
+    let before = handle.inner.state.lock().unwrap().next_id;
+    bind.push_selected_network(same).unwrap();
+    assert_eq!(handle.inner.state.lock().unwrap().next_id, before);
+    assert_eq!(bind.current.as_ref().unwrap().selected.len(), 1);
+    assert_eq!(bind.current.as_ref().unwrap().selected[0].fact, network(0));
+    bind.end_change().unwrap();
+    let mut bind = bind.submit().unwrap();
+    drive(&mut driver);
+    let mut reply = receive(&mut bind);
+    reply
+        .adjustment
+        .take()
+        .unwrap()
+        .install_control(&work.owner, &[])
+        .unwrap();
+    drop(reply);
+    drive(&mut driver);
+    let mut grow = handle.begin_paid_proposal(&work.owner).unwrap();
+    grow.begin_grow(
+        work.owner.control_claim_view().unwrap(),
+        JointResources::ZERO,
+    )
+    .unwrap();
+    let b = url::Url::parse("https://paid-1.example/object-store").unwrap();
+    grow.push_selected_network(SelectedNetworkOrigin::from_selected_url(&b).unwrap())
+        .unwrap();
+    grow.end_change().unwrap();
+    let mut grow = grow.submit().unwrap();
+    drive(&mut driver);
+    let mut reply = receive(&mut grow);
+    reply
+        .adjustment
+        .take()
+        .unwrap()
+        .install_control(&work.owner, &[])
+        .unwrap();
+    drop(reply);
+    drive(&mut driver);
+    let mut overflow = handle.begin_paid_proposal(&work.owner).unwrap();
+    overflow
+        .begin_grow(
+            work.owner.control_claim_view().unwrap(),
+            JointResources::ZERO,
+        )
+        .unwrap();
+    let next = handle.inner.state.lock().unwrap().next_id;
+    let c = url::Url::parse("https://new.example/not-yet-owned").unwrap();
+    assert!(matches!(
+        overflow.push_selected_network(SelectedNetworkOrigin::from_selected_url(&c).unwrap()),
+        Err(WorkError::Capacity(_))
+    ));
+    assert_eq!(handle.inner.state.lock().unwrap().next_id, next);
+    assert!(overflow.submit().is_err());
     finish(work);
     drive(&mut driver);
 }

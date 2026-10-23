@@ -21,6 +21,32 @@
 use super::*;
 use crate::scope::ReclaimWakeOnExit;
 
+use novarocks_resource_contract::SelectedNetworkOrigin;
+
+/// Closed actual authors: a Provider-owned fact or its borrowed selected route.
+/// Neither variant can run an external constructor under the WC mutex.
+enum DependencyInput<'a> {
+    Fact(&'a SharedDependency),
+    Selected(SelectedNetworkOrigin<'a>),
+}
+impl DependencyInput<'_> {
+    fn matches(&self, fact: &SharedDependency) -> bool {
+        match (self, fact) {
+            (Self::Fact(selected), fact) => *selected == fact,
+            (Self::Selected(selected), SharedDependency::Network(fact)) => {
+                fact.matches_selected(*selected)
+            }
+            (Self::Selected(_), SharedDependency::LocalHost) => false,
+        }
+    }
+    fn into_owned(self) -> SharedDependency {
+        match self {
+            Self::Fact(fact) => fact.clone(),
+            Self::Selected(selected) => SharedDependency::Network(selected.into_owned()),
+        }
+    }
+}
+
 struct PendingChange {
     source: Option<JointClaimView>,
     original: Option<(Arc<ProfileFacts>, JointResources)>,
@@ -237,17 +263,37 @@ impl JointProposal {
         // This per-call observer is after that actual exit, outside both locks.
         self.healthy()?;
         let _exit = ReclaimWakeOnExit::observe(&Arc::downgrade(&self.scope.inner));
-        let result = self.arm().and_then(|_| self.push(fact));
+        let result = self
+            .arm()
+            .and_then(|_| self.push(DependencyInput::Fact(fact)));
         self.remember(result)
     }
-    fn push(&mut self, fact: &SharedDependency) -> Result<(), WorkError> {
+    /// Construct a canonical network fact within this paid body. The Provider
+    /// supplies an allocation-free view of its already parsed, selected route.
+    /// Duplicate and full-union checks precede any origin output allocation.
+    pub fn push_selected_network(
+        &mut self,
+        selected: SelectedNetworkOrigin<'_>,
+    ) -> Result<(), WorkError> {
+        self.healthy()?;
+        let _exit = ReclaimWakeOnExit::observe(&Arc::downgrade(&self.scope.inner));
+        let result = self
+            .arm()
+            .and_then(|_| self.push(DependencyInput::Selected(selected)));
+        self.remember(result)
+    }
+    fn push(&mut self, input: DependencyInput<'_>) -> Result<(), WorkError> {
         let change = self.current.as_mut().ok_or(WorkError::Conflict)?;
         let k = self.config.config.max_dependencies_per_claim;
         if change.additional >= k {
             return Err(WorkError::Capacity("paid joint dependency calls"));
         }
         change.additional += 1;
-        if change.selected.iter().any(|record| &record.fact == fact) {
+        if change
+            .selected
+            .iter()
+            .any(|record| input.matches(&record.fact))
+        {
             return if change.source.is_some() {
                 Ok(())
             } else {
@@ -257,6 +303,7 @@ impl JointProposal {
         if change.selected.len() >= k {
             return Err(WorkError::Capacity("joint dependency union"));
         }
+        let fact = input.into_owned();
         let record = self.scope.inner.update(|state| {
             let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
             if ledger.driver_closed {
@@ -276,7 +323,7 @@ impl JointProposal {
                 .dependencies
                 .as_mut()
                 .ok_or(WorkError::NotReady)?;
-            if let Some(record) = registry.lookup(fact) {
+            if let Some(record) = registry.lookup(&fact) {
                 return Ok(record);
             }
             // A provisional identity does not change numeric profiles, layout,
