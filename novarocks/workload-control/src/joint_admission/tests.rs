@@ -104,7 +104,7 @@ fn request(
         )
         .unwrap()
 }
-fn poll(request: &mut JointAdmission) -> Poll<Result<Vec<JointClaim>, JointAdmissionFailure>> {
+fn poll(request: &mut JointAdmission) -> Poll<Result<JointGrantedBatch, JointAdmissionFailure>> {
     Pin::new(request).poll(&mut Context::from_waker(Waker::noop()))
 }
 fn drive(driver: &mut JointProgressDriver) {
@@ -117,7 +117,10 @@ fn drive(driver: &mut JointProgressDriver) {
 }
 fn granted(request: &mut JointAdmission) -> Vec<JointClaim> {
     match poll(request) {
-        Poll::Ready(Ok(claims)) => claims,
+        Poll::Ready(Ok(batch)) => {
+            assert!(batch.adjustment.is_none());
+            batch.new_claims
+        }
         other => panic!("expected original grant: {other:?}"),
     }
 }
@@ -277,24 +280,28 @@ fn granted_but_unreceived_drop_returns_exact_capacity_without_releasing_another_
     let a = dependency(&handle, "a");
     let mut first = request(&handle, &scope, &[&a], JointLane::Foreground, 1);
     drive(&mut driver);
-    let mut original = granted(&mut first);
+    let original = granted(&mut first);
     let replace = handle
         .request(
             &scope,
-            vec![JointClaimChange::Replace {
-                original: original.pop().unwrap(),
-                amounts: bytes(2),
-            }],
+            vec![JointClaimChange::grow_by(
+                original[0].view().unwrap(),
+                bytes(1),
+                vec![],
+            )],
         )
         .unwrap();
     drive(&mut driver);
     assert_eq!(held(&control), (1, 2));
     drop(replace);
+    assert_eq!(held(&control), (1, 1));
+    assert_eq!(original[0].amounts().unwrap(), bytes(1));
+    drop(original);
     assert_eq!(held(&control), (0, 0));
 }
 
 #[test]
-fn foreign_authority_and_owner_rejection_return_original_capability() {
+fn foreign_authority_rejection_leaves_original_capability_in_place() {
     let (control, handle, mut driver) = control();
     let (foreign, foreign_handle, _foreign_driver) = self::control();
     let root = control
@@ -323,19 +330,20 @@ fn foreign_authority_and_owner_rejection_return_original_capability() {
     ));
     let mut first = request(&handle, &scope, &[&a], JointLane::Foreground, 1);
     drive(&mut driver);
-    let mut claims = granted(&mut first);
+    let claims = granted(&mut first);
     let failed = handle.request(
         &other.owner.scope(),
-        vec![JointClaimChange::Replace {
-            original: claims.pop().unwrap(),
-            amounts: bytes(2),
-        }],
+        vec![JointClaimChange::grow_by(
+            claims[0].view().unwrap(),
+            bytes(1),
+            vec![],
+        )],
     );
     let Err(failed) = failed else {
         panic!("foreign scope accepted");
     };
     assert_eq!(failed.error, WorkError::ForeignAuthority);
-    assert_eq!(failed.originals[0].amounts().unwrap(), bytes(1));
+    assert_eq!(claims[0].amounts().unwrap(), bytes(1));
 }
 
 #[test]
@@ -361,7 +369,7 @@ fn request_drop_clears_fence_only_after_the_original_driver_observes_it() {
 }
 
 #[test]
-fn driver_exit_returns_originals_and_never_mints_a_grant() {
+fn driver_exit_keeps_original_holder_and_never_mints_growth() {
     let (control, handle, mut driver) = control();
     let root = control
         .try_begin_root(WorkRequest::new(WorkClass::Management))
@@ -370,14 +378,15 @@ fn driver_exit_returns_originals_and_never_mints_a_grant() {
     let a = dependency(&handle, "a");
     let mut first = request(&handle, &scope, &[&a], JointLane::Foreground, 1);
     drive(&mut driver);
-    let mut claims = granted(&mut first);
+    let claims = granted(&mut first);
     let mut pending = handle
         .request(
             &scope,
-            vec![JointClaimChange::Replace {
-                original: claims.pop().unwrap(),
-                amounts: bytes(2),
-            }],
+            vec![JointClaimChange::grow_by(
+                claims[0].view().unwrap(),
+                bytes(1),
+                vec![],
+            )],
         )
         .unwrap();
     driver.step();
@@ -385,10 +394,12 @@ fn driver_exit_returns_originals_and_never_mints_a_grant() {
     match poll(&mut pending) {
         Poll::Ready(Err(failed)) => {
             assert_eq!(failed.error, WorkError::Closed);
-            assert_eq!(failed.originals[0].amounts().unwrap(), bytes(1));
+            assert_eq!(claims[0].amounts().unwrap(), bytes(1));
         }
         _ => panic!("driver exit did not reject"),
     }
+    assert_eq!(held(&control), (1, 1));
+    drop(claims);
     assert_eq!(held(&control), (0, 0));
 }
 
@@ -556,23 +567,26 @@ fn exact_profiles_aggregate_once_and_keep_distinct_dependencies_and_live_zero_cl
     let mut replacement = handle
         .request(
             &scope,
-            vec![JointClaimChange::Replace {
-                original: originals.pop().unwrap(),
-                amounts: bytes(2),
-            }],
+            vec![JointClaimChange::grow_by(
+                originals[0].view().unwrap(),
+                bytes(1),
+                vec![],
+            )],
         )
         .unwrap();
     drive(&mut driver);
-    let replacement = granted(&mut replacement);
+    adjustment(&mut replacement)
+        .install(&[&originals[0]])
+        .unwrap();
     assert_eq!(profiles(), vec![(1, 0), (1, 2)]);
     drop(second);
     assert_eq!(profiles(), vec![(1, 2)]);
-    drop(replacement);
+    drop(originals);
     assert!(profiles().is_empty());
 }
 
 #[test]
-fn atomic_replacement_subtracts_all_originals_before_any_addition_at_u64_boundary() {
+fn stable_growth_at_u64_boundary_uses_actual_release_and_preserves_both_holders() {
     let control = WorkloadControl::try_new_counted(WorkloadConfig::default())
         .unwrap()
         .owner;
@@ -614,28 +628,37 @@ fn atomic_replacement_subtracts_all_originals_before_any_addition_at_u64_boundar
     drive(&mut driver);
     let mut original = granted(&mut initial).into_iter();
     let zero = original.next().unwrap();
-    let full = original.next().unwrap();
-    let mut replacement = handle
+    let mut full = original.next().unwrap();
+    // A zero-delta batch still removes all certified old profile amounts
+    // before re-adding its post-state. Adding before subtraction overflows.
+    let mut reaffirm = handle
         .request(
             &scope,
             vec![
-                JointClaimChange::Replace {
-                    original: zero,
-                    amounts: bytes(u64::MAX),
-                },
-                JointClaimChange::Replace {
-                    original: full,
-                    amounts: bytes(0),
-                },
+                JointClaimChange::grow_by(zero.view().unwrap(), bytes(0), vec![]),
+                JointClaimChange::grow_by(full.view().unwrap(), bytes(0), vec![]),
             ],
         )
         .unwrap();
     drive(&mut driver);
-    let claims = granted(&mut replacement);
-    assert_eq!(claims[0].amounts().unwrap(), bytes(u64::MAX));
-    assert_eq!(claims[1].amounts().unwrap(), bytes(0));
+    adjustment(&mut reaffirm).install(&[&zero, &full]).unwrap();
     assert_eq!(held(&control), (2, u64::MAX));
-    drop(claims);
+    full.release_part(bytes(u64::MAX)).unwrap();
+    let mut growth = handle
+        .request(
+            &scope,
+            vec![
+                JointClaimChange::grow_by(zero.view().unwrap(), bytes(u64::MAX), vec![]),
+                JointClaimChange::grow_by(full.view().unwrap(), bytes(0), vec![]),
+            ],
+        )
+        .unwrap();
+    drive(&mut driver);
+    adjustment(&mut growth).install(&[&zero, &full]).unwrap();
+    assert_eq!(zero.amounts().unwrap(), bytes(u64::MAX));
+    assert_eq!(full.amounts().unwrap(), bytes(0));
+    assert_eq!(held(&control), (2, u64::MAX));
+    drop((zero, full));
     assert_eq!(held(&control), (0, 0));
 }
 
@@ -696,4 +719,626 @@ fn same_profile_other_owner_release_is_not_restored_by_affected_profile_commit()
     }
     drop((next, last));
     assert_eq!(held(&control), (0, 0));
+}
+
+fn batch(request: &mut JointAdmission) -> JointGrantedBatch {
+    match poll(request) {
+        Poll::Ready(Ok(batch)) => batch,
+        other => panic!("expected granted batch: {other:?}"),
+    }
+}
+fn adjustment(request: &mut JointAdmission) -> JointAdjustmentReceipt {
+    let batch = batch(request);
+    assert!(batch.new_claims.is_empty());
+    batch.adjustment.expect("adjustment receipt")
+}
+fn roomy_control() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+    let control = WorkloadControl::try_new_counted(WorkloadConfig::default())
+        .unwrap()
+        .owner;
+    let (mut config, _) = profile();
+    config.global = limits(100, 100, 0);
+    config.classes = [JointResourceLimits::default(); CLASS_COUNT];
+    config.classes[4] = config.global;
+    config.lanes = [JointResourceLimits::default(); LANE_COUNT];
+    config.lanes[1] = config.global;
+    config.class_lanes = [[JointResourceLimits::default(); LANE_COUNT]; CLASS_COUNT];
+    config.class_lanes[4][1] = config.global;
+    let required = RequiredJointProgress {
+        global: JointResources::ZERO,
+        classes: [JointResources::ZERO; CLASS_COUNT],
+        lanes: [JointResources::ZERO; LANE_COUNT],
+        class_lanes: [[JointResources::ZERO; LANE_COUNT]; CLASS_COUNT],
+    };
+    let (handle, driver) = control
+        .configure_joint_capacity(config.validate(&required).unwrap())
+        .unwrap();
+    control.mark_ready().unwrap();
+    (control, handle, driver)
+}
+
+#[test]
+fn waiting_future_drop_and_unwind_preserve_the_stable_holder() {
+    let (control, handle, mut driver) = control();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let scope = root.owner.scope();
+    let a = dependency(&handle, "a");
+    let mut initial = request(&handle, &scope, &[&a], JointLane::Foreground, 2);
+    drive(&mut driver);
+    let original = granted(&mut initial).pop().unwrap();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _pending = handle
+            .request(
+                &scope,
+                vec![JointClaimChange::grow_by(
+                    original.view().unwrap(),
+                    bytes(1),
+                    vec![],
+                )],
+            )
+            .unwrap();
+        drive(&mut driver);
+        panic!("caller unwinds while a complete growth vector is blocked");
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(original.amounts().unwrap(), bytes(2));
+    assert_eq!(held(&control), (1, 2));
+    let next = handle
+        .request(
+            &scope,
+            vec![JointClaimChange::grow_by(
+                original.view().unwrap(),
+                bytes(0),
+                vec![],
+            )],
+        )
+        .unwrap();
+    drop(next);
+    drop(original);
+    assert_eq!(held(&control), (0, 0));
+}
+
+#[test]
+fn receipt_drop_uses_live_active_after_partial_release() {
+    let (control, handle, mut driver) = roomy_control();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let scope = root.owner.scope();
+    let a = dependency(&handle, "a");
+    let b = dependency(&handle, "b");
+    let mut initial = request(&handle, &scope, &[&a], JointLane::Foreground, 10);
+    drive(&mut driver);
+    let mut original = granted(&mut initial).pop().unwrap();
+    let old_view = original.view().unwrap();
+    let mut growth = handle
+        .request(
+            &scope,
+            vec![JointClaimChange::grow_by(
+                original.view().unwrap(),
+                bytes(4),
+                vec![b],
+            )],
+        )
+        .unwrap();
+    drive(&mut driver);
+    let receipt = adjustment(&mut growth);
+    assert_eq!(original.amounts().unwrap(), bytes(10));
+    assert_eq!(held(&control), (1, 14));
+    original.release_part(bytes(3)).unwrap();
+    assert_eq!(held(&control), (1, 11));
+    drop(receipt);
+    assert_eq!(original.amounts().unwrap(), bytes(7));
+    assert_eq!(held(&control), (1, 7));
+    assert!(matches!(
+        handle.request(
+            &scope,
+            vec![JointClaimChange::grow_by(old_view, bytes(1), vec![])]
+        ),
+        Err(JointAdmissionFailure {
+            error: WorkError::Conflict
+        })
+    ));
+    let mut next = handle
+        .request(
+            &scope,
+            vec![JointClaimChange::grow_by(
+                original.view().unwrap(),
+                bytes(1),
+                vec![],
+            )],
+        )
+        .unwrap();
+    drive(&mut driver);
+    adjustment(&mut next).install(&[&original]).unwrap();
+    assert_eq!(original.amounts().unwrap(), bytes(8));
+}
+
+#[test]
+fn zero_delta_dependency_extension_proves_the_full_original_amount() {
+    let (control, handle, mut driver) = control();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let scope = root.owner.scope();
+    let a = dependency(&handle, "a");
+    let b = dependency(&handle, "b");
+    let mut initial = request(&handle, &scope, &[&a], JointLane::Foreground, 2);
+    drive(&mut driver);
+    let original = granted(&mut initial).pop().unwrap();
+    let mut extend = handle
+        .request(
+            &scope,
+            vec![JointClaimChange::grow_by(
+                original.view().unwrap(),
+                bytes(0),
+                vec![b.clone()],
+            )],
+        )
+        .unwrap();
+    drive(&mut driver);
+    // Two domains require protected headroom for their intersection; charging
+    // only the zero delta would falsely grant this extension.
+    assert!(poll(&mut extend).is_pending());
+    assert_eq!(held(&control), (1, 2));
+    assert_eq!(original.amounts().unwrap(), bytes(2));
+    let mut healthy = request(&handle, &scope, &[&b], JointLane::Foreground, 1);
+    drive(&mut driver);
+    let healthy = granted(&mut healthy);
+    assert_eq!(held(&control), (2, 3));
+    drop((extend, healthy, original));
+}
+
+#[test]
+fn single_pending_and_queued_partial_release_have_exact_conflict() {
+    let (control, handle, mut driver) = control();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let scope = root.owner.scope();
+    let a = dependency(&handle, "a");
+    let mut initial = request(&handle, &scope, &[&a], JointLane::Foreground, 1);
+    drive(&mut driver);
+    let mut original = granted(&mut initial).pop().unwrap();
+    let mut grow = handle
+        .request(
+            &scope,
+            vec![JointClaimChange::grow_by(
+                original.view().unwrap(),
+                bytes(1),
+                vec![],
+            )],
+        )
+        .unwrap();
+    assert!(matches!(
+        handle.request(
+            &scope,
+            vec![JointClaimChange::grow_by(
+                original.view().unwrap(),
+                bytes(0),
+                vec![]
+            )]
+        ),
+        Err(JointAdmissionFailure {
+            error: WorkError::Conflict
+        })
+    ));
+    driver.step();
+    original.release_part(bytes(1)).unwrap();
+    drive(&mut driver);
+    assert!(matches!(
+        poll(&mut grow),
+        Poll::Ready(Err(JointAdmissionFailure {
+            error: WorkError::Conflict
+        }))
+    ));
+    assert_eq!(original.amounts().unwrap(), bytes(0));
+    assert_eq!(held(&control), (1, 0));
+}
+
+#[test]
+fn delivered_new_survives_source_drop_and_late_receipt_withdrawal() {
+    let (control, handle, mut driver) = roomy_control();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let scope = root.owner.scope();
+    let a = dependency(&handle, "a");
+    let mut initial = request(&handle, &scope, &[&a], JointLane::Foreground, 10);
+    drive(&mut driver);
+    let original = granted(&mut initial).pop().unwrap();
+    let mut mixed = handle
+        .request(
+            &scope,
+            vec![
+                JointClaimChange::grow_by(original.view().unwrap(), bytes(4), vec![]),
+                JointClaimChange::New {
+                    dependencies: vec![a],
+                    lane: JointLane::Foreground,
+                    amounts: bytes(5),
+                },
+            ],
+        )
+        .unwrap();
+    drive(&mut driver);
+    let delivered = batch(&mut mixed);
+    assert_eq!(held(&control), (2, 19));
+    drop(original);
+    assert_eq!(held(&control), (1, 5));
+    let receipt = delivered.adjustment.unwrap();
+    assert_eq!(receipt.install(&[]), Err(WorkError::Released));
+    assert_eq!(delivered.new_claims[0].amounts().unwrap(), bytes(5));
+    drop(delivered.new_claims);
+    assert_eq!(held(&control), (0, 0));
+}
+
+#[test]
+fn batch_install_is_atomic_and_does_not_return_replacement_guards() {
+    let (control, handle, mut driver) = roomy_control();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let scope = root.owner.scope();
+    let a = dependency(&handle, "a");
+    let mut first = request(&handle, &scope, &[&a], JointLane::Foreground, 10);
+    let mut second = request(&handle, &scope, &[&a], JointLane::Foreground, 20);
+    drive(&mut driver);
+    let first = granted(&mut first).pop().unwrap();
+    let second = granted(&mut second).pop().unwrap();
+    let mut growth = handle
+        .request(
+            &scope,
+            vec![
+                JointClaimChange::grow_by(first.view().unwrap(), bytes(4), vec![]),
+                JointClaimChange::grow_by(second.view().unwrap(), bytes(5), vec![]),
+            ],
+        )
+        .unwrap();
+    drive(&mut driver);
+    assert_eq!(
+        adjustment(&mut growth).install(&[&first]),
+        Err(WorkError::Conflict)
+    );
+    assert_eq!(held(&control), (2, 30));
+    assert_eq!(first.amounts().unwrap(), bytes(10));
+    assert_eq!(second.amounts().unwrap(), bytes(20));
+}
+
+#[test]
+fn cancel_before_install_rolls_back_delta_but_install_before_cancel_preserves_actual_custody() {
+    for cancel_first in [true, false] {
+        let (control, handle, mut driver) = control();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Management))
+            .unwrap();
+        let scope = root.owner.scope();
+        let a = dependency(&handle, "a");
+        let mut initial = request(&handle, &scope, &[&a], JointLane::Foreground, 1);
+        drive(&mut driver);
+        let original = granted(&mut initial).pop().unwrap();
+        let mut growth = handle
+            .request(
+                &scope,
+                vec![JointClaimChange::grow_by(
+                    original.view().unwrap(),
+                    bytes(1),
+                    vec![],
+                )],
+            )
+            .unwrap();
+        drive(&mut driver);
+        let receipt = adjustment(&mut growth);
+        if cancel_first {
+            root.owner.cancel(crate::CancellationReason::Requested);
+            assert!(receipt.install(&[&original]).is_err());
+            assert_eq!(original.amounts().unwrap(), bytes(1));
+        } else {
+            receipt.install(&[&original]).unwrap();
+            root.owner.cancel(crate::CancellationReason::Requested);
+            assert_eq!(original.amounts().unwrap(), bytes(2));
+        }
+        assert_eq!(held(&control).0, 1);
+        drop(original);
+        assert_eq!(held(&control), (0, 0));
+    }
+}
+
+#[test]
+fn rollback_rekey_behind_snapshot_cursor_forces_fair_reobservation() {
+    let (control, handle, mut driver) = roomy_control();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let scope = root.owner.scope();
+    let a = dependency(&handle, "a");
+    let b = dependency(&handle, "b");
+    // Keep the lower key {A} present after the live 60-byte charge moves to
+    // {A,B}. Snapshot copies this zero group before the rollback rekeys 60.
+    let mut zero = request(&handle, &scope, &[&a], JointLane::Foreground, 0);
+    let mut first = request(&handle, &scope, &[&a], JointLane::Foreground, 60);
+    drive(&mut driver);
+    let zero = granted(&mut zero);
+    let first = granted(&mut first).pop().unwrap();
+    let mut extend = handle
+        .request(
+            &scope,
+            vec![JointClaimChange::grow_by(
+                first.view().unwrap(),
+                bytes(0),
+                vec![b.clone()],
+            )],
+        )
+        .unwrap();
+    drive(&mut driver);
+    let receipt = adjustment(&mut extend);
+    let mut blocked = request(&handle, &scope, &[&b], JointLane::Foreground, 50);
+    // Selection, bounded arena allocation, then the first exact profile copy.
+    driver.step();
+    driver.step();
+    driver.step();
+    drop(receipt);
+    drive(&mut driver);
+    assert!(poll(&mut blocked).is_pending());
+    assert_eq!(first.amounts().unwrap(), bytes(60));
+    // A later feasible request still progresses; neither a stale proof nor a
+    // stale negative cache may bypass the global 100-byte bound or stop scans.
+    let mut healthy = request(&handle, &scope, &[&b], JointLane::Foreground, 40);
+    drive(&mut driver);
+    let healthy = granted(&mut healthy);
+    assert_eq!(held(&control), (3, 100));
+    drop((zero, first, healthy));
+    drive(&mut driver);
+    let blocked = granted(&mut blocked);
+    assert_eq!(held(&control), (1, 50));
+    drop(blocked);
+}
+
+#[test]
+fn granted_partial_release_then_install_adopts_only_live_base_and_delta() {
+    let (control, handle, mut driver) = roomy_control();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let scope = root.owner.scope();
+    let a = dependency(&handle, "a");
+    let mut initial = request(&handle, &scope, &[&a], JointLane::Foreground, 10);
+    drive(&mut driver);
+    let mut original = granted(&mut initial).pop().unwrap();
+    let mut grow = handle
+        .request(
+            &scope,
+            vec![JointClaimChange::grow_by(
+                original.view().unwrap(),
+                bytes(4),
+                vec![],
+            )],
+        )
+        .unwrap();
+    drive(&mut driver);
+    let receipt = adjustment(&mut grow);
+    assert!(matches!(
+        handle.request(
+            &scope,
+            vec![JointClaimChange::grow_by(
+                original.view().unwrap(),
+                bytes(1),
+                vec![]
+            )]
+        ),
+        Err(JointAdmissionFailure {
+            error: WorkError::Conflict
+        })
+    ));
+    original.release_part(bytes(3)).unwrap();
+    receipt.install(&[&original]).unwrap();
+    assert_eq!(original.amounts().unwrap(), bytes(11));
+    assert_eq!(held(&control), (1, 11));
+    drop(original);
+    assert_eq!(held(&control), (0, 0));
+}
+
+#[test]
+fn source_drop_before_reply_refunds_only_unstarted_batch_and_reports_released() {
+    for grant_first in [false, true] {
+        let (control, handle, mut driver) = roomy_control();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Management))
+            .unwrap();
+        let scope = root.owner.scope();
+        let a = dependency(&handle, "a");
+        let mut initial = request(&handle, &scope, &[&a], JointLane::Foreground, 10);
+        drive(&mut driver);
+        let original = granted(&mut initial).pop().unwrap();
+        let mut mixed = handle
+            .request(
+                &scope,
+                vec![
+                    JointClaimChange::grow_by(original.view().unwrap(), bytes(4), vec![]),
+                    JointClaimChange::New {
+                        dependencies: vec![a],
+                        lane: JointLane::Foreground,
+                        amounts: bytes(5),
+                    },
+                ],
+            )
+            .unwrap();
+        if grant_first {
+            drive(&mut driver);
+        } else {
+            driver.step();
+        }
+        drop(original);
+        assert!(matches!(
+            poll(&mut mixed),
+            Poll::Ready(Err(JointAdmissionFailure {
+                error: WorkError::Released
+            }))
+        ));
+        drive(&mut driver);
+        assert_eq!(held(&control), (0, 0));
+    }
+}
+
+#[test]
+fn driver_exit_after_delivery_refunds_delta_and_preserves_delivered_new() {
+    let (control, handle, mut driver) = roomy_control();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let scope = root.owner.scope();
+    let a = dependency(&handle, "a");
+    let mut initial = request(&handle, &scope, &[&a], JointLane::Foreground, 10);
+    drive(&mut driver);
+    let original = granted(&mut initial).pop().unwrap();
+    let mut mixed = handle
+        .request(
+            &scope,
+            vec![
+                JointClaimChange::grow_by(original.view().unwrap(), bytes(4), vec![]),
+                JointClaimChange::New {
+                    dependencies: vec![a],
+                    lane: JointLane::Foreground,
+                    amounts: bytes(5),
+                },
+            ],
+        )
+        .unwrap();
+    drive(&mut driver);
+    let delivered = batch(&mut mixed);
+    drop(driver);
+    assert_eq!(held(&control), (2, 15));
+    assert_eq!(
+        delivered.adjustment.unwrap().install(&[&original]),
+        Err(WorkError::Closed)
+    );
+    assert_eq!(original.amounts().unwrap(), bytes(10));
+    assert_eq!(delivered.new_claims[0].amounts().unwrap(), bytes(5));
+    drop((delivered.new_claims, original));
+    assert_eq!(held(&control), (0, 0));
+}
+
+#[test]
+fn epoch_overflow_without_active_turn_settles_all_tickets_without_refunding_delivered_new() {
+    let (control, handle, mut driver) = roomy_control();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let scope = root.owner.scope();
+    let a = dependency(&handle, "a");
+    let mut first = request(&handle, &scope, &[&a], JointLane::Foreground, 10);
+    let mut second = request(&handle, &scope, &[&a], JointLane::Foreground, 10);
+    let mut third = request(&handle, &scope, &[&a], JointLane::Foreground, 10);
+    drive(&mut driver);
+    let first = granted(&mut first).pop().unwrap();
+    let second = granted(&mut second).pop().unwrap();
+    let mut third = granted(&mut third).pop().unwrap();
+    let mixed = |source: &JointClaim, amount| {
+        handle
+            .request(
+                &scope,
+                vec![
+                    JointClaimChange::grow_by(source.view().unwrap(), bytes(4), vec![]),
+                    JointClaimChange::New {
+                        dependencies: vec![a.clone()],
+                        lane: JointLane::Foreground,
+                        amounts: bytes(amount),
+                    },
+                ],
+            )
+            .unwrap()
+    };
+    let mut delivered = mixed(&first, 5);
+    let mut unreceived = mixed(&second, 6);
+    drive(&mut driver);
+    let delivered = batch(&mut delivered);
+    let mut waiting = mixed(&third, 7);
+    control.inner.update(|state| {
+        let ledger = state.joint.as_mut().unwrap();
+        assert!(ledger.active.is_none());
+        ledger.release_epoch = u64::MAX;
+    });
+    third.release_part(bytes(1)).unwrap();
+    drive(&mut driver);
+    assert_eq!(held(&control), (4, 34));
+    assert!(matches!(
+        poll(&mut unreceived),
+        Poll::Ready(Err(JointAdmissionFailure {
+            error: WorkError::Closed
+        }))
+    ));
+    assert!(matches!(
+        poll(&mut waiting),
+        Poll::Ready(Err(JointAdmissionFailure {
+            error: WorkError::Closed
+        }))
+    ));
+    assert_eq!(
+        delivered.adjustment.unwrap().install(&[&first]),
+        Err(WorkError::Closed)
+    );
+    assert_eq!(delivered.new_claims[0].amounts().unwrap(), bytes(5));
+    assert_eq!(third.amounts().unwrap(), bytes(9));
+    drop((first, second, third, delivered.new_claims));
+    assert_eq!(held(&control), (0, 0));
+}
+
+#[test]
+fn closed_before_reply_refuses_new_permission_without_a_driver_turn() {
+    for receive_first in [false, true] {
+        let (control, handle, mut driver) = roomy_control();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Management))
+            .unwrap();
+        let scope = root.owner.scope();
+        let a = dependency(&handle, "a");
+        let mut first = request(&handle, &scope, &[&a], JointLane::Foreground, 10);
+        let mut trigger = request(&handle, &scope, &[&a], JointLane::Foreground, 1);
+        drive(&mut driver);
+        let first = granted(&mut first).pop().unwrap();
+        let mut trigger = granted(&mut trigger).pop().unwrap();
+        let mut mixed = handle
+            .request(
+                &scope,
+                vec![
+                    JointClaimChange::grow_by(first.view().unwrap(), bytes(4), vec![]),
+                    JointClaimChange::New {
+                        dependencies: vec![a],
+                        lane: JointLane::Foreground,
+                        amounts: bytes(5),
+                    },
+                ],
+            )
+            .unwrap();
+        drive(&mut driver);
+        let delivered = receive_first.then(|| batch(&mut mixed));
+        control.inner.update(|state| {
+            state.joint.as_mut().unwrap().release_epoch = u64::MAX;
+        });
+        trigger.release_part(bytes(1)).unwrap();
+        // Poll races the close before the driver observes it. A previously
+        // delivered New is already owned; an unreceived grant is not permission.
+        if let Some(delivered) = delivered {
+            assert_eq!(delivered.new_claims[0].amounts().unwrap(), bytes(5));
+            assert_eq!(
+                delivered.adjustment.unwrap().install(&[&first]),
+                Err(WorkError::Closed)
+            );
+            assert_eq!(held(&control), (3, 15));
+            drop(delivered.new_claims);
+        } else {
+            assert!(matches!(
+                poll(&mut mixed),
+                Poll::Ready(Err(JointAdmissionFailure {
+                    error: WorkError::Closed
+                }))
+            ));
+            assert_eq!(held(&control), (2, 10));
+        }
+        assert_eq!(first.amounts().unwrap(), bytes(10));
+        drop((first, trigger));
+        drive(&mut driver);
+        assert_eq!(held(&control), (0, 0));
+    }
 }

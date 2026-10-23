@@ -28,8 +28,8 @@ mod protection;
 
 pub use driver::{JointProgress, JointProgressDriver};
 pub use ledger::{
-    JointAdmission, JointAdmissionFailure, JointAdmissionHandle, JointClaim, JointClaimChange,
-    JointDependency,
+    JointAdjustmentReceipt, JointAdmission, JointAdmissionFailure, JointAdmissionHandle,
+    JointClaim, JointClaimChange, JointClaimView, JointDependency, JointGrantedBatch,
 };
 
 use crate::{WorkClass, WorkError};

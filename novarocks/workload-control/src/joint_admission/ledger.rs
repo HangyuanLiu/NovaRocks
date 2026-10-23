@@ -71,40 +71,73 @@ pub(super) struct ProfileRecord {
     pub(super) amounts: JointResources,
     pub(super) claims: usize,
 }
+
+/// Plain identity only: dropping this token cannot release a physical claim.
+/// The nonclone JointClaim is the only actual holder; State retains a Weak.
+struct ClaimIdentity;
 #[derive(Clone)]
-pub(super) struct ClaimRecord {
-    pub(super) owner: WorkId,
+pub(super) struct ProposedClaim {
     pub(super) facts: Arc<ProfileFacts>,
     pub(super) amounts: JointResources,
 }
-
+pub(super) struct ClaimRecord {
+    pub(super) owner: WorkId,
+    /// Charged proposal, including any not-yet-installed delta and DI union.
+    pub(super) facts: Arc<ProfileFacts>,
+    pub(super) amounts: JointResources,
+    active_facts: Arc<ProfileFacts>,
+    active_amounts: JointResources,
+    holder: Weak<ClaimIdentity>,
+    pending: Option<u64>,
+    structure_revision: u64,
+    release_revision: u64,
+}
+#[derive(Clone)]
+pub struct JointClaimView {
+    inner: Weak<Inner>,
+    holder: Weak<ClaimIdentity>,
+    id: u64,
+    structure_revision: u64,
+    release_revision: u64,
+}
 #[derive(Clone)]
 pub(super) struct ChangeRecord {
     pub(super) old: Option<u64>,
     pub(super) original_amounts: Option<JointResources>,
-    pub(super) claim: ClaimRecord,
+    pub(super) original_facts: Option<Arc<ProfileFacts>>,
+    source: Option<JointClaimView>,
+    pub(super) claim: ProposedClaim,
 }
-
+pub(super) enum RequestPhase {
+    Waiting,
+    Granted {
+        new_ids: Vec<u64>,
+    },
+    /// New claims have crossed to their physical recipients. Withdrawal must
+    /// never release them. Only the batch adjustment receipt remains here.
+    Delivered,
+    Failed(WorkError),
+}
 pub(super) struct RequestRecord {
     pub(super) owner: WorkId,
     pub(super) changes: Arc<[ChangeRecord]>,
-    pub(super) result: Option<Result<Vec<u64>, WorkError>>,
+    pub(super) phase: RequestPhase,
     pub(super) blocked_at: Option<u64>,
     pub(super) waker: Option<Waker>,
 }
-
 pub(crate) struct JointLedger {
     pub(super) config: Arc<ValidatedJointCapacityConfig>,
     dependencies: BTreeMap<SharedDependency, Weak<DependencyRecord>>,
     pub(super) claims: BTreeMap<u64, ClaimRecord>,
     pub(super) profiles: BTreeMap<Arc<ProfileKey>, ProfileRecord>,
     pub(super) requests: BTreeMap<u64, RequestRecord>,
-    /// A checked, nonwrapping release epoch; never a proof of actual exit.
     pub(super) release_epoch: u64,
+    /// A rollback can rekey a live charge behind a snapshot's ordered cursor.
+    /// Such a change invalidates both positive and negative certificates.
+    pub(super) profile_layout_revision: u64,
     pub(super) active: Option<u64>,
     pub(super) driver_closed: bool,
 }
-
 impl JointLedger {
     pub(crate) fn is_drained(&self) -> bool {
         self.claims.is_empty()
@@ -115,15 +148,17 @@ impl JointLedger {
     pub(super) fn released(&mut self) {
         match self.release_epoch.checked_add(1) {
             Some(epoch) => self.release_epoch = epoch,
-            // Refuse all subsequent positive growth rather than reuse an epoch.
+            None => self.driver_closed = true,
+        }
+    }
+    fn layout_changed(&mut self) {
+        match self.profile_layout_revision.checked_add(1) {
+            Some(revision) => self.profile_layout_revision = revision,
             None => self.driver_closed = true,
         }
     }
 }
-
 impl WorkloadControl {
-    /// Install once before readiness. The unique driver belongs to the role's
-    /// supervised progression owner; waiting callers do not drive admission.
     pub fn configure_joint_capacity(
         &self,
         config: ValidatedJointCapacityConfig,
@@ -140,6 +175,7 @@ impl WorkloadControl {
                 profiles: BTreeMap::new(),
                 requests: BTreeMap::new(),
                 release_epoch: 0,
+                profile_layout_revision: 0,
                 active: None,
                 driver_closed: false,
             });
@@ -152,7 +188,6 @@ impl WorkloadControl {
         })
     }
 }
-
 impl JointAdmissionHandle {
     pub fn register_dependency(
         &self,
@@ -198,134 +233,116 @@ impl JointAdmissionHandle {
         })
     }
 
-    /// Queue a complete batch in the original authority. Old capabilities move
-    /// into the reply owner until one atomic verdict; their immutable class,
-    /// lane and dependency provenance cannot be supplied again by the caller.
+    /// Queue New claims and/or growth of exact stable holders. No physical
+    /// holder moves into this future. Growth authority starts only at install.
     pub fn request(
         &self,
         scope: &WorkScope,
         changes: Vec<JointClaimChange>,
     ) -> Result<JointAdmission, JointAdmissionFailure> {
-        let build = || -> Result<Arc<[ChangeRecord]>, WorkError> {
-            if !Arc::ptr_eq(&self.inner, &scope.inner) {
-                return Err(WorkError::ForeignAuthority);
-            }
-            let state = self.inner.state.lock().unwrap();
+        if !Arc::ptr_eq(&self.inner, &scope.inner) {
+            return Err(JointAdmissionFailure {
+                error: WorkError::ForeignAuthority,
+            });
+        }
+        let queued = self.inner.update(|state| {
             let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
             let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
             let config = &ledger.config.config;
+            if ledger.driver_closed {
+                return Err(WorkError::Closed);
+            }
             if changes.is_empty() || changes.len() > config.max_changes_per_request {
                 return Err(WorkError::Capacity("joint batch records"));
             }
-            let mut records = Vec::with_capacity(changes.len());
+            if ledger.requests.len() >= config.max_requests {
+                return Err(WorkError::Capacity("joint request and reply records"));
+            }
+            let mut records: Vec<ChangeRecord> = Vec::with_capacity(changes.len());
             for change in &changes {
-                let (old, claim) = match change {
+                let (source, lane, amounts, mut selected, additional) = match change {
                     JointClaimChange::New {
                         dependencies,
                         lane,
                         amounts,
+                    } => (None, *lane, *amounts, Vec::new(), dependencies),
+                    JointClaimChange::Grow {
+                        source,
+                        delta,
+                        dependencies,
                     } => {
-                        if dependencies.len() > config.max_dependencies_per_claim {
-                            return Err(WorkError::Capacity("joint dependency fanout"));
-                        }
-                        let mut selected = Vec::with_capacity(dependencies.len());
-                        for dependency in dependencies {
-                            if !Arc::ptr_eq(&self.inner, &dependency.inner) {
-                                return Err(WorkError::ForeignAuthority);
-                            }
-                            selected.push(Arc::clone(&dependency.record));
-                        }
-                        selected.sort_unstable_by_key(|record| record.ordinal);
-                        if selected
-                            .windows(2)
-                            .any(|pair| pair[0].ordinal == pair[1].ordinal)
-                        {
-                            return Err(WorkError::Conflict);
-                        }
-                        (
-                            None,
-                            ClaimRecord {
-                                owner: scope.id,
-                                facts: Arc::new(ProfileFacts {
-                                    key: Arc::new(ProfileKey {
-                                        class: class_index(node.class),
-                                        lane: *lane as usize,
-                                        dependencies: selected
-                                            .iter()
-                                            .map(|domain| domain.ordinal)
-                                            .collect(),
-                                    }),
-                                    class: node.class,
-                                    lane: *lane,
-                                    dependencies: selected.into(),
-                                }),
-                                amounts: *amounts,
-                            },
-                        )
-                    }
-                    JointClaimChange::Replace { original, amounts } => {
-                        if !Arc::ptr_eq(&self.inner, &original.inner) {
+                        if !Weak::ptr_eq(&source.inner, &Arc::downgrade(&self.inner)) {
                             return Err(WorkError::ForeignAuthority);
                         }
-                        let id = original.id.ok_or(WorkError::Released)?;
-                        let old = ledger.claims.get(&id).ok_or(WorkError::Released)?;
+                        let old = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
+                        authenticate(old, source)?;
                         if old.owner != scope.id
-                            || records.iter().any(|r: &ChangeRecord| r.old == Some(id))
+                            || old.pending.is_some()
+                            || records.iter().any(|record| record.old == Some(source.id))
                         {
                             return Err(WorkError::Conflict);
                         }
-                        let mut claim = old.clone();
-                        claim.amounts = *amounts;
-                        (Some(id), claim)
+                        // Grant and eventual install/rollback each advance structure.
+                        old.structure_revision
+                            .checked_add(2)
+                            .ok_or(WorkError::ArithmeticOverflow)?;
+                        (
+                            Some(source.clone()),
+                            old.active_facts.lane,
+                            old.active_amounts.checked_add(*delta)?,
+                            old.active_facts.dependencies.to_vec(),
+                            dependencies,
+                        )
                     }
                 };
-                let original_amounts = old.map(|id| ledger.claims[&id].amounts);
+                if additional.len() > config.max_dependencies_per_claim {
+                    return Err(WorkError::Capacity("joint dependency fanout"));
+                }
+                for dependency in additional {
+                    if !Arc::ptr_eq(&self.inner, &dependency.inner) {
+                        return Err(WorkError::ForeignAuthority);
+                    }
+                    selected.push(Arc::clone(&dependency.record));
+                }
+                selected.sort_unstable_by_key(|record| record.ordinal);
+                // Extension is a set union, including already-present domains.
+                // A New declaration still rejects duplicate original facts.
+                if source.is_none() && selected.windows(2).any(|p| p[0].ordinal == p[1].ordinal) {
+                    return Err(WorkError::Conflict);
+                }
+                selected.dedup_by_key(|record| record.ordinal);
+                if selected.len() > config.max_dependencies_per_claim {
+                    return Err(WorkError::Capacity("joint dependency union"));
+                }
+                let class = source.as_ref().map_or(node.class, |source| {
+                    ledger.claims[&source.id].active_facts.class
+                });
+                let facts = Arc::new(ProfileFacts {
+                    key: Arc::new(ProfileKey {
+                        class: class_index(class),
+                        lane: lane as usize,
+                        dependencies: selected.iter().map(|d| d.ordinal).collect(),
+                    }),
+                    class,
+                    lane,
+                    dependencies: selected.into(),
+                });
+                let old = source.as_ref().map(|source| source.id);
                 records.push(ChangeRecord {
                     old,
-                    original_amounts,
-                    claim,
+                    original_amounts: old.map(|id| ledger.claims[&id].amounts),
+                    original_facts: old.map(|id| Arc::clone(&ledger.claims[&id].facts)),
+                    source,
+                    claim: ProposedClaim { facts, amounts },
                 });
             }
-            Ok(records.into())
-        };
-        let records = match build() {
-            Ok(records) => records,
-            Err(error) => {
-                return Err(JointAdmissionFailure {
-                    error,
-                    originals: originals(changes),
-                });
-            }
-        };
-        let queued = self.inner.update(|state| {
-            let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
-            // Settlement remains possible after cancellation/admission closure.
             if records
                 .iter()
                 .any(|record| record.claim.facts.lane != JointLane::Settlement)
             {
                 node.check()?;
-            }
-            let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
-            if ledger.driver_closed {
-                return Err(WorkError::Closed);
-            }
-            if state.closed
-                && records
-                    .iter()
-                    .any(|record| record.claim.facts.lane != JointLane::Settlement)
-            {
-                return Err(WorkError::Closed);
-            }
-            if ledger.requests.len() >= ledger.config.config.max_requests {
-                return Err(WorkError::Capacity("joint request and reply records"));
-            }
-            // Every original is still live and exclusively held by `changes`.
-            for record in records.iter() {
-                if let Some(id) = record.old {
-                    if !ledger.claims.contains_key(&id) {
-                        return Err(WorkError::Released);
-                    }
+                if state.closed {
+                    return Err(WorkError::Closed);
                 }
             }
             let waiters = node
@@ -334,59 +351,91 @@ impl JointAdmissionHandle {
                 .ok_or(WorkError::ArithmeticOverflow)?;
             let id = state.next_id()?;
             state.nodes.get_mut(&scope.id).unwrap().resource_waiters = waiters;
-            state.joint.as_mut().unwrap().requests.insert(
+            let ledger = state.joint.as_mut().unwrap();
+            for record in &records {
+                if let Some(old) = record.old {
+                    ledger.claims.get_mut(&old).unwrap().pending = Some(id);
+                }
+            }
+            ledger.requests.insert(
                 id,
                 RequestRecord {
                     owner: scope.id,
-                    changes: records,
-                    result: None,
+                    changes: records.into(),
+                    phase: RequestPhase::Waiting,
                     blocked_at: None,
                     waker: None,
                 },
             );
             Ok(id)
         });
-        match queued {
-            Ok(id) => Ok(JointAdmission {
+        queued
+            .map(|id| JointAdmission {
                 inner: Arc::clone(&self.inner),
                 id: Some(id),
-                originals: originals(changes),
-            }),
-            Err(error) => Err(JointAdmissionFailure {
-                error,
-                originals: originals(changes),
-            }),
-        }
+            })
+            .map_err(|error| JointAdmissionFailure { error })
     }
 }
-
 pub enum JointClaimChange {
     New {
         dependencies: Vec<JointDependency>,
         lane: JointLane,
         amounts: JointResources,
     },
-    Replace {
-        original: JointClaim,
-        amounts: JointResources,
+    Grow {
+        source: JointClaimView,
+        delta: JointResources,
+        dependencies: Vec<JointDependency>,
     },
 }
-fn originals(changes: Vec<JointClaimChange>) -> Vec<JointClaim> {
-    changes
-        .into_iter()
-        .filter_map(|change| match change {
-            JointClaimChange::Replace { original, .. } => Some(original),
-            JointClaimChange::New { .. } => None,
-        })
-        .collect()
+impl JointClaimChange {
+    pub fn grow_by(
+        source: JointClaimView,
+        delta: JointResources,
+        dependencies: Vec<JointDependency>,
+    ) -> Self {
+        Self::Grow {
+            source,
+            delta,
+            dependencies,
+        }
+    }
+}
+fn authenticate(record: &ClaimRecord, source: &JointClaimView) -> Result<(), WorkError> {
+    if !Weak::ptr_eq(&record.holder, &source.holder) {
+        return Err(WorkError::Released);
+    }
+    if record.structure_revision != source.structure_revision
+        || record.release_revision != source.release_revision
+    {
+        return Err(WorkError::Conflict);
+    }
+    Ok(())
+}
+pub(super) fn validate_waiting(
+    ledger: &JointLedger,
+    id: u64,
+    changes: &[ChangeRecord],
+) -> Result<(), WorkError> {
+    for change in changes {
+        if let Some(source) = &change.source {
+            let record = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
+            authenticate(record, source)?;
+            if record.pending != Some(id) {
+                return Err(WorkError::Conflict);
+            }
+        }
+    }
+    Ok(())
 }
 
-/// One noncloneable physical/custody reservation. Its actual resource owner
-/// retains it through real completion. Merely publishing a logical result does
-/// not drop this capability. Shared backing uses an Arc of its real owner.
+/// Physical custody remains here throughout any queued/granted adjustment.
+/// Logical completion and adjustment cancellation must not drop this holder.
 pub struct JointClaim {
-    pub(super) inner: Arc<Inner>,
-    pub(super) id: Option<u64>,
+    inner: Arc<Inner>,
+    id: u64,
+    identity: Arc<ClaimIdentity>,
 }
 impl std::fmt::Debug for JointClaim {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -396,31 +445,50 @@ impl std::fmt::Debug for JointClaim {
     }
 }
 impl JointClaim {
+    pub fn view(&self) -> Result<JointClaimView, WorkError> {
+        let state = self.inner.state.lock().unwrap();
+        let record = state
+            .joint
+            .as_ref()
+            .and_then(|l| l.claims.get(&self.id))
+            .ok_or(WorkError::Released)?;
+        Ok(JointClaimView {
+            inner: Arc::downgrade(&self.inner),
+            holder: Arc::downgrade(&self.identity),
+            id: self.id,
+            structure_revision: record.structure_revision,
+            release_revision: record.release_revision,
+        })
+    }
+    /// Only the installed amount is permission to start physical work.
     pub fn amounts(&self) -> Result<JointResources, WorkError> {
-        let id = self.id.ok_or(WorkError::Released)?;
         let state = self.inner.state.lock().unwrap();
         state
             .joint
             .as_ref()
-            .and_then(|ledger| ledger.claims.get(&id))
-            .map(|record| record.amounts)
+            .and_then(|l| l.claims.get(&self.id))
+            .map(|record| record.active_amounts)
             .ok_or(WorkError::Released)
     }
-    /// Only a real owner's observed release calls this operation. No positive
-    /// growth, class change or dependency change can enter through it.
+    /// Report an actual partial release. Granted delta remains separate; a
+    /// queued/proving source becomes stale and receives typed Conflict.
     pub fn release_part(&mut self, released: JointResources) -> Result<(), WorkError> {
-        let id = self.id.ok_or(WorkError::Released)?;
         self.inner.update(|state| {
             let ledger = state.joint.as_mut().ok_or(WorkError::NotReady)?;
-            let record = ledger.claims.get_mut(&id).ok_or(WorkError::Released)?;
-            let remainder = record.amounts.checked_sub(released)?;
+            let record = ledger.claims.get_mut(&self.id).ok_or(WorkError::Released)?;
+            let active = record.active_amounts.checked_sub(released)?;
+            let charged = record.amounts.checked_sub(released)?;
             let profile = ledger
                 .profiles
                 .get_mut(&record.facts.key)
-                .expect("original claim profile");
-            let total = profile.amounts.checked_sub(released)?;
-            record.amounts = remainder;
-            profile.amounts = total;
+                .expect("live claim profile");
+            profile.amounts = profile.amounts.checked_sub(released)?;
+            record.active_amounts = active;
+            record.amounts = charged;
+            match record.release_revision.checked_add(1) {
+                Some(revision) => record.release_revision = revision,
+                None => ledger.driver_closed = true,
+            }
             ledger.released();
             Ok(())
         })
@@ -428,135 +496,471 @@ impl JointClaim {
 }
 impl Drop for JointClaim {
     fn drop(&mut self) {
-        if let Some(id) = self.id.take() {
-            self.inner.update(|state| release_claim(state, id));
+        let waker = self.inner.update(|state| release_current(state, self.id));
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 }
-pub(super) fn release_claim(state: &mut State, id: u64) {
-    if let Some(record) = state
-        .joint
-        .as_mut()
-        .and_then(|ledger| ledger.claims.remove(&id))
-    {
-        let ledger = state.joint.as_mut().unwrap();
-        let profile = ledger
-            .profiles
-            .get_mut(&record.facts.key)
-            .expect("original claim profile");
-        profile.amounts = profile
-            .amounts
-            .checked_sub(record.amounts)
-            .expect("profile contains original charge");
-        profile.claims -= 1;
-        if profile.claims == 0 {
-            ledger.profiles.remove(&record.facts.key);
-        }
-        ledger.released();
-        state.nodes.get_mut(&record.owner).unwrap().resource_holders -= 1;
-        state.collect(record.owner);
+fn subtract_profile(ledger: &mut JointLedger, facts: &Arc<ProfileFacts>, amounts: JointResources) {
+    let profile = ledger
+        .profiles
+        .get_mut(&facts.key)
+        .expect("live charge profile");
+    profile.amounts = profile
+        .amounts
+        .checked_sub(amounts)
+        .expect("profile contains charge");
+    profile.claims -= 1;
+    if profile.claims == 0 {
+        ledger.profiles.remove(&facts.key);
     }
+}
+fn add_profile(ledger: &mut JointLedger, facts: Arc<ProfileFacts>, amounts: JointResources) {
+    let profile = ledger
+        .profiles
+        .entry(Arc::clone(&facts.key))
+        .or_insert(ProfileRecord {
+            facts,
+            amounts: JointResources::ZERO,
+            claims: 0,
+        });
+    // Rollback is a monotone release of charged delta and dependency membership;
+    // the already-certified global u64 capacity bounds the remaining sum.
+    profile.amounts = profile
+        .amounts
+        .checked_add(amounts)
+        .expect("certified live amount");
+    profile.claims += 1;
+}
+fn remove_claim(state: &mut State, id: u64) {
+    let Some(record) = state.joint.as_mut().unwrap().claims.remove(&id) else {
+        return;
+    };
+    let ledger = state.joint.as_mut().unwrap();
+    subtract_profile(ledger, &record.facts, record.amounts);
+    ledger.released();
+    state.nodes.get_mut(&record.owner).unwrap().resource_holders -= 1;
+    state.collect(record.owner);
+}
+/// Only actual holder Drop or withdrawal of a never-delivered New invokes this.
+fn release_current(state: &mut State, id: u64) -> Option<Waker> {
+    let pending = state
+        .joint
+        .as_ref()
+        .and_then(|l| l.claims.get(&id))
+        .and_then(|r| r.pending);
+    let waker = pending.and_then(|ticket| fail_request(state, ticket, WorkError::Released));
+    remove_claim(state, id);
+    waker
+}
+fn remove_request(state: &mut State, id: u64) {
+    if let Some(request) = state.joint.as_mut().unwrap().requests.remove(&id) {
+        state
+            .nodes
+            .get_mut(&request.owner)
+            .unwrap()
+            .resource_waiters -= 1;
+        state.collect(request.owner);
+    }
+}
+/// Shared cancellation path. The request retains its typed failure until its
+/// future/receipt is consumed. It never restores a snapshot of an old amount.
+pub(super) fn fail_request(state: &mut State, id: u64, error: WorkError) -> Option<Waker> {
+    let ledger = state.joint.as_mut().unwrap();
+    let request = ledger.requests.get_mut(&id)?;
+    if matches!(request.phase, RequestPhase::Failed(_)) {
+        return request.waker.take();
+    }
+    let phase = std::mem::replace(&mut request.phase, RequestPhase::Failed(error));
+    let changes = Arc::clone(&request.changes);
+    let waker = request.waker.take();
+    let charged = matches!(
+        phase,
+        RequestPhase::Granted { .. } | RequestPhase::Delivered
+    );
+    for change in changes.iter() {
+        let Some(old) = change.old else {
+            continue;
+        };
+        let Some(record) = ledger.claims.get_mut(&old) else {
+            continue;
+        };
+        if record.pending != Some(id) {
+            continue;
+        }
+        record.pending = None;
+        if charged {
+            let from = Arc::clone(&record.facts);
+            let amount = record.amounts;
+            let to = Arc::clone(&record.active_facts);
+            let active = record.active_amounts;
+            record.facts = Arc::clone(&to);
+            record.amounts = active;
+            match record.structure_revision.checked_add(1) {
+                Some(revision) => record.structure_revision = revision,
+                None => ledger.driver_closed = true,
+            }
+            subtract_profile(ledger, &from, amount);
+            add_profile(ledger, Arc::clone(&to), active);
+            if from.key != to.key {
+                ledger.layout_changed();
+            }
+            ledger.released();
+        }
+    }
+    if let RequestPhase::Granted { new_ids } = phase {
+        for id in new_ids {
+            remove_claim(state, id);
+        }
+    }
+    waker
+}
+fn withdraw_request(state: &mut State, id: u64) -> Option<Waker> {
+    let waker = fail_request(state, id, WorkError::Released);
+    remove_request(state, id);
+    waker
 }
 
-/// Rejection returns all original capabilities; a capacity wait never implies
-/// their release or cancellation of the originating work.
+/// Called only by the unique driver, after proof and exact source validation.
+/// Preflight reads live affected groups; it never swaps a copied ledger.
+pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError> {
+    let ledger = state.joint.as_ref().unwrap();
+    if ledger.driver_closed {
+        return Err(WorkError::Closed);
+    }
+    let request = ledger.requests.get(&id).ok_or(WorkError::Released)?;
+    if !matches!(request.phase, RequestPhase::Waiting) {
+        return Err(WorkError::Conflict);
+    }
+    validate_waiting(ledger, id, &request.changes)?;
+    let changes = Arc::clone(&request.changes);
+    let owner = request.owner;
+    let new_count = changes.iter().filter(|c| c.old.is_none()).count();
+    if ledger
+        .claims
+        .len()
+        .checked_add(new_count)
+        .ok_or(WorkError::ArithmeticOverflow)?
+        > ledger.config.config.max_claims
+    {
+        return Err(WorkError::Capacity("joint claim records"));
+    }
+    state.nodes[&owner]
+        .resource_holders
+        .checked_add(new_count)
+        .ok_or(WorkError::ArithmeticOverflow)?;
+    state
+        .next_id
+        .checked_add(new_count as u64)
+        .ok_or(WorkError::ArithmeticOverflow)?;
+    ledger
+        .profile_layout_revision
+        .checked_add(changes.len() as u64)
+        .ok_or(WorkError::ArithmeticOverflow)?;
+    let mut profiles = BTreeMap::new();
+    for change in changes.iter() {
+        for facts in change
+            .original_facts
+            .iter()
+            .chain(std::iter::once(&change.claim.facts))
+        {
+            profiles.entry(Arc::clone(&facts.key)).or_insert_with(|| {
+                ledger
+                    .profiles
+                    .get(&facts.key)
+                    .cloned()
+                    .unwrap_or(ProfileRecord {
+                        facts: Arc::clone(facts),
+                        amounts: JointResources::ZERO,
+                        claims: 0,
+                    })
+            });
+        }
+    }
+    // All originals are removed before any candidate is added, including when
+    // original and union dependency keys differ or two sources share a group.
+    for change in changes.iter() {
+        if let Some(facts) = &change.original_facts {
+            let profile = profiles.get_mut(&facts.key).unwrap();
+            profile.amounts = profile
+                .amounts
+                .checked_sub(change.original_amounts.unwrap())?;
+            profile.claims = profile.claims.checked_sub(1).ok_or(WorkError::Conflict)?;
+        }
+    }
+    for change in changes.iter() {
+        let profile = profiles.get_mut(&change.claim.facts.key).unwrap();
+        profile.amounts = profile.amounts.checked_add(change.claim.amounts)?;
+        profile.claims = profile
+            .claims
+            .checked_add(1)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+    }
+    let mut new_ids = Vec::with_capacity(new_count);
+    for change in changes.iter() {
+        if let Some(old) = change.old {
+            let ledger = state.joint.as_mut().unwrap();
+            let record = ledger.claims.get_mut(&old).unwrap();
+            let rekey = record.facts.key != change.claim.facts.key;
+            record.facts = Arc::clone(&change.claim.facts);
+            record.amounts = change.claim.amounts;
+            record.structure_revision += 1; // Reserved by request preflight.
+            if rekey {
+                ledger.layout_changed();
+            }
+        } else {
+            let new_id = state.next_id().expect("prechecked claim ids");
+            state.joint.as_mut().unwrap().claims.insert(
+                new_id,
+                ClaimRecord {
+                    owner,
+                    facts: Arc::clone(&change.claim.facts),
+                    amounts: change.claim.amounts,
+                    active_facts: Arc::clone(&change.claim.facts),
+                    active_amounts: change.claim.amounts,
+                    holder: Weak::new(),
+                    pending: None,
+                    structure_revision: 0,
+                    release_revision: 0,
+                },
+            );
+            state.nodes.get_mut(&owner).unwrap().resource_holders += 1;
+            new_ids.push(new_id);
+        }
+    }
+    let ledger = state.joint.as_mut().unwrap();
+    for (key, profile) in profiles {
+        if profile.claims == 0 {
+            ledger.profiles.remove(&key);
+        } else {
+            ledger.profiles.insert(key, profile);
+        }
+    }
+    ledger.requests.get_mut(&id).unwrap().phase = RequestPhase::Granted { new_ids };
+    Ok(())
+}
+
+#[derive(Debug)]
 pub struct JointAdmissionFailure {
     pub error: WorkError,
-    pub originals: Vec<JointClaim>,
 }
-impl std::fmt::Debug for JointAdmissionFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JointAdmissionFailure")
-            .field("error", &self.error)
-            .field("originals", &self.originals.len())
-            .finish()
-    }
+#[derive(Debug)]
+pub struct JointGrantedBatch {
+    pub new_claims: Vec<JointClaim>,
+    pub adjustment: Option<JointAdjustmentReceipt>,
 }
-
 #[must_use = "Admission must be awaited or explicitly dropped"]
 pub struct JointAdmission {
     inner: Arc<Inner>,
     id: Option<u64>,
-    originals: Vec<JointClaim>,
 }
 impl Future for JointAdmission {
-    type Output = Result<Vec<JointClaim>, JointAdmissionFailure>;
+    type Output = Result<JointGrantedBatch, JointAdmissionFailure>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let id = self.id.expect("completed joint admission polled again");
         let result = self.inner.update(|state| {
+            let closed = state.joint.as_ref().unwrap().driver_closed;
             let request = state
                 .joint
                 .as_mut()
                 .unwrap()
                 .requests
                 .get_mut(&id)
-                .expect("live reply record");
-            if let Some(result) = request.result.take() {
-                let request = state.joint.as_mut().unwrap().requests.remove(&id).unwrap();
-                state
-                    .nodes
-                    .get_mut(&request.owner)
-                    .unwrap()
-                    .resource_waiters -= 1;
-                state.collect(request.owner);
-                Some(result)
-            } else {
-                if request
-                    .waker
-                    .as_ref()
-                    .is_none_or(|old| !old.will_wake(cx.waker()))
-                {
-                    request.waker = Some(cx.waker().clone());
-                }
-                None
-            }
-        });
-        match result {
-            None => Poll::Pending,
-            Some(result) => {
-                self.id = None;
-                match result {
-                    Ok(ids) => {
-                        for original in &mut self.originals {
-                            original.id = None;
-                        }
-                        self.originals.clear();
-                        Poll::Ready(Ok(ids
-                            .into_iter()
-                            .map(|id| JointClaim {
-                                inner: Arc::clone(&self.inner),
-                                id: Some(id),
-                            })
-                            .collect()))
+                .expect("live reply");
+            match &request.phase {
+                RequestPhase::Waiting => {
+                    if request
+                        .waker
+                        .as_ref()
+                        .is_none_or(|w| !w.will_wake(cx.waker()))
+                    {
+                        request.waker = Some(cx.waker().clone());
                     }
-                    Err(error) => Poll::Ready(Err(JointAdmissionFailure {
-                        error,
-                        originals: std::mem::take(&mut self.originals),
-                    })),
+                    return None;
+                }
+                RequestPhase::Failed(error) => {
+                    let error = error.clone();
+                    remove_request(state, id);
+                    return Some(Err(error));
+                }
+                RequestPhase::Delivered => unreachable!("one reply consumer"),
+                RequestPhase::Granted { .. } => {}
+            }
+            if closed {
+                fail_request(state, id, WorkError::Closed);
+                remove_request(state, id);
+                return Some(Err(WorkError::Closed));
+            }
+            let changes = Arc::clone(&request.changes);
+            let owner = request.owner;
+            if changes
+                .iter()
+                .any(|c| c.claim.facts.lane != JointLane::Settlement)
+            {
+                if let Err(error) = state
+                    .nodes
+                    .get(&owner)
+                    .ok_or(WorkError::Released)
+                    .and_then(|n| n.check())
+                {
+                    fail_request(state, id, error.clone());
+                    remove_request(state, id);
+                    return Some(Err(error));
                 }
             }
-        }
+            let request = state.joint.as_mut().unwrap().requests.get_mut(&id).unwrap();
+            let RequestPhase::Granted { new_ids } =
+                std::mem::replace(&mut request.phase, RequestPhase::Delivered)
+            else {
+                unreachable!()
+            };
+            let has_adjustment = changes.iter().any(|change| change.old.is_some());
+            // These are plain tokens, never physical Drop implementations. No
+            // last strong physical owner is upgraded or destroyed under State.
+            let identities: Vec<_> = new_ids
+                .into_iter()
+                .map(|claim| {
+                    let token = Arc::new(ClaimIdentity);
+                    state
+                        .joint
+                        .as_mut()
+                        .unwrap()
+                        .claims
+                        .get_mut(&claim)
+                        .unwrap()
+                        .holder = Arc::downgrade(&token);
+                    (claim, token)
+                })
+                .collect();
+            if !has_adjustment {
+                remove_request(state, id);
+            }
+            Some(Ok((identities, has_adjustment)))
+        });
+        let Some(result) = result else {
+            return Poll::Pending;
+        };
+        self.id = None;
+        Poll::Ready(
+            result
+                .map(|(identities, has_adjustment)| JointGrantedBatch {
+                    new_claims: identities
+                        .into_iter()
+                        .map(|(id, identity)| JointClaim {
+                            inner: Arc::clone(&self.inner),
+                            id,
+                            identity,
+                        })
+                        .collect(),
+                    adjustment: has_adjustment.then(|| JointAdjustmentReceipt {
+                        inner: Arc::clone(&self.inner),
+                        id: Some(id),
+                    }),
+                })
+                .map_err(|error| JointAdmissionFailure { error }),
+        )
     }
 }
 impl Drop for JointAdmission {
     fn drop(&mut self) {
         if let Some(id) = self.id.take() {
-            self.inner.update(|state| {
-                if let Some(request) = state.joint.as_mut().unwrap().requests.remove(&id) {
-                    if let Some(Ok(ids)) = request.result {
-                        for claim in ids {
-                            release_claim(state, claim);
-                        }
-                    }
-                    state
-                        .nodes
-                        .get_mut(&request.owner)
-                        .unwrap()
-                        .resource_waiters -= 1;
-                    state.collect(request.owner);
-                }
-            });
+            let waker = self.inner.update(|state| withdraw_request(state, id));
+            if let Some(waker) = waker {
+                waker.wake();
+            }
         }
-        // Original holder drops happen after the authority lock is released.
+    }
+}
+#[must_use = "Install against the exact stable holders or drop to withdraw the delta"]
+pub struct JointAdjustmentReceipt {
+    inner: Arc<Inner>,
+    id: Option<u64>,
+}
+impl std::fmt::Debug for JointAdjustmentReceipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JointAdjustmentReceipt")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+impl JointAdjustmentReceipt {
+    /// Synchronously adopt the whole batch into its original owners. No action
+    /// may consume newly charged capacity before this operation succeeds.
+    pub fn install(mut self, originals: &[&JointClaim]) -> Result<(), WorkError> {
+        let id = self.id.expect("live adjustment receipt");
+        let result = self.inner.update(|state| {
+            let ledger = state.joint.as_ref().unwrap();
+            let request = ledger.requests.get(&id).ok_or(WorkError::Released)?;
+            match &request.phase {
+                RequestPhase::Failed(error) => return Err(error.clone()),
+                RequestPhase::Delivered => {}
+                _ => return Err(WorkError::Conflict),
+            }
+            if ledger.driver_closed {
+                return Err(WorkError::Closed);
+            }
+            let changes = Arc::clone(&request.changes);
+            if changes
+                .iter()
+                .any(|c| c.claim.facts.lane != JointLane::Settlement)
+            {
+                state
+                    .nodes
+                    .get(&request.owner)
+                    .ok_or(WorkError::Released)?
+                    .check()?;
+            }
+            let sources = changes.iter().filter_map(|c| c.source.as_ref());
+            if originals.len() != sources.clone().count() {
+                return Err(WorkError::Conflict);
+            }
+            for source in sources {
+                let Some(original) = originals.iter().find(|original| original.id == source.id)
+                else {
+                    return Err(WorkError::Conflict);
+                };
+                if !Arc::ptr_eq(&original.inner, &self.inner)
+                    || !Weak::ptr_eq(&source.holder, &Arc::downgrade(&original.identity))
+                {
+                    return Err(WorkError::ForeignAuthority);
+                }
+                let record = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
+                if record.pending != Some(id) {
+                    return Err(WorkError::Conflict);
+                }
+                record
+                    .structure_revision
+                    .checked_add(1)
+                    .ok_or(WorkError::ArithmeticOverflow)?;
+            }
+            let ledger = state.joint.as_mut().unwrap();
+            for change in changes.iter() {
+                if let Some(old) = change.old {
+                    let record = ledger.claims.get_mut(&old).unwrap();
+                    record.active_facts = Arc::clone(&record.facts);
+                    record.active_amounts = record.amounts;
+                    record.pending = None;
+                    record.structure_revision += 1;
+                }
+            }
+            remove_request(state, id);
+            Ok(())
+        });
+        if result.is_ok() {
+            self.id = None;
+        }
+        // Error leaves the RAII ticket armed; Drop rolls back only live delta.
+        result
+    }
+}
+impl Drop for JointAdjustmentReceipt {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            let waker = self.inner.update(|state| withdraw_request(state, id));
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
     }
 }

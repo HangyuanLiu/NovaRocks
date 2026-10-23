@@ -19,7 +19,10 @@
 //! schedules turns and yields between them; this module spawns no task.
 
 use super::{
-    ledger::{ChangeRecord, ProfileFacts, ProfileKey, ProfileRecord, release_claim},
+    ledger::{
+        ChangeRecord, ProfileFacts, ProfileKey, ProfileRecord, RequestPhase, fail_request,
+        grant_request, validate_waiting,
+    },
     protection::{
         CheckError, CoordinateLimit, ExactProfile, Feasibility, ProofInput, ProtectionProof,
     },
@@ -67,6 +70,7 @@ struct Turn {
     owner: WorkId,
     changes: Arc<[ChangeRecord]>,
     release_epoch: u64,
+    layout_revision: u64,
     cursor: Option<Arc<ProfileKey>>,
     records: Vec<ProfileRecord>,
     snapshot_capacity: usize,
@@ -99,9 +103,6 @@ impl JointProgressDriver {
                 let idle_revision = state.progress_marker();
                 let start = (|| {
                     let ledger = state.joint.as_mut().expect("installed joint driver");
-                    if ledger.driver_closed {
-                        return None;
-                    }
                     if self.observed_release != ledger.release_epoch || self.scan_left == 0 {
                         self.observed_release = ledger.release_epoch;
                         self.scan_left = ledger.requests.len();
@@ -117,15 +118,17 @@ impl JointProgressDriver {
                     let (&id, request) = next?;
                     self.cursor = Some(id);
                     self.scan_left -= 1;
-                    let cancelled = request
-                        .changes
-                        .iter()
-                        .any(|change| change.claim.facts.lane != JointLane::Settlement)
-                        && state
-                            .nodes
-                            .get(&request.owner)
-                            .is_none_or(|node| node.check().is_err());
-                    if request.result.is_some()
+                    let cancelled = ledger.driver_closed
+                        || request
+                            .changes
+                            .iter()
+                            .any(|change| change.claim.facts.lane != JointLane::Settlement)
+                            && state
+                                .nodes
+                                .get(&request.owner)
+                                .is_none_or(|node| node.check().is_err());
+                    if matches!(request.phase, RequestPhase::Failed(_))
+                        || (!matches!(request.phase, RequestPhase::Waiting) && !cancelled)
                         || (request.blocked_at == Some(ledger.release_epoch) && !cancelled)
                     {
                         return Some(Err(()));
@@ -137,6 +140,7 @@ impl JointProgressDriver {
                         owner: request.owner,
                         changes: Arc::clone(&request.changes),
                         release_epoch: ledger.release_epoch,
+                        layout_revision: ledger.profile_layout_revision,
                         cursor: None,
                         records: Vec::new(),
                         snapshot_capacity: ledger.profiles.len(),
@@ -181,19 +185,20 @@ impl JointProgressDriver {
                         .ok_or(WorkError::Released)?
                         .check()?;
                 }
-                if turn.changes.iter().any(|change| {
-                    change
-                        .old
-                        .is_some_and(|id| !ledger.claims.contains_key(&id))
-                }) {
-                    return Err(WorkError::Released);
-                }
-                Ok(())
+                validate_waiting(ledger, turn.id, &turn.changes)?;
+                Ok(ledger.profile_layout_revision == turn.layout_revision)
             })()
         };
-        if let Err(error) = valid {
-            self.finish(turn, Err(error), false);
-            return JointProgress::More;
+        match valid {
+            Err(error) => {
+                self.finish(turn, Err(error), false);
+                return JointProgress::More;
+            }
+            Ok(false) => {
+                self.reobserve(turn);
+                return JointProgress::More;
+            }
+            Ok(true) => {}
         }
         if turn.proof.is_none() {
             match turn.work.checked_add(1) {
@@ -226,7 +231,11 @@ impl JointProgressDriver {
                 // aggregate once. Other owners' concurrent releases remain a
                 // conservative overestimate, never a copied grant to restore.
                 for change in turn.changes.iter() {
-                    if change.old.is_some() && change.claim.facts.key == key {
+                    if change
+                        .original_facts
+                        .as_ref()
+                        .is_some_and(|facts| facts.key == key)
+                    {
                         record.amounts = match record
                             .amounts
                             .checked_sub(change.original_amounts.expect("original charge"))
@@ -325,6 +334,20 @@ impl JointProgressDriver {
         JointProgress::More
     }
 
+    fn reobserve(&mut self, turn: Turn) {
+        self.inner.update(|state| {
+            let ledger = state.joint.as_mut().unwrap();
+            if ledger.active == Some(turn.id) {
+                ledger.active = None;
+            }
+            if let Some(request) = ledger.requests.get_mut(&turn.id) {
+                request.blocked_at = None;
+            }
+        });
+        // The request cursor already points at this ticket. Keep it there so
+        // other queued work gets a turn before this fresh observation.
+    }
+
     fn finish(&mut self, turn: Turn, verdict: Result<(), WorkError>, infeasible: bool) {
         let waker = self.inner.update(|state| {
             let ledger = state.joint.as_mut().unwrap();
@@ -334,140 +357,58 @@ impl JointProgressDriver {
             let Some(request) = ledger.requests.get(&turn.id) else {
                 return None;
             };
-            if request.result.is_some() {
-                return None;
-            }
-            let stopped = if turn
-                .changes
-                .iter()
-                .any(|change| change.claim.facts.lane != JointLane::Settlement)
-            {
-                state
-                    .nodes
-                    .get(&turn.owner)
-                    .ok_or(WorkError::Released)
-                    .and_then(|node| node.check())
-            } else {
-                Ok(())
-            };
-            let verdict = stopped.clone().and(verdict);
-            if infeasible && stopped.is_ok() {
-                // A release during observation invalidates a negative answer,
-                // never a positive certificate. Retry fairly on the new epoch.
-                let epoch = ledger.release_epoch;
-                let request = ledger.requests.get_mut(&turn.id).unwrap();
-                request.blocked_at = (turn.release_epoch == epoch).then_some(epoch);
-                return None;
-            }
-            let verdict = verdict.and_then(|()| {
-                let node = state.nodes.get(&turn.owner).ok_or(WorkError::Released)?;
+            let waiting = matches!(request.phase, RequestPhase::Waiting);
+            let stopped = (|| {
+                if ledger.driver_closed {
+                    return Err(WorkError::Closed);
+                }
                 if turn
                     .changes
                     .iter()
                     .any(|change| change.claim.facts.lane != JointLane::Settlement)
                 {
-                    node.check()?;
-                }
-                let ledger = state.joint.as_ref().unwrap();
-                if ledger.driver_closed {
-                    return Err(WorkError::Closed);
-                }
-                let old_count = turn
-                    .changes
-                    .iter()
-                    .filter(|change| change.old.is_some())
-                    .count();
-                let final_count = ledger
-                    .claims
-                    .len()
-                    .checked_sub(old_count)
-                    .and_then(|count| count.checked_add(turn.changes.len()))
-                    .ok_or(WorkError::ArithmeticOverflow)?;
-                if final_count > self.config.config.max_claims {
-                    return Err(WorkError::Capacity("joint claim records"));
-                }
-                for change in turn.changes.iter() {
-                    if let Some(id) = change.old {
-                        let old = ledger.claims.get(&id).ok_or(WorkError::Released)?;
-                        // Amounts may only decrease during a proof. Replacing a
-                        // partially released old claim must not subtract its old
-                        // snapshot a second time from the real live ledger.
-                        if Some(old.amounts) != change.original_amounts {
-                            return Err(WorkError::Conflict);
-                        }
-                    }
-                }
-                state.nodes[&turn.owner]
-                    .resource_holders
-                    .checked_add(turn.changes.len())
-                    .ok_or(WorkError::ArithmeticOverflow)?;
-                state
-                    .next_id
-                    .checked_add(turn.changes.len() as u64)
-                    .ok_or(WorkError::ArithmeticOverflow)?;
-                let ledger = state.joint.as_ref().unwrap();
-                let mut profiles = BTreeMap::new();
-                for change in turn.changes.iter() {
-                    let key = &change.claim.facts.key;
-                    let profile = profiles.entry(Arc::clone(key)).or_insert_with(|| {
-                        ledger.profiles.get(key).cloned().unwrap_or(ProfileRecord {
-                            facts: Arc::clone(&change.claim.facts),
-                            amounts: JointResources::ZERO,
-                            claims: 0,
-                        })
-                    });
-                    if change.old.is_some() {
-                        profile.amounts = profile
-                            .amounts
-                            .checked_sub(change.original_amounts.expect("original charge"))?;
-                        profile.claims =
-                            profile.claims.checked_sub(1).ok_or(WorkError::Conflict)?;
-                    }
-                }
-                // Subtract all originals before adding replacements, matching
-                // the hypothetical batch even at the arithmetic boundary.
-                for change in turn.changes.iter() {
-                    let profile = profiles.get_mut(&change.claim.facts.key).unwrap();
-                    profile.amounts = profile.amounts.checked_add(change.claim.amounts)?;
-                    profile.claims = profile
-                        .claims
-                        .checked_add(1)
-                        .ok_or(WorkError::ArithmeticOverflow)?;
-                }
-                Ok(profiles)
-            });
-            let result = verdict.map(|profiles| {
-                // All checks precede the single affected-entry transaction. Do
-                // not install the shadow: that would resurrect concurrent frees.
-                for change in turn.changes.iter() {
-                    if let Some(id) = change.old {
-                        release_claim(state, id);
-                    }
-                }
-                let mut ids = Vec::with_capacity(turn.changes.len());
-                for change in turn.changes.iter() {
-                    let id = state.next_id().expect("prechecked claim ids");
                     state
-                        .joint
-                        .as_mut()
-                        .unwrap()
-                        .claims
-                        .insert(id, change.claim.clone());
-                    state.nodes.get_mut(&turn.owner).unwrap().resource_holders += 1;
-                    ids.push(id);
+                        .nodes
+                        .get(&turn.owner)
+                        .ok_or(WorkError::Released)?
+                        .check()?;
                 }
-                state.joint.as_mut().unwrap().profiles.extend(profiles);
-                ids
-            });
-            let request = state
-                .joint
-                .as_mut()
-                .unwrap()
-                .requests
-                .get_mut(&turn.id)
-                .unwrap();
-            request.result = Some(result);
-            request.waker.take()
+                if waiting {
+                    validate_waiting(ledger, turn.id, &turn.changes)?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = stopped {
+                return fail_request(state, turn.id, error);
+            }
+            if !waiting {
+                return None;
+            }
+            // Amount-only frees make a positive proof conservative. Rekeying a
+            // live charge can move it behind the snapshot cursor, so layout
+            // changes invalidate every verdict and rotate this request fairly.
+            if ledger.profile_layout_revision != turn.layout_revision {
+                ledger.requests.get_mut(&turn.id).unwrap().blocked_at = None;
+                return None;
+            }
+            if infeasible {
+                let epoch = ledger.release_epoch;
+                ledger.requests.get_mut(&turn.id).unwrap().blocked_at =
+                    (turn.release_epoch == epoch).then_some(epoch);
+                return None;
+            }
+            match verdict.and_then(|()| grant_request(state, turn.id)) {
+                Ok(()) => state
+                    .joint
+                    .as_mut()
+                    .unwrap()
+                    .requests
+                    .get_mut(&turn.id)
+                    .unwrap()
+                    .waker
+                    .take(),
+                Err(error) => fail_request(state, turn.id, error),
+            }
         });
         if let Some(waker) = waker {
             waker.wake();
@@ -698,16 +639,10 @@ impl Drop for JointProgressDriver {
             let ledger = state.joint.as_mut().unwrap();
             ledger.driver_closed = true;
             ledger.active = None;
-            let mut wakers = Vec::new();
-            for request in ledger.requests.values_mut() {
-                if request.result.is_none() {
-                    request.result = Some(Err(WorkError::Closed));
-                    if let Some(waker) = request.waker.take() {
-                        wakers.push(waker);
-                    }
-                }
-            }
-            wakers
+            let ids: Vec<_> = ledger.requests.keys().copied().collect();
+            ids.into_iter()
+                .filter_map(|id| fail_request(state, id, WorkError::Closed))
+                .collect::<Vec<_>>()
         });
         for waker in wakers {
             waker.wake();
