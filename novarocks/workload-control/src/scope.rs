@@ -698,6 +698,56 @@ fn try_begin_root_window(
     request: WorkRequest,
     window: Option<crate::ResultWindowClass>,
 ) -> Result<(RootWork, Option<crate::ResultWindowGrant>), WorkError> {
+    let mut destination = None;
+    install_root_window(
+        inner,
+        request,
+        window,
+        RootDestination::Optional(&mut destination),
+    )?;
+    Ok(destination.expect("successful root publication installs its original owner"))
+}
+
+// Concrete receiving locations only: no caller callback runs under State.
+// The receiver must live outside any destructible publication/receipt future.
+enum RootDestination<'a> {
+    Root(&'a mut Option<RootWork>),
+    Window(&'a mut Option<(RootWork, crate::ResultWindowGrant)>),
+    Optional(&'a mut Option<(RootWork, Option<crate::ResultWindowGrant>)>),
+}
+
+impl RootDestination<'_> {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Root(slot) => slot.is_none(),
+            Self::Window(slot) => slot.is_none(),
+            Self::Optional(slot) => slot.is_none(),
+        }
+    }
+
+    fn install(self, root: RootWork, window: Option<crate::ResultWindowGrant>) {
+        match self {
+            Self::Root(slot) => {
+                debug_assert!(window.is_none());
+                *slot = Some(root);
+            }
+            Self::Window(slot) => {
+                *slot = Some((root, window.expect("requested complete result window")));
+            }
+            Self::Optional(slot) => *slot = Some((root, window)),
+        }
+    }
+}
+
+fn install_root_window(
+    inner: &Arc<Inner>,
+    request: WorkRequest,
+    window: Option<crate::ResultWindowClass>,
+    destination: RootDestination<'_>,
+) -> Result<(), WorkError> {
+    if !destination.is_empty() {
+        return Err(WorkError::Conflict);
+    }
     inner.update(|state| {
         let class = request.class;
         let result = (|| {
@@ -746,7 +796,7 @@ fn try_begin_root_window(
                     }
                 },
             };
-            Ok((
+            destination.install(
                 RootWork {
                     owner: WorkOwner {
                         scope: Some(scope.clone()),
@@ -754,7 +804,8 @@ fn try_begin_root_window(
                     business: BusinessPermit { scope: Some(scope) },
                 },
                 grant,
-            ))
+            );
+            Ok(())
         })();
         if result.is_err() {
             state.root_lifecycle.rejected_admissions.increment(class);
@@ -767,6 +818,19 @@ fn begin_warehouse_root(
     inner: &Arc<Inner>,
     request: WorkRequest,
 ) -> Result<PendingQueryRoot, WorkError> {
+    let mut destination = None;
+    install_warehouse_root(inner, request, &mut destination)?;
+    Ok(destination.expect("successful warehouse publication installs its original owner"))
+}
+
+fn install_warehouse_root(
+    inner: &Arc<Inner>,
+    request: WorkRequest,
+    destination: &mut Option<PendingQueryRoot>,
+) -> Result<(), WorkError> {
+    if destination.is_some() {
+        return Err(WorkError::Conflict);
+    }
     inner.update(|state| {
         let class = request.class;
         let result = (|| {
@@ -788,14 +852,15 @@ fn begin_warehouse_root(
                 .nodes
                 .insert(id, Node::new(None, id, class, cancellation));
             state.roots += 1;
-            Ok(PendingQueryRoot {
+            *destination = Some(PendingQueryRoot {
                 owner: WorkOwner {
                     scope: Some(WorkScope {
                         inner: Arc::clone(inner),
                         id,
                     }),
                 },
-            })
+            });
+            Ok(())
         })();
         if result.is_err() {
             state.root_lifecycle.rejected_admissions.increment(class);
@@ -805,6 +870,53 @@ fn begin_warehouse_root(
 }
 
 impl RootAdmissionHandle {
+    /// Publish the original root into an existing stable receiving location
+    /// before post-transaction wakes can unwind. On an ordinary refusal the
+    /// location stays empty; a nonempty location is never replaced.
+    ///
+    /// The receiving supervisor must retain this location outside its waiter
+    /// future and still drive first binding, cancellation, and actual exit.
+    /// This publication alone grants no external-I/O or execution capacity.
+    pub fn try_begin_root_in(
+        &self,
+        request: WorkRequest,
+        destination: &mut Option<RootWork>,
+    ) -> Result<(), WorkError> {
+        install_root_window(
+            &self.inner,
+            request,
+            None,
+            RootDestination::Root(destination),
+        )
+    }
+
+    /// Publish both the original root and its complete result window into one
+    /// stable location in the same authority transaction.
+    pub fn try_begin_root_with_result_in(
+        &self,
+        request: WorkRequest,
+        class: crate::ResultWindowClass,
+        destination: &mut Option<(RootWork, crate::ResultWindowGrant)>,
+    ) -> Result<(), WorkError> {
+        install_root_window(
+            &self.inner,
+            request,
+            Some(class),
+            RootDestination::Window(destination),
+        )
+    }
+
+    /// Register an original warehouse root directly in supervisor custody,
+    /// before any arbitrary post-State wake. Warehouse concurrency is still
+    /// acquired later through this same root's ordinary fair queue.
+    pub fn begin_warehouse_root_in(
+        &self,
+        request: WorkRequest,
+        destination: &mut Option<PendingQueryRoot>,
+    ) -> Result<(), WorkError> {
+        install_warehouse_root(&self.inner, request, destination)
+    }
+
     pub fn try_begin_root(&self, request: WorkRequest) -> Result<RootWork, WorkError> {
         try_begin_root(&self.inner, request)
     }
@@ -2198,3 +2310,6 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod fixed_control_storage_tests;
+
+#[cfg(test)]
+mod root_publication_tests;
