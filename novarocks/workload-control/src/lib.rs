@@ -154,5 +154,6 @@ mod role_poll;
 pub use control_storage::ControlStorageConfig;
 pub use role_poll::ingress::{MountAttempt, RoleIngress};
 pub use role_poll::{
-    PollCompletion, PollFailure, PollOutput, RoleBackingRetirementObserver, RolePollBank,
+    PollCompletion, PollFailure, PollOutput, PollTurnCompletion, RoleBackingRetirementObserver,
+    RolePollBank,
 };

@@ -84,7 +84,11 @@ async fn original_frame_and_anchor_reuse_wait_for_output_and_silent_stale_waker_
     root.business.release();
     bank.mount_owned(root.owner, input)
         .unwrap_or_else(|_| panic!("original mount must fit"));
-    assert!(bank.progress_turn(budget()).is_none());
+    assert!(
+        bank.progress_turn(budget())
+            .map(|turn| turn.into_parts().1)
+            .is_none()
+    );
     let frame = std::ptr::from_ref(
         bank.positions[slot.0]
             .frame
@@ -96,7 +100,10 @@ async fn original_frame_and_anchor_reuse_wait_for_output_and_silent_stale_waker_
     let stale = saved.lock().unwrap().take().unwrap();
     ready.store(true, Ordering::Release);
     stale.wake_by_ref();
-    let completion = bank.progress_turn(NonZeroUsize::new(2).unwrap()).unwrap();
+    let completion = bank
+        .progress_turn(NonZeroUsize::new(2).unwrap())
+        .map(|turn| turn.into_parts().1)
+        .unwrap();
     let PollCompletion::Ready(output) = completion else {
         panic!("actual future must complete");
     };
@@ -155,7 +162,11 @@ async fn original_frame_and_anchor_reuse_wait_for_output_and_silent_stale_waker_
     next.business.release();
     bank.mount_owned(next.owner, new_input(true))
         .unwrap_or_else(|_| panic!("same original frame must be reusable"));
-    drop(bank.progress_turn(NonZeroUsize::new(2).unwrap()).unwrap());
+    drop(
+        bank.progress_turn(NonZeroUsize::new(2).unwrap())
+            .map(|turn| turn.into_parts().1)
+            .unwrap(),
+    );
     assert_eq!(
         std::ptr::from_ref(
             bank.positions[slot.0]
@@ -190,15 +201,27 @@ async fn bounded_round_robin_polls_a_ready_peer_while_the_first_future_is_pendin
         .unwrap_or_else(|_| panic!("first mount"));
     bank.mount_owned(second.owner, new_input(true))
         .unwrap_or_else(|_| panic!("second mount"));
-    assert!(bank.progress_turn(budget()).is_none());
-    let PollCompletion::Ready(peer) = bank.progress_turn(budget()).unwrap() else {
+    assert!(
+        bank.progress_turn(budget())
+            .map(|turn| turn.into_parts().1)
+            .is_none()
+    );
+    let PollCompletion::Ready(peer) = bank
+        .progress_turn(budget())
+        .map(|turn| turn.into_parts().1)
+        .unwrap()
+    else {
         panic!("ready peer must not wait for first");
     };
     assert_eq!(*peer.value(), 7);
     drop(peer);
     ready.store(true, Ordering::Release);
     wake.lock().unwrap().take().unwrap().wake();
-    drop(bank.progress_turn(budget()).unwrap());
+    drop(
+        bank.progress_turn(budget())
+            .map(|turn| turn.into_parts().1)
+            .unwrap(),
+    );
     control.close_admission();
     drain(&mut driver);
     assert!(control.inner.state.lock().unwrap().is_drained());
@@ -240,7 +263,10 @@ async fn post_state_wake_unwind_keeps_the_actual_owner_and_input_in_the_bank() {
         control.inner.state.lock().unwrap().nodes[&work].owner,
         crate::OwnerState::Active
     );
-    let PollCompletion::Ready(output) = bank.progress_turn(NonZeroUsize::new(2).unwrap()).unwrap()
+    let PollCompletion::Ready(output) = bank
+        .progress_turn(NonZeroUsize::new(2).unwrap())
+        .map(|turn| turn.into_parts().1)
+        .unwrap()
     else {
         panic!("same retained input must run");
     };
@@ -275,7 +301,11 @@ async fn foreign_owner_rejection_returns_the_same_unexecuted_owner_and_input() {
     root.business.release();
     rejected.owner.complete();
     drop(rejected.input);
-    assert!(bank.progress_turn(budget()).is_none());
+    assert!(
+        bank.progress_turn(budget())
+            .map(|turn| turn.into_parts().1)
+            .is_none()
+    );
     assert!(foreign.inner.state.lock().unwrap().nodes.is_empty());
     control.close_admission();
     drain(&mut driver);
@@ -339,7 +369,11 @@ async fn poll_panic_clears_the_real_frame_outside_state_and_preserves_peer_progr
         },
     )
     .unwrap_or_else(|_| panic!("peer mount"));
-    let PollCompletion::Panicked(failed) = bank.progress_turn(budget()).unwrap() else {
+    let PollCompletion::Panicked(failed) = bank
+        .progress_turn(budget())
+        .map(|turn| turn.into_parts().1)
+        .unwrap()
+    else {
         panic!("panic must be an isolated completion");
     };
     assert!(
@@ -347,7 +381,11 @@ async fn poll_panic_clears_the_real_frame_outside_state_and_preserves_peer_progr
         "actual frame fields exit outside State"
     );
     assert!(control.inner.state.lock().unwrap().nodes[&work].completed);
-    let PollCompletion::Ready(healthy) = bank.progress_turn(budget()).unwrap() else {
+    let PollCompletion::Ready(healthy) = bank
+        .progress_turn(budget())
+        .map(|turn| turn.into_parts().1)
+        .unwrap()
+    else {
         panic!("healthy peer still progresses");
     };
     assert_eq!(*healthy.value(), 9);
@@ -378,7 +416,11 @@ async fn factory_panic_does_not_destroy_an_owner_already_received_by_its_stable_
         root.business.release();
         bank.mount_owned(root.owner, ())
             .unwrap_or_else(|_| panic!("original mount"));
-        let PollCompletion::Panicked(failed) = bank.progress_turn(budget()).unwrap() else {
+        let PollCompletion::Panicked(failed) = bank
+            .progress_turn(budget())
+            .map(|turn| turn.into_parts().1)
+            .unwrap()
+        else {
             panic!("factory panic must be isolated");
         };
         assert_eq!(
@@ -444,12 +486,18 @@ async fn original_driver_reclaims_output_after_bank_exit_including_silent_stale_
         root.business.release();
         bank.mount_owned(root.owner, input)
             .unwrap_or_else(|_| panic!("original mount"));
-        assert!(bank.progress_turn(NonZeroUsize::new(2).unwrap()).is_none());
+        assert!(
+            bank.progress_turn(NonZeroUsize::new(2).unwrap())
+                .map(|turn| turn.into_parts().1)
+                .is_none()
+        );
         let stale = saved.lock().unwrap().take().unwrap();
         ready.store(true, Ordering::Release);
         stale.wake_by_ref();
-        let PollCompletion::Ready(output) =
-            bank.progress_turn(NonZeroUsize::new(2).unwrap()).unwrap()
+        let PollCompletion::Ready(output) = bank
+            .progress_turn(NonZeroUsize::new(2).unwrap())
+            .map(|turn| turn.into_parts().1)
+            .unwrap()
         else {
             panic!("original completion");
         };
@@ -676,6 +724,7 @@ async fn one_high_slot_wake_is_ready_without_scanning_the_empty_prefix() {
     assert!(bank.poll_ready(&mut cx).is_ready());
     let output = bank
         .progress_turn(NonZeroUsize::new(7).unwrap())
+        .map(|turn| turn.into_parts().1)
         .expect("one real hint reaches slot 500");
     drop(output);
     for root in roots {
@@ -709,6 +758,7 @@ async fn coalesced_burst_remains_ready_after_the_notification_is_consumed() {
         assert!(bank.poll_ready(&mut cx).is_ready());
         drop(
             bank.progress_turn(budget())
+                .map(|turn| turn.into_parts().1)
                 .expect("remaining original queued role"),
         );
     }
@@ -781,17 +831,33 @@ async fn self_wake_requeues_at_the_tail_before_pending_and_preserves_peer_turns(
     )
     .unwrap_or_else(|_| panic!("original peer mount"));
     let mut cx = Context::from_waker(Waker::noop());
-    assert!(bank.progress_turn(budget()).is_none());
+    assert!(
+        bank.progress_turn(budget())
+            .map(|turn| turn.into_parts().1)
+            .is_none()
+    );
     assert!(bank.poll_ready(&mut cx).is_ready());
-    let PollCompletion::Ready(peer) = bank.progress_turn(budget()).unwrap() else {
+    let PollCompletion::Ready(peer) = bank
+        .progress_turn(budget())
+        .map(|turn| turn.into_parts().1)
+        .unwrap()
+    else {
         panic!("peer completion")
     };
     assert_eq!(*peer.value(), peer_id);
     drop(peer);
     assert_eq!(*order.lock().unwrap(), [hot_id, peer_id]);
-    assert!(bank.progress_turn(budget()).is_none());
+    assert!(
+        bank.progress_turn(budget())
+            .map(|turn| turn.into_parts().1)
+            .is_none()
+    );
     assert!(bank.poll_ready(&mut cx).is_ready());
-    drop(bank.progress_turn(budget()).unwrap());
+    drop(
+        bank.progress_turn(budget())
+            .map(|turn| turn.into_parts().1)
+            .unwrap(),
+    );
     assert_eq!(*order.lock().unwrap(), [hot_id, peer_id, hot_id, hot_id]);
     drain(&mut driver);
 }
@@ -815,7 +881,11 @@ async fn queued_completion_wake_keeps_the_original_anchor_retired_until_consumed
         },
     )
     .unwrap_or_else(|_| panic!("original mount"));
-    drop(bank.progress_turn(budget()).unwrap());
+    drop(
+        bank.progress_turn(budget())
+            .map(|turn| turn.into_parts().1)
+            .unwrap(),
+    );
     drain(&mut driver);
     assert_eq!(observer.is_reclaimed(), Ok(false));
     assert_eq!(
@@ -827,7 +897,9 @@ async fn queued_completion_wake_keeps_the_original_anchor_retired_until_consumed
             .is_ready()
     );
     assert!(
-        bank.progress_turn(budget()).is_none(),
+        bank.progress_turn(budget())
+            .map(|turn| turn.into_parts().1)
+            .is_none(),
         "stale item does not repoll the completed future"
     );
     driver.recheck_retired_backing();
@@ -1009,7 +1081,11 @@ async fn original_poll_and_cleanup_causes_and_ready_output_keep_the_same_footer(
             .unwrap_or_else(|_| panic!("original failed role"));
         bank.mount_owned(peer.owner, input(false, false))
             .unwrap_or_else(|_| panic!("original peer"));
-        let PollCompletion::Panicked(failed) = bank.progress_turn(budget()).unwrap() else {
+        let PollCompletion::Panicked(failed) = bank
+            .progress_turn(budget())
+            .map(|turn| turn.into_parts().1)
+            .unwrap()
+        else {
             panic!("original failure packet")
         };
         let packet = failed.value();
@@ -1036,7 +1112,11 @@ async fn original_poll_and_cleanup_causes_and_ready_output_keep_the_same_footer(
         assert_eq!(poll_drops.load(Ordering::Acquire), 0);
         assert_eq!(cleanup_drops.load(Ordering::Acquire), 0);
         assert_eq!(output_drops.load(Ordering::Acquire), 0);
-        let PollCompletion::Ready(peer) = bank.progress_turn(budget()).unwrap() else {
+        let PollCompletion::Ready(peer) = bank
+            .progress_turn(budget())
+            .map(|turn| turn.into_parts().1)
+            .unwrap()
+        else {
             panic!("peer still runs")
         };
         drop(peer);
@@ -1190,7 +1270,11 @@ async fn prepaid_frame_materializes_only_at_first_real_use_and_stays_for_reuse()
             .iter()
             .all(|position| position.frame.is_none())
     );
-    let PollCompletion::Ready(output) = bank.progress_turn(budget()).unwrap() else {
+    let PollCompletion::Ready(output) = bank
+        .progress_turn(budget())
+        .map(|turn| turn.into_parts().1)
+        .unwrap()
+    else {
         panic!("actual ready role");
     };
     assert_eq!(*output.value(), 7);
@@ -1215,7 +1299,11 @@ async fn prepaid_frame_materializes_only_at_first_real_use_and_stays_for_reuse()
     next.business.release();
     bank.mount_owned(next.owner, new_input(true))
         .unwrap_or_else(|_| panic!("same original frame"));
-    let PollCompletion::Ready(output) = bank.progress_turn(budget()).unwrap() else {
+    let PollCompletion::Ready(output) = bank
+        .progress_turn(budget())
+        .map(|turn| turn.into_parts().1)
+        .unwrap()
+    else {
         panic!("actual reused role");
     };
     assert_eq!(*output.value(), 7);
@@ -1298,7 +1386,7 @@ async fn synchronous_ingress_moves_original_sources_before_unlocked_notification
     let attempt = {
         let mut sources = sources.lock().unwrap();
         let IngressSources { owner, input } = &mut *sources;
-        let attempt = producer.try_mount_in(owner, input);
+        let attempt = producer.try_mount_in(owner, input, &mut Some(()));
         assert_eq!(attempt.result(), &Ok(()));
         assert!(owner.is_none() && input.is_none());
         assert_eq!(wake.calls.load(Ordering::Acquire), 0);
@@ -1320,7 +1408,11 @@ async fn synchronous_ingress_moves_original_sources_before_unlocked_notification
             .iter()
             .all(|position| position.frame.is_none())
     );
-    let PollCompletion::Ready(output) = bank.progress_turn(budget()).unwrap() else {
+    let PollCompletion::Ready(output) = bank
+        .progress_turn(budget())
+        .map(|turn| turn.into_parts().1)
+        .unwrap()
+    else {
         panic!("original factory must run");
     };
     assert_eq!(*output.value(), 7);
@@ -1370,7 +1462,7 @@ async fn dropping_a_successful_sender_wakes_the_waiting_root_and_preserves_input
         let attempt = {
             let mut sources = sources.lock().unwrap();
             let IngressSources { owner, input } = &mut *sources;
-            let attempt = port.try_mount_in(owner, input);
+            let attempt = port.try_mount_in(owner, input, &mut Some(()));
             assert_eq!(attempt.result(), &Ok(()));
             assert!(owner.is_none() && input.is_none());
             assert_eq!(wake.calls.load(Ordering::Acquire), 0);
@@ -1390,7 +1482,11 @@ async fn dropping_a_successful_sender_wakes_the_waiting_root_and_preserves_input
             assert!(Arc::ptr_eq(&mounted.input.ready, &original));
         }
         assert!(bank.poll_ready(&mut Context::from_waker(&waker)).is_ready());
-        let PollCompletion::Ready(output) = bank.progress_turn(budget()).unwrap() else {
+        let PollCompletion::Ready(output) = bank
+            .progress_turn(budget())
+            .map(|turn| turn.into_parts().1)
+            .unwrap()
+        else {
             panic!("accepted input must run through its original factory");
         };
         assert_eq!(*output.value(), 7);
@@ -1440,7 +1536,7 @@ async fn refused_sender_tail_exits_after_external_source_unlock_even_if_it_panic
     let attempt = {
         let mut sources = sources.lock().unwrap();
         let IngressSources { owner, input } = &mut *sources;
-        let attempt = port.try_mount_in(owner, input);
+        let attempt = port.try_mount_in(owner, input, &mut Some(()));
         assert_eq!(attempt.result(), &Err(WorkError::Closed));
         assert!(owner.is_some() && input.is_some());
         drop(bank);
@@ -1485,7 +1581,7 @@ async fn accepted_unpolled_input_survives_root_exit_until_original_sender_exits(
     root.business.release();
     let mut owner = Some(root.owner);
     let mut input = Some(new_input(true));
-    let attempt = port.try_mount_in(&mut owner, &mut input);
+    let attempt = port.try_mount_in(&mut owner, &mut input, &mut Some(()));
     assert_eq!(attempt.result(), &Ok(()));
     drop(bank);
     assert_eq!(observer.is_reclaimed(), Ok(false));
@@ -1520,12 +1616,18 @@ async fn stopping_is_idempotent_and_drains_only_previously_accepted_inputs() {
     root.business.release();
     let mut owner = Some(root.owner);
     let mut input = Some(new_input(true));
-    port.try_mount_in(&mut owner, &mut input).finish().unwrap();
+    port.try_mount_in(&mut owner, &mut input, &mut Some(()))
+        .finish()
+        .unwrap();
     bank.stop_ingress();
     let revision = control.progress_revision();
     bank.stop_ingress();
     assert_eq!(control.progress_revision(), revision);
-    let PollCompletion::Ready(output) = bank.progress_turn(budget()).unwrap() else {
+    let PollCompletion::Ready(output) = bank
+        .progress_turn(budget())
+        .map(|turn| turn.into_parts().1)
+        .unwrap()
+    else {
         panic!("accepted input must drain after stop");
     };
     assert_eq!(*output.value(), 7);
@@ -1580,7 +1682,7 @@ async fn stopped_bank_observes_its_sources_without_waiting_for_delivered_footer(
     let mut owner = Some(root.owner);
     let mut input = Some(pending);
     ingress
-        .try_mount_in(&mut owner, &mut input)
+        .try_mount_in(&mut owner, &mut input, &mut Some(()))
         .finish()
         .unwrap();
 
@@ -1594,7 +1696,11 @@ async fn stopped_bank_observes_its_sources_without_waiting_for_delivered_footer(
         Ok(true),
         "queued original input"
     );
-    assert!(bank.progress_turn(budget()).is_none());
+    assert!(
+        bank.progress_turn(budget())
+            .map(|turn| turn.into_parts().1)
+            .is_none()
+    );
     assert_eq!(
         bank.has_owned_sources_after_stop(),
         Ok(true),
@@ -1602,7 +1708,11 @@ async fn stopped_bank_observes_its_sources_without_waiting_for_delivered_footer(
     );
     ready.store(true, Ordering::Release);
     saved_waker.lock().unwrap().take().unwrap().wake();
-    let PollCompletion::Ready(output) = bank.progress_turn(budget()).unwrap() else {
+    let PollCompletion::Ready(output) = bank
+        .progress_turn(budget())
+        .map(|turn| turn.into_parts().1)
+        .unwrap()
+    else {
         panic!("original frame must finish");
     };
     assert_eq!(*output.value(), 7);
@@ -1623,3 +1733,5 @@ async fn stopped_bank_observes_its_sources_without_waiting_for_delivered_footer(
     drain(&mut driver);
     assert_eq!(retired.is_reclaimed(), Ok(true));
 }
+
+mod context;

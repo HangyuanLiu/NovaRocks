@@ -49,28 +49,38 @@ use tokio::sync::{Notify, futures::OwnedNotified};
 /// Pure layout facts for the actual factory's fixed frames and containers.
 ///
 /// This is neither a capacity reservation nor installation authority. Independent
-/// input/output/factory pointees, service tasks and complete role custody remain
+/// input/output/context/factory pointees, service tasks and complete role custody remain
 /// the composing owner's responsibility.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PollRoleGeometry {
     per_slot: usize,
     shared: usize,
     failure_custody: Layout,
+    completion_custody: Layout,
 }
 impl PollRoleGeometry {
     /// Derive facts from the same concrete factory used by the real bank.
     /// This does not invoke the factory or construct its input or owner.
-    pub fn for_factory<I, F: Future, M: Fn(WorkOwner, I) -> F>(_: &M) -> Result<Self, WorkError> {
-        let per_slot = size_of::<Position<F>>()
-            .checked_add(size_of::<Option<MountedInput<I>>>())
+    pub fn for_factory<I, F: Future, M: Fn(WorkOwner, I) -> F>(
+        make: &M,
+    ) -> Result<Self, WorkError> {
+        Self::for_factory_with_context::<I, F, M, ()>(make)
+    }
+    /// Derive the same facts with context retained outside the actual future.
+    /// This does not construct, clone or invoke the context or the factory.
+    pub fn for_factory_with_context<I, F: Future, M: Fn(WorkOwner, I) -> F, C>(
+        _: &M,
+    ) -> Result<Self, WorkError> {
+        let per_slot = size_of::<Position<F, C>>()
+            .checked_add(size_of::<Option<MountedInput<I, C>>>())
             .ok_or(WorkError::ArithmeticOverflow)?
             .checked_add(size_of::<Option<F>>())
             .and_then(|n| n.checked_add(size_of::<PollBacking>()))
             .and_then(|n| n.checked_add(size_of::<Option<Arc<PollWake>>>()))
             .and_then(|n| n.checked_add(arc_bytes::<PollWake>().ok()?))
             .ok_or(WorkError::ArithmeticOverflow)?;
-        let shared = size_of::<RolePollBank<I, F, M>>()
-            .checked_add(arc_bytes::<SharedIngress<I>>()?)
+        let shared = size_of::<RolePollBank<I, F, M, C>>()
+            .checked_add(arc_bytes::<SharedIngress<I, C>>()?)
             .and_then(|n| n.checked_add(arc_bytes::<Notify>().ok()?))
             .and_then(|n| n.checked_add(arc_bytes::<ReadyQueue>().ok()?))
             .and_then(|n| n.checked_add(size_of::<OwnedNotified>()))
@@ -81,6 +91,7 @@ impl PollRoleGeometry {
             per_slot,
             shared,
             failure_custody: Layout::new::<PollOutput<PollFailure<F::Output>>>(),
+            completion_custody: Layout::new::<PollTurnCompletion<C, F::Output>>(),
         })
     }
     /// Fixed bank backing for the actual number of original inventory slots.
@@ -98,6 +109,13 @@ impl PollRoleGeometry {
     /// the actual receiving owner before that owner can install a complete role.
     pub fn failure_custody_layout(&self) -> &Layout {
         &self.failure_custody
+    }
+
+    /// The actual outer completion, including context and its original Wake
+    /// alias. This independent receiving layout is not included in bytes() or
+    /// the stripped failure packet layout; the caller funds its real overlap.
+    pub fn completion_custody_layout(&self) -> &Layout {
+        &self.completion_custody
     }
 }
 
@@ -175,10 +193,16 @@ impl Wake for PollWake {
 }
 
 // Root-owned frame and result are destroyed before the actual mount footer.
-struct Position<F: Future> {
+struct Position<F: Future, C = ()> {
     frame: Option<Pin<Box<Option<F>>>>,
     output: Option<F::Output>,
+    // Context remains strong through factory/poll/frame cleanup, including
+    // unwind. It is never passed to the business factory or future.
+    context: Option<C>,
     footer: Option<Footer>,
+    // A receiving owner can decline a completed packet. Keep that SAME outer
+    // completion in this original position instead of discarding its source.
+    retained: Option<PollTurnCompletion<C, F::Output>>,
 }
 struct Footer {
     wake: Arc<PollWake>,
@@ -243,9 +267,46 @@ pub enum PollCompletion<O> {
     Ready(PollOutput<O>),
     Panicked(PollOutput<PollFailure<O>>),
 }
-pub(crate) struct MountRejected<I> {
+/// A completion's association is outside the unchanged original value/failure
+/// packet. Receiving owners must remove this outer context before storing that
+/// packet in the context's own source cell, otherwise they could create a cycle.
+/// No source-exit fact follows from dropping the association or its absence.
+pub struct PollTurnCompletion<C, O> {
+    completion: PollCompletion<O>,
+    context: C,
+    // The packet leaves first, then C. This same original Wake keeps the slot
+    // unreapable through C's actual destructor, without a new allocation.
+    _context_backing: Arc<PollWake>,
+}
+impl<C, O> PollTurnCompletion<C, O> {
+    /// Borrows the same association without cloning or granting source rights.
+    pub fn context(&self) -> &C {
+        &self.context
+    }
+
+    /// Borrows the unchanged packet; no value, cause or footer can be detached.
+    pub fn completion(&self) -> &PollCompletion<O> {
+        &self.completion
+    }
+
+    /// Separates the association from the original packet without changing
+    /// that packet's value, failure payloads or footer. The receiving owner
+    /// must keep their custody related after the move. The packet still owns
+    /// its original footer when this outer temporary Wake alias leaves.
+    pub fn into_parts(self) -> (C, PollCompletion<O>) {
+        let Self {
+            completion,
+            context,
+            _context_backing,
+        } = self;
+        drop(_context_backing);
+        (context, completion)
+    }
+}
+pub(crate) struct MountRejected<I, C = ()> {
     pub(crate) owner: WorkOwner,
     pub(crate) input: I,
+    pub(crate) context: C,
     pub(crate) error: WorkError,
 }
 
@@ -253,23 +314,41 @@ pub(crate) struct MountRejected<I> {
 /// independent admission queue, free list, public mount guard, or capacity decision.
 /// The composing application separately owns complete-profile validation and
 /// the root task's actual exit; this generic bank certifies neither.
-pub struct RolePollBank<I, F: Future, M> {
+pub struct RolePollBank<I, F: Future, M, C = ()> {
     inner: Arc<Inner>,
     role: usize,
     make: M,
     changed: Arc<Notify>,
     ready: Arc<ReadyQueue>,
     waiter: Pin<Box<OwnedNotified>>,
-    positions: Vec<Position<F>>,
+    positions: Vec<Position<F, C>>,
     // The original receiving cells/registration leave after every root field.
-    shared: Arc<SharedIngress<I>>,
+    shared: Arc<SharedIngress<I, C>>,
 }
 impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
+    /// Unit-context convenience for existing factories; this is the same bank.
     pub fn install(control: &mut WorkloadControl, role: usize, make: M) -> Result<Self, WorkError> {
+        Self::install_with_context(control, role, make)
+    }
+
+    pub(crate) fn mount_owned(
+        &mut self,
+        owner: WorkOwner,
+        input: I,
+    ) -> Result<(), MountRejected<I>> {
+        self.mount_owned_with_context(owner, input, ())
+    }
+}
+impl<I, F: Future, M: Fn(WorkOwner, I) -> F, C> RolePollBank<I, F, M, C> {
+    pub fn install_with_context(
+        control: &mut WorkloadControl,
+        role: usize,
+        make: M,
+    ) -> Result<Self, WorkError> {
         // Only the original unique startup owner can install. No shared Inner
         // entry point can allocate competing banks against the same paid base.
         let inner = &control.inner;
-        let geometry = PollRoleGeometry::for_factory(&make)?;
+        let geometry = PollRoleGeometry::for_factory_with_context::<I, F, M, C>(&make)?;
         let validate = |state: &mut crate::scope::State| -> Result<(usize, u64), WorkError> {
             if state.ready || state.closed || !state.cancellations.fixed || !state.nodes.is_empty()
             {
@@ -317,7 +396,9 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
             positions.push(Position {
                 frame: None,
                 output: None,
+                context: None,
                 footer: None,
+                retained: None,
             });
         }
         let mut inputs = Vec::new();
@@ -376,28 +457,107 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
     /// Exporting an ingress permanently forbids pre-ready reinstallation of
     /// this role on the same authority. The original process/client owner keeps
     /// its weak header until clients actually exit; this is not hot restart.
-    pub fn ingress(&self) -> Result<ingress::RoleIngress<I>, WorkError> {
+    pub fn ingress(&self) -> Result<ingress::RoleIngress<I, C>, WorkError> {
         self.shared.export()
     }
 
-    pub(crate) fn mount_owned(
+    pub(crate) fn mount_owned_with_context(
         &mut self,
         owner: WorkOwner,
         input: I,
-    ) -> Result<(), MountRejected<I>> {
+        context: C,
+    ) -> Result<(), MountRejected<I, C>> {
         let mut owner = Some(owner);
         let mut input = Some(input);
+        let mut context = Some(context);
         // This exclusive bank borrow keeps the original shared value alive.
         // A refused sender cannot be its last Arc and run registration cleanup.
-        let result = self.shared.attempt(&mut owner, &mut input).finish();
+        let result = self
+            .shared
+            .attempt(&mut owner, &mut input, &mut context)
+            .finish();
         match result {
             Ok(()) => Ok(()),
             Err(error) => Err(MountRejected {
                 owner: owner.take().unwrap(),
                 input: input.take().unwrap(),
+                context: context.take().unwrap(),
                 error,
             }),
         }
+    }
+
+    /// Retain a declined, still-whole completion in its SAME original position.
+    /// Refusal leaves the source unchanged. This does not run foreign Drop,
+    /// poll a future, notify or create an exit/settlement fact. The caller must
+    /// not split the association from its packet before this transaction.
+    /// Retained failure custody prevents an ordinary successful root shutdown;
+    /// loss of the bank itself is not a substitute for external root custody.
+    pub fn retain_completion_in(
+        &mut self,
+        source: &mut Option<PollTurnCompletion<C, F::Output>>,
+    ) -> Result<(), WorkError> {
+        let original = source.as_ref().ok_or(WorkError::Released)?;
+        let footer = match &original.completion {
+            PollCompletion::Ready(output) => &output.footer,
+            PollCompletion::Panicked(output) => &output.footer,
+        };
+        if !Arc::ptr_eq(&footer._pin.inner, &self.inner) {
+            return Err(WorkError::ForeignAuthority);
+        }
+        if footer._pin.role != self.role {
+            return Err(WorkError::Conflict);
+        }
+        // Preserve the sole original State -> input lock order. Failed/cancelled
+        // work, stopped admission and a closed driver still need a receiver.
+        let state = self.inner.state.lock().unwrap();
+        let slot_id = footer._pin.slot;
+        let slot = state
+            .cancellations
+            .slots
+            .get(slot_id.0)
+            .ok_or(WorkError::Conflict)?;
+        let backing = slot.polls.get(self.role).ok_or(WorkError::Conflict)?;
+        let node = state
+            .nodes
+            .get(&footer._pin.work)
+            .ok_or(WorkError::Released)?;
+        if slot.generation != footer._pin.generation
+            || slot.phase != SlotPhase::Node(footer._pin.work)
+            || node.cancellation != slot_id
+            || backing.phase != PollPhase::Mounted
+            || backing.registration_generation != self.shared.generation
+            || !matches!(
+                backing.registration,
+                RegistrationPhase::Installed | RegistrationPhase::Stopping
+            )
+            || !Arc::ptr_eq(&backing.wake, &footer.wake)
+        {
+            return Err(WorkError::Conflict);
+        }
+        let inputs = self.shared.inputs.lock().unwrap();
+        if inputs.get(slot_id.0).is_none_or(Option::is_some) {
+            return Err(WorkError::Conflict);
+        }
+        let position = self
+            .positions
+            .get_mut(slot_id.0)
+            .ok_or(WorkError::Conflict)?;
+        if position.context.is_some()
+            || position.footer.is_some()
+            || position.output.is_some()
+            || position.retained.is_some()
+            || position
+                .frame
+                .as_ref()
+                .is_some_and(|frame| frame.as_ref().get_ref().is_some())
+        {
+            return Err(WorkError::Conflict);
+        }
+        // Every destination and original fence is checked before this silent
+        // move. There is no old value to destroy, including on either refusal.
+        position.retained = source.take();
+        Ok(())
     }
 
     pub fn stop_ingress(&self) {
@@ -424,6 +584,8 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
         Ok(inputs.iter().any(Option::is_some)
             || self.positions.iter().any(|position| {
                 position.footer.is_some()
+                    || position.retained.is_some()
+                    || position.context.is_some()
                     || position.output.is_some()
                     || position
                         .frame
@@ -453,7 +615,10 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
 
     /// Poll at most the given number of actual ready hints. None means no
     /// completion in this turn; poll_ready still checks any remaining items.
-    pub fn progress_turn(&mut self, budget: NonZeroUsize) -> Option<PollCompletion<F::Output>> {
+    pub fn progress_turn(
+        &mut self,
+        budget: NonZeroUsize,
+    ) -> Option<PollTurnCompletion<C, F::Output>> {
         for _ in 0..budget.get() {
             let Some(wake) = self.ready.pop() else {
                 break;
@@ -464,10 +629,14 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
                 |MountedInput {
                      owner,
                      input,
+                     context,
                      footer,
                  }| {
                     assert!(position.footer.is_none());
                     assert!(position.output.is_none());
+                    assert!(position.context.is_none());
+                    assert!(position.retained.is_none());
+                    position.context = Some(context);
                     position.footer = Some(footer);
                     (owner, input)
                 },
@@ -521,27 +690,35 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
             if primary.is_none() {
                 primary = cleanup.take();
             }
+            let context = position.context.take().unwrap();
             let footer = position.footer.take().unwrap();
-            if let Some(primary) = primary {
-                return Some(PollCompletion::Panicked(PollOutput {
+            let context_backing = Arc::clone(&footer.wake);
+            let completion = if let Some(primary) = primary {
+                PollCompletion::Panicked(PollOutput {
                     value: PollFailure {
                         primary,
                         cleanup,
                         output: position.output.take(),
                     },
                     footer,
-                }));
-            }
-            return Some(PollCompletion::Ready(PollOutput {
-                value: position.output.take().unwrap(),
-                footer,
-            }));
+                })
+            } else {
+                PollCompletion::Ready(PollOutput {
+                    value: position.output.take().unwrap(),
+                    footer,
+                })
+            };
+            return Some(PollTurnCompletion {
+                completion,
+                context,
+                _context_backing: context_backing,
+            });
         }
         None
     }
 }
 
-impl<I, F: Future, M> Drop for RolePollBank<I, F, M> {
+impl<I, F: Future, M, C> Drop for RolePollBank<I, F, M, C> {
     fn drop(&mut self) {
         // Stop before any make/frame/input destruction. Shared registration
         // remains until root fields and every original sender tail truly exit.
