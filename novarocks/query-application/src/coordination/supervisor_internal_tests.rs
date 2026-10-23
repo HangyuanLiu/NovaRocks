@@ -225,10 +225,10 @@ mod internal_supervisor_tests {
     }
 
     impl NativeAttemptPreparationPort for InternalCountPreparation {
-        fn prepare(
-            &mut self,
-            request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
+        fn prepare_in<'a>(
+            &'a mut self,
+            request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
             let ordinal = self.signals.preparations.fetch_add(1, Ordering::SeqCst) + 1;
             let replacement_failure = if ordinal > 1 {
                 self.signals.replacement_failure.lock().unwrap().clone()
@@ -248,7 +248,8 @@ mod internal_supervisor_tests {
                 window: self.window.clone(),
                 signals: Arc::clone(&self.signals),
             };
-            Box::pin(async move { request.bind(scheduling, owner).map_err(Into::into) })
+            request.stage_fixture_owner(owner);
+            Box::pin(async move { request.bind_staged(scheduling).map_err(Into::into) })
         }
     }
 
@@ -564,21 +565,28 @@ mod internal_supervisor_tests {
                     0,
                     "both ordinary and shutdown process loops join the original ACK tail"
                 );
-                // The exact actor can join while the original Native/session
-                // local-return author remains an explicit integration obligation.
-                tokio::time::timeout(Duration::from_secs(2), async {
-                    while actual_exit.view().unwrap().actor_phase()
-                        != crate::api::LogicalActorExitPhase::Joined
-                    {
-                        tokio::task::yield_now().await;
-                    }
-                })
+                // Actor join and Native ACK are necessary but independent.
+                // The real role clear now runs the original stable Session's
+                // actual Drop author before returning its local receipt.
+                let actual_receipt = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    std::future::poll_fn(|cx| actual_exit.poll_exit(cx)),
+                )
                 .await
+                .expect("same original preparation source actually exits")
                 .unwrap();
-                assert!(
-                    futures::poll!(std::future::poll_fn(|cx| actual_exit.poll_exit(cx)))
-                        .is_pending(),
-                    "no session disposition may be invented from Registry absence"
+                assert_eq!(
+                    actual_receipt.view().actor_phase(),
+                    crate::api::LogicalActorExitPhase::Joined
+                );
+                assert!(actual_receipt.view().native_preparation_exited());
+                assert_eq!(
+                    actual_receipt.local_disposition(),
+                    crate::api::LocalExecutionDisposition::OriginalPaidOwnerReturn
+                );
+                assert_eq!(
+                    actual_receipt.remote_disposition(),
+                    crate::api::RemoteExecutionDisposition::RemoteNotReported
                 );
                 drop(handle);
                 root.business.release();
@@ -591,6 +599,7 @@ mod internal_supervisor_tests {
                     0,
                     "the actual observer receipt still holds its original footer"
                 );
+                drop(actual_receipt);
                 drop(actual_exit);
                 acknowledge_all_control(&control);
                 tokio::time::timeout(Duration::from_secs(2), scope.wait_released())
@@ -842,10 +851,10 @@ mod internal_supervisor_tests {
     }
 
     impl NativeAttemptPreparationPort for QualificationReplacementPreparation {
-        fn prepare(
-            &mut self,
-            request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
+        fn prepare_in<'a>(
+            &'a mut self,
+            request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
             self.prepared += 1;
             if self.prepared > 1 {
                 let crate::api::NativeAttemptTopologyRequirement::ExcludeProcess(excluded) =
@@ -857,7 +866,7 @@ mod internal_supervisor_tests {
                 assert_ne!(self.replacement_backend, excluded);
                 self.inner.backend = self.replacement_backend;
             }
-            self.inner.prepare(request)
+            self.inner.prepare_in(request)
         }
     }
 
@@ -1189,10 +1198,10 @@ mod internal_supervisor_tests {
     }
 
     impl NativeAttemptPreparationPort for HeldInternalActivationPreparation {
-        fn prepare(
-            &mut self,
-            request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
+        fn prepare_in<'a>(
+            &'a mut self,
+            request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
             let scheduling = no_scan_scheduling(&request);
             let dormant = HeldInternalActivationDormant {
                 inner: InternalCountDormant {
@@ -1203,7 +1212,8 @@ mod internal_supervisor_tests {
                 activation: Arc::clone(&self.activation),
                 failure: self.failure.clone(),
             };
-            Box::pin(async move { request.bind(scheduling, dormant).map_err(Into::into) })
+            request.stage_fixture_owner(dormant);
+            Box::pin(async move { request.bind_staged(scheduling).map_err(Into::into) })
         }
     }
 
@@ -1403,10 +1413,10 @@ mod internal_supervisor_tests {
     }
 
     impl NativeAttemptPreparationPort for FactoryPanickingPreparation {
-        fn prepare(
-            &mut self,
-            request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
+        fn prepare_in<'a>(
+            &'a mut self,
+            request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
             let scheduling = no_scan_scheduling(&request);
             let owner = FactoryPanickingDormant {
                 inner: HeldInternalActivationDormant {
@@ -1421,7 +1431,8 @@ mod internal_supervisor_tests {
                 phase: self.phase,
                 factory_called: Arc::clone(&self.factory_called),
             };
-            Box::pin(async move { request.bind(scheduling, owner).map_err(Into::into) })
+            request.stage_fixture_owner(owner);
+            Box::pin(async move { request.bind_staged(scheduling).map_err(Into::into) })
         }
     }
 

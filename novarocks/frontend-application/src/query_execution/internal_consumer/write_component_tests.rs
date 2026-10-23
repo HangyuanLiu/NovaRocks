@@ -46,10 +46,7 @@ use novarocks_execution_contract::{
 use novarocks_query_application::coordination::LogicalConclusion;
 use novarocks_query_application::{
     admitted_query_context::QueryResultCapacityBinding,
-    api::{
-        LogicalExecutionNativePort, LogicalNativeOpenFuture, LogicalNativeOpenRequest,
-        RetainedRootReply,
-    },
+    api::{LogicalExecutionNativePort, LogicalNativeOpenRequest, RetainedRootReply},
     coordination::{LogicalExecutionRowsConfig, LogicalExecutionSupervisorConfig},
     execution_error::ExecutionFailureInput,
 };
@@ -71,8 +68,12 @@ async fn watchdog<T>(stage: &'static str, future: impl Future<Output = T>) -> T 
 #[derive(Debug)]
 struct ReservationOnly;
 impl LogicalExecutionNativePort for ReservationOnly {
-    fn open(&self, _: LogicalNativeOpenRequest) -> LogicalNativeOpenFuture {
-        panic!("identity reservation must not open Native")
+    fn bind_in(
+        &self,
+        _source: &mut Option<LogicalNativeOpenRequest>,
+        _target: &mut Option<novarocks_query_application::api::LogicalNativeSession>,
+    ) -> Result<(), novarocks_query_application::api::LogicalNativeOpenError> {
+        panic!("reserving an identity cannot bind Native work")
     }
 }
 struct UnavailableInfo;

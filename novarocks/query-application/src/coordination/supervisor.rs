@@ -774,12 +774,10 @@ impl QueryExecutionDriver for QueryExecutionDriverHandle {
         let (reply, response) = oneshot::channel();
         let internal_cut = request.description().finish_boundary()
             == crate::preparation::ExecutionFinishBoundary::ComputationReady;
-        let source = OriginalLogicalExit::new();
+        let source = OriginalLogicalExit::with_native(request, Arc::clone(&self.native));
         let input = LogicalRoleInput {
-            request,
             reply,
             reserved,
-            native: Arc::clone(&self.native),
             query_ids: Arc::clone(&self.query_ids),
             frontend_process_id: self.frontend_process_id,
             config: self.config,
@@ -1010,10 +1008,8 @@ fn rejected_start(owner: WorkOwner, message: &'static str) -> QueryExecutionFutu
 /// This type alone is not a complete byte quote or a startup admission grant.
 struct LogicalRoleInput {
     original_exit: Weak<OriginalLogicalExit>,
-    request: QueryExecutionRequest,
     reply: oneshot::Sender<Result<ExecutionHandle, QueryExecutionError>>,
     reserved: Option<ReservedExecutionIdentity>,
-    native: Arc<dyn LogicalExecutionNativePort>,
     query_ids: Arc<ProcessQueryIdAllocator>,
     frontend_process_id: FrontendProcessId,
     config: LogicalExecutionSupervisorConfig,
@@ -1128,6 +1124,7 @@ fn observe_logical_completion<F, M>(
     }
     let source = Arc::clone(completion.context());
     source.role_ended_silent(failed);
+    source.retire_native_body_silent();
     // An accepted wrapper is installed BEFORE stripping C. Rejection keeps
     // the unchanged whole packet in its SAME original finite bank position.
     let notice = if source.has_failure() {
@@ -1311,10 +1308,8 @@ async fn make_logical_role(
 ) -> Result<(), QueryExecutionError> {
     let LogicalRoleInput {
         original_exit,
-        request,
         reply,
         reserved,
-        native,
         query_ids,
         frontend_process_id,
         config,
@@ -1326,7 +1321,6 @@ async fn make_logical_role(
     // A queued, never-polled input must not call Native open during shutdown.
     // This preserves the old accepted-mailbox drain verdict before any create.
     if *shutdown.borrow() || shutdown.has_changed().is_err() {
-        drop(request);
         return fail_uninstalled_start(
             pending_owner,
             reply,
@@ -1342,17 +1336,51 @@ async fn make_logical_role(
         Ok(execution) => execution,
         Err(error) => return fail_uninstalled_start(pending_owner, reply, error),
     };
+    // Only this original body is strongly borrowed by the role. It has no
+    // backedge to Source; C keeps its strong anchor outside this Future.
+    let native_body = match original_exit.upgrade() {
+        Some(source) => Arc::clone(&source.native),
+        None => {
+            return fail_uninstalled_start(
+                pending_owner,
+                reply,
+                QueryExecutionError::new(
+                    QueryExecutionErrorKind::Failed,
+                    "original Native source is absent",
+                ),
+            );
+        }
+    };
+    let mut native_guard = native_body.lock_owned().await;
+    let body = &mut *native_guard;
+    let request = body.start.as_ref().expect("original stable start input");
     if let Err(error) = request.validate_internal_consumer() {
         return fail_uninstalled_start(pending_owner, reply, error);
     }
     if let Err(error) = request.validate_result_capacity(&scope) {
         return fail_uninstalled_start(pending_owner, reply, error);
     }
-    let (description, native_seed, internal_consumer, result_capacity) = request.into_parts();
+    if !request.native_parts_match() {
+        return fail_uninstalled_start(
+            pending_owner,
+            reply,
+            QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "original Native seed differs from its frozen description",
+            ),
+        );
+    }
+    // into_parts only checks the atomically frozen seed/plan identity. Its
+    // private constructor already validated that relation; there is no foreign
+    // callback between this take and all original stable destination fields.
+    let (description, seed, consumer, capacity) = body.start.take().unwrap().into_parts();
+    body.description = Some(Arc::new(description));
+    body.seed = Some(seed);
+    body.consumer = consumer;
+    body.capacity = capacity;
+    let description = Arc::clone(body.description.as_ref().unwrap());
+    let internal_consumer = body.consumer.clone();
     let internal = internal_consumer.is_some();
-    let description = Arc::new(description);
-    // Activation is one-shot: the plan chosen by preparation and completion is
-    // the one every attempt of this execution runs.
     let active_plan = super::ActiveLogicalPlan::activate(description.completed_candidate().clone());
     let result_schema = match description.output() {
         OutputContract::Rows(fields) => Some(ResultSchema::new(Arc::clone(fields))),
@@ -1372,70 +1400,75 @@ async fn make_logical_role(
         Ok(cancellation) => cancellation,
         Err(error) => return fail_uninstalled_start(pending_owner, reply, work_error(error)),
     };
-    let (open_request, open_acceptance) = LogicalNativeOpenRequest::issue(
+    let (request, acceptance) = LogicalNativeOpenRequest::issue(
         initial_execution,
         Arc::clone(&description),
         scope.id(),
         cancellation.clone(),
-        native_seed,
+        body.seed.take().unwrap(),
     );
+    body.open = Some(request);
+    body.acceptance = Some(acceptance);
     if let Some(source) = original_exit.upgrade() {
         source.native_pre_actor_started_silent();
     }
-    let opened = match await_before_actor_install(
-        native.open(open_request),
+    let opened = body
+        .port
+        .as_ref()
+        .unwrap()
+        .bind_in(&mut body.open, &mut body.session);
+    if let Err(error) = opened {
+        return fail_uninstalled_start(pending_owner, reply, native_open_error(error));
+    }
+    if let Err(error) = body
+        .acceptance
+        .as_ref()
+        .unwrap()
+        .validate(body.session.as_ref().unwrap())
+    {
+        return fail_uninstalled_start(pending_owner, reply, contract_error(error));
+    }
+    drop(body.acceptance.take());
+    body.session
+        .as_mut()
+        .unwrap()
+        .set_result_capacity_in(&mut body.capacity);
+    let super::original_exit::OriginalNativePreparation {
+        session,
+        dormant,
+        pending_activated,
+        ..
+    } = body;
+    let mut session = session.as_mut().unwrap();
+    if let Err(error) = session.begin_preparation(
+        initial_execution,
+        crate::api::NativeAttemptTopologyRequirement::LiveSnapshot,
+    ) {
+        return fail_uninstalled_start(pending_owner, reply, contract_error(error));
+    }
+    match await_before_actor_install(
+        session.prepare_pending(),
         cancellation.clone(),
         &mut shutdown,
         &requester,
     )
     .await
     {
-        PreInstallWait::Completed(opened) => opened,
-        PreInstallWait::Cancelled(reason) => {
-            return fail_uninstalled_start(
-                pending_owner,
-                reply,
-                pre_install_cancellation_error(reason),
-            );
-        }
-    };
-    let mut session =
-        match opened.and_then(|session| open_acceptance.accept(session).map_err(Into::into)) {
-            Ok(session) => session.with_result_capacity(result_capacity),
-            Err(error) => {
-                return fail_uninstalled_start(pending_owner, reply, native_open_error(error));
-            }
-        };
-    let (attempt_request, attempt_acceptance) = match session.issue_attempt(initial_execution) {
-        Ok(pair) => pair,
-        Err(error) => {
-            return fail_uninstalled_start(pending_owner, reply, contract_error(error));
-        }
-    };
-    let prepared = match await_before_actor_install(
-        session.prepare(attempt_request),
-        cancellation.clone(),
-        &mut shutdown,
-        &requester,
-    )
-    .await
-    {
-        PreInstallWait::Completed(prepared) => prepared,
-        PreInstallWait::Cancelled(reason) => {
-            return fail_uninstalled_start(
-                pending_owner,
-                reply,
-                pre_install_cancellation_error(reason),
-            );
-        }
-    };
-    let prepared = match prepared
-        .and_then(|prepared| attempt_acceptance.accept(prepared).map_err(Into::into))
-    {
-        Ok(prepared) => prepared,
-        Err(error) => {
+        PreInstallWait::Completed(Ok(())) => {}
+        PreInstallWait::Completed(Err(error)) => {
             return fail_uninstalled_start(pending_owner, reply, native_prepare_error(error));
         }
+        PreInstallWait::Cancelled(reason) => {
+            return fail_uninstalled_start(
+                pending_owner,
+                reply,
+                pre_install_cancellation_error(reason),
+            );
+        }
+    }
+    let prepared = match session.accept_pending_in(dormant) {
+        Ok(prepared) => prepared,
+        Err(error) => return fail_uninstalled_start(pending_owner, reply, contract_error(error)),
     };
     debug_assert_eq!(prepared.execution, initial_execution);
     let schedule = match build_attempt_schedule(
@@ -1444,8 +1477,8 @@ async fn make_logical_role(
         &prepared.eligible_backends,
         &prepared.scheduling,
         #[cfg(novarocks_dev_controls)]
-        prepared
-            .owner
+        dormant
+            .as_mut()
             .test_preferred_backend_process(initial_execution),
     ) {
         Ok(schedule) => schedule,
@@ -1641,7 +1674,7 @@ async fn make_logical_role(
     };
     let outcome_requester = requester.clone();
     let supervision = async move {
-        let mut dormant = prepared.owner;
+        let dormant = dormant;
         let mut active_custody = match registry.reserve_active_native_owner(
             &registration,
             schedule.execution(),
@@ -1657,7 +1690,7 @@ async fn make_logical_role(
                     .map(|_| ())
                     .or_else(actor_terminal_refusal);
                 converge_dormant(dormant.as_mut(), cancellation, &mut shutdown, &requester).await;
-                drop(dormant);
+                dormant.retire();
                 let retire_result = retire_logical(&registry, registration).await;
                 return first_supervision_error(
                     Err(error),
@@ -1665,9 +1698,14 @@ async fn make_logical_role(
                 );
             }
         };
+        assert!(
+            pending_activated.is_none(),
+            "one original activation output"
+        );
         let activation = await_with_shutdown(
             catch_future_panic(async {
                 dormant
+                    .as_mut()
                     .activate(&schedule, None, cancellation.clone())
                     .await
             }),
@@ -1675,10 +1713,24 @@ async fn make_logical_role(
             &requester,
         )
         .await;
-        let active = match activation {
+        let (mut active, rows_runtime) = match activation {
             Ok(Ok(active)) => {
-                drop(dormant);
-                active
+                // The complete return first occupies its same Source field.
+                // Then the Box enters its ORIGINAL slot before dormant Drop.
+                *pending_activated = Some(
+                    super::native_active_custody::PendingNativeActivation::new(active),
+                );
+                active_custody
+                    .as_ref()
+                    .expect("reserved before activation")
+                    .stage_activated_in(pending_activated)
+                    .expect("same original activation slot");
+                dormant.retire();
+                active_custody
+                    .as_mut()
+                    .expect("reserved before activation")
+                    .finish_activated_in(pending_activated)
+                    .expect("same original activation output")
             }
             Ok(Err(failure)) => {
                 drop(active_custody.take());
@@ -1691,7 +1743,7 @@ async fn make_logical_role(
                     .map(|_| ())
                     .or_else(actor_terminal_refusal);
                 converge_dormant(dormant.as_mut(), cancellation, &mut shutdown, &requester).await;
-                drop(dormant);
+                dormant.retire();
                 let retire_result = retire_logical(&registry, registration).await;
                 return first_supervision_error(actor_result, retire_result);
             }
@@ -1706,7 +1758,7 @@ async fn make_logical_role(
                     .map(|_| ())
                     .or_else(actor_terminal_refusal);
                 converge_dormant(dormant.as_mut(), cancellation, &mut shutdown, &requester).await;
-                drop(dormant);
+                dormant.retire();
                 let retire_result = retire_logical(&registry, registration).await;
                 return first_supervision_error(
                     Err(error),
@@ -1714,11 +1766,6 @@ async fn make_logical_role(
                 );
             }
         };
-        let (original_active, rows_runtime) = active.into_parts();
-        let mut active = active_custody
-            .take()
-            .expect("reserved before activation")
-            .bind(original_active);
         match (internal || result_schema.is_some(), rows_runtime) {
             (true, Some(rows_runtime)) => {
                 let running = match actor.activate(initial.ready()).await {
@@ -1771,6 +1818,8 @@ async fn make_logical_role(
                 let actor_result = supervise_rows(
                     &actor,
                     &mut session,
+                    dormant,
+                    pending_activated,
                     Arc::clone(&description),
                     scope,
                     frontend_process_id,
@@ -2342,6 +2391,8 @@ fn observe_internal_ready(
 async fn supervise_rows(
     actor: &super::LogicalExecutionActor,
     session: &mut LogicalNativeSession,
+    dormant: &mut crate::api::NativeDormantCustody,
+    pending_activated: &mut Option<super::native_active_custody::PendingNativeActivation>,
     description: Arc<crate::preparation::FrozenExecutionDescription>,
     scope: novarocks_workload_control::WorkScope,
     frontend_process_id: FrontendProcessId,
@@ -2359,6 +2410,8 @@ async fn supervise_rows(
     let mut result = supervise_rows_inner(
         actor,
         session,
+        dormant,
+        pending_activated,
         description,
         scope,
         frontend_process_id,
@@ -2421,6 +2474,8 @@ async fn supervise_rows(
 async fn supervise_rows_inner(
     actor: &super::LogicalExecutionActor,
     session: &mut LogicalNativeSession,
+    dormant: &mut crate::api::NativeDormantCustody,
+    pending_activated: &mut Option<super::native_active_custody::PendingNativeActivation>,
     description: Arc<crate::preparation::FrozenExecutionDescription>,
     scope: novarocks_workload_control::WorkScope,
     frontend_process_id: FrontendProcessId,
@@ -2634,6 +2689,7 @@ async fn supervise_rows_inner(
                     });
                 let prepared = prepare_native_attempt(
                     session,
+                    dormant,
                     replacement,
                     decision.topology_requirement(),
                     frontend_process_id,
@@ -2643,7 +2699,7 @@ async fn supervise_rows_inner(
                     preparation_deadline,
                 )
                 .await;
-                let (replacement_schedule, mut dormant) = match prepared {
+                let replacement_schedule = match prepared {
                     Ok(prepared) => prepared,
                     Err(error) => {
                         session.retire_preparation();
@@ -2800,9 +2856,14 @@ async fn supervise_rows_inner(
                         );
                     }
                 };
+                assert!(
+                    pending_activated.is_none(),
+                    "one original activation output"
+                );
                 let activated = await_with_shutdown(
                     catch_future_panic(async {
                         dormant
+                            .as_mut()
                             .activate(
                                 &replacement_schedule,
                                 replacement_admissions,
@@ -2814,8 +2875,17 @@ async fn supervise_rows_inner(
                     requester,
                 )
                 .await;
-                let activated = match activated {
-                    Ok(Ok(activated)) => activated,
+                match activated {
+                    Ok(Ok(activated)) => {
+                        *pending_activated = Some(
+                            super::native_active_custody::PendingNativeActivation::new(activated),
+                        );
+                        replacement_custody
+                            .as_ref()
+                            .expect("reserved before replacement activation")
+                            .stage_activated_in(pending_activated)
+                            .expect("same original replacement slot");
+                    }
                     Ok(Err(failure)) => {
                         drop(replacement_custody.take());
                         session.retire_preparation();
@@ -2870,12 +2940,12 @@ async fn supervise_rows_inner(
                         );
                     }
                 };
-                drop(dormant);
-                let (original_active, rows_runtime) = activated.into_parts();
-                let active = replacement_custody
-                    .take()
+                dormant.retire();
+                let (active, rows_runtime) = replacement_custody
+                    .as_mut()
                     .expect("reserved before replacement activation")
-                    .bind(original_active);
+                    .finish_activated_in(pending_activated)
+                    .expect("same original replacement output");
                 let Some(rows_runtime) = rows_runtime else {
                     session.retire_preparation();
                     let error =
@@ -2955,6 +3025,7 @@ async fn supervise_rows_inner(
 
 async fn prepare_native_attempt(
     session: &mut LogicalNativeSession,
+    dormant: &mut crate::api::NativeDormantCustody,
     execution: QueryExecutionId,
     topology_requirement: crate::api::NativeAttemptTopologyRequirement,
     frontend_process_id: FrontendProcessId,
@@ -2962,15 +3033,14 @@ async fn prepare_native_attempt(
     requester: &novarocks_workload_control::WorkCancellationRequester,
     cancellation: novarocks_workload_control::CancellationView,
     deadline: tokio::time::Instant,
-) -> Result<(super::AttemptSchedule, Box<dyn DormantNativeAttemptOwner>), QueryExecutionError> {
-    let (request, acceptance) = session.issue_attempt(execution).map_err(contract_error)?;
-    let preparation = await_with_shutdown(
-        session.prepare(request.require_topology(topology_requirement)),
-        shutdown,
-        requester,
-    );
-    tokio::pin!(preparation);
-    let prepared = tokio::select! {
+) -> Result<super::AttemptSchedule, QueryExecutionError> {
+    session
+        .begin_preparation(execution, topology_requirement)
+        .map_err(contract_error)?;
+    {
+        let preparation = await_with_shutdown(session.prepare_pending(), shutdown, requester);
+        tokio::pin!(preparation);
+        tokio::select! {
         biased;
         reason = cancellation.cancelled() => {
             return Err(cancellation_error(
@@ -2987,20 +3057,21 @@ async fn prepare_native_attempt(
         }
         prepared = &mut preparation => prepared,
     }
-    .and_then(|prepared| acceptance.accept(prepared).map_err(Into::into))
     .map_err(native_prepare_error)?;
+    }
+    let prepared = session.accept_pending_in(dormant).map_err(contract_error)?;
     let schedule = build_attempt_schedule(
         execution,
         frontend_process_id,
         &prepared.eligible_backends,
         &prepared.scheduling,
         #[cfg(novarocks_dev_controls)]
-        prepared.owner.test_preferred_backend_process(execution),
+        dormant.as_mut().test_preferred_backend_process(execution),
     )
     .map_err(|error| {
         QueryExecutionError::new(QueryExecutionErrorKind::Failed, error.to_string())
     })?;
-    Ok((schedule, prepared.owner))
+    Ok(schedule)
 }
 
 fn next_attempt(execution: QueryExecutionId) -> Result<QueryExecutionId, QueryExecutionError> {
@@ -3307,8 +3378,8 @@ enum PreInstallWait<T> {
 /// only work owner behind an unbounded Native or admission wait.
 ///
 /// This is deliberately limited to the interval before actor installation:
-/// there is then no Task, output, or effect owner whose convergence must be
-/// observed. Once installed, cancellation remains actor-owned and ordinary
+/// the same Native preparation body remains in original stable custody. Its
+/// explicit original close/paid return is observed after the role frame clears. Once installed, cancellation remains actor-owned and ordinary
 /// control delivery cannot be acknowledged as a substitute for terminal
 /// facts. Shutdown retains its existing behavior and lets the in-flight
 /// operation observe its shutdown cancellation before returning.
@@ -3365,10 +3436,9 @@ impl PendingWorkOwner {
             .expect("pending start transfers its work owner once")
     }
 
-    /// A start that failed before installing an actor has no Task, output, or
-    /// external-effect owner left to deliver its cancellation control. Its
-    /// terminal error is therefore the exact settlement boundary for a queued
-    /// cancel intent.
+    /// Actor control can be settled before installation; the fixed original
+    /// Native body/footer separately retains every preparation source until its
+    /// actual close. This does not assert that all Native custody has exited.
     fn complete_uninstalled_failure(mut self) {
         self.take().complete_after_terminal_cancel_settled();
     }
@@ -3609,7 +3679,7 @@ mod tests {
 
     use crate::api::{
         ActivatedNativeAttempt, ActiveNativeAttemptOwner, DormantNativeAttemptOwner,
-        LogicalNativeOpenFailure, LogicalNativeOpenFuture, NativeActiveAttemptConvergenceFuture,
+        LogicalNativeOpenFailure, NativeActiveAttemptConvergenceFuture,
         NativeAttemptActivationFailure, NativeAttemptActivationFuture, NativeAttemptConvergence,
         NativeAttemptConvergenceFuture, NativeAttemptPreparationFailure,
         NativeAttemptPreparationFuture, NativeAttemptPreparationPort,
@@ -4150,10 +4220,10 @@ mod tests {
     struct UnreachablePreparationPort;
 
     impl NativeAttemptPreparationPort for UnreachablePreparationPort {
-        fn prepare(
-            &mut self,
-            _request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
+        fn prepare_in<'a>(
+            &'a mut self,
+            _request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
             Box::pin(async { panic!("unreachable Native attempt preparation") })
         }
     }
@@ -4170,10 +4240,10 @@ mod tests {
     }
 
     impl NativeAttemptPreparationPort for DropTrackedPreparationPort {
-        fn prepare(
-            &mut self,
-            _request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
+        fn prepare_in<'a>(
+            &'a mut self,
+            _request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
             Box::pin(async { panic!("rejected Native seed must never prepare an attempt") })
         }
     }
@@ -4184,16 +4254,25 @@ mod tests {
         })
     }
 
-    #[derive(Debug)]
     struct CaptureAdmittedCapacityPort {
-        captured: Option<oneshot::Sender<NativeAttemptPreparationRequest>>,
+        captured:
+            Option<oneshot::Sender<crate::admitted_query_context::QueryResultCapacityBinding>>,
+    }
+    impl fmt::Debug for CaptureAdmittedCapacityPort {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("CaptureAdmittedCapacityPort")
+        }
     }
     impl NativeAttemptPreparationPort for CaptureAdmittedCapacityPort {
-        fn prepare(
-            &mut self,
-            request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
-            self.captured.take().unwrap().send(request).unwrap();
+        fn prepare_in<'a>(
+            &'a mut self,
+            request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
+            self.captured
+                .take()
+                .unwrap()
+                .send(request.result_capacity().unwrap().clone())
+                .unwrap_or_else(|_| panic!("original admitted binding receiver exited"));
             Box::pin(async {
                 Err(
                     NativeAttemptPreparationFailure::from_input(fixture_execution_input(
@@ -4243,7 +4322,7 @@ mod tests {
                 .shutdown_until(Instant::now() + Duration::from_secs(1))
                 .await
                 .unwrap();
-            let observed = issued.result_capacity().expect("original admitted binding");
+            let observed = &issued;
             assert!(
                 observed
                     .window_alias()
@@ -4372,11 +4451,15 @@ mod tests {
     }
 
     impl LogicalExecutionNativePort for FailingActivationNativePort {
-        fn open(&self, request: LogicalNativeOpenRequest) -> LogicalNativeOpenFuture {
-            let execution = request.initial_execution();
+        fn bind_in(
+            &self,
+            source: &mut Option<LogicalNativeOpenRequest>,
+            target: &mut Option<LogicalNativeSession>,
+        ) -> Result<(), LogicalNativeOpenError> {
+            let execution = source.as_ref().unwrap().initial_execution();
             self.opened_execution_low
                 .store(execution.query_id().low() as u64, Ordering::SeqCst);
-            Box::pin(async move { request.bind().map_err(Into::into) })
+            LogicalNativeOpenRequest::bind_in(source, target).map_err(Into::into)
         }
     }
 
@@ -4388,19 +4471,20 @@ mod tests {
     }
 
     impl NativeAttemptPreparationPort for FailingActivationPreparationPort {
-        fn prepare(
-            &mut self,
-            request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
+        fn prepare_in<'a>(
+            &'a mut self,
+            request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
             let backend = self.backend;
             let dormant = FailingDormantOwner {
                 backend,
                 activated: Arc::clone(&self.activated),
                 residual_converged: Arc::clone(&self.residual_converged),
             };
+            request.stage_fixture_owner(dormant);
             Box::pin(async move {
                 let scheduling = no_scan_scheduling(&request);
-                request.bind(scheduling, dormant).map_err(Into::into)
+                request.bind_staged(scheduling).map_err(Into::into)
             })
         }
     }
@@ -4641,8 +4725,12 @@ mod tests {
     struct BindingNativePort;
 
     impl LogicalExecutionNativePort for BindingNativePort {
-        fn open(&self, request: LogicalNativeOpenRequest) -> LogicalNativeOpenFuture {
-            Box::pin(async move { request.bind().map_err(Into::into) })
+        fn bind_in(
+            &self,
+            source: &mut Option<LogicalNativeOpenRequest>,
+            target: &mut Option<LogicalNativeSession>,
+        ) -> Result<(), LogicalNativeOpenError> {
+            LogicalNativeOpenRequest::bind_in(source, target).map_err(Into::into)
         }
     }
 
@@ -4672,10 +4760,10 @@ mod tests {
     }
 
     impl NativeAttemptPreparationPort for RowsAttemptPreparationPort {
-        fn prepare(
-            &mut self,
-            request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
+        fn prepare_in<'a>(
+            &'a mut self,
+            request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
             let owner = RowsDormantOwner {
                 relay_window: self
                     .relay_window
@@ -4685,9 +4773,10 @@ mod tests {
                 backend: self.backend,
                 converged: Arc::clone(&self.converged),
             };
+            request.stage_fixture_owner(owner);
             Box::pin(async move {
                 let scheduling = no_scan_scheduling(&request);
-                request.bind(scheduling, owner).map_err(Into::into)
+                request.bind_staged(scheduling).map_err(Into::into)
             })
         }
     }
@@ -4828,26 +4917,28 @@ mod tests {
         }
     }
     impl NativeAttemptPreparationPort for PreparationExitPort {
-        fn prepare(
-            &mut self,
-            request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
-            // Match the production Arc-owned preparation state: the future can also
-            // retain the factory, independently of LogicalNativeSession.attempts.
+        fn prepare_in<'a>(
+            &'a mut self,
+            request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
+            // The original Session retains the factory; this fixture stages
+            // its actual dormant owner before returning the borrowed future.
             let state = Arc::clone(&self.state);
             let backend = self.backend;
+            let dormant = PreparationExitDormant {
+                inner: RowsDormantOwner {
+                    relay_window: state.window.as_ref().expect("admitted window").clone(),
+                    backend,
+                    converged: Arc::new(AtomicBool::new(false)),
+                },
+                signals: Arc::clone(&state.signals),
+            };
+            request.stage_fixture_owner(dormant);
+            drop(state);
             Box::pin(async move {
-                let dormant = PreparationExitDormant {
-                    inner: RowsDormantOwner {
-                        relay_window: state.window.as_ref().expect("admitted window").clone(),
-                        backend,
-                        converged: Arc::new(AtomicBool::new(false)),
-                    },
-                    signals: Arc::clone(&state.signals),
-                };
                 let scheduling = no_scan_scheduling(&request);
-                let prepared = request.bind(scheduling, dormant).map_err(Into::into);
-                drop(state);
+                let prepared = request.bind_staged(scheduling).map_err(Into::into);
+
                 prepared
             })
         }
@@ -5200,32 +5291,34 @@ mod tests {
         phase: InitialTerminalPhase,
     }
     impl NativeAttemptPreparationPort for InitialTerminalPreparationPort {
-        fn prepare(
-            &mut self,
-            request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
+        fn prepare_in<'a>(
+            &'a mut self,
+            request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
             let state = Arc::clone(&self.state);
             let backend = self.backend;
             let frontend = self.frontend;
             let phase = self.phase;
+            let dormant = InitialTerminalDormant {
+                inner: SuccessfulCompletionDormantOwner {
+                    backend,
+                    expected_frontend: frontend,
+                },
+                // The actual attempt guard is independent of the factory alias.
+                guard: state
+                    .window
+                    .as_ref()
+                    .expect("original admitted window")
+                    .clone(),
+                signals: Arc::clone(&state.signals),
+                phase,
+            };
+            request.stage_fixture_owner(dormant);
+            drop(state);
             Box::pin(async move {
-                let dormant = InitialTerminalDormant {
-                    inner: SuccessfulCompletionDormantOwner {
-                        backend,
-                        expected_frontend: frontend,
-                    },
-                    // The actual attempt guard is independent of the factory alias.
-                    guard: state
-                        .window
-                        .as_ref()
-                        .expect("original admitted window")
-                        .clone(),
-                    signals: Arc::clone(&state.signals),
-                    phase,
-                };
                 let scheduling = no_scan_scheduling(&request);
-                let result = request.bind(scheduling, dormant).map_err(Into::into);
-                drop(state);
+                let result = request.bind_staged(scheduling).map_err(Into::into);
+
                 result
             })
         }
@@ -5733,10 +5826,10 @@ mod tests {
     }
 
     impl NativeAttemptPreparationPort for RecoveringRowsPreparationPort {
-        fn prepare(
-            &mut self,
-            request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
+        fn prepare_in<'a>(
+            &'a mut self,
+            request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
             let ordinal = self.prepares.fetch_add(1, Ordering::SeqCst) + 1;
             // Every process identity was created with this fixture, before
             // any BackendLost input. Previously failed processes are not reused.
@@ -5773,9 +5866,10 @@ mod tests {
                 replacement_missing_rows: self.replacement_missing_rows,
                 failures_before_success: self.failures_before_success,
             };
+            request.stage_fixture_owner(owner);
             Box::pin(async move {
                 let scheduling = no_scan_scheduling(&request);
-                request.bind(scheduling, owner).map_err(Into::into)
+                request.bind_staged(scheduling).map_err(Into::into)
             })
         }
     }
@@ -5966,12 +6060,12 @@ mod tests {
     }
 
     impl NativeAttemptPreparationPort for HeldReplacementPreparationPort {
-        fn prepare(
-            &mut self,
-            request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
+        fn prepare_in<'a>(
+            &'a mut self,
+            request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
             let replacement = request.execution().attempt_id().get() > 1;
-            let prepared = self.inner.prepare(request);
+            let prepared = self.inner.prepare_in(request);
             let release = Arc::clone(&self.release);
             let exits = Arc::clone(&self.exits);
             let entered = Arc::clone(&self.entered);
@@ -6656,10 +6750,10 @@ mod tests {
     }
 
     impl NativeAttemptPreparationPort for VisibleFailurePreparationPort {
-        fn prepare(
-            &mut self,
-            request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
+        fn prepare_in<'a>(
+            &'a mut self,
+            request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
             self.prepares.fetch_add(1, Ordering::SeqCst);
             let owner = VisibleFailureDormantOwner {
                 relay_window: self
@@ -6670,9 +6764,10 @@ mod tests {
                 backend: self.backend,
                 fail: Arc::clone(&self.fail),
             };
+            request.stage_fixture_owner(owner);
             Box::pin(async move {
                 let scheduling = no_scan_scheduling(&request);
-                request.bind(scheduling, owner).map_err(Into::into)
+                request.bind_staged(scheduling).map_err(Into::into)
             })
         }
     }
@@ -6867,19 +6962,20 @@ mod tests {
     }
 
     impl NativeAttemptPreparationPort for PanickingAttemptPreparationPort {
-        fn prepare(
-            &mut self,
-            request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
+        fn prepare_in<'a>(
+            &'a mut self,
+            request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
             let backend = self.backend;
             let owner = PanickingDormantOwner {
                 backend,
                 phase: self.phase,
                 convergence_calls: Arc::clone(&self.convergence_calls),
             };
+            request.stage_fixture_owner(owner);
             Box::pin(async move {
                 let scheduling = no_scan_scheduling(&request);
-                request.bind(scheduling, owner).map_err(Into::into)
+                request.bind_staged(scheduling).map_err(Into::into)
             })
         }
     }
@@ -7234,10 +7330,10 @@ mod tests {
     }
 
     impl NativeAttemptPreparationPort for ActivationCancellationPreparationPort {
-        fn prepare(
-            &mut self,
-            request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
+        fn prepare_in<'a>(
+            &'a mut self,
+            request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
             let dormant = ActivationCancellationDormant {
                 inner: SuccessfulCompletionDormantOwner {
                     backend: self.backend,
@@ -7245,9 +7341,10 @@ mod tests {
                 },
                 signals: Arc::clone(&self.signals),
             };
+            request.stage_fixture_owner(dormant);
             Box::pin(async move {
                 let scheduling = no_scan_scheduling(&request);
-                request.bind(scheduling, dormant).map_err(Into::into)
+                request.bind_staged(scheduling).map_err(Into::into)
             })
         }
     }
@@ -7415,23 +7512,19 @@ mod tests {
     }
 
     impl NativeAttemptPreparationPort for SuccessfulCompletionPreparationPort {
-        fn prepare(
-            &mut self,
-            request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
+        fn prepare_in<'a>(
+            &'a mut self,
+            request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
             let backend = self.backend;
             let expected_frontend = self.expected_frontend;
+            request.stage_fixture_owner(SuccessfulCompletionDormantOwner {
+                backend,
+                expected_frontend,
+            });
             Box::pin(async move {
                 let scheduling = no_scan_scheduling(&request);
-                request
-                    .bind(
-                        scheduling,
-                        SuccessfulCompletionDormantOwner {
-                            backend,
-                            expected_frontend,
-                        },
-                    )
-                    .map_err(Into::into)
+                request.bind_staged(scheduling).map_err(Into::into)
             })
         }
     }
@@ -7611,16 +7704,15 @@ mod tests {
     }
 
     impl NativeAttemptPreparationPort for PrematureCompletionPreparationPort {
-        fn prepare(
-            &mut self,
-            request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
+        fn prepare_in<'a>(
+            &'a mut self,
+            request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
             let backend = self.backend;
+            request.stage_fixture_owner(PrematureCompletionDormant { backend });
             Box::pin(async move {
                 let scheduling = no_scan_scheduling(&request);
-                request
-                    .bind(scheduling, PrematureCompletionDormant { backend })
-                    .map_err(Into::into)
+                request.bind_staged(scheduling).map_err(Into::into)
             })
         }
     }
@@ -7816,8 +7908,12 @@ mod tests {
     struct PanickingOpenNativePort;
 
     impl LogicalExecutionNativePort for PanickingOpenNativePort {
-        fn open(&self, _request: LogicalNativeOpenRequest) -> LogicalNativeOpenFuture {
-            Box::pin(async { panic!("injected Native open panic") })
+        fn bind_in(
+            &self,
+            _source: &mut Option<LogicalNativeOpenRequest>,
+            _target: &mut Option<LogicalNativeSession>,
+        ) -> Result<(), LogicalNativeOpenError> {
+            panic!("injected Native bind panic")
         }
     }
 
@@ -7826,21 +7922,20 @@ mod tests {
         opens: AtomicU64,
         first_opened: Arc<AtomicBool>,
         second_opened: Arc<AtomicBool>,
-        second_gate: Arc<tokio::sync::Notify>,
     }
 
     impl LogicalExecutionNativePort for IsolatedTaskPanicNativePort {
-        fn open(&self, request: LogicalNativeOpenRequest) -> LogicalNativeOpenFuture {
+        fn bind_in(
+            &self,
+            source: &mut Option<LogicalNativeOpenRequest>,
+            target: &mut Option<LogicalNativeSession>,
+        ) -> Result<(), LogicalNativeOpenError> {
             if self.opens.fetch_add(1, Ordering::SeqCst) == 0 {
                 self.first_opened.store(true, Ordering::SeqCst);
-                return Box::pin(async { panic!("injected isolated logical task panic") });
+                panic!("injected isolated logical bind panic");
             }
             self.second_opened.store(true, Ordering::SeqCst);
-            let gate = Arc::clone(&self.second_gate);
-            Box::pin(async move {
-                gate.notified().await;
-                request.bind().map_err(Into::into)
-            })
+            LogicalNativeOpenRequest::bind_in(source, target).map_err(Into::into)
         }
     }
 
@@ -7855,7 +7950,6 @@ mod tests {
                 opens: AtomicU64::new(0),
                 first_opened: Arc::clone(&first_opened),
                 second_opened: Arc::clone(&second_opened),
-                second_gate: Arc::clone(&second_gate),
             });
             let (first_control, first) = governance().await;
             let (mut supervisor, client) = test_supervisor(
@@ -7884,10 +7978,13 @@ mod tests {
             let second_scope = second.owner.scope();
             let second_cancellation = second_scope.cancellation().unwrap();
             let second_result = client.start(
-                completion_request(SuccessfulCompletionPreparationPort {
-                    backend: BackendProcessId::new_v7(),
-                    expected_frontend: frontend,
-                }),
+                completion_request(OriginalPreparationGate::release(
+                    SuccessfulCompletionPreparationPort {
+                        backend: BackendProcessId::new_v7(),
+                        expected_frontend: frontend,
+                    },
+                    Arc::clone(&second_gate),
+                )),
                 second.owner,
             );
 
@@ -7990,38 +8087,6 @@ mod tests {
         control.finish().await;
     }
 
-    #[derive(Debug)]
-    struct DelayedShutdownNativePort;
-
-    impl LogicalExecutionNativePort for DelayedShutdownNativePort {
-        fn open(&self, request: LogicalNativeOpenRequest) -> LogicalNativeOpenFuture {
-            let cancellation = request.cancellation();
-            Box::pin(async move {
-                cancellation.cancelled().await;
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                Err(
-                    LogicalNativeOpenFailure::cancelled("server shutdown interrupted Native open")
-                        .into(),
-                )
-            })
-        }
-    }
-
-    #[derive(Debug)]
-    struct PendingOpenNativePort {
-        entered: Arc<tokio::sync::Notify>,
-    }
-
-    impl LogicalExecutionNativePort for PendingOpenNativePort {
-        fn open(&self, _request: LogicalNativeOpenRequest) -> LogicalNativeOpenFuture {
-            let entered = Arc::clone(&self.entered);
-            Box::pin(async move {
-                entered.notify_one();
-                std::future::pending::<Result<LogicalNativeSession, LogicalNativeOpenError>>().await
-            })
-        }
-    }
-
     #[tokio::test]
     async fn deadline_before_actor_install_settles_its_cancel_control() {
         let mut control = {
@@ -8037,15 +8102,19 @@ mod tests {
             let (mut supervisor, client) = test_supervisor(
                 &control,
                 Handle::current(),
-                Arc::new(PendingOpenNativePort {
-                    entered: Arc::clone(&entered),
-                }),
+                Arc::new(BindingNativePort),
                 QueryProcessNamespace::new(0x4a),
                 FrontendProcessId::new_v7(),
                 supervisor_config(),
             );
 
-            let start = client.start(completion_request(UnreachablePreparationPort), root.owner);
+            let start = client.start(
+                completion_request(OriginalPreparationGate::pending(
+                    UnreachablePreparationPort,
+                    Arc::clone(&entered),
+                )),
+                root.owner,
+            );
             tokio::time::timeout(Duration::from_secs(1), entered.notified())
                 .await
                 .expect("Native open did not begin");
@@ -8101,14 +8170,19 @@ mod tests {
             let (mut supervisor, client) = test_supervisor(
                 &control,
                 Handle::current(),
-                Arc::new(DelayedShutdownNativePort),
+                Arc::new(BindingNativePort),
                 QueryProcessNamespace::new(0x47),
                 FrontendProcessId::new_v7(),
                 supervisor_config(),
             );
 
             let scope = root.owner.scope();
-            let start = client.start(completion_request(UnreachablePreparationPort), root.owner);
+            let start = client.start(
+                completion_request(OriginalPreparationGate::delayed_cancel(
+                    UnreachablePreparationPort,
+                )),
+                root.owner,
+            );
             tokio::task::yield_now().await;
 
             assert_eq!(
@@ -8153,17 +8227,19 @@ mod tests {
     }
 
     impl LogicalExecutionNativePort for RecordingRejectedOpen {
-        fn open(&self, request: LogicalNativeOpenRequest) -> LogicalNativeOpenFuture {
+        fn bind_in(
+            &self,
+            source: &mut Option<LogicalNativeOpenRequest>,
+            _target: &mut Option<LogicalNativeSession>,
+        ) -> Result<(), LogicalNativeOpenError> {
             self.opened
                 .lock()
                 .unwrap()
-                .push(request.initial_execution());
-            Box::pin(async {
-                Err(crate::api::LogicalNativeOpenFailure::rejected(
-                    "injected Native open rejection after identity observation",
-                )
-                .into())
-            })
+                .push(source.as_ref().unwrap().initial_execution());
+            Err(crate::api::LogicalNativeOpenFailure::rejected(
+                "injected Native bind rejection after identity observation",
+            )
+            .into())
         }
     }
 

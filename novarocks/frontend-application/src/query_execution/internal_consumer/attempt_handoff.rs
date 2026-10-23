@@ -228,14 +228,15 @@ pub(crate) struct AttemptHandoffReserveView {
     mailbox: Weak<Mailbox>,
 }
 impl AttemptHandoffReserveView {
-    pub(crate) fn reserve(
+    pub(crate) fn reserve_in(
         &self,
         execution: QueryExecutionId,
-    ) -> Result<AttemptHandoffProducer, QueryExecutionError> {
+        target: &mut Option<AttemptHandoffProducer>,
+    ) -> Result<(), QueryExecutionError> {
         self.mailbox
             .upgrade()
             .ok_or_else(|| handoff_error("the original handoff directory has exited"))?
-            .reserve(execution)
+            .reserve_in(execution, target)
     }
 }
 
@@ -243,10 +244,23 @@ impl Mailbox {
     /// Called once by the exact request's dormant factory, before projection makes any
     /// attempt resource live. A later admitted attempt can replace only the
     /// unclaimed directory offer, not a consumer's captured independent cell.
+    #[cfg(test)]
     pub(crate) fn reserve(
         &self,
         execution: QueryExecutionId,
     ) -> Result<AttemptHandoffProducer, QueryExecutionError> {
+        let mut target = None;
+        self.reserve_in(execution, &mut target)?;
+        Ok(target.unwrap())
+    }
+    pub(crate) fn reserve_in(
+        &self,
+        execution: QueryExecutionId,
+        target: &mut Option<AttemptHandoffProducer>,
+    ) -> Result<(), QueryExecutionError> {
+        if target.is_some() {
+            return Err(handoff_error("original handoff receiver is occupied"));
+        }
         let cell = Arc::new(Cell {
             execution,
             state: Mutex::new(State::Reserved),
@@ -267,10 +281,13 @@ impl Mailbox {
             }
             offer.replace(Arc::clone(&cell))
         };
+        // The real new producer is in its receiving owner's stable field
+        // before notifying or dropping the original previous offer.
+        *target = Some(AttemptHandoffProducer { cell });
         if let Some(previous) = previous {
             previous.close(Closed::ReplacedBeforeClaim);
         }
-        Ok(AttemptHandoffProducer { cell })
+        Ok(())
     }
 }
 
@@ -510,14 +527,58 @@ mod tests {
         .await;
     }
     #[test]
+    fn new_original_producer_is_stable_before_the_previous_offer_wakes() {
+        struct WakeFailure;
+        struct PanicWake;
+        impl std::task::Wake for PanicWake {
+            fn wake(self: Arc<Self>) {
+                std::panic::panic_any(WakeFailure);
+            }
+        }
+        let (offers, _claims) = attempt_handoff_mailbox();
+        let view = offers.reserve_view();
+        let mut old_target = None;
+        view.reserve_in(execution(1), &mut old_target).unwrap();
+        let original = old_target.take().unwrap();
+        let mut notified = std::pin::pin!(original.cell.changed.notified());
+        let wake = std::task::Waker::from(Arc::new(PanicWake));
+        let mut cx = std::task::Context::from_waker(&wake);
+        assert!(notified.as_mut().poll(&mut cx).is_pending());
+        let mut target = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            view.reserve_in(execution(2), &mut target)
+        }));
+        let original_panic = result.err().expect("the previous real waiter must panic");
+        assert!(original_panic.is::<WakeFailure>());
+        let next = target
+            .as_ref()
+            .expect("the new original producer survived wake unwind");
+        assert_eq!(next.cell.execution, execution(2));
+        assert!(matches!(*next.cell.state.lock().unwrap(), State::Reserved));
+        assert!(Arc::ptr_eq(
+            offers.mailbox.offer.lock().unwrap().as_ref().unwrap(),
+            &next.cell,
+        ));
+        assert!(matches!(
+            *original.cell.state.lock().unwrap(),
+            State::Closed(Closed::ReplacedBeforeClaim)
+        ));
+        drop(notified);
+        drop(target);
+    }
+
+    #[test]
     fn a_factory_view_cannot_recreate_an_exited_directory() {
         let (offers, claims) = attempt_handoff_mailbox();
         let view = offers.reserve_view();
         drop(offers);
-        let producer = view.reserve(execution(1)).unwrap();
+        let mut target = None;
+        view.reserve_in(execution(1), &mut target).unwrap();
+        let producer = target.take().unwrap();
         drop(claims);
         assert!(view.mailbox.upgrade().is_none());
-        assert!(view.reserve(execution(2)).is_err());
+        assert!(view.reserve_in(execution(2), &mut target).is_err());
+        assert!(target.is_none());
         assert!(matches!(
             *producer.cell.state.lock().unwrap(),
             State::Reserved

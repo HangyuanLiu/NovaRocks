@@ -279,7 +279,7 @@ impl PreparedLogicalComputation {
 mod initial_reservation_tests {
     use super::*;
     use novarocks_query_application::{
-        api::{LogicalExecutionNativePort, LogicalNativeOpenFuture, LogicalNativeOpenRequest},
+        api::{LogicalExecutionNativePort, LogicalNativeOpenRequest},
         coordination::{LogicalExecutionRowsConfig, LogicalExecutionSupervisorConfig},
     };
     use novarocks_spi::connector::{
@@ -294,8 +294,12 @@ mod initial_reservation_tests {
     #[derive(Debug)]
     struct NoNativeStart;
     impl LogicalExecutionNativePort for NoNativeStart {
-        fn open(&self, _: LogicalNativeOpenRequest) -> LogicalNativeOpenFuture {
-            panic!("reserving an identity cannot start Native work")
+        fn bind_in(
+            &self,
+            _source: &mut Option<LogicalNativeOpenRequest>,
+            _target: &mut Option<novarocks_query_application::api::LogicalNativeSession>,
+        ) -> Result<(), novarocks_query_application::api::LogicalNativeOpenError> {
+            panic!("reserving an identity cannot bind Native work")
         }
     }
 

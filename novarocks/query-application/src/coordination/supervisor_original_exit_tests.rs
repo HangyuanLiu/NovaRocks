@@ -30,9 +30,13 @@ struct OriginalOpenPanicPort {
     dropped: Arc<AtomicU64>,
 }
 impl LogicalExecutionNativePort for OriginalOpenPanicPort {
-    fn open(&self, _request: LogicalNativeOpenRequest) -> LogicalNativeOpenFuture {
+    fn bind_in(
+        &self,
+        _source: &mut Option<LogicalNativeOpenRequest>,
+        _target: &mut Option<LogicalNativeSession>,
+    ) -> Result<(), LogicalNativeOpenError> {
         let dropped = Arc::clone(&self.dropped);
-        Box::pin(async move { std::panic::panic_any(OriginalOpenPanic { dropped }) })
+        std::panic::panic_any(OriginalOpenPanic { dropped })
     }
 }
 struct OriginalExitPanicWake;
@@ -422,23 +426,8 @@ async fn original_root_joins_installed_actor_after_actual_reply_wake_panics_and_
     control.finish().await;
 }
 
-#[derive(Debug)]
-struct OriginalAbortPendingOpen {
-    entered: Arc<tokio::sync::Notify>,
-}
-impl LogicalExecutionNativePort for OriginalAbortPendingOpen {
-    fn open(&self, request: LogicalNativeOpenRequest) -> LogicalNativeOpenFuture {
-        let entered = Arc::clone(&self.entered);
-        Box::pin(async move {
-            entered.notify_one();
-            std::future::pending::<()>().await;
-            request.bind().map_err(Into::into)
-        })
-    }
-}
-
 #[tokio::test(flavor = "current_thread")]
-async fn actual_root_abort_closes_ingress_before_first_poll_and_after_real_open_pending() {
+async fn actual_root_abort_closes_ingress_before_first_poll_and_after_real_prepare_pending() {
     for after_open in [false, true] {
         let control = governance_empty();
         let first = control.begin_root().await;
@@ -449,16 +438,22 @@ async fn actual_root_abort_closes_ingress_before_first_poll_and_after_real_open_
         let (mut supervisor, client) = test_supervisor(
             &control,
             Handle::current(),
-            Arc::new(OriginalAbortPendingOpen {
-                entered: Arc::clone(&entered),
-            }),
+            Arc::new(BindingNativePort),
             QueryProcessNamespace::new(0x8e),
             FrontendProcessId::new_v7(),
             supervisor_config(),
         );
         // No await between spawning this original root and aborting it in the
         // first branch: current_thread proves its body has never been polled.
-        let first_ready = client.start(drop_tracked_request(&dropped), first.owner);
+        let first_ready = client.start(
+            completion_request(OriginalPreparationGate::pending(
+                DropTrackedPreparationPort {
+                    drops: Arc::clone(&dropped),
+                },
+                Arc::clone(&entered),
+            )),
+            first.owner,
+        );
         if after_open {
             tokio::time::timeout(Duration::from_secs(2), entered.notified())
                 .await
@@ -546,6 +541,431 @@ async fn actual_root_abort_closes_ingress_before_first_poll_and_after_real_open_
         assert_eq!(
             after_disposition, 1,
             "only explicit original process disposition destroyed the accepted source"
+        );
+    }
+}
+
+#[derive(Debug)]
+enum OriginalPreparationGateKind {
+    Pending(Arc<tokio::sync::Notify>),
+    Release(Arc<tokio::sync::Notify>),
+    DelayedCancel,
+}
+#[derive(Debug)]
+struct OriginalPreparationGate {
+    inner: Box<dyn NativeAttemptPreparationPort>,
+    gate: OriginalPreparationGateKind,
+}
+impl OriginalPreparationGate {
+    fn pending(
+        inner: impl NativeAttemptPreparationPort,
+        entered: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            inner: Box::new(inner),
+            gate: OriginalPreparationGateKind::Pending(entered),
+        }
+    }
+    fn release(
+        inner: impl NativeAttemptPreparationPort,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            inner: Box::new(inner),
+            gate: OriginalPreparationGateKind::Release(release),
+        }
+    }
+    fn delayed_cancel(inner: impl NativeAttemptPreparationPort) -> Self {
+        Self {
+            inner: Box::new(inner),
+            gate: OriginalPreparationGateKind::DelayedCancel,
+        }
+    }
+}
+impl NativeAttemptPreparationPort for OriginalPreparationGate {
+    fn prepare_in<'a>(
+        &'a mut self,
+        request: &'a mut crate::api::NativeAttemptPreparationWork,
+    ) -> NativeAttemptPreparationFuture<'a> {
+        let inner = &mut self.inner;
+        match &self.gate {
+            OriginalPreparationGateKind::Pending(entered) => {
+                entered.notify_one();
+                Box::pin(std::future::pending())
+            }
+            OriginalPreparationGateKind::Release(release) => Box::pin(async move {
+                release.notified().await;
+                inner.prepare_in(request).await
+            }),
+            OriginalPreparationGateKind::DelayedCancel => {
+                let cancellation = request.cancellation();
+                Box::pin(async move {
+                    let reason = cancellation.cancelled().await;
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    Err(
+                        NativeAttemptPreparationFailure::from_input(fixture_cancellation_input(
+                            reason,
+                            "server shutdown interrupted Native preparation",
+                        ))
+                        .into(),
+                    )
+                })
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancelled_real_preparation_wait_closes_original_session_before_local_exit_receipt() {
+    let (control, root) = governance().await;
+    let mut control = {
+        let scope = root.owner.scope();
+        let retirement = root.owner.retirement_observer().unwrap();
+        let requester = root.owner.cancellation_requester();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let drops = Arc::new(AtomicU64::new(0));
+        let (mut supervisor, client) = test_supervisor(
+            &control,
+            Handle::current(),
+            Arc::new(BindingNativePort),
+            QueryProcessNamespace::new(0x8f),
+            FrontendProcessId::new_v7(),
+            supervisor_config(),
+        );
+        let mut input = match client.prepare_observed_start(
+            completion_request(OriginalPreparationGate::pending(
+                DropTrackedPreparationPort {
+                    drops: Arc::clone(&drops),
+                },
+                Arc::clone(&entered),
+            )),
+            None,
+        ) {
+            Ok(input) => Some(input),
+            Err(original) => std::panic::panic_any(original),
+        };
+        let mut owner = Some(root.owner);
+        let mut ready = None;
+        let mut exit = None;
+        client
+            .start_observed_in(&mut input, &mut owner, &mut ready, &mut exit)
+            .unwrap()
+            .finish()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("actual original borrowed prepare is waiting");
+        let mut observer = exit.take().unwrap();
+        assert!(futures::poll!(std::future::poll_fn(|cx| observer.poll_exit(cx))).is_pending());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        requester.request(CancellationReason::Requested).unwrap();
+        assert!(ready.take().unwrap().await.is_err());
+        let receipt = tokio::time::timeout(
+            Duration::from_secs(2),
+            std::future::poll_fn(|cx| observer.poll_exit(cx)),
+        )
+        .await
+        .expect("original role clear and explicit Native body Drop must complete")
+        .unwrap();
+        let view = receipt.view();
+        assert!(view.native_preparation_exited());
+        assert_eq!(
+            view.actor_phase(),
+            crate::api::LogicalActorExitPhase::Unreserved
+        );
+        assert!(view.native_preparation_failure().is_none());
+        drop(view);
+        assert_eq!(
+            receipt.local_disposition(),
+            crate::api::LocalExecutionDisposition::ActualSourcesExited
+        );
+        assert_eq!(
+            receipt.remote_disposition(),
+            crate::api::RemoteExecutionDisposition::RemoteNotReported
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "same original port actually dropped"
+        );
+        assert!(
+            !retirement.is_reclaimed().unwrap(),
+            "original receipt footer is still live"
+        );
+        root.business.release();
+        supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
+        drop(receipt);
+        drop(observer);
+        acknowledge_all_control(&control);
+        tokio::time::timeout(Duration::from_secs(2), scope.wait_released())
+            .await
+            .unwrap();
+        control
+    };
+    acknowledge_all_control(&control);
+    control.finish().await;
+}
+
+#[derive(Debug)]
+struct OriginalDormantDropPanic {
+    ordinal: u64,
+}
+#[derive(Debug)]
+struct CompletedActivationDropPreparation {
+    window: Option<TestWindow>,
+    backends: Box<[BackendProcessId]>,
+    prepares: Arc<AtomicU64>,
+    target_drops: Arc<AtomicU64>,
+    panic_ordinal: u64,
+}
+impl TestRowsPreparationPort for CompletedActivationDropPreparation {
+    fn bind_window(&mut self, window: novarocks_workload_control::ResultWindowAlias) {
+        self.window = Some(TestWindow(window));
+    }
+}
+impl NativeAttemptPreparationPort for CompletedActivationDropPreparation {
+    fn prepare_in<'a>(
+        &'a mut self,
+        request: &'a mut crate::api::NativeAttemptPreparationWork,
+    ) -> NativeAttemptPreparationFuture<'a> {
+        let ordinal = self.prepares.fetch_add(1, Ordering::SeqCst) + 1;
+        let backend = self.backends[usize::try_from(ordinal - 1).unwrap()];
+        request.stage_fixture_owner(CompletedActivationDropDormant {
+            inner: RecoveringRowsDormantOwner {
+                relay_window: self.window.as_ref().unwrap().clone(),
+                backend,
+                ordinal,
+                runs: Arc::new(AtomicU64::new(0)),
+                convergences: Arc::new(AtomicU64::new(0)),
+                allow_initial_convergence: Arc::new(tokio::sync::Notify::new()),
+                block_initial_convergence: false,
+                replacement_missing_rows: false,
+                failures_before_success: self.panic_ordinal - 1,
+            },
+            target_drops: Arc::clone(&self.target_drops),
+            panic_ordinal: self.panic_ordinal,
+            completed: false,
+        });
+        Box::pin(async move {
+            let scheduling = no_scan_scheduling(&request);
+            request.bind_staged(scheduling).map_err(Into::into)
+        })
+    }
+}
+#[derive(Debug)]
+struct CompletedActivationDropDormant {
+    inner: RecoveringRowsDormantOwner,
+    target_drops: Arc<AtomicU64>,
+    panic_ordinal: u64,
+    completed: bool,
+}
+impl Drop for CompletedActivationDropDormant {
+    fn drop(&mut self) {
+        if self.completed && self.inner.ordinal == self.panic_ordinal {
+            std::panic::panic_any(OriginalDormantDropPanic {
+                ordinal: self.inner.ordinal,
+            });
+        }
+    }
+}
+impl DormantNativeAttemptOwner for CompletedActivationDropDormant {
+    fn eligible_backends(&self) -> &[BackendProcessId] {
+        self.inner.eligible_backends()
+    }
+    fn activate<'a>(
+        &'a mut self,
+        schedule: &'a AttemptSchedule,
+        admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
+        cancellation: novarocks_workload_control::CancellationView,
+    ) -> NativeAttemptActivationFuture<'a> {
+        Box::pin(async move {
+            let activated = self
+                .inner
+                .activate(schedule, admissions, cancellation)
+                .await?;
+            let (inner, rows) = activated.into_parts();
+            let owner = CompletedActivationDropActive {
+                inner,
+                drops: Arc::clone(&self.target_drops),
+                tracked: self.inner.ordinal == self.panic_ordinal,
+            };
+            self.completed = true;
+            Ok(match rows {
+                Some(rows) => {
+                    ActivatedNativeAttempt::relayed_rows(owner, rows.binding, rows.statuses)
+                }
+                None => ActivatedNativeAttempt::completion(owner),
+            })
+        })
+    }
+    fn converge<'a>(
+        &'a mut self,
+        cancellation: novarocks_workload_control::CancellationView,
+    ) -> NativeAttemptConvergenceFuture<'a> {
+        self.inner.converge(cancellation)
+    }
+}
+#[derive(Debug)]
+struct CompletedActivationDropActive {
+    inner: Box<dyn ActiveNativeAttemptOwner>,
+    drops: Arc<AtomicU64>,
+    tracked: bool,
+}
+impl Drop for CompletedActivationDropActive {
+    fn drop(&mut self) {
+        if self.tracked {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+impl ActiveNativeAttemptOwner for CompletedActivationDropActive {
+    fn run<'a>(
+        &'a mut self,
+        drive: &'a NativeAttemptDrive,
+        cancellation: novarocks_workload_control::CancellationView,
+    ) -> NativeAttemptRunFuture<'a> {
+        self.inner.run(drive, cancellation)
+    }
+    fn converge<'a>(
+        &'a mut self,
+        request: NativeActiveConvergenceRequest,
+    ) -> NativeActiveAttemptConvergenceFuture<'a> {
+        self.inner.converge(request)
+    }
+}
+
+#[tokio::test]
+async fn initial_and_replacement_completed_outputs_survive_original_dormant_drop_panic() {
+    for panic_ordinal in [1, 2] {
+        let (control, root) = governance().await;
+        let scope = root.owner.scope();
+        let prepares = Arc::new(AtomicU64::new(0));
+        let target_drops = Arc::new(AtomicU64::new(0));
+        let (mut supervisor, client) = test_supervisor(
+            &control,
+            Handle::current(),
+            Arc::new(BindingNativePort),
+            QueryProcessNamespace::new(0x91 + panic_ordinal),
+            FrontendProcessId::new_v7(),
+            supervisor_config(),
+        );
+        let recovery = if panic_ordinal == 1 {
+            RecoveryMode::NoRecovery
+        } else {
+            RecoveryMode::RestartAttemptBeforeVisibility
+        };
+        let replacements = (panic_ordinal == 2).then(|| {
+            Arc::new(ImmediateReplacementPort::default())
+                as Arc<dyn super::super::ReplacementQualificationEffectPort>
+        });
+        let request = rows_request(
+            &control,
+            &scope,
+            recovery,
+            replacements,
+            CompletedActivationDropPreparation {
+                window: None,
+                backends: fixture_recovery_backends(2),
+                prepares: Arc::clone(&prepares),
+                target_drops: Arc::clone(&target_drops),
+                panic_ordinal,
+            },
+        );
+        let mut input = match client.prepare_observed_start(request, None) {
+            Ok(input) => Some(input),
+            Err(original) => std::panic::panic_any(original),
+        };
+        // This probe aliases only the original Source, never the activated
+        // output. Without the production slot, the target owner really drops.
+        let source = Arc::clone(input.as_ref().unwrap().context.as_ref().unwrap());
+        let mut owner = Some(root.owner);
+        let mut ready = None;
+        let mut exit = None;
+        client
+            .start_observed_in(&mut input, &mut owner, &mut ready, &mut exit)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let ready_result = tokio::time::timeout(Duration::from_secs(2), ready.take().unwrap())
+            .await
+            .expect("the same original ready source must resolve");
+        let mut observer = exit.take().unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            std::future::poll_fn(|cx| {
+                if observer.view().unwrap().role_ended() {
+                    return Poll::Ready(());
+                }
+                let _ = observer.poll_exit(cx);
+                if observer.view().unwrap().role_ended() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("actual initial or replacement dormant Drop must finish unwinding");
+        let exact_cause = match observer.view().unwrap().role_result() {
+            Some(PollCompletion::Panicked(packet)) => packet
+                .value()
+                .primary()
+                .downcast_ref::<OriginalDormantDropPanic>()
+                .is_some_and(|cause| cause.ordinal == panic_ordinal),
+            _ => false,
+        };
+        let output_retained = source.native.try_lock().unwrap().pending_activated.as_ref()
+            .is_some_and(super::super::native_active_custody::PendingNativeActivation::has_original_rows_and_slot_owner);
+        let before_disposition = target_drops.load(Ordering::SeqCst);
+        let pending_returns = observer.view().unwrap().pending_native_returns();
+        let no_receipt =
+            futures::poll!(std::future::poll_fn(|cx| observer.poll_exit(cx))).is_pending();
+        root.business.release();
+        drop(ready_result);
+        let shutdown = supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        let before_process_exit = target_drops.load(Ordering::SeqCst);
+        let still_staged_before_process_exit = source.native.try_lock().unwrap()
+            .pending_activated.as_ref().is_some_and(
+                super::super::native_active_custody::PendingNativeActivation::has_original_rows_and_slot_owner);
+        // This is an abnormal original-source test. Only the original process
+        // author may destroy the SAME slot's Box and then the Source rows.
+        supervisor.abandon_for_process_exit();
+        let retained = source.native.try_lock().unwrap().pending_activated.take();
+        drop(retained); // Only the original rows/Weak receipt; Box stayed in its Slot.
+        drop(observer);
+        drop(source);
+        drop(client);
+        let after_disposition = target_drops.load(Ordering::SeqCst);
+        acknowledge_all_control(&control);
+        let mut control = control;
+        control.finish_for_process_exit().await;
+        assert!(
+            shutdown.is_err(),
+            "unhandled original panic cannot be normal shutdown"
+        );
+        assert!(exact_cause && output_retained && no_receipt);
+        assert_eq!(prepares.load(Ordering::SeqCst), panic_ordinal);
+        assert_eq!(
+            before_disposition, 0,
+            "original active output must survive dormant Drop unwind"
+        );
+        assert_eq!(
+            before_process_exit, 0,
+            "failed shutdown is not original-source disposition"
+        );
+        assert!(still_staged_before_process_exit);
+        assert!(
+            pending_returns > 0,
+            "the staged original slot has not returned its Native source"
+        );
+        assert_eq!(
+            after_disposition, 1,
+            "only explicit original-source disposition drops the active owner"
         );
     }
 }

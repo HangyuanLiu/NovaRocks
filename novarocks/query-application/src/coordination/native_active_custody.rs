@@ -66,10 +66,16 @@ struct RetainedNativeActiveOwner {
     _owner: Box<dyn ActiveNativeAttemptOwner>,
     failure: StatementNativeHealthFailure,
 }
+enum ActiveSlotOwner {
+    // Successful activation has not crossed dormant destruction yet. The
+    // ORIGINAL slot, not a Source -> Registry strong cycle, owns this Box.
+    Activated(Box<dyn ActiveNativeAttemptOwner>),
+    Retained(RetainedNativeActiveOwner),
+}
 struct ActiveSlot {
     original_exit: Weak<super::original_exit::OriginalLogicalExit>,
     contexts: BTreeSet<QueryContextRef>,
-    owner: Mutex<Option<RetainedNativeActiveOwner>>,
+    owner: Mutex<Option<ActiveSlotOwner>>,
     root_ack: Mutex<RootAckTailState>,
 }
 type RootAckFuture = Pin<
@@ -527,7 +533,12 @@ impl NativeActiveCustodyRegistry {
                     .map(|held| {
                         QueryExecutionError::new(
                             QueryExecutionErrorKind::Failed,
-                            held.failure.detail(),
+                            match held {
+                                ActiveSlotOwner::Activated(_) => {
+                                    "successful Native activation still awaits its original handoff"
+                                }
+                                ActiveSlotOwner::Retained(held) => held.failure.detail(),
+                            },
                         )
                     })
             })
@@ -552,20 +563,164 @@ impl NativeActiveCustodyHandle {
             held.is_none(),
             "original active owner returns to custody once"
         );
-        *held = Some(RetainedNativeActiveOwner {
+        *held = Some(ActiveSlotOwner::Retained(RetainedNativeActiveOwner {
             _owner: owner,
             failure: failure.clone(),
-        });
+        }));
         drop(held);
         self.storage.health.record_unproven_exit(failure);
     }
 }
+/// Same Source output slot. The staged receipt has no strong Registry/health
+/// edge and cannot mint an owner or change the exact pre-reserved slot.
+pub(crate) struct PendingNativeActivation {
+    state: PendingNativeActivationState,
+}
+enum PendingNativeActivationState {
+    Unbound(crate::api::ActivatedNativeAttempt),
+    Staged {
+        key: NativeActiveCustodyKey,
+        slot: Weak<ActiveSlot>,
+        rows: Option<crate::api::NativeRowsAttemptRuntime>,
+    },
+}
+impl PendingNativeActivation {
+    pub(crate) fn new(original: crate::api::ActivatedNativeAttempt) -> Self {
+        Self {
+            state: PendingNativeActivationState::Unbound(original),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn has_original_rows_and_slot_owner(&self) -> bool {
+        match &self.state {
+            PendingNativeActivationState::Staged { slot, rows, .. } => {
+                let Some(slot) = slot.upgrade() else {
+                    return false;
+                };
+                let held = slot.owner.lock().unwrap_or_else(|e| e.into_inner());
+                rows.is_some() && matches!(&*held, Some(ActiveSlotOwner::Activated(_)))
+            }
+            PendingNativeActivationState::Unbound(_) => false,
+        }
+    }
+}
+
 /// Reserve BEFORE activate. On an activation failure, dropping this unbound
 /// reservation just removes its empty custody record, not any live Native owner.
 pub(crate) struct NativeActiveCustodyReservation {
     custody: Option<NativeActiveCustodyHandle>,
 }
 impl NativeActiveCustodyReservation {
+    /// Move the already stable successful output into its ORIGINAL pre-reserved
+    /// slot. All refusal checks precede mutation; no callbacks/drop/notification.
+    pub(crate) fn stage_activated_in(
+        &self,
+        source: &mut Option<PendingNativeActivation>,
+    ) -> Result<(), QueryExecutionError> {
+        let custody = self.custody.as_ref().ok_or_else(|| {
+            QueryExecutionError::new(
+                QueryExecutionErrorKind::Failed,
+                "original activation reservation is absent",
+            )
+        })?;
+        if !source
+            .as_ref()
+            .is_some_and(|source| matches!(&source.state, PendingNativeActivationState::Unbound(_)))
+        {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::Failed,
+                "original successful activation source is absent or already staged",
+            ));
+        }
+        let mut held = custody.slot.owner.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_some() {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::Failed,
+                "original activation slot already contains an owner",
+            ));
+        }
+        let Some(PendingNativeActivation {
+            state: PendingNativeActivationState::Unbound(original),
+        }) = source.take()
+        else {
+            unreachable!()
+        };
+        let (owner, rows) = original.into_parts();
+        *held = Some(ActiveSlotOwner::Activated(owner));
+        *source = Some(PendingNativeActivation {
+            state: PendingNativeActivationState::Staged {
+                key: custody.key,
+                slot: Arc::downgrade(&custody.slot),
+                rows,
+            },
+        });
+        drop(held);
+        Ok(())
+    }
+
+    /// Rejoin the same original Box/rows only after dormant actual Drop. Error
+    /// preserves source and reservation. This is a silent same-slot transfer.
+    pub(crate) fn finish_activated_in(
+        &mut self,
+        source: &mut Option<PendingNativeActivation>,
+    ) -> Result<
+        (
+            SupervisedActiveNativeOwner,
+            Option<crate::api::NativeRowsAttemptRuntime>,
+        ),
+        QueryExecutionError,
+    > {
+        let custody = self.custody.as_ref().ok_or_else(|| {
+            QueryExecutionError::new(
+                QueryExecutionErrorKind::Failed,
+                "original activation reservation is absent",
+            )
+        })?;
+        let Some(PendingNativeActivation {
+            state: PendingNativeActivationState::Staged { key, slot, .. },
+        }) = source.as_ref()
+        else {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::Failed,
+                "original activation output is not staged",
+            ));
+        };
+        if *key != custody.key || slot.as_ptr() != Arc::as_ptr(&custody.slot) {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::Failed,
+                "original activation output belongs to another exact slot",
+            ));
+        }
+        let mut held = custody.slot.owner.lock().unwrap_or_else(|e| e.into_inner());
+        if !matches!(&*held, Some(ActiveSlotOwner::Activated(_))) {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::Failed,
+                "original activation slot has no staged owner",
+            ));
+        }
+        let Some(ActiveSlotOwner::Activated(owner)) = held.take() else {
+            unreachable!()
+        };
+        let Some(PendingNativeActivation {
+            state: PendingNativeActivationState::Staged { rows, slot, .. },
+        }) = source.take()
+        else {
+            unreachable!()
+        };
+        drop(held);
+        drop(slot);
+        let original = SupervisedActiveNativeOwner {
+            owner: Some(owner),
+            custody: self.custody.take().expect("validated original reservation"),
+            terminal_cut: None,
+            remote_deadline: None,
+            computation_ready: None,
+            closed: false,
+        };
+        Ok((original, rows))
+    }
+
+    #[cfg(test)]
     pub(crate) fn bind(
         mut self,
         original: Box<dyn ActiveNativeAttemptOwner>,
@@ -586,7 +741,17 @@ impl NativeActiveCustodyReservation {
 impl Drop for NativeActiveCustodyReservation {
     fn drop(&mut self) {
         if let Some(custody) = self.custody.take() {
-            custody.storage.remove(custody.key);
+            let empty = custody
+                .slot
+                .owner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none();
+            if empty {
+                custody.storage.remove(custody.key);
+            }
+            // A successful staged owner remains in this SAME canonical slot.
+            // It is not an unused reservation and cannot return its source.
         }
     }
 }
@@ -1219,12 +1384,14 @@ mod tests {
                 (later_held, Some("later exact prefix health")),
                 (after, Some("foreign later prefix health")),
             ] {
-                let held = detail.map(|detail| RetainedNativeActiveOwner {
-                    _owner: Box::new(MetadataOnlyOwner),
-                    failure: StatementNativeHealthFailure::actual_exit_unproven(
-                        detail,
-                        Arc::clone(&cause),
-                    ),
+                let held = detail.map(|detail| {
+                    ActiveSlotOwner::Retained(RetainedNativeActiveOwner {
+                        _owner: Box::new(MetadataOnlyOwner),
+                        failure: StatementNativeHealthFailure::actual_exit_unproven(
+                            detail,
+                            Arc::clone(&cause),
+                        ),
+                    })
                 });
                 slots.insert(
                     key,
@@ -1262,16 +1429,13 @@ mod tests {
             .get(&first_held)
             .cloned()
             .unwrap();
-        let retained_cause = retained
-            .owner
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .failure
-            .clone()
-            .into_parts()
-            .1;
+        let retained_cause = {
+            let held = retained.owner.lock().unwrap();
+            let Some(ActiveSlotOwner::Retained(original)) = held.as_ref() else {
+                panic!("the exact retained owner must keep its original failure");
+            };
+            original.failure.clone().into_parts().1
+        };
         assert!(
             Arc::ptr_eq(&retained_cause, &cause),
             "read-only health lookup retains the original typed source Arc"

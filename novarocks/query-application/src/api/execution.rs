@@ -163,6 +163,10 @@ impl QueryExecutionRequest {
         &self.description
     }
 
+    pub(crate) fn native_parts_match(&self) -> bool {
+        self.description.plan_identity() == self.native_seed.plan()
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (

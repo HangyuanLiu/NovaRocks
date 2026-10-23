@@ -199,15 +199,16 @@ impl fmt::Display for NativeAttemptPreparationError {
 
 impl std::error::Error for NativeAttemptPreparationError {}
 
-/// Opening one role-local Native execution may perform bounded asynchronous
-/// setup, but it cannot change the frozen logical description.
-pub type LogicalNativeOpenFuture = Pin<
-    Box<dyn Future<Output = Result<LogicalNativeSession, LogicalNativeOpenError>> + Send + 'static>,
->;
-
-/// Role-composed entry to the Native execution application.
+/// Bind one role-local Native execution into its original stable Session.
+/// Asynchronous preparation separately borrows that same stable source.
 pub trait LogicalExecutionNativePort: fmt::Debug + Send + Sync + 'static {
-    fn open(&self, request: LogicalNativeOpenRequest) -> LogicalNativeOpenFuture;
+    /// Pure local binding. Refusal preserves both original stable slots;
+    /// success installs the same Session before any caller notification.
+    fn bind_in(
+        &self,
+        source: &mut Option<LogicalNativeOpenRequest>,
+        target: &mut Option<LogicalNativeSession>,
+    ) -> Result<(), LogicalNativeOpenError>;
 }
 
 /// Move-only role-local seed for one logical Native execution.
@@ -274,20 +275,16 @@ impl NativeLogicalExecutionSeed {
 
 /// Preparing one physical attempt returns a dormant owner. It must not submit
 /// tasks before the query application installs the logical runtime.
-pub type NativeAttemptPreparationFuture = Pin<
-    Box<
-        dyn Future<Output = Result<PreparedNativeAttempt, NativeAttemptPreparationError>>
-            + Send
-            + 'static,
-    >,
->;
+pub type NativeAttemptPreparationFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), NativeAttemptPreparationError>> + Send + 'a>>;
 
-/// Per-logical-execution Native attempt preparation.
 pub trait NativeAttemptPreparationPort: fmt::Debug + Send + 'static {
-    fn prepare(
-        &mut self,
-        request: NativeAttemptPreparationRequest,
-    ) -> NativeAttemptPreparationFuture;
+    /// The original Session owns this Work and this port outside the polled
+    /// Future. Store every partial owner before another fallible operation.
+    fn prepare_in<'a>(
+        &'a mut self,
+        work: &'a mut NativeAttemptPreparationWork,
+    ) -> NativeAttemptPreparationFuture<'a>;
 }
 
 /// Future that activates one already ticket-bound Native attempt.
@@ -795,7 +792,41 @@ impl LogicalNativeOpenRequest {
                 port: self.seed.attempts,
                 result_capacity: None,
             }),
+            pending_work: None,
+            pending_acceptance: None,
+            retiring: false,
         })
+    }
+
+    pub fn bind_in(
+        source: &mut Option<Self>,
+        target: &mut Option<LogicalNativeSession>,
+    ) -> Result<(), NativeExecutionContractError> {
+        if target.is_some() || source.is_none() {
+            return Err(NativeExecutionContractError::ForeignLogicalOpenTicket);
+        }
+        let request = source.as_ref().unwrap();
+        match (
+            request.ticket.description.recovery(),
+            request.seed.replacements.is_some(),
+        ) {
+            (RecoveryMode::RestartAttemptBeforeVisibility, false) => {
+                return Err(NativeExecutionContractError::MissingReplacementPort);
+            }
+            (RecoveryMode::NoRecovery, true) => {
+                return Err(NativeExecutionContractError::UnexpectedReplacementPort);
+            }
+            _ => {}
+        }
+        // The same pure checks have completed before any original source move.
+        *target = Some(
+            source
+                .take()
+                .unwrap()
+                .bind()
+                .expect("validated pure Native binding"),
+        );
+        Ok(())
     }
 
     pub(crate) fn issue(
@@ -827,6 +858,9 @@ pub struct LogicalNativeSession {
     aborts: Arc<dyn AbortQueryContextEffectPort>,
     replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
     attempts: Option<NativeAttemptPreparationState>,
+    pending_work: Option<NativeAttemptPreparationWork>,
+    pending_acceptance: Option<NativeAttemptPreparationAcceptance>,
+    retiring: bool,
 }
 
 /// Explicit preparation custody. It is never shared by the logical ticket or
@@ -850,6 +884,16 @@ pub(crate) struct LogicalNativeOpenAcceptance {
 }
 
 impl LogicalNativeOpenAcceptance {
+    pub(crate) fn validate(
+        &self,
+        session: &LogicalNativeSession,
+    ) -> Result<(), NativeExecutionContractError> {
+        if !Arc::ptr_eq(&self.ticket, &session.ticket) {
+            return Err(NativeExecutionContractError::ForeignLogicalOpenTicket);
+        }
+        Ok(())
+    }
+    #[cfg(test)]
     pub(crate) fn accept(
         self,
         session: LogicalNativeSession,
@@ -862,17 +906,17 @@ impl LogicalNativeOpenAcceptance {
 }
 
 impl LogicalNativeSession {
-    /// The supervisor moves the validated start binding here only after the
-    /// original Native open ticket is accepted. The seed never receives it.
-    pub(crate) fn with_result_capacity(
-        mut self,
-        capacity: Option<QueryResultCapacityBinding>,
-    ) -> Self {
-        self.attempts
+    pub(crate) fn set_result_capacity_in(
+        &mut self,
+        capacity: &mut Option<QueryResultCapacityBinding>,
+    ) {
+        let target = &mut self
+            .attempts
             .as_mut()
-            .expect("newly accepted preparation owner")
-            .result_capacity = capacity;
-        self
+            .expect("original installed preparation")
+            .result_capacity;
+        assert!(target.is_none());
+        *target = capacity.take();
     }
 
     pub(crate) fn issue_attempt(
@@ -905,24 +949,105 @@ impl LogicalNativeSession {
         ))
     }
 
-    pub(crate) fn prepare(
+    pub(crate) fn begin_preparation(
         &mut self,
-        request: NativeAttemptPreparationRequest,
-    ) -> NativeAttemptPreparationFuture {
-        match self.attempts.as_mut() {
-            Some(attempts) => attempts.port.prepare(request),
-            None => Box::pin(async {
+        execution: QueryExecutionId,
+        requirement: NativeAttemptTopologyRequirement,
+    ) -> Result<(), NativeExecutionContractError> {
+        if self.pending_work.is_some() || self.pending_acceptance.is_some() || self.retiring {
+            return Err(NativeExecutionContractError::ForeignAttemptTicket);
+        }
+        let (request, acceptance) = self.issue_attempt(execution)?;
+        self.pending_work = Some(NativeAttemptPreparationWork::new(
+            request.require_topology(requirement),
+        ));
+        self.pending_acceptance = Some(acceptance);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_pending(&mut self) -> NativeAttemptPreparationFuture<'_> {
+        match (self.attempts.as_mut(), self.pending_work.as_mut()) {
+            (Some(attempts), Some(work)) => attempts.port.prepare_in(work),
+            _ => Box::pin(async {
                 Err(NativeExecutionContractError::AttemptPreparationRetired.into())
             }),
         }
     }
 
-    /// Stop creating attempts once the supervisor has chosen a terminal path.
-    /// Drop the preparation owner before remote convergence: its unused window
-    /// alias is not a fetch/transport tail. Already-created futures, replies and
-    /// active attempts keep their own owners through their actual exit.
+    pub(crate) fn accept_pending_in(
+        &mut self,
+        dormant: &mut NativeDormantCustody,
+    ) -> Result<NativePreparedFacts, NativeExecutionContractError> {
+        if dormant.owner.is_some() || dormant.retiring {
+            return Err(NativeExecutionContractError::ForeignAttemptTicket);
+        }
+        let work = self
+            .pending_work
+            .as_mut()
+            .ok_or(NativeExecutionContractError::ForeignAttemptTicket)?;
+        let prepared = work
+            .prepared
+            .as_ref()
+            .ok_or(NativeExecutionContractError::ForeignAttemptTicket)?;
+        self.pending_acceptance
+            .as_ref()
+            .ok_or(NativeExecutionContractError::ForeignAttemptTicket)?
+            .validate(prepared)?;
+        // Every identity/destination check precedes all moves. The owner is
+        // installed in its original stable slot before dropping ticket aliases.
+        let prepared = work.prepared.take().unwrap();
+        let PreparedNativeAttempt {
+            logical_ticket,
+            attempt_ticket,
+            execution,
+            eligible_backends,
+            scheduling,
+            owner,
+        } = prepared;
+        dormant.owner = Some(owner);
+        let facts = NativePreparedFacts {
+            execution,
+            eligible_backends,
+            scheduling,
+        };
+        drop((logical_ticket, attempt_ticket));
+        self.pending_acceptance.take();
+        self.pending_work.take();
+        Ok(facts)
+    }
+
+    /// This is actual synchronous destruction of the first-party preparation
+    /// body, not a receipt. A panic leaves retiring=true and the original
+    /// Source cannot report local exit. Whole Session exit is separate.
     pub(crate) fn retire_preparation(&mut self) {
-        self.attempts.take();
+        if self.retiring {
+            return;
+        }
+        self.retiring = true;
+        drop(self.pending_work.take());
+        drop(self.pending_acceptance.take());
+        drop(self.attempts.take());
+        self.retiring = false;
+    }
+
+    pub(crate) fn preparation_drop_unproven(&self) -> bool {
+        self.retiring
+    }
+
+    #[cfg(test)]
+    async fn prepare(
+        &mut self,
+        request: NativeAttemptPreparationRequest,
+    ) -> Result<PreparedNativeAttempt, NativeAttemptPreparationError> {
+        if self.attempts.is_none() {
+            return Err(NativeExecutionContractError::AttemptPreparationRetired.into());
+        }
+        assert!(self.pending_work.is_none());
+        self.pending_work = Some(NativeAttemptPreparationWork::new(request));
+        self.prepare_pending().await?;
+        let prepared = self.pending_work.as_mut().unwrap().prepared.take().unwrap();
+        self.pending_work.take();
+        Ok(prepared)
     }
 
     pub(crate) fn abort_effect_port(&self) -> Arc<dyn AbortQueryContextEffectPort> {
@@ -1060,6 +1185,127 @@ impl NativeAttemptPreparationRequest {
     }
 }
 
+/// Stable work space of the one original Session request. It grants no new
+/// Work, identity, claim, network capability or scheduling authority.
+#[derive(Debug)]
+pub struct NativeAttemptPreparationWork {
+    request: Option<NativeAttemptPreparationRequest>,
+    prepared: Option<PreparedNativeAttempt>,
+    // Actual unit fixtures use these same finite source fields. Production
+    // binds from its concrete original port's stable source fields below.
+    #[cfg(test)]
+    staged_owner: Option<Box<dyn DormantNativeAttemptOwner>>,
+    #[cfg(test)]
+    staged_scheduling: Option<ExecutionSchedulingFacts>,
+}
+impl std::ops::Deref for NativeAttemptPreparationWork {
+    type Target = NativeAttemptPreparationRequest;
+    fn deref(&self) -> &Self::Target {
+        self.request
+            .as_ref()
+            .expect("original request not yet bound")
+    }
+}
+impl NativeAttemptPreparationWork {
+    fn new(request: NativeAttemptPreparationRequest) -> Self {
+        Self {
+            request: Some(request),
+            prepared: None,
+            #[cfg(test)]
+            staged_owner: None,
+            #[cfg(test)]
+            staged_scheduling: None,
+        }
+    }
+    pub fn bind_in(
+        &mut self,
+        scheduling: &mut Option<ExecutionSchedulingFacts>,
+        owner: &mut Option<Box<dyn DormantNativeAttemptOwner>>,
+    ) -> Result<(), NativeExecutionContractError> {
+        Self::bind_original_in(&mut self.request, &mut self.prepared, scheduling, owner)
+    }
+    fn bind_original_in(
+        request: &mut Option<NativeAttemptPreparationRequest>,
+        prepared: &mut Option<PreparedNativeAttempt>,
+        scheduling: &mut Option<ExecutionSchedulingFacts>,
+        owner: &mut Option<Box<dyn DormantNativeAttemptOwner>>,
+    ) -> Result<(), NativeExecutionContractError> {
+        if prepared.is_some() || request.is_none() || owner.is_none() || scheduling.is_none() {
+            return Err(NativeExecutionContractError::ForeignAttemptTicket);
+        }
+        let original = request.as_ref().unwrap();
+        let eligible = owner.as_ref().unwrap().eligible_backends().to_vec();
+        validate_prepared_inputs(
+            original.description(),
+            &eligible,
+            scheduling.as_ref().unwrap(),
+        )?;
+        if let NativeAttemptTopologyRequirement::ExcludeProcess(excluded) =
+            original.topology_requirement
+            && eligible.contains(&excluded)
+        {
+            return Err(NativeExecutionContractError::ExcludedBackendProcess);
+        }
+        let original = request.take().unwrap();
+        *prepared = Some(PreparedNativeAttempt {
+            logical_ticket: original.logical_ticket,
+            attempt_ticket: original.attempt_ticket,
+            execution: original.execution,
+            eligible_backends: eligible.into_boxed_slice(),
+            scheduling: scheduling.take().unwrap(),
+            owner: owner.take().unwrap(),
+        });
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn stage_fixture_owner(&mut self, owner: impl DormantNativeAttemptOwner) {
+        assert!(self.staged_owner.is_none() && self.prepared.is_none());
+        self.staged_owner = Some(Box::new(owner));
+    }
+    #[cfg(test)]
+    pub(crate) fn bind_staged(
+        &mut self,
+        scheduling: ExecutionSchedulingFacts,
+    ) -> Result<(), NativeExecutionContractError> {
+        assert!(self.staged_scheduling.is_none());
+        self.staged_scheduling = Some(scheduling);
+        Self::bind_original_in(
+            &mut self.request,
+            &mut self.prepared,
+            &mut self.staged_scheduling,
+            &mut self.staged_owner,
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct NativeDormantCustody {
+    owner: Option<Box<dyn DormantNativeAttemptOwner>>,
+    retiring: bool,
+}
+impl NativeDormantCustody {
+    pub(crate) fn as_mut(&mut self) -> &mut dyn DormantNativeAttemptOwner {
+        self.owner
+            .as_mut()
+            .expect("same stable dormant owner")
+            .as_mut()
+    }
+    pub(crate) fn retire(&mut self) {
+        self.retiring = true;
+        drop(self.owner.take());
+        self.retiring = false;
+    }
+    pub(crate) fn drop_unproven(&self) -> bool {
+        self.retiring
+    }
+}
+#[derive(Debug)]
+pub(crate) struct NativePreparedFacts {
+    pub(crate) execution: QueryExecutionId,
+    pub(crate) eligible_backends: Box<[BackendProcessId]>,
+    pub(crate) scheduling: ExecutionSchedulingFacts,
+}
+
 /// Ticketed dormant attempt returned across the Native port.
 ///
 /// Its fields and split remain private to the query application. A role adapter
@@ -1091,6 +1337,7 @@ impl fmt::Debug for PreparedNativeAttempt {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct PreparedNativeAttemptParts {
     pub(crate) execution: QueryExecutionId,
@@ -1119,6 +1366,19 @@ impl NativeAttemptPreparationAcceptance {
         }
     }
 
+    fn validate(
+        &self,
+        prepared: &PreparedNativeAttempt,
+    ) -> Result<(), NativeExecutionContractError> {
+        if !Arc::ptr_eq(&self.logical_ticket, &prepared.logical_ticket)
+            || !Arc::ptr_eq(&self.attempt_ticket, &prepared.attempt_ticket)
+            || self.execution != prepared.execution
+        {
+            return Err(NativeExecutionContractError::ForeignAttemptTicket);
+        }
+        Ok(())
+    }
+    #[cfg(test)]
     pub(crate) fn accept(
         self,
         prepared: PreparedNativeAttempt,
@@ -1928,10 +2188,10 @@ mod tests {
             exits: Arc<AtomicU64>,
         }
         impl NativeAttemptPreparationPort for ObservedPreparationPort {
-            fn prepare(
-                &mut self,
-                _request: NativeAttemptPreparationRequest,
-            ) -> NativeAttemptPreparationFuture {
+            fn prepare_in<'a>(
+                &'a mut self,
+                _request: &'a mut crate::api::NativeAttemptPreparationWork,
+            ) -> NativeAttemptPreparationFuture<'a> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async { Err(NativeExecutionContractError::ForeignAttemptTicket.into()) })
             }
@@ -1984,10 +2244,10 @@ mod tests {
     }
 
     impl NativeAttemptPreparationPort for NoopPreparationPort {
-        fn prepare(
-            &mut self,
-            _request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
+        fn prepare_in<'a>(
+            &'a mut self,
+            _request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
             Box::pin(async { Err(NativeExecutionContractError::ForeignAttemptTicket.into()) })
         }
     }
@@ -1998,17 +2258,18 @@ mod tests {
     }
 
     impl NativeAttemptPreparationPort for EchoPreparationPort {
-        fn prepare(
-            &mut self,
-            request: NativeAttemptPreparationRequest,
-        ) -> NativeAttemptPreparationFuture {
+        fn prepare_in<'a>(
+            &'a mut self,
+            request: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
             self.calls += 1;
             assert_eq!(self.calls, 1);
             let _exact_execution = request.execution();
             let backends = prepared_inputs();
+            request.stage_fixture_owner(Dormant::new(9, backends));
             Box::pin(async move {
                 request
-                    .bind(scheduling_over(&[]), Dormant::new(9, backends))
+                    .bind_staged(scheduling_over(&[]))
                     .map_err(Into::into)
             })
         }
@@ -2063,5 +2324,49 @@ mod tests {
 
         owner.converge(cancellation).await;
         assert_eq!(owner.polls, 2);
+    }
+
+    #[test]
+    fn silent_open_refusal_keeps_the_same_original_input_and_empty_target() {
+        let (_governance, open, _acceptance) = issue(execution(301, 1), RecoveryMode::NoRecovery);
+        let mut source = Some(open);
+        let original = Arc::as_ptr(&source.as_ref().unwrap().ticket);
+        let mut target = None;
+        LogicalNativeOpenRequest::bind_in(&mut source, &mut target).unwrap();
+        assert!(source.is_none());
+        assert_eq!(Arc::as_ptr(&target.as_ref().unwrap().ticket), original);
+        let (_other_governance, other, _other_acceptance) =
+            issue(execution(302, 1), RecoveryMode::NoRecovery);
+        let mut source = Some(other);
+        let before = Arc::as_ptr(&source.as_ref().unwrap().ticket);
+        assert!(LogicalNativeOpenRequest::bind_in(&mut source, &mut target).is_err());
+        assert_eq!(Arc::as_ptr(&source.as_ref().unwrap().ticket), before);
+        assert_eq!(Arc::as_ptr(&target.as_ref().unwrap().ticket), original);
+    }
+
+    #[test]
+    fn silent_attempt_validation_refusal_retains_original_request_owner_and_schedule() {
+        let (_governance, open, acceptance) = issue(execution(303, 1), RecoveryMode::NoRecovery);
+        let session = acceptance.accept(open.bind().unwrap()).unwrap();
+        let (request, _) = session.issue_attempt(execution(303, 1)).unwrap();
+        let ticket = Arc::as_ptr(&request.attempt_ticket);
+        let mut work = NativeAttemptPreparationWork::new(request);
+        let mut owner: Option<Box<dyn DormantNativeAttemptOwner>> =
+            Some(Box::new(Dormant::new(8, vec![])));
+        let original: *const dyn DormantNativeAttemptOwner = owner.as_ref().unwrap().as_ref();
+        let mut schedule = Some(scheduling_over(&[]));
+        assert!(matches!(
+            work.bind_in(&mut schedule, &mut owner),
+            Err(NativeExecutionContractError::EmptyEligibleBackends)
+        ));
+        assert!(work.prepared.is_none() && schedule.is_some());
+        assert_eq!(
+            Arc::as_ptr(&work.request.as_ref().unwrap().attempt_ticket),
+            ticket
+        );
+        assert!(std::ptr::addr_eq(
+            owner.as_ref().unwrap().as_ref() as *const dyn DormantNativeAttemptOwner,
+            original
+        ));
     }
 }

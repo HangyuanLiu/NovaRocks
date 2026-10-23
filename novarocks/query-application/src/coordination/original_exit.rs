@@ -59,6 +59,8 @@ struct State {
     actor: Option<Result<(), Arc<JoinError>>>,
     pending_native_returns: u64,
     native_pre_actor_started: bool,
+    native_body_exited: bool,
+    native_failure: Option<Box<dyn std::any::Any + Send>>,
     native_closure_seen: bool,
     native_return_disposition: Option<LocalExecutionDisposition>,
     role: Option<RoleResult>,
@@ -69,6 +71,7 @@ struct State {
 }
 pub(super) struct OriginalLogicalExit {
     state: Mutex<State>,
+    pub(super) native: Arc<tokio::sync::Mutex<OriginalNativePreparation>>,
     changed: futures::task::AtomicWaker,
 }
 impl fmt::Debug for OriginalLogicalExit {
@@ -92,6 +95,8 @@ impl OriginalLogicalExit {
                 actor: None,
                 pending_native_returns: 0,
                 native_pre_actor_started: false,
+                native_body_exited: true,
+                native_failure: None,
                 native_closure_seen: false,
                 native_return_disposition: None,
                 role: None,
@@ -100,8 +105,62 @@ impl OriginalLogicalExit {
                 health_published: false,
                 health_disposed: false,
             }),
+            native: Arc::new(tokio::sync::Mutex::new(OriginalNativePreparation::default())),
             changed: futures::task::AtomicWaker::new(),
         })
+    }
+    pub(super) fn with_native(
+        request: crate::api::QueryExecutionRequest,
+        port: Arc<dyn crate::api::LogicalExecutionNativePort>,
+    ) -> Arc<Self> {
+        let mut source = Self::new();
+        let original = Arc::get_mut(&mut source).unwrap();
+        original.state.get_mut().unwrap().native_body_exited = false;
+        // Only this source owns the new Native body before publication.
+        let body = Arc::get_mut(&mut original.native).unwrap().get_mut();
+        body.start = Some(request);
+        body.port = Some(port);
+        source
+    }
+    /// Called only after the real role frame cleared. The private Native-body
+    /// mutex serializes its own borrow; no Source/Registry/WC/health lock is
+    /// held across a first-party destructor or callback.
+    pub(super) fn retire_native_body_silent(&self) {
+        {
+            let state = self.lock();
+            if !state.role_ended || state.role_failed || state.native_body_exited {
+                return;
+            }
+        }
+        let Ok(mut body) = self.native.try_lock() else {
+            return;
+        };
+        if body.exiting
+            || body.pending_activated.is_some()
+            || body
+                .session
+                .as_ref()
+                .is_some_and(crate::api::LogicalNativeSession::preparation_drop_unproven)
+            || body.dormant.drop_unproven()
+        {
+            return;
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body.close()));
+        drop(body);
+        let mut state = self.lock();
+        match result {
+            Ok(()) => {
+                state.native_body_exited = true;
+                state.native_pre_actor_started = false;
+            }
+            Err(original) => {
+                // A failed real Drop is not a successful local return. This
+                // fixed source keeps the original opaque cause for health.
+                assert!(state.native_failure.is_none());
+                state.native_failure = Some(original);
+                state.role_failed = true;
+            }
+        }
     }
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
@@ -194,7 +253,8 @@ impl OriginalLogicalExit {
     }
     pub(super) fn has_unhandled_failure(&self) -> bool {
         let s = self.lock();
-        !s.health_disposed && (s.role_failed || matches!(&s.actor, Some(Err(_))))
+        !s.health_disposed
+            && (s.role_failed || s.native_failure.is_some() || matches!(&s.actor, Some(Err(_))))
     }
     pub(super) fn receive_role_silent(&self, packet: &mut Option<RoleResult>) {
         let mut s = self.lock();
@@ -208,7 +268,7 @@ impl OriginalLogicalExit {
     }
     pub(super) fn has_failure(&self) -> bool {
         let s = self.lock();
-        s.role_failed || matches!(&s.actor, Some(Err(_)))
+        s.role_failed || s.native_failure.is_some() || matches!(&s.actor, Some(Err(_)))
     }
     pub(super) fn pending_actor(&self) -> bool {
         let s = self.lock();
@@ -225,7 +285,7 @@ impl OriginalLogicalExit {
             Some(PollCompletion::Panicked(p)) => p.value().cleanup().is_none(),
             None => false,
         };
-        if !cleared {
+        if !cleared || !s.native_body_exited {
             return None;
         }
         match s.phase {
@@ -248,6 +308,44 @@ impl OriginalLogicalExit {
         }
     }
 }
+/// The original source's Native body, never owned by a caught/cancelled role
+/// Future. Its private mutex protects only this original local body.
+#[derive(Default)]
+pub(super) struct OriginalNativePreparation {
+    pub(super) start: Option<crate::api::QueryExecutionRequest>,
+    pub(super) port: Option<Arc<dyn crate::api::LogicalExecutionNativePort>>,
+    pub(super) seed: Option<crate::api::NativeLogicalExecutionSeed>,
+    pub(super) open: Option<crate::api::LogicalNativeOpenRequest>,
+    pub(super) acceptance: Option<crate::api::LogicalNativeOpenAcceptance>,
+    pub(super) session: Option<crate::api::LogicalNativeSession>,
+    pub(super) dormant: crate::api::NativeDormantCustody,
+    // A successful activation becomes stable before dormant Drop. The Box
+    // stays in its ORIGINAL slot; Source holds rows and only a Weak receipt.
+    pub(super) pending_activated: Option<super::native_active_custody::PendingNativeActivation>,
+    pub(super) description: Option<Arc<crate::preparation::FrozenExecutionDescription>>,
+    pub(super) consumer: Option<Arc<dyn crate::api::InternalComputationConsumer>>,
+    pub(super) capacity: Option<crate::admitted_query_context::QueryResultCapacityBinding>,
+    pub(super) exiting: bool,
+}
+impl OriginalNativePreparation {
+    fn close(&mut self) {
+        self.exiting = true;
+        // This actual Drop, not None or an empty converge future, is the local
+        // author. Any unwind leaves exiting=true and Source unproven.
+        self.dormant.retire();
+        drop(self.start.take());
+        drop(self.open.take());
+        drop(self.seed.take());
+        drop(self.acceptance.take());
+        drop(self.session.take());
+        drop(self.capacity.take());
+        drop(self.consumer.take());
+        drop(self.description.take());
+        drop(self.port.take());
+        self.exiting = false;
+    }
+}
+
 /// Installed only in the original health slot. Dropping a rejected wrapper
 /// does not dispose its source; the caller disarms it before returning custody
 /// to the same finite bank Position.
@@ -309,6 +407,12 @@ impl LogicalExecutionExitView<'_> {
         self.state.role.as_ref()
     }
     /// Diagnostic facts only; none substitutes for an actual local return.
+    pub fn native_preparation_failure(&self) -> Option<&(dyn std::any::Any + Send)> {
+        self.state.native_failure.as_deref()
+    }
+    pub fn native_preparation_exited(&self) -> bool {
+        self.state.native_body_exited
+    }
     pub fn native_action_started(&self) -> bool {
         self.state.native_pre_actor_started
     }
@@ -376,6 +480,7 @@ impl LogicalExecutionExitReceipt {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LogicalExecutionExitGeometry {
     pub source: Layout,
+    pub native_body: Layout,
     pub observer: Layout,
     pub receipt: Layout,
     pub input_header: Layout,
@@ -393,6 +498,9 @@ impl LogicalExecutionExitObserver {
             source: novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<
                 OriginalLogicalExit,
             >())?,
+            native_body: novarocks_type_contract::owned_resources::layout::arc_layout(
+                Layout::new::<tokio::sync::Mutex<OriginalNativePreparation>>(),
+            )?,
             observer: Layout::new::<Self>(),
             receipt: Layout::new::<LogicalExecutionExitReceipt>(),
             input_header: Layout::new::<super::supervisor::OriginalLogicalStartInput>(),

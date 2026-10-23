@@ -415,7 +415,10 @@ async fn actual_staged_bundle_waits_for_drive_then_claims_once_and_reaches_real_
     let view = offers.reserve_view();
     drop(offers);
     let (mut attempt, resources, activation) = OriginalAttempt::new(1).await;
-    let mut producer = view.reserve(attempt.root.query_execution_id()).unwrap();
+    let mut original_producer = None;
+    view.reserve_in(attempt.root.query_execution_id(), &mut original_producer)
+        .unwrap();
+    let mut producer = original_producer.take().unwrap();
     producer
         .stage(
             attempt.root.query_execution_id(),
