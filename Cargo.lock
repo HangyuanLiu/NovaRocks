@@ -4263,6 +4263,7 @@ dependencies = [
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-task-codec",
+ "novarocks-transport-io",
  "novarocks-type-contract",
  "novarocks-types",
  "novarocks-value-arrays",
@@ -4296,6 +4297,7 @@ dependencies = [
  "http",
  "hyper-util",
  "novarocks-secret",
+ "novarocks-transport-io",
  "novarocks-types",
  "rcgen",
  "rustls",
@@ -4741,6 +4743,7 @@ dependencies = [
  "novarocks-spi",
  "novarocks-task-codec",
  "novarocks-test-support",
+ "novarocks-transport-io",
  "novarocks-type-contract",
  "novarocks-types",
  "novarocks-version",
@@ -4807,6 +4810,13 @@ dependencies = [
  "novarocks-server-application",
  "novarocks-spi",
  "parquet",
+ "tokio",
+]
+
+[[package]]
+name = "novarocks-transport-io"
+version = "0.1.0"
+dependencies = [
  "tokio",
 ]
 

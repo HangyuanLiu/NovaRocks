@@ -782,10 +782,9 @@ async fn public_queue_recipe(ready_only: bool) -> Result<QueueRun, StdError> {
             // This is the actual connector firstpoll and original public dial
             // guard. The test pause owns that guard until actual IO is returned.
             if signals.attempts.fetch_add(1, Ordering::AcqRel) != 0 {
-                return Err::<
-                    hyper_util::rt::TokioIo<novarocks_native_trust::BoxedNativeIo>,
-                    StdError,
-                >("queue recipe attempted a second connector".into());
+                return Err::<hyper_util::rt::TokioIo<novarocks_transport_io::BoxedIo>, StdError>(
+                    "queue recipe attempted a second connector".into(),
+                );
             }
             let dial = admission.try_dial_lane(FrontendNativeLane::ResultData)?;
             let mut released = signals
@@ -813,8 +812,8 @@ async fn public_queue_recipe(ready_only: bool) -> Result<QueueRun, StdError> {
             })
             .await?;
             let io = native.connect().await?;
-            let io: novarocks_native_trust::BoxedNativeIo = Box::new(
-                novarocks_native_trust::OwnedNativeIo::with_guard(io, dial.established()?),
+            let io: novarocks_transport_io::BoxedIo = Box::new(
+                novarocks_transport_io::OwnedIo::with_guard(io, dial.established()?),
             );
             Ok(hyper_util::rt::TokioIo::new(io))
         }

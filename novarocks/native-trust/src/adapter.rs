@@ -3,7 +3,6 @@
 // The ASF licenses this file to you under the Apache License, Version 2.0.
 
 use std::{
-    any::Any,
     fmt,
     future::Future,
     io,
@@ -16,115 +15,13 @@ use std::{
 use hyper_util::rt::TokioIo;
 use novarocks_types::{NativeEndpoint, NativeReferenceHost};
 use rustls::{ClientConfig, ServerConfig, pki_types::ServerName};
-use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::TcpStream,
-    sync::Semaphore,
-};
+use tokio::{net::TcpStream, sync::Semaphore};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tower::Service;
 
+use novarocks_transport_io::BoxedIo;
+
 use crate::{AutomaticTlsMaterial, NativeTlsMaterial, NativeTransportMode, NativeTrustFailureKind};
-
-/// Object-safe Native IO for Tonic's `connect_with_connector` bridge. The
-/// connector preserves the `NativeEndpoint` reference host for TLS name
-/// verification; DNS resolution never becomes its identity key.
-pub trait NativeIo: AsyncRead + AsyncWrite + Send + Unpin {}
-impl<T: AsyncRead + AsyncWrite + Send + Unpin> NativeIo for T {}
-pub type BoxedNativeIo = Box<dyn NativeIo>;
-
-/// Native IO that keeps a caller-supplied guard alive until the transport
-/// itself has been destroyed.
-///
-/// The guard drops after the boxed transport, even when the transport
-/// destructor unwinds, so an admission position carried by the guard is never
-/// returned while its connection's socket is still open. There is deliberately
-/// no IO or guard extraction API.
-pub struct OwnedNativeIo {
-    io: Option<BoxedNativeIo>,
-    guard: Option<Box<dyn Any + Send + Sync>>,
-}
-
-impl OwnedNativeIo {
-    pub fn new(io: BoxedNativeIo) -> Self {
-        Self {
-            io: Some(io),
-            guard: None,
-        }
-    }
-
-    pub fn with_guard<G: Send + Sync + 'static>(io: BoxedNativeIo, guard: G) -> Self {
-        Self {
-            io: Some(io),
-            guard: Some(Box::new(guard)),
-        }
-    }
-
-    fn io_mut(&mut self) -> &mut (dyn NativeIo + 'static) {
-        self.io.as_deref_mut().expect("owned Native IO is live")
-    }
-}
-
-impl fmt::Debug for OwnedNativeIo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OwnedNativeIo")
-            .field("guarded", &self.guard.is_some())
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for OwnedNativeIo {
-    fn drop(&mut self) {
-        // The local guard unwinds after drop(io), even if the boxed
-        // destructor panics.
-        let guard = self.guard.take();
-        drop(self.io.take());
-        drop(guard);
-    }
-}
-
-impl AsyncRead for OwnedNativeIo {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(self.get_mut().io_mut()).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for OwnedNativeIo {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bytes: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(self.get_mut().io_mut()).poll_write(cx, bytes)
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buffers: &[io::IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(self.get_mut().io_mut()).poll_write_vectored(cx, buffers)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.io
-            .as_deref()
-            .expect("owned Native IO is live")
-            .is_write_vectored()
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(self.get_mut().io_mut()).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(self.get_mut().io_mut()).poll_shutdown(cx)
-    }
-}
 
 /// How many Native DNS resolutions may run at once in one process.
 ///
@@ -262,7 +159,7 @@ impl NativeEndpointConnector {
         &self.endpoint
     }
 
-    pub async fn connect(&self) -> Result<BoxedNativeIo, NativeConnectFailure> {
+    pub async fn connect(&self) -> Result<BoxedIo, NativeConnectFailure> {
         self.connect_with(NativeDnsResolver::process()).await
     }
 
@@ -271,7 +168,7 @@ impl NativeEndpointConnector {
     pub async fn connect_with(
         &self,
         resolver: &NativeDnsResolver,
-    ) -> Result<BoxedNativeIo, NativeConnectFailure> {
+    ) -> Result<BoxedIo, NativeConnectFailure> {
         let addresses = resolver
             .resolve(&self.endpoint)
             .await
@@ -358,7 +255,7 @@ impl std::error::Error for NativeConnectFailure {
 }
 
 impl Service<http::Uri> for NativeEndpointConnector {
-    type Response = TokioIo<BoxedNativeIo>;
+    type Response = TokioIo<BoxedIo>;
     type Error = io::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -407,13 +304,13 @@ impl NativeIncomingAdapter {
         self.mode
     }
 
-    pub async fn accept(&self, stream: TcpStream) -> Result<BoxedNativeIo, NativeTrustFailureKind> {
+    pub async fn accept(&self, stream: TcpStream) -> Result<BoxedIo, NativeTrustFailureKind> {
         match &self.server_tls {
             None => Ok(Box::new(stream)),
             Some(config) => TlsAcceptor::from(config.clone())
                 .accept(stream)
                 .await
-                .map(|stream| Box::new(stream) as BoxedNativeIo)
+                .map(|stream| Box::new(stream) as BoxedIo)
                 .map_err(|_| NativeTrustFailureKind::TransportConfiguration),
         }
     }

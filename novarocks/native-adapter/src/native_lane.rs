@@ -593,7 +593,7 @@ pub(crate) fn admitted_connector_service(
     dial: NativeDial,
 ) -> impl Service<
     hyper::http::Uri,
-    Response = hyper_util::rt::TokioIo<novarocks_native_trust::BoxedNativeIo>,
+    Response = hyper_util::rt::TokioIo<novarocks_transport_io::BoxedIo>,
     Error = std::io::Error,
     Future = impl Send,
 > + Clone
@@ -614,8 +614,8 @@ pub(crate) fn admitted_connector_service(
                     std::io::Error::new(error.kind(), "native dial admission refused")
                 })?;
             let io = connector.connect().await.map_err(std::io::Error::other)?;
-            let io: novarocks_native_trust::BoxedNativeIo = match dial {
-                Some(dial) => Box::new(novarocks_native_trust::OwnedNativeIo::with_guard(
+            let io: novarocks_transport_io::BoxedIo = match dial {
+                Some(dial) => Box::new(novarocks_transport_io::OwnedIo::with_guard(
                     io,
                     dial.established()?,
                 )),
@@ -633,7 +633,7 @@ pub fn frontend_lane_connector(
     lane: FrontendNativeLane,
 ) -> impl Service<
     hyper::http::Uri,
-    Response = hyper_util::rt::TokioIo<novarocks_native_trust::BoxedNativeIo>,
+    Response = hyper_util::rt::TokioIo<novarocks_transport_io::BoxedIo>,
     Error = std::io::Error,
     Future = impl Send,
 > + Clone

@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
-use novarocks_native_trust::OwnedNativeIo;
+use novarocks_transport_io::OwnedIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 struct TrackedIo {
@@ -83,10 +83,10 @@ impl Drop for Guard {
     }
 }
 
-fn owned(panic_on_drop: bool) -> (OwnedNativeIo, Arc<AtomicBool>, Arc<AtomicBool>) {
+fn owned(panic_on_drop: bool) -> (OwnedIo, Arc<AtomicBool>, Arc<AtomicBool>) {
     let destroyed = Arc::new(AtomicBool::new(false));
     let released = Arc::new(AtomicBool::new(false));
-    let io = OwnedNativeIo::with_guard(
+    let io = OwnedIo::with_guard(
         Box::new(TrackedIo {
             destroyed: Arc::clone(&destroyed),
             panic_on_drop,
@@ -119,7 +119,7 @@ fn guard_still_leaves_when_the_transport_destructor_unwinds() {
 #[test]
 fn unguarded_io_is_an_ordinary_transport() {
     let destroyed = Arc::new(AtomicBool::new(false));
-    let io = OwnedNativeIo::new(Box::new(TrackedIo {
+    let io = OwnedIo::new(Box::new(TrackedIo {
         destroyed: Arc::clone(&destroyed),
         panic_on_drop: false,
     }));

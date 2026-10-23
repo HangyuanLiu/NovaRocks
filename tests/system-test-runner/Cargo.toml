@@ -26,6 +26,7 @@ publish = false
 workspace = true
 
 [dependencies]
+novarocks-transport-io.workspace = true
 anyhow.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
