@@ -159,7 +159,7 @@ async fn run_case(fail_writer: bool) {
     let capacity_binding =
         QueryResultCapacityBinding::try_new(&attempt.scope, window.retain_alias()).unwrap();
     drop(window);
-    let mut cpu_owner = InternalResultCpuOwner::try_new().unwrap();
+    let mut cpu_owner = InternalResultCpuOwner::try_new_for_test().unwrap();
     // This child module exercises the closed consumer. The frozen-template
     // from_frozen constructor remains a separately named integration gate.
     let frozen_targets =

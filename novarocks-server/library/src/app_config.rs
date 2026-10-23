@@ -1178,6 +1178,10 @@ pub struct FrontendWorkloadRuntimeConfig {
     /// Warehouse-wide admitted compute queries. This is the Frontend's only
     /// query-load control: it covers planning through protocol terminality.
     pub concurrency_limit: usize,
+    /// FE Internal computation windows and their matching fixed CPU positions.
+    pub internal_result_positions: usize,
+    /// Complete retained backing allowance per Internal window.
+    pub internal_result_all_objects_bytes: u64,
     pub waiting_limit: usize,
     pub capacity_wait_timeout_ms: u64,
     pub restarts_per_work: usize,
@@ -1204,6 +1208,10 @@ impl Default for FrontendWorkloadRuntimeConfig {
     fn default() -> Self {
         Self {
             concurrency_limit: 256,
+            internal_result_positions: novarocks_workload_control::ResultCapacityConfig::V1
+                .positions[2],
+            internal_result_all_objects_bytes: novarocks_workload_control::ResultCapacityConfig::V1
+                .all_objects_bytes[2],
             waiting_limit: 1024,
             capacity_wait_timeout_ms: 30_000,
             restarts_per_work: 2,
@@ -3028,6 +3036,26 @@ mod tests {
     /// One gibibyte, used as a readable stand-in for `P` throughout these
     /// tests so the arithmetic stays checkable by eye.
     const P: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn internal_result_capacity_uses_explicit_runtime_values_and_original_defaults() {
+        let configured: RuntimeConfig = toml::from_str(
+            "[frontend_workload]\ninternal_result_positions = 1\ninternal_result_all_objects_bytes = 2147483648\n"
+        ).unwrap();
+        assert_eq!(configured.frontend_workload.internal_result_positions, 1);
+        assert_eq!(
+            configured
+                .frontend_workload
+                .internal_result_all_objects_bytes,
+            2147483648
+        );
+        let defaults: RuntimeConfig = toml::from_str("").unwrap();
+        assert_eq!(defaults.frontend_workload.internal_result_positions, 4);
+        assert_eq!(
+            defaults.frontend_workload.internal_result_all_objects_bytes,
+            1073741824
+        );
+    }
 
     #[test]
     fn an_absent_memory_partition_derives_a_quarter_of_the_bound_as_headroom() {

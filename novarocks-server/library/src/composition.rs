@@ -36,7 +36,7 @@ use novarocks_frontend_application::task_protocol_config::{
 use novarocks_frontend_application::{
     ClusterBackendOpenConfig, FrontendApplicationOpenConfig, FrontendExecutionConfig,
     FrontendLogicalExecutionRuntimeConfig, FrontendManagementConfig, FrontendQueryControlTimeouts,
-    FrontendServingConfig,
+    FrontendResultCapacityProfile, FrontendServingConfig,
 };
 use novarocks_fs::{
     FsAccessResolver, FsAccessResources, ObjectStoreProviderPool, ObjectStoreProviderPoolOptions,
@@ -591,10 +591,14 @@ pub fn compose_frontend_role_config(
         .ok_or_else(|| anyhow::anyhow!("compose frontend server without catalog source preflight"))?
         .input()?;
     let task_execution_budgets = compose_task_execution_budgets(config)?;
-    let (logical_supervisor, workload, abort_capacity) =
+    let (logical_supervisor, workload, abort_capacity, result_profile) =
         compose_frontend_workload_runtime(runtime_config)?;
-    let logical_runtime =
-        FrontendLogicalExecutionRuntimeConfig::new(logical_supervisor, workload, abort_capacity);
+    let logical_runtime = FrontendLogicalExecutionRuntimeConfig::new(
+        logical_supervisor,
+        workload,
+        abort_capacity,
+        result_profile,
+    );
     let mut execution = FrontendExecutionConfig::new(
         runtime_filter_worker_count,
         native_compatibility_id,
@@ -822,12 +826,22 @@ fn compose_frontend_workload_policy(
     Ok(workload)
 }
 
+fn compose_frontend_result_profile(
+    runtime: &crate::app_config::RuntimeConfig,
+) -> anyhow::Result<FrontendResultCapacityProfile> {
+    let mut capacity = novarocks_workload_control::ResultCapacityConfig::V1;
+    capacity.positions[2] = runtime.frontend_workload.internal_result_positions;
+    capacity.all_objects_bytes[2] = runtime.frontend_workload.internal_result_all_objects_bytes;
+    FrontendResultCapacityProfile::try_new(capacity).context("construct frontend result capacity")
+}
+
 /// Pure load-time check over the same policy projection used by composition.
 pub(crate) fn validate_frontend_joint_startup(
     runtime: &crate::app_config::RuntimeConfig,
 ) -> anyhow::Result<crate::joint_startup_report::JointStartupReport> {
     let workload = compose_frontend_workload_policy(runtime)?;
-    crate::joint_startup_report::validate_current(&workload)
+    let profile = compose_frontend_result_profile(runtime)?;
+    crate::joint_startup_report::validate_profile(&workload, profile.declared())
 }
 
 fn compose_frontend_workload_runtime(
@@ -836,10 +850,13 @@ fn compose_frontend_workload_runtime(
     LogicalExecutionSupervisorConfig,
     WorkloadConfig,
     NonZeroUsize,
+    FrontendResultCapacityProfile,
 )> {
     let input = &runtime.frontend_workload;
     let workload = compose_frontend_workload_policy(runtime)?;
-    let report = crate::joint_startup_report::validate_current(&workload)?;
+    let result_profile = compose_frontend_result_profile(runtime)?;
+    let report =
+        crate::joint_startup_report::validate_profile(&workload, result_profile.declared())?;
     tracing::debug!(
         ?report,
         "Frontend joint startup number checks completed; owner projections remain open"
@@ -901,7 +918,7 @@ fn compose_frontend_workload_runtime(
     .with_remote_cleanup_timeout(Duration::from_millis(
         input.logical_remote_cleanup_timeout_ms,
     ));
-    Ok((supervisor, workload, abort_capacity))
+    Ok((supervisor, workload, abort_capacity, result_profile))
 }
 
 fn compose_task_execution_budgets(
@@ -1355,7 +1372,7 @@ mod tests {
     fn frontend_workload_runtime_is_built_from_validated_server_fields() {
         let mut config = crate::app_config::NovaRocksConfig::default();
         config.runtime.mem_limit = "1G".to_string();
-        let (_, workload, abort_capacity) = compose_frontend_workload_runtime(&config.runtime)
+        let (_, workload, abort_capacity, _) = compose_frontend_workload_runtime(&config.runtime)
             .expect("explicit frontend workload fields compose");
         assert_eq!(workload.query_concurrency_limit, 256);
         assert_eq!(workload.execution_limit, workload.scope_records_limit);
@@ -1508,12 +1525,40 @@ mod joint_startup_policy_tests {
     use super::*;
 
     #[test]
+    fn configured_internal_capacity_reaches_the_original_startup_and_runtime_projection() {
+        let mut runtime = crate::app_config::RuntimeConfig::default();
+        runtime.frontend_workload.internal_result_positions = 1;
+        runtime.frontend_workload.internal_result_all_objects_bytes = 2 * 1024 * 1024 * 1024;
+        let report = validate_frontend_joint_startup(&runtime).unwrap();
+        let (_, _, _, installed) = compose_frontend_workload_runtime(&runtime).unwrap();
+        assert_eq!(report.result_class_positions[2], 1);
+        assert_eq!(installed.declared().positions[2], 1);
+        assert_eq!(
+            report.result_class_all_objects_bytes[2],
+            2 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            installed.declared().all_objects_bytes[2],
+            report.result_class_all_objects_bytes[2]
+        );
+        for positions in [0, 5] {
+            runtime.frontend_workload.internal_result_positions = positions;
+            assert!(validate_frontend_joint_startup(&runtime).is_err());
+            assert!(compose_frontend_workload_runtime(&runtime).is_err());
+        }
+        runtime.frontend_workload.internal_result_positions = 1;
+        runtime.frontend_workload.internal_result_all_objects_bytes = 1;
+        assert!(validate_frontend_joint_startup(&runtime).is_err());
+        assert!(compose_frontend_workload_runtime(&runtime).is_err());
+    }
+
+    #[test]
     fn load_check_and_composition_use_the_same_original_workload_projection() {
         let mut runtime = crate::app_config::RuntimeConfig::default();
         runtime.frontend_workload.concurrency_limit = 16;
         let projected = compose_frontend_workload_policy(&runtime).expect("original workload");
         let report = validate_frontend_joint_startup(&runtime).expect("joint number check");
-        let (_, composed, _) =
+        let (_, composed, _, _) =
             compose_frontend_workload_runtime(&runtime).expect("pure composition");
         assert_eq!(projected.query_concurrency_limit, 16);
         assert_eq!(

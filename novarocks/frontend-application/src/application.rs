@@ -400,6 +400,8 @@ impl Drop for FrontendWorkloadDeadlineSupervisor {
     }
 }
 
+pub use crate::query_execution::internal_result_cpu::FrontendResultCapacityProfile;
+
 /// Frozen native-read policy consumed while Server composes one Frontend role
 /// graph.
 ///
@@ -424,6 +426,7 @@ impl FrontendExecutionRuntimeOwner {
         frontend_process_id: FrontendProcessId,
         supervisor_config: LogicalExecutionSupervisorConfig,
         workload_config: WorkloadConfig,
+        result_profile: FrontendResultCapacityProfile,
         query_cpu_config: QueryCpuExecutorConfig,
         query_blocking_config: QueryBlockingExecutorConfig,
     ) -> Result<Self, FrontendApplicationError> {
@@ -434,7 +437,7 @@ impl FrontendExecutionRuntimeOwner {
         // concurrency limit beyond its client positions is refused here.
         let result_capacity = workload
             .owner
-            .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+            .configure_result_capacity(result_profile.declared())
             .map_err(|error| {
                 FrontendApplicationError::new(
                     FrontendApplicationErrorKind::WorkloadControlOpen,
@@ -453,12 +456,13 @@ impl FrontendExecutionRuntimeOwner {
                 )
             })?;
         let query_blocking_executor = query_blocking.executor();
-        let internal_result_cpu = InternalResultCpuOwner::try_new().map_err(|error| {
-            FrontendApplicationError::new(
-                FrontendApplicationErrorKind::InternalResultCpuOpen,
-                error,
-            )
-        })?;
+        let internal_result_cpu =
+            InternalResultCpuOwner::try_new(result_profile).map_err(|error| {
+                FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::InternalResultCpuOpen,
+                    error,
+                )
+            })?;
         let internal_result_cpu_runtime = internal_result_cpu.runtime();
         let process_bytes = frontend_process_id.to_bytes();
         let namespace = QueryProcessNamespace::new(
@@ -861,6 +865,7 @@ impl Default for FrontendQueryControlTimeouts {
 pub struct FrontendLogicalExecutionRuntimeConfig {
     supervisor: LogicalExecutionSupervisorConfig,
     workload: WorkloadConfig,
+    result_profile: FrontendResultCapacityProfile,
     abort_effect_capacity: NonZeroUsize,
 }
 
@@ -869,10 +874,12 @@ impl FrontendLogicalExecutionRuntimeConfig {
         supervisor: LogicalExecutionSupervisorConfig,
         workload: WorkloadConfig,
         abort_effect_capacity: NonZeroUsize,
+        result_profile: FrontendResultCapacityProfile,
     ) -> Self {
         Self {
             supervisor,
             workload,
+            result_profile,
             abort_effect_capacity,
         }
     }
@@ -891,6 +898,10 @@ impl FrontendLogicalExecutionRuntimeConfig {
             ),
             WorkloadConfig::default(),
             DEFAULT_LOGICAL_ABORT_EFFECT_CAPACITY,
+            FrontendResultCapacityProfile::try_new(
+                novarocks_workload_control::ResultCapacityConfig::V1,
+            )
+            .expect("test result profile"),
         )
     }
 }
@@ -937,6 +948,7 @@ pub struct FrontendExecutionConfig {
     /// Fixed process-wide worker and waiting bounds for synchronous result decode.
     logical_execution_supervisor: LogicalExecutionSupervisorConfig,
     workload: WorkloadConfig,
+    result_profile: FrontendResultCapacityProfile,
     logical_abort_effect_capacity: NonZeroUsize,
     /// Connector split enumeration's bounded, server-owned initial feedback
     /// wait. This is frozen at startup and deliberately has no SQL override.
@@ -1005,6 +1017,7 @@ impl FrontendExecutionConfig {
             ),
             logical_execution_supervisor: logical_runtime.supervisor,
             workload: logical_runtime.workload,
+            result_profile: logical_runtime.result_profile,
             logical_abort_effect_capacity: logical_runtime.abort_effect_capacity,
             connector_split_initial_dynamic_filter_wait_cap:
                 DEFAULT_CONNECTOR_SPLIT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
@@ -1337,6 +1350,7 @@ impl FrontendApplicationHost {
             frontend_process_id,
             execution.logical_execution_supervisor,
             execution.workload.clone(),
+            execution.result_profile,
             execution.query_cpu_executor_config,
             execution.query_blocking_executor_config,
         )?;
@@ -2365,8 +2379,8 @@ mod tests {
 
     use super::{
         FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
-        FrontendExecutionConfig, FrontendExecutionRuntimeOwner, LogicalExecutionRowsConfig,
-        LogicalExecutionSupervisorConfig, test_native_trust,
+        FrontendExecutionConfig, FrontendExecutionRuntimeOwner, FrontendResultCapacityProfile,
+        LogicalExecutionRowsConfig, LogicalExecutionSupervisorConfig, test_native_trust,
     };
     use novarocks_native_adapter::FrontendNativeTransport;
 
@@ -2411,6 +2425,7 @@ mod tests {
                 ),
             ),
             WorkloadConfig::default(),
+            FrontendResultCapacityProfile::for_test(),
             QueryCpuExecutorConfig::with_idle_keepalive(Duration::from_millis(20)),
             QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
@@ -2455,6 +2470,7 @@ mod tests {
                 ),
             ),
             WorkloadConfig::default(),
+            FrontendResultCapacityProfile::for_test(),
             QueryCpuExecutorConfig::with_idle_keepalive(Duration::from_millis(20)),
             QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
@@ -2509,6 +2525,7 @@ mod tests {
                 ),
             ),
             WorkloadConfig::default(),
+            FrontendResultCapacityProfile::for_test(),
             QueryCpuExecutorConfig::with_idle_keepalive(Duration::from_millis(20)),
             QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),

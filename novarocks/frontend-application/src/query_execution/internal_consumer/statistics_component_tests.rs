@@ -184,7 +184,7 @@ async fn run_case(case: Case) {
     let binding =
         QueryResultCapacityBinding::try_new(&attempt.scope, window.retain_alias()).unwrap();
     drop(window);
-    let mut cpu_owner = InternalResultCpuOwner::try_new().unwrap();
+    let mut cpu_owner = InternalResultCpuOwner::try_new_for_test().unwrap();
     let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
     let program = original_program();
     let (consumer, offers, mut output) = statistics_computation_consumer(

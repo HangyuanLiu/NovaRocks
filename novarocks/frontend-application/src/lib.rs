@@ -50,6 +50,7 @@ pub(crate) mod application;
 pub use application::{
     FrontendApplicationError, FrontendApplicationErrorKind, FrontendExecutionConfig,
     FrontendLogicalExecutionRuntimeConfig, FrontendQueryControlTimeouts,
+    FrontendResultCapacityProfile,
 };
 pub(crate) mod capabilities;
 mod catalog_application;

@@ -525,6 +525,16 @@ impl QueryBlockingExecutorOwner {
 }
 
 impl QueryBlockingExecutor {
+    /// Original installed physical geometry, for composition checks. Reading
+    /// this declaration does not reserve a worker or a waiting queue position.
+    pub fn configured_capacity(&self) -> QueryBlockingExecutorConfig {
+        let snapshot = self.handle.snapshot();
+        QueryBlockingExecutorConfig::new(
+            NonZeroUsize::new(snapshot.worker_threads).expect("installed worker geometry"),
+            NonZeroUsize::new(snapshot.queue_capacity).expect("installed queue geometry"),
+        )
+    }
+
     /// Runs one already-classified command edge after bounded admission.
     ///
     /// This is intentionally not a generic statement runner: callers must

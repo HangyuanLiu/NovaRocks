@@ -347,7 +347,7 @@ mod tests {
         use novarocks_failure_contract::FailureProjection;
         use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
         let (_control, root, binding, capacity) = admitted_internal_fixture();
-        let mut owner = InternalResultCpuOwner::try_new().unwrap();
+        let mut owner = InternalResultCpuOwner::try_new_for_test().unwrap();
         let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
         let cancellation = QueryCancellationSource::new();
         let source = ConnectorError::new(
@@ -393,7 +393,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn statistics_eof_and_all_success_finalization_are_distinct_cpu_receipts() {
         let (_control, root, binding, capacity) = admitted_internal_fixture();
-        let mut owner = InternalResultCpuOwner::try_new().unwrap();
+        let mut owner = InternalResultCpuOwner::try_new_for_test().unwrap();
         let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
         let cancellation = QueryCancellationSource::new();
         let end = RootResultEnd {
@@ -458,7 +458,7 @@ mod tests {
             AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
         };
         let (_control, root, binding, capacity) = admitted_internal_fixture();
-        let mut owner = InternalResultCpuOwner::try_new().unwrap();
+        let mut owner = InternalResultCpuOwner::try_new_for_test().unwrap();
         let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
         let cancellation = QueryCancellationSource::new();
         let kind = RootOutputKind::InternalFacts(InternalResultDomain::StatisticsArtifactV1);

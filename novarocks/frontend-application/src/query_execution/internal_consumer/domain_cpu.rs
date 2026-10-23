@@ -341,7 +341,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn statistics_retains_distinct_eof_and_success_receipts_in_stable_custody() {
         let (_control, root, binding, capacity) = admitted_internal_fixture();
-        let mut owner = InternalResultCpuOwner::try_new().unwrap();
+        let mut owner = InternalResultCpuOwner::try_new_for_test().unwrap();
         let cancellation = QueryCancellationSource::new();
         let custody = DomainCpuCustody::try_new(
             InternalDomainState::Statistics(StatisticsRootResultDecoder::for_test_with_capacity(
@@ -385,7 +385,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn dropping_receipt_waiter_keeps_original_job_until_real_cpu_exit() {
         let (_control, root, binding, capacity) = admitted_internal_fixture();
-        let mut owner = InternalResultCpuOwner::try_new().unwrap();
+        let mut owner = InternalResultCpuOwner::try_new_for_test().unwrap();
         let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
         let cancellation = QueryCancellationSource::new();
         let mut blockers = Vec::new();
@@ -516,7 +516,7 @@ mod tests {
             }
         }
         let (_control, root, binding, capacity) = admitted_internal_fixture();
-        let mut owner = InternalResultCpuOwner::try_new().unwrap();
+        let mut owner = InternalResultCpuOwner::try_new_for_test().unwrap();
         let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
         let cancellation = QueryCancellationSource::new();
         let custody = DomainCpuCustody::try_new(

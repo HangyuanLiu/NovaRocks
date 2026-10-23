@@ -92,6 +92,42 @@ impl std::fmt::Debug for InternalResultRetention {
     }
 }
 
+/// Frozen FE result capacity shared by the original window and CPU owners.
+/// This validates declarations only; it grants no position or retained bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct FrontendResultCapacityProfile {
+    capacity: ResultCapacityConfig,
+    internal_positions: NonZeroUsize,
+}
+impl FrontendResultCapacityProfile {
+    pub fn try_new(
+        capacity: ResultCapacityConfig,
+    ) -> Result<Self, novarocks_workload_control::WorkError> {
+        let capacity = capacity.validate()?;
+        if capacity.all_objects_bytes[2] < INTERNAL_PEAK_BYTES {
+            return Err(novarocks_workload_control::WorkError::InvalidConfig(
+                "internal result capacity does not cover its supported peak",
+            ));
+        }
+        let internal_positions = NonZeroUsize::new(capacity.positions[2]).ok_or(
+            novarocks_workload_control::WorkError::InvalidConfig("internal result positions"),
+        )?;
+        Ok(Self {
+            capacity,
+            internal_positions,
+        })
+    }
+
+    pub const fn declared(self) -> ResultCapacityConfig {
+        self.capacity
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self::try_new(ResultCapacityConfig::V1).expect("test result capacity is supported")
+    }
+}
+
 pub(crate) struct InternalResultCpuOwner {
     workers: QueryBlockingExecutorOwner,
     runtime: InternalResultCpu,
@@ -103,9 +139,8 @@ pub(crate) struct InternalResultCpu {
 }
 
 impl InternalResultCpuOwner {
-    pub(crate) fn try_new() -> Result<Self, String> {
-        let positions = NonZeroUsize::new(ResultCapacityConfig::V1.positions[2])
-            .expect("the frozen Internal profile has positions");
+    pub(crate) fn try_new(profile: FrontendResultCapacityProfile) -> Result<Self, String> {
+        let positions = profile.internal_positions;
         let workers = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
             positions, positions,
         ))?;
@@ -113,6 +148,11 @@ impl InternalResultCpuOwner {
             executor: workers.executor(),
         };
         Ok(Self { workers, runtime })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_new_for_test() -> Result<Self, String> {
+        Self::try_new(FrontendResultCapacityProfile::for_test())
     }
 
     pub(crate) fn runtime(&self) -> InternalResultCpu {
@@ -547,6 +587,72 @@ mod tests {
         .expect("CPU outcome watchdog")
     }
 
+    #[tokio::test]
+    async fn one_validated_profile_governs_actual_windows_and_physical_cpu_geometry() {
+        let profile = FrontendResultCapacityProfile::try_new(ResultCapacityConfig {
+            positions: [320, 16, 1, 64],
+            all_objects_bytes: [
+                8 * 1024 * 1024,
+                96 * 1024 * 1024,
+                INTERNAL_PEAK_BYTES,
+                8 * 1024 * 1024,
+            ],
+            ..ResultCapacityConfig::V1
+        })
+        .unwrap();
+        let control = WorkloadControl::try_new_counted(WorkloadConfig::default())
+            .unwrap()
+            .owner;
+        let capacity = control
+            .configure_result_capacity(profile.declared())
+            .unwrap();
+        control.mark_ready().unwrap();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Management))
+            .unwrap();
+        let window = capacity
+            .try_acquire(&root.owner.scope(), ResultWindowClass::Internal)
+            .unwrap();
+        assert!(matches!(
+            capacity.try_acquire(&root.owner.scope(), ResultWindowClass::Internal),
+            Err(novarocks_workload_control::WorkError::Capacity(_))
+        ));
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        assert!(
+            window
+                .retain_alias()
+                .check_backing_total(INTERNAL_PEAK_BYTES)
+                .is_ok()
+        );
+        assert!(
+            window
+                .retain_alias()
+                .check_backing_total(INTERNAL_PEAK_BYTES + 1)
+                .is_err()
+        );
+        let mut owner = InternalResultCpuOwner::try_new(profile).unwrap();
+        let installed = owner.runtime().executor.configured_capacity();
+        assert_eq!(installed.worker_threads().get(), 1);
+        assert_eq!(installed.queue_capacity().get(), 1);
+        drop(window);
+        root.owner.complete();
+        root.business.release();
+        owner
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn unsupported_internal_declarations_fail_before_opening_workers() {
+        for (positions, bytes) in [(0, INTERNAL_PEAK_BYTES), (1, INTERNAL_PEAK_BYTES - 1)] {
+            let mut capacity = ResultCapacityConfig::V1;
+            capacity.positions[2] = positions;
+            capacity.all_objects_bytes[2] = bytes;
+            assert!(FrontendResultCapacityProfile::try_new(capacity).is_err());
+        }
+    }
+
     #[test]
     fn foreign_class_or_incomplete_envelope_refuses_before_constructor() {
         let (control, _) = control();
@@ -636,7 +742,7 @@ mod tests {
                 ResultWindowClass::Internal,
             )
             .unwrap();
-        let mut owner = InternalResultCpuOwner::try_new().unwrap();
+        let mut owner = InternalResultCpuOwner::try_new_for_test().unwrap();
         let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
         let (entered, started) = mpsc::channel();
         let (release, blocked) = mpsc::channel();
@@ -714,7 +820,7 @@ mod tests {
                 ResultWindowClass::Internal,
             )
             .unwrap();
-        let mut owner = InternalResultCpuOwner::try_new().unwrap();
+        let mut owner = InternalResultCpuOwner::try_new_for_test().unwrap();
         let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
         let dropped = Arc::new(AtomicBool::new(false));
         let input =
@@ -766,7 +872,7 @@ mod tests {
             )
             .unwrap();
         let binding = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias()).unwrap();
-        let mut owner = InternalResultCpuOwner::try_new().unwrap();
+        let mut owner = InternalResultCpuOwner::try_new_for_test().unwrap();
         let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
         let (entered, started) = mpsc::channel();
         let (release, blocked) = mpsc::channel();
@@ -889,7 +995,7 @@ mod actual_close_tests {
             .unwrap()
             .track_actual_exit(&binding)
             .unwrap();
-        let mut owner = InternalResultCpuOwner::try_new().unwrap();
+        let mut owner = InternalResultCpuOwner::try_new_for_test().unwrap();
         let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
         let (entered, started) = mpsc::channel();
         let (release, blocked) = mpsc::channel();

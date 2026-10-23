@@ -70,11 +70,19 @@ pub(crate) struct JointStartupReport {
     pub(crate) open_owner_projections: [OpenOwnerProjection; 4],
 }
 
-pub(crate) fn validate_current(workload: &WorkloadConfig) -> Result<JointStartupReport> {
+#[cfg(test)]
+fn validate_current(workload: &WorkloadConfig) -> Result<JointStartupReport> {
+    validate_profile(workload, ResultCapacityConfig::V1)
+}
+
+pub(crate) fn validate_profile(
+    workload: &WorkloadConfig,
+    result: ResultCapacityConfig,
+) -> Result<JointStartupReport> {
     let sdk = crate::sdk_listing_profile::validated_current()?;
     validate_parts(
         workload,
-        ResultCapacityConfig::V1,
+        result,
         &NativeResultSupportGeometry::V1,
         LocalResultBound::V1,
         sdk,
@@ -193,6 +201,10 @@ fn validate_parts(
         computation_positions <= compute,
         "joint startup result windows do not cover frontend computation admission"
     );
+    ensure!(
+        positions[2] <= geometry.frontend_internal_positions,
+        "joint startup Internal windows exceed advertised Native support"
+    );
     for (actual, declared, name) in [
         (
             compute,
@@ -213,11 +225,6 @@ fn validate_parts(
             positions[1],
             geometry.frontend_local_positions,
             "Local window positions",
-        ),
-        (
-            positions[2],
-            geometry.frontend_internal_positions,
-            "Internal window positions",
         ),
         (
             positions[3],
@@ -440,7 +447,7 @@ mod tests {
             |g| g.frontend_short_tail_positions += 1,
             |g| g.frontend_client_window_positions += 1,
             |g| g.frontend_local_positions += 1,
-            |g| g.frontend_internal_positions += 1,
+            |g| g.frontend_internal_positions -= 1,
             |g| g.frontend_closing_positions += 1,
             |g| g.frontend_supported_cancel_burst += 1,
             |g| g.frontend_sustained_cancels_per_second += 1,
