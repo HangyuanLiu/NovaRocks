@@ -3740,7 +3740,6 @@ name = "novarocks-connector-starrocks"
 version = "0.1.0"
 dependencies = [
  "arrow",
- "base64 0.22.1",
  "bytes",
  "futures",
  "novarocks-connector-contract",
@@ -4719,7 +4718,6 @@ dependencies = [
  "novarocks-failure-contract",
  "novarocks-functions",
  "novarocks-type-contract",
- "num-traits",
  "serde",
  "serde_json",
  "toml",

@@ -970,10 +970,6 @@ impl Chunk {
 
 #[cfg(test)]
 use novarocks_functions::array_projection::validate_dictionary_rows_observed;
-/// Validate every actual dictionary's keys regardless of semantic nullability.
-/// Root NULL is returned separately; nested active required-child rules remain
-/// those of Arrow's validated container construction, including parent masks.
-
 fn retag_columns_to_chunk_schema(
     columns: &[ArrayRef],
     chunk_schema: &ChunkSchema,
