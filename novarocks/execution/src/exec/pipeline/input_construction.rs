@@ -144,6 +144,17 @@ pub trait InputConstructionFactory: Send + Sync {
         &self,
         schema: &ChunkSchema,
     ) -> Result<Box<dyn InputConstructionOwner>, ConstructionFailure>;
+    /// The actual creator must enforce the operator's already reserved window
+    /// across exact requests and locked-library bounds before allocation.
+    fn begin_typed_construction_bounded(
+        &self,
+        _schema: &ChunkSchema,
+        _byte_limit: usize,
+    ) -> Result<Box<dyn InputConstructionOwner>, ConstructionFailure> {
+        Err(ConstructionFailure::InvalidSource(
+            "input creator has no bounded construction capability".into(),
+        ))
+    }
     /// Begin schema construction from an already frozen complete declaration.
     /// No runtime ChunkSchema is manufactured before the creating owner exists.
     fn begin_compiled_layout_construction(
@@ -196,6 +207,12 @@ pub struct EncodedValueOccurrence<'a> {
 /// Observation grants no capacity and publishes no allocator facts.
 pub trait InputConstructionOwner: Send + Sync {
     fn storage_lifetime(&self) -> ValueTypeStorageLifetime;
+    /// Successful original constructor requests only. This is a size fact,
+    /// never the caller's capacity limit or an allocation permission. An
+    /// owner without complete request observation cannot sign this extent.
+    fn successful_request_extent_upper(&self) -> Option<usize> {
+        None
+    }
 
     /// One concrete constructor request, before the allocation it describes.
     fn request(&self, layout: Layout) -> Result<(), ConstructionFailure>;

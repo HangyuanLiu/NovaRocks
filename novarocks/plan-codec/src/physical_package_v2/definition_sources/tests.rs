@@ -1068,6 +1068,12 @@ pub(in crate::physical_package_v2) fn writer_constant_package() -> p::FragmentPa
 pub(in crate::physical_package_v2) fn writer_finish_package() -> p::FragmentPackage {
     crate::physical_type_v2::sender_tests::checked_finish_package_with(writer_recipe(), true)
 }
+pub(in crate::physical_package_v2) fn change_stream_packages() -> Vec<p::FragmentPackage> {
+    crate::physical_type_v2::sender_tests::checked_change_stream_packages(writer_recipe())
+        .into_values()
+        .collect()
+}
+
 fn writer_recipe() -> c::ConnectorWriteRecipeDraft {
     let provider = c::ConnectorProviderId::parse("iceberg").unwrap();
     let instance = c::ConnectorInstanceId::try_from_canonical("lake").unwrap();

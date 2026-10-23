@@ -65,6 +65,7 @@ pub(crate) enum WorkerFailureReason {
     InboundKeyClosed = 75,
     InboundKeyClaimed = 76,
     InboundForeignClosedKey = 77,
+    InboundCloseContract = 78,
     CatalogConfiguration = 80,
     CatalogPropertiesConflict = 81,
     CatalogNotReadyAfterInstall = 82,

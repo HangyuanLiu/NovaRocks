@@ -30,7 +30,7 @@ use novarocks_type_contract::{
     owned_resources::{layout::LayoutResourceError, vec::original_resize_growth},
 };
 
-fn model_error(cause: ReaderStructureFailure<ExchangeFailure>) -> ExchangeFailure {
+pub(super) fn model_error(cause: ReaderStructureFailure<ExchangeFailure>) -> ExchangeFailure {
     match cause {
         ReaderStructureFailure::Creator(cause) => cause,
         ReaderStructureFailure::Layout(cause) => cause.into(),

@@ -149,6 +149,9 @@ struct ArcHeader {
 /// Aliases are charged in full every time; there is no allocation identity map.
 /// Any inspection error rejects the input; a partial walk is never a proof.
 pub(crate) struct RootSchemaInspection<'a> {
+    operator: bool,
+    column_limit: usize,
+    auxiliary_limit: usize,
     byte_limit: usize,
     node_limit: usize,
     depth_limit: usize,
@@ -163,11 +166,29 @@ pub(crate) struct RootSchemaInspection<'a> {
 impl<'a> RootSchemaInspection<'a> {
     pub(crate) fn new(bytes: usize, nodes: usize, depth: usize) -> Self {
         Self {
+            operator: false,
+            column_limit: RootProfileV1::MAX_COLUMNS,
+            auxiliary_limit: MAX_AUXILIARY_NODES,
             byte_limit: bytes.min(MAX_BYTES),
             // Carrier-only Dictionary key/value and Map entries also consume
             // work. This does not enlarge the frozen semantic schema budget.
             node_limit: nodes.min(2 * RootProfileV1::SCHEMA_TYPE_NODES),
             depth_limit: depth.min(RootProfileV1::MAX_DEPTH),
+            bytes: 0,
+            nodes: 0,
+            auxiliary_nodes: 0,
+            inspected_origin_index: None,
+        }
+    }
+
+    pub(crate) fn for_operator(bytes: usize, nodes: usize, depth: usize, columns: usize) -> Self {
+        Self {
+            operator: true,
+            column_limit: columns,
+            auxiliary_limit: nodes.saturating_mul(8),
+            byte_limit: bytes,
+            node_limit: nodes,
+            depth_limit: depth,
             bytes: 0,
             nodes: 0,
             auxiliary_nodes: 0,
@@ -210,7 +231,7 @@ impl<'a> RootSchemaInspection<'a> {
         self.auxiliary_nodes = self
             .auxiliary_nodes
             .checked_add(1)
-            .filter(|nodes| *nodes <= MAX_AUXILIARY_NODES)
+            .filter(|nodes| *nodes <= self.auxiliary_limit)
             .ok_or(RootSchemaBackingError::WorkExceeded)?;
         Ok(())
     }
@@ -306,7 +327,7 @@ impl<'a> RootSchemaInspection<'a> {
                 .original_backing_observed(schema, &mut || self.enter_auxiliary_node(0))
                 .ok_or(RootSchemaBackingError::UnknownSchemaMetadataOwner)??,
         };
-        if schema.fields.len() > RootProfileV1::MAX_COLUMNS {
+        if schema.fields.len() > self.column_limit {
             return Err(RootSchemaBackingError::WorkExceeded);
         }
         self.preflight_tree_fields(&schema.fields)?;
@@ -383,9 +404,40 @@ impl<'a> RootSchemaInspection<'a> {
     ) -> Result<(), RootSchemaBackingError> {
         self.enter_tree_node(depth)?;
         self.field_own_heap(field, origins)?;
-        let data_type = field.data_type();
+        self.inspect_type_tree(field.data_type(), origins, depth)
+    }
+
+    fn inspect_type_tree(
+        &mut self,
+        data_type: &DataType,
+        origins: RootFieldSource<'_>,
+        depth: usize,
+    ) -> Result<(), RootSchemaBackingError> {
         self.type_own_heap(data_type, origins, depth, false)?;
         match data_type {
+            DataType::FixedSizeList(child, _)
+            | DataType::ListView(child)
+            | DataType::LargeListView(child)
+                if self.operator =>
+            {
+                self.inspect_field_at(child, origins, depth + 1)?;
+            }
+            DataType::Union(fields, _) if self.operator => {
+                self.preflight_auxiliary(fields.len())?;
+                for (_, field) in fields.iter() {
+                    self.inspect_field_at(field, origins, depth + 1)?;
+                }
+            }
+            DataType::RunEndEncoded(ends, values) if self.operator => {
+                self.inspect_field_at(ends, origins, depth)?;
+                self.inspect_field_at(values, origins, depth)?;
+            }
+            DataType::Dictionary(key, value) if self.operator => {
+                self.enter_tree_node(depth)?;
+                self.inspect_type_tree(key, origins, depth)?;
+                self.enter_tree_node(depth)?;
+                self.inspect_type_tree(value, origins, depth)?;
+            }
             DataType::List(child) | DataType::LargeList(child) => {
                 self.inspect_field_at(child, origins, depth + 1)?;
             }
@@ -451,6 +503,32 @@ impl<'a> RootSchemaInspection<'a> {
                     self.charge_arc(zone.as_ref())?;
                 }
             }
+            DataType::FixedSizeList(child, _)
+            | DataType::ListView(child)
+            | DataType::LargeListView(child)
+                if self.operator =>
+            {
+                self.require_child(child, origins, depth, actual_array_type)?;
+            }
+            DataType::Float16
+            | DataType::Utf8View
+            | DataType::BinaryView
+            | DataType::Duration(_)
+            | DataType::Interval(_)
+                if self.operator => {}
+            DataType::Union(fields, _) if self.operator => {
+                self.preflight_auxiliary(fields.len())?;
+                let layout = Layout::array::<(i8, FieldRef)>(fields.len())
+                    .map_err(|_| RootSchemaBackingError::CapacityExceeded)?;
+                self.charge_arc_layout(layout)?;
+                for (_, field) in fields.iter() {
+                    self.require_child(field, origins, depth, actual_array_type)?;
+                }
+            }
+            DataType::RunEndEncoded(ends, values) if self.operator => {
+                self.require_child(ends, origins, depth, actual_array_type)?;
+                self.require_child(values, origins, depth, actual_array_type)?;
+            }
             DataType::List(child) | DataType::LargeList(child) | DataType::Map(child, _) => {
                 self.require_child(child, origins, depth, actual_array_type)?;
             }
@@ -470,6 +548,13 @@ impl<'a> RootSchemaInspection<'a> {
                 // The guarded key/value variants have no own variable heap.
                 // Their constant checks need no repeated auxiliary traversal;
                 // the tree walk separately counts both physical type nodes.
+            }
+            DataType::Dictionary(key, value) if self.operator => {
+                self.charge(Layout::new::<DataType>().size())?;
+                self.charge(Layout::new::<DataType>().size())?;
+                // The schema tree inspects boxed DataType children; actual
+                // physical key/value arrays each visit their own DataType.
+                let _ = (key, value);
             }
             _ => return Err(RootSchemaBackingError::UnsupportedType),
         }
@@ -539,7 +624,7 @@ impl<'a> RootSchemaInspection<'a> {
     }
 
     fn preflight_auxiliary(&self, nodes: usize) -> Result<(), RootSchemaBackingError> {
-        if nodes > MAX_AUXILIARY_NODES.saturating_sub(self.auxiliary_nodes) {
+        if nodes > self.auxiliary_limit.saturating_sub(self.auxiliary_nodes) {
             return Err(RootSchemaBackingError::WorkExceeded);
         }
         Ok(())

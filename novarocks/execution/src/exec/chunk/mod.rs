@@ -41,7 +41,7 @@ mod typed_array_normalization;
 pub(crate) mod typed_fixture;
 
 pub(crate) use additional_buffers::AdditionalBufferLedger;
-pub use chunk_impl::{Chunk, ChunkAccessFailure, ChunkBatchProjection};
+pub use chunk_impl::{Chunk, ChunkAccessFailure, ChunkBatchProjection, ChunkSourceBackingReceipt};
 pub use compiled_layout_metadata_request::{
     CompiledSchemaRequestFailure, original_compiled_schema_metadata_request,
 };
@@ -61,7 +61,9 @@ pub use root_array_storage::{
     ARROW_BUFFER_OWNER_METADATA_BOUND, RootArrayStorageError, RootArrayStorageLimits,
     borrowed_root_array_storage, borrowed_root_batch_storage,
 };
-pub use root_chunk_storage::{borrowed_root_chunk_schema_storage, borrowed_root_chunk_storage};
+pub use root_chunk_storage::{
+    OperatorStorageLimits, borrowed_root_chunk_schema_storage, borrowed_root_chunk_storage,
+};
 pub use schema::{ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 pub use slot_layout::SlotLayout;
 pub(crate) use source_authority::ChunkSourceAuthorityRef;
@@ -71,3 +73,6 @@ pub use typed_array_normalization::{
 };
 
 pub(crate) use schema::validate_chunk_carrier_encoding_observed;
+
+#[cfg(test)]
+mod operator_storage_tests;

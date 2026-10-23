@@ -888,53 +888,220 @@ pub(crate) fn checked_finish_package_with(
         .unwrap()
 }
 
-/// Both checked packages of one producer/stream/finisher plan.
-fn checked_writer_plan_packages(
-    recipe: c::ConnectorWriteRecipeDraft,
-    constant_row: bool,
-) -> BTreeMap<p::FragmentId, p::FragmentPackage> {
-    // A real producer/stream/finisher plan, with original cut derivation and
-    // full Package publication. There are no aggregate or function calls.
-    let pool = p::ConstantPoolId::new(5);
-    let ordinal = c::WriteTargetOrdinal::try_new(0).unwrap();
-    let edge = p::EdgeId::new(7);
-    let mut builder = p::FragmentBuilder::new(p::FragmentId::new(1));
-    let source = builder.reserve_node_id().unwrap();
+fn change_stream_source(
+    recipe: &c::ConnectorWriteRecipeDraft,
+    pool: p::ConstantPoolId,
+    route_edge: p::EdgeId,
+    summary_edge: p::EdgeId,
+) -> (p::Fragment, p::ValueId, p::LogicalSummaryOutput) {
+    let mut builder = p::FragmentBuilder::new(p::FragmentId::new(3));
+    let input = builder.reserve_node_id().unwrap();
     let expression = builder
         .add_expression(
-            source,
+            input,
             FunctionValueType::new(DataType::Int64, false),
-            if constant_row {
-                p::ExprKind::Constant(p::ConstantReference { pool, ordinal: 0 })
-            } else {
-                p::ExprKind::Literal(p::LiteralValue::Int64(42))
-            },
+            p::ExprKind::Constant(p::ConstantReference { pool, ordinal: 0 }),
         )
         .unwrap();
     let value = builder
         .add_value(
             FunctionValueType::new(DataType::Int64, false),
             p::ValueOrigin::NodeOutput {
-                node: source,
+                node: input,
                 output_ordinal: 0,
             },
         )
         .unwrap();
     builder
-        .insert_node_unchecked(p::PhysicalNode {
-            id: source,
-            inputs: Box::default(),
-            required_inputs: Box::default(),
-            output_properties: property(p::Distribution::Singleton),
-            output: p::OutputPort {
-                node: source,
-                columns: Box::from([value]),
+        .add_values(
+            input,
+            Box::from([Box::from([expression])]),
+            Box::from([value]),
+        )
+        .unwrap();
+    let expand = builder.reserve_node_id().unwrap();
+    let assignment = builder
+        .add_expression(
+            expand,
+            FunctionValueType::new(DataType::Int64, false),
+            p::ExprKind::Value(value),
+        )
+        .unwrap();
+    let effect = builder
+        .add_value(
+            FunctionValueType::new(DataType::Int8, false),
+            p::ValueOrigin::NodeOutput {
+                node: expand,
+                output_ordinal: 0,
             },
-            kind: p::NodeKind::Values {
-                rows: Box::from([Box::from([expression])]),
+        )
+        .unwrap();
+    let routed = builder
+        .add_value(
+            FunctionValueType::new(DataType::Int64, false),
+            p::ValueOrigin::NodeOutput {
+                node: expand,
+                output_ordinal: 1,
+            },
+        )
+        .unwrap();
+    builder
+        .insert_node_unchecked(p::PhysicalNode {
+            id: expand,
+            inputs: Box::from([input]),
+            required_inputs: Box::from([property(p::Distribution::Unconstrained)]),
+            output_properties: property(p::Distribution::Unconstrained),
+            output: p::OutputPort {
+                node: expand,
+                columns: Box::from([effect, routed]),
+            },
+            kind: p::NodeKind::ChangeEventExpand {
+                events: Box::from([p::ChangeEventSpec {
+                    predicate: None,
+                    effect: c::ConnectorRowMutationEffect::Insert,
+                    assignments: Box::from([(routed, Some(assignment))]),
+                }]),
+                effect_output: effect,
             },
         })
         .unwrap();
+    let mut add_count = |field| {
+        builder
+            .add_value(
+                FunctionValueType::new(DataType::Int64, false),
+                p::ValueOrigin::LogicalSummary { field },
+            )
+            .unwrap()
+    };
+    let summary = p::LogicalSummaryOutput {
+        edge: summary_edge,
+        columns: p::LogicalSummaryColumns {
+            inserted: add_count(p::LogicalChangeCountField::Inserted),
+            replaced: add_count(p::LogicalChangeCountField::Replaced),
+            deleted: add_count(p::LogicalChangeCountField::Deleted),
+        },
+    };
+    let fragment = builder
+        .finish_definition(
+            expand,
+            p::FragmentSink::Router {
+                summary,
+                effect,
+                routes: Box::from([p::ChangeStreamRoute {
+                    route_id: c::ConnectorWriteRouteId::from_bytes([9; 32]),
+                    write_target_ordinal: c::WriteTargetOrdinal::try_new(0).unwrap(),
+                    accepted_effects: Box::from([c::ConnectorRowMutationEffect::Insert]),
+                    input_mapping: Box::from([(
+                        recipe.input().fields_iter().next().unwrap().token(),
+                        routed,
+                    )]),
+                    requirements: p::WriteRouteRequirements {
+                        colocation: p::WriteColocation::Singleton,
+                        layout: p::WriteLayoutPreference::ClusterBy(Box::from([routed])),
+                    },
+                    edge: route_edge,
+                }]),
+            },
+            dop(),
+            p::StagePlacementPolicy::Spread {
+                max_instances: std::num::NonZeroU32::new(3),
+            },
+        )
+        .unwrap();
+    (fragment, routed, summary)
+}
+
+/// All packages of one independently authored Router/writer/summary/finish graph.
+pub(crate) fn checked_change_stream_packages(
+    recipe: c::ConnectorWriteRecipeDraft,
+) -> BTreeMap<p::FragmentId, p::FragmentPackage> {
+    checked_writer_plan_packages_inner(recipe, true, true)
+}
+
+/// Both checked packages of one producer/stream/finisher plan.
+fn checked_writer_plan_packages(
+    recipe: c::ConnectorWriteRecipeDraft,
+    constant_row: bool,
+) -> BTreeMap<p::FragmentId, p::FragmentPackage> {
+    checked_writer_plan_packages_inner(recipe, constant_row, false)
+}
+
+fn checked_writer_plan_packages_inner(
+    recipe: c::ConnectorWriteRecipeDraft,
+    constant_row: bool,
+    change_stream: bool,
+) -> BTreeMap<p::FragmentId, p::FragmentPackage> {
+    // A real producer/stream/finisher plan, with original cut derivation and
+    // full Package publication. There are no aggregate or function calls.
+    let pool = p::ConstantPoolId::new(5);
+    let ordinal = c::WriteTargetOrdinal::try_new(0).unwrap();
+    let edge = p::EdgeId::new(7);
+    let route_edge = p::EdgeId::new(8);
+    let summary_edge = p::EdgeId::new(9);
+    let router =
+        change_stream.then(|| change_stream_source(&recipe, pool, route_edge, summary_edge));
+    let mut builder = p::FragmentBuilder::new(p::FragmentId::new(1));
+    let (source, value) = if let Some((_, route_value, _)) = &router {
+        let source = builder.reserve_node_id().unwrap();
+        let value = builder
+            .add_value(
+                FunctionValueType::new(DataType::Int64, false),
+                p::ValueOrigin::ExchangeImport {
+                    edge: route_edge,
+                    source_value: *route_value,
+                },
+            )
+            .unwrap();
+        builder
+            .add_exchange_source(
+                source,
+                route_edge,
+                Box::from([(*route_value, value)]),
+                Box::from([value]),
+                p::Distribution::Singleton,
+                p::RowMultiplicity::SingleCopy,
+            )
+            .unwrap();
+        (source, value)
+    } else {
+        let source = builder.reserve_node_id().unwrap();
+        let expression = builder
+            .add_expression(
+                source,
+                FunctionValueType::new(DataType::Int64, false),
+                if constant_row {
+                    p::ExprKind::Constant(p::ConstantReference { pool, ordinal: 0 })
+                } else {
+                    p::ExprKind::Literal(p::LiteralValue::Int64(42))
+                },
+            )
+            .unwrap();
+        let value = builder
+            .add_value(
+                FunctionValueType::new(DataType::Int64, false),
+                p::ValueOrigin::NodeOutput {
+                    node: source,
+                    output_ordinal: 0,
+                },
+            )
+            .unwrap();
+        builder
+            .insert_node_unchecked(p::PhysicalNode {
+                id: source,
+                inputs: Box::default(),
+                required_inputs: Box::default(),
+                output_properties: property(p::Distribution::Singleton),
+                output: p::OutputPort {
+                    node: source,
+                    columns: Box::from([value]),
+                },
+                kind: p::NodeKind::Values {
+                    rows: Box::from([Box::from([expression])]),
+                },
+            })
+            .unwrap();
+        (source, value)
+    };
     let writer = builder.reserve_node_id().unwrap();
     let fields = relation_fields(&mut builder, writer, false);
     let recipe_field = recipe.input().fields_iter().next().unwrap();
@@ -1020,25 +1187,74 @@ fn checked_writer_plan_packages(
             },
         })
         .unwrap();
+    let summary_input = router.as_ref().map(|(_, _, summary)| {
+        let node = builder.reserve_node_id().unwrap();
+        let original = [
+            summary.columns.inserted,
+            summary.columns.replaced,
+            summary.columns.deleted,
+        ];
+        let mut imports = Vec::new();
+        for source_value in original {
+            let value = builder
+                .add_value(
+                    FunctionValueType::new(DataType::Int64, false),
+                    p::ValueOrigin::ExchangeImport {
+                        edge: summary_edge,
+                        source_value,
+                    },
+                )
+                .unwrap();
+            imports.push((source_value, value));
+        }
+        builder
+            .add_exchange_source(
+                node,
+                summary_edge,
+                imports.clone().into_boxed_slice(),
+                imports.iter().map(|(_, value)| *value).collect(),
+                p::Distribution::Singleton,
+                p::RowMultiplicity::SingleCopy,
+            )
+            .unwrap();
+        (
+            node,
+            p::LogicalSummaryColumns {
+                inserted: imports[0].1,
+                replaced: imports[1].1,
+                deleted: imports[2].1,
+            },
+        )
+    });
     let finish = builder.reserve_node_id().unwrap();
     let outputs = relation_fields(&mut builder, finish, true);
     builder
         .insert_node_unchecked(p::PhysicalNode {
             id: finish,
-            inputs: Box::from([exchange]),
-            required_inputs: Box::from([property(p::Distribution::Singleton)]),
+            inputs: std::iter::once(exchange)
+                .chain(summary_input.map(|(node, _)| node))
+                .collect(),
+            required_inputs: std::iter::repeat_n(
+                property(p::Distribution::Singleton),
+                1 + usize::from(summary_input.is_some()),
+            )
+            .collect(),
             output_properties: property(p::Distribution::Singleton),
             output: p::OutputPort {
                 node: finish,
                 columns: outputs.iter().map(|field| field.value).collect(),
             },
             kind: p::NodeKind::TableFinish(p::WriterFinishSpec {
-                count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
+                count_mode: if change_stream {
+                    p::FinishCountMode::LogicalChanges
+                } else {
+                    p::FinishCountMode::WriterReported
+                },
                 inputs: novarocks_physical_plan::FinishInputs {
                     writer_results: 0,
-                    logical_summary: None,
+                    logical_summary: summary_input.map(|_| 1),
                 },
-                logical_summary: None,
+                logical_summary: summary_input.map(|(_, columns)| columns),
                 expected_target_ordinals: Box::from([ordinal]),
                 input_schema: p::WriterRelationSchema {
                     revision: p::WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -1086,6 +1302,66 @@ fn checked_writer_plan_packages(
             )
             .unwrap(),
         )
+        .unwrap();
+    }
+    if let Some((router_fragment, route_value, summary)) = router {
+        let source_id = router_fragment.id();
+        plan.add_fragment(router_fragment).unwrap();
+        plan.add_edge(p::Edge {
+            role: p::OutputRole::ProviderRoute { target: ordinal },
+            delivery: p::DeliveryRequirement::MustDrain,
+            id: route_edge,
+            kind: p::EdgeKind::ChangeStreamRouter,
+            source: p::EdgeSource {
+                port: p::FragmentOutputPort::Root,
+                fragment: source_id,
+                projection: Box::from([route_value]),
+            },
+            destination: p::EdgeDestination {
+                fragment: producer.id(),
+                node: source,
+                receive_mapping: Box::from([(route_value, value)]),
+            },
+            partitioning: p::EdgePartitioning {
+                source: p::Distribution::Singleton,
+                source_multiplicity: p::RowMultiplicity::SingleCopy,
+                destination: p::Distribution::Singleton,
+                destination_multiplicity: p::RowMultiplicity::SingleCopy,
+            },
+        })
+        .unwrap();
+        let (summary_node, imported) =
+            summary_input.expect("an actual Router always has its exact summary input");
+        plan.add_edge(p::Edge {
+            role: p::OutputRole::LogicalSummary,
+            delivery: p::DeliveryRequirement::MustDrain,
+            id: summary_edge,
+            kind: p::EdgeKind::Stream,
+            source: p::EdgeSource {
+                port: p::FragmentOutputPort::LogicalSummary,
+                fragment: source_id,
+                projection: Box::from([
+                    summary.columns.inserted,
+                    summary.columns.replaced,
+                    summary.columns.deleted,
+                ]),
+            },
+            destination: p::EdgeDestination {
+                fragment: consumer.id(),
+                node: summary_node,
+                receive_mapping: Box::from([
+                    (summary.columns.inserted, imported.inserted),
+                    (summary.columns.replaced, imported.replaced),
+                    (summary.columns.deleted, imported.deleted),
+                ]),
+            },
+            partitioning: p::EdgePartitioning {
+                source: p::Distribution::Singleton,
+                source_multiplicity: p::RowMultiplicity::SingleCopy,
+                destination: p::Distribution::Singleton,
+                destination_multiplicity: p::RowMultiplicity::SingleCopy,
+            },
+        })
         .unwrap();
     }
     plan.add_fragment(producer).unwrap();
@@ -1137,7 +1413,7 @@ fn checked_writer_plan_packages(
             .map(|(ordinal, (_, root))| {
                 assert!(matches!(
                     fragment.expressions().get(root.expr).unwrap().kind,
-                    p::ExprKind::Literal(_) | p::ExprKind::Constant(_)
+                    p::ExprKind::Literal(_) | p::ExprKind::Constant(_) | p::ExprKind::Value(_)
                 ));
                 ExpressionInvocation {
                     context: ExpressionEffectContext {

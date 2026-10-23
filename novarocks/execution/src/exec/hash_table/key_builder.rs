@@ -707,6 +707,48 @@ pub(crate) fn encode_group_key_row_tracked(
     Ok(Some(out))
 }
 
+/// Encode a tuple under one immutable key schema. Every nullable component is
+/// framed independently, including nested lengths and the existing canonical
+/// scalar tags. The caller retains and checks the complete schema; the bytes
+/// are never a replacement for that type authority.
+pub(crate) fn encode_canonical_tuple_row_tracked<'a, I>(
+    columns: I,
+    row: usize,
+    allocator: AggregateAllocator,
+) -> ExecutionResult<AggregateVec<u8>>
+where
+    I: Iterator<Item = ExecutionResult<&'a ArrayRef>> + Clone,
+{
+    let mut length = 0usize;
+    for column in columns.clone() {
+        let column = column?;
+        if row >= column.len() {
+            return Err(group_key_encoding_contract(
+                "canonical tuple row exceeds its column",
+            ));
+        }
+        let part = if column.is_null(row) {
+            1
+        } else {
+            5usize
+                .checked_add(encoded_group_key_non_null_len(column, row)?)
+                .ok_or_else(group_key_request_arithmetic)?
+        };
+        length = length
+            .checked_add(part)
+            .ok_or_else(group_key_request_arithmetic)?;
+    }
+    let mut output = AggregateVec::new_in(allocator.clone());
+    output
+        .try_reserve_exact(length)
+        .map_err(|source| allocator.allocation_error("reserve canonical tuple key", source))?;
+    for column in columns {
+        encode_nullable_nested(column?, row, &mut output, "tuple key component")?;
+    }
+    debug_assert_eq!(output.len(), length);
+    Ok(output)
+}
+
 trait KeyByteSink {
     fn push_byte(&mut self, value: u8) -> ExecutionResult<()>;
     fn extend_bytes(&mut self, values: &[u8]) -> ExecutionResult<()>;
@@ -2901,3 +2943,7 @@ mod decoding_failure_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "canonical_tuple_tests.rs"]
+mod canonical_tuple_tests;

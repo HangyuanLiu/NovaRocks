@@ -1408,13 +1408,23 @@ fn unsupported_scan_shapes_are_refused_explicitly() {
             "provider relation other than a table",
         );
     }
-    refused(
-        Spec {
-            kind: ConnectorReadRelationKind::ChangeWindow,
-            ..Spec::slice()
-        },
-        "provider relation other than a table",
-    );
+}
+
+#[test]
+fn change_window_uses_the_frozen_provider_work_unit_and_exact_output_types() {
+    let source = Spec {
+        kind: ConnectorReadRelationKind::ChangeWindow,
+        ..Spec::slice()
+    };
+    let program = compile(source).expect("a frozen ChangeWindow compiles through the scan owner");
+    assert_eq!(program.scan_inputs().len(), 1);
+    let graph = program.graph();
+    let scan = graph
+        .nodes()
+        .iter()
+        .find(|node| matches!(node.kind(), ProgramNodeKind::Scan { .. }))
+        .expect("a provider scan");
+    assert_eq!(scan.output_layout().schema().as_ref(), &public_schema());
 }
 
 #[test]

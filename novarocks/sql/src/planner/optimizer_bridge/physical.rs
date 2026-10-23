@@ -20,7 +20,7 @@ use super::scalar::{
     materialize, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
     materialize_sort_keys, materialize_window_exprs,
 };
-use crate::analysis::{ExprKind, TypedExpr};
+use crate::analysis::{ExprKind, ProjectItem, TypedExpr};
 use crate::common::{JoinKind, OutputColumn};
 use crate::optimizer::operator::{Operator, PhysicalDistributionOp};
 use crate::optimizer::optimized_tree::{JoinExecutionDistribution, OptimizedOperatorNode};
@@ -42,6 +42,7 @@ use crate::planner::physical::{
 
 struct BridgeCtx<'a> {
     scalars: &'a ScalarArena,
+    next_scan_column: std::cell::Cell<u32>,
 }
 
 impl BridgeCtx<'_> {
@@ -63,13 +64,185 @@ impl BridgeCtx<'_> {
 
         let output_columns = physical_node_output_columns(node)?;
 
-        Ok(PhysicalPlanNode {
+        let plan = PhysicalPlanNode {
             kind,
             children,
             output_columns,
             stats: planner_stats(node),
             probe_runtime_filters: vec![],
-        })
+        };
+        self.materialize_change_window_sign(node, plan)
+    }
+
+    /// The private IMV algebra uses Int8. Its provider scan must publish the
+    /// exact Int32 schema, with a real cast restoring the original internal
+    /// identity before any parent consumes the action column.
+    fn materialize_change_window_sign(
+        &self,
+        original: &OptimizedOperatorNode,
+        mut plan: PhysicalPlanNode,
+    ) -> Result<PhysicalPlanNode, String> {
+        use crate::planner::imv_rewrite::action_column::ImvActionColumn;
+        use crate::planner::table::{ScanSource, SqlScanKind};
+        use arrow::datatypes::DataType;
+        let PhysicalPlanKind::Scan(scan) = &mut plan.kind else {
+            return Ok(plan);
+        };
+        let ScanSource::Sql(source) = &scan.table.source;
+        if !matches!(source.kind, SqlScanKind::Delta { .. }) {
+            return Ok(plan);
+        }
+        let actions = scan
+            .columns
+            .iter()
+            .filter(|column| ImvActionColumn::matches(column))
+            .cloned()
+            .collect::<Vec<_>>();
+        let [internal] = actions.as_slice() else {
+            return Err("ChangeWindow scan must declare exactly one internal action column".into());
+        };
+        if internal.value_type.data_type() != &DataType::Int8 || internal.value_type.nullable() {
+            return Err("ChangeWindow internal action must be non-null Int8 before physical materialization".into());
+        }
+        let raw_id = crate::column_id::ColumnId(self.next_scan_column.get());
+        self.next_scan_column.set(
+            raw_id.0.checked_add(1).ok_or_else(|| {
+                "ChangeWindow physical column identity space exhausted".to_string()
+            })?,
+        );
+        let mut raw = internal.clone();
+        raw.column_id = raw_id;
+        raw.value_type = novarocks_type_contract::FunctionValueType::new(DataType::Int32, false);
+        for column in &mut scan.columns {
+            if column.column_id == internal.column_id {
+                *column = raw.clone();
+            }
+        }
+        if let Some(required) = &mut scan.required_columns {
+            for column in required {
+                if *column == internal.column_id {
+                    *column = raw_id;
+                }
+            }
+        }
+        // A predicate on the internal sign belongs after its cast. Other scan
+        // predicates retain their original provider pushdown opportunity.
+        let Operator::PhysicalScan(scan_op) = &original.op else {
+            unreachable!()
+        };
+        let mut retained = Vec::new();
+        let mut residual = Vec::new();
+        for (scalar, predicate) in scan_op
+            .predicates
+            .iter()
+            .zip(std::mem::take(&mut scan.predicates))
+        {
+            let refs =
+                crate::optimizer::scalar_expr::collect_column_ids_strict(self.scalars, *scalar)
+                    .ok_or_else(|| {
+                        "ChangeWindow scan predicate has unresolved column references".to_string()
+                    })?;
+            if refs.contains(&internal.column_id) {
+                residual.push(predicate);
+            } else {
+                retained.push(predicate);
+            }
+        }
+        scan.predicates = retained;
+        let requested_outputs = plan.output_columns.clone();
+        let hidden_action = !requested_outputs
+            .iter()
+            .any(|column| column.column_id == internal.column_id);
+        if hidden_action && residual.is_empty() {
+            return Ok(plan);
+        }
+        let mut internal_outputs = requested_outputs.clone();
+        if hidden_action {
+            // A pushed predicate may need a sign that the scan's consumer did
+            // not request. Retain it through the residual, then project it away.
+            internal_outputs.push(internal.clone());
+            plan.output_columns.push(raw.clone());
+            if let Some(required) = &mut scan.required_columns {
+                required.push(raw_id);
+            }
+        }
+        for column in &mut plan.output_columns {
+            if column.column_id == internal.column_id {
+                *column = raw.clone();
+            }
+        }
+        let items = internal_outputs
+            .iter()
+            .map(|column| {
+                let is_action = column.column_id == internal.column_id;
+                let input = if is_action { &raw } else { column };
+                let source = TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: input.column_id,
+                        qualifier: None,
+                        column: input.name.clone(),
+                    },
+                    value_type: input.value_type.clone(),
+                };
+                ProjectItem {
+                    expr: if is_action {
+                        TypedExpr {
+                            kind: ExprKind::Cast {
+                                expr: Box::new(source),
+                                target: DataType::Int8,
+                                decimal_overflow_policy:
+                                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                            },
+                            value_type: internal.value_type.clone(),
+                        }
+                    } else {
+                        source
+                    },
+                    output_name: column.name.clone(),
+                    output_column_id: column.column_id,
+                }
+            })
+            .collect();
+        let mut projected = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Project(PlanProjectNode {
+                items,
+                output_qualifier: None,
+            }),
+            stats: plan.stats.clone(),
+            probe_runtime_filters: Vec::new(),
+            output_columns: internal_outputs,
+            children: vec![plan],
+        };
+        for predicate in residual {
+            projected = PhysicalPlanNode {
+                kind: PhysicalPlanKind::Filter(PlanFilterNode { predicate }),
+                stats: projected.stats.clone(),
+                probe_runtime_filters: Vec::new(),
+                output_columns: projected.output_columns.clone(),
+                children: vec![projected],
+            };
+        }
+        if hidden_action {
+            let items = requested_outputs
+                .iter()
+                .map(|column| ProjectItem {
+                    expr: output_column_ref(column),
+                    output_name: column.name.clone(),
+                    output_column_id: column.column_id,
+                })
+                .collect();
+            projected = PhysicalPlanNode {
+                kind: PhysicalPlanKind::Project(PlanProjectNode {
+                    items,
+                    output_qualifier: None,
+                }),
+                stats: projected.stats.clone(),
+                probe_runtime_filters: Vec::new(),
+                output_columns: requested_outputs,
+                children: vec![projected],
+            };
+        }
+        Ok(projected)
     }
 
     fn convert_kind(&self, node: &OptimizedOperatorNode) -> Result<PhysicalPlanKind, String> {
@@ -802,7 +975,35 @@ pub(super) fn materialize_physical_plan(
         .scalar_arena
         .as_deref()
         .ok_or_else(|| "Bridge 2a requires OptimizedOperatorNode.scalar_arena".to_string())?;
-    BridgeCtx { scalars }.convert_node(root)
+    fn max_column(node: &OptimizedOperatorNode) -> u32 {
+        let outputs = node
+            .output_columns
+            .iter()
+            .map(|column| column.column_id.0)
+            .max()
+            .unwrap_or(0);
+        let scan = match &node.op {
+            Operator::PhysicalScan(scan) => scan
+                .columns
+                .iter()
+                .map(|column| column.column_id.0)
+                .max()
+                .unwrap_or(0),
+            _ => 0,
+        };
+        node.children
+            .iter()
+            .map(max_column)
+            .fold(outputs.max(scan), u32::max)
+    }
+    let next_scan_column = max_column(root)
+        .checked_add(1)
+        .ok_or_else(|| "ChangeWindow physical column identity space exhausted".to_string())?;
+    BridgeCtx {
+        scalars,
+        next_scan_column: std::cell::Cell::new(next_scan_column),
+    }
+    .convert_node(root)
 }
 
 #[cfg(test)]
@@ -1091,6 +1292,143 @@ mod tests {
 
         assert!(matches!(physical.kind, PhysicalPlanKind::Scan(_)));
         assert_output_columns_eq(&physical.output_columns, &[output_column(2, "s")]);
+    }
+
+    fn delta_sign_scan(
+        value_type: novarocks_type_contract::FunctionValueType,
+    ) -> OptimizedOperatorNode {
+        let mut action = crate::planner::imv_rewrite::action_column::ImvActionColumn::output_column(
+            ColumnId::new_for_test(11),
+        );
+        action.value_type = value_type;
+        let columns = vec![output_column(1, "id"), action];
+        let mut table = table_def(&columns[..1]);
+        crate::planner::imv_rewrite::action_column::ImvActionColumn::ensure_metadata_column(
+            &mut table.iceberg_row_lineage_metadata_columns,
+        );
+        table.source = crate::compiler::mv_rewrite::test_scan_source(
+            crate::planner::table::SqlScanKind::Delta {
+                from_snapshot_id: 7,
+                to_snapshot_id: 11,
+            },
+        );
+        let mut node = base_node(Operator::PhysicalScan(ScanOp {
+            database: "db".into(),
+            table,
+            alias: None,
+            stats_ref: None,
+            columns: columns.clone(),
+            predicates: vec![],
+            required_columns: None,
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        }));
+        node.output_columns = columns;
+        attach_arena(node, Arc::new(ScalarArena::new()))
+    }
+
+    #[test]
+    fn change_window_materializes_exact_int32_scan_and_explicit_int8_identity() {
+        use arrow::datatypes::DataType;
+        let source = delta_sign_scan(novarocks_type_contract::FunctionValueType::new(
+            DataType::Int8,
+            false,
+        ));
+        let plan = super::super::to_physical_plan(&source).unwrap();
+        let PhysicalPlanKind::Project(project) = &plan.kind else {
+            panic!("expected physical sign cast")
+        };
+        let PhysicalPlanKind::Scan(scan) = &plan.children[0].kind else {
+            panic!("expected raw provider scan")
+        };
+        assert_eq!(scan.columns[1].column_id, ColumnId::new_for_test(12));
+        assert_eq!(scan.columns[1].value_type.data_type(), &DataType::Int32);
+        assert!(!scan.columns[1].value_type.nullable());
+        assert_eq!(
+            plan.children[0].output_columns[1].column_id,
+            ColumnId::new_for_test(12)
+        );
+        assert_eq!(plan.output_columns[1].column_id, ColumnId::new_for_test(11));
+        assert_eq!(
+            project.items[1].output_column_id,
+            ColumnId::new_for_test(11)
+        );
+        assert!(matches!(&project.items[1].expr.kind,
+            ExprKind::Cast { target: DataType::Int8, expr, .. }
+            if expr.value_type.data_type() == &DataType::Int32
+            && matches!(expr.kind, ExprKind::ColumnRef { column_id: ColumnId(12), .. })));
+    }
+
+    #[test]
+    fn change_window_keeps_a_pruned_sign_until_its_residual_predicate() {
+        use arrow::datatypes::DataType;
+        let mut source = delta_sign_scan(novarocks_type_contract::FunctionValueType::new(
+            DataType::Int8,
+            false,
+        ));
+        let mut arena = source
+            .execution_props
+            .scalar_arena
+            .as_deref()
+            .unwrap()
+            .clone();
+        let sign = arena.intern(
+            crate::optimizer::scalar::ScalarNode::ColumnRef(ColumnId(11)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+        );
+        let zero = arena.intern(
+            crate::optimizer::scalar::ScalarNode::Literal(
+                crate::optimizer::scalar::HashableLiteral(LiteralValue::Int(0)),
+            ),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+        );
+        let predicate = arena.intern(
+            crate::optimizer::scalar::ScalarNode::BinaryOp {
+                op: crate::common::BinOp::Gt,
+                left: sign,
+                right: zero,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+        );
+        let Operator::PhysicalScan(scan) = &mut source.op else {
+            unreachable!()
+        };
+        scan.predicates = vec![predicate];
+        scan.required_columns = Some(vec![ColumnId(1)]);
+        source.output_columns.truncate(1);
+        source.execution_props.scalar_arena = Some(Arc::new(arena));
+        let plan = super::super::to_physical_plan(&source).unwrap();
+        assert_eq!(
+            plan.output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![ColumnId(1)]
+        );
+        let filter = &plan.children[0];
+        assert!(matches!(filter.kind, PhysicalPlanKind::Filter(_)));
+        assert_eq!(filter.output_columns[1].column_id, ColumnId(11));
+        let cast = &filter.children[0];
+        assert!(matches!(cast.kind, PhysicalPlanKind::Project(_)));
+        let PhysicalPlanKind::Scan(scan) = &cast.children[0].kind else {
+            panic!("expected provider scan")
+        };
+        assert!(scan.predicates.is_empty());
+        assert_eq!(scan.required_columns, Some(vec![ColumnId(1), ColumnId(12)]));
+        assert_eq!(scan.columns[1].value_type.data_type(), &DataType::Int32);
+    }
+
+    #[test]
+    fn change_window_rejects_wrong_or_nullable_internal_sign_declarations() {
+        use arrow::datatypes::DataType;
+        for declaration in [
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int8, true),
+        ] {
+            let error = super::super::to_physical_plan(&delta_sign_scan(declaration)).unwrap_err();
+            assert!(error.contains("non-null Int8"), "{error}");
+        }
     }
 
     #[test]

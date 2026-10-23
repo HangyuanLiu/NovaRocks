@@ -197,14 +197,22 @@ pub fn encode_permit_grant(value: ExchangePermitGrant) -> wire::ExchangePermitGr
     }
 }
 
-/// Structural validation only. Token single-claim state and actual IPC geometry
-/// belong to the receiving owner and must still be checked before allocation.
-pub fn validate_permitted_frame(
+/// Exact structural facts of a frame, without a capacity or token-use grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidatedExchangeFrameEnvelope {
+    pub sequence: ExchangeFrameSequence,
+    pub kind: ExchangeFrameKind,
+    pub token: ExchangePermitToken,
+}
+
+/// Validate the original frame envelope even when its receiver is closed.
+/// Retirement does not excuse malformed identities, tokens, kinds or EOS data.
+pub fn validate_frame_envelope(
     value: &wire::ExchangeRequest,
-    expected: ExchangePermitGrant,
+    expected_stream: ExchangeStreamIdentity,
     expected_sender_count: u32,
     path: FieldPath,
-) -> Result<(), ProtocolError> {
+) -> Result<ValidatedExchangeFrameEnvelope, ProtocolError> {
     let stream = decode_stream(
         value
             .stream
@@ -212,7 +220,7 @@ pub fn validate_permitted_frame(
             .ok_or_else(|| missing(path.field("stream"), "exchange frame stream is required"))?,
         path.field("stream"),
     )?;
-    if stream != expected.request.stream
+    if stream != expected_stream
         || value.finst_id_hi != stream.destination_fragment_instance_id().high()
         || value.finst_id_lo != stream.destination_fragment_instance_id().low()
         || value.node_id != stream.destination_node().get()
@@ -228,20 +236,55 @@ pub fn validate_permitted_frame(
             "exchange frame does not match its frozen stream",
         ));
     }
-    if decode_sequence(value.sequence, path.field("sequence"))? != expected.request.sequence {
+    let sequence = decode_sequence(value.sequence, path.field("sequence"))?;
+    let kind = decode_kind(value.frame_kind, path.field("frame_kind"))?;
+    if value.eos != (kind == ExchangeFrameKind::End) {
+        return Err(inconsistent(
+            path.field("eos"),
+            "exchange frame kind differs from EOS",
+        ));
+    }
+    if kind == ExchangeFrameKind::End && !value.payload.is_empty() {
+        return Err(inconsistent(
+            path.field("payload"),
+            "exchange End frame must have an empty payload",
+        ));
+    }
+    let token = decode_token(&value.permit_token, path.field("permit_token"))?;
+    Ok(ValidatedExchangeFrameEnvelope {
+        sequence,
+        kind,
+        token,
+    })
+}
+
+/// Structural validation only. Token single-claim state and actual IPC geometry
+/// belong to the receiving owner and must still be checked before allocation.
+pub fn validate_permitted_frame(
+    value: &wire::ExchangeRequest,
+    expected: ExchangePermitGrant,
+    expected_sender_count: u32,
+    path: FieldPath,
+) -> Result<(), ProtocolError> {
+    let envelope = validate_frame_envelope(
+        value,
+        expected.request.stream,
+        expected_sender_count,
+        path.clone(),
+    )?;
+    if envelope.sequence != expected.request.sequence {
         return Err(inconsistent(
             path.field("sequence"),
             "exchange frame sequence does not match its grant",
         ));
     }
-    let kind = decode_kind(value.frame_kind, path.field("frame_kind"))?;
-    if kind != expected.request.kind || value.eos != (kind == ExchangeFrameKind::End) {
+    if envelope.kind != expected.request.kind {
         return Err(inconsistent(
             path.field("frame_kind"),
-            "exchange frame kind does not match its grant and EOS",
+            "exchange frame kind does not match its grant",
         ));
     }
-    if decode_token(&value.permit_token, path.field("permit_token"))? != expected.token {
+    if envelope.token != expected.token {
         return Err(inconsistent(
             path.field("permit_token"),
             "exchange permit token does not match its grant",

@@ -115,6 +115,100 @@ pub struct IpcStreamSchemaFacts<'a> {
     source: &'a Schema,
     fields: usize,
     dictionaries: usize,
+    views: usize,
+    types: usize,
+    string_bytes: usize,
+    wire: IpcStreamWireFacts,
+    construction_upper: usize,
+}
+impl IpcStreamSchemaFacts<'_> {
+    pub fn wire(&self) -> IpcStreamWireFacts {
+        self.wire
+    }
+    pub fn field_occurrences(&self) -> usize {
+        self.fields
+    }
+    pub fn type_occurrences(&self) -> usize {
+        self.types
+    }
+    pub fn string_bytes(&self) -> usize {
+        self.string_bytes
+    }
+    pub fn dictionary_occurrences(&self) -> usize {
+        self.dictionaries
+    }
+    pub fn construction_upper_bound(&self) -> usize {
+        self.construction_upper
+    }
+}
+
+/// Size-only outputs of the SAME pinned writer traversal. Framing includes
+/// alignment and continuation prefixes; the terminal marker is stream-owned.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IpcStreamWireFacts {
+    wire_bytes: usize,
+    metadata_bytes: usize,
+    max_message_metadata: usize,
+    dictionary_messages: usize,
+    variadic_buffers: usize,
+    body_bytes: usize,
+    messages: usize,
+    field_nodes: usize,
+    buffers: usize,
+    variadic_counts: usize,
+}
+impl IpcStreamWireFacts {
+    pub fn wire_bytes_upper_bound(self) -> usize {
+        self.wire_bytes
+    }
+    pub fn metadata_bytes_upper_bound(self) -> usize {
+        self.metadata_bytes
+    }
+    pub fn body_bytes_upper_bound(self) -> usize {
+        self.body_bytes
+    }
+    pub fn message_count_upper_bound(self) -> usize {
+        self.messages
+    }
+    pub fn field_nodes_upper_bound(self) -> usize {
+        self.field_nodes
+    }
+    pub fn buffers_upper_bound(self) -> usize {
+        self.buffers
+    }
+    pub fn variadic_counts_upper_bound(self) -> usize {
+        self.variadic_counts
+    }
+    pub fn max_message_metadata_upper_bound(self) -> usize {
+        self.max_message_metadata
+    }
+    pub fn dictionary_messages_upper_bound(self) -> usize {
+        self.dictionary_messages
+    }
+    pub fn variadic_buffers_upper_bound(self) -> usize {
+        self.variadic_buffers
+    }
+    fn message(
+        &mut self,
+        metadata: usize,
+        body: &Body,
+        dictionary: bool,
+    ) -> Result<(), IpcGeometryError> {
+        self.wire_bytes = add(
+            self.wire_bytes,
+            add(align(add(metadata, 8)?)?, body.copied)?,
+        )?;
+        self.metadata_bytes = add(self.metadata_bytes, metadata)?;
+        self.max_message_metadata = self.max_message_metadata.max(metadata);
+        self.dictionary_messages = add(self.dictionary_messages, usize::from(dictionary))?;
+        self.variadic_buffers = add(self.variadic_buffers, body.variadic_buffers)?;
+        self.body_bytes = add(self.body_bytes, body.copied)?;
+        self.messages = add(self.messages, 1)?;
+        self.field_nodes = add(self.field_nodes, body.nodes)?;
+        self.buffers = add(self.buffers, body.buffers)?;
+        self.variadic_counts = add(self.variadic_counts, body.variadic_counts)?;
+        Ok(())
+    }
 }
 #[derive(Default)]
 struct Counts {
@@ -127,6 +221,7 @@ struct Counts {
     unions: usize,
     union_requests: usize,
     dictionaries: usize,
+    views: usize,
 }
 impl Counts {
     fn field(&mut self, field: &Field) -> Result<(), IpcGeometryError> {
@@ -145,6 +240,9 @@ impl Counts {
     }
     fn ty(&mut self, ty: &DataType) -> Result<(), IpcGeometryError> {
         self.types = add(self.types, 1)?;
+        if matches!(ty, DataType::Utf8View | DataType::BinaryView) {
+            self.views = add(self.views, 1)?;
+        }
         let arity = type_header_geometry(ty);
         self.children = add(self.children, arity.children)?;
         self.child_requests = add(self.child_requests, usize::from(arity.children != 0))?;
@@ -243,15 +341,24 @@ pub fn observe_stream_writer_schema_construction<'a, H>(
     creation
         .observe_opaque_upper_bound(add(metrics.request_bytes, dynamic.bytes)?)
         .map_err(IpcConstructionError::Creator)?;
+    let mut wire = IpcStreamWireFacts::default();
+    wire.message(backing, &Body::default(), false)?;
     Ok(IpcStreamSchemaFacts {
         source: schema,
         fields: counts.fields,
         dictionaries: counts.dictionaries,
+        views: counts.views,
+        types: counts.types,
+        string_bytes: counts.string_bytes,
+        wire,
+        construction_upper: add(metrics.request_bytes, dynamic.bytes)?,
     })
 }
 
 #[derive(Default)]
 struct Body {
+    variadic_sequence: Vec<i64>,
+    variadic_buffers: usize,
     nodes: usize,
     buffers: usize,
     copied: usize,
@@ -377,7 +484,13 @@ fn window<H>(
                 work.step()?;
                 body.buffer(buffer.len())?;
             }
+            if body.variadic_sequence.len() == body.variadic_sequence.capacity() {
+                return Err(IpcGeometryError::SourceModel.into());
+            }
+            body.variadic_sequence
+                .push(i64::try_from(buffers.len()).map_err(|_| IpcGeometryError::Overflow)?);
             body.variadic_counts = add(body.variadic_counts, 1)?;
+            body.variadic_buffers = add(body.variadic_buffers, buffers.len())?;
         }
         DataType::ListView(_) | DataType::LargeListView(_) => {
             let (width, child) = if matches!(ty, DataType::ListView(_)) {
@@ -533,6 +646,7 @@ fn message_upper<H>(
     body: &Body,
     dictionary: bool,
     requests: &mut SchemaRequestAccumulator,
+    wire: &mut IpcStreamWireFacts,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<(), IpcConstructionError<H>> {
     // The generated FieldNode and Buffer wire structs each contain two i64
@@ -551,6 +665,7 @@ fn message_upper<H>(
     if body.variadic_counts != 0 {
         backing = add(backing, add(mul(body.variadic_counts, 8)?, 4 + 7)?)?;
     }
+    wire.message(backing, body, dictionary)?;
     let mut observe = || work.step().map_err(IpcConstructionError::<H>::from);
     requests.geometric::<[i64; 2], IpcConstructionError<H>>(body.nodes, 0, 1, &mut observe)?;
     requests.geometric::<[i64; 2], IpcConstructionError<H>>(body.buffers, 0, 1, &mut observe)?;
@@ -574,6 +689,7 @@ fn message_upper<H>(
 fn dictionary_messages<H>(
     array: &dyn Array,
     requests: &mut SchemaRequestAccumulator,
+    wire: &mut IpcStreamWireFacts,
     work: &mut EvaluationCheckpoints<'_>,
     depth: usize,
 ) -> Result<(), IpcConstructionError<H>> {
@@ -597,17 +713,19 @@ fn dictionary_messages<H>(
             }
             let mut body = Body::default();
             window::<H>(values.as_ref(), 0, values.len(), &mut body, work, depth + 1)?;
-            message_upper(&body, true, requests, work)?;
+            message_upper(&body, true, requests, wire, work)?;
         }
         DataType::List(_) => dictionary_messages::<H>(
             concrete::<ListArray>(array)?.values().as_ref(),
             requests,
+            wire,
             work,
             depth + 1,
         )?,
         DataType::LargeList(_) => dictionary_messages::<H>(
             concrete::<LargeListArray>(array)?.values().as_ref(),
             requests,
+            wire,
             work,
             depth + 1,
         )?,
@@ -620,7 +738,13 @@ fn dictionary_messages<H>(
                     let metadata =
                         crate::array_backing_geometry::source_metadata_bytes(array, work)?;
                     requests.bytes = add(requests.bytes, metadata)?;
-                    dictionary_messages::<H>(run.values().as_ref(), requests, work, depth + 1)?;
+                    dictionary_messages::<H>(
+                        run.values().as_ref(),
+                        requests,
+                        wire,
+                        work,
+                        depth + 1,
+                    )?;
                 }};
             }
             match ends.data_type() {
@@ -633,12 +757,14 @@ fn dictionary_messages<H>(
         DataType::ListView(_) => dictionary_messages::<H>(
             concrete::<ListViewArray>(array)?.values().as_ref(),
             requests,
+            wire,
             work,
             depth + 1,
         )?,
         DataType::LargeListView(_) => dictionary_messages::<H>(
             concrete::<LargeListViewArray>(array)?.values().as_ref(),
             requests,
+            wire,
             work,
             depth + 1,
         )?,
@@ -646,24 +772,32 @@ fn dictionary_messages<H>(
             let union = concrete::<UnionArray>(array)?;
             for (id, _) in fields.iter() {
                 work.step()?;
-                dictionary_messages::<H>(union.child(id).as_ref(), requests, work, depth + 1)?;
+                dictionary_messages::<H>(
+                    union.child(id).as_ref(),
+                    requests,
+                    wire,
+                    work,
+                    depth + 1,
+                )?;
             }
         }
         DataType::FixedSizeList(_, _) => dictionary_messages::<H>(
             concrete::<FixedSizeListArray>(array)?.values().as_ref(),
             requests,
+            wire,
             work,
             depth + 1,
         )?,
         DataType::Map(_, _) => dictionary_messages::<H>(
             concrete::<MapArray>(array)?.entries(),
             requests,
+            wire,
             work,
             depth + 1,
         )?,
         DataType::Struct(_) => {
             for child in concrete::<StructArray>(array)?.columns() {
-                dictionary_messages::<H>(child.as_ref(), requests, work, depth + 1)?;
+                dictionary_messages::<H>(child.as_ref(), requests, wire, work, depth + 1)?;
             }
         }
         _ => {}
@@ -690,6 +824,7 @@ pub fn observe_stream_writer_batch_construction<'a, H>(
     }
     let mut work = EvaluationCheckpoints::new(control);
     let mut requests = SchemaRequestAccumulator::default();
+    let mut wire = IpcStreamWireFacts::default();
     // encode() allocates flattened_fields() and an EncodedData vector of that
     // capacity; each EncodedData is its two public Vec<u8> members. This is
     // private-operation geometry, not an exact private struct Layout request.
@@ -707,7 +842,13 @@ pub fn observe_stream_writer_batch_construction<'a, H>(
             schema.dictionaries, || work.step().map_err(Into::into),
         )?;
     requests.bytes = add(requests.bytes, tracker)?;
-    let mut body = Body::default();
+    creation
+        .request_layout(Layout::array::<i64>(schema.views).map_err(|_| IpcGeometryError::Overflow)?)
+        .map_err(IpcConstructionError::Creator)?;
+    let mut body = Body {
+        variadic_sequence: Vec::with_capacity(schema.views),
+        ..Body::default()
+    };
     let mut source_buffers = SourceBufferSlots::default();
     let mut to_data_metadata_upper = 0;
     for array in batch.columns() {
@@ -723,9 +864,9 @@ pub fn observe_stream_writer_batch_construction<'a, H>(
         to_data_metadata_upper = add(to_data_metadata_upper, metadata)?;
         requests.bytes = add(requests.bytes, metadata)?;
         window::<H>(array.as_ref(), 0, array.len(), &mut body, &mut work, 0)?;
-        dictionary_messages::<H>(array.as_ref(), &mut requests, &mut work, 0)?;
+        dictionary_messages::<H>(array.as_ref(), &mut requests, &mut wire, &mut work, 0)?;
     }
-    message_upper::<H>(&body, false, &mut requests, &mut work)?;
+    message_upper::<H>(&body, false, &mut requests, &mut wire, &mut work)?;
     work.flush()?;
     creation
         .observe_opaque_upper_bound(requests.bytes)
@@ -734,6 +875,13 @@ pub fn observe_stream_writer_batch_construction<'a, H>(
         source: batch,
         buffer_slots_upper: source_buffers.slots,
         to_data_metadata_upper,
+        wire,
+        construction_upper: add(
+            requests.bytes,
+            mul(schema.views, std::mem::size_of::<i64>())?,
+        )?,
+        variadic_sequence: body.variadic_sequence,
+        _geometry_storage: creation.storage_lifetime(),
     })
 }
 
@@ -744,8 +892,21 @@ pub struct IpcStreamBatchFacts<'a> {
     source: &'a RecordBatch,
     buffer_slots_upper: usize,
     to_data_metadata_upper: usize,
+    wire: IpcStreamWireFacts,
+    construction_upper: usize,
+    variadic_sequence: Vec<i64>,
+    _geometry_storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
 impl IpcStreamBatchFacts<'_> {
+    pub fn variadic_buffer_counts(&self) -> &[i64] {
+        &self.variadic_sequence
+    }
+    pub fn wire(&self) -> IpcStreamWireFacts {
+        self.wire
+    }
+    pub fn construction_upper_bound(&self) -> usize {
+        self.construction_upper
+    }
     pub fn buffer_slots_upper_bound(&self) -> usize {
         self.buffer_slots_upper
     }
@@ -916,8 +1077,9 @@ mod retained_carrier_tests {
             let facts =
                 observe_stream_writer_schema_construction(schema.as_ref(), &mut creation, &control)
                     .unwrap();
-            observe_stream_writer_batch_construction(&batch, &facts, &mut creation, &control)
-                .unwrap();
+            let batch_facts =
+                observe_stream_writer_batch_construction(&batch, &facts, &mut creation, &control)
+                    .unwrap();
             assert!(requests.load(Ordering::SeqCst) > 0);
             let mut bytes = Vec::new();
             let mut writer =
@@ -925,6 +1087,26 @@ mod retained_carrier_tests {
             writer.write(&batch).unwrap();
             writer.finish().unwrap();
             drop(writer);
+            let wire_upper = facts.wire().wire_bytes_upper_bound()
+                + batch_facts.wire().wire_bytes_upper_bound()
+                + 8;
+            assert!(
+                bytes.len() <= wire_upper,
+                "same writer bounds its actual {:?} stream: {} <= {wire_upper}",
+                batch.columns()[0].data_type(),
+                bytes.len()
+            );
+            if let Some(view) = batch.columns()[0]
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+            {
+                assert_eq!(
+                    batch_facts.variadic_buffer_counts(),
+                    &[view.data_buffers().len() as i64]
+                );
+            } else {
+                assert!(batch_facts.variadic_buffer_counts().is_empty());
+            }
             let decoded =
                 arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
                     .unwrap()

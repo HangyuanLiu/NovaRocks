@@ -19,6 +19,7 @@
 //! evicted only when nobody waits on it; eviction drops the cache's Channel
 //! alias, while escaped Channels and their connections keep their own owners.
 
+use std::alloc::Layout;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -123,12 +124,14 @@ struct Core<C> {
 /// with its stream positions, so every caller shares the same positions.
 pub(crate) struct NativeChannelCache<C = NativeLaneChannel> {
     core: Arc<Core<C>>,
+    flow: Arc<NativeFlowPositions>,
 }
 
 impl<C> Clone for NativeChannelCache<C> {
     fn clone(&self) -> Self {
         Self {
             core: Arc::clone(&self.core),
+            flow: Arc::clone(&self.flow),
         }
     }
 }
@@ -150,7 +153,33 @@ impl<C: Clone> NativeChannelCache<C> {
                 state: Mutex::new(entries),
                 eviction_cursor: AtomicUsize::new(0),
             }),
+            flow: Arc::new(NativeFlowPositions::bounded()?),
         })
+    }
+
+    /// Reserve the complete frozen stream set before Q/R/S can be retained.
+    /// Every cache clone and channel generation uses this one process owner.
+    pub(crate) fn reserve_flow_streams(
+        &self,
+        streams: &[(
+            InlineNativeChannelIdentity,
+            novarocks_execution_contract::ExchangeStreamIdentity,
+        )],
+    ) -> io::Result<Vec<NativeFlowPosition>> {
+        self.flow.reserve(streams)
+    }
+
+    /// Actual retained backing of the same fixed preparation-position book.
+    /// This is a construction request for the enclosing Native envelope owner;
+    /// observing it does not itself publish or fund an allocation.
+    pub(crate) fn flow_metadata_layouts(&self) -> io::Result<[Layout; 2]> {
+        let rows = self.flow.rows.lock().map_err(|_| invalid())?;
+        let owner = novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<
+            NativeFlowPositions,
+        >())
+        .map_err(|_| invalid())?;
+        let backing = Layout::array::<FlowRow>(rows.capacity()).map_err(|_| invalid())?;
+        Ok([owner, backing])
     }
 
     #[cfg(test)]
@@ -177,6 +206,144 @@ impl<C: Clone> NativeChannelCache<C> {
             identity,
             registration: None,
         }
+    }
+}
+
+type FlowRow = Option<(
+    InlineNativeChannelIdentity,
+    novarocks_execution_contract::ExchangeStreamIdentity,
+)>;
+
+/// A fixed position per exact frozen stream, independent of live HTTP/2
+/// request lifetime. At most one Acquire may run per reserved stream, so the
+/// complete dependency set fits the original per-peer HTTP/2 lane limit.
+struct NativeFlowPositions {
+    rows: Mutex<Vec<FlowRow>>,
+}
+
+impl NativeFlowPositions {
+    fn bounded() -> io::Result<Self> {
+        let g = NativeResultSupportGeometry::V1;
+        let count = usize::try_from(g.transport_maximum_live_backends)
+            .map_err(|_| invalid())?
+            .checked_mul(
+                usize::try_from(g.transport_streams_per_connection).map_err(|_| invalid())?,
+            )
+            .ok_or_else(invalid)?;
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(count)
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        rows.resize(count, None);
+        Ok(Self {
+            rows: Mutex::new(rows),
+        })
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+        streams: &[(
+            InlineNativeChannelIdentity,
+            novarocks_execution_contract::ExchangeStreamIdentity,
+        )],
+    ) -> io::Result<Vec<NativeFlowPosition>> {
+        let g = NativeResultSupportGeometry::V1;
+        let limit = usize::try_from(g.transport_streams_per_connection).map_err(|_| invalid())?;
+        let mut result = Vec::new();
+        let mut rows = self
+            .rows
+            .lock()
+            .map_err(|_| io::Error::other("native flow-position lock poisoned"))?;
+        if streams.len() > rows.iter().filter(|row| row.is_none()).count() {
+            return Err(io::Error::other(
+                "native flow-position capacity exhausted during preparation",
+            ));
+        }
+        result
+            .try_reserve_exact(streams.len())
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        for (index, (key, stream)) in streams.iter().enumerate() {
+            if key.method()
+                != novarocks_proto_codec::native_rpc::NativeRpcMethod::AcquireExchangePermit
+                || key.peer() != Some(stream.destination().backend_process_id())
+            {
+                return Err(invalid());
+            }
+            if rows.iter().flatten().any(|(_, active)| active == stream)
+                || streams[..index]
+                    .iter()
+                    .any(|(_, earlier)| earlier == stream)
+            {
+                return Err(io::Error::other(
+                    "exact exchange stream is already reserved",
+                ));
+            }
+        }
+        // This fixed stack index covers the same admitted peer domain. It is
+        // scratch for one atomic admission, not another retained capacity book.
+        const PEERS: usize =
+            NativeResultSupportGeometry::V1.transport_maximum_live_backends as usize;
+        let mut peers = [None; PEERS];
+        let mut count_peer = |peer| -> io::Result<()> {
+            let index = if let Some(index) = peers.iter().position(
+                |entry: &Option<(novarocks_types::BackendProcessId, usize)>| {
+                    entry.is_some_and(|(active, _)| active == peer)
+                },
+            ) {
+                index
+            } else {
+                let index = peers.iter().position(Option::is_none).ok_or_else(|| {
+                    io::Error::other("frozen exchange flow peers exceed the Native peer domain")
+                })?;
+                peers[index] = Some((peer, 0));
+                index
+            };
+            let (_, count) = peers[index]
+                .as_mut()
+                .expect("peer was admitted into its fixed index");
+            *count += 1;
+            if *count > limit {
+                return Err(io::Error::other(
+                    "frozen exchange streams exceed the peer flow-lane positions",
+                ));
+            }
+            Ok(())
+        };
+        for (key, _) in rows.iter().flatten().chain(streams.iter()) {
+            count_peer(key.peer().ok_or_else(invalid)?)?;
+        }
+        for &(key, stream) in streams {
+            let index = rows
+                .iter()
+                .position(Option::is_none)
+                .expect("validated flow positions remain free under this lock");
+            rows[index] = Some((key, stream));
+            result.push(NativeFlowPosition {
+                owner: Arc::clone(self),
+                index,
+                stream,
+            });
+        }
+        Ok(result)
+    }
+}
+
+/// Dropping a Task capability returns its original exact stream reservation.
+/// An active request borrows that capability until the native future exits.
+pub(crate) struct NativeFlowPosition {
+    owner: Arc<NativeFlowPositions>,
+    index: usize,
+    stream: novarocks_execution_contract::ExchangeStreamIdentity,
+}
+
+impl Drop for NativeFlowPosition {
+    fn drop(&mut self) {
+        let mut rows = self.owner.rows.lock().expect("native flow-position lock");
+        debug_assert!(
+            rows[self.index]
+                .as_ref()
+                .is_some_and(|(_, stream)| *stream == self.stream)
+        );
+        rows[self.index] = None;
     }
 }
 

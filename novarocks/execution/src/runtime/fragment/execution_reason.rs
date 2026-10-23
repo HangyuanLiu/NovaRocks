@@ -565,6 +565,9 @@ pub(crate) enum ExecutionReason {
     PreparedDrainBeforeConclusion = 610,
     RootReadinessNotificationPanicked = 611,
     RootReadinessNotificationInvariant = 612,
+    OperatorByteCreditContract = 613,
+    OperatorByteCreditCapacity = 614,
+    FragmentIoCapacity = 615,
 }
 impl ExecutionReason {
     pub(crate) const fn code(self) -> NonZeroU16 {

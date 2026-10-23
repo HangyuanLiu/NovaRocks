@@ -36,6 +36,15 @@ impl RawInput {
     pub fn rows(&self) -> usize {
         self.chunk.len()
     }
+    /// Inspect the original retained backing while custody stays with the edge.
+    /// Sliced-away parent buffers remain part of the observed storage.
+    pub fn retained_geometry(
+        &self,
+        limits: crate::exec::chunk::OperatorStorageLimits,
+    ) -> ExecutionResult<usize> {
+        self.chunk.retained_operator_geometry(limits)
+    }
+
     pub fn result_metadata(&self) -> crate::runtime::fragment::io::ResultInputMetadata {
         (&self.chunk).into()
     }

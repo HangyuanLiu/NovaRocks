@@ -73,6 +73,7 @@ pub(super) fn retain_received_buffer(
     port.register(ExchangeReceiverRegistration {
         key,
         expected_senders: 1,
+        network: None,
         expected_chunk_schema: expected,
         column_binding: ExchangeColumnBinding::Positional,
         creation_factory: factory.clone(),

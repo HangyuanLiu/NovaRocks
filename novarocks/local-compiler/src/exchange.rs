@@ -85,20 +85,10 @@ fn lower_core_with_creation<H>(
         ))
         .into());
     }
-    if matches!(
-        cut.payload,
-        novarocks_physical_plan::ExchangePayloadContract::LogicalSummary(_)
-    ) {
+    if cut.kind != EdgeKind::Stream && cut.kind != EdgeKind::ChangeStreamRouter {
         return Err((FragmentCompileError::Unsupported {
             node: Some(node.id),
-            feature: "logical-summary exchange input",
-        })
-        .into());
-    }
-    if cut.kind != EdgeKind::Stream || cut.change_stream_writer().is_some() {
-        return Err((FragmentCompileError::Unsupported {
-            node: Some(node.id),
-            feature: "inbound CTE or change-stream edge",
+            feature: "inbound CTE edge",
         })
         .into());
     }
@@ -140,30 +130,16 @@ fn lower_core_with_creation<H>(
     // The edge names keys in the destination value domain. Project each
     // actual imported occurrence onto its exact channel, preserving key order.
     let keys = match &cut.partitioning.destination {
-        Distribution::Hash { scheme, .. }
-            if scheme.definition.algorithm
-                == novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1 =>
-        {
-            return Err((FragmentCompileError::Unsupported {
-                node: Some(node.id),
-                feature: "hierarchical exchange input",
-            })
-            .into());
-        }
-        Distribution::Hash { keys, .. } | Distribution::BucketShuffle { keys, .. } => {
+        Distribution::Hash { keys, .. }
+        | Distribution::ConditionalKey { keys, .. }
+        | Distribution::BucketShuffle { keys, .. } => {
             if keys.is_empty() {
-                return Err(
-                    (FragmentCompileError::Invalid("ExchangeSource hash cut has no keys")).into(),
-                );
+                return Err((FragmentCompileError::Invalid(
+                    "ExchangeSource keyed cut has no keys",
+                ))
+                .into());
             }
             keys.as_ref()
-        }
-        Distribution::ConditionalKey { .. } => {
-            return Err((FragmentCompileError::Unsupported {
-                node: Some(node.id),
-                feature: "conditional-key exchange input",
-            })
-            .into());
         }
         Distribution::Unconstrained
         | Distribution::Singleton
@@ -230,6 +206,45 @@ fn lower_core_with_creation<H>(
                     creation,
                 )?
             }
+            (None, None)
+                if matches!(
+                    cut.payload,
+                    novarocks_physical_plan::ExchangePayloadContract::LogicalSummary(_)
+                ) =>
+            {
+                let names = ["inserted", "replaced", "deleted"];
+                let name = names.get(ordinal).ok_or(FragmentCompileError::Invalid(
+                    "summary receiver width differs",
+                ))?;
+                crate::typed_layout::copy_name_with_creation(name, work, creation)?
+            }
+            (None, None) if cut.change_stream_writer().is_some() => {
+                let root = package
+                    .fragment()
+                    .nodes()
+                    .get(&package.fragment().root())
+                    .ok_or(FragmentCompileError::Invalid("missing route writer root"))?;
+                let NodeKind::TableWriter { target } = &root.kind else {
+                    return Err(FragmentCompileError::Invalid(
+                        "provider route receiver has no writer",
+                    )
+                    .into());
+                };
+                let field =
+                    target
+                        .target_fields
+                        .get(ordinal)
+                        .ok_or(FragmentCompileError::Invalid(
+                            "provider route field is absent",
+                        ))?;
+                if field.input != *value {
+                    return Err(FragmentCompileError::Invalid(
+                        "provider route field occurrence differs",
+                    )
+                    .into());
+                }
+                crate::typed_layout::copy_name_with_creation(&field.provider_name, work, creation)?
+            }
             (None, None) => crate::typed_layout::local_name_with_creation(
                 "local_exchange",
                 node.id.get(),
@@ -266,12 +281,25 @@ fn lower_core_with_creation<H>(
                         algorithm: scheme.hash,
                     }
                 }
-                Distribution::ConditionalKey { .. } => {
-                    return Err((FragmentCompileError::Unsupported {
-                        node: Some(node.id),
-                        feature: "conditional-key exchange input",
-                    })
-                    .into());
+                Distribution::ConditionalKey {
+                    applies, scheme, ..
+                } => {
+                    let mut mask = None;
+                    for (ordinal, value) in node.output.columns.iter().enumerate() {
+                        if value == applies && mask.replace(slots[ordinal]).is_some() {
+                            return Err(FragmentCompileError::Invalid(
+                                "conditional mask has multiple receiver occurrences",
+                            )
+                            .into());
+                        }
+                        work.step()?;
+                    }
+                    novarocks_local_program::CompiledExchangeRouting::ConditionalKey {
+                        applies: mask.ok_or(FragmentCompileError::Invalid(
+                            "conditional mask is absent from receiver",
+                        ))?,
+                        algorithm: scheme.definition.algorithm,
+                    }
                 }
                 Distribution::RoundRobin => {
                     novarocks_local_program::CompiledExchangeRouting::RoundRobin

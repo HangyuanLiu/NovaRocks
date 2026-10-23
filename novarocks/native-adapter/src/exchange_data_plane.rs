@@ -16,13 +16,20 @@
 // under the License.
 //! Native exchange wire projection and route settlement.
 
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Instant};
+use tokio_util::sync::CancellationToken;
 
+use crate::native_ingress::NativeIngressOwnership;
+use novarocks_execution::runtime::fragment::io::exchange_receiver::{
+    ClaimedExchangeFrame, ExchangePermitAdmission,
+};
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverFrame, ExchangeReceiverKey, ExchangeReceiverPort,
 };
-use novarocks_execution_contract::FragmentNodeId;
+use novarocks_execution_contract::{ExchangePermitGrant, ExchangeStreamIdentity, FragmentNodeId};
+use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models as proto;
+use novarocks_types::BackendProcessId;
 use novarocks_types::UniqueId;
 use novarocks_worker::{InboundFrameClaim, NormalClosedInbound, TaskInboundCapabilities};
 
@@ -89,6 +96,27 @@ pub trait ExchangeRouteAuthority: Send + Sync + 'static {
 
     fn claim_exchange_route(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim;
 
+    fn claim_exact_stream(
+        &self,
+        _stream: ExchangeStreamIdentity,
+    ) -> Result<novarocks_worker::InboundFrameAdmission, ExchangeRouteClaim> {
+        Err(ExchangeRouteClaim::Refused(
+            "route authority has no exact stream admission".into(),
+        ))
+    }
+
+    fn claim_permitted_frame(
+        &self,
+        _stream: ExchangeStreamIdentity,
+        _receiver: &dyn ExchangeReceiverPort,
+        _grant: ExchangePermitGrant,
+    ) -> Result<ClaimedExchangeFrame, ExchangeRouteDelivery> {
+        Err(ExchangeRouteDelivery::Refused(
+            "route authority has no permitted-frame claim".into(),
+        ))
+    }
+
+    #[cfg(test)]
     fn deliver_exchange_route(
         &self,
         query: ExchangeRouteQuery,
@@ -131,6 +159,37 @@ impl ExchangeRouteAuthority for TaskInboundCapabilitiesRouteAuthority {
         "the task substrate"
     }
 
+    fn claim_exact_stream(
+        &self,
+        stream: ExchangeStreamIdentity,
+    ) -> Result<novarocks_worker::InboundFrameAdmission, ExchangeRouteClaim> {
+        self.0.claim_stream(stream).map_err(worker_claim)
+    }
+
+    fn claim_permitted_frame(
+        &self,
+        stream: ExchangeStreamIdentity,
+        receiver: &dyn ExchangeReceiverPort,
+        grant: ExchangePermitGrant,
+    ) -> Result<ClaimedExchangeFrame, ExchangeRouteDelivery> {
+        match self
+            .0
+            .with_claimed_stream(stream, |_| receiver.claim(grant))
+        {
+            Ok(result) => result.map_err(ExchangeRouteDelivery::Receiver),
+            Err(InboundFrameClaim::NormallyClosed(proof)) => {
+                Err(ExchangeRouteDelivery::NormallyClosed(proof))
+            }
+            Err(InboundFrameClaim::Refused(detail)) => Err(ExchangeRouteDelivery::Refused(detail)),
+            Err(InboundFrameClaim::NotHeld) => Err(ExchangeRouteDelivery::Refused(
+                "task destination was withdrawn before permit claim".into(),
+            )),
+            Err(InboundFrameClaim::Authorized) => {
+                unreachable!("authorized stream returns its frozen admission")
+            }
+        }
+    }
+
     fn claim_exchange_route(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim {
         match self.0.claim_frame(
             query.destination_fragment_instance_id,
@@ -146,6 +205,7 @@ impl ExchangeRouteAuthority for TaskInboundCapabilitiesRouteAuthority {
         }
     }
 
+    #[cfg(test)]
     fn deliver_exchange_route(
         &self,
         query: ExchangeRouteQuery,
@@ -203,13 +263,234 @@ impl NativeExchangeDataPlane {
         }
     }
 
-    pub fn transmit(
+    pub async fn acquire(
+        &self,
+        request: proto::novarocks::AcquireExchangePermitRequest,
+        caller: BackendProcessId,
+        stop: CancellationToken,
+        deadline: Instant,
+    ) -> proto::novarocks::AcquireExchangePermitResponse {
+        let result = self.acquire_inner(request, caller, stop, deadline).await;
+        match result {
+            Ok(result) => proto::novarocks::AcquireExchangePermitResponse {
+                status: Some(ok_common_status()),
+                result: Some(result),
+            },
+            Err(detail) => proto::novarocks::AcquireExchangePermitResponse {
+                status: Some(error_common_status(detail)),
+                result: None,
+            },
+        }
+    }
+
+    async fn acquire_inner(
+        &self,
+        request: proto::novarocks::AcquireExchangePermitRequest,
+        caller: BackendProcessId,
+        stop: CancellationToken,
+        deadline: Instant,
+    ) -> Result<proto::novarocks::acquire_exchange_permit_response::Result, String> {
+        let request = novarocks_task_codec::exchange_flow_codec::decode_permit_request(
+            &request,
+            FieldPath::root("exchange_permit"),
+        )
+        .map_err(|error| error.to_string())?;
+        authenticate_source(request.stream, caller)?;
+        let (owner, admission) = match settle_exact_stream(&self.route_authorities, request.stream)?
+        {
+            SettledStream::Authorized { owner, admission } => (owner, admission),
+            SettledStream::Closed(proof) => {
+                return Ok(
+                    proto::novarocks::acquire_exchange_permit_response::Result::NormalClosed(
+                        novarocks_task_codec::exchange_flow_codec::encode_normal_close(
+                            proof.close(),
+                            proof.sender_count(),
+                        ),
+                    ),
+                );
+            }
+        };
+        let _ = owner; // Admission is frozen; the receiver rechecks its own stream state after each wait.
+        match self
+            .receiver_port
+            .acquire(request, stop, deadline)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            ExchangePermitAdmission::Granted(grant) => Ok(
+                proto::novarocks::acquire_exchange_permit_response::Result::Granted(
+                    novarocks_task_codec::exchange_flow_codec::encode_permit_grant(grant),
+                ),
+            ),
+            ExchangePermitAdmission::Closed(close) => {
+                if close.stream != request.stream {
+                    return Err("receiver close differs from the exact permit stream".into());
+                }
+                Ok(
+                    proto::novarocks::acquire_exchange_permit_response::Result::NormalClosed(
+                        novarocks_task_codec::exchange_flow_codec::encode_normal_close(
+                            close,
+                            admission.sender_count(),
+                        ),
+                    ),
+                )
+            }
+        }
+    }
+
+    pub async fn transmit(
         &self,
         request: proto::novarocks::ExchangeRequest,
+        caller: BackendProcessId,
+        ownership: Arc<NativeIngressOwnership>,
     ) -> proto::novarocks::ExchangeResponse {
-        let authorities: Vec<&dyn ExchangeRouteAuthority> =
-            self.route_authorities.iter().map(Arc::as_ref).collect();
-        handle_transmit_chunk(self.receiver_port.as_ref(), &authorities, request)
+        let sequence = request.sequence;
+        match self.transmit_inner(request, caller, ownership).await {
+            Ok(normal_closed) => proto::novarocks::ExchangeResponse {
+                ack_sequence: sequence,
+                status: Some(ok_common_status()),
+                normal_closed,
+            },
+            Err(detail) => proto::novarocks::ExchangeResponse {
+                ack_sequence: sequence,
+                status: Some(error_common_status(detail)),
+                normal_closed: None,
+            },
+        }
+    }
+
+    async fn transmit_inner(
+        &self,
+        request: proto::novarocks::ExchangeRequest,
+        caller: BackendProcessId,
+        ownership: Arc<NativeIngressOwnership>,
+    ) -> Result<Option<proto::novarocks::ExchangeNormalClosed>, String> {
+        let stream = novarocks_task_codec::exchange_flow_codec::decode_stream(
+            request
+                .stream
+                .as_ref()
+                .ok_or_else(|| "exchange frame omits its exact stream".to_string())?,
+            FieldPath::root("exchange_frame").field("stream"),
+        )
+        .map_err(|error| error.to_string())?;
+        authenticate_source(stream, caller)?;
+        let (owner, admission) = match settle_exact_stream(&self.route_authorities, stream)? {
+            SettledStream::Authorized { owner, admission } => (owner, admission),
+            SettledStream::Closed(proof) => {
+                novarocks_task_codec::exchange_flow_codec::validate_frame_envelope(
+                    &request,
+                    stream,
+                    proof.sender_count(),
+                    FieldPath::root("exchange_frame"),
+                )
+                .map_err(|error| error.to_string())?;
+                return Ok(Some(
+                    novarocks_task_codec::exchange_flow_codec::encode_normal_close(
+                        proof.close(),
+                        proof.sender_count(),
+                    ),
+                ));
+            }
+        };
+        let token = novarocks_task_codec::exchange_flow_codec::decode_token(
+            &request.permit_token,
+            FieldPath::root("exchange_frame").field("permit_token"),
+        )
+        .map_err(|error| error.to_string())?;
+        let grant = self
+            .receiver_port
+            .lookup_grant(stream, token)
+            .map_err(|error| error.to_string())?;
+        novarocks_task_codec::exchange_flow_codec::validate_permitted_frame(
+            &request,
+            grant,
+            admission.sender_count(),
+            FieldPath::root("exchange_frame"),
+        )
+        .map_err(|error| error.to_string())?;
+        let mut claim = match self.route_authorities[owner].claim_permitted_frame(
+            stream,
+            self.receiver_port.as_ref(),
+            grant,
+        ) {
+            Ok(claim) => claim,
+            Err(ExchangeRouteDelivery::NormallyClosed(proof)) => {
+                return Ok(Some(
+                    novarocks_task_codec::exchange_flow_codec::encode_normal_close(
+                        proof.close(),
+                        proof.sender_count(),
+                    ),
+                ));
+            }
+            Err(ExchangeRouteDelivery::Receiver(error)) => return Err(error.to_string()),
+            Err(ExchangeRouteDelivery::Refused(detail)) => return Err(detail),
+            Err(ExchangeRouteDelivery::Delivered) => {
+                unreachable!("a permit claim returns a linear ticket")
+            }
+        };
+        claim
+            .retain_transport_lifetime(ownership)
+            .map_err(|error| error.to_string())?;
+        // No Worker lock crosses this await. The original finite CPU closure
+        // holds the claim and transport ownership until actual decode exit.
+        self.receiver_port
+            .accept(claim, request.payload)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(None)
+    }
+}
+
+fn worker_claim(claim: InboundFrameClaim) -> ExchangeRouteClaim {
+    match claim {
+        InboundFrameClaim::NotHeld => ExchangeRouteClaim::NotHeld,
+        InboundFrameClaim::NormallyClosed(proof) => ExchangeRouteClaim::NormallyClosed(proof),
+        InboundFrameClaim::Refused(detail) => ExchangeRouteClaim::Refused(detail),
+        InboundFrameClaim::Authorized => ExchangeRouteClaim::Authorized,
+    }
+}
+
+fn authenticate_source(
+    stream: ExchangeStreamIdentity,
+    caller: BackendProcessId,
+) -> Result<(), String> {
+    if stream.source().task().backend_process_id() != caller {
+        return Err("exchange source Task differs from the authenticated backend process".into());
+    }
+    Ok(())
+}
+
+enum SettledStream {
+    Authorized {
+        owner: usize,
+        admission: novarocks_worker::InboundFrameAdmission,
+    },
+    Closed(NormalClosedInbound),
+}
+
+fn settle_exact_stream(
+    authorities: &[Arc<dyn ExchangeRouteAuthority>],
+    stream: ExchangeStreamIdentity,
+) -> Result<SettledStream, String> {
+    let mut selected = None;
+    for (owner, authority) in authorities.iter().enumerate() {
+        let claim = authority.claim_exact_stream(stream);
+        if matches!(claim, Err(ExchangeRouteClaim::NotHeld)) {
+            continue;
+        }
+        if selected.is_some() {
+            return Err("multiple exchange owners hold the exact stream destination".into());
+        }
+        selected = Some((owner, claim));
+    }
+    match selected {
+        Some((owner, Ok(admission))) => Ok(SettledStream::Authorized { owner, admission }),
+        Some((_, Err(ExchangeRouteClaim::NormallyClosed(proof)))) => {
+            Ok(SettledStream::Closed(proof))
+        }
+        Some((_, Err(ExchangeRouteClaim::Refused(detail)))) => Err(detail),
+        Some((_, Err(_))) => Err("exact stream owner omitted its frozen admission".into()),
+        None => Err("no active exchange owner holds the exact stream destination".into()),
     }
 }
 
@@ -307,7 +588,8 @@ fn error_common_status(message: impl Into<String>) -> proto::common::Status {
     }
 }
 
-pub fn handle_transmit_chunk(
+#[cfg(test)]
+fn handle_transmit_chunk(
     receiver_port: &dyn ExchangeReceiverPort,
     authorities: &[&dyn ExchangeRouteAuthority],
     params: proto::novarocks::ExchangeRequest,
@@ -375,19 +657,12 @@ pub fn handle_transmit_chunk(
     match authorities[owner].deliver_exchange_route(query, receiver_port, key, frame) {
         ExchangeRouteDelivery::Delivered => {}
         ExchangeRouteDelivery::NormallyClosed(proof) => {
-            response.normal_closed = Some(proto::novarocks::ExchangeNormalClosed {
-            disposition: Some(novarocks_proto_models::novarocks::exchange_normal_closed::Disposition::Withdrawn(novarocks_proto_models::novarocks::ExchangeWithdrawn {})),
-                destination_task: Some(novarocks_task_codec::identity::encode_task_identity(
-                    proof.destination(),
-                )),
-                destination_finst_id_hi: proof.destination_kernel_key().high(),
-                destination_finst_id_lo: proof.destination_kernel_key().low(),
-                destination_node_id: proof.destination_node_id().get(),
-                source_finst_id_hi: proof.source().fragment_instance_id().high(),
-                source_finst_id_lo: proof.source().fragment_instance_id().low(),
-                sender_ordinal: proof.source().sender_ordinal(),
-                sender_count: proof.sender_count(),
-            });
+            response.normal_closed = Some(
+                novarocks_task_codec::exchange_flow_codec::encode_normal_close(
+                    proof.close(),
+                    proof.sender_count(),
+                ),
+            );
         }
         ExchangeRouteDelivery::Receiver(error) => {
             // This is the existing final wire projection, not error classification.
@@ -411,6 +686,144 @@ mod tests {
     };
     use novarocks_execution::runtime::fragment::io::UnavailableExchangeReceiverPort;
     use novarocks_proto_models as proto;
+
+    fn exact_task_fixture() -> (
+        std::sync::Arc<novarocks_worker::TaskInboundCapabilities>,
+        novarocks_execution_contract::TaskDescriptor,
+        novarocks_execution_contract::ExchangePermitRequest,
+    ) {
+        use novarocks_execution_contract::{
+            ExchangeDeliveryRequirement, ExchangeFrameGeometry, ExchangeFrameKind,
+            ExchangeFrameSequence, ExchangeInbound, ExchangePermitRequest, ExchangeSource,
+            ExchangeStreamIdentity, ExchangeTopology, FragmentNodeId, TaskDescriptor, TaskIdentity,
+        };
+        use novarocks_types::{
+            UniqueId,
+            identity::{AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId},
+        };
+        let execution =
+            QueryExecutionId::new(QueryId::new(61, 62), AttemptId::new(1).unwrap()).unwrap();
+        let task = |stage| {
+            TaskIdentity::new(
+                execution,
+                StageId::new(stage).unwrap(),
+                TaskId::new(1).unwrap(),
+                BackendProcessId::new_v7(),
+            )
+        };
+        let destination = task(2);
+        let source = ExchangeSource::new(task(1), UniqueId::new(11, 12), 0);
+        let node = FragmentNodeId::new(7);
+        let kernel = UniqueId::new(21, 22);
+        let descriptor = TaskDescriptor::try_new(
+            destination,
+            kernel,
+            std::num::NonZeroUsize::new(1).unwrap(),
+            Vec::new(),
+            ExchangeTopology::try_new(
+                Vec::new(),
+                vec![
+                    ExchangeInbound::try_new(
+                        node,
+                        vec![source],
+                        ExchangeDeliveryRequirement::DemandDriven,
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let capabilities = novarocks_worker::TaskInboundCapabilities::with_limits(8, 65536);
+        capabilities
+            .install(std::sync::Arc::new(descriptor.clone()))
+            .unwrap();
+        let request = ExchangePermitRequest {
+            stream: ExchangeStreamIdentity::try_new(source, destination, kernel, node).unwrap(),
+            sequence: ExchangeFrameSequence::FIRST,
+            kind: ExchangeFrameKind::Data,
+            geometry: ExchangeFrameGeometry::try_new(17, 33, 11).unwrap(),
+        };
+        (capabilities, descriptor, request)
+    }
+
+    #[test]
+    fn native_async_acquire_checks_signed_process_before_receiver_or_close() {
+        use super::{NativeExchangeDataPlane, TaskInboundCapabilitiesRouteAuthority};
+        use std::{
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+        let (capabilities, descriptor, request) = exact_task_fixture();
+        let plane = NativeExchangeDataPlane::new(
+            Arc::new(UnavailableExchangeReceiverPort),
+            vec![Arc::new(TaskInboundCapabilitiesRouteAuthority::new(
+                capabilities.clone(),
+            ))],
+        );
+        let runtime = crate::backend_test_support::test_backend_data_runtime();
+        let call = |caller| {
+            runtime.block_on(plane.acquire(
+                novarocks_task_codec::exchange_flow_codec::encode_permit_request(request),
+                caller,
+                tokio_util::sync::CancellationToken::new(),
+                Instant::now() + Duration::from_secs(1),
+            ))
+        };
+        let wrong = call(novarocks_types::BackendProcessId::new_v7());
+        assert_eq!(wrong.status.unwrap().code, 1);
+        assert!(wrong.result.is_none());
+        // The same signed caller check remains mandatory after retirement.
+        capabilities.close_normally(&descriptor, || {}).unwrap();
+        let wrong_closed = call(novarocks_types::BackendProcessId::new_v7());
+        assert_eq!(wrong_closed.status.unwrap().code, 1);
+        assert!(wrong_closed.result.is_none());
+        let closed = call(request.stream.source().task().backend_process_id());
+        assert_eq!(closed.status.unwrap().code, 0);
+        let Some(proto::novarocks::acquire_exchange_permit_response::Result::NormalClosed(proof)) =
+            closed.result
+        else {
+            panic!("expected actual retained close")
+        };
+        let close = novarocks_task_codec::exchange_flow_codec::decode_normal_close(
+            &proof,
+            request.stream,
+            1,
+            novarocks_proto_codec::FieldPath::root("close"),
+        )
+        .unwrap();
+        assert_eq!(close.stream, request.stream);
+        assert_eq!(
+            close.disposition,
+            novarocks_execution_contract::ExchangeCloseDisposition::Withdrawn
+        );
+    }
+
+    #[test]
+    fn native_async_acquire_rejects_incomplete_or_unheld_exact_stream() {
+        use super::NativeExchangeDataPlane;
+        use std::{
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+        let (_, _, request) = exact_task_fixture();
+        let plane =
+            NativeExchangeDataPlane::new(Arc::new(UnavailableExchangeReceiverPort), Vec::new());
+        let runtime = crate::backend_test_support::test_backend_data_runtime();
+        for raw in [
+            proto::novarocks::AcquireExchangePermitRequest::default(),
+            novarocks_task_codec::exchange_flow_codec::encode_permit_request(request),
+        ] {
+            let response = runtime.block_on(plane.acquire(
+                raw,
+                request.stream.source().task().backend_process_id(),
+                tokio_util::sync::CancellationToken::new(),
+                Instant::now() + Duration::from_secs(1),
+            ));
+            assert_eq!(response.status.unwrap().code, 1);
+            assert!(response.result.is_none());
+        }
+    }
 
     /// An authority with a fixed answer, so a composition test can state
     /// exactly which owners claim a destination.

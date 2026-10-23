@@ -14,6 +14,7 @@ pub mod kernel_memory;
 pub mod mem_tracker;
 pub mod observable;
 pub mod operator_statistics;
+pub(crate) mod operator_byte_credit;
 pub mod preparation_memory;
 pub mod preparation_metadata;
 pub mod profile;

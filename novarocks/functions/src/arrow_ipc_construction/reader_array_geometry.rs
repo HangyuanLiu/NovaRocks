@@ -680,6 +680,7 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
     fn read_node(
         &mut self,
         field: &arrow_schema::Field,
+        shape_projection: bool,
         class: ReaderArrayHeaderClass,
         variadic: &mut (impl Iterator<Item = i64> + Clone),
         dictionary_present: &mut impl FnMut(i64) -> Result<bool, H>,
@@ -689,7 +690,7 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
         match ty {
             DataType::Struct(fields) => {
                 for field in fields {
-                    self.read_node(field, class, variadic, dictionary_present)?;
+                    self.read_node(field, shape_projection, class, variadic, dictionary_present)?;
                 }
                 self.pushes::<ArrayRef>(fields.len(), class)?;
                 for field in fields {
@@ -705,6 +706,7 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
                 for (_, field) in fields.iter() {
                     self.read_node(
                         field,
+                        shape_projection,
                         ReaderArrayHeaderClass::Temporary,
                         variadic,
                         dictionary_present,
@@ -742,6 +744,7 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
                 let mut clone_variadic = variadic.clone();
                 self.read_node(
                     child,
+                    shape_projection,
                     ReaderArrayHeaderClass::Temporary,
                     variadic,
                     dictionary_present,
@@ -767,9 +770,9 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
             }
             DataType::Dictionary(_, values) => {
                 #[allow(deprecated)]
-                let id = field.dict_id().ok_or(ReaderStructureFailure::SourceModel(
-                    "IPC dictionary occurrence id missing",
-                ))?;
+                let id = field.dict_id().or(shape_projection.then_some(0)).ok_or(
+                    ReaderStructureFailure::SourceModel("IPC dictionary occurrence id missing"),
+                )?;
                 if !dictionary_present(id).map_err(ReaderStructureFailure::Creator)? {
                     // Original omitted-dictionary case authors an empty values
                     // array. It creates public array/table structures before
@@ -791,6 +794,7 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
             DataType::RunEndEncoded(ends, values) => {
                 self.read_node(
                     ends,
+                    shape_projection,
                     ReaderArrayHeaderClass::Temporary,
                     variadic,
                     dictionary_present,
@@ -798,6 +802,7 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
                 let mut clone_variadic = variadic.clone();
                 self.read_node(
                     values,
+                    shape_projection,
                     ReaderArrayHeaderClass::Temporary,
                     variadic,
                     dictionary_present,
@@ -1008,6 +1013,12 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
                 "IPC dictionary values source is unsupported",
             ));
         }
+        self.dictionary_value_headers(value)
+    }
+    fn dictionary_value_headers(
+        &mut self,
+        value: &DataType,
+    ) -> Result<(), ReaderStructureFailure<H>> {
         // get_dictionary_values authors a genuine one-column temporary schema
         // with empty label and required source value DataType. No metadata or
         // execution semantic declaration is read/recreated here.
@@ -1029,6 +1040,61 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
         self.pushes::<ArrayRef>(1, ReaderArrayHeaderClass::Temporary)?;
         Ok(())
     }
+    /// Before encoding, dictionary IDs have not been assigned to every field.
+    /// The original lookup's all-field flattening is a monotone bound for its
+    /// ID-filtered result; no per-ID payload or replacement schema is created.
+    pub fn network_dictionary_shape(
+        &mut self,
+        schema: &Schema,
+        buffer_descriptors: usize,
+    ) -> Result<(), ReaderStructureFailure<H>> {
+        self.private_headers(buffer_descriptors, ReaderArrayHeaderClass::Retained)?;
+        self.private_headers(1, ReaderArrayHeaderClass::Retained)?;
+        let (mut length, mut capacity) = (0, 0);
+        for field in schema.fields() {
+            let count = self.field_lookup(field)?;
+            self.flat_segment::<&arrow_schema::Field>(&mut length, &mut capacity, count)?;
+        }
+        // The supported dictionary value carriers are Utf8 and LargeUtf8.
+        // All constructor tables are identical; select the actual larger Arc
+        // header rather than multiplying a general metadata cover constant.
+        let string = arc_layout(Layout::new::<StringArray>())?;
+        let large = arc_layout(Layout::new::<LargeStringArray>())?;
+        self.dictionary_value_headers(if string.size() >= large.size() {
+            &DataType::Utf8
+        } else {
+            &DataType::LargeUtf8
+        })
+    }
+    /// Header-only projection before the writer encodes payload. The variadic
+    /// sequence is the original writer's bounded per-view sequence, not a
+    /// total replicated for each view. No rows or array values are scanned.
+    pub fn network_record_shape(
+        &mut self,
+        schema: &Schema,
+        buffer_descriptors: usize,
+        variadic_counts: &[i64],
+    ) -> Result<(), ReaderStructureFailure<H>> {
+        self.private_headers(buffer_descriptors, ReaderArrayHeaderClass::Retained)?;
+        self.private_headers(1, ReaderArrayHeaderClass::Retained)?;
+        if !variadic_counts.is_empty() {
+            self.array::<i64>(
+                variadic_counts.len().max(4),
+                ReaderArrayHeaderClass::Temporary,
+            )?;
+        }
+        let mut variadic = variadic_counts.iter().copied();
+        for field in schema.fields() {
+            self.read_node(
+                field,
+                true,
+                ReaderArrayHeaderClass::Retained,
+                &mut variadic,
+                &mut |_| Ok(false),
+            )?;
+        }
+        self.pushes::<ArrayRef>(schema.fields().len(), ReaderArrayHeaderClass::Temporary)
+    }
     pub fn record_batch(
         &mut self,
         schema: &Schema,
@@ -1046,7 +1112,13 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
         }
         let mut variadic = counts.into_iter().flat_map(|counts| counts.iter());
         for field in schema.fields() {
-            self.read_node(field, root_class, &mut variadic, &mut dictionary_present)?;
+            self.read_node(
+                field,
+                false,
+                root_class,
+                &mut variadic,
+                &mut dictionary_present,
+            )?;
         }
         // Original root column Vec belongs to RecordBatch, which materializer
         // consumes and destroys. Nested array-owned tables use Retained above.
@@ -1185,6 +1257,65 @@ mod tests {
             let decoded = reader.next().unwrap().unwrap();
             assert_eq!(decoded.num_rows(), batch.num_rows());
             assert_eq!(decoded.column(0).data_type(), batch.column(0).data_type());
+            assert_eq!(decoded.column(0).to_data(), batch.column(0).to_data());
+        }
+    }
+    #[test]
+    fn network_record_shape_covers_actual_map_run_union_and_view_reader_constructors() {
+        use std::cell::Cell;
+        for array in sources() {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "value",
+                array.data_type().clone(),
+                true,
+            )]));
+            let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+            let bytes = write(&batch);
+            let mut reader =
+                arrow_ipc::reader::StreamReader::try_new(Cursor::new(bytes.as_slice()), None)
+                    .unwrap();
+            let (metadata, body) = record(&bytes, reader.get_ref().position() as usize);
+            let actual = Cell::new([0usize; 2]);
+            let projected = Cell::new([0usize; 2]);
+            let add = |target: &Cell<[usize; 2]>, bytes, class| {
+                let index = usize::from(class == ReaderArrayHeaderClass::Temporary);
+                let mut counts = target.get();
+                counts[index] += bytes;
+                target.set(counts);
+                Ok::<_, ()>(())
+            };
+            ReaderArrayStructureObserver {
+                request: &mut |layout, class| add(&actual, layout.size(), class),
+                opaque: &mut |bytes, class| add(&actual, bytes, class),
+                work: &mut || Ok(()),
+            }
+            .record_batch(
+                reader.schema().as_ref(),
+                metadata,
+                body,
+                ReaderArrayHeaderClass::Retained,
+                |_| Ok(false),
+            )
+            .unwrap();
+            let variadic = metadata
+                .variadicBufferCounts()
+                .into_iter()
+                .flat_map(|counts| counts.iter())
+                .collect::<Vec<_>>();
+            ReaderArrayStructureObserver {
+                request: &mut |layout, class| add(&projected, layout.size(), class),
+                opaque: &mut |bytes, class| add(&projected, bytes, class),
+                work: &mut || Ok(()),
+            }
+            .network_record_shape(
+                batch.schema().as_ref(),
+                metadata.buffers().unwrap().len(),
+                &variadic,
+            )
+            .unwrap();
+            assert!(projected.get()[0] >= actual.get()[0]);
+            assert!(projected.get()[1] >= actual.get()[1]);
+            let decoded = reader.next().unwrap().unwrap();
             assert_eq!(decoded.column(0).to_data(), batch.column(0).to_data());
         }
     }

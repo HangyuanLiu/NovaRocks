@@ -235,16 +235,114 @@ impl<H> ReaderStructureObserver<'_, H> {
         self.metadata(source.custom_metadata())?;
         self.shared::<Schema>()
     }
-    /// Constructor facts only. The source must first pass the shared full
-    /// verifier; this callback does not interpret metadata as value semantics.
-    pub fn field(&mut self, source: ipc::Field<'_>) -> Result<(), ReaderStructureFailure<H>> {
-        self.array::<u8>(
-            source.name().unwrap_or_default().len(),
-            ReaderStructureClass::SourceHeader,
-        )?;
-        self.shared::<Field>()?;
-        self.metadata(source.custom_metadata())?;
-        if source.dictionary().is_some() {
+    /// Size-only projection from the writer's real Arrow schema. It shares
+    /// constructor heads/type shapes with the borrowed IPC reader author and
+    /// allocates no replacement schema, field, string or logical type.
+    pub fn schema_from_arrow(&mut self, schema: &Schema) -> Result<(), ReaderStructureFailure<H>> {
+        if !novarocks_type_contract::owned_resources::profile::LOCKED_TOOLCHAIN {
+            return Err(ReaderStructureFailure::SourceModel(
+                "IPC reader toolchain source model drift",
+            ));
+        }
+        for field in schema.fields() {
+            self.field_from_arrow(field)?;
+        }
+        self.fresh_pushes::<Field>(schema.fields().len())?;
+        self.shared_slice::<FieldRef>(schema.fields().len())?;
+        self.metadata_from_arrow(schema.metadata())?;
+        self.shared::<Schema>()
+    }
+    fn metadata_from_arrow(
+        &mut self,
+        entries: &std::collections::HashMap<String, String>,
+    ) -> Result<(), ReaderStructureFailure<H>> {
+        // StreamWriter serializes this actual unique-key map. Receiver's
+        // association scratch and final String map use their original authors.
+        let table = novarocks_type_contract::owned_resources::hashmap::fresh_table_layout::<
+            &str,
+            (usize, usize),
+        >(entries.len())?;
+        (self.opaque)(
+            table.request_bytes_upper_bound,
+            ReaderStructureClass::Temporary,
+        )
+        .map_err(ReaderStructureFailure::Creator)?;
+        for (key, value) in entries {
+            self.step()?;
+            self.array::<u8>(key.len(), ReaderStructureClass::SourceHeader)?;
+            self.array::<u8>(value.len(), ReaderStructureClass::SourceHeader)?;
+        }
+        let opaque = &mut *self.opaque;
+        let work = &mut *self.work;
+        original_fresh_unique_insert_tables_observed::<String, String, ReaderStructureFailure<H>>(
+            entries.len(),
+            || work().map_err(ReaderStructureFailure::Creator),
+            |table, last| {
+                opaque(
+                    table.request_bytes_upper_bound,
+                    if last {
+                        ReaderStructureClass::SourceHeader
+                    } else {
+                        ReaderStructureClass::Temporary
+                    },
+                )
+                .map_err(ReaderStructureFailure::Creator)
+            },
+        )
+    }
+    fn field_from_arrow(&mut self, field: &Field) -> Result<(), ReaderStructureFailure<H>> {
+        self.field_head(field.name().len())?;
+        self.metadata_from_arrow(field.metadata())?;
+        let dictionary = matches!(field.data_type(), DataType::Dictionary(..));
+        let ty = if let DataType::Dictionary(_, value) = field.data_type() {
+            value.as_ref()
+        } else {
+            field.data_type()
+        };
+        let shape = match ty {
+            DataType::Struct(fields) => ReaderFieldShape::Struct(fields.len()),
+            DataType::Timestamp(_, zone) => {
+                ReaderFieldShape::Timestamp(zone.as_ref().map(|zone| zone.len()))
+            }
+            DataType::Union(fields, _) => ReaderFieldShape::Union(fields.len()),
+            _ => ReaderFieldShape::Plain,
+        };
+        self.field_type(dictionary, shape)?;
+        match ty {
+            DataType::Struct(fields) => {
+                for field in fields {
+                    self.field_from_arrow(field)?;
+                }
+            }
+            DataType::Union(fields, _) => {
+                for (_, field) in fields.iter() {
+                    self.field_from_arrow(field)?;
+                }
+            }
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::ListView(field)
+            | DataType::LargeListView(field)
+            | DataType::FixedSizeList(field, _)
+            | DataType::Map(field, _) => self.field_from_arrow(field)?,
+            DataType::RunEndEncoded(ends, values) => {
+                self.field_from_arrow(ends)?;
+                self.field_from_arrow(values)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn field_head(&mut self, name_bytes: usize) -> Result<(), ReaderStructureFailure<H>> {
+        self.array::<u8>(name_bytes, ReaderStructureClass::SourceHeader)?;
+        self.shared::<Field>()
+    }
+    fn field_type(
+        &mut self,
+        dictionary: bool,
+        shape: ReaderFieldShape,
+    ) -> Result<(), ReaderStructureFailure<H>> {
+        if dictionary {
             self.layout(
                 Layout::new::<DataType>(),
                 ReaderStructureClass::SourceHeader,
@@ -254,14 +352,29 @@ impl<H> ReaderStructureObserver<'_, H> {
                 ReaderStructureClass::SourceHeader,
             )?;
         }
-        let children = source.children().map_or(0, |children| children.len());
-        match source.type_type() {
-            ipc::Type::Struct_ => {
-                // Flatbuffers25.9.23 VectorIter is ExactSize, NOT TrustedLen:
-                // generic Arc FromIterator creates Vec<FieldRef> then Arc slice.
+        match shape {
+            ReaderFieldShape::Struct(children) => {
                 self.known_nontrusted_collect::<FieldRef>(children)?;
                 self.shared_slice::<FieldRef>(children)?;
             }
+            ReaderFieldShape::Timestamp(Some(bytes)) => self.shared_slice::<u8>(bytes)?,
+            ReaderFieldShape::Union(children) => {
+                self.fresh_pushes::<Field>(children)?;
+                self.fresh_pushes::<(i8, FieldRef)>(children)?;
+                self.shared_slice::<(i8, FieldRef)>(children)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    /// Constructor facts only. The source must first pass the shared full
+    /// verifier; this callback does not interpret metadata as value semantics.
+    pub fn field(&mut self, source: ipc::Field<'_>) -> Result<(), ReaderStructureFailure<H>> {
+        self.field_head(source.name().unwrap_or_default().len())?;
+        self.metadata(source.custom_metadata())?;
+        let children = source.children().map_or(0, |children| children.len());
+        let shape = match source.type_type() {
+            ipc::Type::Struct_ => ReaderFieldShape::Struct(children),
             ipc::Type::Timestamp => {
                 let timestamp =
                     source
@@ -269,9 +382,7 @@ impl<H> ReaderStructureObserver<'_, H> {
                         .ok_or(ReaderStructureFailure::SourceModel(
                             "unverified timestamp constructor",
                         ))?;
-                if let Some(timezone) = timestamp.timezone() {
-                    self.shared_slice::<u8>(timezone.len())?;
-                }
+                ReaderFieldShape::Timestamp(timestamp.timezone().map(str::len))
             }
             ipc::Type::Union => {
                 let union = source
@@ -284,12 +395,119 @@ impl<H> ReaderStructureObserver<'_, H> {
                         "IPC union implicit IDs are outside the verified source author",
                     ));
                 }
-                self.fresh_pushes::<Field>(children)?;
-                self.fresh_pushes::<(i8, FieldRef)>(children)?;
-                self.shared_slice::<(i8, FieldRef)>(children)?;
+                ReaderFieldShape::Union(children)
             }
-            _ => {}
+            _ => ReaderFieldShape::Plain,
+        };
+        self.field_type(source.dictionary().is_some(), shape)
+    }
+}
+
+enum ReaderFieldShape {
+    Plain,
+    Struct(usize),
+    Timestamp(Option<usize>),
+    Union(usize),
+}
+
+#[cfg(test)]
+mod network_projection_tests {
+    use super::*;
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+    use std::{cell::Cell, io::Cursor, sync::Arc};
+    #[test]
+    fn writer_schema_projection_covers_the_actual_reader_schema_round_trip() {
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, true)
+                    .with_metadata([("field-owner".to_owned(), "original".to_owned())].into()),
+            ],
+            [("schema-owner".to_owned(), "original".to_owned())].into(),
+        ));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("a"), None])),
+            ],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut writer =
+                arrow_ipc::writer::StreamWriter::try_new(&mut bytes, schema.as_ref()).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
         }
-        Ok(())
+        let mut reader =
+            arrow_ipc::reader::StreamReader::try_new(Cursor::new(bytes.as_slice()), None).unwrap();
+        assert_eq!(
+            reader.next().unwrap().unwrap().schema().as_ref(),
+            schema.as_ref()
+        );
+        let arrow_source = Cell::new(0usize);
+        let arrow_temporary = Cell::new(0usize);
+        let mut request = |layout: Layout, class| {
+            let target = if class == ReaderStructureClass::SourceHeader {
+                &arrow_source
+            } else {
+                &arrow_temporary
+            };
+            target.set(target.get() + layout.size());
+            Ok::<_, std::convert::Infallible>(())
+        };
+        let mut opaque = |bytes, class| {
+            let target = if class == ReaderStructureClass::SourceHeader {
+                &arrow_source
+            } else {
+                &arrow_temporary
+            };
+            target.set(target.get() + bytes);
+            Ok::<_, std::convert::Infallible>(())
+        };
+        let mut work = || Ok::<_, std::convert::Infallible>(());
+        ReaderStructureObserver {
+            request: &mut request,
+            opaque: &mut opaque,
+            work: &mut work,
+        }
+        .schema_from_arrow(schema.as_ref())
+        .unwrap();
+        let ipc_source = Cell::new(0usize);
+        let ipc_temporary = Cell::new(0usize);
+        let mut request = |layout: Layout, class| {
+            let target = if class == ReaderStructureClass::SourceHeader {
+                &ipc_source
+            } else {
+                &ipc_temporary
+            };
+            target.set(target.get() + layout.size());
+            Ok::<_, std::convert::Infallible>(())
+        };
+        let mut opaque = |bytes, class| {
+            let target = if class == ReaderStructureClass::SourceHeader {
+                &ipc_source
+            } else {
+                &ipc_temporary
+            };
+            target.set(target.get() + bytes);
+            Ok::<_, std::convert::Infallible>(())
+        };
+        let mut work = || Ok::<_, std::convert::Infallible>(());
+        let mut observer = ReaderStructureObserver {
+            request: &mut request,
+            opaque: &mut opaque,
+            work: &mut work,
+        };
+        let metadata_len = i32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let message = arrow_ipc::root_as_message(&bytes[8..8 + metadata_len]).unwrap();
+        let actual = message.header_as_schema().unwrap();
+        for field in actual.fields().unwrap().iter() {
+            observer.field(field).unwrap();
+        }
+        observer.schema(actual).unwrap();
+        assert_eq!(arrow_source.get(), ipc_source.get());
+        assert_eq!(arrow_temporary.get(), ipc_temporary.get());
     }
 }

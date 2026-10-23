@@ -76,6 +76,7 @@ struct Usage {
 struct CreatorGuard {
     host: Arc<dyn InputConstructionRequestHost>,
     profile: InputConstructionProfile,
+    byte_limit: Option<usize>,
     usage: Mutex<Usage>,
 }
 impl ValueTypeStorageHold for CreatorGuard {}
@@ -106,7 +107,7 @@ impl CreatorGuard {
         }
         if bytes
             .checked_add(usage.opaque_bytes)
-            .is_none_or(|total| total > i64::MAX as usize)
+            .is_none_or(|total| total > self.byte_limit.unwrap_or(i64::MAX as usize))
         {
             return Err(exhausted());
         }
@@ -134,7 +135,7 @@ impl CreatorGuard {
             || work > self.profile.max_work
             || bytes
                 .checked_add(usage.exact_bytes)
-                .is_none_or(|total| total > i64::MAX as usize)
+                .is_none_or(|total| total > self.byte_limit.unwrap_or(i64::MAX as usize))
         {
             return Err(exhausted());
         }
@@ -208,14 +209,25 @@ impl ObservedInputConstructionFactory {
         profile: InputConstructionProfile,
         host: Arc<dyn InputConstructionRequestHost>,
     ) -> Result<Arc<CreatorGuard>, ConstructionFailure> {
+        Self::creator_with_limit(profile, host, None)
+    }
+    fn creator_with_limit(
+        profile: InputConstructionProfile,
+        host: Arc<dyn InputConstructionRequestHost>,
+        byte_limit: Option<usize>,
+    ) -> Result<Arc<CreatorGuard>, ConstructionFailure> {
         let layout = Self::schema_scope_allocation_layouts()?[0];
-        if profile.max_requests < 1 || layout.size() > profile.max_request_bytes {
+        if profile.max_requests < 1
+            || layout.size() > profile.max_request_bytes
+            || byte_limit.is_some_and(|limit| limit > i64::MAX as usize || layout.size() > limit)
+        {
             return Err(exhausted());
         }
         host.request(layout)?;
         Ok(Arc::new(CreatorGuard {
             host,
             profile,
+            byte_limit,
             usage: Mutex::new(Usage {
                 requests: 1,
                 exact_bytes: layout.size(),
@@ -224,8 +236,14 @@ impl ObservedInputConstructionFactory {
         }))
     }
     fn begin_scope(&self) -> Result<Box<dyn InputConstructionOwner>, ConstructionFailure> {
+        self.begin_scope_with_limit(None)
+    }
+    fn begin_scope_with_limit(
+        &self,
+        byte_limit: Option<usize>,
+    ) -> Result<Box<dyn InputConstructionOwner>, ConstructionFailure> {
         self.control.checkpoint(0)?;
-        let guard = Self::creator(self.profile, self.host.clone())?;
+        let guard = Self::creator_with_limit(self.profile, self.host.clone(), byte_limit)?;
         guard.request(Self::schema_scope_allocation_layouts()?[1])?;
         Ok(Box::new(Scope {
             guard,
@@ -260,6 +278,18 @@ impl InputConstructionFactory for ObservedInputConstructionFactory {
         }
         self.begin_scope()
     }
+    fn begin_typed_construction_bounded(
+        &self,
+        schema: &ChunkSchema,
+        byte_limit: usize,
+    ) -> Result<Box<dyn InputConstructionOwner>, ConstructionFailure> {
+        if !schema.is_typed() {
+            return Err(ConstructionFailure::InvalidSource(
+                "input creator requires explicit value bindings".into(),
+            ));
+        }
+        self.begin_scope_with_limit(Some(byte_limit))
+    }
 }
 struct Scope {
     guard: Arc<CreatorGuard>,
@@ -269,6 +299,10 @@ struct Scope {
 impl InputConstructionOwner for Scope {
     fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
         ValueTypeStorageLifetime::held(self.guard.clone())
+    }
+    fn successful_request_extent_upper(&self) -> Option<usize> {
+        let usage = self.guard.usage.lock().expect("construction usage lock");
+        usage.exact_bytes.checked_add(usage.opaque_bytes)
     }
     fn request(&self, layout: Layout) -> Result<(), ConstructionFailure> {
         self.control.checkpoint(0)?;
@@ -338,6 +372,60 @@ mod tests {
             |_| Ok(()),
         )
         .unwrap()
+    }
+    #[test]
+    fn bounded_scope_checks_combined_exact_and_opaque_before_original_host() {
+        let tracker = MemTracker::new_root("bounded original construction");
+        let factory = ObservedInputConstructionFactory::try_new(
+            profile(),
+            Arc::new(TrackedInputConstructionHost::new(tracker.clone())),
+            Arc::new(RuntimeInputConstructionControl::new(Arc::new(
+                RuntimeErrorState::default(),
+            ))),
+            Arc::new(LockedArrowInputConstructionModel),
+        )
+        .unwrap();
+        let before = tracker.current();
+        assert!(
+            factory
+                .begin_typed_construction_bounded(source().chunk_schema(), 1)
+                .is_err()
+        );
+        assert_eq!(
+            tracker.current(),
+            before,
+            "scope metadata is checked before allocation"
+        );
+        let scope_bytes: usize =
+            ObservedInputConstructionFactory::schema_scope_allocation_layouts()
+                .unwrap()
+                .iter()
+                .map(|layout| layout.size())
+                .sum();
+        let owner = factory
+            .begin_typed_construction_bounded(source().chunk_schema(), scope_bytes + 100)
+            .unwrap();
+        owner.request(Layout::array::<u8>(60).unwrap()).unwrap();
+        owner.observe_opaque_upper_bound(40).unwrap();
+        let full = tracker.current();
+        assert!(owner.request(Layout::array::<u8>(1).unwrap()).is_err());
+        assert!(owner.observe_opaque_upper_bound(1).is_err());
+        assert_eq!(
+            tracker.current(),
+            full,
+            "refused exact and opaque work never reaches the host"
+        );
+        let hold = owner.storage_lifetime();
+        drop(owner);
+        assert_eq!(
+            tracker.current(),
+            full,
+            "scope Drop is not result-storage exit"
+        );
+        drop(hold);
+        assert_eq!(tracker.current(), before);
+        drop(factory);
+        assert_eq!(tracker.current(), 0);
     }
     #[test]
     fn actual_tracker_requests_survive_scope_and_control_until_final_creation_hold_drop() {

@@ -979,16 +979,22 @@ where
     }
 
     fn call(&mut self, request: axum::http::Request<Body>) -> Self::Future {
-        if self.admission.admit_headers(request.headers()).is_err() {
-            (self.on_authentication_failure)();
-            drop(request);
-            let response = tonic::Status::new(
-                tonic::Code::Unauthenticated,
-                "native caller authentication failed",
-            )
-            .into_http();
-            return Box::pin(async move { Ok(response) });
-        }
+        let caller = match self.admission.admit_headers(request.headers()) {
+            Ok(caller) => caller,
+            Err(_) => {
+                (self.on_authentication_failure)();
+                drop(request);
+                let response = tonic::Status::new(
+                    tonic::Code::Unauthenticated,
+                    "native caller authentication failed",
+                )
+                .into_http();
+                return Box::pin(async move { Ok(response) });
+            }
+        };
+        let mut request = request;
+        // This is the signed authentication result, never a payload claim.
+        request.extensions_mut().insert(caller);
         Box::pin(self.inner.call(request))
     }
 }
@@ -1095,6 +1101,40 @@ mod tests {
         assert_eq!(entered.load(Ordering::SeqCst), 0);
         assert_eq!(response.status(), 200);
         assert_eq!(response.headers()["grpc-status"], "16");
+    }
+
+    #[tokio::test]
+    async fn successful_authentication_forwards_the_signed_process_claim() {
+        let trust = crate::backend_test_support::test_backend_native_trust();
+        let process = novarocks_native_trust::NativeProcessIdentity::Backend(
+            novarocks_types::BackendProcessId::new_v7(),
+        );
+        trust.bind_process_identity(process).unwrap();
+        let inner = tower::service_fn(move |request: axum::http::Request<axum::body::Body>| {
+            let caller = request
+                .extensions()
+                .get::<novarocks_native_trust::AuthenticatedNativeCaller>()
+                .expect("authenticated process custody reaches the domain owner");
+            assert_eq!(caller.process_identity(), Some(process));
+            async { Ok::<_, std::convert::Infallible>(tonic::Status::ok("").into_http()) }
+        });
+        let mut service = NativeListenerAuthService::new(
+            inner,
+            trust.server_admission(),
+            Arc::new(|| panic!("valid signed process must authenticate")),
+        );
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        trust.apply_client_authorization(&mut metadata).unwrap();
+        let mut request = axum::http::Request::new(axum::body::Body::empty());
+        request.headers_mut().insert(
+            "authorization",
+            axum::http::HeaderValue::from_bytes(
+                metadata.get("authorization").unwrap().as_encoded_bytes(),
+            )
+            .unwrap(),
+        );
+        let response = service.call(request).await.unwrap();
+        assert_eq!(response.headers()["grpc-status"], "0");
     }
 
     #[tokio::test]

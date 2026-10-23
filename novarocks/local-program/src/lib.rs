@@ -118,8 +118,9 @@ pub use runtime_filter::{
 };
 pub use sink::{
     MAX_STATIC_SINK_BRANCHES, MAX_STATIC_SINK_COLUMNS, MAX_STATIC_SINK_EXPRESSIONS,
-    ProgramOutputRole, SinkCompileError, StaticRouterRoute, StaticSinkError, StaticSinkProgram,
-    StaticStreamBranch, StaticStreamContract, StaticStreamRouting,
+    ProgramOutputRole, ProgramWriteLayoutPreference, SinkCompileError, StaticRouterRoute,
+    StaticSinkError, StaticSinkProgram, StaticStreamBranch, StaticStreamContract,
+    StaticStreamRouting,
 };
 pub use typed_channels::*;
 pub use typed_expressions::*;

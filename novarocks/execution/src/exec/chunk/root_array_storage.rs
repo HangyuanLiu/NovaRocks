@@ -24,7 +24,7 @@ use std::mem::{size_of, size_of_val};
 
 use arrow::array::*;
 use arrow::buffer::Buffer;
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
 use novarocks_result_contract::RootProfileV1;
 
 /// No String allocation is needed on the inspection/failure path.
@@ -35,6 +35,7 @@ pub enum RootArrayStorageError {
     CarrierDowncastMismatch,
     CarrierOuterOwnerMismatch,
     UnknownMetadataOwner,
+    UnknownBackingOwner,
     CapacityExceeded,
     WorkExceeded,
 }
@@ -49,6 +50,7 @@ impl std::fmt::Display for RootArrayStorageError {
             }
             Self::CarrierOuterOwnerMismatch => "root storage carrier has a different outer owner",
             Self::UnknownMetadataOwner => "root storage metadata has no exact owner proof",
+            Self::UnknownBackingOwner => "operator storage has no complete source backing receipt",
             Self::CapacityExceeded => "root storage inspection exceeds its byte bound",
             Self::WorkExceeded => "root storage inspection exceeds its structural work bound",
         })
@@ -63,7 +65,7 @@ impl novarocks_failure_contract::FailureProjection for RootArrayStorageError {
             Self::UnsupportedCarrier => {
                 (FailureClass::Invariant, ExecutionReason::RootStorageCarrier)
             }
-            Self::UnknownMetadataOwner => {
+            Self::UnknownMetadataOwner | Self::UnknownBackingOwner => {
                 (FailureClass::Invariant, ExecutionReason::RootStorageOwner)
             }
             Self::UnsupportedSchemaType => (
@@ -131,9 +133,11 @@ pub fn borrowed_root_array_storage(
     let mut state = Inspection {
         limits,
         bytes: 0,
+        payload_bytes: 0,
         nodes: 0,
         backing: [None; 64],
         inspect_type: &mut no_types,
+        operator: false,
     };
     state.array(array, 0)?;
     Ok(state.bytes)
@@ -165,12 +169,52 @@ pub(crate) fn borrowed_root_batch_storage_with_types(
         nodes: limits.nodes.min(2 * RootProfileV1::SCHEMA_TYPE_NODES),
         depth: limits.depth.min(RootProfileV1::MAX_DEPTH),
     };
+    borrowed_batch_storage_profile(
+        batch,
+        limits,
+        RootProfileV1::MAX_COLUMNS,
+        false,
+        inspect_type,
+    )
+}
+
+/// Same complete backing inspector under the operator's explicit frozen
+/// structural bounds. RootProfile's carrier and byte policy stays in its
+/// wrapper; execution queues do not inherit the result protocol's limits.
+pub(crate) fn borrowed_batch_storage_profile(
+    batch: &RecordBatch,
+    limits: RootArrayStorageLimits,
+    columns: usize,
+    operator: bool,
+    inspect_type: &mut dyn FnMut(&DataType) -> Result<(), RootArrayStorageError>,
+) -> Result<usize, RootArrayStorageError> {
+    borrowed_batch_storage_geometry_profile(batch, limits, columns, operator, inspect_type)
+        .map(|v| v.payload_bytes + v.metadata_bytes)
+}
+
+pub(crate) struct ArrayStorageGeometry {
+    pub payload_bytes: usize,
+    pub metadata_bytes: usize,
+}
+
+pub(crate) fn borrowed_batch_storage_geometry_profile(
+    batch: &RecordBatch,
+    limits: RootArrayStorageLimits,
+    columns: usize,
+    operator: bool,
+    inspect_type: &mut dyn FnMut(&DataType) -> Result<(), RootArrayStorageError>,
+) -> Result<ArrayStorageGeometry, RootArrayStorageError> {
+    if batch.num_columns() > columns {
+        return Err(RootArrayStorageError::WorkExceeded);
+    }
     let mut state = Inspection {
         limits,
         bytes: 0,
+        payload_bytes: 0,
         nodes: 0,
         backing: [None; 64],
         inspect_type,
+        operator,
     };
     state.charge(size_of::<RecordBatch>())?;
     // Upstream Arrow does not expose the column Vec's spare capacity; the
@@ -185,13 +229,18 @@ pub(crate) fn borrowed_root_batch_storage_with_types(
     for array in batch.columns() {
         state.array(array.as_ref(), 0)?;
     }
-    Ok(state.bytes)
+    Ok(ArrayStorageGeometry {
+        payload_bytes: state.payload_bytes,
+        metadata_bytes: state.bytes - state.payload_bytes,
+    })
 }
 
 struct Inspection<'a> {
+    operator: bool,
     inspect_type: &'a mut dyn FnMut(&DataType) -> Result<(), RootArrayStorageError>,
     limits: RootArrayStorageLimits,
     bytes: usize,
+    payload_bytes: usize,
     nodes: usize,
     // All inspected buffers remain borrowed and alive throughout inspection,
     // so a nonempty allocation cannot be freed/reused under this identity.
@@ -217,6 +266,10 @@ impl Inspection<'_> {
         let identity = (buffer.data_ptr().as_ptr() as usize, buffer.capacity());
         if !self.backing.contains(&Some(identity)) {
             self.charge(identity.1)?;
+            self.payload_bytes = self
+                .payload_bytes
+                .checked_add(identity.1)
+                .ok_or(RootArrayStorageError::CapacityExceeded)?;
             if let Some(slot) = self.backing.iter_mut().find(|slot| slot.is_none()) {
                 *slot = Some(identity);
             }
@@ -273,6 +326,28 @@ impl Inspection<'_> {
             DataType::UInt16 => primitive!(UInt16Array),
             DataType::UInt32 => primitive!(UInt32Array),
             DataType::UInt64 => primitive!(UInt64Array),
+            DataType::Float16 if self.operator => primitive!(Float16Array),
+            DataType::Duration(TimeUnit::Second) if self.operator => {
+                primitive!(DurationSecondArray)
+            }
+            DataType::Duration(TimeUnit::Millisecond) if self.operator => {
+                primitive!(DurationMillisecondArray)
+            }
+            DataType::Duration(TimeUnit::Microsecond) if self.operator => {
+                primitive!(DurationMicrosecondArray)
+            }
+            DataType::Duration(TimeUnit::Nanosecond) if self.operator => {
+                primitive!(DurationNanosecondArray)
+            }
+            DataType::Interval(IntervalUnit::YearMonth) if self.operator => {
+                primitive!(IntervalYearMonthArray)
+            }
+            DataType::Interval(IntervalUnit::DayTime) if self.operator => {
+                primitive!(IntervalDayTimeArray)
+            }
+            DataType::Interval(IntervalUnit::MonthDayNano) if self.operator => {
+                primitive!(IntervalMonthDayNanoArray)
+            }
             DataType::Float32 => primitive!(Float32Array),
             DataType::Float64 => primitive!(Float64Array),
             DataType::Decimal128(_, _) => primitive!(Decimal128Array),
@@ -291,6 +366,32 @@ impl Inspection<'_> {
             DataType::LargeUtf8 => bytes!(LargeStringArray),
             DataType::Binary => bytes!(BinaryArray),
             DataType::LargeBinary => bytes!(LargeBinaryArray),
+            DataType::Utf8View | DataType::BinaryView if self.operator => {
+                macro_rules! view {
+                    ($ty:ty) => {{
+                        let a = exact::<$ty>(array)?;
+                        self.object(a)?;
+                        self.buffer(a.views().inner())?;
+                        // GenericByteViewArray owns one immutable Arc<[Buffer]>.
+                        self.charge(2 * size_of::<usize>())?;
+                        self.charge(
+                            a.data_buffers()
+                                .len()
+                                .checked_mul(size_of::<Buffer>())
+                                .ok_or(RootArrayStorageError::CapacityExceeded)?,
+                        )?;
+                        for buffer in a.data_buffers() {
+                            self.buffer(buffer)?;
+                        }
+                        self.nulls(a)?;
+                    }};
+                }
+                if matches!(array.data_type(), DataType::Utf8View) {
+                    view!(StringViewArray)
+                } else {
+                    view!(BinaryViewArray)
+                }
+            }
             DataType::FixedSizeBinary(_) => {
                 let a = exact::<FixedSizeBinaryArray>(array)?;
                 self.object(a)?;
@@ -299,6 +400,70 @@ impl Inspection<'_> {
             }
             DataType::List(_) => list!(ListArray),
             DataType::LargeList(_) => list!(LargeListArray),
+            DataType::FixedSizeList(_, _) if self.operator => {
+                let a = exact::<FixedSizeListArray>(array)?;
+                self.object(a)?;
+                self.nulls(a)?;
+                self.array(a.values().as_ref(), depth + 1)?;
+            }
+            DataType::ListView(_) | DataType::LargeListView(_) if self.operator => {
+                macro_rules! list_view {
+                    ($ty:ty) => {{
+                        let a = exact::<$ty>(array)?;
+                        self.object(a)?;
+                        self.buffer(a.offsets().inner())?;
+                        self.buffer(a.sizes().inner())?;
+                        self.nulls(a)?;
+                        self.array(a.values().as_ref(), depth + 1)?;
+                    }};
+                }
+                if matches!(array.data_type(), DataType::ListView(_)) {
+                    list_view!(ListViewArray)
+                } else {
+                    list_view!(LargeListViewArray)
+                }
+            }
+            DataType::Union(fields, _) if self.operator => {
+                let a = exact::<UnionArray>(array)?;
+                self.object(a)?;
+                self.buffer(a.type_ids().inner())?;
+                if let Some(offsets) = a.offsets() {
+                    self.buffer(offsets.inner())?;
+                }
+                // The pinned standard UnionArray constructs its private fixed
+                // lookup Vec with exactly max_type_id+1 entries. Clone/slice
+                // keep that length; no public API can append spare entries.
+                let mut slots = 0usize;
+                for (type_id, _) in fields.iter() {
+                    let id = usize::try_from(type_id)
+                        .map_err(|_| RootArrayStorageError::CarrierDowncastMismatch)?;
+                    slots = slots.max(id + 1);
+                }
+                self.charge(
+                    slots
+                        .checked_mul(size_of::<Option<ArrayRef>>())
+                        .ok_or(RootArrayStorageError::CapacityExceeded)?,
+                )?;
+                for (type_id, _) in fields.iter() {
+                    self.array(a.child(type_id).as_ref(), depth + 1)?;
+                }
+            }
+            DataType::RunEndEncoded(ends, _) if self.operator => {
+                macro_rules! run {
+                    ($ty:ty) => {{
+                        let a = exact::<RunArray<$ty>>(array)?;
+                        self.object(a)?;
+                        self.buffer(a.run_ends().inner().inner())?;
+                        self.array(a.values().as_ref(), depth)?;
+                    }};
+                }
+                match ends.data_type() {
+                    DataType::Int16 => run!(arrow::datatypes::Int16Type),
+                    DataType::Int32 => run!(arrow::datatypes::Int32Type),
+                    DataType::Int64 => run!(arrow::datatypes::Int64Type),
+                    _ => return Err(RootArrayStorageError::UnsupportedCarrier),
+                }
+            }
             DataType::Struct(_) => self.structure(exact::<StructArray>(array)?, depth)?,
             DataType::Map(_, _) => {
                 let a = exact::<MapArray>(array)?;
@@ -322,6 +487,28 @@ impl Inspection<'_> {
                 // All values retain their original backing, irrespective of
                 // which keys the visible root rows happen to reference.
                 self.array(a.values().as_ref(), depth)?;
+            }
+            DataType::Dictionary(key, _) if self.operator => {
+                macro_rules! dictionary {
+                    ($ty:ty) => {{
+                        let a = exact::<DictionaryArray<$ty>>(array)?;
+                        self.object(a)?;
+                        self.array(a.keys(), depth)?;
+                        self.array(a.values().as_ref(), depth)?;
+                    }};
+                }
+                use arrow::datatypes::*;
+                match key.as_ref() {
+                    DataType::Int8 => dictionary!(Int8Type),
+                    DataType::Int16 => dictionary!(Int16Type),
+                    DataType::Int32 => dictionary!(Int32Type),
+                    DataType::Int64 => dictionary!(Int64Type),
+                    DataType::UInt8 => dictionary!(UInt8Type),
+                    DataType::UInt16 => dictionary!(UInt16Type),
+                    DataType::UInt32 => dictionary!(UInt32Type),
+                    DataType::UInt64 => dictionary!(UInt64Type),
+                    _ => return Err(RootArrayStorageError::UnsupportedCarrier),
+                }
             }
             _ => return Err(RootArrayStorageError::UnsupportedCarrier),
         }

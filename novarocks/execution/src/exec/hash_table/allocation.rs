@@ -33,9 +33,13 @@ use crate::runtime::mem_tracker::MemTracker;
 /// allocator is invoked, then releases the old layout only after success. This
 /// intentionally accounts the conservative `old + new` reallocation peak.
 #[derive(Clone, Debug)]
-pub(crate) struct AggregateAllocator {
+pub(crate) struct ExecutionStateAllocator {
     tracker: Arc<MemTracker>,
 }
+
+/// Aggregate callers retain their existing allocator API. Other execution
+/// state owners bind the same allocation mechanism to their own tracker.
+pub(crate) type AggregateAllocator = ExecutionStateAllocator;
 
 impl novarocks_functions::aggregate_scalar::ScalarStateAllocator for AggregateAllocator {
     fn scalar_allocation_error<

@@ -67,6 +67,46 @@ impl std::fmt::Debug for ChunkAccountingHandle {
     }
 }
 
+/// Positive complete backing fact supplied by the actual source constructor.
+/// This number is an upper bound for all parent payload backing retained by
+/// its Chunk, including externally owned regions and sliced-away storage.
+/// It grants no allocation, query, Task or provider execution capability.
+#[derive(Clone)]
+pub struct ChunkSourceBackingReceipt {
+    retained_bytes: usize,
+    _source: SourceBackingStorage,
+}
+#[derive(Clone)]
+enum SourceBackingStorage {
+    Original {
+        _storage: ValueTypeStorageLifetime,
+    },
+    Connector {
+        _owner: Arc<Mutex<ConnectorOutputMemoryToken>>,
+    },
+}
+impl std::fmt::Debug for ChunkSourceBackingReceipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkSourceBackingReceipt")
+            .field("retained_bytes", &self.retained_bytes)
+            .finish_non_exhaustive()
+    }
+}
+impl ChunkSourceBackingReceipt {
+    /// Only the source that knows the complete allocation/custody closure may
+    /// supply this fact. Buffer region size, logical bytes, pure lifetimes and
+    /// observed display schemas are not complete backing evidence.
+    pub fn from_source(retained_bytes: usize, source: ValueTypeStorageLifetime) -> Self {
+        Self {
+            retained_bytes,
+            _source: SourceBackingStorage::Original { _storage: source },
+        }
+    }
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+}
+
 /// A chunk of data, consisting of multiple rows.
 /// Phase 2: Wrapper around Arrow RecordBatch.
 #[derive(Debug, Clone)]
@@ -87,6 +127,7 @@ pub struct Chunk {
     array_type_storage: ValueTypeStorageLifetime,
     construction_storage: ValueTypeStorageLifetime,
     output_column_metadata: Option<super::OutputColumnMetadata>,
+    source_backing: Option<ChunkSourceBackingReceipt>,
 }
 
 /// Owned Arrow access paired with its complete immutable execution binding
@@ -100,6 +141,7 @@ pub struct ChunkBatchProjection {
     array_type_storage: ValueTypeStorageLifetime,
     construction_storage: ValueTypeStorageLifetime,
     output_column_metadata: Option<super::OutputColumnMetadata>,
+    source_backing: Option<ChunkSourceBackingReceipt>,
 }
 
 // Shared source custody contains only existing buffer charges, exact schema
@@ -112,6 +154,7 @@ struct ChunkSourceStorageHold {
     construction_storage: ValueTypeStorageLifetime,
     storage: ValueTypeStorageLifetime,
     output_column_metadata: Option<super::OutputColumnMetadata>,
+    source_backing: Option<ChunkSourceBackingReceipt>,
 }
 impl novarocks_type_contract::ValueTypeStorageHold for ChunkSourceStorageHold {}
 
@@ -164,6 +207,7 @@ impl ChunkBatchProjection {
             array_type_storage: self.array_type_storage,
             construction_storage: self.construction_storage,
             output_column_metadata: self.output_column_metadata,
+            source_backing: self.source_backing,
         }
     }
 }
@@ -196,6 +240,7 @@ impl Chunk {
         if self.accounting.is_none()
             && self.connector_output_memory.is_none()
             && self.output_column_metadata.is_none()
+            && self.source_backing.is_none()
         {
             let storage = storage.retaining_observed(&self.array_type_storage, &mut request)?;
             let storage = storage.retaining_observed(&self.construction_storage, &mut request)?;
@@ -214,6 +259,7 @@ impl Chunk {
                 array_type_storage: self.array_type_storage.clone(),
                 construction_storage: self.construction_storage.clone(),
                 output_column_metadata: self.output_column_metadata.clone(),
+                source_backing: self.source_backing.clone(),
                 storage,
             },
         )))
@@ -247,6 +293,7 @@ impl Chunk {
                 array_type_storage: source.array_type_storage.clone(),
                 construction_storage: source.construction_storage.clone(),
                 output_column_metadata: source.output_column_metadata.clone(),
+                source_backing: source.source_backing.clone(),
                 storage: ValueTypeStorageLifetime::pure(),
             });
         }
@@ -256,6 +303,38 @@ impl Chunk {
                 storage,
             },
         )))
+    }
+
+    /// Explicit original source backing, independent of accounting authority.
+    pub fn source_backing_receipt(&self) -> Option<&ChunkSourceBackingReceipt> {
+        self.source_backing.as_ref()
+    }
+
+    pub fn attach_source_backing_receipt(
+        &mut self,
+        receipt: ChunkSourceBackingReceipt,
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
+        if self.source_backing.is_some() {
+            return Err(crate::runtime::operator_byte_credit::credit_contract(
+                "complete Chunk backing receipt is already attached",
+            ));
+        }
+        self.source_backing = Some(receipt);
+        Ok(())
+    }
+
+    /// An allocating output constructor must consume BOTH the original source
+    /// custody and its positive extent. A lifetime alone does not re-elect
+    /// completeness for a newly assembled set of output arrays.
+    pub fn source_storage_with_backing_observed<E: From<LayoutResourceError>>(
+        &self,
+        storage: ValueTypeStorageLifetime,
+        request: impl FnMut(Layout) -> Result<(), E>,
+    ) -> Result<(ValueTypeStorageLifetime, Option<ChunkSourceBackingReceipt>), E> {
+        Ok((
+            self.source_storage_lifetime_observed(storage, request)?,
+            self.source_backing.clone(),
+        ))
     }
 
     pub fn record_batch(&self) -> &RecordBatch {
@@ -273,6 +352,7 @@ impl Chunk {
             array_type_storage: self.array_type_storage.clone(),
             construction_storage: self.construction_storage.clone(),
             output_column_metadata: self.output_column_metadata.clone(),
+            source_backing: self.source_backing.clone(),
         }
     }
     pub fn into_batch_projection(self) -> ChunkBatchProjection {
@@ -284,11 +364,13 @@ impl Chunk {
             array_type_storage: self.array_type_storage,
             construction_storage: self.construction_storage,
             output_column_metadata: self.output_column_metadata,
+            source_backing: self.source_backing,
         }
     }
     #[cfg(test)]
     pub(crate) fn replace_record_batch_for_test(&mut self, batch: RecordBatch) {
         self.batch = Arc::new(batch);
+        self.source_backing = None;
     }
     /// Retain only the original shared buffer funding handles. Newly decoded
     /// buffers are covered by the hydration caller's separate creation hold.
@@ -411,6 +493,7 @@ impl Chunk {
             array_type_storage: source.storage.clone(),
             construction_storage: source.storage,
             output_column_metadata: None,
+            source_backing: None,
         })
     }
 
@@ -522,6 +605,7 @@ impl Chunk {
             array_type_storage: ValueTypeStorageLifetime::pure(),
             construction_storage: ValueTypeStorageLifetime::pure(),
             output_column_metadata: None,
+            source_backing: None,
         })
     }
 
@@ -577,6 +661,7 @@ impl Chunk {
                 array_type_storage: ValueTypeStorageLifetime::pure(),
                 construction_storage: ValueTypeStorageLifetime::pure(),
                 output_column_metadata: None,
+                source_backing: None,
             });
         }
         let row_count = batch.num_rows();
@@ -591,6 +676,7 @@ impl Chunk {
             array_type_storage: ValueTypeStorageLifetime::pure(),
             construction_storage: ValueTypeStorageLifetime::pure(),
             output_column_metadata: None,
+            source_backing: None,
         })
     }
 
@@ -680,6 +766,30 @@ impl Chunk {
         Ok(())
     }
 
+    /// Complete borrowed storage geometry, without cloning carriers or scanning
+    /// rows. This is an observation under the caller's existing window.
+    pub fn retained_operator_geometry(
+        &self,
+        limits: super::OperatorStorageLimits,
+    ) -> crate::runtime::fragment::ExecutionResult<usize> {
+        super::root_chunk_storage::borrowed_operator_chunk_storage(self, limits)
+            .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)
+    }
+
+    /// Attach already-acquired, release-only storage responsibility to backing
+    /// custody. No runtime, Task, provider, or funding capability may be held by
+    /// this marker. Downstream source loans retain it with the actual arrays.
+    pub fn retain_operator_holder<E: From<LayoutResourceError>>(
+        &mut self,
+        holder: ValueTypeStorageLifetime,
+        observe: impl FnMut(std::alloc::Layout) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.array_type_storage = self
+            .array_type_storage
+            .retaining_observed(&holder, observe)?;
+        Ok(())
+    }
+
     pub fn chunk_schema_ref(&self) -> ChunkSchemaRef {
         Arc::clone(&self.chunk_schema)
     }
@@ -731,6 +841,7 @@ impl Chunk {
             array_type_storage: self.array_type_storage.clone(),
             construction_storage: ValueTypeStorageLifetime::pure(),
             output_column_metadata: self.output_column_metadata.clone(),
+            source_backing: self.source_backing.clone(),
         };
         if let Some(ChunkAccountingHandle::WholeBatch(accounting)) = self.accounting.as_ref() {
             let tracker = accounting.tracker();
@@ -820,6 +931,7 @@ impl Chunk {
             array_type_storage: self.array_type_storage.clone(),
             construction_storage: storage,
             output_column_metadata: self.output_column_metadata.clone(),
+            source_backing: self.source_backing.clone(),
         };
         result.retain_source_buffer_funding(self);
         Ok(result)
@@ -972,12 +1084,45 @@ impl Chunk {
         &mut self,
         output_memory: ConnectorOutputMemoryToken,
     ) -> Result<(), ChunkConstructionFailure> {
+        self.attach_connector_memory_and_backing(output_memory, None)
+    }
+
+    /// The actual page author supplies its complete original source extent,
+    /// including newly normalized independent storage. The ordinary accounting
+    /// token may have been shrunk/transferred and is not elected as that fact.
+    pub(crate) fn attach_connector_output_memory_with_backing(
+        &mut self,
+        output_memory: ConnectorOutputMemoryToken,
+        retained_parent_bytes: usize,
+    ) -> Result<(), ChunkConstructionFailure> {
+        if self.source_backing.is_some() {
+            return Err(ChunkConstructionFailure::source(
+                ChunkViolation::AccountingOwner,
+            ));
+        }
+        self.attach_connector_memory_and_backing(output_memory, Some(retained_parent_bytes))
+    }
+
+    fn attach_connector_memory_and_backing(
+        &mut self,
+        output_memory: ConnectorOutputMemoryToken,
+        retained_parent_bytes: Option<usize>,
+    ) -> Result<(), ChunkConstructionFailure> {
         if self.accounting.is_some() || self.connector_output_memory.is_some() {
             return Err(ChunkConstructionFailure::source(
                 ChunkViolation::AccountingOwner,
             ));
         }
-        self.connector_output_memory = Some(Arc::new(Mutex::new(output_memory)));
+        let owner = Arc::new(Mutex::new(output_memory));
+        if let Some(retained_bytes) = retained_parent_bytes {
+            self.source_backing = Some(ChunkSourceBackingReceipt {
+                retained_bytes,
+                _source: SourceBackingStorage::Connector {
+                    _owner: owner.clone(),
+                },
+            });
+        }
+        self.connector_output_memory = Some(owner);
         Ok(())
     }
 }
@@ -1028,6 +1173,7 @@ impl Default for Chunk {
             array_type_storage: ValueTypeStorageLifetime::pure(),
             construction_storage: ValueTypeStorageLifetime::pure(),
             output_column_metadata: None,
+            source_backing: None,
         }
     }
 }

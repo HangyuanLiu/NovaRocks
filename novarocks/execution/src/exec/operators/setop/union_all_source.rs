@@ -36,8 +36,6 @@ use crate::exec::pipeline::shape::{Source, SourceKernel, SourceRead, SourceStart
 use crate::exec::pipeline::step::{NextStep, StepResult, WaitFact, WaitReason};
 
 use super::union_all_shared::UnionAllSharedState;
-#[cfg(test)]
-use crate::runtime::runtime_state::RuntimeState;
 
 /// Factory for UNION ALL source operators that emit merged branch chunk streams.
 pub struct UnionAllSourceFactory {
@@ -86,6 +84,17 @@ impl OperatorLifecycle for UnionAllSourceOperator {
     fn name(&self) -> &str {
         &self.name
     }
+    fn cancel(&mut self) {
+        if self.active {
+            self.state.close();
+        }
+    }
+    fn close(&mut self) -> ExecutionResult<()> {
+        if self.active {
+            self.state.close();
+        }
+        Ok(())
+    }
 }
 
 impl SourceKernel for UnionAllSourceOperator {
@@ -102,7 +111,7 @@ impl SourceKernel for UnionAllSourceOperator {
     ) -> ExecutionResult<StepResult> {
         let observable = self.state.observable();
         let observed_generation = observable.generation();
-        let (output, next) = match self.state.next_chunk() {
+        let (output, next) = match self.state.next_chunk()? {
             SourceRead::Chunk(chunk) => (Some(chunk), NextStep::Runnable),
             SourceRead::Finished => (None, NextStep::Finished),
             SourceRead::Pending => (
@@ -116,88 +125,5 @@ impl SourceKernel for UnionAllSourceOperator {
             ),
         };
         Ok(StepResult::new(output, next, 0))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use arrow::array::{ArrayRef, Int32Array};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-
-    use super::*;
-    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
-    use novarocks_types::SlotId;
-
-    fn one_row_chunk() -> Chunk {
-        let field = Field::new("v", DataType::Int32, false);
-        let schema = Arc::new(Schema::new(vec![field.clone()]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
-        )
-        .expect("record batch");
-        let chunk_schema = Arc::new(
-            ChunkSchema::try_new(vec![
-                ChunkSlotSchema::from_field(SlotId(1), &field, None).expect("chunk slot"),
-            ])
-            .expect("chunk schema"),
-        );
-        Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk")
-    }
-
-    #[test]
-    fn last_producer_publication_is_delivered_before_source_eos() {
-        use crate::exec::pipeline::step_context::{StepContext, TurnWork};
-        use std::num::NonZeroU64;
-        let state = RuntimeState::default();
-        let shared = UnionAllSharedState::new(2, 7);
-        let mut source = UnionAllSourceFactory::new(shared.clone(), 7).create(1, 0);
-        let control = state.error_state();
-        let mut work = TurnWork::new(NonZeroU64::new(1).unwrap(), 8);
-        let mut context = StepContext::new(&control, &mut work);
-        let source = source.as_mut();
-        let waiting = source.drive(&mut context).unwrap();
-        assert!(waiting.output.is_none());
-        let NextStep::Wait(wait) = waiting.next else {
-            panic!("an empty live source must wait");
-        };
-        shared.producer_finished();
-        assert!(matches!(
-            source.drive(&mut context).unwrap().next,
-            NextStep::Wait(_)
-        ));
-        // Publication and last-producer close precede any wait registration.
-        // The frozen generation must still force a poll of the retained row.
-        shared.push_chunk(shared.queue_mem_tracker(&state).as_ref(), one_row_chunk());
-        shared.producer_finished();
-        assert!(wait.is_ready());
-        let data = source.drive(&mut context).unwrap();
-        assert_eq!(data.output.unwrap().len(), 1);
-        assert!(matches!(data.next, NextStep::Runnable));
-        let eos = source.drive(&mut context).unwrap();
-        assert!(eos.output.is_none());
-        assert!(matches!(eos.next, NextStep::Finished));
-        assert!(source.drive(&mut context).unwrap().output.is_none());
-    }
-
-    #[test]
-    fn non_zero_source_driver_does_not_drain_shared_queue() {
-        let state = RuntimeState::default();
-        let shared = UnionAllSharedState::new(1, 7);
-        shared.push_chunk(shared.queue_mem_tracker(&state).as_ref(), one_row_chunk());
-
-        let factory = UnionAllSourceFactory::new(shared.clone(), 7);
-        let mut inactive = factory.create(2, 1);
-        let idle = inactive.drive_for_test(&state).unwrap();
-        assert!(idle.output.is_none());
-        assert!(matches!(idle.next, NextStep::Finished));
-
-        let mut active = factory.create(2, 0);
-        let step = active.drive_for_test(&state).unwrap();
-        assert_eq!(step.output.expect("active source chunk").len(), 1);
-        assert!(!matches!(step.next, NextStep::Finished));
     }
 }

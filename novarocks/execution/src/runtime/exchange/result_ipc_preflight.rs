@@ -44,6 +44,7 @@ const MAX_TYPED_ROOT_RESULT_STRUCTURE_ENTRIES: usize = 65_536;
 pub struct TypedRootResultDecodeBounds {
     decode_operation_upper_bound: u64,
     retained_backing_upper_bound: u64,
+    network_scratch_upper_bound: u64,
 }
 
 impl TypedRootResultDecodeBounds {
@@ -63,6 +64,7 @@ impl TypedRootResultDecodeBounds {
 struct TypedRootResultPreflightState {
     schema_seen: bool,
     record_batch_seen: bool,
+    record_batches: usize,
     dictionary_ids: HashSet<i64>,
     schema_dictionary_ids: HashSet<i64>,
     metadata_bytes: usize,
@@ -86,10 +88,160 @@ pub fn preflight_typed_root_result_decode(
     payload: &[u8],
     payload_limit: ResultByteLimit,
 ) -> Result<TypedRootResultDecodeBounds, ExchangeFailure> {
+    preflight_profile(payload, payload_limit.get(), 1, None)
+}
+
+/// Network frames use the same metadata scanner, with explicitly bounded
+/// multiple record batches and replacement dictionaries between batches.
+/// The root-result profile remains exactly one record batch.
+pub fn preflight_network_exchange_decode(
+    payload: &[u8],
+    declared: novarocks_execution_contract::ExchangeFrameGeometry,
+    max_chunks: usize,
+    expected: &arrow::datatypes::Schema,
+) -> Result<novarocks_execution_contract::ExchangeFrameGeometry, ExchangeFailure> {
+    if max_chunks == 0 {
+        return Err(failure::contract(
+            "network frame chunk bound must be nonzero",
+        ));
+    }
+    if payload.is_empty() {
+        return novarocks_execution_contract::ExchangeFrameGeometry::try_new(0, 0, 0)
+            .map_err(|error| failure::metadata("empty frame geometry", error));
+    }
+    let meter = NetworkMeter {
+        queue: std::cell::Cell::new(0),
+        scratch: std::cell::Cell::new(0),
+        declared,
+    };
+    let bounds = preflight_profile(
+        payload,
+        declared.wire_bytes(),
+        max_chunks,
+        Some((expected, &meter)),
+    )?;
+    novarocks_execution_contract::ExchangeFrameGeometry::try_new(
+        payload.len() as u64,
+        bounds.decode_operation_upper_bound,
+        bounds.network_scratch_upper_bound,
+    )
+    .map_err(|error| failure::metadata("network IPC geometry", error))
+}
+struct NetworkMeter {
+    queue: std::cell::Cell<usize>,
+    scratch: std::cell::Cell<usize>,
+    declared: novarocks_execution_contract::ExchangeFrameGeometry,
+}
+impl NetworkMeter {
+    fn add(&self, bytes: usize, queue: bool) -> Result<(), ExchangeFailure> {
+        let (target, limit) = if queue {
+            (&self.queue, self.declared.decoded_bytes())
+        } else {
+            (&self.scratch, self.declared.decode_scratch_bytes())
+        };
+        let next = target
+            .get()
+            .checked_add(bytes)
+            .ok_or_else(|| failure::payload("network IPC constructor extent overflows"))?;
+        if next as u128 > limit as u128 {
+            return Err(failure::payload(
+                "network IPC constructor exceeds its claimed queue or scratch reservation",
+            ));
+        }
+        target.set(next);
+        Ok(())
+    }
+    fn schema_field(&self, field: arrow::ipc::Field<'_>) -> Result<(), ExchangeFailure> {
+        use novarocks_functions::arrow_ipc_construction::{
+            ReaderStructureClass as C, ReaderStructureObserver,
+        };
+        let mut request =
+            |layout: std::alloc::Layout, class| self.add(layout.size(), class == C::SourceHeader);
+        let mut opaque = |bytes, class| self.add(bytes, class == C::SourceHeader);
+        let mut work = || Ok(());
+        ReaderStructureObserver {
+            request: &mut request,
+            opaque: &mut opaque,
+            work: &mut work,
+        }
+        .field(field)
+        .map_err(super::reader_structure::model_error)
+    }
+    fn schema(&self, schema: arrow::ipc::Schema<'_>) -> Result<(), ExchangeFailure> {
+        use novarocks_functions::arrow_ipc_construction::{
+            ReaderStructureClass as C, ReaderStructureObserver,
+        };
+        let mut request =
+            |layout: std::alloc::Layout, class| self.add(layout.size(), class == C::SourceHeader);
+        let mut opaque = |bytes, class| self.add(bytes, class == C::SourceHeader);
+        let mut work = || Ok(());
+        ReaderStructureObserver {
+            request: &mut request,
+            opaque: &mut opaque,
+            work: &mut work,
+        }
+        .schema(schema)
+        .map_err(super::reader_structure::model_error)
+    }
+    fn batch(
+        &self,
+        schema: &arrow::datatypes::Schema,
+        batch: arrow::ipc::RecordBatch<'_>,
+        dictionary: bool,
+    ) -> Result<(), ExchangeFailure> {
+        use novarocks_functions::arrow_ipc_construction::{
+            ReaderArrayHeaderClass as C, ReaderArrayStructureObserver,
+        };
+        let mut request =
+            |layout: std::alloc::Layout, class| self.add(layout.size(), class == C::Retained);
+        let mut opaque = |bytes, class| self.add(bytes, class == C::Retained);
+        let mut work = || Ok(());
+        let mut model = ReaderArrayStructureObserver {
+            request: &mut request,
+            opaque: &mut opaque,
+            work: &mut work,
+        };
+        let buffers = batch.buffers().map_or(0, |buffers| buffers.len());
+        if dictionary {
+            model
+                .network_dictionary_shape(schema, buffers)
+                .map_err(super::reader_structure::model_error)
+        } else {
+            let count = batch
+                .variadicBufferCounts()
+                .map_or(0, |counts| counts.len());
+            self.add(
+                std::alloc::Layout::array::<i64>(count)
+                    .map_err(|_| failure::payload("network variadic scratch extent overflow"))?
+                    .size(),
+                false,
+            )?;
+            let mut counts = Vec::new();
+            counts
+                .try_reserve_exact(count)
+                .map_err(failure::allocation)?;
+            if let Some(source) = batch.variadicBufferCounts() {
+                for value in source {
+                    counts.push(value);
+                }
+            }
+            model
+                .network_record_shape(schema, buffers, &counts)
+                .map_err(super::reader_structure::model_error)
+        }
+    }
+}
+
+fn preflight_profile(
+    payload: &[u8],
+    payload_limit: u64,
+    max_chunks: usize,
+    network_input: Option<(&arrow::datatypes::Schema, &NetworkMeter)>,
+) -> Result<TypedRootResultDecodeBounds, ExchangeFailure> {
+    let network = network_input.is_some();
     if payload.is_empty() {
         return Err(failure::payload("typed root result payload is empty"));
     }
-    let payload_limit = payload_limit.get();
     if payload.len() as u128 > payload_limit as u128 {
         return Err(extent(
             DecodeExtent::PayloadBytes,
@@ -156,6 +308,7 @@ pub fn preflight_typed_root_result_decode(
 
     let mut state = TypedRootResultPreflightState::default();
     let mut offset = 0usize;
+    let (mut metadata_len_before, mut metadata_capacity) = (0, 0);
     let mut terminal_seen = false;
     while offset < arrow_payload.len() {
         let prefix = novarocks_arrow_ipc_frame::continuation_prefix(arrow_payload, offset)
@@ -190,6 +343,22 @@ pub fn preflight_typed_root_result_decode(
                 "Arrow IPC framed metadata length {} is not {ARROW_IPC_ALIGNMENT}-byte aligned",
                 metadata_len.saturating_add(8)
             )));
+        }
+        if let Some((_, meter)) = network_input {
+            let growth =
+                novarocks_type_contract::owned_resources::vec::original_resize_growth::<u8>(
+                    metadata_len_before,
+                    metadata_capacity,
+                    metadata_len,
+                )
+                .map_err(|error| {
+                    failure::metadata("network reader metadata resize model", error)
+                })?;
+            if let Some(layout) = growth.requested_backing {
+                meter.add(layout.size(), false)?;
+            }
+            metadata_len_before = metadata_len;
+            metadata_capacity = growth.requested_capacity;
         }
         state.metadata_bytes = state
             .metadata_bytes
@@ -262,11 +431,16 @@ pub fn preflight_typed_root_result_decode(
                 let schema = message.header_as_schema().ok_or_else(|| {
                     failure::payload("Arrow IPC schema message is missing schema header")
                 })?;
-                validate_typed_root_result_schema(schema, slot_count, &mut state)?;
+                validate_typed_root_result_schema(
+                    schema,
+                    slot_count,
+                    &mut state,
+                    network_input.map(|(_, meter)| meter),
+                )?;
                 state.schema_seen = true;
             }
             arrow::ipc::MessageHeader::DictionaryBatch => {
-                if !state.schema_seen || state.record_batch_seen {
+                if !state.schema_seen || (!network && state.record_batch_seen) {
                     return Err(failure::payload(
                         "Arrow IPC dictionary message must follow schema and precede record batch",
                     ));
@@ -285,17 +459,25 @@ pub fn preflight_typed_root_result_decode(
                         dictionary.id()
                     )));
                 }
-                if state.dictionary_ids.contains(&dictionary.id()) {
+                if !network && state.dictionary_ids.contains(&dictionary.id()) {
                     return Err(failure::payload(format_args!(
                         "Arrow IPC dictionary id {} is repeated",
                         dictionary.id()
                     )));
                 }
-                state
-                    .dictionary_ids
-                    .try_reserve(1)
-                    .map_err(failure::allocation)?;
-                state.dictionary_ids.insert(dictionary.id());
+                if !state.dictionary_ids.contains(&dictionary.id()) {
+                    if let Some((_, meter)) = network_input {
+                        let bytes = novarocks_type_contract::owned_resources::hashmap::next_insert_allocation_upper_bound_observed::<i64, (), novarocks_type_contract::owned_resources::hashmap::HashMapResourceError>(
+                            state.dictionary_ids.len(), state.dictionary_ids.capacity(), || Ok(()),
+                        ).map_err(|error| failure::metadata("network dictionary preflight table", error))?;
+                        meter.add(bytes, false)?;
+                    }
+                    state
+                        .dictionary_ids
+                        .try_reserve(1)
+                        .map_err(failure::allocation)?;
+                    state.dictionary_ids.insert(dictionary.id());
+                }
                 if state.dictionary_ids.len() > MAX_TYPED_ROOT_RESULT_DICTIONARIES {
                     return Err(extent(
                         DecodeExtent::Dictionaries,
@@ -306,6 +488,9 @@ pub fn preflight_typed_root_result_decode(
                 let batch = dictionary.data().ok_or_else(|| {
                     failure::payload("Arrow IPC dictionary message is missing record-batch data")
                 })?;
+                if let Some((schema, meter)) = network_input {
+                    meter.batch(schema, batch, true)?;
+                }
                 validate_typed_root_result_record_batch(
                     batch,
                     body_len,
@@ -321,10 +506,12 @@ pub fn preflight_typed_root_result_decode(
                 })?;
             }
             arrow::ipc::MessageHeader::RecordBatch => {
-                if !state.schema_seen || state.record_batch_seen {
-                    return Err(failure::payload(
-                        "Arrow IPC stream must contain exactly one record batch",
-                    ));
+                if !state.schema_seen || state.record_batches == max_chunks {
+                    return Err(failure::payload(if network {
+                        "Arrow IPC stream exceeds its admitted record-batch count"
+                    } else {
+                        "Arrow IPC stream must contain exactly one record batch"
+                    }));
                 }
                 let batch = message.header_as_record_batch().ok_or_else(|| {
                     failure::payload(
@@ -332,6 +519,9 @@ pub fn preflight_typed_root_result_decode(
                     )
                 })?;
                 let expected_nodes = state.schema_fields;
+                if let Some((schema, meter)) = network_input {
+                    meter.batch(schema, batch, false)?;
+                }
                 validate_typed_root_result_record_batch(
                     batch,
                     body_len,
@@ -346,6 +536,7 @@ pub fn preflight_typed_root_result_decode(
                     failure::payload("Arrow IPC retained record-batch body length overflow")
                 })?;
                 state.record_batch_seen = true;
+                state.record_batches += 1;
             }
             other => {
                 return Err(failure::payload(format_args!(
@@ -374,7 +565,19 @@ pub fn preflight_typed_root_result_decode(
         .checked_add(state.metadata_bytes)
         .and_then(|bytes| bytes.checked_add(structure_cover))
         .ok_or_else(|| failure::payload("typed root result decode-operation bound overflow"))?;
+    let (decode_operation_bytes, network_scratch) = if let Some((_, meter)) = network_input {
+        (
+            state
+                .retained_backing_bytes
+                .checked_add(meter.queue.get())
+                .ok_or_else(|| failure::payload("network queue geometry overflow"))?,
+            meter.scratch.get(),
+        )
+    } else {
+        (decode_operation_bytes, 0)
+    };
     Ok(TypedRootResultDecodeBounds {
+        network_scratch_upper_bound: network_scratch as u64,
         decode_operation_upper_bound: u64::try_from(decode_operation_bytes)
             .map_err(|source| failure::metadata("root decode operation extent", source))?,
         retained_backing_upper_bound: u64::try_from(state.retained_backing_bytes)
@@ -386,6 +589,7 @@ fn validate_typed_root_result_schema(
     schema: arrow::ipc::Schema<'_>,
     slot_count: usize,
     state: &mut TypedRootResultPreflightState,
+    network: Option<&NetworkMeter>,
 ) -> Result<(), ExchangeFailure> {
     if schema.endianness() != arrow::ipc::Endianness::Little {
         return Err(failure::payload(format_args!(
@@ -419,11 +623,22 @@ fn validate_typed_root_result_schema(
         ));
     }
     let mut pending = Vec::new();
+    if let Some(meter) = network {
+        meter.add(
+            std::alloc::Layout::array::<arrow::ipc::Field<'_>>(fields.len())
+                .map_err(|_| failure::payload("network schema work extent overflow"))?
+                .size(),
+            false,
+        )?;
+    }
     pending
         .try_reserve_exact(fields.len())
         .map_err(failure::allocation)?;
     pending.extend(fields.iter());
     while let Some(field) = pending.pop() {
+        if let Some(meter) = network {
+            meter.schema_field(field)?;
+        }
         state.schema_fields = state
             .schema_fields
             .checked_add(1)
@@ -437,6 +652,10 @@ fn validate_typed_root_result_schema(
         }
         if let Some(dictionary) = field.dictionary() {
             if !state.schema_dictionary_ids.contains(&dictionary.id()) {
+                if let Some(meter) = network {
+                    let bytes=novarocks_type_contract::owned_resources::hashmap::next_insert_allocation_upper_bound_observed::<i64,(),novarocks_type_contract::owned_resources::hashmap::HashMapResourceError>(state.schema_dictionary_ids.len(),state.schema_dictionary_ids.capacity(),||Ok(())).map_err(|error|failure::metadata("network dictionary preflight table",error))?;
+                    meter.add(bytes, false)?;
+                }
                 state
                     .schema_dictionary_ids
                     .try_reserve(1)
@@ -463,11 +682,28 @@ fn validate_typed_root_result_schema(
                     MAX_TYPED_ROOT_RESULT_SCHEMA_FIELDS as u64,
                 ));
             }
+            if let Some(meter) = network {
+                let target = pending
+                    .len()
+                    .checked_add(children.len())
+                    .ok_or_else(|| failure::payload("network schema work extent overflow"))?;
+                if target > pending.capacity() {
+                    meter.add(
+                        std::alloc::Layout::array::<arrow::ipc::Field<'_>>(target)
+                            .map_err(|_| failure::payload("network schema work extent overflow"))?
+                            .size(),
+                        false,
+                    )?;
+                }
+            }
             pending
                 .try_reserve_exact(children.len())
                 .map_err(failure::allocation)?;
             pending.extend(children.iter());
         }
+    }
+    if let Some(meter) = network {
+        meter.schema(schema)?;
     }
     Ok(())
 }

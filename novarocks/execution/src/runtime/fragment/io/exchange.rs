@@ -1,6 +1,9 @@
 use std::fmt;
 
-use novarocks_execution_contract::TaskIdentity;
+use novarocks_execution_contract::{
+    ExchangeDeliveryRequirement, ExchangePermitGrant, ExchangePermitRequest, ExchangeStreamClose,
+    ExchangeStreamIdentity,
+};
 use novarocks_types::UniqueId;
 
 use crate::runtime::endpoint::RuntimeEndpoint;
@@ -8,22 +11,33 @@ use crate::task_execution::status::CancelReason;
 
 use super::FragmentIoError;
 
-/// Encoded exchange payload prepared by the execution kernel for a host-owned
-/// transport adapter.
-#[derive(Clone, Debug)]
-pub struct ExchangeFrame {
+/// All address and protocol facts of a preparation-reserved exact stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExchangeStreamTarget {
     pub destination: RuntimeEndpoint,
-    pub destination_fragment_instance_id: UniqueId,
-    pub destination_task_identity: Option<TaskIdentity>,
-    pub sender_fragment_instance_id: UniqueId,
-    pub sender_ordinal: u32,
+    pub stream: ExchangeStreamIdentity,
+    pub delivery: ExchangeDeliveryRequirement,
     pub sender_count: u32,
-    pub destination_node_id: i32,
     pub sender_id: i32,
     pub backend_number: i32,
-    pub sequence: i64,
-    pub eos: bool,
+}
+
+/// Encoded only after its receiver placement and sender staging were granted.
+#[derive(Clone, Debug)]
+pub struct ExchangeFrame {
+    pub target: ExchangeStreamTarget,
+    pub grant: ExchangePermitGrant,
     pub payload: Vec<u8>,
+}
+
+pub type ExchangeFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// Completion is an independently authored fact, never a capacity grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExchangePermitAcquire {
+    Granted(ExchangePermitGrant),
+    Closed(ExchangeStreamClose),
 }
 
 /// Why a destination refused one exchange frame.
@@ -83,20 +97,32 @@ impl From<FragmentIoError> for ExchangeTransmitRejection {
     }
 }
 
-/// Host-owned transport boundary for exchange frames.
+/// Process composition installs the transport factory. Preparation reserves
+/// all exact streams before any of them may retain Q, R or S. A failed batch
+/// releases every partial reservation through its original RAII owner.
 pub trait ExchangeFrameTransmitter: Send + Sync + 'static {
-    fn transmit(&self, frame: ExchangeFrame) -> Result<(), ExchangeTransmitRejection>;
-
-    /// A task-scoped stop signal. Transports with cancellable I/O should
-    /// override this so cancellation interrupts a blocked send as well as
-    /// preventing queued successors from starting.
-    fn transmit_cancellable(
+    fn reserve_streams(
         &self,
+        targets: &[ExchangeStreamTarget],
+        construction: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
+    ) -> Result<Vec<std::sync::Arc<dyn ExchangeStreamTransmitter>>, ExchangeTransmitRejection>;
+}
+
+/// A Task-bound stream capability retains its finite transport position.
+/// Neither network nor capacity waits occupy a fixed CPU worker.
+pub trait ExchangeStreamTransmitter: Send + Sync + 'static {
+    fn target(&self) -> &ExchangeStreamTarget;
+    fn acquire<'a>(
+        &'a self,
+        request: ExchangePermitRequest,
+        stop: tokio_util::sync::CancellationToken,
+    ) -> ExchangeFuture<'a, Result<ExchangePermitAcquire, ExchangeTransmitRejection>>;
+    fn transmit<'a>(
+        &'a self,
         frame: ExchangeFrame,
-        _stop: tokio_util::sync::CancellationToken,
-    ) -> Result<(), ExchangeTransmitRejection> {
-        self.transmit(frame)
-    }
+        stop: tokio_util::sync::CancellationToken,
+    ) -> ExchangeFuture<'a, Result<(), ExchangeTransmitRejection>>;
+    fn spawn(&self, future: ExchangeFuture<'static, ()>);
 }
 
 #[cfg(test)]
@@ -252,6 +278,7 @@ mod tests {
         port.register(crate::runtime::fragment::io::ExchangeReceiverRegistration {
             key,
             expected_senders: 2,
+            network: None,
             expected_chunk_schema: expected,
             column_binding: crate::runtime::exchange::ExchangeColumnBinding::Positional,
             creation_factory: factory.clone(),

@@ -676,13 +676,6 @@ impl ConnectorWriteRouteFacts {
         &self.requirements
     }
 
-    pub fn partition_fields(&self) -> &[ConnectorWriteFieldToken] {
-        match &self.requirements.colocation {
-            ConnectorWriteColocation::ByKey(keys) => keys,
-            ConnectorWriteColocation::None | ConnectorWriteColocation::Singleton => &[],
-        }
-    }
-
     pub fn selection_bindings(&self) -> &[ConnectorWriteSelectionBinding] {
         &self.selection_bindings
     }

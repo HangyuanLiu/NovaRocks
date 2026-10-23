@@ -211,8 +211,8 @@ pub(crate) fn authored_with_catalog(
                     ConnectorWriteFieldToken::from_bytes([1; 32]),
                     0,
                 )],
-                partition_input_positions: Vec::new(),
-                output_partition_ordinals: Vec::new(),
+
+
                 sink: declared_inputs[i].clone(),
             }
             })
@@ -326,7 +326,17 @@ fn walk(
         let state = final_source.state_inputs_observed(&mut work)?;
         let root = state.root();
         assert_eq!(root.value, final_source.source().input);
-        assert_eq!(root.node, final_source.node().inputs[0]);
+        let NodeKind::TableFinish(finish) = &final_source.node().kind else {
+            panic!("actual Writer Final must belong to TableFinish")
+        };
+        assert_eq!(
+            root.node,
+            final_source.node().inputs[finish.inputs.writer_results as usize]
+        );
+        if let Some(summary) = finish.inputs.logical_summary {
+            assert_ne!(summary, finish.inputs.writer_results);
+            assert_ne!(root.node, final_source.node().inputs[summary as usize]);
+        }
         state.visit_observed(
             &mut work,
             |source, endpoint, work| {

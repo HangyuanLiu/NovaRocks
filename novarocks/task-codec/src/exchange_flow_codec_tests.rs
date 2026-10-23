@@ -269,3 +269,49 @@ fn close_requires_an_explicit_disposition_and_exact_frozen_stream() {
     ));
     assert!(decode_normal_close(&invalid, stream, 2, path()).is_err());
 }
+
+#[test]
+fn closed_frame_envelope_still_requires_exact_frozen_fields_and_real_end_shape() {
+    let grant = grant();
+    let valid = frame(grant);
+    let actual = validate_frame_envelope(&valid, grant.request.stream, 2, path()).unwrap();
+    assert_eq!(actual.sequence, ExchangeFrameSequence::FIRST);
+    assert_eq!(actual.kind, ExchangeFrameKind::Data);
+    assert_eq!(actual.token.to_bytes(), [7; 16]);
+    let mutations: [fn(&mut wire::ExchangeRequest); 13] = [
+        |r| r.stream = None,
+        |r| r.finst_id_hi += 1,
+        |r| r.finst_id_lo += 1,
+        |r| r.node_id += 1,
+        |r| r.source_finst_id_hi += 1,
+        |r| r.source_finst_id_lo += 1,
+        |r| r.sender_ordinal = 0,
+        |r| r.sender_count = 3,
+        |r| r.sequence = -1,
+        |r| r.frame_kind = 0,
+        |r| r.frame_kind = 999,
+        |r| r.eos = true,
+        |r| r.permit_token.clear(),
+    ];
+    for mutate in mutations {
+        let mut altered = valid.clone();
+        mutate(&mut altered);
+        assert!(validate_frame_envelope(&altered, grant.request.stream, 2, path()).is_err());
+    }
+    let mut end = valid;
+    end.frame_kind = wire::ExchangeFrameKind::End as i32;
+    end.eos = true;
+    assert!(validate_frame_envelope(&end, grant.request.stream, 2, path()).is_err());
+    end.payload.clear();
+    assert_eq!(
+        validate_frame_envelope(&end, grant.request.stream, 2, path())
+            .unwrap()
+            .kind,
+        ExchangeFrameKind::End
+    );
+    // A syntactically valid token is still no permission: only the active
+    // receiver's stored grant may authorize this alternate exact frame.
+    end.permit_token = vec![8; 16];
+    validate_frame_envelope(&end, grant.request.stream, 2, path()).unwrap();
+    assert!(validate_permitted_frame(&end, grant, 2, path()).is_err());
+}

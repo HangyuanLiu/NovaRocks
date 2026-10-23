@@ -754,12 +754,16 @@ impl ProgramTypedChannels {
                 }
                 ProgramNodeKind::TableFinish {
                     inputs,
+                    input_roles,
                     writer_multiplex_layout,
                     root_result_layout,
                     final_aggregates,
                     ..
                 } => {
-                    for input in inputs {
+                    let writer_input = inputs
+                        .get(input_roles.writer_results as usize)
+                        .ok_or(ProgramChannelTypeError::WrongShape)?;
+                    for input in std::iter::once(writer_input) {
                         for slot in writer_multiplex_layout.slots() {
                             same_value(
                                 self.actual_slot(*input, Role::NodeOutput, *slot)?,

@@ -53,7 +53,9 @@ use novarocks_types::format_uuid;
 use novarocks_types::{SlotId, UniqueId};
 use tracing::debug;
 
+mod network_receiver;
 mod reader_structure;
+pub use network_receiver::*;
 mod result_ipc_preflight;
 pub use result_ipc_preflight::{TypedRootResultDecodeBounds, preflight_typed_root_result_decode};
 
@@ -282,6 +284,7 @@ struct DecodedExchangePayload<'a> {
 #[derive(Default)]
 struct ReceiverState {
     expected_senders: usize,
+    network: Option<ExchangeReceiverNetworkContract>,
     #[cfg(novarocks_dev_controls)]
     test_observer: Option<Arc<dyn TestEventObserver>>,
     expected: Option<ExpectedReceiverSchema>,
@@ -398,8 +401,12 @@ impl ExecutionExchangeRegistry {
                 let notify = r.observable.defer_notify();
                 let mut st = r.mu.lock().expect("exchange receiver lock");
                 st.canceled = true;
+                let network = st.network.clone();
                 r.cv.notify_all();
                 drop(st);
+                if let Some(network) = network {
+                    network.stop();
+                }
                 notify.arm();
             }
             guard.remove(&k);
@@ -416,8 +423,12 @@ impl ExecutionExchangeRegistry {
             let notify = r.observable.defer_notify();
             let mut st = r.mu.lock().expect("exchange receiver lock");
             st.canceled = true;
+            let network = st.network.clone();
             r.cv.notify_all();
             drop(st);
+            if let Some(network) = network {
+                network.stop();
+            }
             notify.arm();
         }
         self.receivers.lock().expect("exchange lock").remove(&key);
@@ -636,6 +647,11 @@ impl ExecutionExchangeRegistry {
 
         let lock_start = Instant::now();
         let mut st = r.mu.lock().expect("exchange receiver lock");
+        if let Some(network) = st.network.clone() {
+            drop(st);
+            network.reject_local_ingress();
+            return;
+        }
         let lock_wait = lock_start.elapsed();
         if lock_wait >= EXCHANGE_LOCK_WAIT_WARN {
             debug!(
@@ -786,6 +802,16 @@ impl ExecutionExchangeRegistry {
         self.set_expected_senders(key, expected_senders);
         let r = get_or_create(self, key);
 
+        if r.mu
+            .lock()
+            .expect("exchange receiver lock")
+            .network
+            .is_some()
+        {
+            return Err(exchange_contract(
+                "network input requires scheduler-driven bounded source consumption",
+            ));
+        }
         let start = Instant::now();
         let mut st = r.mu.lock().expect("exchange receiver lock");
         loop {
@@ -888,6 +914,20 @@ impl ExchangeReceiverHandle {
         use tracing::debug;
 
         let r = &self.receiver;
+        let network = r.mu.lock().expect("exchange receiver lock").network.clone();
+        if let Some(network) = network {
+            if network.0.kind == novarocks_execution_contract::ExchangeFrameKind::LogicalSummary {
+                return Err(exchange_contract(
+                    "logical summary requires source-bound exchange consumption",
+                ));
+            }
+            return network.0.pop().map(|output| {
+                output.map(|output| match output {
+                    ExchangeSourcedPopResult::Chunk(item) => ExchangePopResult::Chunk(item.chunk),
+                    ExchangeSourcedPopResult::Finished(stats) => ExchangePopResult::Finished(stats),
+                })
+            });
+        }
         let mut st = r.mu.lock().expect("exchange receiver lock");
         if st.canceled {
             debug!(
@@ -924,12 +964,20 @@ impl ExchangeReceiverHandle {
     }
 
     pub fn observable(&self) -> Arc<Observable> {
-        Arc::clone(&self.receiver.observable)
+        let state = self.receiver.mu.lock().expect("exchange receiver lock");
+        state
+            .network
+            .as_ref()
+            .map(|network| network.observable())
+            .unwrap_or_else(|| Arc::clone(&self.receiver.observable))
     }
 
     pub fn has_output_or_finished(&self, expected_senders: usize) -> bool {
         let r = &self.receiver;
         let st = r.mu.lock().expect("exchange receiver lock");
+        if let Some(network) = &st.network {
+            return network.0.ready();
+        }
         let canceled = st.canceled;
         let has_chunks = !st.chunks.is_empty();
         let expected = st.expected_senders.max(expected_senders);
@@ -976,6 +1024,16 @@ impl ExchangeReceiverHandle {
         use tracing::debug;
 
         let r = &self.receiver;
+        if r.mu
+            .lock()
+            .expect("exchange receiver lock")
+            .network
+            .is_some()
+        {
+            return Err(exchange_contract(
+                "network input requires scheduler-driven bounded source consumption",
+            ));
+        }
         let mut st = r.mu.lock().expect("exchange receiver lock");
         loop {
             if st.canceled {
@@ -1062,6 +1120,13 @@ impl ExecutionExchangeRegistry {
         let receiver = get_or_create(self, key);
         {
             let mut st = receiver.mu.lock().expect("exchange receiver lock");
+            if let Some(network) = &st.network
+                && network.source_count() != expected_senders
+            {
+                return Err(exchange_contract(
+                    "source binding sender count differs from frozen membership",
+                ));
+            }
             let before = st.expected_senders;
             st.expected_senders = st.expected_senders.max(expected_senders);
             if st.expected_senders != before {
@@ -1095,6 +1160,9 @@ impl ExecutionExchangeRegistry {
             guard.get(&key).cloned()
         }?;
         let st = receiver.mu.lock().expect("exchange receiver lock");
+        if let Some(network) = &st.network {
+            return Some(network.0.snapshot_receiver());
+        }
         let queued_rows = st.chunks.iter().map(|c| c.len()).sum::<usize>();
         Some(ExchangeReceiverSnapshot {
             expected_senders: st.expected_senders,

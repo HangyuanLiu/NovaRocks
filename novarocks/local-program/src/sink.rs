@@ -211,8 +211,15 @@ impl StaticStreamBranch {
 /// One immutable arena per stream sink. Multicast and split branches share
 /// that arena, preserving exact expression IDs without per-branch duplication.
 #[derive(Clone, Debug)]
+pub enum ProgramWriteLayoutPreference {
+    None,
+    ClusterBy(Arc<[SlotId]>),
+}
+
+#[derive(Clone, Debug)]
 pub struct StaticRouterRoute {
     pub branch: u32,
+    pub layout: ProgramWriteLayoutPreference,
     pub accepted_effects: Arc<[novarocks_connector_contract::ConnectorRowMutationEffect]>,
 }
 
@@ -449,6 +456,24 @@ fn validate_router_core<E: From<StaticSinkError>>(
         observe()?;
         if !valid {
             return Err(StaticSinkError::InvalidRouter.into());
+        }
+        if let ProgramWriteLayoutPreference::ClusterBy(keys) = &route.layout {
+            if keys.is_empty() {
+                return Err(StaticSinkError::InvalidRouter.into());
+            }
+            let mut seen = BTreeSet::new();
+            for key in keys.iter() {
+                let mut present = false;
+                for column in branch.output_columns() {
+                    present |= column == key;
+                    observe()?;
+                }
+                let valid = present && seen.insert(*key);
+                observe()?;
+                if !valid {
+                    return Err(StaticSinkError::InvalidRouter.into());
+                }
+            }
         }
         let mut effects = BTreeSet::new();
         for effect in route.accepted_effects.iter() {
@@ -947,6 +972,7 @@ mod router_contract_tests {
         let arena =
             Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap());
         let routes = vec![StaticRouterRoute {
+            layout: crate::ProgramWriteLayoutPreference::None,
             branch: 0,
             accepted_effects: Arc::from([ConnectorRowMutationEffect::Insert]),
         }];
@@ -978,6 +1004,29 @@ mod router_contract_tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn route_layout_hints_only_name_unique_projected_provider_occurrences() {
+        for keys in [
+            vec![SlotId::new(2)],
+            vec![],
+            vec![SlotId::new(1)],
+            vec![SlotId::new(2); 2],
+            vec![SlotId::new(10)],
+        ] {
+            let valid = keys == vec![SlotId::new(2)];
+            let (branches, arena, mut routes, summary) = fixture();
+            routes[0].layout = ProgramWriteLayoutPreference::ClusterBy(Arc::from(keys));
+            let result = StaticSinkProgram::try_change_stream_router(
+                branches,
+                arena,
+                SlotId::new(1),
+                routes,
+                1,
+                summary,
+            );
+            assert_eq!(result.is_ok(), valid);
+        }
     }
     #[test]
     fn summary_cannot_claim_a_provider_route_or_nullable_counters() {

@@ -30,6 +30,7 @@ pub enum FragmentIoErrorKind {
     InvalidResponse,
     Cancelled,
     Internal,
+    ResourceExhausted,
 }
 
 impl fmt::Display for FragmentIoErrorKind {
@@ -41,6 +42,7 @@ impl fmt::Display for FragmentIoErrorKind {
             Self::InvalidResponse => "invalid response",
             Self::Cancelled => "cancelled",
             Self::Internal => "internal",
+            Self::ResourceExhausted => "resource exhausted",
         };
         formatter.write_str(label)
     }
@@ -156,6 +158,9 @@ impl novarocks_failure_contract::FailureProjection for FragmentIoError {
                 FailureClass::Unexpected,
                 ExecutionReason::FragmentIoInternal,
             ),
+            FragmentIoErrorKind::ResourceExhausted => {
+                (FailureClass::Resource, ExecutionReason::FragmentIoCapacity)
+            }
         };
         FailureFact::new(class, FailureReason::new(namespace, code.code()))
     }

@@ -25,7 +25,6 @@ use std::time::Instant;
 
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_proto_models::{catalog, filter, novarocks as proto};
-use tokio_stream::wrappers::ReceiverStream;
 
 use crate::native_control_executor::NativeControlExecutor;
 use crate::native_ingress::NativeIngressOwnership;
@@ -96,6 +95,25 @@ fn ingress_ownership<T>(request: &tonic::Request<T>) -> Option<Arc<NativeIngress
         .cloned()
 }
 
+impl novarocks_execution::runtime::exchange::ExchangeTransportHold for NativeIngressOwnership {}
+
+fn authenticated_exchange_source<T>(
+    request: &tonic::Request<T>,
+) -> Result<novarocks_types::BackendProcessId, tonic::Status> {
+    let caller = request
+        .extensions()
+        .get::<novarocks_native_trust::AuthenticatedNativeCaller>()
+        .ok_or_else(|| {
+            tonic::Status::unauthenticated("native exchange requires authenticated caller custody")
+        })?;
+    match caller.process_identity() {
+        Some(novarocks_native_trust::NativeProcessIdentity::Backend(process)) => Ok(process),
+        _ => Err(tonic::Status::permission_denied(
+            "native exchange requires an exact signed backend process",
+        )),
+    }
+}
+
 fn retired_fetch_result_status() -> tonic::Status {
     tonic::Status::unimplemented("FetchResult is retired; use FetchTaskResult")
 }
@@ -122,90 +140,48 @@ impl NovaRocksGrpc for BackendRpcService {
 
     async fn exchange(
         &self,
-        request: tonic::Request<tonic::Streaming<proto::ExchangeRequest>>,
+        _request: tonic::Request<tonic::Streaming<proto::ExchangeRequest>>,
     ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
-        let mut inbound = request.into_inner();
-        let (tx, rx) = tokio::sync::mpsc::channel(4096);
-        let kernel = self.exchange_data_plane.clone();
-        tokio::spawn(async move {
-            loop {
-                let request = match inbound.message().await {
-                    Ok(Some(request)) => request,
-                    Ok(None) => break,
-                    Err(error) => {
-                        let _ = tx
-                            .send(Err(tonic::Status::internal(format!(
-                                "exchange recv failed: {error}"
-                            ))))
-                            .await;
-                        break;
-                    }
-                };
-                let kernel = kernel.clone();
-                let queued_at = Instant::now();
-                let response = match tokio::task::spawn_blocking(move || {
-                    crate::backend_metrics::native_blocking_queue_wait(
-                        "exchange_stream",
-                        queued_at.elapsed(),
-                    );
-                    kernel.transmit(request)
-                })
-                .await
-                {
-                    Ok(response) => response,
-                    Err(error) => {
-                        let _ = tx
-                            .send(Err(tonic::Status::internal(format!(
-                                "exchange handler panicked: {error}"
-                            ))))
-                            .await;
-                        break;
-                    }
-                };
-                let failed = response
-                    .status
-                    .as_ref()
-                    .is_some_and(|status| status.code != 0);
-                if tx.send(Ok(response)).await.is_err() || failed {
-                    break;
-                }
-            }
-        });
-        Ok(tonic::Response::new(Box::pin(ReceiverStream::new(rx))))
+        Err(tonic::Status::unimplemented(
+            "streaming Exchange is retired; use permitted ExchangeUnary",
+        ))
     }
 
     async fn acquire_exchange_permit(
         &self,
-        _request: tonic::Request<novarocks_proto_models::novarocks::AcquireExchangePermitRequest>,
-    ) -> Result<
-        tonic::Response<novarocks_proto_models::novarocks::AcquireExchangePermitResponse>,
-        tonic::Status,
-    > {
-        Err(tonic::Status::unimplemented(
-            "exchange permit owner is not installed",
-        ))
+        request: tonic::Request<proto::AcquireExchangePermitRequest>,
+    ) -> Result<tonic::Response<proto::AcquireExchangePermitResponse>, tonic::Status> {
+        let caller = authenticated_exchange_source(&request)?;
+        let ownership = ingress_ownership(&request).ok_or_else(|| {
+            tonic::Status::internal("native exchange permit ingress ownership is missing")
+        })?;
+        let deadline = ownership.deadline();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let cancelled_on_drop = stop.clone().drop_guard();
+        let response = self
+            .exchange_data_plane
+            .acquire(request.into_inner(), caller, stop, deadline)
+            .await;
+        // A successful grant survives its metadata response and remains bound
+        // to the receiver TTL until the data claim. Cancellation while waiting
+        // still drops this guard and wakes the original capacity waiters.
+        cancelled_on_drop.disarm();
+        drop(ownership);
+        Ok(tonic::Response::new(response))
     }
 
     async fn exchange_unary(
         &self,
         request: tonic::Request<proto::ExchangeRequest>,
     ) -> Result<tonic::Response<proto::ExchangeResponse>, tonic::Status> {
-        let kernel = self.exchange_data_plane.clone();
-        let ownership = ingress_ownership(&request);
-        let raw = request.into_inner();
-        let queued_at = Instant::now();
-        let response = tokio::task::spawn_blocking(move || {
-            crate::backend_metrics::native_blocking_queue_wait(
-                "exchange_unary",
-                queued_at.elapsed(),
-            );
-            let _ownership = ownership;
-            kernel.transmit(raw)
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!("exchange_unary handler panicked: {error}"))
+        let caller = authenticated_exchange_source(&request)?;
+        let ownership = ingress_ownership(&request).ok_or_else(|| {
+            tonic::Status::internal("native exchange ingress ownership is missing")
         })?;
+        let response = self
+            .exchange_data_plane
+            .transmit(request.into_inner(), caller, ownership)
+            .await;
         Ok(tonic::Response::new(response))
     }
 

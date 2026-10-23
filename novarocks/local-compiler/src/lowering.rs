@@ -35,7 +35,7 @@ use crate::{
     repeat::{RepeatLoweringError, lower_repeat_with_creation},
     scan::{admit_scan, lower_scan_with_creation},
     sort::lower_sort,
-    stream_sink::lower_stream_sink_with_creation,
+    stream_sink::{lower_router_sink_with_creation, lower_stream_sink_with_creation},
     topn::lower_topn,
     unpivot::{UnpivotLoweringError, UnpivotLoweringInput, lower_unpivot_with_creation},
     values::{lower_values_with_creation, retired_values_uses},
@@ -368,6 +368,7 @@ fn lower_with_creation<
         .into());
     }
     let outbound = &package.cuts().outbound;
+    let is_router = matches!(physical.sink(), FragmentSink::Router { .. });
     // A Result sink publishes the result port; a Stream sink publishes its
     // one exact outbound cut. Every other sink family remains explicit.
     let stream_cut = match physical.sink() {
@@ -393,7 +394,7 @@ fn lower_with_creation<
                 ))
                 .into());
             }
-            if cut.kind != EdgeKind::Stream || cut.change_stream_writer().is_some() {
+            if cut.kind != EdgeKind::Stream {
                 return Err((FragmentCompileError::Unsupported {
                     node: None,
                     feature: "outbound CTE or change-stream edge",
@@ -409,32 +410,30 @@ fn lower_with_creation<
             if cut.writer_result().is_some() || writer_rooted {
                 crate::writer::admit_writer_result_cut(package, cut, work)?;
             }
-            if matches!(
-                cut.partitioning.source,
-                Distribution::Unconstrained | Distribution::RoundRobin
-            ) {
+            if matches!(cut.partitioning.source, Distribution::Unconstrained) {
                 return Err((FragmentCompileError::Unsupported {
                     node: None,
-                    feature: "unconstrained or round-robin stream partitioning",
+                    feature: "unconstrained stream partitioning",
                 })
                 .into());
             }
             Some(cut)
         }
-        FragmentSink::Multicast { .. } | FragmentSink::Router { .. } | FragmentSink::Noop => {
+        FragmentSink::Router { .. } => None,
+        FragmentSink::Multicast { .. } | FragmentSink::Noop => {
             return Err((FragmentCompileError::Unsupported {
                 node: None,
-                feature: "multicast, router or noop sink",
+                feature: "multicast or noop sink",
             })
             .into());
         }
     };
     for cut in package.cuts().inbound.iter() {
         work.step()?;
-        if cut.kind != EdgeKind::Stream || cut.change_stream_writer().is_some() {
+        if cut.kind != EdgeKind::Stream && cut.kind != EdgeKind::ChangeStreamRouter {
             return Err((FragmentCompileError::Unsupported {
                 node: Some(cut.destination_node),
-                feature: "inbound CTE or change-stream edge",
+                feature: "inbound CTE edge",
             })
             .into());
         }
@@ -452,10 +451,10 @@ fn lower_with_creation<
     // The result port exists exactly for a Result sink; a stream producer
     // has no result labels and never borrows another fragment's port.
     let result = package.result();
-    if stream_cut.is_none() && result.is_none() {
+    if !is_router && stream_cut.is_none() && result.is_none() {
         return Err((FragmentCompileError::Invalid("missing result port")).into());
     }
-    if stream_cut.is_some() && result.is_some() {
+    if (is_router || stream_cut.is_some()) && result.is_some() {
         return Err((FragmentCompileError::Invalid("stream sink carries a result port")).into());
     }
     // Borrowed input order determines the bounded postorder. Each physical
@@ -551,6 +550,30 @@ fn lower_with_creation<
         }
         work.step()?;
     }
+    if let FragmentSink::Router { routes, .. } = physical.sink() {
+        let root_width = physical
+            .nodes()
+            .get(&physical.root())
+            .ok_or(FragmentCompileError::Invalid("missing router root"))?
+            .output
+            .columns
+            .len();
+        let width = routes
+            .iter()
+            .try_fold(root_width, |width, route| {
+                width.checked_add(route.input_mapping.len())
+            })
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        expanded_nodes = expanded_nodes
+            .checked_add(1)
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        derived_definitions = derived_definitions
+            .checked_add(width)
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        channel_count = channel_count
+            .checked_add(width)
+            .ok_or(CompileControlError::ResourceExhausted)?;
+    }
     // Each scan runtime-filter consumer key is one derived slot read.
     derived_definitions = derived_definitions
         .checked_add(runtime_filters.consumer_count()?)
@@ -640,26 +663,6 @@ fn lower_with_creation<
         // local partitioning instead of relying on this. Copied rows and
         // broadcast placement stay refused, except the broadcast receiver a
         // join consumes as its complete build side.
-        // These signed contracts need their dedicated lowering; accepting
-        // ordinary hash slots here would silently erase bypass and level
-        // domains before the execution implementation is installed.
-        if std::iter::once(&node.output_properties.distribution)
-            .chain(node.required_inputs.iter().map(|p| &p.distribution))
-            .any(|distribution| match distribution {
-                Distribution::ConditionalKey { .. } => true,
-                Distribution::Hash { scheme, .. } => {
-                    scheme.definition.algorithm
-                        == novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1
-                }
-                _ => false,
-            })
-        {
-            return Err((FragmentCompileError::Unsupported {
-                node: Some(id),
-                feature: "conditional or hierarchical partition contract",
-            })
-            .into());
-        }
         if !replicated_builds.contains(&id)
             && (!matches!(
                 node.output_properties.distribution,
@@ -667,6 +670,7 @@ fn lower_with_creation<
                     | Distribution::Unconstrained
                     | Distribution::RoundRobin
                     | Distribution::Hash { .. }
+                    | Distribution::ConditionalKey { .. }
                     | Distribution::BucketShuffle { .. }
             ) || node.output_properties.row_multiplicity != RowMultiplicity::SingleCopy)
         {
@@ -734,7 +738,17 @@ fn lower_with_creation<
                 ..
             } => node.inputs.len() >= 2,
             // The writer family, under its own admission below.
-            NodeKind::TableWriter { .. } | NodeKind::TableFinish(_) => node.inputs.len() == 1,
+            NodeKind::TableWriter { .. } => node.inputs.len() == 1,
+            NodeKind::TableFinish(spec) => {
+                node.inputs.len()
+                    == if spec.count_mode
+                        == novarocks_physical_plan::FinishCountMode::LogicalChanges
+                    {
+                        2
+                    } else {
+                        1
+                    }
+            }
             // Both join families, under their own admission below.
             NodeKind::HashJoin { .. } | NodeKind::NestLoopJoin { .. } => node.inputs.len() == 2,
             // A table function, under its own admission: exactly one outer
@@ -808,7 +822,7 @@ fn lower_with_creation<
         .into());
     }
     // Expansion conservatively loses distribution knowledge. It still has
-    // the exact singleton child and one driver; only descendants of this
+    // the exact input placement at every admitted driver width; descendants of this
     // actual expansion can consume that uncertainty. A runtime-split scan is
     // an unconstrained source in its own right: its rows land on any instance
     // and driver, and only its transparent Project/Filter/Limit descendants
@@ -885,7 +899,9 @@ fn lower_with_creation<
                     == novarocks_physical_plan::RowMultiplicity::SingleCopy
                     && matches!(
                         input.output_properties.distribution,
-                        Distribution::Hash { .. } | Distribution::BucketShuffle { .. }
+                        Distribution::Hash { .. }
+                            | Distribution::ConditionalKey { .. }
+                            | Distribution::BucketShuffle { .. }
                     )
             });
         // Repeat emits its frozen grouping sets on the exact input instances.
@@ -902,6 +918,7 @@ fn lower_with_creation<
                             Distribution::Singleton
                                 | Distribution::RoundRobin
                                 | Distribution::Hash { .. }
+                                | Distribution::ConditionalKey { .. }
                                 | Distribution::BucketShuffle { .. }
                         ))
             });
@@ -924,13 +941,6 @@ fn lower_with_creation<
             return Err((FragmentCompileError::Unsupported {
                 node: Some(id),
                 feature: "unconstrained distribution without a runtime-split scan placement",
-            })
-            .into());
-        }
-        if (expanded || changes) && options.pipeline_dop.get() != 1 {
-            return Err((FragmentCompileError::Unsupported {
-                node: Some(id),
-                feature: "change-event source-chain distribution or driver count",
             })
             .into());
         }
@@ -1190,7 +1200,18 @@ fn lower_with_creation<
             local_ids.insert(source, id);
             continue;
         }
-        if let Some(branches) = channels_plan.unions.get(&source) {
+        if matches!(
+            node.kind,
+            NodeKind::SetOp {
+                kind: novarocks_physical_plan::SetOperationKind::UnionAll,
+                ..
+            }
+        ) {
+            let branches = channels_plan
+                .unions
+                .get(&source)
+                .ok_or(FragmentCompileError::Invalid("missing UnionAll branches"))?;
+            let branches = &branches[..node.inputs.len()];
             let definitions =
                 expressions
                     .union_ids
@@ -1198,6 +1219,7 @@ fn lower_with_creation<
                     .ok_or(FragmentCompileError::Invalid(
                         "missing UnionAll definitions",
                     ))?;
+            let definitions = &definitions[..node.inputs.len()];
             work.flush()?;
             let emitted = crate::union::lower_union_with_creation(
                 package,
@@ -1562,6 +1584,9 @@ fn lower_with_creation<
                     child,
                     nodes[child.index()].output_layout(),
                     keys,
+                    *channels_plan.assertion_applicability.get(&source).ok_or(
+                        FragmentCompileError::Invalid("missing planned assertion applicability"),
+                    )?,
                     work.control(),
                 )?
             }
@@ -1758,13 +1783,12 @@ fn lower_with_creation<
                 program_writes.insert(id, recipe);
                 (lowered.kind, lowered.layout)
             }
-            NodeKind::TableFinish(_) => {
-                let child =
-                    *local_ids
-                        .get(&node.inputs[0])
-                        .ok_or(FragmentCompileError::Invalid(
-                            "missing lowered table finish child",
-                        ))?;
+            NodeKind::TableFinish(spec) => {
+                let child = *local_ids
+                    .get(&node.inputs[spec.inputs.writer_results as usize])
+                    .ok_or(FragmentCompileError::Invalid(
+                        "missing lowered table finish child",
+                    ))?;
                 let statistics_slots = channels_plan.finish_statistics.get(&source).ok_or(
                     FragmentCompileError::Invalid("missing planned finish statistics"),
                 )?;
@@ -1776,6 +1800,10 @@ fn lower_with_creation<
                     crate::writer::FinishLoweringInput {
                         child,
                         child_layout: nodes[child.index()].output_layout(),
+                        summary: spec.inputs.logical_summary.map(|port| {
+                            let id = local_ids[&node.inputs[port as usize]];
+                            (id, nodes[id.index()].output_layout())
+                        }),
                         slots: &planned.slots,
                         statistics_slots,
                         expressions: &expressions.ids,
@@ -1878,7 +1906,107 @@ fn lower_with_creation<
         .into());
     }
     runtime_filters.finish()?;
-    let root = local_ids[&physical.root()];
+    let mut root = local_ids[&physical.root()];
+    if let Some(projection) = &channels_plan.sink_projection {
+        let branch = channels_plan
+            .unions
+            .get(&physical.root())
+            .and_then(|branches| branches.last())
+            .ok_or(FragmentCompileError::Invalid(
+                "missing router projection source",
+            ))?;
+        let definitions = expressions
+            .union_ids
+            .get(&physical.root())
+            .and_then(|branches| branches.last())
+            .ok_or(FragmentCompileError::Invalid(
+                "missing router projection definitions",
+            ))?;
+        if projection.node.index() != nodes.len() || definitions.len() != projection.slots.len() {
+            return Err(FragmentCompileError::Invalid("router projection schedule differs").into());
+        }
+        let mut typed = crate::typed_layout::TypedLayoutBuilder::new_with_creation(
+            branch.sources.len(),
+            work,
+            creation,
+        )?;
+        for (ordinal, (source, definition)) in branch.sources.iter().zip(definitions).enumerate() {
+            let source_ordinal = match source.input.source {
+                ProgramChannelSite::Layout {
+                    node,
+                    role: ProgramChannelLayoutRole::NodeOutput,
+                    ordinal,
+                } if node == root => ordinal as usize,
+                _ => {
+                    return Err(FragmentCompileError::Invalid(
+                        "router alias reads a foreign input",
+                    )
+                    .into());
+                }
+            };
+            let name = nodes[root.index()]
+                .output_layout()
+                .schema()
+                .field(source_ordinal)
+                .name();
+            let name = crate::typed_layout::copy_name_with_creation(name, work, creation)?;
+            typed.push_with_creation(&source.ty, name, work, creation)?;
+            channels.push((
+                ProgramChannelSite::Layout {
+                    node: projection.node,
+                    role: ProgramChannelLayoutRole::NodeOutput,
+                    ordinal: u32::try_from(ordinal)
+                        .map_err(|_| CompileControlError::ResourceExhausted)?,
+                },
+                source.ty.clone_observed(|| work.step())?,
+            ));
+            union_roots.push(crate::union_flow::UnionRoot {
+                node: projection.node,
+                ordinal: u32::try_from(ordinal)
+                    .map_err(|_| CompileControlError::ResourceExhausted)?,
+                definition: *definition,
+                source: source.input.source,
+            });
+            work.step()?;
+        }
+        let layout = typed.finish_with_creation(&projection.slots, work, creation)?;
+        let diagnostic = DiagnosticSourceNodeId::new(physical.root().get());
+        let operator = LocalOperatorId::new(
+            u32::try_from(projection.node.index())
+                .map_err(|_| CompileControlError::ResourceExhausted)?,
+        );
+        operators.push(LocalOperatorProvenance {
+            id: operator,
+            lowered_nodes: Box::from([projection.node]),
+            sources: Box::from([diagnostic]),
+            origin: LocalOperatorOrigin::Synthetic {
+                reason: SyntheticOperatorReason::ExpressionControl,
+            },
+            cost_owner: LocalOperatorId::new(
+                u32::try_from(root.index()).map_err(|_| CompileControlError::ResourceExhausted)?,
+            ),
+            metrics: OperatorMetricAggregation {
+                cpu_time: MetricAggregation::Sum,
+                wall_time: MetricAggregation::Maximum,
+                peak_retained_bytes: MetricAggregation::Maximum,
+            },
+        });
+        nodes.push(ProgramNode::new_local(
+            projection.node,
+            vec![diagnostic],
+            ProgramNodeKind::Project {
+                input: root,
+                is_subordinate: true,
+                validate_final_result_input: false,
+                exprs: definitions.clone(),
+                expr_slot_ids: projection.slots.to_vec(),
+                expr_slot_schemas: None,
+                output_indices: None,
+            },
+            layout,
+        ));
+        root = projection.node;
+    }
     let root_layout = nodes[root.index()].output_layout();
     work.flush()?;
     let profile = CompileProfile::new(
@@ -1901,7 +2029,33 @@ fn lower_with_creation<
                 crate::creation::borrow_scope(&mut temporary),
                 factory,
             )?;
-            requirement_entries.push(lowered.requirement);
+            requirement_entries.extend(lowered.requirements);
+            (lowered.sink, Some(lowered.flow))
+        }
+        None if is_router => {
+            let projection = channels_plan
+                .sink_projection
+                .as_ref()
+                .ok_or(FragmentCompileError::Invalid("missing router projection"))?;
+            let summary_slots =
+                channels_plan
+                    .summary_slots
+                    .as_ref()
+                    .ok_or(FragmentCompileError::Invalid(
+                        "missing router summary slots",
+                    ))?;
+            let lowered = lower_router_sink_with_creation(
+                package,
+                root,
+                root_layout,
+                &projection.route_slots,
+                summary_slots,
+                work.control(),
+                creation,
+                crate::creation::borrow_scope(&mut temporary),
+                factory,
+            )?;
+            requirement_entries.extend(lowered.requirements);
             (lowered.sink, Some(lowered.flow))
         }
         None => {

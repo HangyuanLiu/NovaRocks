@@ -492,3 +492,114 @@ async fn full_connecting_occupied_ready_or_exhausted_rows_refuse_cold_eviction()
             .all(|entry| matches!(entry.phase, Phase::Ready(_)) && entry.generation == u64::MAX)
     );
 }
+
+fn flow_stream(
+    key: InlineNativeChannelIdentity,
+    ordinal: u32,
+) -> novarocks_execution_contract::ExchangeStreamIdentity {
+    use novarocks_execution_contract::{
+        ExchangeSource, ExchangeStreamIdentity, FragmentNodeId, TaskIdentity,
+    };
+    use novarocks_types::{
+        UniqueId,
+        identity::{AttemptId, QueryExecutionId, QueryId, StageId, TaskId},
+    };
+    let execution =
+        QueryExecutionId::new(QueryId::new(21, 22), AttemptId::new(1).unwrap()).unwrap();
+    let source = TaskIdentity::new(
+        execution,
+        StageId::new(1).unwrap(),
+        TaskId::new(1).unwrap(),
+        BackendProcessId::new_v7(),
+    );
+    let destination = TaskIdentity::new(
+        execution,
+        StageId::new(2).unwrap(),
+        TaskId::new(1).unwrap(),
+        key.peer().unwrap(),
+    );
+    ExchangeStreamIdentity::try_new(
+        ExchangeSource::new(source, UniqueId::new(10, 11), ordinal),
+        destination,
+        UniqueId::new(12, 13),
+        FragmentNodeId::new(7),
+    )
+    .unwrap()
+}
+
+#[test]
+fn flow_preparation_has_exact_128_peer_positions_shared_across_cache_clones() {
+    let (cache, _, _, _) = fixture();
+    let shared = cache.clone();
+    let key = identity(1, 9000, NativeRpcMethod::AcquireExchangePermit);
+    let frozen: Vec<_> = (0..128)
+        .map(|ordinal| (key, flow_stream(key, ordinal)))
+        .collect();
+    let positions = cache.reserve_flow_streams(&frozen).unwrap();
+    assert_eq!(positions.len(), 128);
+    let extra = (key, flow_stream(key, 128));
+    assert!(shared.reserve_flow_streams(&[extra]).is_err());
+    assert!(shared.reserve_flow_streams(&[frozen[0]]).is_err());
+    // A different endpoint/channel generation cannot multiply this peer budget.
+    let other_endpoint = identity(1, 9001, NativeRpcMethod::AcquireExchangePermit);
+    assert!(
+        shared
+            .reserve_flow_streams(&[(other_endpoint, flow_stream(other_endpoint, 129))])
+            .is_err()
+    );
+    drop(positions);
+    assert_eq!(shared.reserve_flow_streams(&frozen).unwrap().len(), 128);
+}
+
+#[test]
+fn flow_batch_refusal_is_atomic_and_original_positions_are_raii() {
+    let (cache, _, _, _) = fixture();
+    let key = identity(1, 9000, NativeRpcMethod::AcquireExchangePermit);
+    let oversized: Vec<_> = (0..129)
+        .map(|ordinal| (key, flow_stream(key, ordinal)))
+        .collect();
+    assert!(cache.reserve_flow_streams(&oversized).is_err());
+    assert!(cache.flow.rows.lock().unwrap().iter().all(Option::is_none));
+    let one = oversized[0];
+    assert!(cache.reserve_flow_streams(&[one, one]).is_err());
+    assert!(cache.flow.rows.lock().unwrap().iter().all(Option::is_none));
+    let slots = cache.reserve_flow_streams(&oversized[..128]).unwrap();
+    assert_eq!(
+        cache.flow.rows.lock().unwrap().iter().flatten().count(),
+        128
+    );
+    drop(slots);
+    assert_eq!(cache.flow.rows.lock().unwrap().iter().flatten().count(), 0);
+}
+
+#[test]
+fn flow_book_uses_original_32_peer_by_128_stream_domain_and_actual_layouts() {
+    let (cache, _, _, _) = fixture();
+    let frozen: Vec<_> = (1..=32)
+        .map(|peer| {
+            let key = identity(peer, 9000, NativeRpcMethod::AcquireExchangePermit);
+            (key, flow_stream(key, 0))
+        })
+        .collect();
+    let slots = cache.reserve_flow_streams(&frozen).unwrap();
+    let extra = identity(33, 9000, NativeRpcMethod::AcquireExchangePermit);
+    assert!(
+        cache
+            .reserve_flow_streams(&[(extra, flow_stream(extra, 0))])
+            .is_err()
+    );
+    let rows = cache.flow.rows.lock().unwrap();
+    assert_eq!(rows.len(), 4096);
+    let capacity = rows.capacity();
+    drop(rows);
+    let layouts = cache.flow_metadata_layouts().unwrap();
+    assert_eq!(
+        layouts[1],
+        std::alloc::Layout::array::<FlowRow>(capacity).unwrap()
+    );
+    assert!(
+        layouts[0].size()
+            >= std::mem::size_of::<NativeFlowPositions>() + 2 * std::mem::size_of::<usize>()
+    );
+    drop(slots);
+}

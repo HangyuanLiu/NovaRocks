@@ -78,6 +78,13 @@ struct LocalExchangerState {
 pub(crate) enum LocalExchangePartitionSpec {
     Single,
     InputSlotIds(Vec<SlotId>),
+    /// Explicit DriverV1 domain over the shared native tuple base.
+    HierarchicalInputSlotIds(Vec<SlotId>),
+    /// TRUE rows own one target key; FALSE/NULL rows use producer-local RR.
+    ConditionalKey {
+        applies: SlotId,
+        keys: Vec<SlotId>,
+    },
 }
 
 /// How a local exchange bounds the chunks it queues.
@@ -101,6 +108,7 @@ pub(crate) struct LocalExchanger {
     partition_count: usize,
     consumer_count: usize,
     partition_spec: LocalExchangePartitionSpec,
+    bounded: Option<BoundedLocalExchange>,
     capacity: LocalExchangeCapacity,
     memory_manager: Arc<ChunkBufferMemoryManager>,
     source_observable: Arc<Observable>,
@@ -232,6 +240,7 @@ impl LocalExchanger {
             partition_count,
             consumer_count,
             partition_spec,
+            bounded: None,
             capacity,
             memory_manager,
             source_observable: Arc::new(Observable::new()),
@@ -311,6 +320,12 @@ impl LocalExchanger {
             (discarded, all_closed)
         };
         drop(discarded);
+        if let Some(bounded) = &self.bounded {
+            if self.partition_closed(consumer % self.partition_count) {
+                let discarded = bounded.close_partition(consumer % self.partition_count);
+                self.queued_chunks.fetch_sub(discarded, Ordering::AcqRel);
+            }
+        }
         if all_closed && !self.all_consumers_closed.swap(true, Ordering::AcqRel) {
             debug!(
                 "LocalExchange all consumers closed: exchange_id={} consumers={}",
@@ -406,11 +421,183 @@ impl LocalExchanger {
         factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
         ctx: &crate::exec::pipeline::step_context::StepContext<'_>,
     ) -> crate::runtime::fragment::ExecutionResult<()> {
+        if matches!(
+            &self.partition_spec,
+            LocalExchangePartitionSpec::HierarchicalInputSlotIds(_)
+                | LocalExchangePartitionSpec::ConditionalKey { .. }
+        ) {
+            return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+                LocalPartitionContract,
+            ));
+        }
         ctx.checkpoint()?;
         self.accept_with(queue_tracker, chunk, |chunk| {
             self.partition_chunk_created(chunk, factory, ctx)
         })
     }
+    pub(crate) fn accept_created_with_cursor(
+        self: &Arc<Self>,
+        queue_tracker: Option<&Arc<MemTracker>>,
+        chunk: Chunk,
+        factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+        ctx: &crate::exec::pipeline::step_context::StepContext<'_>,
+        _bypass_cursor: &mut usize,
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
+        self.accept_created(queue_tracker, chunk, factory, ctx)
+    }
+
+    /// Pure row destinations; both transport and driver layers consume the
+    /// same native FNV author and apply their own frozen full-width domain.
+    fn driver_partition_rows(
+        &self,
+        chunk: &Chunk,
+        bypass_cursor: &mut usize,
+    ) -> crate::runtime::fragment::ExecutionResult<Vec<Vec<u32>>> {
+        self.driver_partition_rows_observed(
+            chunk,
+            bypass_cursor,
+            |arrays, rows| {
+                crate::exec::hash_table::tuple_partition::native_tuple_hashes(arrays, rows)
+            },
+            |_| Ok(()),
+        )
+    }
+
+    fn driver_partition_rows_observed(
+        &self,
+        chunk: &Chunk,
+        bypass_cursor: &mut usize,
+        mut hash: impl FnMut(
+            &[arrow::array::ArrayRef],
+            usize,
+        ) -> crate::runtime::fragment::ExecutionResult<Vec<u64>>,
+        mut request: impl FnMut(std::alloc::Layout) -> crate::runtime::fragment::ExecutionResult<()>,
+    ) -> crate::runtime::fragment::ExecutionResult<Vec<Vec<u32>>> {
+        use crate::exec::hash_table::tuple_partition::check_partition_row_extent;
+        use arrow::array::{Array, BooleanArray};
+        use novarocks_type_contract::PartitionHashDomain;
+        check_partition_row_extent(chunk.len())?;
+        if *bypass_cursor >= self.partition_count {
+            return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+                LocalPartitionContract,
+            ));
+        }
+        let (keys, applies) = match &self.partition_spec {
+            LocalExchangePartitionSpec::HierarchicalInputSlotIds(keys) => (keys, None),
+            LocalExchangePartitionSpec::ConditionalKey { applies, keys } => {
+                (keys, Some(chunk.column_by_slot_id(*applies)?))
+            }
+            _ => {
+                return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+                    LocalPartitionContract,
+                ));
+            }
+        };
+        if keys.is_empty() {
+            return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+                LocalPartitionContract,
+            ));
+        }
+        let mask = applies
+            .as_ref()
+            .map(|array| {
+                array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        crate::runtime::fragment::ExecutionFailure::from_domain(
+                            LocalPartitionContract,
+                        )
+                    })
+            })
+            .transpose()?;
+        let active = |row: usize| mask.is_none_or(|mask| !mask.is_null(row) && mask.value(row));
+        // NoAction/insert-only batches do not inspect absent or NULL target
+        // columns. TRUE matched rows must carry every actual non-NULL key.
+        let hashes = if (0..chunk.len()).any(active) {
+            request(std::alloc::Layout::array::<arrow::array::ArrayRef>(keys.len()).map_err(|_|crate::runtime::operator_byte_credit::credit_layout(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
+            let arrays = keys
+                .iter()
+                .map(|key| chunk.column_by_slot_id(*key))
+                .collect::<Result<Vec<_>, _>>()?;
+            if mask.is_some()
+                && (0..chunk.len())
+                    .any(|row| active(row) && arrays.iter().any(|array| array.is_null(row)))
+            {
+                return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+                    LocalPartitionContract,
+                ));
+            }
+            Some(hash(&arrays, chunk.len())?)
+        } else {
+            None
+        };
+        use crate::runtime::operator_byte_credit::{
+            credit_allocation, credit_contract, credit_layout,
+        };
+        use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+        let mut allocate = |layout: Result<std::alloc::Layout, std::alloc::LayoutError>| {
+            request(layout.map_err(|_| credit_layout(LayoutResourceError::Arithmetic))?)
+        };
+        allocate(std::alloc::Layout::array::<usize>(chunk.len()))?;
+        allocate(std::alloc::Layout::array::<usize>(self.partition_count))?;
+        allocate(std::alloc::Layout::array::<Vec<u32>>(self.partition_count))?;
+        let mut destinations = Vec::new();
+        destinations
+            .try_reserve_exact(chunk.len())
+            .map_err(credit_allocation)?;
+        let mut counts = Vec::new();
+        counts
+            .try_reserve_exact(self.partition_count)
+            .map_err(credit_allocation)?;
+        counts.resize(self.partition_count, 0usize);
+        for row in 0..chunk.len() {
+            let destination = if active(row) {
+                (PartitionHashDomain::DriverV1
+                    .mix(hashes.as_ref().expect("active row has native hash")[row])
+                    % self.partition_count as u64) as usize
+            } else {
+                let destination = *bypass_cursor;
+                *bypass_cursor = if destination == self.partition_count - 1 {
+                    0
+                } else {
+                    destination + 1
+                };
+                destination
+            };
+            destinations.push(destination);
+            counts[destination] += 1;
+        }
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(self.partition_count)
+            .map_err(credit_allocation)?;
+        if rows.capacity() != self.partition_count
+            || destinations.capacity() != chunk.len()
+            || counts.capacity() != self.partition_count
+        {
+            return Err(credit_contract(
+                "local routing backing differs from admitted Layout",
+            ));
+        }
+        for count in counts {
+            allocate(std::alloc::Layout::array::<u32>(count))?;
+            let mut indices = Vec::new();
+            indices
+                .try_reserve_exact(count)
+                .map_err(credit_allocation)?;
+            if indices.capacity() != count {
+                return Err(credit_contract(
+                    "local routing indices differ from admitted Layout",
+                ));
+            }
+            rows.push(indices);
+        }
+        for (row, destination) in destinations.into_iter().enumerate() {
+            rows[destination].push(row as u32);
+        }
+        Ok(rows)
+    }
+
     fn accept_with(
         self: &Arc<Self>,
         queue_tracker: Option<&Arc<MemTracker>>,
@@ -423,7 +610,13 @@ impl LocalExchanger {
         if chunk.is_empty() || self.all_consumers_closed() {
             return Ok(());
         }
-        if self.partition_count <= 1 {
+        if self.partition_count <= 1
+            && !matches!(
+                &self.partition_spec,
+                LocalExchangePartitionSpec::HierarchicalInputSlotIds(_)
+                    | LocalExchangePartitionSpec::ConditionalKey { .. }
+            )
+        {
             let mut chunk = chunk;
             if let Some(tracker) = queue_tracker {
                 chunk.transfer_to(tracker);
@@ -444,8 +637,26 @@ impl LocalExchanger {
         Ok(())
     }
 
+    pub(crate) fn next_chunk_checked(
+        &self,
+        partition: usize,
+    ) -> crate::runtime::fragment::ExecutionResult<crate::exec::pipeline::shape::SourceRead> {
+        if let Some(bounded) = &self.bounded {
+            let read = bounded.next_chunk(partition, self.remaining_producers() == 0)?;
+            if let crate::exec::pipeline::shape::SourceRead::Chunk(chunk) = &read {
+                self.queued_chunks.fetch_sub(1, Ordering::AcqRel);
+                self.popped_rows[partition].fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                self.popped_chunks[partition].fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(read)
+        } else {
+            Ok(self.read_chunk_from_partition(partition))
+        }
+    }
+    #[cfg(test)]
     pub(crate) fn next_chunk(&self, partition: usize) -> crate::exec::pipeline::shape::SourceRead {
-        self.read_chunk_from_partition(partition)
+        self.next_chunk_checked(partition)
+            .expect("valid local source read")
     }
 
     #[cfg(test)]
@@ -468,6 +679,9 @@ impl LocalExchanger {
         if self.remaining_producers.load(Ordering::Acquire) != 0 {
             return false;
         }
+        if let Some(bounded) = &self.bounded {
+            return bounded.buffered(partition) == Some(0);
+        }
         let in_memory_empty = {
             let guard = self.inner.lock().expect("local exchanger lock");
             guard
@@ -483,6 +697,11 @@ impl LocalExchanger {
     }
 
     pub(crate) fn partition_buffered_chunks(&self, partition: usize) -> Option<(usize, usize)> {
+        if let Some(bounded) = &self.bounded {
+            return bounded
+                .buffered(partition)
+                .map(|v| (v, self.remaining_producers()));
+        }
         let guard = self.inner.lock().expect("local exchanger lock");
         let buffered = guard.partitions.get(partition).map(|buf| buf.len())?;
         Some((buffered, self.remaining_producers()))
@@ -512,7 +731,11 @@ impl LocalExchanger {
                 .get(idx)
                 .map(|v| v.load(Ordering::Relaxed))
                 .unwrap_or(0);
-            let buffered_chunks = guard.partitions.get(idx).map(|buf| buf.len()).unwrap_or(0);
+            let buffered_chunks = self
+                .bounded
+                .as_ref()
+                .and_then(|bounded| bounded.buffered(idx))
+                .unwrap_or_else(|| guard.partitions.get(idx).map(|buf| buf.len()).unwrap_or(0));
             partitions.push(LocalExchangePartitionStats {
                 partition: idx,
                 pushed_rows,
@@ -559,7 +782,9 @@ impl LocalExchanger {
                     &|| control.checkpoint(),
                 )?
             }
-            LocalExchangePartitionSpec::Single => {
+            LocalExchangePartitionSpec::Single
+            | LocalExchangePartitionSpec::HierarchicalInputSlotIds(_)
+            | LocalExchangePartitionSpec::ConditionalKey { .. } => {
                 return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
                     LocalPartitionContract,
                 ));
@@ -581,7 +806,9 @@ impl LocalExchanger {
                 }
                 partition_chunk_by_hash_arrays(chunk, &arrays, self.partition_count, false)?
             }
-            LocalExchangePartitionSpec::Single => {
+            LocalExchangePartitionSpec::Single
+            | LocalExchangePartitionSpec::HierarchicalInputSlotIds(_)
+            | LocalExchangePartitionSpec::ConditionalKey { .. } => {
                 return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
                     LocalPartitionContract,
                 ));
@@ -835,3 +1062,12 @@ impl novarocks_failure_contract::FailureProjection for LocalPartitionContract {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "local_exchanger_hierarchical_tests.rs"]
+mod hierarchical_tests;
+
+#[path = "local_exchanger_bounded.rs"]
+mod bounded;
+use bounded::BoundedLocalExchange;
+pub(crate) use bounded::{LocalAdmission, LocalContinuation, LocalInputPermit};

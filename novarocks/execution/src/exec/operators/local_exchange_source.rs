@@ -148,9 +148,11 @@ impl SourceKernel for LocalExchangeSourceOperator {
         if self.finished {
             return Ok(StepResult::new(None, NextStep::Finished, 0));
         }
-        let observable = self.exchanger.source_observable();
+        let observable = self
+            .exchanger
+            .source_observable_for_partition(self.partition)?;
         let observed_generation = observable.generation();
-        let read = self.exchanger.next_chunk(self.partition);
+        let read = self.exchanger.next_chunk_checked(self.partition)?;
         if let SourceRead::Chunk(chunk) = read {
             if self.blocked_empty {
                 if let Some((buffered, remaining)) =

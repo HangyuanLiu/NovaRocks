@@ -146,6 +146,62 @@ mod owner_tests {
     }
 
     impl ExchangeReceiverPort for ReceiverConstructionPort {
+        fn acquire(
+            &self,
+            request: novarocks_execution_contract::ExchangePermitRequest,
+            stop: tokio_util::sync::CancellationToken,
+            deadline: std::time::Instant,
+        ) -> crate::runtime::fragment::io::ExchangeReceiveFuture<
+            '_,
+            crate::runtime::fragment::io::ExchangePermitAdmission,
+        > {
+            self.delegate.acquire(request, stop, deadline)
+        }
+        fn lookup_grant(
+            &self,
+            stream: novarocks_execution_contract::ExchangeStreamIdentity,
+            token: novarocks_execution_contract::ExchangePermitToken,
+        ) -> Result<
+            novarocks_execution_contract::ExchangePermitGrant,
+            crate::runtime::exchange::ExchangeFailure,
+        > {
+            self.delegate.lookup_grant(stream, token)
+        }
+        fn claim(
+            &self,
+            grant: novarocks_execution_contract::ExchangePermitGrant,
+        ) -> Result<
+            crate::runtime::fragment::io::ClaimedExchangeFrame,
+            crate::runtime::exchange::ExchangeFailure,
+        > {
+            self.delegate.claim(grant)
+        }
+        fn accept(
+            &self,
+            claim: crate::runtime::fragment::io::ClaimedExchangeFrame,
+            payload: Vec<u8>,
+        ) -> crate::runtime::fragment::io::ExchangeReceiveFuture<'_, ()> {
+            self.delegate.accept(claim, payload)
+        }
+        fn close_snapshot(
+            &self,
+            key: ExchangeReceiverKey,
+        ) -> Result<
+            Option<crate::runtime::fragment::io::ExchangeReceiverCloseSnapshot>,
+            crate::runtime::exchange::ExchangeFailure,
+        > {
+            self.delegate.close_snapshot(key)
+        }
+        fn withdraw(
+            &self,
+            key: ExchangeReceiverKey,
+        ) -> Result<
+            Option<crate::runtime::fragment::io::ExchangeReceiverCloseSnapshot>,
+            crate::runtime::exchange::ExchangeFailure,
+        > {
+            self.delegate.withdraw(key)
+        }
+
         fn register(
             &self,
             registration: ExchangeReceiverRegistration,
@@ -792,6 +848,7 @@ mod owner_tests {
                 vec![ExchangeReceiverRegistration {
                     key,
                     expected_senders: 1,
+                    network: None,
                     expected_chunk_schema: schema,
                     column_binding: crate::runtime::exchange::ExchangeColumnBinding::Positional,
                     creation_factory: factory,
@@ -1077,6 +1134,7 @@ mod owner_tests {
                 vec![crate::runtime::fragment::io::ExchangeReceiverRegistration {
                     key,
                     expected_senders: 1,
+                    network: None,
                     expected_chunk_schema: schema,
                     column_binding: crate::runtime::exchange::ExchangeColumnBinding::Positional,
                     creation_factory: factory,

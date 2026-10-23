@@ -17,7 +17,6 @@
 
 //! Borrowed root input backing inspection, before any cursor/clone/hydration.
 
-use super::root_array_storage::borrowed_root_batch_storage_with_types;
 use super::root_schema_backing::{
     RootFieldSource, RootSchemaBackingError, RootSchemaInspection, RootSchemaSource,
 };
@@ -26,6 +25,7 @@ use super::root_schema_backing::{
 /// Missing positive sources remain a refusal; equal schemas cannot elect one.
 fn sources(
     schema: &ChunkSchema,
+    origin_nodes: usize,
 ) -> Result<(RootSchemaSource<'_>, RootFieldSource<'_>), RootArrayStorageError> {
     if schema.is_typed() {
         // The private typed author guarantees metadata-free representation;
@@ -40,7 +40,7 @@ fn sources(
         if !original.schema_owner().lends(&schema.arrow_schema_ref()) {
             return Err(RootArrayStorageError::UnknownMetadataOwner);
         }
-        if original.fields().len() > 65_536 {
+        if original.fields().len() > origin_nodes {
             return Err(RootArrayStorageError::WorkExceeded);
         }
         let index = original
@@ -122,14 +122,58 @@ pub fn borrowed_root_chunk_storage(
     chunk: &Chunk,
     limits: RootArrayStorageLimits,
 ) -> Result<usize, RootArrayStorageError> {
-    let cap = limits.bytes.min(96 * 1024 * 1024);
-    if chunk.record_batch().num_columns() > RootProfileV1::MAX_COLUMNS
-        || chunk.chunk_schema().slots().len() > RootProfileV1::MAX_COLUMNS
+    inspect_chunk_storage_profile(chunk, limits, RootProfileV1::MAX_COLUMNS, false)
+}
+
+/// Explicit operator profile; structural bounds come from the frozen layout,
+/// and the byte bound comes from this input occurrence's actual window.
+#[derive(Clone, Copy, Debug)]
+pub struct OperatorStorageLimits {
+    pub bytes: usize,
+    pub nodes: usize,
+    pub depth: usize,
+    pub columns: usize,
+}
+
+pub(crate) fn borrowed_operator_chunk_storage(
+    chunk: &Chunk,
+    limits: OperatorStorageLimits,
+) -> Result<usize, RootArrayStorageError> {
+    let receipt = chunk
+        .source_backing_receipt()
+        .ok_or(RootArrayStorageError::UnknownBackingOwner)?;
+    if receipt.retained_bytes() > limits.bytes {
+        return Err(RootArrayStorageError::CapacityExceeded);
+    }
+    inspect_chunk_storage_profile(
+        chunk,
+        RootArrayStorageLimits {
+            bytes: limits.bytes,
+            nodes: limits.nodes,
+            depth: limits.depth,
+        },
+        limits.columns,
+        true,
+    )
+}
+
+fn inspect_chunk_storage_profile(
+    chunk: &Chunk,
+    limits: RootArrayStorageLimits,
+    columns: usize,
+    operator: bool,
+) -> Result<usize, RootArrayStorageError> {
+    let cap = if operator {
+        limits.bytes
+    } else {
+        limits.bytes.min(96 * 1024 * 1024)
+    };
+    if chunk.record_batch().num_columns() > columns || chunk.chunk_schema().slots().len() > columns
     {
         return Err(RootArrayStorageError::WorkExceeded);
     }
     let schema = chunk.chunk_schema();
-    let (top, origins) = sources(schema)?;
+    let (top, origins) = sources(schema, if operator { limits.nodes } else { 65_536 })?;
     // Validate the ACTUAL batch Arc first. Expected equality is not provenance;
     // an independently allocated equal map can have arbitrary table history.
     let actual = chunk.record_batch().schema();
@@ -140,11 +184,15 @@ pub fn borrowed_root_chunk_storage(
             if std::sync::Arc::ptr_eq(&actual, &schema.arrow_schema_ref()) => {}
         _ => return Err(RootArrayStorageError::UnknownMetadataOwner),
     }
-    let mut metadata = RootSchemaInspection::new(
-        cap,
-        limits.nodes.min(2 * RootProfileV1::SCHEMA_TYPE_NODES),
-        limits.depth,
-    );
+    let mut metadata = if operator {
+        RootSchemaInspection::for_operator(cap, limits.nodes, limits.depth, columns)
+    } else {
+        RootSchemaInspection::new(
+            cap,
+            limits.nodes.min(2 * RootProfileV1::SCHEMA_TYPE_NODES),
+            limits.depth,
+        )
+    };
     chunk
         .inspect_root_holder_scaffolds(&mut metadata)
         .map_err(map_error)?;
@@ -158,18 +206,45 @@ pub fn borrowed_root_chunk_storage(
     let storage_cap = cap
         .checked_sub(metadata.bytes())
         .ok_or(RootArrayStorageError::CapacityExceeded)?;
-    let storage = borrowed_root_batch_storage_with_types(
+    let storage = super::root_array_storage::borrowed_batch_storage_geometry_profile(
         chunk.record_batch(),
         RootArrayStorageLimits {
             bytes: storage_cap,
-            ..limits
+            nodes: if operator {
+                limits.nodes
+            } else {
+                limits.nodes.min(2 * RootProfileV1::SCHEMA_TYPE_NODES)
+            },
+            depth: if operator {
+                limits.depth
+            } else {
+                limits.depth.min(RootProfileV1::MAX_DEPTH)
+            },
         },
+        columns,
+        operator,
         &mut |data_type| {
             metadata
                 .inspect_data_type_source(data_type, origins)
                 .map_err(map_error)
         },
     )?;
+    let payload = if operator {
+        storage.payload_bytes.max(
+            chunk
+                .source_backing_receipt()
+                .ok_or(RootArrayStorageError::UnknownBackingOwner)?
+                .retained_bytes(),
+        )
+    } else {
+        storage.payload_bytes
+    };
+    // Original parent extent overlaps the visible buffer payload, never the
+    // independent array/Buffer owner scaffolds. Keep those metadata bytes even
+    // when a custom region's full parent dominates its declared buffer size.
+    let storage = payload
+        .checked_add(storage.metadata_bytes)
+        .ok_or(RootArrayStorageError::CapacityExceeded)?;
     storage
         .checked_add(metadata.bytes())
         .filter(|bytes| *bytes <= cap)
@@ -188,7 +263,7 @@ pub fn borrowed_root_chunk_schema_storage(
     if schema.slots().len() > RootProfileV1::MAX_COLUMNS {
         return Err(RootArrayStorageError::WorkExceeded);
     }
-    let (top, origins) = sources(schema)?;
+    let (top, origins) = sources(schema, 65_536)?;
     let actual = schema.arrow_schema_ref();
     let mut inspection = RootSchemaInspection::new(limits.bytes, limits.nodes, limits.depth);
     schema

@@ -137,7 +137,7 @@ fn mor_merge_completion_reaches_the_original_compiled_router_refusal() {
                 vec![ConnectorRowMutationEffect::Replace]
             },
             input_ordinals: inputs,
-            partition_input_tokens: Vec::new(),
+
             sink: DmlWritePlanInput::try_new(
                 if ordinal == 0 {
                     DmlWriteSinkMode::RowLineageData
@@ -176,7 +176,7 @@ fn mor_merge_completion_reaches_the_original_compiled_router_refusal() {
                 .collect(),
             pre_expand_keyed_assert: Some(DmlPreExpandKeyedAssert {
                 applicability_output_ordinal: None,
-                key_column_name: "__nr_merge_assert_key".into(),
+                key_column_name: "__nr_row_id".into(),
                 key_label: "_row_id".into(),
                 message_prefix: "MOR MERGE matched target row".into(),
             }),

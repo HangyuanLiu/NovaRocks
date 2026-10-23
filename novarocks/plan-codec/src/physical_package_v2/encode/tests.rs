@@ -17,7 +17,7 @@
 
 use super::*;
 use crate::physical_package_v2::definition_sources::tests::{
-    cv_package, rich_package, writer_constant_package, writer_package,
+    change_stream_packages, cv_package, rich_package, writer_constant_package, writer_package,
 };
 use crate::physical_package_v2::prepare_package_wire_in;
 use crate::physical_package_v2::provider_sources::tests::checked_read;
@@ -43,13 +43,23 @@ impl PureCompileControl for Control {
 }
 
 fn fixtures() -> Vec<(&'static str, p::FragmentPackage)> {
-    vec![
+    let mut fixtures = vec![
         ("rich", rich_package()),
         ("cv", cv_package()),
         ("writer", writer_constant_package()),
         ("data-read", checked_read(false)),
         ("metadata-read", checked_read(true)),
-    ]
+    ];
+    for package in change_stream_packages() {
+        let name = match package.fragment().id().get() {
+            1 => "change-stream-writer",
+            2 => "logical-change-finish",
+            3 => "independent-router-summary",
+            _ => panic!("the fixture must have exactly its three declared fragments"),
+        };
+        fixtures.push((name, package));
+    }
+    fixtures
 }
 
 fn decode_limits() -> DecodeProjectionLimits {
@@ -133,48 +143,49 @@ fn whole_sender_output_passes_generated_preflight_and_is_deterministic() {
 
 #[test]
 fn whole_sender_refuses_over_coarse_bound_component_limit_and_control() {
-    let package = rich_package();
-    let size = encode_fragment_package(&package, &encode_limits(), &Control::default())
-        .unwrap()
-        .encoded_len();
-    let exact = PackageEncodeLimits {
-        max_wire_bytes: size,
-        ..encode_limits()
-    };
-    encode_fragment_package(&package, &exact, &Control::default()).unwrap();
-    let under = PackageEncodeLimits {
-        max_wire_bytes: size - 1,
-        ..encode_limits()
-    };
-    assert!(matches!(
-        encode_fragment_package(&package, &under, &Control::default()),
-        Err(PackageEncodeError::Control(
-            CompileControlError::ResourceExhausted
-        ))
-    ));
-    let mut tight = encode_limits();
-    tight.definition_sources.max_values = package.fragment().values().len() - 1;
-    assert!(matches!(
-        encode_fragment_package(&package, &tight, &Control::default()),
-        Err(PackageEncodeError::Control(
-            CompileControlError::ResourceExhausted
-        ))
-    ));
-    // Representative control: the caller's cause stays primary at the entry,
-    // in the middle and at the final footer of the one Encode scope.
-    let control = Control::default();
-    encode_fragment_package(&package, &encode_limits(), &control).unwrap();
-    let callbacks = control.trace.lock().unwrap().len();
-    for at in [0, callbacks / 2, callbacks - 1] {
-        let stop = Control {
-            stop: Some((at, CompileControlError::Cancelled)),
-            ..Default::default()
+    for (_name, package) in fixtures() {
+        let size = encode_fragment_package(&package, &encode_limits(), &Control::default())
+            .unwrap()
+            .encoded_len();
+        let exact = PackageEncodeLimits {
+            max_wire_bytes: size,
+            ..encode_limits()
+        };
+        encode_fragment_package(&package, &exact, &Control::default()).unwrap();
+        let under = PackageEncodeLimits {
+            max_wire_bytes: size - 1,
+            ..encode_limits()
         };
         assert!(matches!(
-            encode_fragment_package(&package, &encode_limits(), &stop),
-            Err(PackageEncodeError::Control(CompileControlError::Cancelled))
+            encode_fragment_package(&package, &under, &Control::default()),
+            Err(PackageEncodeError::Control(
+                CompileControlError::ResourceExhausted
+            ))
         ));
-        assert_eq!(stop.trace.lock().unwrap().len(), at + 1);
+        let mut tight = encode_limits();
+        tight.definition_sources.max_values = package.fragment().values().len() - 1;
+        assert!(matches!(
+            encode_fragment_package(&package, &tight, &Control::default()),
+            Err(PackageEncodeError::Control(
+                CompileControlError::ResourceExhausted
+            ))
+        ));
+        // Representative control: the caller's cause stays primary at the entry,
+        // in the middle and at the final footer of the one Encode scope.
+        let control = Control::default();
+        encode_fragment_package(&package, &encode_limits(), &control).unwrap();
+        let callbacks = control.trace.lock().unwrap().len();
+        for at in [0, callbacks / 2, callbacks - 1] {
+            let stop = Control {
+                stop: Some((at, CompileControlError::Cancelled)),
+                ..Default::default()
+            };
+            assert!(matches!(
+                encode_fragment_package(&package, &encode_limits(), &stop),
+                Err(PackageEncodeError::Control(CompileControlError::Cancelled))
+            ));
+            assert_eq!(stop.trace.lock().unwrap().len(), at + 1);
+        }
     }
 }
 

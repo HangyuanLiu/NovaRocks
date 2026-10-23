@@ -74,6 +74,11 @@ impl ExecutionRuntimeConfig {
                 "local_exchange_max_buffered_rows",
             ));
         }
+        if self.exchange_io_max_inflight_bytes > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(ExecutionRuntimeConfigError::runtime(
+                "exchange_io_max_inflight_bytes exceeds the pinned semaphore capacity".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -101,6 +106,7 @@ pub struct ExecutionRuntime {
     exchange_registry: Arc<ExecutionExchangeRegistry>,
     driver_executor: Arc<GlobalDriverExecutor>,
     exchange_send_queue: Arc<ExchangeSendQueue>,
+    exchange_codec_executor: Arc<IoExecutor>,
 }
 
 /// A real, small memory authority for tests that need to build an
@@ -134,7 +140,7 @@ impl ExecutionRuntime {
         let exchange_io_executor = Arc::new(IoExecutor::new(config.exchange_io_threads));
         let exchange_send_queue = Arc::new(ExchangeSendQueue::new(
             config.exchange_io_max_inflight_bytes,
-            exchange_io_executor,
+            Arc::clone(&exchange_io_executor),
         ));
         Ok(Self {
             execution_health: Arc::new(crate::runtime::execution_health::ExecutionHealth::default()),
@@ -149,6 +155,7 @@ impl ExecutionRuntime {
             exchange_registry: Arc::new(ExecutionExchangeRegistry::default()),
             driver_executor,
             exchange_send_queue,
+            exchange_codec_executor: exchange_io_executor,
         })
     }
 
@@ -198,6 +205,10 @@ impl ExecutionRuntime {
 
     pub fn exchange_send_queue(&self) -> Arc<ExchangeSendQueue> {
         Arc::clone(&self.exchange_send_queue)
+    }
+    /// Short bounded codec work only; no network or capacity wait runs here.
+    pub fn exchange_codec_executor(&self) -> Arc<IoExecutor> {
+        Arc::clone(&self.exchange_codec_executor)
     }
 }
 

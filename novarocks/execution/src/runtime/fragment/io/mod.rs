@@ -19,14 +19,20 @@ pub use events::{
     FragmentEvent, FragmentEventSink, FragmentProfileSnapshot, FragmentProgress,
     NoopFragmentEventSink,
 };
-pub use exchange::{ExchangeFrame, ExchangeFrameTransmitter, ExchangeTransmitRejection};
+pub use exchange::{
+    ExchangeFrame, ExchangeFrameTransmitter, ExchangeFuture, ExchangePermitAcquire,
+    ExchangeStreamTarget, ExchangeStreamTransmitter, ExchangeTransmitRejection,
+};
 pub use exchange_edge::{
     EdgeOpenAccepted, EdgeSendGate, EdgeSendState, ExchangeDestinationKey, ExchangeEdgeGateError,
     ExchangeEdgeGates,
 };
 pub use exchange_receiver::{
-    ExchangeReceiverFrame, ExchangeReceiverKey, ExchangeReceiverPort, ExchangeReceiverRegistration,
-    ExecutionRuntimeExchangeReceiverPort, UnavailableExchangeReceiverPort,
+    ClaimedExchangeFrame, ExchangePermitAdmission, ExchangeReceiveFuture, ExchangeReceivePool,
+    ExchangeReceiverCloseSnapshot, ExchangeReceiverFrame, ExchangeReceiverKey,
+    ExchangeReceiverNetworkContract, ExchangeReceiverNetworkSpec, ExchangeReceiverPort,
+    ExchangeReceiverRegistration, ExchangeTransportHold, ExecutionRuntimeExchangeReceiverPort,
+    UnavailableExchangeReceiverPort,
 };
 pub use result::{
     FragmentResultSession, FragmentResultWriter, ResultAbort, ResultInputMetadata,

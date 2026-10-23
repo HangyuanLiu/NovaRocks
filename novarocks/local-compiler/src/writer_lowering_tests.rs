@@ -535,7 +535,7 @@ fn fixture_with_types(
     })
 }
 
-/// One complete eager use per literal root site in one root domain.
+/// One complete eager use per literal or materialized-value root site in one domain.
 fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
     let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
     let mut uses = Vec::new();
@@ -547,7 +547,7 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
             let id = ExpressionUseId::new(index as u32);
             assert!(matches!(
                 fragment.expressions().get(root.expr).unwrap().kind,
-                ExprKind::Literal(_)
+                ExprKind::Literal(_) | ExprKind::Value(_)
             ));
             // A literal has no argument, so its control shape is trivially eager.
             let _ = control_argument_semantics(ControlShape::Eager, 0, 0, root.demand);
@@ -2260,3 +2260,5 @@ fn actual_writer_compilation_accepts_root_null_obligation_and_refuses_nested_bin
         }
     }
 }
+
+mod change_stream;

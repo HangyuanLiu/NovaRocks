@@ -28,10 +28,8 @@
 //! Two things separate this reader from the data reader it delegates to:
 //!
 //! * `__change_op` is derived from the split variant and produced here as an
-//!   Arrow `Int8`. It is never read from a file, and it is never widened -- the
-//!   engine contract in `novarocks-execution` is eight-bit, while the Iceberg
-//!   column handle has to declare `int` because the table format has no
-//!   eight-bit integer;
+//!   Arrow `Int32`, matching the provider's signed public schema. SQL authors
+//!   an explicit cast when its internal delta algebra requires an Int8 sign;
 //! * the reverse side *selects* the rows a delete removed instead of hiding
 //!   them by comparing both complete endpoint closures. Added and removed
 //!   files use ordinary exclusion at their independently pinned endpoint.
@@ -40,7 +38,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow::array::{ArrayRef, Int8Array};
+use arrow::array::{ArrayRef, Int32Array};
 use futures::Stream;
 use futures::future::BoxFuture;
 use novarocks_fs::{FileReadBudget, FileReadContext, FileReaderOptions};
@@ -293,9 +291,9 @@ impl ChangeOpOutput {
     }
 }
 
-/// The sign column: eight-bit, one value, never widened.
+/// The public sign column has the exact Int32 carrier declared by the provider.
 fn change_op_column(change_op: i8, rows: usize) -> ArrayRef {
-    Arc::new(Int8Array::from(vec![change_op; rows]))
+    Arc::new(Int32Array::from(vec![i32::from(change_op); rows]))
 }
 
 /// One change-window split read as a page stream: its data split's stream,
@@ -704,7 +702,7 @@ mod tests {
 
     /// Drain the source into `(id, __change_op)` pairs, proving the sign column
     /// is eight-bit on the way through.
-    fn drain(source: &mut DrivenStream<'_>) -> Vec<(i64, i8)> {
+    fn drain(source: &mut DrivenStream<'_>) -> Vec<(i64, i32)> {
         let mut rows = Vec::new();
         for _ in 0..64 {
             let Some(page) = source.next_page().expect("page") else {
@@ -720,7 +718,7 @@ mod tests {
         fixture: &Fixture,
         stream: &mut OwnedConnectorPageStream,
         budget: &ConnectorPollBudget,
-    ) -> Vec<(i64, i8)> {
+    ) -> Vec<(i64, i32)> {
         use futures::StreamExt;
         fixture._runtime.block_on(async {
             let mut rows = Vec::new();
@@ -735,13 +733,13 @@ mod tests {
     }
 
     /// One page's `(id, __change_op)` pairs.
-    fn signed_rows(page: SourcePage) -> Vec<(i64, i8)> {
+    fn signed_rows(page: SourcePage) -> Vec<(i64, i32)> {
         let (count, columns) = page.into_columns().expect("materialize");
         assert_eq!(columns.len(), 2, "id and the derived sign");
         assert_eq!(
             columns[1].data_type(),
-            &DataType::Int8,
-            "the change sign is eight-bit"
+            &DataType::Int32,
+            "the public change sign matches the signed Int32 schema"
         );
         let ids = columns[0]
             .as_any()
@@ -749,8 +747,8 @@ mod tests {
             .expect("int64 ids");
         let signs = columns[1]
             .as_any()
-            .downcast_ref::<Int8Array>()
-            .expect("int8 signs");
+            .downcast_ref::<Int32Array>()
+            .expect("int32 signs");
         (0..count)
             .map(|row| (ids.value(row), signs.value(row)))
             .collect()
@@ -762,7 +760,7 @@ mod tests {
         handle: &IcebergChangeWindowHandle,
         split: &IcebergChangeSplit,
         schema: &Schema,
-    ) -> Vec<(i64, i8)> {
+    ) -> Vec<(i64, i32)> {
         let columns = id_and_change_op(schema);
         let budget = ConnectorPollBudget::new();
         let mut stream = fixture
@@ -942,7 +940,7 @@ mod tests {
             assert_eq!(columns.len(), 3);
             let a = columns[0].as_any().downcast_ref::<Int64Array>().unwrap();
             let b = columns[1].as_any().downcast_ref::<Int64Array>().unwrap();
-            let sign = columns[2].as_any().downcast_ref::<Int8Array>().unwrap();
+            let sign = columns[2].as_any().downcast_ref::<Int32Array>().unwrap();
             rows.extend((0..count).map(|i| (a.value(i), b.value(i), sign.value(i))));
         }
         assert_eq!(rows, vec![(11, 11, -1)]);
@@ -965,10 +963,9 @@ mod tests {
     }
 
     #[test]
-    fn the_change_sign_is_an_int8_array_rather_than_a_widened_integer() {
-        // The Iceberg column handle has to declare `int` because the table
-        // format has no eight-bit integer, but the engine contract is Int8 and
-        // the page must not widen it.
+    fn the_change_sign_matches_the_public_int32_declaration() {
+        // The page and the signed column handle agree at the provider boundary.
+        // The SQL-owned internal narrowing is a separate expression.
         let fixture = Fixture::new(&[50]);
         let schema = iceberg_schema();
         let handle = change_window_handle(&schema);
@@ -993,11 +990,11 @@ mod tests {
         let (rows, columns) = page.into_columns().expect("materialize");
         assert_eq!(rows, 1);
         assert_eq!(columns.len(), 1, "the sign alone is a legal projection");
-        assert_eq!(columns[0].data_type(), &DataType::Int8);
+        assert_eq!(columns[0].data_type(), &DataType::Int32);
         let signs = columns[0]
             .as_any()
-            .downcast_ref::<Int8Array>()
-            .expect("int8 signs");
+            .downcast_ref::<Int32Array>()
+            .expect("int32 signs");
         assert_eq!(signs.value(0), 1);
     }
 

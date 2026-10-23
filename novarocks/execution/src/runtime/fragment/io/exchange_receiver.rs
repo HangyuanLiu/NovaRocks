@@ -1,14 +1,23 @@
 //! Application-hosted ingress for one exchange receiver.
 
 use crate::exec::chunk::ChunkSchemaRef;
+pub use crate::runtime::exchange::{
+    ClaimedExchangeFrame, ExchangePermitAdmission, ExchangeReceiveFuture, ExchangeReceivePool,
+    ExchangeReceiverCloseSnapshot, ExchangeReceiverNetworkContract, ExchangeReceiverNetworkSpec,
+    ExchangeTransportHold,
+};
 use crate::runtime::exchange::{
     ExchangeColumnBinding, ExchangeKey, ExchangeReceiverHandle, ExchangeSenderIdentity,
 };
 use crate::runtime::execution_runtime::ExecutionRuntime;
 use crate::runtime::mem_tracker::MemTracker;
+use novarocks_execution_contract::{
+    ExchangePermitGrant, ExchangePermitRequest, ExchangePermitToken, ExchangeStreamIdentity,
+};
 use novarocks_types::UniqueId;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ExchangeReceiverKey {
@@ -32,6 +41,8 @@ pub struct ExchangeReceiverFrame {
 pub struct ExchangeReceiverRegistration {
     pub key: ExchangeReceiverKey,
     pub expected_senders: usize,
+    /// None is the explicit local-only profile and grants no native ingress.
+    pub network: Option<ExchangeReceiverNetworkContract>,
     pub expected_chunk_schema: ChunkSchemaRef,
     /// How decoded wire columns bind to `expected_chunk_schema`. Legacy
     /// fragments bind by slot id; compiled fragments bind by position.
@@ -44,6 +55,35 @@ pub struct ExchangeReceiverRegistration {
 /// Execution uses this port instead of a process-global exchange map. The
 /// role installs one shared implementation for native ingress and operators.
 pub trait ExchangeReceiverPort: Send + Sync + 'static {
+    fn acquire(
+        &self,
+        request: ExchangePermitRequest,
+        stop: CancellationToken,
+        deadline: Instant,
+    ) -> ExchangeReceiveFuture<'_, ExchangePermitAdmission>;
+    fn lookup_grant(
+        &self,
+        stream: ExchangeStreamIdentity,
+        token: ExchangePermitToken,
+    ) -> Result<ExchangePermitGrant, crate::runtime::exchange::ExchangeFailure>;
+    fn claim(
+        &self,
+        grant: ExchangePermitGrant,
+    ) -> Result<ClaimedExchangeFrame, crate::runtime::exchange::ExchangeFailure>;
+    fn accept(
+        &self,
+        claim: ClaimedExchangeFrame,
+        payload: Vec<u8>,
+    ) -> ExchangeReceiveFuture<'_, ()>;
+    fn close_snapshot(
+        &self,
+        key: ExchangeReceiverKey,
+    ) -> Result<Option<ExchangeReceiverCloseSnapshot>, crate::runtime::exchange::ExchangeFailure>;
+    fn withdraw(
+        &self,
+        key: ExchangeReceiverKey,
+    ) -> Result<Option<ExchangeReceiverCloseSnapshot>, crate::runtime::exchange::ExchangeFailure>;
+
     fn register(
         &self,
         registration: ExchangeReceiverRegistration,
@@ -121,6 +161,86 @@ impl ExecutionRuntimeExchangeReceiverPort {
 }
 
 impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
+    fn acquire(
+        &self,
+        request: ExchangePermitRequest,
+        stop: CancellationToken,
+        deadline: Instant,
+    ) -> ExchangeReceiveFuture<'_, ExchangePermitAdmission> {
+        Box::pin(async move {
+            let key = ExchangeReceiverKey {
+                fragment_instance_id: request.stream.destination_fragment_instance_id(),
+                node_id: request.stream.destination_node().get(),
+            };
+            let contract = self
+                .runtime
+                .exchange_registry()
+                .network_receiver(Self::key(key))?;
+            contract.acquire(request, stop, deadline).await
+        })
+    }
+    fn lookup_grant(
+        &self,
+        stream: ExchangeStreamIdentity,
+        token: ExchangePermitToken,
+    ) -> Result<ExchangePermitGrant, crate::runtime::exchange::ExchangeFailure> {
+        let key = ExchangeKey {
+            finst_id_hi: stream.destination_fragment_instance_id().high(),
+            finst_id_lo: stream.destination_fragment_instance_id().low(),
+            node_id: stream.destination_node().get(),
+        };
+        self.runtime
+            .exchange_registry()
+            .network_receiver(key)?
+            .lookup_grant(stream, token)
+    }
+    fn claim(
+        &self,
+        grant: ExchangePermitGrant,
+    ) -> Result<ClaimedExchangeFrame, crate::runtime::exchange::ExchangeFailure> {
+        self.runtime.exchange_registry().claim_exchange_frame(grant)
+    }
+    fn accept(
+        &self,
+        claim: ClaimedExchangeFrame,
+        payload: Vec<u8>,
+    ) -> ExchangeReceiveFuture<'_, ()> {
+        let registry = self.runtime.exchange_registry();
+        let executor = self.runtime.exchange_codec_executor();
+        let mut job = crate::runtime::exchange::ClaimedExchangeJob::new(claim, payload);
+        Box::pin(async move {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            // The closure owns claim, raw backing and both windows through real
+            // exit. Dropping this future only drops its result observation.
+            executor.submit(move |_context| {
+                let result = job.finish(&registry);
+                let _ = sender.send(result);
+                drop(job);
+            });
+            receiver.await.map_err(|error| {
+                crate::runtime::exchange::ExchangeFailure::metadata_channel(error)
+            })?
+        })
+    }
+    fn close_snapshot(
+        &self,
+        key: ExchangeReceiverKey,
+    ) -> Result<Option<ExchangeReceiverCloseSnapshot>, crate::runtime::exchange::ExchangeFailure>
+    {
+        let registry = self.runtime.exchange_registry();
+        let contract = registry.network_receiver(Self::key(key))?;
+        Ok(contract.close_snapshot())
+    }
+    fn withdraw(
+        &self,
+        key: ExchangeReceiverKey,
+    ) -> Result<Option<ExchangeReceiverCloseSnapshot>, crate::runtime::exchange::ExchangeFailure>
+    {
+        let registry = self.runtime.exchange_registry();
+        let contract = registry.network_receiver(Self::key(key))?;
+        contract.withdraw().map(Some)
+    }
+
     fn register(
         &self,
         registration: ExchangeReceiverRegistration,
@@ -135,6 +255,11 @@ impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
                 registration.column_binding,
                 registration.creation_factory,
             )?;
+        if let Some(network) = registration.network {
+            self.runtime
+                .exchange_registry()
+                .register_network_receiver(key, network)?;
+        }
         #[cfg(novarocks_dev_controls)]
         if let Some(observer) = self.test_observer.clone() {
             self.runtime
@@ -149,21 +274,8 @@ impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
         key: ExchangeReceiverKey,
         frame: ExchangeReceiverFrame,
     ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
-        let exchange_key = Self::key(key);
-        let decode_start = Instant::now();
-        let registry = self.runtime.exchange_registry();
-        let sender =
-            ExchangeSenderIdentity::native(frame.source_fragment_instance_id, frame.sender_ordinal);
-        let chunks = registry.decode_chunks_for_sender(exchange_key, sender, &frame.payload)?;
-        registry.push_chunks_with_stats(
-            exchange_key,
-            sender,
-            chunks,
-            frame.eos,
-            frame.payload.len(),
-            decode_start.elapsed().as_nanos(),
-        );
-        Ok(())
+        let _ = (key, frame);
+        Err(crate::runtime::exchange::ExchangeFailure::unpermitted_native_frame())
     }
 
     fn cancel(&self, key: ExchangeReceiverKey) {
@@ -234,6 +346,49 @@ impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
 pub struct UnavailableExchangeReceiverPort;
 
 impl ExchangeReceiverPort for UnavailableExchangeReceiverPort {
+    fn acquire(
+        &self,
+        _request: ExchangePermitRequest,
+        _stop: CancellationToken,
+        _deadline: Instant,
+    ) -> ExchangeReceiveFuture<'_, ExchangePermitAdmission> {
+        Box::pin(async { Err(crate::runtime::exchange::ExchangeFailure::receiver_unavailable()) })
+    }
+    fn lookup_grant(
+        &self,
+        _stream: ExchangeStreamIdentity,
+        _token: ExchangePermitToken,
+    ) -> Result<ExchangePermitGrant, crate::runtime::exchange::ExchangeFailure> {
+        Err(crate::runtime::exchange::ExchangeFailure::receiver_unavailable())
+    }
+    fn claim(
+        &self,
+        _grant: ExchangePermitGrant,
+    ) -> Result<ClaimedExchangeFrame, crate::runtime::exchange::ExchangeFailure> {
+        Err(crate::runtime::exchange::ExchangeFailure::receiver_unavailable())
+    }
+    fn accept(
+        &self,
+        _claim: ClaimedExchangeFrame,
+        _payload: Vec<u8>,
+    ) -> ExchangeReceiveFuture<'_, ()> {
+        Box::pin(async { Err(crate::runtime::exchange::ExchangeFailure::receiver_unavailable()) })
+    }
+    fn close_snapshot(
+        &self,
+        _key: ExchangeReceiverKey,
+    ) -> Result<Option<ExchangeReceiverCloseSnapshot>, crate::runtime::exchange::ExchangeFailure>
+    {
+        Err(crate::runtime::exchange::ExchangeFailure::receiver_unavailable())
+    }
+    fn withdraw(
+        &self,
+        _key: ExchangeReceiverKey,
+    ) -> Result<Option<ExchangeReceiverCloseSnapshot>, crate::runtime::exchange::ExchangeFailure>
+    {
+        Err(crate::runtime::exchange::ExchangeFailure::receiver_unavailable())
+    }
+
     fn register(
         &self,
         _registration: ExchangeReceiverRegistration,
@@ -301,7 +456,7 @@ mod tests {
     use novarocks_types::UniqueId;
 
     #[test]
-    fn runtime_port_uses_exact_native_source_identity_for_eos() {
+    fn local_receiver_registration_does_not_authorize_native_frames_without_permits() {
         let port = ExecutionRuntimeExchangeReceiverPort::new(Arc::clone(&test_execution_runtime()));
         let key = ExchangeReceiverKey {
             fragment_instance_id: UniqueId::new(50, 60),
@@ -321,6 +476,7 @@ mod tests {
         port.register(crate::runtime::fragment::io::ExchangeReceiverRegistration {
             key,
             expected_senders: 2,
+            network: None,
             expected_chunk_schema: expected,
             column_binding: crate::runtime::exchange::ExchangeColumnBinding::Positional,
             creation_factory: factory.clone(),
@@ -339,13 +495,11 @@ mod tests {
             payload: Vec::new(),
         };
 
-        port.push(key, frame(UniqueId::new(1, 1), 0))
-            .expect("first native eos");
-        port.push(key, frame(UniqueId::new(2, 2), 1))
-            .expect("second native eos");
+        assert!(port.push(key, frame(UniqueId::new(1, 1), 0)).is_err());
+        assert!(port.push(key, frame(UniqueId::new(2, 2), 1)).is_err());
 
         let snapshot = port.snapshot(key).expect("receiver snapshot");
-        assert_eq!(snapshot.finished_senders, 2);
+        assert_eq!(snapshot.finished_senders, 0);
         port.remove(key);
         assert!(port.snapshot(key).is_none());
         drop(factory);

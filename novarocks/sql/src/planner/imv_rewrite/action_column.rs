@@ -87,7 +87,7 @@ impl ImvActionColumn {
         }
         columns.push(ColumnDef {
             name: Self::NAME.to_string(),
-            data_type: DataType::Int8,
+            data_type: DataType::Int32,
             nullable: false,
             write_default: None,
             logical_type: None,

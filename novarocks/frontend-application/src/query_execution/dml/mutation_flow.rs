@@ -432,7 +432,7 @@ fn compile_dml_change_stream_write(
             accepted_effects: route.accepted_effects().to_vec(),
             input_ordinals: route.input_ordinals().to_vec(),
             requirements: route.requirements().clone(),
-            partition_input_tokens: route.partition_fields().to_vec(),
+
             sink,
         });
         statistics_targets.push(
@@ -4307,8 +4307,7 @@ fn resolve_merge_insert_columns(
 )]
 struct MergeMatchRows {
     /// The full RecordBatch from the MERGE match SELECT, with rows for both
-    /// matched and unmatched cases. Filters for each side are derived from
-    /// `__nr_match_kind` / `__nr_matched_apply` / `__nr_unmatched_apply`.
+    /// matched and unmatched cases. Both filters read the selected action.
     full: RecordBatch,
 }
 
@@ -4332,7 +4331,7 @@ impl MergeMatchRows {
         if self.full.num_rows() == 0 {
             return Ok(self.full.clone());
         }
-        let filter = self.row_filter("matched", "__nr_matched_apply")?;
+        let filter = self.row_filter(true)?;
         filter_record_batch(&self.full, &filter)
             .map_err(|e| format!("filter MERGE matched rows failed: {e}"))
     }
@@ -4358,7 +4357,7 @@ impl MergeMatchRows {
         if self.full.num_rows() == 0 {
             return Ok(RecordBatch::new_empty(target_arrow_schema));
         }
-        let filter = self.row_filter("unmatched", "__nr_unmatched_apply")?;
+        let filter = self.row_filter(false)?;
         let filtered = filter_record_batch(&self.full, &filter)
             .map_err(|e| format!("filter MERGE unmatched rows failed: {e}"))?;
         if filtered.num_rows() == 0 {
@@ -4393,34 +4392,21 @@ impl MergeMatchRows {
         dead_code,
         reason = "Retained for staged query-execution DML recovery and connector wiring."
     )]
-    fn row_filter(&self, kind: &str, apply_col: &str) -> Result<BooleanArray, String> {
-        let kind_col = cast(
-            required_column(&self.full, "__nr_match_kind")?,
-            &DataType::Utf8,
-        )
-        .map_err(|e| format!("cast __nr_match_kind to Utf8 failed: {e}"))?;
-        let kind_arr = kind_col
+    fn row_filter(&self, matched: bool) -> Result<BooleanArray, String> {
+        let action = required_column(&self.full, "__nr_merge_action")?;
+        let action = action
             .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| "__nr_match_kind was not Utf8 after cast".to_string())?;
-        let apply_col = cast(required_column(&self.full, apply_col)?, &DataType::Boolean)
-            .map_err(|e| format!("cast {apply_col} to Boolean failed: {e}"))?;
-        let apply_arr = apply_col
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| "MERGE apply column was not Boolean after cast".to_string())?;
-
-        let mut bits = Vec::with_capacity(self.full.num_rows());
-        for row in 0..self.full.num_rows() {
-            if kind_arr.is_null(row) {
-                bits.push(false);
-                continue;
-            }
-            let matches_kind = kind_arr.value(row) == kind;
-            let applies = !apply_arr.is_null(row) && apply_arr.value(row);
-            bits.push(matches_kind && applies);
-        }
-        Ok(BooleanArray::from(bits))
+            .downcast_ref::<arrow::array::Int64Array>()
+            .ok_or_else(|| "MERGE selected action is not Int64".to_string())?;
+        Ok(BooleanArray::from_iter((0..action.len()).map(|row| {
+            let applies = !action.is_null(row)
+                && if matched {
+                    matches!(action.value(row), 1 | 2)
+                } else {
+                    action.value(row) == 3
+                };
+            Some(applies)
+        })))
     }
 }
 
@@ -4848,10 +4834,9 @@ fn build_merge_mor_change_stream_write_plan(
         },
         (has_matched_update || has_matched_delete).then(|| DmlPreExpandKeyedAssert {
             applicability_output_ordinal: None,
-            // Matched rows use the real target `_row_id`; unmatched rows use
-            // a generated negative row number so fresh-only rows do not
-            // collide under the same NULL key before expansion.
-            key_column_name: "__nr_merge_assert_key".to_string(),
+            // SQL authors the exact TRUE-only selected-action mask after
+            // optimization. INSERT rows carry no old target identity.
+            key_column_name: "__nr_row_id".to_string(),
             key_label: novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
             message_prefix: "MOR MERGE matched target row".to_string(),
         }),
@@ -4919,14 +4904,6 @@ fn build_merge_match_query_sql(
         let value = qualify(column);
         format!("CASE WHEN {row_id} IS NOT NULL THEN {value} ELSE NULL END")
     };
-    let matched_apply_expr = format!(
-        "(CASE WHEN ({}) THEN TRUE ELSE FALSE END)",
-        matched_predicate_sql.unwrap_or("TRUE")
-    );
-    let unmatched_apply_expr = format!(
-        "(CASE WHEN ({}) THEN TRUE ELSE FALSE END)",
-        not_matched_predicate_sql.unwrap_or("TRUE")
-    );
     let mut action_cases = Vec::new();
     if let Some(action) = matched_action {
         action_cases.push(format!(
@@ -4964,9 +4941,6 @@ fn build_merge_match_query_sql(
             "{} AS __nr_last_updated_sequence_number",
             nullable_target_column("_last_updated_sequence_number")
         ),
-        format!(
-            "CASE WHEN {row_id} IS NOT NULL THEN {row_id} ELSE -ROW_NUMBER() OVER () END AS __nr_merge_assert_key"
-        ),
         format!("({action_expr}) AS __nr_merge_action"),
         format!(
             "(CASE WHEN {} IS NOT NULL THEN 'matched' ELSE 'unmatched' END) AS __nr_match_kind",
@@ -4974,8 +4948,6 @@ fn build_merge_match_query_sql(
         ),
     ];
     select_items.extend(target_select_items);
-    select_items.push(format!("{matched_apply_expr} AS __nr_matched_apply"));
-    select_items.push(format!("{unmatched_apply_expr} AS __nr_unmatched_apply"));
     for (column, expr) in matched_assignments_sql {
         select_items.push(format!("({expr}) AS __nr_new_{column}"));
     }
@@ -5804,7 +5776,7 @@ mod tests {
             route.route_id(),
             route.accepted_effects().to_vec(),
             route.input_ordinals().to_vec(),
-            { let keys = route.partition_fields().to_vec(); novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements { colocation: if keys.is_empty() { novarocks_spi::connector::write_stack::ConnectorWriteColocation::None } else { novarocks_spi::connector::write_stack::ConnectorWriteColocation::ByKey(keys) }, layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None } },
+            route.requirements().clone(),
             vec![
                 novarocks_spi::connector::write_stack::ConnectorWriteSelectionBinding::new(
                     id_token,
@@ -6049,18 +6021,7 @@ mod tests {
                     )
                 })
                 .collect(),
-            {
-                let keys = fixture.route_facts.partition_fields().to_vec();
-                novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
-                    colocation: if keys.is_empty() {
-                        novarocks_spi::connector::write_stack::ConnectorWriteColocation::None
-                    } else {
-                        novarocks_spi::connector::write_stack::ConnectorWriteColocation::ByKey(keys)
-                    },
-                    layout:
-                        novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
-                }
-            },
+            fixture.route_facts.requirements().clone(),
             fixture.route_facts.selection_bindings().to_vec(),
         )
         .expect("route");
@@ -6337,8 +6298,29 @@ mod tests {
         );
         assert!(sql.contains("(s.v) AS __nr_new_v"), "{sql}");
         assert!(sql.contains("(s.id) AS __nr_ins_id"), "{sql}");
-        assert!(sql.contains("AS __nr_merge_action"), "{sql}");
-        assert!(sql.contains("AS __nr_merge_assert_key"), "{sql}");
+        assert_eq!(sql.matches("AS __nr_merge_action").count(), 1, "{sql}");
+    }
+
+    #[test]
+    fn merge_action_selection_materializes_each_when_predicate_once() {
+        let sql = build_merge_match_query_sql(
+            "target t",
+            "t",
+            "source s",
+            "t.id = s.id",
+            Some("RAND() < 0.25"),
+            Some("RAND() > 0.75"),
+            &[col("id")],
+            &[],
+            &[("id", "s.id")],
+            Some(MERGE_ACTION_MATCHED_DELETE),
+            true,
+        );
+        assert_eq!(sql.matches("RAND() < 0.25").count(), 1, "{sql}");
+        assert_eq!(sql.matches("RAND() > 0.75").count(), 1, "{sql}");
+        assert!(sql.contains("THEN 2"), "{sql}");
+        assert!(sql.contains("THEN 3"), "{sql}");
+        assert!(sql.contains("ELSE 0 END"), "{sql}");
     }
 
     #[test]

@@ -235,8 +235,8 @@ pub fn writer_state_source_for_test(
                     ConnectorWriteFieldToken::from_bytes([1; 32]),
                     0,
                 )],
-                partition_input_positions: Vec::new(),
-                output_partition_ordinals: Vec::new(),
+
+
                 sink: declared_inputs[i].clone(),
             }
             })

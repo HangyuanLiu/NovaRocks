@@ -28,7 +28,7 @@ pub use schema_geometry::{
     schema_backing_upper_bound, schema_writer_allocation_metrics, type_header_geometry,
 };
 pub use stream_geometry::{
-    IpcConstructionError, IpcStreamBatchFacts, IpcStreamSchemaFacts,
+    IpcConstructionError, IpcStreamBatchFacts, IpcStreamSchemaFacts, IpcStreamWireFacts,
     observe_stream_logical_size_construction, observe_stream_writer_batch_construction,
     observe_stream_writer_schema_construction,
 };

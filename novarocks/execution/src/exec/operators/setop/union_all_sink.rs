@@ -14,114 +14,163 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! UNION ALL sink branch operator.
-//!
-//! Responsibilities:
-//! - Pushes branch chunks into shared UNION ALL queues without deduplication.
-//! - Marks branch completion for source-side termination detection.
-//!
-//! Key exported interfaces:
-//! - Types: `UnionAllSinkFactory`.
-//!
-//! Current limitations:
-//! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
-//! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
-
-use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::runtime::fragment::ExecutionResult;
-
-use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
-use crate::exec::pipeline::operator_factory::OperatorFactory;
+//! Exactly addressed UNION ALL producer endpoint.
+use super::union_all_shared::{UnionAllSharedState, UnionProducer};
 use crate::exec::pipeline::{
-    input::PreparedInput,
-    shape::{SinkKernel, SinkStep, Transform},
-    step::NextStep,
+    input::{PreparedInput, RawInput},
+    operator::{EncodedValueOccurrence, InputEncodingPolicy, Operator, OperatorLifecycle},
+    operator_factory::OperatorFactory,
+    shape::{ControlStep, SinkKernel, SinkStep, Transform},
+    step::{AdmissionNext, NextStep},
     step_context::StepContext,
 };
-use crate::runtime::mem_tracker::MemTracker;
-use std::sync::Arc;
+use crate::runtime::{
+    fragment::ExecutionResult,
+    operator_byte_credit::{CreditAcquire, QueuePermit, credit_contract},
+};
+use std::sync::Mutex;
 
-use super::union_all_shared::UnionAllSharedState;
-use crate::runtime::runtime_state::RuntimeState;
-
-/// Factory for UNION ALL sink branches that enqueue branch chunks into shared state.
 pub struct UnionAllSinkFactory {
     name: String,
     state: UnionAllSharedState,
+    input: usize,
 }
-
 impl UnionAllSinkFactory {
-    pub(crate) fn new(state: UnionAllSharedState, node_id: i32) -> Self {
-        let name = if node_id >= 0 {
-            format!("UnionAllSink (id={node_id})")
-        } else {
-            "UnionAllSink".to_string()
-        };
-        Self { name, state }
+    pub(crate) fn new(state: UnionAllSharedState, input: usize, node_id: i32) -> Self {
+        Self {
+            name: format!("UnionAllSink (id={node_id}, input={input})"),
+            state,
+            input,
+        }
     }
 }
-
 impl OperatorFactory for UnionAllSinkFactory {
     fn name(&self) -> &str {
         &self.name
     }
-
-    fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
+    fn create(&self, dop: i32, driver_id: i32) -> Box<dyn Operator> {
+        let endpoint = usize::try_from(dop)
+            .ok()
+            .zip(usize::try_from(driver_id).ok())
+            .ok_or_else(|| credit_contract("negative UnionAll endpoint"))
+            .and_then(|(dop, driver)| self.state.producer(self.input, driver, dop));
         Box::new(Transform::hydrating(UnionAllSinkOperator {
             name: self.name.clone(),
             state: self.state.clone(),
-            memory: None,
+            endpoint,
+            pending: Mutex::new(None),
+            finished: false,
         }))
     }
-
     fn is_sink(&self) -> bool {
         true
     }
 }
-
 struct UnionAllSinkOperator {
     name: String,
     state: UnionAllSharedState,
-    memory: Option<QueueInputMemory>,
+    endpoint: ExecutionResult<UnionProducer>,
+    pending: Mutex<Option<QueuePermit>>,
+    finished: bool,
 }
-struct QueueInputMemory {
-    tracker: Option<Arc<MemTracker>>,
-}
-
 impl OperatorLifecycle for UnionAllSinkOperator {
     fn name(&self) -> &str {
         &self.name
     }
-    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        self.memory = Some(QueueInputMemory {
-            tracker: self.state.queue_mem_tracker(state),
-        });
+    fn cancel(&mut self) {
+        self.pending
+            .get_mut()
+            .expect("UnionAll pending lock")
+            .take();
+        self.state.close();
+    }
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.pending
+            .get_mut()
+            .expect("UnionAll pending lock")
+            .take();
         Ok(())
     }
 }
-impl InputEncodingPolicy for UnionAllSinkOperator {}
+// UnionAll has no scalar operation. It retains every exact encoded occurrence
+// already admitted by each branch's normalizing Project, including nested ones.
+impl InputEncodingPolicy for UnionAllSinkOperator {
+    fn retains_encoded_column(
+        &self,
+        _: novarocks_types::SlotId,
+        _: &arrow::datatypes::DataType,
+    ) -> bool {
+        true
+    }
+    fn retains_encoded_path(&self, _: EncodedValueOccurrence<'_>) -> bool {
+        true
+    }
+}
 impl SinkKernel for UnionAllSinkOperator {
+    fn control_observable(&self) -> Option<std::sync::Arc<crate::runtime::observable::Observable>> {
+        self.endpoint
+            .as_ref()
+            .ok()
+            .and_then(|endpoint| self.state.producer_observable(*endpoint).ok())
+    }
+    fn poll_control(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+        if self.state.is_closed() {
+            Ok(ControlStep::Withdrawn)
+        } else {
+            Ok(ControlStep::Active)
+        }
+    }
+    fn admission(
+        &self,
+        _: &mut StepContext<'_>,
+        input: &RawInput,
+    ) -> ExecutionResult<Option<AdmissionNext>> {
+        let endpoint = *self.endpoint.as_ref().map_err(Clone::clone)?;
+        let mut pending = self.pending.lock().expect("UnionAll pending lock");
+        if pending.is_some() {
+            return Err(credit_contract(
+                "UnionAll accepted another input before using its reservation",
+            ));
+        }
+        if self.finished {
+            return Err(credit_contract(
+                "UnionAll admission follows endpoint finish",
+            ));
+        }
+        let bytes = input.retained_geometry(self.state.input_limits(endpoint)?)?;
+        match self.state.acquire(endpoint, bytes)? {
+            CreditAcquire::Granted(permit) => {
+                *pending = Some(permit);
+                Ok(None)
+            }
+            CreditAcquire::Pending(wait) => Ok(Some(AdmissionNext::Wait(wait))),
+            CreditAcquire::Closed => Ok(Some(AdmissionNext::ResumeExisting)),
+        }
+    }
     fn consume(
         &mut self,
         _: &mut StepContext<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<SinkStep> {
-        let memory = self.memory.as_ref().ok_or_else(|| {
-            novarocks_functions::KernelFailure::InvalidProgram(
-                novarocks_functions::KernelDiagnostic::new(
-                    "union input runtime binding is missing",
-                ),
-            )
-        })?;
+        let endpoint = *self.endpoint.as_ref().map_err(Clone::clone)?;
+        let permit = self
+            .pending
+            .get_mut()
+            .expect("UnionAll pending lock")
+            .take()
+            .ok_or_else(|| credit_contract("UnionAll accepted input has no queue reservation"))?;
         let chunk = input.into_uncovered_chunk()?;
-        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
-        if !chunk.is_empty() {
-            self.state.push_chunk(memory.tracker.as_ref(), chunk);
-        }
+        let rows = u64::try_from(chunk.len())
+            .map_err(|_| credit_contract("UnionAll row count is not representable"))?;
+        self.state.push_chunk(endpoint, chunk, permit)?;
         Ok(SinkStep::new(NextStep::NeedInput, rows))
     }
     fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
-        self.state.producer_finished();
+        if !self.finished {
+            self.state
+                .producer_finished(*self.endpoint.as_ref().map_err(Clone::clone)?)?;
+            self.finished = true;
+        }
         Ok(SinkStep::new(NextStep::Finished, 0))
     }
 }

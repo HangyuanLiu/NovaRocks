@@ -24,7 +24,6 @@ use hyper_util::rt::TokioIo;
 use novarocks_native_trust::{NativeClientAuthInterceptor, NativeTrust};
 use novarocks_proto_codec::native_rpc::{NativeRpcMethod, NativeTrafficClass};
 use novarocks_proto_models::{filter, novarocks as proto};
-use novarocks_types::identity::UniqueId;
 use novarocks_types::{BackendProcessId, NativeEndpoint};
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
@@ -55,7 +54,7 @@ pub struct NativeRpcClient {
     backend_process_id: Option<BackendProcessId>,
 }
 
-/// Only the three BE-origin methods use this role-local cache. Their manifest
+/// The BE-origin methods use this role-local cache. Their manifest
 /// classes are distinct physical lanes. Membership has no BE peer identity.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct NativeChannelKey {
@@ -74,7 +73,7 @@ impl NativeChannelKey {
             self.method,
         )
     }
-    fn new(
+    pub(crate) fn new(
         backend_process_id: Option<BackendProcessId>,
         endpoint: NativeEndpoint,
         method: NativeRpcMethod,
@@ -199,81 +198,110 @@ impl NativeRpcClient {
         })
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The frozen native boundary keeps independently validated inputs explicit."
-    )]
-    pub fn exchange_unary(
+    /// Capacity acquisition carries metadata only and never retries an unknown RPC.
+    pub(crate) async fn acquire_exchange_permit(
         &self,
-        finst_id: UniqueId,
-        node_id: i32,
-        source_finst_id: UniqueId,
-        sender_ordinal: u32,
-        sender_count: u32,
-        sender_id: i32,
-        be_number: i32,
-        eos: bool,
-        sequence: i64,
-        payload: Vec<u8>,
+        request: novarocks_execution_contract::ExchangePermitRequest,
+        timeout: Duration,
+        stop: CancellationToken,
+    ) -> Result<NativeExchangePermitReply, String> {
+        request.validate().map_err(|error| error.to_string())?;
+        if self.backend_process_id != Some(request.stream.destination().backend_process_id()) {
+            return Err("exchange permit peer differs from its frozen destination process".into());
+        }
+        let deadline_at = tokio::time::Instant::now() + timeout;
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => Err("exchange permit cancelled by task stop".into()),
+            response = async {
+                let mut client = self.make_deadline_async_client(
+                    "exchange permit", NativeRpcMethod::AcquireExchangePermit, deadline_at,
+                ).await?;
+                let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() { return Err("exchange permit deadline exceeded before unary RPC submission".into()); }
+                let mut wire = Request::new(novarocks_task_codec::exchange_flow_codec::encode_permit_request(request));
+                wire.set_timeout(remaining);
+                let response = tokio::time::timeout_at(deadline_at, client.acquire_exchange_permit(wire)).await
+                    .map_err(|_| "exchange permit deadline exceeded during unary RPC".to_string())?
+                    .map_err(|error| format!("exchange permit rpc failed: {error}"))?.into_inner();
+                decode_permit_response(response, request)
+            } => response,
+        }
+    }
+
+    /// The caller owns a preparation-reserved exact stream and one live grant.
+    /// No synchronous bridge or data replay is installed on this path.
+    pub(crate) async fn exchange_unary(
+        &self,
+        request: proto::ExchangeRequest,
         timeout: Duration,
         stop: CancellationToken,
     ) -> Result<Option<proto::ExchangeNormalClosed>, String> {
-        let request = proto::ExchangeRequest {
-            permit_token: Vec::new(),
-            stream: None,
-            frame_kind: novarocks_proto_models::novarocks::ExchangeFrameKind::Unspecified as i32,
-            finst_id_hi: finst_id.high(),
-            finst_id_lo: finst_id.low(),
-            node_id,
-            source_finst_id_hi: source_finst_id.high(),
-            source_finst_id_lo: source_finst_id.low(),
-            sender_ordinal,
-            sender_count,
-            sender_id,
-            be_number,
-            eos,
-            sequence,
-            payload,
-        };
-        self.runtime.block_on(async {
-            tokio::select! {
-                biased;
-                _ = stop.cancelled() => Err("exchange send cancelled by task stop".to_string()),
-                result = async {
-            let deadline_at = tokio::time::Instant::now() + timeout;
-            let mut client = self
-                .make_deadline_async_client("exchange", NativeRpcMethod::ExchangeUnary, deadline_at)
-                .await?;
-            let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err("exchange deadline exceeded before unary RPC submission".to_string());
-            }
-            let mut request = Request::new(request);
-            request.set_timeout(remaining);
-            let response = client
-                .exchange_unary(request);
-            let response = tokio::time::timeout_at(deadline_at, response)
-                .await
-                .map_err(|_| "exchange deadline exceeded during unary RPC".to_string())?
-                .map_err(|error| format!("exchange rpc failed: {error}"))?
-                .into_inner();
-            if response.ack_sequence != sequence {
-                return Err("exchange rpc returned a different request sequence".to_string());
-            }
-            let status = response.status.as_ref().ok_or_else(||
-                "exchange rpc omitted its status".to_string()
-            )?;
-            if status.code != 0 {
-                return Err(if status.message.is_empty() {
-                    format!("exchange rpc returned status_code={}", status.code)
-                } else {
-                    format!("exchange rpc failed: {}", status.message)
-                });
-            }
-            Ok(response.normal_closed)
-                } => result,
-            }
-        })
+        let sequence = request.sequence;
+        let deadline_at = tokio::time::Instant::now() + timeout;
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => Err("exchange send cancelled by task stop".to_string()),
+            response = async {
+                let mut client = self.make_deadline_async_client("exchange", NativeRpcMethod::ExchangeUnary, deadline_at).await?;
+                let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() { return Err("exchange deadline exceeded before unary RPC submission".into()); }
+                let mut request = Request::new(request);
+                request.set_timeout(remaining);
+                let response = tokio::time::timeout_at(deadline_at, client.exchange_unary(request)).await
+                    .map_err(|_| "exchange deadline exceeded during unary RPC".to_string())?
+                    .map_err(|error| format!("exchange rpc failed: {error}"))?.into_inner();
+                if response.ack_sequence != sequence {
+                    return Err("exchange rpc returned a different request sequence".into());
+                }
+                validate_exchange_status(response.status.as_ref(), "exchange")?;
+                Ok(response.normal_closed)
+            } => response,
+        }
+    }
+}
+
+pub(crate) enum NativeExchangePermitReply {
+    Granted(novarocks_execution_contract::ExchangePermitGrant),
+    Closed(proto::ExchangeNormalClosed),
+}
+
+fn validate_exchange_status(
+    status: Option<&novarocks_proto_models::common::Status>,
+    operation: &str,
+) -> Result<(), String> {
+    let status = status.ok_or_else(|| format!("{operation} rpc omitted its status"))?;
+    if status.code != 0 {
+        return Err(if status.message.is_empty() {
+            format!("{operation} rpc returned status_code={}", status.code)
+        } else {
+            format!("{operation} rpc failed: {}", status.message)
+        });
+    }
+    Ok(())
+}
+
+fn decode_permit_response(
+    response: proto::AcquireExchangePermitResponse,
+    request: novarocks_execution_contract::ExchangePermitRequest,
+) -> Result<NativeExchangePermitReply, String> {
+    validate_exchange_status(response.status.as_ref(), "exchange permit")?;
+    match response
+        .result
+        .ok_or_else(|| "exchange permit rpc omitted its result".to_string())?
+    {
+        proto::acquire_exchange_permit_response::Result::Granted(grant) => {
+            novarocks_task_codec::exchange_flow_codec::decode_permit_grant(
+                &grant,
+                request,
+                novarocks_proto_codec::FieldPath::root("exchange_permit_response").field("granted"),
+            )
+            .map(NativeExchangePermitReply::Granted)
+            .map_err(|error| error.to_string())
+        }
+        proto::acquire_exchange_permit_response::Result::NormalClosed(close) => {
+            Ok(NativeExchangePermitReply::Closed(close))
+        }
     }
 }
 
@@ -381,10 +409,108 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use novarocks_types::UniqueId;
+    use novarocks_proto_models::novarocks as proto;
     use tokio_util::sync::CancellationToken;
 
     use super::{NativeRpcClient, channel_endpoint};
+
+    fn permit_request() -> novarocks_execution_contract::ExchangePermitRequest {
+        use novarocks_execution_contract::{
+            ExchangeFrameGeometry, ExchangeFrameKind, ExchangeFrameSequence, ExchangeSource,
+            ExchangeStreamIdentity, FragmentNodeId, TaskIdentity,
+        };
+        use novarocks_types::{
+            UniqueId,
+            identity::{AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId},
+        };
+        let execution =
+            QueryExecutionId::new(QueryId::new(31, 32), AttemptId::new(1).unwrap()).unwrap();
+        let task = |stage| {
+            TaskIdentity::new(
+                execution,
+                StageId::new(stage).unwrap(),
+                TaskId::new(1).unwrap(),
+                BackendProcessId::new_v7(),
+            )
+        };
+        novarocks_execution_contract::ExchangePermitRequest {
+            stream: ExchangeStreamIdentity::try_new(
+                ExchangeSource::new(task(1), UniqueId::new(11, 12), 0),
+                task(2),
+                UniqueId::new(21, 22),
+                FragmentNodeId::new(7),
+            )
+            .unwrap(),
+            sequence: ExchangeFrameSequence::FIRST,
+            kind: ExchangeFrameKind::Data,
+            geometry: ExchangeFrameGeometry::try_new(17, 33, 11).unwrap(),
+        }
+    }
+
+    #[test]
+    fn permit_response_requires_status_result_and_exact_request_echo() {
+        use super::{NativeExchangePermitReply, decode_permit_response};
+        use novarocks_execution_contract::{
+            ExchangeFrameSequence, ExchangePermitGrant, ExchangePermitToken,
+        };
+        let request = permit_request();
+        let grant = ExchangePermitGrant {
+            request,
+            token: ExchangePermitToken::try_from_bytes([9; 16]).unwrap(),
+        };
+        let response = proto::AcquireExchangePermitResponse {
+            status: Some(novarocks_proto_models::common::Status {
+                code: 0,
+                message: String::new(),
+            }),
+            result: Some(proto::acquire_exchange_permit_response::Result::Granted(
+                novarocks_task_codec::exchange_flow_codec::encode_permit_grant(grant),
+            )),
+        };
+        assert!(
+            matches!(decode_permit_response(response.clone(), request).unwrap(), NativeExchangePermitReply::Granted(actual) if actual == grant)
+        );
+        let mut absent_status = response.clone();
+        absent_status.status = None;
+        assert!(decode_permit_response(absent_status, request).is_err());
+        let mut absent_result = response.clone();
+        absent_result.result = None;
+        assert!(decode_permit_response(absent_result, request).is_err());
+        let mut denied = response.clone();
+        denied.status.as_mut().unwrap().code = 1;
+        assert!(decode_permit_response(denied, request).is_err());
+        let mut other_request = request;
+        other_request.sequence = ExchangeFrameSequence::try_new(1).unwrap();
+        assert!(decode_permit_response(response.clone(), other_request).is_err());
+        let mut empty_token = response;
+        let Some(proto::acquire_exchange_permit_response::Result::Granted(ref mut value)) =
+            empty_token.result
+        else {
+            unreachable!()
+        };
+        value.token.clear();
+        assert!(decode_permit_response(empty_token, request).is_err());
+    }
+
+    #[test]
+    fn task_stop_interrupts_permit_before_channel_acquisition() {
+        let request = permit_request();
+        let client = NativeRpcClient::new_backend_endpoint(
+            crate::backend_test_support::test_backend_data_runtime(),
+            novarocks_types::NativeEndpoint::from_host_port("127.0.0.1", 1).unwrap(),
+            request.stream.destination().backend_process_id(),
+        );
+        let stop = CancellationToken::new();
+        stop.cancel();
+        let started = Instant::now();
+        let error = client
+            .runtime
+            .block_on(client.acquire_exchange_permit(request, Duration::from_secs(10), stop))
+            .err()
+            .expect("cancelled permit must refuse before dialing");
+        assert!(error.contains("cancelled by task stop"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     fn send_to_test_endpoint(
         port: u16,
@@ -396,21 +522,26 @@ mod tests {
             novarocks_types::NativeEndpoint::from_host_port("127.0.0.1", port).unwrap(),
             novarocks_types::BackendProcessId::new_v7(),
         );
+        let request = proto::ExchangeRequest {
+            finst_id_hi: 1,
+            finst_id_lo: 2,
+            node_id: 3,
+            source_finst_id_hi: 4,
+            source_finst_id_lo: 5,
+            sender_ordinal: 0,
+            sender_count: 1,
+            sender_id: 0,
+            be_number: 0,
+            eos: false,
+            sequence: 0,
+            payload: Vec::new(),
+            permit_token: Vec::new(),
+            stream: None,
+            frame_kind: 0,
+        };
         client
-            .exchange_unary(
-                UniqueId::new(1, 2),
-                3,
-                UniqueId::new(4, 5),
-                0,
-                1,
-                0,
-                0,
-                false,
-                0,
-                Vec::new(),
-                timeout,
-                stop,
-            )
+            .runtime
+            .block_on(client.exchange_unary(request, timeout, stop))
             .map(|_| ())
     }
 

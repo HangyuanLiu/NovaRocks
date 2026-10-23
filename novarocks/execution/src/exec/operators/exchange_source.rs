@@ -390,7 +390,11 @@ impl OperatorLifecycle for ExchangeSourceOperator {
         Ok(())
     }
     fn close(&mut self) -> ExecutionResult<()> {
-        self.begin_exit()
+        self.begin_exit()?;
+        if let Some(receiver) = &self.receiver {
+            receiver.withdraw_network_input()?;
+        }
+        Ok(())
     }
 
     fn cancel(&mut self) {
@@ -647,6 +651,7 @@ mod tests {
             .register(crate::runtime::fragment::io::ExchangeReceiverRegistration {
                 key: receiver_key(binding.key),
                 expected_senders: binding.expected_senders,
+                network: None,
                 expected_chunk_schema,
                 column_binding: exchange::ExchangeColumnBinding::Positional,
                 creation_factory,

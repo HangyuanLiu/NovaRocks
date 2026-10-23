@@ -27,7 +27,9 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use crate::exec::operators::local_exchanger::LocalExchanger;
+use crate::exec::operators::local_exchanger::{
+    LocalAdmission, LocalContinuation, LocalExchanger, LocalInputPermit,
+};
 use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::exec::pipeline::{
     input::{PreparedInput, RawInput},
@@ -40,7 +42,7 @@ use crate::exec::pipeline::{
 };
 use crate::runtime::fragment::ExecutionResult;
 use crate::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeState};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::debug;
 
 /// Factory for local-exchange sink operators that partition and enqueue chunks locally.
@@ -67,11 +69,15 @@ impl OperatorFactory for LocalExchangeSinkFactory {
     fn name(&self) -> &str {
         &self.name
     }
-    fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
+    fn create(&self, dop: i32, driver_id: i32) -> Box<dyn Operator> {
         Box::new(Transform::hydrating(LocalExchangeSinkOperator {
             name: self.name.clone(),
             owner_node_id: self.owner_node_id,
             driver_id,
+            bypass_cursor: 0,
+            dop,
+            pending_admission: Mutex::new(None),
+            pending_input: None,
             exchanger: self.exchanger.clone(),
             producer_finished: false,
             logged_first_input: false,
@@ -88,6 +94,10 @@ struct LocalExchangeSinkOperator {
     name: String,
     owner_node_id: i32,
     driver_id: i32,
+    bypass_cursor: usize,
+    dop: i32,
+    pending_admission: Mutex<Option<LocalInputPermit>>,
+    pending_input: Option<LocalContinuation>,
     exchanger: Arc<LocalExchanger>,
     producer_finished: bool,
     logged_first_input: bool,
@@ -96,11 +106,12 @@ struct LocalExchangeSinkOperator {
     queue_tracker: Option<Option<Arc<MemTracker>>>,
 }
 impl LocalExchangeSinkOperator {
-    fn finish_producer(&mut self) {
+    fn finish_producer(&mut self) -> ExecutionResult<()> {
         if !self.producer_finished {
+            self.exchanger.finish_producer_at(self.driver_id)?;
             self.producer_finished = true;
-            self.exchanger.finish_producer();
         }
+        Ok(())
     }
 }
 impl OperatorLifecycle for LocalExchangeSinkOperator {
@@ -122,21 +133,49 @@ impl OperatorLifecycle for LocalExchangeSinkOperator {
         Ok(())
     }
     fn begin_exit(&mut self) -> ExecutionResult<()> {
-        self.finish_producer();
-        Ok(())
+        self.pending_input.take();
+        self.pending_admission
+            .get_mut()
+            .expect("local admission lock")
+            .take();
+        self.finish_producer()
     }
     fn close(&mut self) -> ExecutionResult<()> {
         self.begin_exit()
     }
     fn cancel(&mut self) {
-        self.finish_producer();
+        self.pending_input.take();
+        self.pending_admission
+            .get_mut()
+            .expect("local admission lock")
+            .take();
+        let _ = self.finish_producer();
     }
 }
-impl InputEncodingPolicy for LocalExchangeSinkOperator {}
+impl InputEncodingPolicy for LocalExchangeSinkOperator {
+    fn retains_encoded_column(
+        &self,
+        _: novarocks_types::SlotId,
+        _: &arrow::datatypes::DataType,
+    ) -> bool {
+        self.exchanger.is_bounded()
+    }
+    fn retains_encoded_path(
+        &self,
+        _: crate::exec::pipeline::operator::EncodedValueOccurrence<'_>,
+    ) -> bool {
+        self.exchanger.is_bounded()
+    }
+}
 impl SinkKernel for LocalExchangeSinkOperator {
     fn poll_control(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
         if self.exchanger.all_consumers_closed() {
-            self.finish_producer();
+            self.pending_input.take();
+            self.pending_admission
+                .get_mut()
+                .expect("local admission lock")
+                .take();
+            self.finish_producer()?;
             Ok(ControlStep::Withdrawn)
         } else {
             Ok(ControlStep::Active)
@@ -148,8 +187,27 @@ impl SinkKernel for LocalExchangeSinkOperator {
     fn admission(
         &self,
         _: &mut StepContext<'_>,
-        _: &RawInput,
+        input: &RawInput,
     ) -> ExecutionResult<Option<AdmissionNext>> {
+        if self.exchanger.is_bounded() {
+            let mut pending = self.pending_admission.lock().expect("local admission lock");
+            if pending.is_some() || self.pending_input.is_some() {
+                return Err(crate::runtime::operator_byte_credit::credit_contract(
+                    "strict local input overlaps its continuation",
+                ));
+            }
+            return match self
+                .exchanger
+                .admit_bounded(self.driver_id, self.dop, input)?
+            {
+                LocalAdmission::Granted(permit) => {
+                    *pending = Some(permit);
+                    Ok(None)
+                }
+                LocalAdmission::Pending(wait) => Ok(Some(AdmissionNext::Wait(wait))),
+                LocalAdmission::Closed => Ok(Some(AdmissionNext::ResumeExisting)),
+            };
+        }
         let observable = self.exchanger.sink_observable();
         let observed_generation = observable.generation();
         if !self.exchanger.need_input() && !self.exchanger.all_consumers_closed() {
@@ -171,7 +229,7 @@ impl SinkKernel for LocalExchangeSinkOperator {
         let chunk = input.into_uncovered_chunk()?;
         if self.exchanger.all_consumers_closed() {
             drop(chunk);
-            self.finish_producer();
+            self.finish_producer()?;
             return Ok(SinkStep::new(NextStep::Finished, 0));
         }
         let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
@@ -192,12 +250,56 @@ impl SinkKernel for LocalExchangeSinkOperator {
             .construction
             .as_deref()
             .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
-        self.exchanger
-            .accept_created(tracker.as_ref(), chunk, factory, ctx)?;
+        if self.exchanger.is_bounded() {
+            let permit = self
+                .pending_admission
+                .get_mut()
+                .expect("local admission lock")
+                .take()
+                .ok_or_else(|| {
+                    crate::runtime::operator_byte_credit::credit_contract(
+                        "strict local input has no original reservation",
+                    )
+                })?;
+            self.pending_input = Some(self.exchanger.prepare_bounded(
+                chunk,
+                permit,
+                &mut self.bypass_cursor,
+                factory,
+                ctx,
+            )?);
+            return self
+                .exchanger
+                .poll_bounded(&mut self.pending_input, factory, ctx);
+        }
+        self.exchanger.accept_created_with_cursor(
+            tracker.as_ref(),
+            chunk,
+            factory,
+            ctx,
+            &mut self.bypass_cursor,
+        )?;
         Ok(SinkStep::new(NextStep::NeedInput, rows))
     }
+    fn poll(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+        if self.pending_input.is_some() {
+            let factory = self
+                .construction
+                .as_deref()
+                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+            self.exchanger
+                .poll_bounded(&mut self.pending_input, factory, ctx)
+        } else {
+            Ok(SinkStep::new(NextStep::NeedInput, 0))
+        }
+    }
     fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
-        self.finish_producer();
+        if self.pending_input.is_some() {
+            return Err(crate::runtime::operator_byte_credit::credit_contract(
+                "strict local EOS precedes its continuation",
+            ));
+        }
+        self.finish_producer()?;
         Ok(SinkStep::new(NextStep::Finished, 0))
     }
 }
@@ -235,7 +337,7 @@ mod tests {
         );
     }
 
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -249,7 +351,9 @@ mod tests {
     use novarocks_failure_contract::FailureProjection;
     use novarocks_types::SlotId;
 
-    use crate::exec::operators::local_exchanger::LocalExchanger;
+    use crate::exec::operators::local_exchanger::{
+        LocalAdmission, LocalContinuation, LocalExchanger, LocalInputPermit,
+    };
 
     fn chunk_of(values: &[i32]) -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
