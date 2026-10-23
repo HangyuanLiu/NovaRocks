@@ -39,7 +39,7 @@ use super::{
 ///
 /// Its create is not a catalog call: the linearization point is a conditional
 /// install of the canonical complete `v1.metadata.json` in storage. A lost
-/// response needs exact positive readback (ADR-0195). That gives atomic empty-table creation, and
+/// response needs exact positive readback (ADR-0196). That gives atomic empty-table creation, and
 /// it is why this catalog accepts one create intent while refusing the other.
 ///
 /// CTAS is refused before any side effect. There is no staged-create protocol

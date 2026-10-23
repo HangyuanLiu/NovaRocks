@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Design: ADR-0195 (docs/adr/ADR-0195-hadoop-test-catalog-complete-version-installation.md)
+//! Design: ADR-0196 (docs/adr/ADR-0196-hadoop-test-catalog-complete-version-installation.md)
 //! Frozen Hadoop version installation. The journal owns the verdict; hints
 //! are independently bounded finalization after complete, non-replacing install.
 use super::*;

@@ -1,5 +1,5 @@
 ---
-id: ADR-0195
+id: ADR-0196
 title: "Hadoop test catalogs use complete non-replacing version installation and read-only discovery"
 domain: [provider-spi, table-maintenance]
 status: active

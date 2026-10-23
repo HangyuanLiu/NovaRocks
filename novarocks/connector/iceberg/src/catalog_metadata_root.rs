@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Design: ADR-0195 (docs/adr/ADR-0195-hadoop-test-catalog-complete-version-installation.md)
+//! Design: ADR-0196 (docs/adr/ADR-0196-hadoop-test-catalog-complete-version-installation.md)
 //! A conservative, catalog-neutral deletion guard. Metadata version slots
 //! and their hint remain discovery roots even when absent from metadata logs.
 
