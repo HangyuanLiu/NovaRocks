@@ -37,7 +37,7 @@ pub use authority::{AuthorityConfig, CapacityWriter, MemoryAuthority};
 pub use domain::{DomainSnapshot, FundingDomain, OWNER_METADATA_BYTES};
 pub use error::{CapacityError, ConfigError, ConstraintKind, MetadataRegistryLabel, Refusal};
 pub use ids::{AccountId, AccountKind, ConfigVersion, ExternalRef, PolicyVersion};
-pub use lane::{FactToken, LaneHandle};
+pub use lane::{CoverageGap, FactToken, LaneHandle, LaneShards, ShardSnapshot, ShardsSnapshot};
 pub use observe::{AllocatorSnapshot, CountingAllocator, CoverageDescriptor};
 pub use policy::{LimitDimension, LimitUnit, PolicyInstallOutcome, PolicyLimit};
 pub use snapshot::{AccountSnapshot, AuthoritySnapshot};

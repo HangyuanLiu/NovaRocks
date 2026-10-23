@@ -242,7 +242,8 @@ impl Drop for LaneShared {
 impl AccountHandle {
     /// Creates attribution access only. This performs no capacity qualification,
     /// stock consumption or funding-ledger commitment.
-    pub fn create_lane(&self) -> Result<LaneHandle, CoverageError> {
+    #[cfg(all(test, loom))]
+    pub(crate) fn create_lane(&self) -> Result<LaneHandle, CoverageError> {
         self.0.shared.prune_observations(16);
         let lane = LaneHandle::new(self, super::RecordRegion::Observation)?;
         let member = crate::membership::MemberNode::lane(&lane.0, None);

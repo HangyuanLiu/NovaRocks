@@ -23,7 +23,7 @@ use std::{alloc::Layout, marker::PhantomData, rc::Rc};
 
 #[derive(Clone, Debug)]
 pub struct ExplicitOwner {
-    lane: LaneHandle,
+    lane: Option<LaneHandle>,
 }
 struct ExplicitStep {
     previous: Option<RecordRef>,
@@ -39,19 +39,39 @@ impl Drop for ExplicitStep {
     }
 }
 impl ExplicitOwner {
-    pub fn new(lane: LaneHandle) -> Self {
-        Self { lane }
+    pub(crate) fn new(lane: LaneHandle) -> Self {
+        Self { lane: Some(lane) }
     }
-    pub fn lane(&self) -> &LaneHandle {
-        &self.lane
+    pub(crate) fn uncovered() -> Self {
+        Self { lane: None }
+    }
+    /// This diagnostic identity grants no access after the owner is dropped.
+    pub fn reference(&self) -> Option<RecordRef> {
+        self.lane.as_ref().map(LaneHandle::reference)
+    }
+    fn binding(&self) -> RecordRef {
+        self.reference().unwrap_or(RecordRef::SHADOW)
+    }
+    unsafe fn publish_small(&self, bytes: i64, count: i64, transfer: bool) {
+        if let Some(reference) = self.reference() {
+            // SAFETY: caller supplies one real allocation transition and this
+            // owner retains the record for the complete publication.
+            unsafe {
+                if transfer {
+                    binding::publish_small_transfer(reference, bytes, count);
+                } else {
+                    binding::publish_small(reference, bytes, count);
+                }
+            }
+        }
     }
     fn bind(&self) -> ExplicitStep {
         // Explicit ownership remains effective after seal/teardown: a surviving
         // container can still resize; diagnostics report growth without refusal.
         // SAFETY: self holds the owner throughout the helper and guard lifetime.
-        let previous = unsafe { binding::try_install_explicit(self.lane.reference()) };
+        let previous = unsafe { binding::try_install_explicit(self.binding()) };
         if previous.is_none() {
-            self.lane.store().faults.binding_failed();
+            crate::lane::global_store().faults.binding_failed();
         }
         ExplicitStep {
             previous,
@@ -71,7 +91,7 @@ impl ExplicitOwner {
         let result = underlying();
         if result.is_ok() && layout.size() != 0 && !is_tagged(layout.size()) {
             // SAFETY: successful distinct allocation, owner held to publication.
-            unsafe { binding::publish_small(self.lane.reference(), layout.size() as i64, 1) };
+            unsafe { self.publish_small(layout.size() as i64, 1, false) };
         }
         result
     }
@@ -85,7 +105,7 @@ impl ExplicitOwner {
         underlying();
         if layout.size() != 0 && !is_tagged(layout.size()) {
             // SAFETY: caller guarantees the one outstanding allocation's free.
-            unsafe { binding::publish_small(self.lane.reference(), -(layout.size() as i64), -1) };
+            unsafe { self.publish_small(-(layout.size() as i64), -1, false) };
         }
     }
     /// Wraps grow, grow_zeroed or shrink through the wrapped allocator.
@@ -116,13 +136,103 @@ impl ExplicitOwner {
                 // SAFETY: successful transition and held owner protect both sides.
                 unsafe {
                     if !old_small && new_small {
-                        binding::publish_small_transfer(self.lane.reference(), bytes, count);
+                        self.publish_small(bytes, count, true);
                     } else {
-                        binding::publish_small(self.lane.reference(), bytes, count);
+                        self.publish_small(bytes, count, false);
                     }
                 }
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attribution::AttributingAllocator;
+    use crate::{AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority, TeardownEvidence};
+    use std::alloc::{GlobalAlloc, System};
+    #[test]
+    fn funded_small_facts_are_counted_once_and_survive_teardown_then_growth() {
+        let mut config = AuthorityConfig::new(1 << 20, 1 << 20, 0);
+        config.max_accounts = 4;
+        config.max_active_owners = 4;
+        config.metadata_budget_bytes = 16 * 1024;
+        let authority = MemoryAuthority::new(config).unwrap();
+        let account = authority
+            .create_account(AccountKind::Work, ExternalRef::NONE)
+            .unwrap();
+        let domain = account.create_domain(128).unwrap();
+        let owner = ExplicitOwner::new(domain.lane().clone());
+        let allocator = AttributingAllocator::new(System);
+        let small = Layout::from_size_align(64, 8).unwrap();
+        let grown = Layout::from_size_align(96, 8).unwrap();
+        let pointer = owner
+            .allocate_with(small, || {
+                // SAFETY: nonzero valid layout, checked successful allocation.
+                std::ptr::NonNull::new(unsafe { allocator.alloc(small) }).ok_or(())
+            })
+            .unwrap();
+        binding::flush_current();
+        let sample = domain.lane().record().snapshot();
+        assert_eq!(
+            (
+                sample.tagged_bytes,
+                sample.r1_small_bytes,
+                sample.outstanding
+            ),
+            (0, 64, 1)
+        );
+        assert_eq!(domain.settle().accepted_live, 64);
+        let before = authority.pressure_projection();
+        assert_eq!(domain.snapshot().committed, 128);
+        account
+            .retire(&TeardownEvidence {
+                tasks_exited: true,
+                operators_destroyed: true,
+                io: &[],
+                now_ns: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            domain.lane().responsibility_class(),
+            crate::lane::ResponsibilityClass::Residual
+        );
+        assert_eq!(domain.snapshot().committed, 64);
+        assert_eq!(authority.pressure_projection().query_pressure(), 0);
+        assert_eq!(
+            before.root_committed - authority.pressure_projection().root_committed,
+            64
+        );
+        let before_fault = crate::lane::global_store()
+            .faults
+            .snapshot()
+            .residual_growth_events;
+        // SAFETY: one live block, exact old/new layouts, no duplicate facts.
+        let pointer = unsafe {
+            owner.resize_with(small, grown, || {
+                std::ptr::NonNull::new(allocator.realloc(pointer.as_ptr(), small, grown.size()))
+                    .ok_or(())
+            })
+        }
+        .unwrap();
+        binding::flush_current();
+        assert_eq!(domain.lane().record().snapshot().r1_small_bytes, 96);
+        assert_eq!(
+            crate::lane::global_store()
+                .faults
+                .snapshot()
+                .residual_growth_events,
+            before_fault + 1
+        );
+        assert_eq!(domain.settle().accepted_live, 96);
+        // SAFETY: the sole successful block is released through the same owner.
+        unsafe {
+            owner.deallocate_with(grown, || allocator.dealloc(pointer.as_ptr(), grown));
+        }
+        binding::flush_current();
+        assert_eq!(domain.lane().record().snapshot().outstanding, 0);
+        authority.maintain(32);
     }
 }

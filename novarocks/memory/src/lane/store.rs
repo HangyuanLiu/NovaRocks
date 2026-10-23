@@ -16,6 +16,7 @@
 // under the License.
 
 //! Stable System-backed segments. Only control-plane callers allocate/reclaim.
+// Design: ADR-0196 (docs/adr/ADR-0196-observation-owner-shards-and-coverage-shadow.md)
 use super::{faults::FaultCounters, owner::RecordOwner, record::*, token::RecordRef};
 use crate::sync::{AtomicPtr, AtomicU32, Mutex, Ordering};
 use std::{

@@ -2,7 +2,7 @@
 
 The historical M02a map below follows accepted spec revision 3 and approved
 implementation-plan revision 3. Current attribution/lifecycle changes are described
-in the M02b section; historical receipts are not current-HEAD receipts. Execution receipts are
+in the M02b and M02c sections; historical receipts are not current-HEAD receipts. Execution receipts are
 recorded in the approved plan; a suite name alone is not a passing receipt. Retain the
 behavior of explicit grants, external bounds and shared-holder exposure; do not
 retain unused APIs merely to keep historical round trips compiling.
@@ -176,3 +176,27 @@ MIRI_TOOLCHAIN=nightly-YYYY-MM-DD tools/ci/memory-model-checks.sh --miri
 脚本以 `--locked --offline` 执行 Cargo，Miri 预检已安装 nightly、miri、rust-src；缺项非零退出并报告，`--all` 在缺项时不先跑 Loom。Miri sysroot 在 rust-src 的 `library/` 内准备，使用其随附的 vendored std 依赖，不联网。Miri 使用 System 后端、Tree Borrows 与 strict provenance/symbolic alignment，并关闭 isolation（readout 读取 SystemTime；isolation 只限制宿主访问，不放宽 UB 检查）。选择 Tree Borrows 的原因见 ADR-0167：Stacked Borrows 把 std Box/Arc 交给 `dealloc` 的指针权限收窄到 `size_of::<T>()`，任何经该指针读取请求长度之后带内元数据的 allocator 都会被拒绝。Miri 覆盖 lib lane/TLS/readout、全部 `attribution_*`、旧 allocator observation，以及驱动资金域 FactToken 发布与释放的 `owner_lifetime`、`lane_lifecycle`；验证非对齐 token、realloc/受控失败、System segment、TLS，以及 owned store 在最后访问之后释放 backing。生产 store 的 segment 永不释放，回收后的逻辑晚访问不产生地址错误，Miri 看不到；这部分最终访问证明（I4）由 Loom 模型和静态复核承担。token 不含指针，不提供 provenance 豁免。独立 `attribution_reconcile` 避免 libtest 后台分配污染对账；压力测试不代替 Loom/Miri。
 
 收敛边界：Miri 结论以 Tree Borrows 为别名模型，不等于 Rust 最终别名模型下的证明；当前不维护Linux成本采集入口；历史成本缺口保持未验证，不以本次功能通过关闭。P00 同一 33 套件选择集记录 822 cases /806 PASS /16 FAIL /0 SKIP，最终 SQL 必须与该失败集合比较，不能声称 all 全通过。当前指标/模型/定向测试不能证明所有生产 query/R1 已接线或硬内存治理交付。
+
+
+## M02c：owner 作用域、记录容量与角色诊断
+
+本节列出行为与原生入口，运行结论仍由本轮执行记录保存；不把历史收据当作当前源码通过。长期合同由 [ADR-0196](../../../docs/adr/ADR-0196-observation-owner-shards-and-coverage-shadow.md) 部分替代 ADR-0167，尺寸段、token、资金资格与真实释放规则保留。
+
+| 验收面 | 目标 | 独立预期与边界 |
+|---|---|---|
+| V1–V3 完整 future | `attribution_future_scope` | 测试持有真实块并读尾部来源；构造、迁移 poll、输出、未 poll/取消/完成后的就地 Drop、构造/poll/析构 unwind；!Unpin 对象地址稳定，外层恢复 |
+| V4–V5 分片句柄 | `attribution_lane_shards`、`lane_membership`、`lane_lifecycle` | 顺序线程选择不同记录，同线程重复选择相同；整组成员与汇总；未覆盖态缺口、停止与无新成员；不是性能证据 |
+| V6 发布竞态 | `owner_loom` | 关闭、退役与祖先关闭相对组发布只见全组或空组，registry 与成员一致 |
+| V7–V8 遮蔽 | `attribution_shadow`、`attribution_scope`；execution `kernel_memory_observation_tests` | 未覆盖/已封口 owner 嵌套服务与另一查询，构造/poll/Drop 不借用外层；显式 owner 优先，未覆盖 explicit 跨尺寸 resize 仍遮蔽；资金域失败保留原外层回落 |
+| V9 无效证据 | `teardown_deadlines` | 不关闭、不封口、不改资金状态；有效重试保持残留交接与真实释放 |
+| V10–V12 角色与读数 | `attribution_roles`、`attribution_hook_contract`；lib `attribution::roles` / `attribution::readout` | 表错误与显式冻结、角色 token 归属和跨线程/角色释放；锁住表时 hook 仍能完成；真实大块、R1-only小块与零字节强owner验证两区构成；真实块的buffered正负事实抵消后，独占slot pin仍保留记录，flush后才转待回收；按角色之和独立核对 |
+| V13–V14 隔离与恢复 | `lane_region_exhaustion`、`lane_exhaustion` | 真实生产记录容量的观测区占满后资金域与 request_domain 仍可授予；所有分片被 tagged、R1 small 或强句柄保留，释放后在追赶预算推出的调用界内恢复 |
+| V15–V16 存储与配置 | `lane_loom`；lib `lane` / `authority` | 同一边界 segment CAS 唯一发布、旧地址稳定；配置上限不得超过资金区 |
+| V17–V18 出口 | Native Adapter `backend_metrics`；system `memory-attribution/observation-families` | 文本/JSON 保留 signed 样本、role刷新、两区状态；最终场景逐个 BE 检查256条永生记录、unknown>0、容量闭合和故障为零 |
+| V19–V20 消费者与地址安全 | execution 本地 allocator 消费者；`tools/ci/memory-model-checks.sh` | 定向覆盖真实本地 allocator；全部有界Loom和Tree Borrows Miri，模型不替代地址验证 |
+
+正常修剪与耗尽追赶预算由 `lane/shards.rs` 的常量给出；恢复测试据实际预算和区容量计算次数上界，不延长超时制造通过。记录可以只被 R1 小对象、slot pin 或零字节强句柄保留，不能按每条最少512B估算容量。
+
+新增 `attribution_*` 源目标自动进入既有 Miri 循环。`lane_region_exhaustion` 占满真实 130944 条观测记录，规模大，只在原生进程测试中执行，不进入 Miri；owned 小库与所有 attribution 目标仍保护地址/生命周期。测试独立预期来自自己持有的真实分配、来源身份、证据和释放；不以进程总量差分推导归属。TLS const且无析构，在当前平台无法经公共接口制造不可用状态，测试不伪造该结果。
+
+当前阶段没有吞吐、延迟或RSS验收门，分片争用收益尚未测量。上述机制与指标通过也不代表生产query/R1作用域、角色装配或资金硬治理已接线。

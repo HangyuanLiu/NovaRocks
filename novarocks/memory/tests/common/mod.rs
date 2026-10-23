@@ -40,3 +40,18 @@ pub fn exited() -> TeardownEvidence<'static> {
 pub fn free(origin: FactToken, bytes: u64) {
     unsafe { origin.record_deallocation(bytes) }
 }
+
+pub fn reference(owner: &LaneShards) -> lane::RecordRef {
+    owner
+        .explicit_owner()
+        .reference()
+        .expect("covered test owner")
+}
+pub fn contains(owner: &LaneShards, reference: lane::RecordRef) -> bool {
+    owner
+        .snapshot()
+        .records
+        .iter()
+        .flatten()
+        .any(|shard| shard.reference == reference)
+}

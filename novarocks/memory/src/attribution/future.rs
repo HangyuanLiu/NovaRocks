@@ -15,33 +15,45 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Each poll is one complete synchronous attribution step, including unwind.
-use crate::lane::LaneHandle;
+//! Construction, every poll, and in-place destruction share one owner policy.
+// Design: ADR-0196 (docs/adr/ADR-0196-observation-owner-shards-and-coverage-shadow.md)
+use crate::lane::LaneShards;
 use std::{
     future::Future,
+    mem::ManuallyDrop,
     pin::Pin,
     task::{Context, Poll},
 };
 
 pub struct AttributedFuture<F> {
-    lane: LaneHandle,
-    future: F,
+    owner: LaneShards,
+    future: ManuallyDrop<F>,
 }
-/// Retains the same lane across polls and executor thread migration. Each poll
-/// restores and flushes its thread's outer binding before returning Pending or
-/// Ready. Dropping this wrapper holds no installed binding or pending slot.
-pub fn attributed<F: Future>(lane: LaneHandle, future: F) -> AttributedFuture<F> {
-    AttributedFuture { lane, future }
+impl<F: Future> AttributedFuture<F> {
+    pub fn new(owner: LaneShards, make: impl FnOnce() -> F) -> Self {
+        let future = owner.run(make);
+        Self {
+            owner,
+            future: ManuallyDrop::new(future),
+        }
+    }
 }
 impl<F: Future> Future for AttributedFuture<F> {
     type Output = F::Output;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: future is structurally pinned; neither this implementation nor
-        // a Drop implementation moves it. The lane is not projected as pinned.
+        // SAFETY: the future is structurally pinned. Neither poll nor Drop
+        // moves it; projecting the owner does not pin the owner.
         let this = unsafe { self.get_unchecked_mut() };
-        this.lane.run(|| {
-            // SAFETY: the structurally pinned field stays at the same address.
-            unsafe { Pin::new_unchecked(&mut this.future) }.poll(cx)
-        })
+        this.owner
+            .run(|| unsafe { Pin::new_unchecked(&mut *this.future) }.poll(cx))
+    }
+}
+impl<F> Drop for AttributedFuture<F> {
+    fn drop(&mut self) {
+        // SAFETY: the structurally pinned field is destroyed exactly once in
+        // place, including when its destructor unwinds. ManuallyDrop prevents
+        // automatic destruction from running it a second time.
+        self.owner
+            .run(|| unsafe { ManuallyDrop::drop(&mut self.future) });
     }
 }

@@ -23,8 +23,13 @@ pub mod explicit;
 pub mod future;
 pub mod hook;
 pub mod readout;
+pub mod roles;
 pub mod scope;
-mod tls;
+pub(crate) mod tls;
 pub use band::{ATTRIBUTION_THRESHOLD_BYTES, ATTRIBUTION_TOKEN_BYTES};
 pub use counters::BandSnapshot;
 pub use hook::AttributingAllocator;
+pub use roles::{
+    RoleLabels, ThreadRole, ThreadRoleError, freeze_thread_roles, register_thread_role,
+    set_current_thread_role, thread_role_labels,
+};

@@ -98,17 +98,17 @@ fn observed_ready_domain_has_one_real_tagged_fact_and_preserves_return() {
 fn observed_sealed_entry_still_runs_body_under_actual_outer_origin() {
     let authority = authority(65_536);
     let account = work(&authority);
-    let outer = account.create_lane().unwrap();
-    let sealed = account.create_lane().unwrap();
+    let outer = account.create_lane_shards();
+    let sealed = account.create_domain(1).unwrap();
     sealed.seal();
     let allocator = AttributingAllocator::new(System);
     let mut facts = AmbientStepObservation::default();
     let calls = Cell::new(0);
     let value = outer.run(|| {
-        sealed.run_observed(&mut facts, || {
+        sealed.lane().run_observed(&mut facts, || {
             calls.set(calls.get() + 1);
             let block = allocate(&allocator);
-            assert_eq!(origin(block), outer.reference());
+            assert_eq!(origin(block), outer.explicit_owner().reference().unwrap());
             release(&allocator, block);
             73
         })
@@ -124,15 +124,15 @@ fn observed_sealed_entry_still_runs_body_under_actual_outer_origin() {
 fn observed_body_panic_retains_facts_and_restores_actual_outer_origin() {
     let authority = authority(65_536);
     let account = work(&authority);
-    let outer = account.create_lane().unwrap();
-    let inner = account.create_lane().unwrap();
+    let outer = account.create_lane_shards();
+    let inner = account.create_lane_shards();
     let allocator = AttributingAllocator::new(System);
-    let mut facts = AmbientStepObservation::default();
+    let mut facts = novarocks_memory::attribution::scope::OwnerStepObservation::default();
     outer.run(|| {
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             inner.run_observed(&mut facts, || {
                 let block = allocate(&allocator);
-                assert_eq!(origin(block), inner.reference());
+                assert_eq!(origin(block), inner.explicit_owner().reference().unwrap());
                 release(&allocator, block);
                 panic!("original synchronous body panic");
             });
@@ -142,10 +142,13 @@ fn observed_body_panic_retains_facts_and_restores_actual_outer_origin() {
             payload.downcast_ref::<&str>(),
             Some(&"original synchronous body panic")
         );
-        assert_eq!(facts.entry(), AmbientEntryObservation::Bound);
+        assert_eq!(
+            facts.entry(),
+            novarocks_memory::attribution::scope::OwnerEntryObservation::Bound
+        );
         assert_eq!(facts.exit(), AmbientExitObservation::Restored);
         let block = allocate(&allocator);
-        assert_eq!(origin(block), outer.reference());
+        assert_eq!(origin(block), outer.explicit_owner().reference().unwrap());
         release(&allocator, block);
     });
     assert_eq!(binding::pending_bytes(), 0);
@@ -156,13 +159,13 @@ fn observed_body_panic_retains_facts_and_restores_actual_outer_origin() {
 fn observed_reuse_resets_prior_unbound_fact_without_process_sampling() {
     let authority = authority(65_536);
     let account = work(&authority);
-    let sealed = account.create_lane().unwrap();
-    let ready = account.create_lane().unwrap();
+    let sealed = account.create_domain(1).unwrap();
+    let ready = account.create_domain(1).unwrap();
     sealed.seal();
     let mut facts = AmbientStepObservation::default();
-    sealed.run_observed(&mut facts, || ());
+    sealed.lane().run_observed(&mut facts, || ());
     let first = facts;
-    ready.run_observed(&mut facts, || ());
+    ready.lane().run_observed(&mut facts, || ());
     assert_eq!(first.entry(), AmbientEntryObservation::LaneEntryRefused);
     assert_eq!(first.exit(), AmbientExitObservation::EntryWasUnbound);
     assert_eq!(facts.entry(), AmbientEntryObservation::Bound);

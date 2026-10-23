@@ -25,31 +25,34 @@ fn retirement_visits_only_its_subtree_amid_ten_thousand_unrelated_lanes() {
     let service = a
         .create_account(AccountKind::Service, ExternalRef::NONE)
         .unwrap();
-    let unrelated: Vec<_> = (0..10_000)
-        .map(|_| service.create_lane().unwrap())
-        .collect();
+    let unrelated: Vec<_> = (0..625).map(|_| service.create_lane_shards()).collect();
     let query = work(&a);
     let child = query
         .create_child(AccountKind::Task, ExternalRef::NONE)
         .unwrap();
-    let lanes = [query.create_lane().unwrap(), child.create_lane().unwrap()];
+    let lanes = [query.create_lane_shards(), child.create_lane_shards()];
     let receipt = query.retire(&exited()).unwrap();
     assert_eq!(
-        receipt.visited_members, 3,
-        "one child account and two own lanes"
+        receipt.visited_members,
+        1 + 2 * lane::LANE_SHARDS,
+        "one child account and two complete owner groups"
     );
     assert!(child.is_retired());
     assert!(!service.is_closed_to_growth());
-    assert!(
-        unrelated
+    assert!(unrelated.iter().all(|lane| {
+        lane.snapshot()
+            .records
             .iter()
-            .all(|lane| lane.production_state() == lane::ProductionState::Producing)
-    );
-    assert!(
-        lanes
+            .flatten()
+            .all(|shard| shard.production == lane::ProductionState::Producing)
+    }));
+    assert!(lanes.iter().all(|lane| {
+        lane.snapshot()
+            .records
             .iter()
-            .all(|lane| lane.responsibility_class() == lane::ResponsibilityClass::Residual)
-    );
+            .flatten()
+            .all(|shard| shard.class == lane::ResponsibilityClass::Residual)
+    }));
 }
 
 #[test]
@@ -65,13 +68,16 @@ fn removed_middle_sibling_never_hides_live_members() {
     let last = query
         .create_child(AccountKind::Task, ExternalRef::NONE)
         .unwrap();
-    let lane = first.create_lane().unwrap();
+    let lane = first.create_lane_shards();
     drop(middle);
     let receipt = query.retire(&exited()).unwrap();
-    assert_eq!(receipt.visited_members, 3);
+    assert_eq!(receipt.visited_members, 2 + lane::LANE_SHARDS);
     assert!(first.is_retired() && last.is_retired());
-    assert_eq!(
-        lane.responsibility_class(),
-        lane::ResponsibilityClass::Residual
+    assert!(
+        lane.snapshot()
+            .records
+            .iter()
+            .flatten()
+            .all(|shard| shard.class == lane::ResponsibilityClass::Residual)
     );
 }

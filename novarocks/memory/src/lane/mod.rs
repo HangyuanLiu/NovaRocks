@@ -22,6 +22,8 @@ pub mod owner;
 pub mod record;
 pub(crate) mod registry;
 pub use registry::OBSERVATION_LANE_METADATA_BYTES;
+pub mod shards;
+pub use shards::{CoverageGap, LaneShards, ShardSnapshot, ShardsSnapshot};
 pub mod slot;
 pub mod store;
 pub mod token;

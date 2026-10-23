@@ -36,7 +36,7 @@ impl ObservationRegistry {
         let start = super::UNATTRIBUTED_RECORDS as usize
             + super::store::funding_record_capacity(capacity as u32) as usize;
         Self {
-            records: (0..capacity).map(|_| None).collect(),
+            records: (start..capacity).map(|_| None).collect(),
             start,
             upper: start,
             cursor: start,
@@ -50,13 +50,23 @@ pub const OBSERVATION_LANE_METADATA_BYTES: u64 = (std::mem::size_of::<LaneShared
     + 4 * std::mem::size_of::<usize>()
     + 64) as u64;
 impl Shared {
+    #[cfg(all(test, loom))]
     pub(crate) fn retain_observation(&self, lane: &LaneHandle) {
-        let index = lane.reference().index as usize;
+        self.retain_observations(std::slice::from_ref(lane));
+    }
+    /// Every shell and node already exists. A single lock publishes the full
+    /// group without allocation while the caller holds its lifecycle gates.
+    pub(crate) fn retain_observations(&self, lanes: &[LaneHandle]) {
         let mut registry = self.observation_lanes.lock().unwrap();
-        assert!(registry.records[index].is_none());
-        registry.records[index] = Some(lane.clone());
-        registry.occupied += 1;
-        registry.upper = registry.upper.max(index + 1);
+        for lane in lanes {
+            let index = lane.reference().index as usize;
+            let offset = index - registry.start;
+            assert!(registry.records[offset].is_none());
+            registry.records[offset] = Some(lane.clone());
+            registry.occupied += 1;
+            registry.upper = registry.upper.max(index + 1);
+        }
+        self.membership_revision.fetch_add(1, Ordering::Release);
     }
     pub(crate) fn prune_observations(&self, budget: usize) {
         let visits = {
@@ -71,7 +81,10 @@ impl Shared {
                 }
                 let index = registry.cursor;
                 registry.cursor += 1;
-                (index, registry.records[index].clone())
+                (
+                    index - registry.start,
+                    registry.records[index - registry.start].clone(),
+                )
             };
             let Some(lane) = lane else {
                 continue;

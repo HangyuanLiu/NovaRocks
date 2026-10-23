@@ -24,6 +24,7 @@ use crate::scenarios::{query_lifecycle, task_evidence};
 use anyhow::{Context, Result, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::ServerHandle;
+use novarocks_memory::lane::{MAX_RECORDS, REGION_LABELS, UNATTRIBUTED_RECORDS};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -275,11 +276,20 @@ fn scrape_cluster(context: &mut ScenarioContext) -> Result<Vec<Sample>> {
                     false,
                 )?;
                 ensure!(
-                    count == if production == "producing" { 16.0 } else { 0.0 },
+                    count
+                        == if production == "producing" {
+                            f64::from(UNATTRIBUTED_RECORDS)
+                        } else {
+                            0.0
+                        },
                     "immortal unattributed record states changed"
                 );
             }
-            let unattr = check("novarocks_backend_memory_unattributed_bytes", &[], false)?;
+            let unattr = check(
+                "novarocks_backend_memory_unattributed_bytes",
+                &[("role", "unknown")],
+                false,
+            )?;
             ensure!(
                 unattr > 0.0,
                 "active wrapped backend allocations must report unattributed bytes"
@@ -299,9 +309,29 @@ fn scrape_cluster(context: &mut ScenarioContext) -> Result<Vec<Sample>> {
                     true,
                 )?;
             }
+            let capacity = check("novarocks_backend_memory_lane_record_capacity", &[], false)?;
             ensure!(
-                check("novarocks_backend_memory_lane_record_capacity", &[], false)? == 262144.0,
+                capacity == f64::from(MAX_RECORDS),
                 "record capacity changed from frozen manifest"
+            );
+            let mut dynamic_capacity = 0.0;
+            for region in REGION_LABELS {
+                dynamic_capacity += check(
+                    "novarocks_backend_memory_lane_record_region_capacity",
+                    &[("region", region)],
+                    false,
+                )?;
+                for state in ["active", "residual_retained", "pending_reclaim"] {
+                    check(
+                        "novarocks_backend_memory_lane_record_region",
+                        &[("region", region), ("state", state)],
+                        false,
+                    )?;
+                }
+            }
+            ensure!(
+                dynamic_capacity + f64::from(UNATTRIBUTED_RECORDS) == capacity,
+                "isolated dynamic regions and immortal records must account for all record positions"
             );
             ensure!(
                 check("novarocks_backend_memory_batch_threshold_bytes", &[], false)? == 1048576.0,
@@ -328,6 +358,15 @@ fn scrape_cluster(context: &mut ScenarioContext) -> Result<Vec<Sample>> {
                 let value = sample_value(&body, name, &[])?;
                 ensure!(value.is_finite(), "nonfinite signed observation");
                 values.insert(name.to_string(), value);
+            }
+            for region in REGION_LABELS {
+                for band in ["tagged", "r1_small"] {
+                    let name = "novarocks_backend_memory_lane_record_region_residual_bytes";
+                    let labels = [("band", band), ("region", region)];
+                    let value = sample_value(&body, name, &labels)?;
+                    ensure!(value.is_finite(), "nonfinite signed residual observation");
+                    values.insert(format!("{name}{labels:?}"), value);
+                }
             }
             Ok(Sample {
                 backend_index: index,
