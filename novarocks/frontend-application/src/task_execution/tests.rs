@@ -6990,6 +6990,8 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
         ExecutionEffect, LogicalExecutionActorConfig,
     };
     use novarocks_query_application::test_support::LogicalExecutionTestHarness;
+
+    use super::status_intake::CondvarWake;
     use novarocks_workload_control::{
         ResourceConfig, Stage, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
     };
@@ -7007,7 +7009,7 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
         .map(|context| (context.backend_process_id(), admission_epoch()))
         .collect::<BTreeMap<_, _>>();
     let sink = Arc::new(SwitchableQueueSink::default());
-    let wake = Arc::new(CountingWake::default());
+    let wake = Arc::new(CondvarWake::default());
     let status = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
     let execution = QueryTaskExecution::new(
         graph,
@@ -7127,11 +7129,14 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
         )
         .await
         .expect("settle actor admission");
-    for _ in 0..100 {
-        if round.queued_abort_effects() == 1 {
+    loop {
+        let notified = wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if round.queued_abort_effects() != 0 {
             break;
         }
-        tokio::task::yield_now().await;
+        notified.await;
     }
     assert_eq!(round.queued_abort_effects(), 1, "actor publishes one Abort");
 
@@ -7176,8 +7181,12 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
         .turn()
         .expect("unknown outcome is published to the actor");
 
-    let mut replay = None;
-    for _ in 0..100 {
+    let replay = loop {
+        let notified = wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        round.turn().expect("notification-driven retry turn");
+        let mut replay = None;
         for intent in sink
             .take()
             .into_iter()
@@ -7191,13 +7200,11 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
                 _ => {}
             }
         }
-        if replay.is_some() {
-            break;
+        if let Some(replay) = replay {
+            break replay;
         }
-        round.turn().expect("bounded retry turn");
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-    let replay = replay.expect("the actor replays after unknown outcome");
+        notified.await;
+    };
     assert_eq!(replay.operation_id(), operation_id);
     let OperationIntent::AbortQueryContext(first_request) = first_abort else {
         unreachable!()
@@ -7252,17 +7259,6 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
         .turn()
         .expect("replay gen2's later callback is absorbed by the exact closing tombstone");
     assert_eq!(tombstoned.acknowledgements, 1);
-    for _ in 0..100 {
-        if logical
-            .stand_down_snapshot(exact_context)
-            .await
-            .expect("stand-down snapshot")
-            .is_some_and(|snapshot| snapshot.closure() == ContextClosureState::TerminalRetained)
-        {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
     assert_eq!(
         logical
             .stand_down_snapshot(exact_context)
