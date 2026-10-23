@@ -284,11 +284,11 @@ impl<O: Send> InputPreparation<AsyncTarget<'_, O>> for AsyncPreparation {
     }
     fn prepare(
         &mut self,
-        _: &mut StepContext<'_>,
+        ctx: &mut StepContext<'_>,
         input: AcceptedInput,
         target: &AsyncTarget<'_, O>,
     ) -> Result<PreparationStep, InputPreparationFailure> {
-        self.hydrate.prepare_accepted(input, target)
+        self.hydrate.prepare_accepted(ctx, input, target)
     }
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
         self.hydrate.install_tracker(tracker);
@@ -1512,7 +1512,9 @@ mod tests {
             let control = state.error_state();
             let mut work =
                 crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-            let mut ctx = StepContext::new(&control, &mut work);
+            let mut value_conversions =
+                novarocks_value_arrays::decode::ValueConversionContext::default();
+            let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
             match self.try_push(&mut ctx, RawInput::for_test(chunk)) {
                 InputResult::Accepted(result) => {
                     result?;
@@ -1528,7 +1530,9 @@ mod tests {
             let control = state.error_state();
             let mut work =
                 crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-            let mut ctx = StepContext::new(&control, &mut work);
+            let mut value_conversions =
+                novarocks_value_arrays::decode::ValueConversionContext::default();
+            let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
             StepOperator::finish(self, &mut ctx)?;
             self.drive(&mut ctx)?;
             Ok(())
@@ -1747,7 +1751,9 @@ mod tests {
         let control = state.error_state();
         let mut work =
             crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        let mut ctx = StepContext::new(&control, &mut work);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
         let mut raw = RawInput::for_test(chunk);
         let mut previous = None;
         for _ in 0..2 {
@@ -2973,7 +2979,9 @@ mod tests {
         let control = state.error_state();
         let mut work =
             crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        let mut ctx = StepContext::new(&control, &mut work);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
         assert!(matches!(
             op.try_push(&mut ctx, RawInput::for_test(chunk)),
             InputResult::Accepted(Ok(_))
@@ -3169,7 +3177,9 @@ mod tests {
         let control = state.error_state();
         let mut work =
             crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        let mut ctx = StepContext::new(&control, &mut work);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
         assert!(matches!(
             op.try_push(&mut ctx, RawInput::for_test(chunk)),
             InputResult::Accepted(Ok(_))

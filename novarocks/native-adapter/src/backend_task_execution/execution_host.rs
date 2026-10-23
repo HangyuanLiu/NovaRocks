@@ -5189,6 +5189,95 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn value_representation_keeps_complete_fact_original_source_site_and_native_status_wire() {
+        use novarocks_execution::runtime::fragment::{
+            FragmentLaunchError, FragmentLaunchErrorKind, FragmentLaunchStage, PipelineOperation,
+        };
+        use novarocks_execution_contract::{
+            TaskConclusionPort, TaskConclusionProposal,
+            failure::{FailureClass, FailureEvidence, FailureProjection, RepresentationBoundary},
+        };
+        use novarocks_functions::array_projection::ArrayProjectionFailure;
+        use novarocks_value_arrays::{ByteLayout, ValueError};
+        for (index, boundary) in [
+            RepresentationBoundary::MinimumUnit,
+            RepresentationBoundary::SingleOutput,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let representation = ByteLayout::Utf8.representation(
+                boundary,
+                Some(i32::MAX as u64 + 1),
+                Some(i32::MAX as u64),
+                Some(index as u64),
+            );
+            let source = ValueError::Representation(representation);
+            let expected = source.failure_fact();
+            let kernel =
+                novarocks_functions::KernelFailure::from(ArrayProjectionFailure::Value(source));
+            let failure = ExecutionFailure::from(kernel).at_operator(7, PipelineOperation::Push);
+            let source_pointer = crate::backend_test_support::find_source::<ValueError>(&failure)
+                .unwrap() as *const _;
+            assert_eq!(failure.failure_fact(), expected);
+            assert_eq!(expected.class(), FailureClass::Representation);
+            assert_eq!(expected.evidence(), FailureEvidence::Originating);
+            assert_eq!(
+                super::failure_category(&failure),
+                TaskFailureCategory::Execution
+            );
+            let forwarded = ExecutionFailure::from(
+                novarocks_execution::exec::pipeline::operator::ConstructionFailure::Caller(
+                    Box::new(failure.clone()),
+                ),
+            );
+            assert!(std::ptr::eq(forwarded.cause(), failure.cause()));
+            assert_eq!(forwarded.context(), failure.context());
+            let launch = FragmentLaunchError::from_failure(
+                FragmentLaunchStage::BuildPipelines,
+                FragmentLaunchErrorKind::PipelineBuild,
+                failure.clone(),
+            );
+            let task = identity(80_030 + index as i64, 1, 1);
+            let host = super::preparation_failure_to_host(task, &launch);
+            assert_eq!(host.failure_fact(), expected);
+            assert_eq!(
+                crate::backend_test_support::find_source::<ValueError>(&host).unwrap() as *const _,
+                source_pointer
+            );
+            let (owner, reporter) = reporter_for(task);
+            // A derived stop is replaceable; the value author's actual refusal
+            // remains an origin and is never relabelled as a stop observation.
+            owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+            super::report_failure(&reporter, forwarded);
+            let receipt = owner.accepted().unwrap();
+            let origin = receipt.originating_failure().unwrap();
+            assert_eq!(origin.failure_fact(), expected);
+            assert_eq!(origin.context(), failure.context());
+            assert_eq!(origin.context().unwrap().operator_ordinal, 7);
+            assert_eq!(origin.context().unwrap().operation, PipelineOperation::Push);
+            assert_eq!(
+                crate::backend_test_support::find_source::<ValueError>(origin).unwrap() as *const _,
+                source_pointer
+            );
+            let status = owner.current();
+            let wire = novarocks_task_codec::status::encode_task_status(&status);
+            let decoded = novarocks_task_codec::status::decode_task_status(
+                &wire,
+                FieldPath::root("value_status"),
+            )
+            .unwrap();
+            let Some(TerminationDetail::Failed(wire_failure)) = decoded.termination() else {
+                panic!("native status lost value failure")
+            };
+            assert_eq!(wire_failure.fact(), expected);
+            assert_eq!(wire_failure.fact().representation(), Some(representation));
+            assert_eq!(wire_failure.category(), TaskFailureCategory::Execution);
+            assert!(wire_failure.detail().as_str().contains("operator 7"));
+        }
+    }
+
+    #[test]
     fn typed_failure_native_preparation_preserves_kernel_category_without_stage_or_text_guessing() {
         use novarocks_execution::runtime::fragment::{
             FragmentLaunchError, FragmentLaunchErrorKind, FragmentLaunchStage,

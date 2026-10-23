@@ -2236,7 +2236,11 @@ mod tests {
         let error = state.error_state();
         let mut work =
             crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, units);
-        action(&mut StepContext::new(&error, &mut work))
+        action(&mut StepContext::new(
+            &error,
+            &mut work,
+            &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
+        ))
     }
     pub(crate) fn complete_input(
         step: &mut dyn Operator,
@@ -3347,7 +3351,9 @@ mod tests {
         operator.bind_runtime_state(&state).unwrap();
         let error = state.error_state();
         let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 0);
-        let mut ctx = StepContext::new(&error, &mut work);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&error, &mut work, &mut value_conversions);
         assert!(matches!(
             operator.try_push(
                 &mut ctx,

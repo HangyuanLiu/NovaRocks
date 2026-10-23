@@ -157,7 +157,9 @@ mod tests {
         let mut source = UnionAllSourceFactory::new(shared.clone(), 7).create(1, 0);
         let control = state.error_state();
         let mut work = TurnWork::new(NonZeroU64::new(1).unwrap(), 8);
-        let mut context = StepContext::new(&control, &mut work);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut context = StepContext::new(&control, &mut work, &mut value_conversions);
         let source = source.as_mut();
         let waiting = source.drive(&mut context).unwrap();
         assert!(waiting.output.is_none());

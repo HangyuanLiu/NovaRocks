@@ -93,15 +93,24 @@ fn inspect<E>(
     observe(HydrateEvent::InspectType(source.data_type())).map_err(ValueFailure::Caller)?;
     if matches!(source.data_type(), DataType::Dictionary(..)) {
         let (keys, values) = arrow_raw::source_dictionary(source)?;
-        for row in 0..keys.len() {
-            work(1).map_err(ValueFailure::Caller)?;
-            if keys.is_null(row) {
-                continue;
-            }
-            let index = usize::try_from(keys.value(row))
-                .map_err(|_| ValueError::Invariant(ValueViolation::Bounds))?;
-            if index >= values.len() {
-                return Err(ValueError::Invariant(ValueViolation::Bounds).into());
+        for row_start in (0..keys.len()).step_by(1024) {
+            let row_count = (keys.len() - row_start).min(1024);
+            observe(HydrateEvent::InspectDictionaryRows {
+                source,
+                row_start,
+                row_count,
+            })
+            .map_err(ValueFailure::Caller)?;
+            for row in row_start..row_start + row_count {
+                work(1).map_err(ValueFailure::Caller)?;
+                if keys.is_null(row) {
+                    continue;
+                }
+                let index = usize::try_from(keys.value(row))
+                    .map_err(|_| ValueError::Invariant(ValueViolation::Bounds))?;
+                if index >= values.len() {
+                    return Err(ValueError::Invariant(ValueViolation::Bounds).into());
+                }
             }
         }
     }
@@ -111,6 +120,12 @@ fn inspect<E>(
             for (field, input) in fields.iter().zip(children) {
                 observe(HydrateEvent::InspectField(field)).map_err(ValueFailure::Caller)?;
                 inspect(input, work, observe, depth + 1)?;
+            }
+        }
+        StructuralRef::Union { fields, array } => {
+            for (id, field) in fields.iter() {
+                observe(HydrateEvent::InspectField(field)).map_err(ValueFailure::Caller)?;
+                inspect(array.child(id), work, observe, depth + 1)?;
             }
         }
         StructuralRef::List32 { field, values, .. }
@@ -164,6 +179,9 @@ fn validate_row<E>(
     child_rows(source, row, &mut |index, start, end| {
         let input = match arrow_raw::structural_view(source)? {
             StructuralRef::Struct { children, .. } => children.get(index).ok_or_else(invalid)?,
+            StructuralRef::Union { fields, array } => {
+                array.child(fields.iter().nth(index).ok_or_else(invalid)?.0)
+            }
             StructuralRef::List32 { values, .. }
             | StructuralRef::List64 { values, .. }
             | StructuralRef::FixedSizeList { values, .. } => values,
@@ -257,6 +275,14 @@ fn parameterized_shape<E>(
             (DataType::Struct(a), DataType::Struct(b)) if a.len() == b.len() => {
                 for (a, b) in a.iter().zip(b) {
                     if !field(a, b, true, options, depth + 1, work)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            (DataType::Union(a, am), DataType::Union(b, bm)) if am == bm && a.len() == b.len() => {
+                for ((ai, a), (bi, b)) in a.iter().zip(b.iter()) {
+                    if ai != bi || !field(a, b, true, options, depth + 1, work)? {
                         return Ok(false);
                     }
                 }

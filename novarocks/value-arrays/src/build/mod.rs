@@ -136,6 +136,7 @@ pub struct ValueBuilder<A: Allocator + Clone + 'static = Global> {
     copied_bytes: u128,
     planned_payload_region: Option<usize>,
     publication_regions: Option<Vec<Buffer>>,
+    _serial: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
 impl ValueBuilder<Global> {
@@ -147,6 +148,7 @@ impl ValueBuilder<Global> {
 impl<A: Allocator + Clone + 'static> ValueBuilder<A> {
     pub fn new_in(layout: ByteLayout, allocator: A) -> Self {
         Self {
+            _serial: std::marker::PhantomData,
             layout,
             payload: AllocVec::new_in(allocator.clone()),
             offsets32: AllocVec::new_in(allocator.clone()),
@@ -355,10 +357,36 @@ impl<A: Allocator + Clone + 'static> ValueBuilder<A> {
     /// refusal drops all unpublished storage with its original allocator.
     /// Arrow's additional private headers remain a public-library boundary.
     pub fn finish_observed<E>(
-        mut self,
+        self,
         growth: &mut Growth<'_, E>,
         work: &mut Work<'_, E>,
     ) -> Result<BuiltArray, ValueFailure<E>> {
+        self.finish_structured_observed(growth, work, &mut |_| Ok(()))
+    }
+    pub fn finish_structured_observed<E>(
+        mut self,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+        observe: &mut crate::control::StructureObserver<'_, E>,
+    ) -> Result<BuiltArray, ValueFailure<E>> {
+        let owners = if self.layout.is_view() {
+            1 + if self.rows == 0 {
+                0
+            } else {
+                self.regions
+                    .iter()
+                    .filter(|region| matches!(region, Region::Owned(_)))
+                    .count()
+                    + usize::from(self.null_count != 0)
+            }
+        } else {
+            2 + usize::from(self.rows != 0 && self.null_count != 0)
+        };
+        observe(crate::control::ValueStructure::ByteArray {
+            layout: self.layout,
+            new_buffer_owners: owners,
+        })
+        .map_err(ValueFailure::Caller)?;
         work(0).map_err(ValueFailure::Caller)?;
         let mut facts = self.facts();
         if self.rows == 0 {
@@ -402,6 +430,7 @@ impl<A: Allocator + Clone + 'static> ValueBuilder<A> {
             };
             facts.declared_payload_capacity = arrow_raw::byte_payload_capacity(array.as_ref())?;
             debug_assert!(array.to_data().validate_full().is_ok());
+            work(0).map_err(ValueFailure::Caller)?;
             return Ok(BuiltArray { array, facts });
         }
         let nulls = if self.null_count == 0 {
@@ -491,6 +520,7 @@ impl<A: Allocator + Clone + 'static> ValueBuilder<A> {
         };
         facts.declared_payload_capacity = arrow_raw::byte_payload_capacity(array.as_ref())?;
         debug_assert!(array.to_data().validate_full().is_ok());
+        work(0).map_err(ValueFailure::Caller)?;
         Ok(BuiltArray { array, facts })
     }
 

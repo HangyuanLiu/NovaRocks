@@ -350,7 +350,9 @@ mod tests {
         );
         let control = RuntimeErrorState::default();
         let mut work = TurnWork::new(NonZeroU64::new(1).unwrap(), 2);
-        let mut context = StepContext::new(&control, &mut work);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut context = StepContext::new(&control, &mut work, &mut value_conversions);
         let first = source.drive(&mut context).unwrap();
         assert_eq!(first.output.unwrap().len(), 2);
         assert!(matches!(first.next, NextStep::Wait(_)));
@@ -373,7 +375,9 @@ mod tests {
         let (mut source, polls) = script(SourceStart::Finished, []);
         let control = RuntimeErrorState::default();
         let mut work = TurnWork::new(NonZeroU64::new(1).unwrap(), 2);
-        let mut context = StepContext::new(&control, &mut work);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut context = StepContext::new(&control, &mut work, &mut value_conversions);
         let input = RawInput::new(chunk(), None);
         let InputResult::Rejected { input, .. } = source.try_push(&mut context, input) else {
             panic!("a source must return the exact unaccepted input");
@@ -441,7 +445,9 @@ mod exit_tests {
         ));
         let control = RuntimeErrorState::default();
         let mut work = TurnWork::new(NonZeroU64::new(1).unwrap(), 8);
-        let mut context = StepContext::new(&control, &mut work);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut context = StepContext::new(&control, &mut work, &mut value_conversions);
         let step = source.drive(&mut context).unwrap();
         assert!(step.output.is_none());
         assert!(matches!(step.next, NextStep::Finished));
@@ -469,7 +475,9 @@ mod exit_tests {
         });
         let control = RuntimeErrorState::default();
         let mut work = TurnWork::new(NonZeroU64::MIN, 8);
-        let mut ctx = StepContext::new(&control, &mut work);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
         assert_eq!(source.drive(&mut ctx).unwrap_err(), first);
         assert_eq!(source.drive(&mut ctx).unwrap_err(), first);
         assert_eq!(polls.load(Ordering::Relaxed), 1);

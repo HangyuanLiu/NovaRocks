@@ -24,6 +24,7 @@ use crate::runtime::{
 };
 use novarocks_functions::KernelFailure;
 use novarocks_spi::connector::read_stack::ConnectorPollBudget;
+use novarocks_value_arrays::decode::ValueConversionContext;
 use std::num::NonZeroU64;
 
 pub(crate) const DEFAULT_TURN_WORK_UNITS: u32 = 64;
@@ -92,13 +93,19 @@ impl novarocks_functions::KernelEvaluationControl for StepKernelControl<'_> {
 pub struct StepContext<'a> {
     control: &'a RuntimeErrorState,
     work: &'a mut TurnWork,
+    value_conversions: &'a mut ValueConversionContext,
     site: Option<ExecutionFailureContext>,
 }
 impl<'a> StepContext<'a> {
-    pub(crate) fn new(control: &'a RuntimeErrorState, work: &'a mut TurnWork) -> Self {
+    pub(crate) fn new(
+        control: &'a RuntimeErrorState,
+        work: &'a mut TurnWork,
+        value_conversions: &'a mut ValueConversionContext,
+    ) -> Self {
         Self {
             control,
             work,
+            value_conversions,
             site: None,
         }
     }
@@ -112,6 +119,7 @@ impl<'a> StepContext<'a> {
         StepContext {
             control: self.control,
             work: &mut *self.work,
+            value_conversions: &mut *self.value_conversions,
             site: Some(ExecutionFailureContext {
                 operator_ordinal,
                 operation,
@@ -128,6 +136,7 @@ impl<'a> StepContext<'a> {
         let mut scoped = StepContext {
             control: self.control,
             work: &mut *self.work,
+            value_conversions: &mut *self.value_conversions,
             site: self
                 .site
                 .map(|site| ExecutionFailureContext { operation, ..site }),
@@ -154,6 +163,11 @@ impl<'a> StepContext<'a> {
             control: self.control,
         }
     }
+    /// Borrow the actual driver's serial conversion state for this call.
+    /// The borrow cannot escape the step or cross an asynchronous boundary.
+    pub fn value_conversions(&mut self) -> &mut ValueConversionContext {
+        self.value_conversions
+    }
     pub fn work(&mut self) -> &mut TurnWork {
         self.work
     }
@@ -175,7 +189,11 @@ pub(super) fn with_test_step<T>(
 ) -> T {
     let control = state.error_state();
     let mut turn = TurnWork::new(std::num::NonZeroU64::MIN, DEFAULT_TURN_WORK_UNITS);
-    action(&mut StepContext::new(&control, &mut turn))
+    action(&mut StepContext::new(
+        &control,
+        &mut turn,
+        &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
+    ))
 }
 
 #[cfg(test)]
@@ -185,7 +203,9 @@ mod tests {
     fn failure_location_and_work_allowance_share_the_same_short_step() {
         let control = RuntimeErrorState::default();
         let mut work = TurnWork::new(NonZeroU64::new(9).unwrap(), 3);
-        let mut context = StepContext::new(&control, &mut work);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut context = StepContext::new(&control, &mut work, &mut value_conversions);
         {
             let mut step = context.operator_step(7, PipelineOperation::Pull);
             assert!(step.work().try_consume(2));

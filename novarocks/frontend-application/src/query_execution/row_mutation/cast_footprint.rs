@@ -16,11 +16,13 @@
 // under the License.
 
 //! Before-allocation bounds for signed COW layout normalization.
-//! No value conversion is admitted here. Dictionary expansion is measured by
-//! reading actual keys and UTF8 offsets; all other payload is borrowed until
-//! the existing source owner copies it. Tree/header bounds precede any cloning.
+//! The shared value plan authors expansion and output geometry once. This
+//! boundary adds its existing independent safe-copy coexistence and metadata
+//! bounds; it never rescans dictionary keys or chooses another conversion.
+#[cfg(test)]
+use arrow::array::ArrayRef;
 use arrow::{
-    array::{Array, ArrayRef},
+    array::Array,
     datatypes::{DataType, Field, Schema, TimeUnit},
     record_batch::RecordBatch,
 };
@@ -31,7 +33,7 @@ use std::collections::HashMap;
 use std::mem::size_of;
 const INPUT_BYTES: usize = 32 * 1024 * 1024;
 const SELECTION_BYTES: usize = 64 * 1024 * 1024;
-const TRANSFORM_BYTES: usize = 256 * 1024 * 1024;
+pub(super) const TRANSFORM_BYTES: usize = 256 * 1024 * 1024;
 const METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NODES: usize = 4096;
 const MAX_DEPTH: usize = 64;
@@ -48,29 +50,75 @@ pub(super) struct CowSignedLayoutFootprint {
     pub peak_bytes: usize,
 }
 impl CowSignedLayoutFootprint {
+    #[cfg(test)]
     pub(super) fn for_batch(
         schema: &Schema,
         batch: &RecordBatch,
+        retained: usize,
+        scratch: usize,
+        other: usize,
+    ) -> Result<Self, ConnectorError> {
+        Self::with_limit(schema, batch, retained, scratch, other, TRANSFORM_BYTES)
+    }
+    #[cfg(test)]
+    fn with_limit(
+        schema: &Schema,
+        batch: &RecordBatch,
+        retained: usize,
+        scratch: usize,
+        other: usize,
+        limit: usize,
+    ) -> Result<Self, ConnectorError> {
+        preflight_inputs(schema, batch, retained, scratch)?;
+        let mut context = novarocks_value_arrays::decode::ValueConversionContext::new(0);
+        let plan = super::signed_layout::CowSignedLayoutPlan::plan(
+            &std::sync::Arc::new(schema.clone()),
+            batch,
+            &super::signed_layout::fixture_declarations(schema),
+            &mut context,
+            TRANSFORM_BYTES,
+            &mut |_| Ok(()),
+        )?;
+        Self::with_plans_limit(
+            schema,
+            batch,
+            &plan,
+            retained,
+            scratch,
+            other,
+            limit,
+            &mut |_| Ok(()),
+        )
+    }
+    pub(super) fn for_plans(
+        schema: &Schema,
+        batch: &RecordBatch,
+        plan: &super::signed_layout::CowSignedLayoutPlan,
         retained_selection_bytes: usize,
         source_scratch_bytes: usize,
         other_live_bytes: usize,
+        work: &mut dyn FnMut(usize) -> Result<(), ConnectorError>,
     ) -> Result<Self, ConnectorError> {
-        Self::with_limit(
+        Self::with_plans_limit(
             schema,
             batch,
+            plan,
             retained_selection_bytes,
             source_scratch_bytes,
             other_live_bytes,
             TRANSFORM_BYTES,
+            work,
         )
     }
-    fn with_limit(
+    fn with_plans_limit(
         schema: &Schema,
         batch: &RecordBatch,
+        plan: &super::signed_layout::CowSignedLayoutPlan,
         retained_selection_bytes: usize,
         source_scratch_bytes: usize,
         other_live_bytes: usize,
         limit: usize,
+        work: &mut dyn FnMut(usize) -> Result<(), ConnectorError>,
     ) -> Result<Self, ConnectorError> {
         if batch.num_rows() > MAX_ROWS || retained_selection_bytes > SELECTION_BYTES {
             return Err(exhausted());
@@ -93,14 +141,53 @@ impl CowSignedLayoutFootprint {
         }
         let mut output_bytes = 0;
         let mut copy_peak_bytes = 0;
-        for (array, field) in batch.columns().iter().zip(schema.fields()) {
-            let (expanded, copied) = layout(array, field)?;
-            output_bytes = add(output_bytes, expanded)?;
-            copy_peak_bytes = add(copy_peak_bytes, copied)?;
+        for column in &plan.columns {
+            column
+                .visit_output_storage_observed(
+                    &mut |storage| {
+                        use novarocks_value_arrays::hydrate::PlannedOutputStorage;
+                        match storage {
+                            PlannedOutputStorage::Node {
+                                rows,
+                                source_offset,
+                            } => {
+                                if source_offset != 0 {
+                                    return Err(invalid(
+                                        "COW signed layout requires unsliced source arrays",
+                                    ));
+                                }
+                                if rows > MAX_ROWS {
+                                    return Err(exhausted());
+                                }
+                            }
+                            PlannedOutputStorage::Buffer { bytes, newly_owned } => {
+                                let bytes = round64(bytes)?;
+                                if newly_owned {
+                                    output_bytes = add(output_bytes, bytes)?;
+                                }
+                                copy_peak_bytes = add(copy_peak_bytes, bytes)?;
+                            }
+                        }
+                        Ok(())
+                    },
+                    work,
+                )
+                .map_err(|failure| match failure {
+                    novarocks_value_arrays::ValueFailure::Caller(error) => error,
+                    novarocks_value_arrays::ValueFailure::Value(error) => {
+                        super::signed_layout::value_error(error)
+                    }
+                })?;
         }
         let nodes = add(add(target.nodes, source.nodes)?, arrays.nodes)?;
         let metadata = add(add(target.metadata, source.metadata)?, arrays.metadata)?;
-        let temporary_bytes = add(mul(nodes, NODE_HEADERS)?, mul(metadata, 36)?)?;
+        let mut temporary_bytes = add(mul(nodes, NODE_HEADERS)?, mul(metadata, 36)?)?;
+        temporary_bytes = add(temporary_bytes, plan.planning_requested_bytes)?;
+        for column in &plan.columns {
+            for layout in &column.requirements().execution_scratch {
+                temporary_bytes = add(temporary_bytes, layout.size())?;
+            }
+        }
         let peak_bytes = add(
             add(
                 add(input_bytes, retained_selection_bytes)?,
@@ -120,7 +207,34 @@ impl CowSignedLayoutFootprint {
         })
     }
 }
-fn exhausted() -> ConnectorError {
+pub(super) fn preflight_inputs(
+    schema: &Schema,
+    batch: &RecordBatch,
+    retained: usize,
+    scratch: usize,
+) -> Result<(), ConnectorError> {
+    if batch.num_rows() > MAX_ROWS
+        || retained > SELECTION_BYTES
+        || batch.num_columns() != schema.fields().len()
+    {
+        return Err(exhausted());
+    }
+    TypeWalk::schema(schema)?;
+    TypeWalk::schema(batch.schema_ref())?;
+    let mut arrays = TypeWalk::default();
+    for array in batch.columns() {
+        arrays.data_type(array.data_type(), 0)?;
+    }
+    if add(
+        ConnectorRowConversionFootprint::retained_batch_bytes(batch)?,
+        scratch,
+    )? > INPUT_BYTES
+    {
+        return Err(exhausted());
+    }
+    Ok(())
+}
+pub(super) fn exhausted() -> ConnectorError {
     ConnectorError::new(
         ConnectorErrorKind::ResourceExhausted,
         "COW signed layout exceeds its fixed input, metadata or transform workspace",
@@ -137,83 +251,6 @@ fn mul(a: usize, b: usize) -> Result<usize, ConnectorError> {
 }
 fn round64(bytes: usize) -> Result<usize, ConnectorError> {
     Ok(add(bytes, 63)? / 64 * 64)
-}
-fn bitmap(rows: usize) -> Result<usize, ConnectorError> {
-    round64(add(rows, 7)? / 8)
-}
-fn layout(array: &ArrayRef, field: &Field) -> Result<(usize, usize), ConnectorError> {
-    let data = array.to_data();
-    if data.offset() != 0 {
-        return Err(invalid("COW signed layout requires unsliced source arrays"));
-    }
-    let rows = array.len();
-    if rows > MAX_ROWS {
-        return Err(exhausted());
-    }
-    let validity = if field.is_nullable() && data.nulls().is_some() {
-        bitmap(rows)?
-    } else {
-        0
-    };
-    match (array.data_type(), field.data_type()) {
-        (DataType::Dictionary(key, value), DataType::Utf8)
-            if **key == DataType::Int32 && **value == DataType::Utf8 =>
-        {
-            let bytes = super::signed_layout::decoded_dictionary_bytes(array)?;
-            let expanded = add(
-                add(round64(bytes)?, round64(mul(add(rows, 1)?, 4)?)?)?,
-                bitmap(rows)?,
-            )?;
-            Ok((expanded, expanded))
-        }
-        (DataType::Struct(source), DataType::Struct(target)) if source.len() == target.len() => {
-            let structure = array
-                .as_any()
-                .downcast_ref::<arrow::array::StructArray>()
-                .ok_or_else(|| invalid("COW Struct carrier differs from its declaration"))?;
-            let (mut output, mut copy) = (0, validity);
-            for (child, target) in structure.columns().iter().zip(target) {
-                let (e, c) = layout(child, target)?;
-                output = add(output, e)?;
-                copy = add(copy, c)?;
-            }
-            Ok((output, copy))
-        }
-        (DataType::List(_), DataType::List(target)) => {
-            let list = array
-                .as_any()
-                .downcast_ref::<arrow::array::ListArray>()
-                .ok_or_else(|| invalid("COW List carrier differs from its declaration"))?;
-            let (e, c) = layout(list.values(), target)?;
-            Ok((e, add(add(validity, round64(mul(add(rows, 1)?, 4)?)?)?, c)?))
-        }
-        (DataType::LargeList(_), DataType::LargeList(target)) => {
-            let list = array
-                .as_any()
-                .downcast_ref::<arrow::array::LargeListArray>()
-                .ok_or_else(|| invalid("COW LargeList carrier differs from its declaration"))?;
-            let (e, c) = layout(list.values(), target)?;
-            Ok((e, add(add(validity, round64(mul(add(rows, 1)?, 8)?)?)?, c)?))
-        }
-        (source, target) if source == target => {
-            // Copy each logical buffer separately: the source owner does so even
-            // if two columns share backing. Full buffer lengths conservatively
-            // include unused payload; no retained-source deduplication is used.
-            let mut copied = validity;
-            for buffer in data.buffers() {
-                copied = add(copied, round64(buffer.len())?)?;
-            }
-            if !data.child_data().is_empty() {
-                return Err(invalid(
-                    "COW signed layout has an unsupported nested carrier",
-                ));
-            }
-            Ok((0, copied))
-        }
-        _ => Err(invalid(
-            "COW root carrier differs beyond admitted layout differences",
-        )),
-    }
 }
 #[derive(Default)]
 struct TypeWalk {

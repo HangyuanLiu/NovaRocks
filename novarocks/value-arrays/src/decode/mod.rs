@@ -22,7 +22,7 @@ use crate::{
     ByteLayout, ValueError, ValueFailure, ValueViolation,
     access::{ByteRegion, ByteSource},
     arrow_raw,
-    control::{Growth, Work},
+    control::{Growth, StructureObserver, ValueStructure, Work, shared_owner},
     reachability::{ReachableRows, SelectionSet},
 };
 use arrow_array::{Array, ArrayRef, Int32Array};
@@ -129,6 +129,7 @@ struct DecodedBottom {
     array: ArrayRef,
     covered: SelectionSet,
     owned_descriptor_bytes: usize,
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
 /// A decoded result owns Arrow aliases and never borrows a mutable cache. This
 /// remains valid if the context is cleared, replaced or moved to another thread.
@@ -140,6 +141,7 @@ pub struct DecodedBytes {
     dictionary: bool,
     flattened: bool,
     utf8: bool,
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
 impl DecodedBytes {
     pub fn len(&self) -> usize {
@@ -551,6 +553,16 @@ impl ValueConversionContext {
         growth: &mut Growth<'_, E>,
         work: &mut Work<'_, E>,
     ) -> Result<DecodePlan, ValueFailure<E>> {
+        self.plan_decode_structured_observed(source, rows, growth, work, &mut |_| Ok(()))
+    }
+    pub fn plan_decode_structured_observed<E>(
+        &mut self,
+        source: &ByteSource<'_>,
+        rows: &ReachableRows<'_>,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+        observe: &mut StructureObserver<'_, E>,
+    ) -> Result<DecodePlan, ValueFailure<E>> {
         let previous = if source.is_dictionary() && !source.value_layout().is_view() {
             let identity = arrow_raw::byte_storage_identity(source.values().as_ref())?;
             self.entries
@@ -561,7 +573,7 @@ impl ValueConversionContext {
             None
         };
         let mut planning_growth_requested_bytes = 0u128;
-        let decoded = self.decode_observed(
+        let decoded = self.decode_structured_observed(
             source,
             rows,
             &mut |layout| {
@@ -571,6 +583,7 @@ impl ValueConversionContext {
                 Ok(())
             },
             work,
+            observe,
         )?;
         let shared_cached_storage_bytes = previous
             .filter(|bottom| Arc::ptr_eq(bottom, &decoded.bottom))
@@ -612,11 +625,23 @@ impl ValueConversionContext {
         growth: &mut Growth<'_, E>,
         work: &mut Work<'_, E>,
     ) -> Result<DecodedBytes, ValueFailure<E>> {
+        self.decode_structured_observed(source, rows, growth, work, &mut |_| Ok(()))
+    }
+    pub fn decode_structured_observed<E>(
+        &mut self,
+        source: &ByteSource<'_>,
+        rows: &ReachableRows<'_>,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+        observe: &mut StructureObserver<'_, E>,
+    ) -> Result<DecodedBytes, ValueFailure<E>> {
         if rows.len() != source.len() {
             return Err(violation(ValueViolation::Bounds).into());
         }
         work(0).map_err(ValueFailure::Caller)?;
-        let readable = Arc::new(rows.materialize_observed(growth, work)?);
+        let readable_rows = rows.materialize_observed(growth, work)?;
+        shared_owner::<SelectionSet, E>(observe)?;
+        let readable = Arc::new(readable_rows);
         let mapping = if let Some(keys) = source.dictionary_keys() {
             RowMapping::Dictionary(keys.clone())
         } else if source.is_constant() {
@@ -645,6 +670,8 @@ impl ValueConversionContext {
                 growth,
                 work,
                 &mut self.stats,
+                &source.storage(),
+                observe,
             )?;
             return Ok(DecodedBytes {
                 bottom,
@@ -653,6 +680,7 @@ impl ValueConversionContext {
                 dictionary: false,
                 flattened: false,
                 utf8,
+                _storage: source.storage(),
             });
         }
         let identity = if source.value_layout().is_view() {
@@ -662,9 +690,17 @@ impl ValueConversionContext {
         };
         let descriptor_bytes = source.values().len().saturating_mul(16);
         let bitmap_bytes = source.values().len().div_ceil(8);
+        // Reuse quotes include fixed cache holders even for zero-value
+        // dictionaries. A zero efficiency budget must never retain sources.
+        // Declared backing remains an estimate, not a full-owner capacity fact.
+        let declared_backing_bytes =
+            arrow_raw::byte_declared_backing_capacity(source.values().as_ref())?;
         let charge = descriptor_bytes
             .saturating_add(bitmap_bytes)
-            .saturating_add(identity[5]);
+            .saturating_add(declared_backing_bytes)
+            .saturating_add(std::mem::size_of::<CacheEntry>())
+            .saturating_add(std::mem::size_of::<DecodedBottom>())
+            .saturating_add(4 * std::mem::size_of::<usize>());
         let found = self
             .entries
             .iter()
@@ -679,7 +715,7 @@ impl ValueConversionContext {
         if !source.value_layout().is_view() && !retain {
             self.clear();
             self.stats.cache_skips = self.stats.cache_skips.saturating_add(1);
-            return self.flatten(source, readable, growth, work);
+            return self.flatten(source, readable, growth, work, observe);
         }
         let mut required =
             SelectionSet::try_new_with_control_observed(source.values().len(), growth, work)?;
@@ -691,17 +727,20 @@ impl ValueConversionContext {
         }
         if source.value_layout().is_view() {
             self.clear();
+            shared_owner::<DecodedBottom, E>(observe)?;
             return Ok(DecodedBytes {
                 bottom: Arc::new(DecodedBottom {
                     array: source.values().clone(),
                     owned_descriptor_bytes: required.descriptor_bytes(),
                     covered: required,
+                    _storage: source.storage(),
                 }),
                 mapping,
                 readable,
                 dictionary: source.is_dictionary(),
                 flattened: false,
                 utf8,
+                _storage: source.storage(),
             });
         }
         self.clock = self.clock.wrapping_add(1);
@@ -718,6 +757,8 @@ impl ValueConversionContext {
                     growth,
                     work,
                     &mut self.stats,
+                    &source.storage(),
+                    observe,
                 )?;
                 self.stats.cache_extensions = self.stats.cache_extensions.saturating_add(1);
                 self.entries[index].bottom = bottom.clone();
@@ -731,12 +772,13 @@ impl ValueConversionContext {
                 growth,
                 work,
                 &mut self.stats,
+                &source.storage(),
+                observe,
             )?;
             while self
                 .entries
                 .iter()
-                .map(|e| e.charge)
-                .sum::<usize>()
+                .fold(0usize, |total, e| total.saturating_add(e.charge))
                 .saturating_add(charge)
                 > self.budget
             {
@@ -758,9 +800,7 @@ impl ValueConversionContext {
                 _source: source.values().clone(),
                 bottom: bottom.clone(),
                 charge,
-                declared_backing_bytes: arrow_raw::byte_declared_backing_capacity(
-                    source.values().as_ref(),
-                )?,
+                declared_backing_bytes,
                 last_use: self.clock,
             });
             bottom
@@ -775,6 +815,7 @@ impl ValueConversionContext {
             dictionary: true,
             flattened: false,
             utf8,
+            _storage: source.storage(),
         })
     }
     fn flatten<E>(
@@ -783,6 +824,7 @@ impl ValueConversionContext {
         readable: Arc<SelectionSet>,
         growth: &mut Growth<'_, E>,
         work: &mut Work<'_, E>,
+        observe: &mut StructureObserver<'_, E>,
     ) -> Result<DecodedBytes, ValueFailure<E>> {
         let count = source.len();
         let layout = if source.value_layout().is_utf8() {
@@ -819,6 +861,11 @@ impl ValueConversionContext {
                 .capacity()
                 .saturating_mul(std::mem::size_of::<Buffer>()),
         );
+        observe(ValueStructure::ByteArray {
+            layout,
+            new_buffer_owners: 2,
+        })
+        .map_err(ValueFailure::Caller)?;
         let array = unsafe {
             arrow_raw::make_view_unchecked(
                 layout,
@@ -828,18 +875,21 @@ impl ValueConversionContext {
             )
         }?;
         let covered = readable.try_clone_with_control_observed(growth, work)?;
+        shared_owner::<DecodedBottom, E>(observe)?;
         Ok(DecodedBytes {
             bottom: Arc::new(DecodedBottom {
                 array,
                 owned_descriptor_bytes: owned_descriptor_bytes
                     .saturating_add(covered.descriptor_bytes()),
                 covered,
+                _storage: source.storage(),
             }),
             mapping: RowMapping::Identity { len: count },
             readable,
             dictionary: false,
             flattened: source.is_dictionary(),
             utf8: layout.is_utf8(),
+            _storage: source.storage(),
         })
     }
 }
@@ -850,6 +900,8 @@ fn convert_original<E>(
     growth: &mut Growth<'_, E>,
     work: &mut Work<'_, E>,
     stats: &mut ConversionStats,
+    storage: &novarocks_type_contract::ValueTypeStorageLifetime,
+    observe: &mut StructureObserver<'_, E>,
 ) -> Result<Arc<DecodedBottom>, ValueFailure<E>> {
     let layout = if ByteLayout::from_data_type(source.data_type())
         .ok_or_else(|| violation(ValueViolation::Layout))?
@@ -905,13 +957,20 @@ fn convert_original<E>(
                 .saturating_mul(std::mem::size_of::<Buffer>()),
         )
         .saturating_add(covered.descriptor_bytes());
+    observe(ValueStructure::ByteArray {
+        layout,
+        new_buffer_owners: 1,
+    })
+    .map_err(ValueFailure::Caller)?;
     let array = unsafe {
         arrow_raw::make_view_unchecked(layout, views.into(), regions, source.nulls().cloned())
     }?;
+    shared_owner::<DecodedBottom, E>(observe)?;
     Ok(Arc::new(DecodedBottom {
         array,
         covered,
         owned_descriptor_bytes,
+        _storage: storage.clone(),
     }))
 }
 
@@ -1327,6 +1386,123 @@ mod tests {
         assert_eq!(context.stats().cache_hits, 0);
         assert_eq!(context.stats().converted_values, 4);
     }
+    #[test]
+    fn zero_efficiency_budget_does_not_retain_even_an_empty_dictionary_source() {
+        for budget in [0, 1] {
+            let values: ArrayRef = Arc::new(StringArray::from(Vec::<Option<&str>>::new()));
+            let weak = Arc::downgrade(&values);
+            let input = dictionary(values.clone(), vec![None, None]);
+            let mut context = ValueConversionContext::new(budget);
+            let decoded = context
+                .decode(&source(&input, ByteLayout::Utf8), &ReachableRows::all(2))
+                .unwrap();
+            assert!(decoded.is_flattened());
+            assert_eq!(context.stats().cache_skips, 1);
+            assert_eq!(context.stats().cache_hits, 0);
+            drop(input);
+            drop(values);
+            assert!(
+                weak.upgrade().is_none(),
+                "efficiency rejection cannot pin the original source"
+            );
+            assert_eq!(decoded.value(0).unwrap(), None);
+            assert_eq!(decoded.value(1).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn cache_bottom_and_published_aliases_keep_actual_source_and_creator_custody() {
+        use novarocks_type_contract::{ValueTypeStorageHold, ValueTypeStorageLifetime};
+        struct Hold;
+        impl ValueTypeStorageHold for Hold {}
+        let hold = Arc::new(Hold);
+        let weak = Arc::downgrade(&hold);
+        let storage = ValueTypeStorageLifetime::held(hold);
+        let values: ArrayRef = Arc::new(StringArray::from(vec!["retained external payload"]));
+        let input = dictionary(values, vec![Some(0), Some(0)]);
+        let mut context = ValueConversionContext::default();
+        let mut publications = 0;
+        let decoded = context
+            .decode_structured_observed(
+                &source(&input, ByteLayout::Utf8).with_storage(&storage),
+                &ReachableRows::all(2),
+                &mut |_| Ok::<_, Infallible>(()),
+                &mut |_| Ok(()),
+                &mut |event| {
+                    if matches!(event, ValueStructure::ByteArray { .. }) {
+                        publications += 1;
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(publications, 1);
+        let hit = context
+            .decode_structured_observed(
+                &source(&input, ByteLayout::Utf8).with_storage(&storage),
+                &ReachableRows::all(2),
+                &mut |_| Ok::<_, Infallible>(()),
+                &mut |_| Ok(()),
+                &mut |event| {
+                    assert!(!matches!(event, ValueStructure::ByteArray { .. }));
+                    Ok(())
+                },
+            )
+            .unwrap();
+        drop(storage);
+        drop(input);
+        context.clear();
+        assert!(weak.upgrade().is_some());
+        assert_eq!(hit.string(0).unwrap(), Some("retained external payload"));
+        drop(hit);
+        assert!(weak.upgrade().is_some());
+        drop(decoded);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn copy_on_write_bottom_keeps_current_creator_without_chaining_previous_creators() {
+        use novarocks_type_contract::{ValueTypeStorageHold, ValueTypeStorageLifetime};
+        struct Hold;
+        impl ValueTypeStorageHold for Hold {}
+        let first_hold = Arc::new(Hold);
+        let first_weak = Arc::downgrade(&first_hold);
+        let second_hold = Arc::new(Hold);
+        let second_weak = Arc::downgrade(&second_hold);
+        let first_storage = ValueTypeStorageLifetime::held(first_hold);
+        let second_storage = ValueTypeStorageLifetime::held(second_hold);
+        let values: ArrayRef = Arc::new(StringArray::from(vec![
+            "first external payload",
+            "second external payload",
+        ]));
+        let input1 = dictionary(values.clone(), vec![Some(0)]);
+        let input2 = dictionary(values, vec![Some(1)]);
+        let mut context = ValueConversionContext::default();
+        let first = context
+            .decode(
+                &source(&input1, ByteLayout::Utf8).with_storage(&first_storage),
+                &ReachableRows::all(1),
+            )
+            .unwrap();
+        let second = context
+            .decode(
+                &source(&input2, ByteLayout::Utf8).with_storage(&second_storage),
+                &ReachableRows::all(1),
+            )
+            .unwrap();
+        drop(first_storage);
+        drop(second_storage);
+        drop(input1);
+        drop(input2);
+        drop(first);
+        assert!(first_weak.upgrade().is_none());
+        context.clear();
+        assert!(second_weak.upgrade().is_some());
+        assert_eq!(second.string(0).unwrap(), Some("second external payload"));
+        drop(second);
+        assert!(second_weak.upgrade().is_none());
+    }
+
     #[test]
     fn decode_plan_freezes_real_context_reuse_and_never_reallocates_on_publication() {
         let values: ArrayRef = Arc::new(StringArray::from(vec![

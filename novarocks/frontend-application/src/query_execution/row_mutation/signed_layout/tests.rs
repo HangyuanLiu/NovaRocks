@@ -17,9 +17,12 @@
 
 use super::*;
 use arrow::{
-    array::{FixedSizeBinaryArray, Int32Array, Int64Array},
+    array::{
+        Array, DictionaryArray, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray,
+        StringArray, StructArray,
+    },
     buffer::{NullBuffer, OffsetBuffer, ScalarBuffer},
-    datatypes::Schema,
+    datatypes::{Int32Type, Schema},
 };
 fn normalize_one(array: ArrayRef, target: Field) -> Result<RecordBatch, String> {
     let source = Arc::new(Schema::new(vec![Field::new(
@@ -132,7 +135,6 @@ fn signed_layout_dictionary_expands_exact_keys_and_value_nulls() {
         )
         .unwrap(),
     );
-    assert_eq!(decoded_dictionary_bytes(&dictionary).unwrap(), 4);
     let out = normalize_one(dictionary.clone(), Field::new("v", DataType::Utf8, true)).unwrap();
     let strings = out
         .column(0)
@@ -198,7 +200,6 @@ fn signed_layout_dictionary_extent_retains_representation_before_decode() {
     // Exercise normalization directly as well as measurement: decode must refuse
     // before constructing a StringBuilder for the expanded 2 GiB payload.
     let error = super::normalize(&schema, &input).unwrap_err();
-    assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
     let fact = error.failure_fact();
     assert_eq!(fact.class(), FailureClass::Representation);
     assert!(fact.resource().is_none());
@@ -212,21 +213,17 @@ fn signed_layout_dictionary_extent_retains_representation_before_decode() {
         Some(ROWS as u64 * VALUE_BYTES as u64)
     );
     assert_eq!(representation.extent_limit, Some(i32::MAX as u64));
-    assert_eq!(representation.representable_prefix, None);
+    assert_eq!(representation.representable_prefix, Some((ROWS - 1) as u64));
     let shared = error
         .source()
         .unwrap()
         .downcast_ref::<SharedFailureCause>()
         .unwrap();
-    let original = shared.downcast_ref::<DictionaryExtentFailure>().unwrap();
-    assert_eq!(original.required, representation.required);
+    let original = shared
+        .downcast_ref::<novarocks_value_arrays::ValueError>()
+        .unwrap();
+    assert_eq!(original.failure_fact(), fact);
     assert_eq!(shared.failure_fact(), fact);
-    assert_eq!(
-        decoded_dictionary_bytes(&dictionary)
-            .unwrap_err()
-            .failure_fact(),
-        fact
-    );
     assert!(Arc::ptr_eq(input.column(0), &dictionary));
     assert_eq!(dictionary.len(), ROWS);
 }

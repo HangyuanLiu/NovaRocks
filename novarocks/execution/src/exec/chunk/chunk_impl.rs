@@ -378,21 +378,9 @@ impl Chunk {
                     ChunkViolation::ColumnBinding { column: index },
                 )));
             }
-            let root_has_nulls = validate_encoded_keys_and_root_nulls_observed(
-                &normalized,
-                &mut |step| observe(step).map_err(ChunkObservationFailure::Caller),
-                1,
-                &mut 0,
-            )
-            .map_err(ChunkObservationFailure::into_caller)?;
-            if !slot.nullable() && root_has_nulls {
-                return Err(E::from(ChunkConstructionFailure::source(
-                    ChunkViolation::RequiredNull { column: index },
-                )));
-            }
             super::required_dictionary_nulls::validate_required_dictionary_children(
                 &normalized,
-                slot.typed_binding().value_type(),
+                slot.typed_binding(),
                 &mut |step| observe(step).map_err(ChunkObservationFailure::Caller),
             )
             .map_err(ChunkObservationFailure::into_caller)?;
@@ -985,7 +973,6 @@ use novarocks_functions::array_projection::validate_dictionary_rows_observed;
 /// Validate every actual dictionary's keys regardless of semantic nullability.
 /// Root NULL is returned separately; nested active required-child rules remain
 /// those of Arrow's validated container construction, including parent masks.
-use novarocks_functions::array_projection::validate_encoded_keys_and_root_nulls_observed;
 
 fn retag_columns_to_chunk_schema(
     columns: &[ArrayRef],
@@ -1108,6 +1095,7 @@ mod tests {
 mod dictionary_validation_tests {
     use super::*;
     use arrow::array::StringArray;
+    use novarocks_functions::array_projection::validate_encoded_keys_and_root_nulls_observed;
 
     #[test]
     fn nullable_key_row_validation_rejects_negative_and_out_of_bounds_without_unsafe_array() {

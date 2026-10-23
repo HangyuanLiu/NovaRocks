@@ -1338,7 +1338,8 @@ fn compiled_table_schema_prepare_and_output_last_reference_use_real_owner() {
     let duplicate = input.clone();
     let original = duplicate.columns()[0].clone();
     let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
-    let mut ctx = StepContext::new(&control, &mut work);
+    let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+    let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
     let step = operator.as_mut();
     assert!(matches!(
         step.try_push(&mut ctx, RawInput::for_test(input)),

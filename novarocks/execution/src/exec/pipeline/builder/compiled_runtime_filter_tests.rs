@@ -2336,7 +2336,8 @@ fn join_probe_owned_shared_processor_gate_starts_at_input_and_has_exact_observab
     assert!(consumers.state().gate_deadline().is_none());
     let control = runtime.error_state();
     let mut turn = TurnWork::new(std::num::NonZeroU64::MIN, 64);
-    let mut ctx = StepContext::new(&control, &mut turn);
+    let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+    let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
     let InputResult::Deferred {
         input,
         next: AdmissionNext::Wait(wait),

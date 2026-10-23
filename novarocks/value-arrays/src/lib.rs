@@ -19,7 +19,20 @@
 //!
 //! This crate owns value algorithms and original failure facts. Input acceptance,
 //! capacity authorization, scheduling and SQL semantics remain with callers.
+//!
+//! Supply the complete typed binding from its semantic owner. `access` borrows
+//! actual storage, `decode` separates bottom coverage from logical row mapping,
+//! and `build` publishes the requested frozen layout. `hydrate` and `compact`
+//! plan storage before execution; a complete-batch boundary calls
+//! `HydratePlan::require_complete` rather than silently returning a prefix.
+//!
+//! Conversion contexts belong to the real serial caller (for example a driver
+//! or a COW operation). Borrow them across related synchronous calls and clear
+//! their cache when work exits. Efficiency budgets may skip reuse, never reject
+//! an otherwise legal value; published aliases retain their own source custody.
+//! Growth, Work and structure observations remain separate caller policies.
 
+// Design: ADR-0195 (docs/adr/ADR-0195-public-value-access-and-construction.md)
 pub mod access;
 pub(crate) mod arrow_raw;
 pub mod carrier;

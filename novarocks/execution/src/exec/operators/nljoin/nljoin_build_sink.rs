@@ -205,7 +205,9 @@ mod tests {
                 .unwrap();
         let control = runtime.error_state();
         let mut turn = TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        let mut ctx = StepContext::new(&control, &mut turn);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
         let step = sink.as_mut();
         assert!(matches!(
             step.try_push(&mut ctx, RawInput::for_test(chunk)),

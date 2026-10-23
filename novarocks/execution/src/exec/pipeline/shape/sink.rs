@@ -87,7 +87,9 @@ pub trait SinkKernel: Send {
         let control = state.error_state();
         let mut turn =
             crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        let mut ctx = StepContext::new(&control, &mut turn);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
         self.consume(&mut ctx, PreparedInput::for_test(chunk))
     }
     #[cfg(test)]
@@ -98,7 +100,9 @@ pub trait SinkKernel: Send {
         let control = state.error_state();
         let mut turn =
             crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        let mut ctx = StepContext::new(&control, &mut turn);
+        let mut value_conversions =
+            novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
         SinkKernel::finish(self, &mut ctx)
     }
 }

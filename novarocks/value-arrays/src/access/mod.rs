@@ -40,6 +40,7 @@ pub struct ByteSource<'a> {
     layout: ByteLayout,
     mapping: SourceMapping<'a>,
     len: usize,
+    storage: Option<&'a novarocks_type_contract::ValueTypeStorageLifetime>,
 }
 impl<'a> ByteSource<'a> {
     /// Dictionary-value layout is an explicit primitive parameter. Engine
@@ -69,6 +70,7 @@ impl<'a> ByteSource<'a> {
                 layout: frozen,
                 mapping: SourceMapping::Dictionary(keys),
                 len: input.len(),
+                storage: None,
             })
         } else {
             if input.data_type() != &frozen.data_type() {
@@ -80,8 +82,22 @@ impl<'a> ByteSource<'a> {
                 layout: frozen,
                 mapping: SourceMapping::Identity,
                 len: input.len(),
+                storage: None,
             })
         }
+    }
+    /// Carry real source and creator custody without retaining a runtime owner.
+    pub fn with_storage(
+        mut self,
+        storage: &'a novarocks_type_contract::ValueTypeStorageLifetime,
+    ) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+    pub(crate) fn storage(&self) -> novarocks_type_contract::ValueTypeStorageLifetime {
+        self.storage
+            .cloned()
+            .unwrap_or_else(novarocks_type_contract::ValueTypeStorageLifetime::pure)
     }
     pub fn constant(
         value: &'a ArrayRef,

@@ -53,6 +53,7 @@ pub fn data_type_layout_matches_carrier_observed<E: From<ValueTypeError>>(
     .ty(expected, actual, 1)
 }
 
+// Design: ADR-0195 (docs/adr/ADR-0195-public-value-access-and-construction.md)
 /// Frozen string layouts have one canonical dictionary-value storage layout.
 /// This is a storage fact, not a local consumer capability or wire identity.
 pub fn dictionary_value_layout(layout: &DataType) -> Option<DataType> {

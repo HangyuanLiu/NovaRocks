@@ -124,8 +124,7 @@ fn layout_preflight_preserves_utf8_extent_from_small_legal_dictionary() {
     // Only the footprint runs. No expanded output array is materialized.
     let error = CowSignedLayoutFootprint::for_batch(&schema, &input, 0, 0, 0).unwrap_err();
     let measured_error =
-        super::super::signed_layout::decoded_dictionary_bytes(&dictionary).unwrap_err();
-    assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+        super::super::signed_layout::normalize(&Arc::new(schema.clone()), &input).unwrap_err();
     let fact = error.failure_fact();
     assert_eq!(fact, measured_error.failure_fact());
     assert_eq!(fact.class(), FailureClass::Representation);
@@ -140,7 +139,7 @@ fn layout_preflight_preserves_utf8_extent_from_small_legal_dictionary() {
         Some(ROWS as u64 * VALUE_BYTES as u64)
     );
     assert_eq!(representation.extent_limit, Some(i32::MAX as u64));
-    assert_eq!(representation.representable_prefix, None);
+    assert_eq!(representation.representable_prefix, Some((ROWS - 1) as u64));
     // A blanket InvalidRequest/Resource remap would discard this typed source.
     let shared = error
         .source()

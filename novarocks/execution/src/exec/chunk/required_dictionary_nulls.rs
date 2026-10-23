@@ -155,25 +155,23 @@ mod tests {
     }
 
     fn assert_required_null(error: &ConstructionFailure) {
-        use novarocks_failure_contract::{FailureClass, FailureProjection};
-        use novarocks_functions::array_projection::{
-            ArrayProjectionFailure, ArrayProjectionViolation,
-        };
-        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
-        let mut original: &dyn std::error::Error = error;
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_value_arrays::{ValueError, ValueViolation};
+        let expected = ValueError::Invariant(ValueViolation::RequiredNull);
+        assert_eq!(error.failure_fact(), expected.failure_fact());
+        let mut source: &dyn std::error::Error = error;
         loop {
-            if let Some(cause) = original.downcast_ref::<ArrayProjectionFailure>() {
+            if let Some(original) = source.downcast_ref::<ValueError>() {
                 assert!(matches!(
-                    cause,
-                    ArrayProjectionFailure::Contract(
-                        ArrayProjectionViolation::UnmaskedRequiredNull
-                    )
+                    original,
+                    ValueError::Invariant(ValueViolation::RequiredNull)
                 ));
+                assert_eq!(original.failure_fact(), expected.failure_fact());
                 break;
             }
-            original = original
+            source = source
                 .source()
-                .expect("the original required-child cause");
+                .expect("the original value required-child cause");
         }
     }
 
@@ -368,7 +366,14 @@ mod tests {
             assert!(!actual.entries().fields()[1].is_nullable());
         }
         let failure = ingress(source.slice(1, 2), value).unwrap_err();
-        assert!(failure.to_string().contains("unmasked logical null"));
+        assert_eq!(
+            novarocks_failure_contract::FailureProjection::failure_fact(&failure),
+            novarocks_failure_contract::FailureProjection::failure_fact(
+                &novarocks_value_arrays::ValueError::Invariant(
+                    novarocks_value_arrays::ValueViolation::RequiredNull
+                )
+            )
+        );
     }
 
     #[test]
@@ -380,7 +385,11 @@ mod tests {
         let mut calls = 0;
         validate_required_dictionary_children::<crate::runtime::fragment::ExecutionFailure, _>(
             &array,
-            &value,
+            &TypedValueBinding::try_new(
+                value.clone(),
+                ValueLayout::try_new(array.data_type(), ValueTypeStorageLifetime::pure()).unwrap(),
+            )
+            .unwrap(),
             &mut |_| {
                 calls += 1;
                 Ok(())
@@ -393,14 +402,23 @@ mod tests {
             let error = validate_required_dictionary_children::<
                 crate::runtime::fragment::ExecutionFailure,
                 _,
-            >(&array, &value, &mut |_| {
-                observed += 1;
-                if observed == stop {
-                    Err(original.clone())
-                } else {
-                    Ok(())
-                }
-            })
+            >(
+                &array,
+                &TypedValueBinding::try_new(
+                    value.clone(),
+                    ValueLayout::try_new(array.data_type(), ValueTypeStorageLifetime::pure())
+                        .unwrap(),
+                )
+                .unwrap(),
+                &mut |_| {
+                    observed += 1;
+                    if observed == stop {
+                        Err(original.clone())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
             .unwrap_err();
             assert_eq!(error, original);
             assert_eq!(observed, stop);

@@ -439,6 +439,9 @@ fn normalize_owned_to_signed_selection(
     retained_selection: usize,
     assembly_bytes: usize,
     retention: Option<&ConnectorPayloadRetentionGuard>,
+    declarations: &[novarocks_type_contract::FunctionValueType],
+    conversions: &mut novarocks_value_arrays::decode::ValueConversionContext,
+    work: &mut dyn FnMut(usize) -> Result<(), ConnectorError>,
 ) -> Result<ConnectorRowMutationSourceBatch, ConnectorError> {
     let input = source.batch();
     let observed_input = ConnectorRowConversionFootprint::retained_batch_bytes(input)?;
@@ -449,12 +452,23 @@ fn normalize_owned_to_signed_selection(
         .checked_add(40 * 1024 * 1024)
         .and_then(|bytes| bytes.checked_add(MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES))
         .ok_or_else(|| invalid_match("COW layout coexistence accounting overflowed"))?;
-    let footprint = CowSignedLayoutFootprint::for_batch(
+    cast_footprint::preflight_inputs(schema, input, retained_selection, source_scratch)?;
+    let plan = signed_layout::CowSignedLayoutPlan::plan(
         schema,
         input,
+        declarations,
+        conversions,
+        cast_footprint::TRANSFORM_BYTES,
+        work,
+    )?;
+    let footprint = CowSignedLayoutFootprint::for_plans(
+        schema,
+        input,
+        &plan,
         retained_selection,
         source_scratch,
         other_live,
+        work,
     )?;
     tracing::trace!(
         input_bytes = footprint.input_bytes,
@@ -472,7 +486,7 @@ fn normalize_owned_to_signed_selection(
         )?,
         None => ConnectorRowMutationSourceBuilder::try_new(Arc::clone(schema))?,
     };
-    let normalized = signed_layout::normalize(schema, input)?;
+    let normalized = plan.execute(conversions, work)?;
     let mut columns = owner.children(schema.fields().len())?;
     let mut node = 0;
     for column in normalized.columns() {
@@ -500,20 +514,36 @@ pub struct RelayedCowSelectionCollector {
     decoder: CowSelectionStreamDecoder,
     schema: SchemaRef,
     collector: BoundedRowMutationMatchCollector,
+    declarations: Vec<novarocks_type_contract::FunctionValueType>,
+    conversions: novarocks_value_arrays::decode::ValueConversionContext,
     retention: Option<ConnectorPayloadRetentionGuard>,
 }
 
 impl RelayedCowSelectionCollector {
+    #[cfg(test)]
     pub fn try_new(
         context: ConnectorRequestContext,
         exec_mem_limit: Option<i64>,
         schema: SchemaRef,
+    ) -> Result<Self, ConnectorError> {
+        let declarations = signed_layout::fixture_declarations(&schema);
+        Self::try_new_declared(context, exec_mem_limit, schema, declarations)
+    }
+
+    pub fn try_new_declared(
+        context: ConnectorRequestContext,
+        exec_mem_limit: Option<i64>,
+        schema: SchemaRef,
+        declarations: Vec<novarocks_type_contract::FunctionValueType>,
     ) -> Result<Self, ConnectorError> {
         let collector = BoundedRowMutationMatchCollector::try_new_with_schema(
             context,
             exec_mem_limit,
             Arc::clone(&schema),
         )?;
+        signed_layout::validate_declarations(&schema, &declarations, &mut |_| {
+            collector.check_control()
+        })?;
         let record_bound = collector
             .max_bytes()
             .min(COW_SELECTION_MAX_RECORD_BYTES)
@@ -525,6 +555,8 @@ impl RelayedCowSelectionCollector {
             schema,
             collector,
             retention: None,
+            declarations,
+            conversions: novarocks_value_arrays::decode::ValueConversionContext::new(0),
         })
     }
 
@@ -558,6 +590,8 @@ impl RelayedCowSelectionCollector {
             schema,
             collector,
             retention,
+            declarations,
+            conversions,
         } = self;
         // Keep the collector's own error kind (cancellation, deadline,
         // budget) rather than flattening it through the assembly sink.
@@ -610,6 +644,9 @@ impl RelayedCowSelectionCollector {
                 collector.byte_count() as usize,
                 record.len(),
                 retention.as_ref(),
+                declarations,
+                conversions,
+                &mut |_| collector.check_control(),
             )
             .map_err(|error| {
                 let message = error.to_string();
@@ -623,13 +660,18 @@ impl RelayedCowSelectionCollector {
             })
         });
         if let Some(error) = collector_error {
+            conversions.clear();
             return Err(error);
+        }
+        if pushed.is_err() {
+            conversions.clear();
         }
         pushed.map_err(invalid_match)
     }
 
     /// The stream's End: no record may remain unfinished.
-    pub fn finish(self) -> Result<ConnectorRowMutationSelection, ConnectorError> {
+    pub fn finish(mut self) -> Result<ConnectorRowMutationSelection, ConnectorError> {
+        self.conversions.clear();
         self.assembly.finish().map_err(invalid_match)?;
         // Schema-only streams retain the decoder's holder until the whole
         // selection has its own holder, including its empty indices.
@@ -646,21 +688,57 @@ pub(crate) struct CowMatchRootConsumer {
 }
 
 impl CowMatchRootConsumer {
+    #[cfg(test)]
     pub(crate) fn try_new(
         context: ConnectorRequestContext,
         schema: SchemaRef,
         contract: ConnectorMutationMatchContract,
         intent: ConnectorRowMutationIntent,
     ) -> Result<Self, ConnectorError> {
+        let declarations = signed_layout::fixture_declarations(&schema);
+        Self::try_new_declared(context, schema, declarations, contract, intent)
+    }
+    #[cfg(test)]
+    pub(crate) fn try_new_with_capacity(
+        context: ConnectorRequestContext,
+        schema: SchemaRef,
+        contract: ConnectorMutationMatchContract,
+        intent: ConnectorRowMutationIntent,
+        binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Result<Self, ConnectorError> {
+        let declarations = signed_layout::fixture_declarations(&schema);
+        Self::try_new_declared_with_capacity(
+            context,
+            schema,
+            declarations,
+            contract,
+            intent,
+            binding,
+        )
+    }
+
+    pub(crate) fn try_new_declared(
+        context: ConnectorRequestContext,
+        schema: SchemaRef,
+        declarations: Vec<novarocks_type_contract::FunctionValueType>,
+        contract: ConnectorMutationMatchContract,
+        intent: ConnectorRowMutationIntent,
+    ) -> Result<Self, ConnectorError> {
         Ok(Self {
-            collector: RelayedCowSelectionCollector::try_new(context, None, schema)?,
+            collector: RelayedCowSelectionCollector::try_new_declared(
+                context,
+                None,
+                schema,
+                declarations,
+            )?,
             validator: RowMutationMatchValidator::try_new(contract, intent)?,
         })
     }
 
-    pub(crate) fn try_new_with_capacity(
+    pub(crate) fn try_new_declared_with_capacity(
         context: ConnectorRequestContext,
         schema: SchemaRef,
+        declarations: Vec<novarocks_type_contract::FunctionValueType>,
         contract: ConnectorMutationMatchContract,
         intent: ConnectorRowMutationIntent,
         binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
@@ -672,7 +750,7 @@ impl CowMatchRootConsumer {
         )
         .map_err(invalid_match)?;
         let guard = ConnectorPayloadRetentionGuard::new(window);
-        let mut consumer = Self::try_new(context, schema, contract, intent)?;
+        let mut consumer = Self::try_new_declared(context, schema, declarations, contract, intent)?;
         consumer.collector.collector.retention = Some(guard.clone());
         consumer.collector.retention = Some(guard);
         Ok(consumer)
@@ -1217,10 +1295,25 @@ mod tests {
             .push_body(&relayed_stream(std::slice::from_ref(&input)))
             .unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-        assert!(error.to_string().contains("required field contains NULL"));
-        use novarocks_failure_contract::{FailureClass, FailureProjection};
-        let expected = error.failure_fact();
-        assert_eq!(expected.class(), FailureClass::Data);
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        use novarocks_value_arrays::{ValueError, ValueViolation};
+        use std::error::Error;
+        let expected = ValueError::Invariant(ValueViolation::RequiredNull).failure_fact();
+        let assert_original = |error: &ConnectorError| {
+            assert_eq!(error.failure_fact(), expected);
+            let shared = error
+                .source()
+                .unwrap()
+                .downcast_ref::<SharedFailureCause>()
+                .unwrap();
+            let original = shared.downcast_ref::<ValueError>().unwrap();
+            assert!(matches!(
+                original,
+                ValueError::Invariant(ValueViolation::RequiredNull)
+            ));
+            assert_eq!(original.failure_fact(), expected);
+        };
+        assert_original(&error);
         // Use the real four-column mutation contract at the RootConsumer boundary.
         let signed = selection_schema();
         let mut input_fields = signed
@@ -1254,11 +1347,7 @@ mod tests {
         let error = consumer.push_body(&relayed_stream(&[input])).unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         assert_eq!(error.failure_fact(), expected);
-        assert!(
-            error
-                .to_string()
-                .contains("signed COW required field contains NULL")
-        );
+        assert_original(&error);
     }
 
     #[test]

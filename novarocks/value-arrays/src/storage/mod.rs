@@ -22,6 +22,12 @@ use arrow_buffer::Buffer;
 use arrow_schema::DataType;
 use std::ops::Range;
 
+/// General Arrow construction fact, shared with existing metadata observers.
+/// This does not admit a carrier or relax active-ancestor value validation.
+pub fn requires_default_validated_container(target: &DataType) -> bool {
+    crate::arrow_raw::requires_default_validated_container(target)
+}
+
 /// Additional knowledge supplied by the actual source owner. Neither field is
 /// inferred from an Arrow pointer or its declared capacity.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

@@ -62,6 +62,10 @@ fn rebox(source: &ArrayRef, target: &DataType) -> ArrayRef {
         | arrow_raw::StructuralRef::List64 { values, .. }
         | arrow_raw::StructuralRef::FixedSizeList { values, .. } => vec![values.clone()],
         arrow_raw::StructuralRef::Map { keys, values, .. } => vec![keys.clone(), values.clone()],
+        arrow_raw::StructuralRef::Union { fields, array } => fields
+            .iter()
+            .map(|(id, _)| array.child(id).clone())
+            .collect(),
         arrow_raw::StructuralRef::Leaf => panic!("container"),
     };
     arrow_raw::rebuild_structural(source, target, children).unwrap()
@@ -1040,7 +1044,11 @@ fn second_leaf_admission_refusal_precedes_every_output_materialization() {
         &mut |event| {
             if matches!(
                 event,
-                HydrateEvent::DecodeDictionary { .. } | HydrateEvent::RebuildArray { .. }
+                HydrateEvent::RebuildArray { .. }
+                    | HydrateEvent::ValueStructure {
+                        event: crate::control::ValueStructure::ByteArray { .. },
+                        ..
+                    }
             ) {
                 output_operations += 1;
             }
@@ -1279,5 +1287,114 @@ fn empty_dictionary_materialization_uses_planned_offsets_sentinel_and_view_geome
         if let Some(array) = output.as_any().downcast_ref::<StringArray>() {
             assert_eq!(array.value_offsets(), &[0]);
         }
+    }
+}
+
+#[test]
+fn dense_and_sparse_union_occurrences_keep_encoding_demands_and_reachable_required_rows() {
+    use arrow_array::{DictionaryArray, Int32Array, StringArray, UnionArray, types::Int32Type};
+    use arrow_schema::{UnionFields, UnionMode};
+    for dense in [false, true] {
+        let dictionary: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![Some(0), Some(1), None]),
+                Arc::new(StringArray::from(vec!["alpha", "beta"])) as ArrayRef,
+            )
+            .unwrap(),
+        );
+        let number: ArrayRef = Arc::new(Int32Array::from(vec![7, 8, 9]));
+        let fields = UnionFields::try_new(
+            [1, 4],
+            vec![
+                Arc::new(Field::new("encoded", dictionary.data_type().clone(), true)),
+                Arc::new(Field::new("number", DataType::Int32, false)),
+            ],
+        )
+        .unwrap();
+        let ids = if dense {
+            vec![1i8, 4, 1]
+        } else {
+            vec![1i8, 1, 4]
+        };
+        let source: ArrayRef = Arc::new(
+            UnionArray::try_new(
+                fields,
+                ids.into(),
+                dense.then(|| vec![0i32, 0, 1].into()),
+                vec![dictionary.clone(), number.clone()],
+            )
+            .unwrap(),
+        );
+        let mode = if dense {
+            UnionMode::Dense
+        } else {
+            UnionMode::Sparse
+        };
+        let target = DataType::Union(
+            UnionFields::try_new(
+                [1, 4],
+                vec![
+                    Arc::new(Field::new("encoded", DataType::Utf8, false)),
+                    Arc::new(Field::new("number", DataType::Int32, false)),
+                ],
+            )
+            .unwrap(),
+            mode,
+        );
+        let declaration = binding(target.clone(), true);
+        let mut context = ValueConversionContext::default();
+        let mut demands = Vec::new();
+        let planned = HydratePlan::plan_with_options_observed(
+            &source,
+            &declaration,
+            HydrateOptions {
+                projection: HydrateProjection::FrozenNamesAndNullability,
+                dictionary_value_layout: None,
+            },
+            &mut context,
+            &mut |path, _| {
+                demands.push(path.to_vec());
+                false
+            },
+            &mut |_| Ok::<_, Infallible>(()),
+            &mut |_| Ok(()),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        planned.require_complete().unwrap();
+        assert_eq!(demands, vec![vec![HydratePathStep::UnionField(1)]]);
+        let mut copy_extents = 0usize;
+        planned
+            .visit_output_storage_observed(
+                &mut |part| {
+                    if let PlannedOutputStorage::Buffer { bytes, .. } = part {
+                        copy_extents += bytes;
+                    }
+                    Ok::<_, Infallible>(())
+                },
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        let output = execute(&planned, &mut context);
+        output.to_data().validate_full().unwrap();
+        assert_eq!(output.data_type(), &target);
+        let union = output.as_any().downcast_ref::<UnionArray>().unwrap();
+        let values = union
+            .child(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            values.iter().collect::<Vec<_>>(),
+            vec![Some("alpha"), Some("beta"), Some("")]
+        );
+        assert!(
+            Arc::ptr_eq(union.child(4), &number) || union.child(4).to_data() == number.to_data()
+        );
+        assert!(
+            copy_extents
+                >= values.value_data().len() + values.offsets().inner().len() * 4 + 3 * 4 + 3
+        );
+        assert!(matches!(dictionary.data_type(), DataType::Dictionary(..)));
     }
 }

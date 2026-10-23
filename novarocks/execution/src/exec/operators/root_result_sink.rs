@@ -907,7 +907,11 @@ mod tests {
         let control = crate::runtime::runtime_state::RuntimeErrorState::default();
         let mut work =
             crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        action(&mut StepContext::new(&control, &mut work))
+        action(&mut StepContext::new(
+            &control,
+            &mut work,
+            &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
+        ))
     }
     fn reserve(operator: &mut Box<dyn Operator>) -> ExecutionResult<UpstreamPull> {
         operator.activate(&RuntimeState::default())?;
@@ -2080,7 +2084,11 @@ mod tests {
         let control = state.error_state();
         let mut work =
             crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        action(&mut StepContext::new(&control, &mut work))
+        action(&mut StepContext::new(
+            &control,
+            &mut work,
+            &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
+        ))
     }
     fn accept_exit_input(sink: &mut Box<dyn Operator>, state: &RuntimeState, chunk: Chunk) {
         let permit = input_exit_context(state, |ctx| match sink.reserve_upstream(ctx).unwrap() {

@@ -111,7 +111,11 @@ fn with_context<T>(state: &RuntimeState, action: impl FnOnce(&mut StepContext<'_
     let error = state.error_state();
     let mut work =
         crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-    action(&mut StepContext::new(&error, &mut work))
+    action(&mut StepContext::new(
+        &error,
+        &mut work,
+        &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
+    ))
 }
 fn apply(
     processor: &mut CompiledGenerateSeriesProcessor,
@@ -206,7 +210,8 @@ fn compiled_generate_series_control_finishing_owes_exact_output_then_latches_fin
     let (kernel, chunk) = instance([1, 9, 2], control);
     let mut processor = Transform::hydrating(kernel);
     let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
-    let mut ctx = StepContext::new(&error, &mut work);
+    let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+    let mut ctx = StepContext::new(&error, &mut work, &mut value_conversions);
     assert!(matches!(processor.initial_step(), NextStep::NeedInput));
     assert!(matches!(
         processor.try_push(&mut ctx, RawInput::for_test(chunk)),

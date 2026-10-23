@@ -160,8 +160,10 @@ fn check_exact_inner(
         (Timestamp(_, _), Timestamp(_, _)) | (Utf8, Binary) | (Binary, Utf8) => {
             Err(mismatch(ScalarMismatch, path))
         }
-        (Utf8 | LargeUtf8, Dictionary(key, value))
-            if key.as_ref() == &Int32 && value.as_ref() == expected =>
+        (Utf8 | LargeUtf8 | Utf8View, Dictionary(key, value))
+            if key.as_ref() == &Int32
+                && novarocks_type_contract::dictionary_value_layout(expected).as_ref()
+                    == Some(value.as_ref()) =>
         {
             Ok(())
         }

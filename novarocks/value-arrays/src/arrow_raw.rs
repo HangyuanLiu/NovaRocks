@@ -764,6 +764,10 @@ pub(crate) enum StructuralRef<'a> {
         fields: &'a arrow_schema::Fields,
         children: &'a [ArrayRef],
     },
+    Union {
+        fields: &'a arrow_schema::UnionFields,
+        array: &'a arrow_array::UnionArray,
+    },
     List32 {
         field: &'a arrow_schema::FieldRef,
         offsets: &'a arrow_buffer::OffsetBuffer<i32>,
@@ -795,6 +799,10 @@ pub(crate) fn structural_view(source: &ArrayRef) -> Result<StructuralRef<'_>, Va
         DataType::Struct(fields) => StructuralRef::Struct {
             fields,
             children: concrete::<StructArray>(source.as_ref())?.columns(),
+        },
+        DataType::Union(fields, _) => StructuralRef::Union {
+            fields,
+            array: concrete::<UnionArray>(source.as_ref())?,
         },
         DataType::List(field) => {
             let a = concrete::<ListArray>(source.as_ref())?;
@@ -836,6 +844,34 @@ pub(crate) fn structural_view(source: &ArrayRef) -> Result<StructuralRef<'_>, Va
     })
 }
 
+/// Arrow's high-level constructors impose extra logical masks for these
+/// required encoded children. Default validated ArrayData preserves the
+/// original physical contract already proved under active ancestors.
+pub(crate) fn requires_default_validated_container(target: &arrow_schema::DataType) -> bool {
+    use arrow_schema::{DataType, Field};
+
+    let extra_mask = |field: &Field| {
+        !field.is_nullable()
+            && matches!(
+                field.data_type(),
+                DataType::Dictionary(_, _)
+                    | DataType::RunEndEncoded(_, _)
+                    | DataType::Union(_, _)
+                    | DataType::Null
+            )
+    };
+    match target {
+        DataType::Struct(fields) => fields.iter().any(|field| extra_mask(field)),
+        DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
+            extra_mask(field)
+        }
+        DataType::Map(entries, _) => {
+            matches!(entries.data_type(), DataType::Struct(fields) if fields.iter().any(|field| extra_mask(field)))
+        }
+        _ => false,
+    }
+}
+
 /// Rebox admitted containers with their original offset/null geometry. The
 /// caller has observed the actual wrapper/field work before entering here.
 pub(crate) fn rebuild_structural(
@@ -843,7 +879,10 @@ pub(crate) fn rebuild_structural(
     target: &arrow_schema::DataType,
     children: Vec<ArrayRef>,
 ) -> Result<ArrayRef, ValueError> {
-    use arrow_array::{MapArray, make_array};
+    use arrow_array::{
+        FixedSizeListArray, LargeListArray, ListArray, MapArray, StructArray, UnionArray,
+        make_array,
+    };
     use arrow_schema::DataType;
     let same_shape = match (source.data_type(), target) {
         (arrow_schema::DataType::Struct(a), arrow_schema::DataType::Struct(b)) => {
@@ -856,12 +895,98 @@ pub(crate) fn rebuild_structural(
             arrow_schema::DataType::FixedSizeList(_, a),
             arrow_schema::DataType::FixedSizeList(_, b),
         ) => a == b,
+        (DataType::Union(a, am), DataType::Union(b, bm)) => {
+            am == bm && a.iter().map(|(id, _)| id).eq(b.iter().map(|(id, _)| id))
+        }
         _ => false,
     };
     if !same_shape {
         return Err(ValueError::Invariant(ValueViolation::Structure));
     }
+    if !requires_default_validated_container(target) {
+        let nulls = source.nulls().cloned();
+        let output: Option<ArrayRef> = match (target, structural_view(source)?) {
+            (DataType::Struct(fields), _) => Some(Arc::new(StructArray::try_new_with_length(
+                fields.clone(),
+                children,
+                nulls,
+                source.len(),
+            )?)),
+            (DataType::List(field), StructuralRef::List32 { offsets, .. })
+                if children.len() == 1 =>
+            {
+                Some(Arc::new(ListArray::try_new(
+                    field.clone(),
+                    offsets.clone(),
+                    children
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| ValueError::Invariant(ValueViolation::Structure))?,
+                    nulls,
+                )?))
+            }
+            (DataType::LargeList(field), StructuralRef::List64 { offsets, .. })
+                if children.len() == 1 =>
+            {
+                Some(Arc::new(LargeListArray::try_new(
+                    field.clone(),
+                    offsets.clone(),
+                    children
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| ValueError::Invariant(ValueViolation::Structure))?,
+                    nulls,
+                )?))
+            }
+            (DataType::FixedSizeList(field, width), _) if children.len() == 1 => {
+                Some(Arc::new(FixedSizeListArray::try_new_with_length(
+                    field.clone(),
+                    *width,
+                    children
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| ValueError::Invariant(ValueViolation::Structure))?,
+                    nulls,
+                    source.len(),
+                )?))
+            }
+            (DataType::Union(fields, _), StructuralRef::Union { array, .. }) => {
+                Some(Arc::new(UnionArray::try_new(
+                    fields.clone(),
+                    array.type_ids().clone(),
+                    array.offsets().cloned(),
+                    children,
+                )?))
+            }
+            (DataType::Map(entries, sorted), StructuralRef::Map { offsets, .. }) => {
+                let map = concrete::<MapArray>(source.as_ref())?;
+                let DataType::Struct(fields) = entries.data_type() else {
+                    return Err(ValueError::Invariant(ValueViolation::Structure));
+                };
+                let values = StructArray::try_new_with_length(
+                    fields.clone(),
+                    children,
+                    map.entries().nulls().cloned(),
+                    map.entries().len(),
+                )?;
+                Some(Arc::new(MapArray::try_new(
+                    entries.clone(),
+                    offsets.clone(),
+                    values,
+                    nulls,
+                    *sorted,
+                )?))
+            }
+            _ => None,
+        };
+        // Every supported ordinary branch owns the supplied child vector;
+        // unsupported shapes are rejected, never retried under weaker checks.
+        return output.ok_or(ValueError::Invariant(ValueViolation::Structure));
+    }
     let child_data = match target {
+        DataType::Union(fields, _) if fields.len() == children.len() => {
+            children.into_iter().map(|child| child.to_data()).collect()
+        }
         DataType::Struct(fields) if fields.len() == children.len() => {
             children.iter().map(|c| c.to_data()).collect()
         }
@@ -945,6 +1070,22 @@ pub(crate) fn metadata_free_type_rebuild(
                     .map(|((a, f), t)| field(a, f, t))
                     .collect::<Result<_, _>>()?,
             )
+        }
+        (DataType::Union(actual, am), DataType::Union(fields, mode))
+            if am == mode && actual.len() == fields.len() && fields.len() == children.len() =>
+        {
+            let mut ids = Vec::with_capacity(fields.len());
+            let mut output = Vec::with_capacity(fields.len());
+            for (((aid, actual), (id, frozen)), child) in
+                actual.iter().zip(fields.iter()).zip(children)
+            {
+                if aid != id {
+                    return Err(invalid());
+                }
+                ids.push(id);
+                output.push(field(actual, frozen, child)?);
+            }
+            DataType::Union(arrow_schema::UnionFields::try_new(ids, output)?, *mode)
         }
         (DataType::List(a), DataType::List(f)) if children.len() == 1 => {
             DataType::List(field(a, f, &children[0])?)

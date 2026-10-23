@@ -335,6 +335,7 @@ pub(crate) fn hydrate_for_downstream_with_factory(
     chunk: &Chunk,
     downstream: &(impl InputEncodingPolicy + ?Sized),
     factory: Option<&dyn InputConstructionFactory>,
+    conversions: &mut novarocks_value_arrays::decode::ValueConversionContext,
 ) -> ExecutionResult<Chunk> {
     if chunk.chunk_schema().is_typed() {
         let mut accepts =
@@ -361,17 +362,25 @@ pub(crate) fn hydrate_for_downstream_with_factory(
         return crate::exec::chunk::hydrate_dictionary_columns_owned_observed(
             chunk,
             owner.storage_lifetime(),
+            conversions,
             accepts,
             |occurrence, path, step| owner.observe(occurrence, path, step),
             |layout| owner.request(layout),
+            |units| factory.observe_input_work(units),
         )
         .map_err(Into::into);
     }
-    // Explicit expansion adapter for producers not yet emitting typed Chunks.
-    crate::exec::chunk::hydrate_dictionary_columns_except(chunk, |slot_id, dt| {
-        downstream.retains_encoded_column(slot_id, dt)
-    })
-    .map_err(Into::into)
+    if chunk
+        .columns()
+        .iter()
+        .any(|array| crate::exec::chunk::contains_dictionary(array.data_type()))
+    {
+        return Err(ConstructionFailure::from(
+            crate::exec::chunk::ChunkConstructionFailure::missing_hydration_binding(),
+        )
+        .into());
+    }
+    Ok(chunk.clone())
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -635,7 +644,7 @@ mod typed_input_construction_tests {
             nested: false,
         };
         assert!(
-            matches!(hydrate_for_downstream_with_factory(&source, &op, op.factory.as_ref().map(|factory| factory as &dyn InputConstructionFactory)), Err(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)))
+            matches!(hydrate_for_downstream_with_factory(&source, &op, op.factory.as_ref().map(|factory| factory as &dyn InputConstructionFactory), &mut novarocks_value_arrays::decode::ValueConversionContext::default()), Err(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)))
         );
     }
     #[test]
@@ -649,6 +658,7 @@ mod typed_input_construction_tests {
             op.factory
                 .as_ref()
                 .map(|factory| factory as &dyn InputConstructionFactory),
+            &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
         )
         .unwrap();
         let array = result.columns()[0]
@@ -701,6 +711,7 @@ mod typed_input_construction_tests {
             op.factory
                 .as_ref()
                 .map(|factory| factory as &dyn InputConstructionFactory),
+            &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
         )
         .unwrap();
         assert!(Arc::ptr_eq(&source.columns()[0], &result.columns()[0]));
@@ -729,7 +740,7 @@ mod typed_input_construction_tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let op = consumer(&drops, false, true);
         assert!(
-            matches!(hydrate_for_downstream_with_factory(&source, &op, op.factory.as_ref().map(|factory| factory as &dyn InputConstructionFactory)), Err(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Kernel(novarocks_functions::KernelFailure::ResourceExhausted)))
+            matches!(hydrate_for_downstream_with_factory(&source, &op, op.factory.as_ref().map(|factory| factory as &dyn InputConstructionFactory), &mut novarocks_value_arrays::decode::ValueConversionContext::default()), Err(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Kernel(novarocks_functions::KernelFailure::ResourceExhausted)))
         );
         assert_eq!(
             op.factory.as_ref().unwrap().requests.load(Ordering::SeqCst),
@@ -748,6 +759,7 @@ mod typed_input_construction_tests {
             op.factory
                 .as_ref()
                 .map(|factory| factory as &dyn InputConstructionFactory),
+            &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
         )
         .unwrap();
         let second = hydrate_for_downstream_with_factory(
@@ -756,6 +768,7 @@ mod typed_input_construction_tests {
             op.factory
                 .as_ref()
                 .map(|factory| factory as &dyn InputConstructionFactory),
+            &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
         )
         .unwrap();
         assert_eq!(
@@ -791,7 +804,7 @@ mod typed_input_construction_tests {
             let mut op = consumer(&drops, false, false);
             op.factory.as_mut().unwrap().control_error = Some(cause.clone());
             assert!(
-                matches!(hydrate_for_downstream_with_factory(&source, &op, op.factory.as_ref().map(|factory| factory as &dyn InputConstructionFactory)), Err(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Construction(ConstructionFailure::Control(actual)) if *actual == cause))
+                matches!(hydrate_for_downstream_with_factory(&source, &op, op.factory.as_ref().map(|factory| factory as &dyn InputConstructionFactory), &mut novarocks_value_arrays::decode::ValueConversionContext::default()), Err(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Construction(ConstructionFailure::Control(actual)) if *actual == cause))
             );
             assert_eq!(
                 op.factory.as_ref().unwrap().begins.load(Ordering::SeqCst),
@@ -811,11 +824,9 @@ mod tests {
         Chunk, InputEncodingPolicy, dictionary_carrier_stats, forward_observable,
         hydrate_for_downstream_with_factory,
     };
-    use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
     use crate::exec::pipeline::schedule::observer::Observable;
     use arrow::array::{Array, ArrayRef, DictionaryArray, StringArray};
-    use arrow::datatypes::{DataType, Field, Int32Type};
-    use arrow::record_batch::RecordBatch;
+    use arrow::datatypes::{DataType, Int32Type};
     use novarocks_types::SlotId;
 
     struct StubOp;
@@ -845,30 +856,54 @@ mod tests {
     }
 
     fn two_dictionary_column_chunk() -> Chunk {
-        let slot1 = SlotId::new(1);
-        let slot2 = SlotId::new(2);
-        let column1 = dict_utf8_with_nulls_and_empty();
-        let column2 = dict_utf8_with_nulls_and_empty();
-        let chunk_schema = Arc::new(
-            ChunkSchema::try_new(vec![
-                ChunkSlotSchema::new_with_field(
-                    slot1,
-                    Field::new("status_1", column1.data_type().clone(), true),
+        use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+        use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+        let columns = vec![
+            dict_utf8_with_nulls_and_empty(),
+            dict_utf8_with_nulls_and_empty(),
+        ];
+        let storage = ValueTypeStorageLifetime::pure();
+        // Semantics and frozen layouts are authored independently. Fields
+        // describe the actual encoded batch, never a compiled static layout.
+        let declaration = FunctionValueType::new(DataType::Utf8, true);
+        let slots = columns
+            .iter()
+            .zip(["status_1", "status_2"])
+            .enumerate()
+            .map(|(i, (array, name))| {
+                ChunkSlotSchema::try_new_typed(
+                    SlotId::new(i as u32 + 1),
+                    Arc::new(arrow::datatypes::Field::new(
+                        name,
+                        array.data_type().clone(),
+                        true,
+                    )),
+                    declaration.typed_binding().clone(),
                     None,
-                    None,
-                ),
-                ChunkSlotSchema::new_with_field(
-                    slot2,
-                    Field::new("status_2", column2.data_type().clone(), true),
-                    None,
-                    None,
-                ),
-            ])
-            .expect("chunk schema"),
-        );
-        let batch = RecordBatch::try_new(chunk_schema.arrow_schema_ref(), vec![column1, column2])
-            .expect("record batch");
-        Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk")
+                    storage.clone(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let schema = Arc::new(ChunkSchema::try_new_typed(slots, storage).unwrap());
+        let factory = fixture_factory();
+        let owner = factory.begin_typed_construction(&schema).unwrap();
+        Chunk::try_new_typed_with_columns_owned_observed::<super::ConstructionFailure, _>(
+            schema,
+            columns,
+            4,
+            owner.storage_lifetime(),
+            |step| owner.observe(0, &[], step),
+        )
+        .unwrap()
+    }
+    fn fixture_factory() -> Arc<dyn super::InputConstructionFactory> {
+        crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root("typed receiver fixture"),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        )
+        .unwrap()
     }
 
     fn assert_utf8_values(column: &ArrayRef) {
@@ -898,8 +933,13 @@ mod tests {
         let chunk = two_dictionary_column_chunk();
         let op = StubOp;
 
-        let hydrated =
-            hydrate_for_downstream_with_factory(&chunk, &op, None).expect("hydrate for downstream");
+        let hydrated = hydrate_for_downstream_with_factory(
+            &chunk,
+            &op,
+            Some(fixture_factory().as_ref()),
+            &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
+        )
+        .expect("hydrate for downstream");
 
         assert_eq!(hydrated.columns()[0].data_type(), &DataType::Utf8);
         assert_eq!(hydrated.columns()[1].data_type(), &DataType::Utf8);
@@ -928,8 +968,13 @@ mod tests {
         let chunk = two_dictionary_column_chunk();
         let op = KeepSlot1Op;
 
-        let hydrated =
-            hydrate_for_downstream_with_factory(&chunk, &op, None).expect("hydrate for downstream");
+        let hydrated = hydrate_for_downstream_with_factory(
+            &chunk,
+            &op,
+            Some(fixture_factory().as_ref()),
+            &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
+        )
+        .expect("hydrate for downstream");
 
         assert!(matches!(
             hydrated.columns()[0].data_type(),

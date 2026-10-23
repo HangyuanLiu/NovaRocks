@@ -59,6 +59,9 @@ impl Node {
         for (index, node) in self.children.iter().enumerate() {
             path[depth] = match arrow_raw::structural_view(&self.source)? {
                 StructuralRef::Struct { .. } => HydratePathStep::StructField(index),
+                StructuralRef::Union { fields, .. } => {
+                    HydratePathStep::UnionField(fields.iter().nth(index).ok_or_else(invalid)?.0)
+                }
                 StructuralRef::Map { .. } => {
                     if index == 0 {
                         HydratePathStep::MapKey
@@ -160,14 +163,6 @@ impl Node {
             .decode_plan
             .as_ref()
             .map(|plan| context.decode_planned(plan));
-        if decoded.is_none() && matches!(self.source.data_type(), DataType::Dictionary(..)) {
-            observe(HydrateEvent::DecodeDictionary {
-                path,
-                source: &self.source,
-                target: binding.data_type(),
-            })
-            .map_err(ValueFailure::Caller)?;
-        }
         let mut builder = ValueBuilder::new(layout);
         builder.reserve_planned_observed(
             self.source.len(),
@@ -206,13 +201,11 @@ impl Node {
                 WriteFailure::Full => ValueError::Invariant(ValueViolation::RowTransaction).into(),
             })?;
         }
-        observe(HydrateEvent::RebuildArray {
-            path,
-            source: &self.source,
-            target: binding.data_type(),
-        })
-        .map_err(ValueFailure::Caller)?;
-        let result = builder.finish_observed(growth, work)?.array;
+        let result = builder
+            .finish_structured_observed(growth, work, &mut |event| {
+                observe(HydrateEvent::ValueStructure { path, event })
+            })?
+            .array;
         observe(HydrateEvent::OpaqueOperationFinished).map_err(ValueFailure::Caller)?;
         Ok(result)
     }
@@ -230,6 +223,10 @@ pub(super) fn local_metadata_changes(
         (DataType::Struct(a), DataType::Struct(b)) if a.len() == b.len() => {
             a.iter().zip(b).any(|(a, b)| field_changes(a, b))
         }
+        (DataType::Union(a, am), DataType::Union(b, bm)) if am == bm && a.len() == b.len() => a
+            .iter()
+            .zip(b.iter())
+            .any(|((ai, a), (bi, b))| ai != bi || field_changes(a, b)),
         (DataType::List(a), DataType::List(b))
         | (DataType::LargeList(a), DataType::LargeList(b)) => field_changes(a, b),
         (DataType::FixedSizeList(a, aw), DataType::FixedSizeList(b, bw)) if aw == bw => {
@@ -254,6 +251,16 @@ fn observe_fields<E>(
     match target {
         DataType::Struct(fields) => {
             for (field, child) in fields.iter().zip(children) {
+                observe(HydrateEvent::RebuildField {
+                    path,
+                    source: field,
+                    target: child.data_type(),
+                })
+                .map_err(ValueFailure::Caller)?;
+            }
+        }
+        DataType::Union(fields, _) => {
+            for ((_, field), child) in fields.iter().zip(children) {
                 observe(HydrateEvent::RebuildField {
                     path,
                     source: field,

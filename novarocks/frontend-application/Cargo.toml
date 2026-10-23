@@ -18,6 +18,7 @@ mem-1-m07-exact-mysql-write = ["novarocks-mysql-adapter/mem-1-m07-exact-mysql-wr
 
 [dependencies]
 novarocks-type-contract.workspace = true
+novarocks-value-arrays.workspace = true
 allocator-api2.workspace = true
 hashbrown.workspace = true
 anyhow.workspace = true

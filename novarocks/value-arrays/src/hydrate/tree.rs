@@ -123,6 +123,11 @@ impl Node {
                     push(input, index, HydratePathStep::StructField(index))?;
                 }
             }
+            StructuralRef::Union { fields, array } => {
+                for (index, (id, _)) in fields.iter().enumerate() {
+                    push(array.child(id), index, HydratePathStep::UnionField(id))?;
+                }
+            }
             StructuralRef::List32 { values, .. }
             | StructuralRef::List64 { values, .. }
             | StructuralRef::FixedSizeList { values, .. } => {
@@ -258,6 +263,7 @@ impl Node {
         &mut self,
         binding: BorrowedTypedValueBinding<'_>,
         context: &mut ValueConversionContext,
+        storage: &novarocks_type_contract::ValueTypeStorageLifetime,
         path: &mut [HydratePathStep],
         depth: usize,
         growth: &mut Growth<'_, E>,
@@ -269,32 +275,28 @@ impl Node {
                 &self.source,
                 self.layout.ok_or_else(invalid)?,
                 self.dictionary_layout,
-            )?;
-            let event = if matches!(self.source.data_type(), DataType::Dictionary(..)) {
-                HydrateEvent::DecodeDictionary {
-                    path: &path[..depth],
-                    source: &self.source,
-                    target: binding.data_type(),
-                }
-            } else {
-                HydrateEvent::RebuildArray {
-                    path: &path[..depth],
-                    source: &self.source,
-                    target: binding.data_type(),
-                }
-            };
-            observe(event).map_err(ValueFailure::Caller)?;
-            self.decode_plan = Some(context.plan_decode_observed(
+            )?
+            .with_storage(storage);
+            self.decode_plan = Some(context.plan_decode_structured_observed(
                 &source,
                 &crate::reachability::ReachableRows::Selection(&self.active),
                 growth,
                 work,
+                &mut |event| {
+                    observe(HydrateEvent::ValueStructure {
+                        path: &path[..depth],
+                        event,
+                    })
+                },
             )?);
             observe(HydrateEvent::OpaqueOperationFinished).map_err(ValueFailure::Caller)?;
         }
         for (index, node) in self.children.iter_mut().enumerate() {
             path[depth] = match arrow_raw::structural_view(&self.source)? {
                 StructuralRef::Struct { .. } => HydratePathStep::StructField(index),
+                StructuralRef::Union { fields, .. } => {
+                    HydratePathStep::UnionField(fields.iter().nth(index).ok_or_else(invalid)?.0)
+                }
                 StructuralRef::Map { .. } => {
                     if index == 0 {
                         HydratePathStep::MapKey
@@ -307,12 +309,112 @@ impl Node {
             node.prepare_decode(
                 child(binding, index)?,
                 context,
+                storage,
                 path,
                 depth + 1,
                 growth,
                 work,
                 observe,
             )?;
+        }
+        Ok(())
+    }
+    pub(super) fn visit_output_storage<E>(
+        &self,
+        binding: BorrowedTypedValueBinding<'_>,
+        visit: &mut impl FnMut(super::PlannedOutputStorage) -> Result<(), E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<(), ValueFailure<E>> {
+        use super::PlannedOutputStorage;
+        if self.keep {
+            return crate::storage::visit_borrowed(self.source.as_ref(), &mut |node| {
+                work(1).map_err(ValueFailure::Caller)?;
+                let (rows, source_offset) = match &node {
+                    crate::storage::BorrowedNode::Array { array, .. } => {
+                        (array.len(), array.offset())
+                    }
+                    crate::storage::BorrowedNode::RunEnds { .. } => return Err(invalid().into()),
+                };
+                visit(PlannedOutputStorage::Node {
+                    rows,
+                    source_offset,
+                })
+                .map_err(ValueFailure::Caller)?;
+                if let Some(nulls) = node.nulls() {
+                    visit(PlannedOutputStorage::Buffer {
+                        bytes: nulls.inner().inner().len(),
+                        newly_owned: false,
+                    })
+                    .map_err(ValueFailure::Caller)?;
+                }
+                for index in 0..node.data_buffers() {
+                    visit(PlannedOutputStorage::Buffer {
+                        bytes: node.buffer(index)?.len(),
+                        newly_owned: false,
+                    })
+                    .map_err(ValueFailure::Caller)?;
+                }
+                Ok(())
+            })
+            .map_err(|error| match error {
+                ValueFailure::Value(error) => ValueFailure::Value(error),
+                ValueFailure::Caller(error) => error,
+            });
+        }
+        work(1).map_err(ValueFailure::Caller)?;
+        visit(PlannedOutputStorage::Node {
+            rows: self.source.len(),
+            source_offset: self.source.offset(),
+        })
+        .map_err(ValueFailure::Caller)?;
+        let mut buffer = |bytes, newly_owned| {
+            visit(PlannedOutputStorage::Buffer { bytes, newly_owned }).map_err(ValueFailure::Caller)
+        };
+        if self.convert {
+            let layout = self.layout.ok_or_else(invalid)?;
+            // The builder may eliminate an all-valid bitmap; the bound remains
+            // valid for nullable keys, NULL values and inactive ancestors.
+            if binding.value_type().nullable() {
+                buffer(self.source.len().div_ceil(8), true)?;
+            }
+            if layout.is_view() {
+                buffer(self.source.len().checked_mul(16).ok_or_else(invalid)?, true)?;
+                buffer(self.planned_payload, true)?;
+                if let Some(plan) = &self.decode_plan {
+                    let bottom = crate::storage::borrowed_node(plan.decoded().bottom().as_ref())?;
+                    for index in 1..bottom.data_buffers() {
+                        buffer(bottom.buffer(index)?.len(), false)?;
+                    }
+                }
+            } else {
+                let width = if matches!(layout, ByteLayout::Utf8 | ByteLayout::Binary) {
+                    4
+                } else {
+                    8
+                };
+                buffer(
+                    self.source
+                        .len()
+                        .checked_add(1)
+                        .and_then(|n| n.checked_mul(width))
+                        .ok_or_else(invalid)?,
+                    true,
+                )?;
+                buffer(self.planned_payload, true)?;
+            }
+            return Ok(());
+        }
+        let node = crate::storage::borrowed_node(self.source.as_ref())?;
+        if !self.clear_nulls
+            && let Some(nulls) = node.nulls()
+        {
+            buffer(nulls.inner().inner().len(), false)?;
+        }
+        for index in 0..node.data_buffers() {
+            buffer(node.buffer(index)?.len(), false)?;
+        }
+        for (index, child_node) in self.children.iter().enumerate() {
+            child_node.visit_output_storage(child(binding, index)?, visit, work)?;
         }
         Ok(())
     }
@@ -441,6 +543,20 @@ pub(super) fn child_rows<E>(
         }
     };
     match arrow_raw::structural_view(source)? {
+        StructuralRef::Union { fields, array } => {
+            let id = array.type_id(row);
+            let index = fields
+                .iter()
+                .position(|(candidate, _)| candidate == id)
+                .ok_or_else(invalid)?;
+            let offset = array.value_offset(row);
+            let (start, end) = range(
+                offset,
+                offset.checked_add(1).ok_or_else(invalid)?,
+                array.child(id).len(),
+            )?;
+            visit(index, start, end)?;
+        }
         StructuralRef::Leaf => {}
         StructuralRef::Struct { children, .. } => {
             for (index, child) in children.iter().enumerate() {

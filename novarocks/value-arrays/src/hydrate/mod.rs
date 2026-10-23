@@ -38,6 +38,7 @@ pub use validation::validate_required_observed;
 pub enum HydratePathStep {
     ListItem,
     StructField(usize),
+    UnionField(i8),
     MapKey,
     MapValue,
 }
@@ -47,16 +48,20 @@ pub enum HydratePathStep {
 #[derive(Clone, Copy, Debug)]
 pub enum HydrateEvent<'a> {
     InspectType(&'a DataType),
+    InspectDictionaryRows {
+        source: &'a ArrayRef,
+        row_start: usize,
+        row_count: usize,
+    },
+    ValueStructure {
+        path: &'a [HydratePathStep],
+        event: crate::control::ValueStructure,
+    },
     InspectField(&'a Field),
     SliceArray {
         source: &'a ArrayRef,
         offset: usize,
         length: usize,
-    },
-    DecodeDictionary {
-        path: &'a [HydratePathStep],
-        source: &'a ArrayRef,
-        target: &'a DataType,
     },
     RebuildArray {
         path: &'a [HydratePathStep],
@@ -94,6 +99,15 @@ pub struct HydrateRequirements {
     pub logical_bytes: u128,
 }
 
+/// Borrowed output geometry from a frozen plan, before any output is built.
+/// Buffer lengths are conservative copy extents, never owner capacities. A
+/// newly materialized byte array may omit an all-valid bitmap at execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlannedOutputStorage {
+    Node { rows: usize, source_offset: usize },
+    Buffer { bytes: usize, newly_owned: bool },
+}
+
 /// Caller-authored representation projection. Signed external boundaries may
 /// freeze new ordinal field names and NULL declarations; carrier semantics and
 /// value parameters remain exact in both modes.
@@ -127,6 +141,7 @@ pub struct HydratePlan {
     requirements: HydrateRequirements,
     claims: Vec<AllocationClaim>,
     claim_counter_layout: Option<Layout>,
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
 impl HydratePlan {
     pub fn plan_observed<E>(
@@ -154,6 +169,29 @@ impl HydratePlan {
         binding: &TypedValueBinding,
         options: HydrateOptions,
         context: &mut ValueConversionContext,
+        keep_encoded: &mut impl FnMut(&[HydratePathStep], &DataType) -> bool,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+        observe: &mut HydrateObserver<'_, E>,
+    ) -> Result<Self, ValueFailure<E>> {
+        Self::plan_with_options_and_storage_observed(
+            source,
+            binding,
+            options,
+            context,
+            &novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            keep_encoded,
+            growth,
+            work,
+            observe,
+        )
+    }
+    pub fn plan_with_options_and_storage_observed<E>(
+        source: &ArrayRef,
+        binding: &TypedValueBinding,
+        options: HydrateOptions,
+        context: &mut ValueConversionContext,
+        storage: &novarocks_type_contract::ValueTypeStorageLifetime,
         keep_encoded: &mut impl FnMut(&[HydratePathStep], &DataType) -> bool,
         growth: &mut Growth<'_, E>,
         work: &mut Work<'_, E>,
@@ -225,6 +263,7 @@ impl HydratePlan {
         root.prepare_decode(
             binding.borrowed(),
             context,
+            storage,
             &mut path,
             0,
             growth,
@@ -291,6 +330,7 @@ impl HydratePlan {
             requirements,
             claims,
             claim_counter_layout,
+            _storage: storage.clone(),
         })
     }
     pub fn rows(&self) -> usize {
@@ -305,8 +345,17 @@ impl HydratePlan {
     pub fn source(&self) -> &ArrayRef {
         &self.source
     }
-    /// Single-result boundaries reject before output allocation. The original
-    /// value-domain fact, including its complete row prefix, is preserved.
+    /// Visit the planned output directly. No ArrayData, duplicate key scan or
+    /// secondary materialization policy is created by a boundary's preflight.
+    pub fn visit_output_storage_observed<E>(
+        &self,
+        visit: &mut impl FnMut(PlannedOutputStorage) -> Result<(), E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<(), ValueFailure<E>> {
+        self.root
+            .visit_output_storage(self.binding.borrowed(), visit, work)
+    }
+    /// Reject incomplete single-result output with the original value fact.
     pub fn require_complete(&self) -> Result<(), ValueError> {
         if let Some(facts) = self.blocking {
             return Err(ValueError::Representation(facts));
