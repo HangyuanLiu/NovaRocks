@@ -151,12 +151,37 @@ fn row_bag(case: &Value) -> Result<Vec<ExpectedRow>> {
 pub(super) async fn immutable_artifacts(
     fixture: &Fixture,
 ) -> Result<novarocks_connector_iceberg::iceberg::io::FileIO> {
-    use novarocks_connector_iceberg::opendal::{Operator, services::S3};
+    use novarocks_fs::{
+        FileCancellation, FileIdentity, FileReadRange, FsAccessResolver, ObjectStoreAccessContext,
+        ObjectStoreConfig, ObjectStoreCredentialProviderIdentity, ObjectStoreProviderPool,
+        ObjectStoreProviderPoolOptions, SecretValue,
+    };
+    use novarocks_spi::connector::{StaticCredentialReference, StorageAccessDomainId};
     let access = env::var("AWS_S3_ACCESS_KEY_ID").context("missing fixture access credential")?;
     let secret =
         env::var("AWS_S3_SECRET_ACCESS_KEY").context("missing fixture secret credential")?;
     let io = novarocks_connector_iceberg::iceberg::io::FileIO::new_with_memory();
-    let mut operators = std::collections::BTreeMap::new();
+    let provider_pool = ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions::default())?;
+    let config = ObjectStoreConfig {
+        endpoint: fixture.manifest.s3_endpoint.clone(),
+        access_key_id: SecretValue::new(access),
+        access_key_secret: SecretValue::new(secret),
+        session_token: None,
+        enable_path_style_access: Some(true),
+        region: Some("us-east-1".to_owned()),
+        retry_max_times: None,
+        retry_min_delay_ms: None,
+        retry_max_delay_ms: None,
+        timeout_ms: None,
+        io_timeout_ms: None,
+    };
+    let identity = ObjectStoreCredentialProviderIdentity::Static(
+        StaticCredentialReference::try_new("uea4g-immutable-fixture", "v1")?,
+    );
+    // Fixture access identity is independent of execution fault-domain admission.
+    let domain = StorageAccessDomainId::from_bytes(
+        Sha256::digest(fixture.manifest.s3_endpoint.as_bytes()).into(),
+    );
     let mut verified = std::collections::BTreeMap::new();
     for artifact in fixture.corpus["artifacts"]
         .as_array()
@@ -181,22 +206,25 @@ pub(super) async fn immutable_artifacts(
             );
             continue;
         }
-        let (bucket, key) = path
+        let (_bucket, _key) = path
             .strip_prefix("s3://")
             .context("artifact must be S3")?
             .split_once('/')
             .context("artifact lacks bucket/key")?;
-        if !operators.contains_key(bucket) {
-            let service = S3::default()
-                .bucket(bucket)
-                .endpoint(&fixture.manifest.s3_endpoint)
-                .region("us-east-1")
-                .access_key_id(&access)
-                .secret_access_key(&secret)
-                .disable_config_load();
-            operators.insert(bucket.to_owned(), Operator::new(service)?.finish());
-        }
-        let bytes = operators[bucket].read(key).await?.to_bytes();
+        let file = FsAccessResolver::new().resolve_location(
+            domain,
+            path,
+            Some(ObjectStoreAccessContext::new(
+                config.endpoint_config(),
+                identity.clone(),
+                config.secret_material(),
+                &provider_pool,
+            )),
+        )?;
+        let bytes = file
+            .bind(0, FileIdentity::new(path, size, None))?
+            .read(FileReadRange::WholeFile, &FileCancellation::new())
+            .await?;
         ensure!(
             bytes.len() as u64 == size && format!("{:x}", Sha256::digest(&bytes)) == hash,
             "immutable artifact bytes changed: {path}"

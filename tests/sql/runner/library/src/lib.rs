@@ -26,6 +26,7 @@ mod extension_manifest;
 mod failure_artifacts;
 mod fault_injection;
 mod fixture_context;
+mod fixture_object_store;
 mod iceberg_orphan_fixture;
 mod mv_rest_document_graph;
 mod namespace_guard;

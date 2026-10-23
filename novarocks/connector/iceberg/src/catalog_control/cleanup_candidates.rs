@@ -372,9 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn orphan_listing_visits_nested_table_objects() {
-        let operator = Operator::new(Memory::default())
-            .expect("memory operator")
-            .finish();
+        let operator = Operator::new(Memory::default()).expect("memory operator");
         operator
             .write("warehouse/table/data/partition=1/file.parquet", vec![1])
             .await

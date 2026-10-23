@@ -146,7 +146,7 @@ impl IcebergUnanchoredCtasCleanupAdapter {
     fn validate_cleanup_capabilities(
         access: &crate::fs_io::IcebergFsAccess,
     ) -> Result<(), ConnectorError> {
-        let capability = access.operator().info().full_capability();
+        let capability = access.operator().info().capability();
         if !capability.list
             || !capability.list_with_recursive
             || !capability.stat
@@ -728,9 +728,7 @@ mod listing_tests {
 
     #[tokio::test]
     async fn cleanup_deletes_multiple_finite_batches_without_collecting_the_prefix() {
-        let operator = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         for index in 0..9 {
             operator
                 .write(&format!("root/file{index}"), "data")
@@ -756,9 +754,7 @@ mod listing_tests {
 
     #[tokio::test]
     async fn cleanup_entry_bound_refuses_the_destructive_pass_without_truncation_success() {
-        let operator = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         for index in 0..3 {
             operator
                 .write(&format!("root/file{index}"), "data")
@@ -795,8 +791,7 @@ mod listing_tests {
         let operator = opendal::Operator::new(
             opendal::services::Fs::default().root(directory.path().to_str().unwrap()),
         )
-        .unwrap()
-        .finish();
+        .unwrap();
         operator.write("root/table/data/a", "data").await.unwrap();
         operator.write("root/table/data/b", "data").await.unwrap();
         operator
@@ -838,9 +833,7 @@ mod listing_tests {
 
     #[tokio::test]
     async fn cleanup_listing_refusal_before_first_delete_keeps_exact_error_and_files() {
-        let operator = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         for index in 0..3 {
             operator
                 .write(&format!("root/file{index}"), "data")
@@ -876,9 +869,7 @@ mod listing_tests {
 
     #[tokio::test]
     async fn cleanup_expired_admission_keeps_exact_deadline_without_starting_delete() {
-        let operator = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         operator.write("root/keep", "data").await.unwrap();
         let stop = ConnectorStopOwner::new();
         let expired = ConnectorRequestContext::try_new(
@@ -915,9 +906,7 @@ mod listing_tests {
 
     #[tokio::test]
     async fn cleanup_stop_is_refused_before_first_delete() {
-        let operator = opendal::Operator::new(opendal::services::Memory::default())
-            .unwrap()
-            .finish();
+        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         operator.write("root/keep", "data").await.unwrap();
         let stop = ConnectorStopOwner::new();
         let context = context(&stop);

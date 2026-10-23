@@ -522,7 +522,7 @@ fn records_from_candidates(
             .map_err(unavailable)?
             .operator()
             .info()
-            .full_capability()
+            .capability()
             .delete_with_version;
     files
         .iter()

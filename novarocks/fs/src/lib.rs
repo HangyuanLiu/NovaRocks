@@ -36,6 +36,7 @@ mod access;
 mod cache;
 mod catalog_properties;
 mod error;
+mod http_transport;
 mod list_body_limit;
 
 /// Read the fixed per-response byte limit used only for OpenDAL List.

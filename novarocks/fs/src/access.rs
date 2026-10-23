@@ -30,13 +30,19 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use novarocks_failure_contract::SharedFailureCause;
 use novarocks_spi::connector::{StaticCredentialReference, StorageAccessDomainId};
-use opendal::layers::{ConcurrentLimitLayer, HttpClientLayer, RetryLayer, TimeoutLayer};
+use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
 use opendal::raw::{
-    Access, Layer, LayeredAccess, OpDelete, OpList, OpRead, OpStat, OpWrite, RpList, RpRead,
-    RpStat, RpWrite, oio,
+    Layer, OpCopier, OpCopy, OpCreateDir, OpDelete, OpList, OpPresign, OpRead, OpRename, OpStat,
+    OpWrite, RpCreateDir, RpPresign, RpRead, RpRename, RpStat, Service, ServiceInfo, Servicer, oio,
 };
-use opendal::{Buffer, Metadata, Operator};
+use opendal::{Buffer, HttpTransporter, Metadata, OperationContext, Operator};
 use url::{Host, Url};
+
+use crate::http_transport::Reqwest012Transport;
+
+#[path = "s3_signing.rs"]
+mod s3_signing;
+use s3_signing::{S3PresignLayer, S3RequestSigner, S3SigningTransport};
 
 use crate::list_body_limit::{
     ListBodyLimitFetch, OBJECT_STORE_LIST_BODY_LIMIT_BYTES, is_list_body_limit_exceeded,
@@ -833,12 +839,7 @@ impl FsAccessHandle {
         let path = self.paths.get(path_index).ok_or_else(|| {
             FileError::invalid(format!("file path index out of bounds: {path_index}"))
         })?;
-        if !self
-            .operator
-            .info()
-            .full_capability()
-            .write_with_if_not_exists
-        {
+        if !self.operator.info().capability().write_with_if_not_exists {
             return Err(FileError::unsupported(
                 "filesystem does not support native conditional create",
             ));
@@ -2194,8 +2195,7 @@ fn resolve_local_locations(
     let (root, relative_paths) = normalize_local_paths(&raw_paths)?;
     let builder = opendal::services::Fs::default().root(&root);
     let operator = Operator::new(builder)
-        .map_err(|error| map_opendal_error("initialize local file operator", error))?
-        .finish();
+        .map_err(|error| map_opendal_error("initialize local file operator", error))?;
     let paths = locations
         .into_iter()
         .zip(relative_paths)
@@ -2361,67 +2361,53 @@ fn build_object_store_operator(
     endpoint: &ObjectStoreEndpointIdentity,
     credentials: &ObjectStoreCredentialSource,
 ) -> FileResult<Operator> {
+    // Signing belongs to the Provider transport, after it sees the actual
+    // SDK-selected request URI. The SDK must not load credentials first.
     let mut builder = opendal::services::S3::default()
         .endpoint(&endpoint.endpoint)
         .bucket(&endpoint.bucket)
-        .region(&endpoint.region);
+        .region(&endpoint.region)
+        .skip_signature()
+        .disable_config_load();
     if !endpoint.use_path_style {
         builder = builder.enable_virtual_host_style();
     }
-    let denial = match credentials {
-        ObjectStoreCredentialSource::Static(secrets) => {
-            builder = builder
-                .access_key_id(secrets.access_key_id.expose_secret())
-                .secret_access_key(secrets.access_key_secret.expose_secret());
-            if let Some(session_token) = secrets.session_token.as_ref() {
-                builder = builder.session_token(session_token.expose_secret());
-            }
-            None
-        }
-        ObjectStoreCredentialSource::Authority(authority) => {
-            // The material is never welded into the builder: the loader reads
-            // it back from the authority for every request that is about to be
-            // signed, which is what keeps this operator usable across a
-            // credential rotation (CAD-1 D0).
-            let denial = Arc::new(CredentialDenialLatch::default());
-            builder = builder.customized_credential_load(Box::new(AuthorityCredentialLoad {
-                authority: Arc::clone(authority),
-                denial: Arc::clone(&denial),
-                budget: Duration::from_millis(endpoint.timeout_ms),
-            }));
-            Some(denial)
-        }
-    };
+    let mut client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    if is_local_endpoint(&endpoint.endpoint) {
+        client = client.no_proxy();
+    }
+    let client = client.build().map_err(|error| {
+        FileError::with_source(
+            FileErrorKind::Internal,
+            "build Provider S3 signing HTTP client",
+            error,
+        )
+    })?;
+    let denial = Arc::new(CredentialDenialLatch::default());
+    let signer = Arc::new(S3RequestSigner::new(
+        endpoint,
+        credentials,
+        Arc::clone(&denial),
+    )?);
     let mut operator = Operator::new(builder)
         .map_err(|error| map_opendal_error("initialize object store operator", error))?
-        .finish();
-    if let Some(denial) = denial {
-        // Installed first, so it sits *under* the RetryLayer added below and
-        // gets to restore a confirmed denial's meaning before the retry
-        // predicate reads it.
+        .layer(S3PresignLayer::new(Arc::clone(&signer)));
+    if matches!(credentials, ObjectStoreCredentialSource::Authority(_)) {
+        // Preserve the original authority denial classifier below RetryLayer.
         operator = operator.layer(CredentialDenialLayer { denial });
     }
-    let inner_client = if is_local_endpoint(&endpoint.endpoint) {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .map_err(|error| {
-                FileError::with_source(
-                    FileErrorKind::Internal,
-                    "build local object store HTTP client",
-                    error,
-                )
-            })?;
-        opendal::raw::HttpClient::with(client)
-    } else {
-        opendal::raw::HttpClient::new()
-            .map_err(|error| map_opendal_error("initialize object store HTTP client", error))?
-    };
-    // Install for every endpoint, before the timeout/concurrency/retry layers.
-    // Credential acquisition uses the authority's independent reqwest path.
-    operator = operator.layer(HttpClientLayer::new(opendal::raw::HttpClient::with(
-        ListBodyLimitFetch::new(inner_client, OBJECT_STORE_LIST_BODY_LIMIT_BYTES),
-    )));
+    let signed_transport = HttpTransporter::new(S3SigningTransport::new(
+        Reqwest012Transport::new(client),
+        signer,
+    ));
+    // Preserve the independent list body limit outside signing/HTTP dispatch.
+    let context = operator
+        .base_context()
+        .with_http_transport(HttpTransporter::new(ListBodyLimitFetch::new(
+            signed_transport,
+            OBJECT_STORE_LIST_BODY_LIMIT_BYTES,
+        )));
+    operator = operator.with_context(context);
     let mut timeout = TimeoutLayer::new();
     timeout = timeout.with_timeout(Duration::from_millis(endpoint.timeout_ms));
     timeout = timeout.with_io_timeout(Duration::from_millis(endpoint.io_timeout_ms));
@@ -2442,12 +2428,12 @@ fn build_object_store_operator(
 
 /// Serves one operator's signing material out of its storage authority.
 ///
-/// opendal calls this at every authentication boundary, so the path that
-/// matters is the cache hit: [`StorageAuthority::material_for_request`] takes a
-/// lock, clones the material in hand, and returns without touching the network.
+/// The Provider signer reads the original authority on every signing attempt.
+/// [`StorageAuthority::material_for_request`] serves cached material without
+/// touching the network while it remains valid.
 /// A remote acquisition happens only when the authority itself decides one is
 /// due, and it runs on the authority's own executor, never on this thread.
-struct AuthorityCredentialLoad {
+struct AuthoritySigningSource {
     authority: Arc<StorageAuthority>,
     denial: Arc<CredentialDenialLatch>,
     /// How long one credential load may take. This is the operator's own
@@ -2457,16 +2443,12 @@ struct AuthorityCredentialLoad {
     budget: Duration,
 }
 
-#[async_trait::async_trait]
-impl reqsign::AwsCredentialLoad for AuthorityCredentialLoad {
-    async fn load_credential(
-        &self,
-        _client: reqwest::Client,
-    ) -> anyhow::Result<Option<reqsign::AwsCredential>> {
+impl AuthoritySigningSource {
+    async fn credential_for_request(&self) -> anyhow::Result<reqsign::AwsCredential> {
         let now = Instant::now();
         let deadline = now.checked_add(self.budget).unwrap_or(now);
         match self.authority.material_for_request(now, deadline).await {
-            Ok(material) => Ok(Some(reqsign::AwsCredential {
+            Ok(material) => Ok(reqsign::AwsCredential {
                 access_key_id: material.access_key_id().expose_secret().to_string(),
                 secret_access_key: material.secret_access_key().expose_secret().to_string(),
                 session_token: material
@@ -2477,7 +2459,7 @@ impl reqsign::AwsCredentialLoad for AuthorityCredentialLoad {
                 // expiry, which is a second, disagreeing opinion about the
                 // same material.
                 expires_in: None,
-            })),
+            }),
             Err(error) => {
                 if error.kind() == FileErrorKind::Permission {
                     self.denial.record(&error);
@@ -2490,13 +2472,9 @@ impl reqsign::AwsCredentialLoad for AuthorityCredentialLoad {
 
 /// One operator's record that its storage authority answered with a denial.
 ///
-/// opendal turns *every* credential-load failure into a temporary error
-/// (`opendal-0.55.0/src/services/s3/core.rs`: a loader that succeeded before
-/// and fails now becomes `PermissionDenied` + `set_temporary()`, and an error
-/// returned by the loader becomes `Unexpected` + `set_temporary()`), and its
-/// `RetryLayer` retries whatever is temporary with a fixed, non-overridable
-/// predicate. That collapses the third state of CAD-1 D4: a confirmed denial
-/// would be retried as if it were jitter and would then surface as transient.
+/// The Provider signs requests through the original authority. Its typed
+/// acquisition outcomes must survive the SDK operation and stream wrappers;
+/// a confirmed denial must not be retried as transient S3 transport failure.
 ///
 /// The loader latches a denial here and [`CredentialDenialLayer`], installed
 /// under the RetryLayer, restores its meaning before the retry predicate can
@@ -2593,29 +2571,27 @@ impl CredentialDenialLatch {
 
 /// Restores a confirmed credential denial before opendal's retry predicate
 /// sees it. Must be installed under the `RetryLayer`.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct CredentialDenialLayer {
     denial: Arc<CredentialDenialLatch>,
 }
 
-impl<A: Access> Layer<A> for CredentialDenialLayer {
-    type LayeredAccess = CredentialDenialAccessor<A>;
-
-    fn layer(&self, inner: A) -> Self::LayeredAccess {
-        CredentialDenialAccessor {
+impl Layer for CredentialDenialLayer {
+    fn apply_service(&self, inner: Servicer) -> Servicer {
+        Arc::new(CredentialDenialService {
             inner,
             denial: Arc::clone(&self.denial),
-        }
+        })
     }
 }
 
 #[derive(Debug)]
-struct CredentialDenialAccessor<A: Access> {
-    inner: A,
+struct CredentialDenialService {
+    inner: Servicer,
     denial: Arc<CredentialDenialLatch>,
 }
 
-impl<A: Access> CredentialDenialAccessor<A> {
+impl CredentialDenialService {
     fn wrap<T>(&self, inner: T) -> CredentialDenialStream<T> {
         CredentialDenialStream {
             inner,
@@ -2624,99 +2600,201 @@ impl<A: Access> CredentialDenialAccessor<A> {
     }
 }
 
-impl<A: Access> LayeredAccess for CredentialDenialAccessor<A> {
-    type Inner = A;
-    type Reader = CredentialDenialStream<A::Reader>;
-    type Writer = CredentialDenialStream<A::Writer>;
-    type Lister = CredentialDenialStream<A::Lister>;
-    type Deleter = CredentialDenialStream<A::Deleter>;
+impl Service for CredentialDenialService {
+    type Reader = CredentialDenialStream<oio::Reader>;
+    type Writer = CredentialDenialStream<oio::Writer>;
+    type Lister = CredentialDenialStream<oio::Lister>;
+    type Deleter = CredentialDenialStream<oio::Deleter>;
+    type Copier = oio::Copier;
 
-    fn inner(&self) -> &Self::Inner {
-        &self.inner
+    fn info(&self) -> ServiceInfo {
+        self.inner.info()
     }
 
-    async fn read(&self, path: &str, args: OpRead) -> opendal::Result<(RpRead, Self::Reader)> {
-        let outcome = self.inner.read(path, args).await;
-        outcome
-            .map(|(reply, reader)| (reply, self.wrap(reader)))
+    fn capability(&self) -> opendal::Capability {
+        self.inner.capability()
+    }
+
+    async fn create_dir(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpCreateDir,
+    ) -> opendal::Result<RpCreateDir> {
+        self.inner.create_dir(ctx, path, args).await
+    }
+
+    fn read(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpRead,
+    ) -> opendal::Result<Self::Reader> {
+        self.inner
+            .read(ctx, path, args)
+            .map(|reader| self.wrap(reader))
             .map_err(|error| self.denial.classify(error))
     }
 
-    async fn write(&self, path: &str, args: OpWrite) -> opendal::Result<(RpWrite, Self::Writer)> {
-        let outcome = self.inner.write(path, args).await;
-        outcome
-            .map(|(reply, writer)| (reply, self.wrap(writer)))
+    fn write(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpWrite,
+    ) -> opendal::Result<Self::Writer> {
+        self.inner
+            .write(ctx, path, args)
+            .map(|writer| self.wrap(writer))
             .map_err(|error| self.denial.classify(error))
     }
 
-    async fn stat(&self, path: &str, args: OpStat) -> opendal::Result<RpStat> {
-        let outcome = self.inner.stat(path, args).await;
-        outcome.map_err(|error| self.denial.classify(error))
-    }
-
-    async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
-        let outcome = self.inner.delete().await;
-        outcome
-            .map(|(reply, deleter)| (reply, self.wrap(deleter)))
+    async fn stat(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpStat,
+    ) -> opendal::Result<RpStat> {
+        self.inner
+            .stat(ctx, path, args)
+            .await
             .map_err(|error| self.denial.classify(error))
     }
 
-    async fn list(&self, path: &str, args: OpList) -> opendal::Result<(RpList, Self::Lister)> {
-        let outcome = self.inner.list(path, args).await;
-        outcome
-            .map(|(reply, lister)| (reply, self.wrap(lister)))
+    fn delete(&self, ctx: &OperationContext) -> opendal::Result<Self::Deleter> {
+        self.inner
+            .delete(ctx)
+            .map(|deleter| self.wrap(deleter))
             .map_err(|error| self.denial.classify(error))
+    }
+
+    fn list(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpList,
+    ) -> opendal::Result<Self::Lister> {
+        self.inner
+            .list(ctx, path, args)
+            .map(|lister| self.wrap(lister))
+            .map_err(|error| self.denial.classify(error))
+    }
+
+    fn copy(
+        &self,
+        ctx: &OperationContext,
+        from: &str,
+        to: &str,
+        args: OpCopy,
+        opts: OpCopier,
+    ) -> opendal::Result<Self::Copier> {
+        self.inner.copy(ctx, from, to, args, opts)
+    }
+
+    async fn rename(
+        &self,
+        ctx: &OperationContext,
+        from: &str,
+        to: &str,
+        args: OpRename,
+    ) -> opendal::Result<RpRename> {
+        self.inner.rename(ctx, from, to, args).await
+    }
+
+    async fn presign(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpPresign,
+    ) -> opendal::Result<RpPresign> {
+        self.inner.presign(ctx, path, args).await
     }
 }
 
-/// Wraps one streamed opendal handle so the per-request signing failures it
-/// raises are classified the same way the accessor's own calls are.
+/// Classify the same signing failures at lazy reader and stream boundaries.
 struct CredentialDenialStream<T> {
     inner: T,
     denial: Arc<CredentialDenialLatch>,
 }
 
 impl<R: oio::Read> oio::Read for CredentialDenialStream<R> {
+    async fn open(
+        &self,
+        range: opendal::BytesRange,
+    ) -> opendal::Result<(RpRead, Box<dyn oio::ReadStreamDyn>)> {
+        let (reply, inner) = self
+            .inner
+            .open(range)
+            .await
+            .map_err(|error| self.denial.classify(error))?;
+        let stream: Box<dyn oio::ReadStreamDyn> = Box::new(CredentialDenialStream {
+            inner,
+            denial: Arc::clone(&self.denial),
+        });
+        Ok((reply, stream))
+    }
+
+    async fn read(&self, range: opendal::BytesRange) -> opendal::Result<(RpRead, Buffer)> {
+        self.inner
+            .read(range)
+            .await
+            .map_err(|error| self.denial.classify(error))
+    }
+}
+
+impl<R: oio::ReadStream> oio::ReadStream for CredentialDenialStream<R> {
     async fn read(&mut self) -> opendal::Result<Buffer> {
-        let outcome = self.inner.read().await;
-        outcome.map_err(|error| self.denial.classify(error))
+        self.inner
+            .read()
+            .await
+            .map_err(|error| self.denial.classify(error))
     }
 }
 
 impl<W: oio::Write> oio::Write for CredentialDenialStream<W> {
     async fn write(&mut self, buffer: Buffer) -> opendal::Result<()> {
-        let outcome = self.inner.write(buffer).await;
-        outcome.map_err(|error| self.denial.classify(error))
+        self.inner
+            .write(buffer)
+            .await
+            .map_err(|error| self.denial.classify(error))
     }
 
     async fn close(&mut self) -> opendal::Result<Metadata> {
-        let outcome = self.inner.close().await;
-        outcome.map_err(|error| self.denial.classify(error))
+        self.inner
+            .close()
+            .await
+            .map_err(|error| self.denial.classify(error))
     }
 
     async fn abort(&mut self) -> opendal::Result<()> {
-        let outcome = self.inner.abort().await;
-        outcome.map_err(|error| self.denial.classify(error))
+        self.inner
+            .abort()
+            .await
+            .map_err(|error| self.denial.classify(error))
     }
 }
 
 impl<L: oio::List> oio::List for CredentialDenialStream<L> {
     async fn next(&mut self) -> opendal::Result<Option<oio::Entry>> {
-        let outcome = self.inner.next().await;
-        outcome.map_err(|error| self.denial.classify(error))
+        self.inner
+            .next()
+            .await
+            .map_err(|error| self.denial.classify(error))
     }
 }
 
 impl<D: oio::Delete> oio::Delete for CredentialDenialStream<D> {
-    fn delete(&mut self, path: &str, args: OpDelete) -> opendal::Result<()> {
+    async fn delete<'a>(&'a mut self, path: &'a str, args: OpDelete) -> opendal::Result<()> {
         self.inner
             .delete(path, args)
+            .await
             .map_err(|error| self.denial.classify(error))
     }
 
-    async fn flush(&mut self) -> opendal::Result<usize> {
-        let outcome = self.inner.flush().await;
-        outcome.map_err(|error| self.denial.classify(error))
+    async fn close(&mut self) -> opendal::Result<()> {
+        self.inner
+            .close()
+            .await
+            .map_err(|error| self.denial.classify(error))
     }
 }
 
@@ -2931,8 +3009,7 @@ fn build_hdfs_operator(name_node: &str, user: Option<&str>) -> FileResult<Operat
         .name_node(url.as_str().trim_end_matches('/'))
         .root("/");
     let operator = Operator::new(builder)
-        .map_err(|error| map_opendal_error("initialize hdfs operator", error))?
-        .finish();
+        .map_err(|error| map_opendal_error("initialize hdfs operator", error))?;
     hdfs_operator_cache()
         .lock()
         .map_err(|_| FileError::new(FileErrorKind::Internal, "lock hdfs operator cache"))?
@@ -3417,7 +3494,6 @@ mod tests {
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorInstanceId, StorageCredentialScopePrefix,
     };
-    use reqsign::AwsCredentialLoad;
 
     use super::*;
     use crate::storage_authority::{
@@ -3648,33 +3724,34 @@ mod tests {
 
     #[derive(Clone, Debug, Default)]
     struct ListingRecord {
-        pending_open: Arc<AtomicUsize>,
+        pending_first_poll: Arc<AtomicUsize>,
         pending_next: Arc<AtomicUsize>,
-        open_future_drops: Arc<AtomicUsize>,
+        first_poll_future_drops: Arc<AtomicUsize>,
         next_future_drops: Arc<AtomicUsize>,
         stats: Arc<AtomicUsize>,
         stat_failure: Arc<AtomicUsize>,
         requests: Arc<Mutex<Vec<Option<usize>>>>,
         polls: Arc<AtomicUsize>,
+        first_polls: Arc<AtomicUsize>,
         drops: Arc<AtomicUsize>,
     }
-    impl<A: Access> Layer<A> for ListingRecord {
-        type LayeredAccess = ListingRecorder<A>;
-        fn layer(&self, inner: A) -> Self::LayeredAccess {
-            ListingRecorder {
+    impl Layer for ListingRecord {
+        fn apply_service(&self, inner: Servicer) -> Servicer {
+            Arc::new(RecordingListAccess {
                 inner,
                 record: self.clone(),
-            }
+            })
         }
     }
     #[derive(Debug)]
-    struct ListingRecorder<A: Access> {
-        inner: A,
+    struct RecordingListAccess {
+        inner: Servicer,
         record: ListingRecord,
     }
     struct RecordedLister<L> {
         inner: L,
         record: ListingRecord,
+        first_poll: bool,
     }
     struct PendingListingFutureDrop(Arc<AtomicUsize>);
     impl Drop for PendingListingFutureDrop {
@@ -3690,36 +3767,72 @@ mod tests {
     impl<L: oio::List> oio::List for RecordedLister<L> {
         async fn next(&mut self) -> opendal::Result<Option<oio::Entry>> {
             self.record.polls.fetch_add(1, Ordering::SeqCst);
-            if self.record.pending_next.load(Ordering::SeqCst) != 0 {
+            if std::mem::replace(&mut self.first_poll, false) {
+                self.record.first_polls.fetch_add(1, Ordering::SeqCst);
+                if self.record.pending_first_poll.load(Ordering::SeqCst) != 0 {
+                    let _hold =
+                        PendingListingFutureDrop(Arc::clone(&self.record.first_poll_future_drops));
+                    return std::future::pending::<opendal::Result<Option<oio::Entry>>>().await;
+                }
+            } else if self.record.pending_next.load(Ordering::SeqCst) != 0 {
                 let _hold = PendingListingFutureDrop(Arc::clone(&self.record.next_future_drops));
                 return std::future::pending::<opendal::Result<Option<oio::Entry>>>().await;
             }
             self.inner.next().await
         }
     }
-    impl<A: Access> LayeredAccess for ListingRecorder<A> {
-        type Inner = A;
-        type Reader = A::Reader;
-        type Writer = A::Writer;
-        type Lister = RecordedLister<A::Lister>;
-        type Deleter = A::Deleter;
-        fn inner(&self) -> &A {
-            &self.inner
+    impl Service for RecordingListAccess {
+        type Reader = oio::Reader;
+        type Writer = oio::Writer;
+        type Lister = RecordedLister<oio::Lister>;
+        type Deleter = oio::Deleter;
+        type Copier = oio::Copier;
+
+        fn info(&self) -> ServiceInfo {
+            self.inner.info()
         }
-        async fn read(&self, path: &str, args: OpRead) -> opendal::Result<(RpRead, Self::Reader)> {
-            self.inner.read(path, args).await
+
+        fn capability(&self) -> opendal::Capability {
+            self.inner.capability()
         }
-        async fn write(
+
+        async fn create_dir(
             &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpCreateDir,
+        ) -> opendal::Result<RpCreateDir> {
+            self.inner.create_dir(ctx, path, args).await
+        }
+
+        fn read(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpRead,
+        ) -> opendal::Result<Self::Reader> {
+            self.inner.read(ctx, path, args)
+        }
+
+        fn write(
+            &self,
+            ctx: &OperationContext,
             path: &str,
             args: OpWrite,
-        ) -> opendal::Result<(RpWrite, Self::Writer)> {
-            self.inner.write(path, args).await
+        ) -> opendal::Result<Self::Writer> {
+            self.inner.write(ctx, path, args)
         }
-        async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
-            self.inner.delete().await
+
+        fn delete(&self, ctx: &OperationContext) -> opendal::Result<Self::Deleter> {
+            self.inner.delete(ctx)
         }
-        async fn stat(&self, path: &str, args: OpStat) -> opendal::Result<RpStat> {
+
+        async fn stat(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpStat,
+        ) -> opendal::Result<RpStat> {
             self.record.stats.fetch_add(1, Ordering::SeqCst);
             if self.record.stat_failure.load(Ordering::SeqCst) != 0 {
                 return Err(opendal::Error::new(
@@ -3729,25 +3842,56 @@ mod tests {
                 .with_context("path", "y".repeat(8192))
                 .set_source(ListingPanicDisplay));
             }
-            self.inner.stat(path, args).await
+            self.inner.stat(ctx, path, args).await
         }
-        async fn list(&self, path: &str, args: OpList) -> opendal::Result<(RpList, Self::Lister)> {
+
+        fn list(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpList,
+        ) -> opendal::Result<Self::Lister> {
             self.record.requests.lock().unwrap().push(args.limit());
-            if self.record.pending_open.load(Ordering::SeqCst) != 0 {
-                let _hold = PendingListingFutureDrop(Arc::clone(&self.record.open_future_drops));
-                return std::future::pending::<opendal::Result<(RpList, Self::Lister)>>().await;
-            }
-            self.inner.list(path, args).await.map(|(reply, inner)| {
-                (
-                    reply,
-                    RecordedLister {
-                        inner,
-                        record: self.record.clone(),
-                    },
-                )
-            })
+            self.inner
+                .list(ctx, path, args)
+                .map(|inner| RecordedLister {
+                    inner,
+                    record: self.record.clone(),
+                    first_poll: true,
+                })
+        }
+
+        fn copy(
+            &self,
+            ctx: &OperationContext,
+            from: &str,
+            to: &str,
+            args: OpCopy,
+            opts: OpCopier,
+        ) -> opendal::Result<Self::Copier> {
+            self.inner.copy(ctx, from, to, args, opts)
+        }
+
+        async fn rename(
+            &self,
+            ctx: &OperationContext,
+            from: &str,
+            to: &str,
+            args: OpRename,
+        ) -> opendal::Result<RpRename> {
+            self.inner.rename(ctx, from, to, args).await
+        }
+
+        async fn presign(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpPresign,
+        ) -> opendal::Result<RpPresign> {
+            self.inner.presign(ctx, path, args).await
         }
     }
+
     fn listing_access(operator: Operator) -> FsAccessHandle {
         FsAccessHandle::new(
             domain(84),
@@ -3763,10 +3907,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_listing_pending_open_stop_and_deadline_drop_future() {
+    async fn bounded_listing_pending_first_poll_stop_and_deadline_drop_state_then_eof() {
         for deadline in [false, true] {
             let record = ListingRecord::default();
-            record.pending_open.store(1, Ordering::SeqCst);
+            record.pending_first_poll.store(1, Ordering::SeqCst);
             let access = listing_access(memory_operator().unwrap().layer(record.clone()));
             let cancellation = if deadline {
                 FileCancellation::new()
@@ -3780,26 +3924,35 @@ mod tests {
                 &cancellation,
                 listing_bound(64),
             ));
+            // OpenDAL 0.58 creates the lister synchronously. The first async
+            // listing boundary is the returned lister's actual next poll.
+            let mut stream = match futures::poll!(opening.as_mut()) {
+                std::task::Poll::Ready(Ok(stream)) => stream,
+                std::task::Poll::Ready(Err(error)) => panic!("lister creation failed: {error}"),
+                std::task::Poll::Pending => panic!("synchronous SDK lister creation suspended"),
+            };
+            drop(opening);
+            assert_eq!(*record.requests.lock().unwrap(), [Some(1)]);
+            assert_eq!(record.polls.load(Ordering::SeqCst), 0);
+            assert_eq!(record.drops.load(Ordering::SeqCst), 0);
+            let mut next = Box::pin(stream.next());
             assert!(matches!(
-                futures::poll!(opening.as_mut()),
+                futures::poll!(next.as_mut()),
                 std::task::Poll::Pending
             ));
-            assert_eq!(
-                record.requests.lock().unwrap().len(),
-                1,
-                "the SDK open actually started"
-            );
-            assert_eq!(record.open_future_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(record.polls.load(Ordering::SeqCst), 1);
+            assert_eq!(record.first_polls.load(Ordering::SeqCst), 1);
+            assert_eq!(record.first_poll_future_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(record.next_future_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(record.drops.load(Ordering::SeqCst), 0);
             if !deadline {
                 cancellation.cancel();
             }
-            let outcome = tokio::time::timeout(Duration::from_secs(2), opening.as_mut())
+            let error = tokio::time::timeout(Duration::from_secs(2), next.as_mut())
                 .await
-                .expect("pending SDK open must wake on stop/deadline");
-            let error = match outcome {
-                Ok(_) => panic!("pending SDK unexpectedly opened"),
-                Err(error) => error,
-            };
+                .expect("pending first SDK poll must wake on stop/deadline")
+                .expect("typed terminal error")
+                .unwrap_err();
             assert_eq!(
                 error.kind(),
                 if deadline {
@@ -3808,13 +3961,17 @@ mod tests {
                     FileErrorKind::Cancelled
                 }
             );
-            assert_eq!(record.open_future_drops.load(Ordering::SeqCst), 1);
-            assert_eq!(record.polls.load(Ordering::SeqCst), 0);
+            drop(next);
+            assert_eq!(record.first_poll_future_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(record.next_future_drops.load(Ordering::SeqCst), 0);
             assert_eq!(
                 record.drops.load(Ordering::SeqCst),
-                0,
-                "a lister was never constructed"
+                1,
+                "the constructed lister exits with the terminal error"
             );
+            assert!(stream.next().await.is_none());
+            assert_eq!(record.polls.load(Ordering::SeqCst), 1);
+            assert_eq!(record.first_polls.load(Ordering::SeqCst), 1);
         }
     }
 
@@ -3823,7 +3980,10 @@ mod tests {
         for deadline in [false, true] {
             let record = ListingRecord::default();
             record.pending_next.store(1, Ordering::SeqCst);
-            let access = listing_access(memory_operator().unwrap().layer(record.clone()));
+            let operator = memory_operator().unwrap().layer(record.clone());
+            operator.write("warehouse/a", "a").await.unwrap();
+            operator.write("warehouse/b", "b").await.unwrap();
+            let access = listing_access(operator);
             let cancellation = if deadline {
                 FileCancellation::new()
                     .with_deadline(Some(Instant::now() + Duration::from_millis(100)))
@@ -3839,6 +3999,16 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            assert_eq!(*record.requests.lock().unwrap(), [Some(1)]);
+            assert_eq!(record.polls.load(Ordering::SeqCst), 0);
+            let first = stream.next().await.unwrap().unwrap();
+            assert_eq!(first.location, "s3://bucket/warehouse/a");
+            assert!(!first.is_dir);
+            assert_eq!(record.polls.load(Ordering::SeqCst), 1);
+            assert_eq!(record.first_polls.load(Ordering::SeqCst), 1);
+            assert_eq!(record.first_poll_future_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(record.next_future_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(record.drops.load(Ordering::SeqCst), 0);
             let mut next = Box::pin(stream.next());
             assert!(matches!(
                 futures::poll!(next.as_mut()),
@@ -3846,9 +4016,10 @@ mod tests {
             ));
             assert_eq!(
                 record.polls.load(Ordering::SeqCst),
-                1,
-                "the SDK next actually started"
+                2,
+                "the SDK continuation actually started after a real entry"
             );
+            assert_eq!(record.first_polls.load(Ordering::SeqCst), 1);
             assert_eq!(record.next_future_drops.load(Ordering::SeqCst), 0);
             if !deadline {
                 cancellation.cancel();
@@ -3867,6 +4038,7 @@ mod tests {
                 }
             );
             drop(next);
+            assert_eq!(record.first_poll_future_drops.load(Ordering::SeqCst), 0);
             assert_eq!(record.next_future_drops.load(Ordering::SeqCst), 1);
             assert_eq!(
                 record.drops.load(Ordering::SeqCst),
@@ -3876,9 +4048,10 @@ mod tests {
             assert!(stream.next().await.is_none());
             assert_eq!(
                 record.polls.load(Ordering::SeqCst),
-                1,
+                2,
                 "EOF must not poll the dropped lister"
             );
+            assert_eq!(record.first_polls.load(Ordering::SeqCst), 1);
         }
     }
 
@@ -4212,7 +4385,6 @@ mod tests {
 
     fn memory_operator() -> FileResult<Operator> {
         Operator::new(opendal::services::Memory::default())
-            .map(|builder| builder.finish())
             .map_err(|error| map_opendal_error("initialize test memory operator", error))
     }
 
@@ -4842,7 +5014,7 @@ mod tests {
                 Instant::now() + Duration::from_secs(900),
             )),
         );
-        let loader = AuthorityCredentialLoad {
+        let loader = AuthoritySigningSource {
             authority: Arc::clone(&authority),
             denial: Arc::new(CredentialDenialLatch::default()),
             budget: Duration::from_secs(60),
@@ -4850,8 +5022,7 @@ mod tests {
 
         for _ in 0..3 {
             let credential = runtime
-                .block_on(loader.load_credential(reqwest::Client::new()))
-                .unwrap()
+                .block_on(loader.credential_for_request())
                 .expect("material in hand is served");
             assert_eq!(credential.access_key_id, "access-live");
             assert_eq!(credential.secret_access_key, "secret-live");

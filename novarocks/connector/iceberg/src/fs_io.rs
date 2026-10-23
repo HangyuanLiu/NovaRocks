@@ -304,10 +304,7 @@ impl IcebergFsAccess {
     }
 
     pub fn supports_conditional_create(&self) -> bool {
-        self.operator()
-            .info()
-            .full_capability()
-            .write_with_if_not_exists
+        self.operator().info().capability().write_with_if_not_exists
     }
 
     pub async fn ensure_parent_directory(&self) -> std::result::Result<(), String> {
@@ -622,7 +619,8 @@ impl Storage for IcebergFsStorage {
         let (access, relative_path) = self.resolve_path("delete_prefix", path)?;
         access
             .operator()
-            .remove_all(&relative_path)
+            .delete_with(&relative_path)
+            .recursive(true)
             .await
             .map_err(|e| {
                 Error::new(
@@ -1225,30 +1223,95 @@ mod tests {
         delay_close: bool,
         fail_write: bool,
     }
-    impl crate::opendal::raw::Access for ControlledWriterService {
-        type Reader = crate::opendal::raw::oio::Reader;
+    impl crate::opendal::raw::Service for ControlledWriterService {
+        type Reader = ();
         type Writer = crate::opendal::raw::oio::Writer;
-        type Lister = crate::opendal::raw::oio::Lister;
-        type Deleter = crate::opendal::raw::oio::Deleter;
-        fn info(&self) -> Arc<crate::opendal::raw::AccessorInfo> {
-            let info = crate::opendal::raw::AccessorInfo::default();
-            info.set_scheme("mock")
-                .set_native_capability(crate::opendal::Capability {
-                    write: true,
-                    write_can_multi: true,
-                    ..Default::default()
-                });
-            Arc::new(info)
+        type Lister = ();
+        type Deleter = ();
+        type Copier = ();
+        fn info(&self) -> crate::opendal::raw::ServiceInfo {
+            crate::opendal::raw::ServiceInfo::with_scheme("mock")
         }
-        async fn write(
+        fn capability(&self) -> crate::opendal::Capability {
+            crate::opendal::Capability {
+                write: true,
+                write_can_multi: true,
+                ..Default::default()
+            }
+        }
+        async fn create_dir(
             &self,
-            _: &str,
-            _: crate::opendal::raw::OpWrite,
-        ) -> crate::opendal::Result<(crate::opendal::raw::RpWrite, Self::Writer)> {
-            Ok((
-                crate::opendal::raw::RpWrite::new(),
-                Box::new(ControlledWriter(self.clone())),
-            ))
+            ctx: &crate::opendal::OperationContext,
+            path: &str,
+            args: crate::opendal::raw::OpCreateDir,
+        ) -> crate::opendal::Result<crate::opendal::raw::RpCreateDir> {
+            crate::opendal::raw::Service::create_dir(&(), ctx, path, args).await
+        }
+        async fn stat(
+            &self,
+            ctx: &crate::opendal::OperationContext,
+            path: &str,
+            args: crate::opendal::raw::OpStat,
+        ) -> crate::opendal::Result<crate::opendal::raw::RpStat> {
+            crate::opendal::raw::Service::stat(&(), ctx, path, args).await
+        }
+        fn read(
+            &self,
+            ctx: &crate::opendal::OperationContext,
+            path: &str,
+            args: crate::opendal::raw::OpRead,
+        ) -> crate::opendal::Result<Self::Reader> {
+            crate::opendal::raw::Service::read(&(), ctx, path, args)
+        }
+        fn write(
+            &self,
+            ctx: &crate::opendal::OperationContext,
+            path: &str,
+            args: crate::opendal::raw::OpWrite,
+        ) -> crate::opendal::Result<Self::Writer> {
+            let _ = (ctx, path, args);
+            Ok(Box::new(ControlledWriter(self.clone())))
+        }
+        fn delete(
+            &self,
+            ctx: &crate::opendal::OperationContext,
+        ) -> crate::opendal::Result<Self::Deleter> {
+            crate::opendal::raw::Service::delete(&(), ctx)
+        }
+        fn list(
+            &self,
+            ctx: &crate::opendal::OperationContext,
+            path: &str,
+            args: crate::opendal::raw::OpList,
+        ) -> crate::opendal::Result<Self::Lister> {
+            crate::opendal::raw::Service::list(&(), ctx, path, args)
+        }
+        fn copy(
+            &self,
+            ctx: &crate::opendal::OperationContext,
+            from: &str,
+            to: &str,
+            args: crate::opendal::raw::OpCopy,
+            opts: crate::opendal::raw::OpCopier,
+        ) -> crate::opendal::Result<Self::Copier> {
+            crate::opendal::raw::Service::copy(&(), ctx, from, to, args, opts)
+        }
+        async fn rename(
+            &self,
+            ctx: &crate::opendal::OperationContext,
+            from: &str,
+            to: &str,
+            args: crate::opendal::raw::OpRename,
+        ) -> crate::opendal::Result<crate::opendal::raw::RpRename> {
+            crate::opendal::raw::Service::rename(&(), ctx, from, to, args).await
+        }
+        async fn presign(
+            &self,
+            ctx: &crate::opendal::OperationContext,
+            path: &str,
+            args: crate::opendal::raw::OpPresign,
+        ) -> crate::opendal::Result<crate::opendal::raw::RpPresign> {
+            crate::opendal::raw::Service::presign(&(), ctx, path, args).await
         }
     }
     #[derive(Debug)]
@@ -1312,10 +1375,13 @@ mod tests {
             delay_close,
             fail_write,
         };
-        let accessor: crate::opendal::raw::Accessor = Arc::new(service);
+        let service: crate::opendal::raw::Servicer = Arc::new(service);
         // Exercise the exact SDK wrapper which moves inner ownership into the pending future.
-        let operator = crate::opendal::Operator::from_inner(accessor)
-            .layer(crate::opendal::layers::RetryLayer::new().with_max_times(0));
+        let operator = crate::opendal::Operator::from_parts(
+            crate::opendal::OperationContext::default(),
+            service,
+        )
+        .layer(crate::opendal::layers::RetryLayer::new().with_max_times(0));
         let admission = Arc::new(ControlledAdmission {
             cancellation: novarocks_fs::FileCancellation::new(),
             semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -1362,13 +1428,16 @@ mod tests {
         .unwrap();
         let context = grant.for_io(&original).unwrap();
         let events = Arc::new(WriterEvents::default());
-        let accessor: crate::opendal::raw::Accessor = Arc::new(ControlledWriterService {
+        let service: crate::opendal::raw::Servicer = Arc::new(ControlledWriterService {
             events: events.clone(),
             delay_close: true,
             fail_write: false,
         });
-        let operator = crate::opendal::Operator::from_inner(accessor)
-            .layer(crate::opendal::layers::RetryLayer::new().with_max_times(0));
+        let operator = crate::opendal::Operator::from_parts(
+            crate::opendal::OperationContext::default(),
+            service,
+        )
+        .layer(crate::opendal::layers::RetryLayer::new().with_max_times(0));
         let used_operator = operator.clone();
         let used_context = context.clone();
         let task = tokio::spawn(async move {
@@ -2265,8 +2334,7 @@ mod manifest_stream_tests {
                     .root(root.to_str().unwrap())
                     .atomic_write_dir(temporary.to_str().unwrap()),
             )
-            .unwrap()
-            .finish();
+            .unwrap();
             AtomicManifestWriterBoundary {
                 operator,
                 root,
