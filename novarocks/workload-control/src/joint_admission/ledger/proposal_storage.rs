@@ -54,6 +54,7 @@ impl ProposalCell {
 /// Internal raw aliases never run callbacks on Drop, including under State.
 #[derive(Clone)]
 pub(in crate::joint_admission) enum ChangeBody {
+    #[cfg(test)]
     Migration(Arc<Vec<ChangeRecord>>),
     Fixed(Arc<ProposalBody>),
 }
@@ -61,6 +62,7 @@ impl Deref for ChangeBody {
     type Target = [ChangeRecord];
     fn deref(&self) -> &Self::Target {
         match self {
+            #[cfg(test)]
             Self::Migration(records) => records,
             Self::Fixed(body) => &body.changes,
         }
@@ -148,7 +150,10 @@ impl JointAdmissionHandle {
         records: Vec<ChangeRecord>,
     ) -> Result<ChangeBody, WorkError> {
         let Some(key) = custody.as_ref().and_then(|c| c.key) else {
+            #[cfg(test)]
             return Ok(ChangeBody::Migration(Arc::new(records)));
+            #[cfg(not(test))]
+            return Err(WorkError::NotReady);
         };
         // A failed construction keeps its original pin until all local values
         // exit. The original anchor remains unavailable during that exit.

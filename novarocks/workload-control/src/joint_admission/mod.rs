@@ -29,9 +29,10 @@ mod protection;
 pub use driver::{JointProgress, JointProgressDriver};
 pub use ledger::{
     JointAdjustmentReceipt, JointAdmission, JointAdmissionFailure, JointAdmissionHandle,
-    JointClaim, JointClaimChange, JointClaimView, JointDependency, JointGrantedBatch,
-    JointGrantedClaims,
+    JointClaim, JointClaimView, JointGrantedBatch, JointGrantedClaims, JointProposal,
 };
+#[cfg(test)]
+pub use ledger::{JointClaimChange, JointDependency};
 
 use crate::{WorkClass, WorkError};
 use std::num::NonZeroUsize;

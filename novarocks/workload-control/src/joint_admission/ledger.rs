@@ -35,6 +35,8 @@ use std::{
 mod control_storage;
 mod dependency_storage;
 mod metadata_geometry;
+mod paid_proposal;
+pub use paid_proposal::JointProposal;
 pub(crate) mod proposal_storage;
 #[cfg(test)]
 pub(crate) use control_storage::control_storage_base;
@@ -50,11 +52,13 @@ pub(super) struct DependencyRecord {
 }
 
 /// A registry identity for an actual selected dependency, not an I/O permit.
+#[cfg(test)]
 pub struct JointDependency {
     inner: Arc<Inner>,
     pub(super) record: DependencyRef,
     _exit: crate::scope::ReclaimWakeOnExit,
 }
+#[cfg(test)]
 impl Clone for JointDependency {
     fn clone(&self) -> Self {
         Self {
@@ -64,6 +68,7 @@ impl Clone for JointDependency {
         }
     }
 }
+#[cfg(test)]
 impl JointDependency {
     pub fn fact(&self) -> &SharedDependency {
         &self.record.fact
@@ -336,6 +341,7 @@ impl WorkloadControl {
     }
 }
 impl JointAdmissionHandle {
+    #[cfg(test)]
     pub fn register_dependency(
         &self,
         fact: SharedDependency,
@@ -496,6 +502,7 @@ impl JointAdmissionHandle {
 
     /// Queue New claims and/or growth of exact stable holders. No physical
     /// holder moves into this future. Growth authority starts only at install.
+    #[cfg(test)]
     pub fn request(
         &self,
         scope: &WorkScope,
@@ -510,6 +517,7 @@ impl JointAdmissionHandle {
     /// Infeasible capacity is returned rather than parked for another holder.
     /// This still awaits the original driver's bounded progression; it grants
     /// no capacity or metadata funding merely by constructing the request.
+    #[cfg(test)]
     pub fn request_finite(
         &self,
         scope: &WorkScope,
@@ -528,6 +536,7 @@ impl JointAdmissionHandle {
 
     /// Capture only immutable headers under State. Dependency union, sorting
     /// and record allocation occur outside the original authority's mutex.
+    #[cfg(test)]
     pub(super) fn prepare_request(
         &self,
         scope: &WorkScope,
@@ -569,36 +578,11 @@ impl JointAdmissionHandle {
             };
             let (source, original, lane, amounts, mut selected, additional) =
                 if let Some((source, delta, dependencies, first_bind)) = adjustment {
-                    if !Weak::ptr_eq(&source.inner, &Arc::downgrade(&self.inner)) {
-                        return Err(WorkError::ForeignAuthority);
+                    if first_bind && dependencies.is_empty() {
+                        return Err(WorkError::Conflict);
                     }
-                    let (facts, old_amounts) = {
-                        let state = self.inner.state.lock().unwrap();
-                        let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
-                        let old = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
-                        authenticate_scope(&state, old, source, scope.id)?;
-                        if old.pending.is_some() {
-                            return Err(WorkError::Conflict);
-                        }
-                        match (source.source, first_bind) {
-                            (ClaimSource::Physical, false) => {}
-                            (ClaimSource::NodeControl { slot, .. }, true)
-                                if old.active_facts.dependencies.is_empty()
-                                    && old.active_amounts
-                                        == state.cancellations.slots[slot.0].base
-                                    && !dependencies.is_empty() => {}
-                            (ClaimSource::NodeControl { slot, .. }, false)
-                                if delta == JointResources::ZERO
-                                    && !old.active_facts.dependencies.is_empty()
-                                    && old.active_amounts
-                                        == state.cancellations.slots[slot.0].base => {}
-                            _ => return Err(WorkError::Conflict),
-                        }
-                        old.structure_revision
-                            .checked_add(2)
-                            .ok_or(WorkError::ArithmeticOverflow)?;
-                        (Arc::clone(&old.active_facts), old.active_amounts)
-                    };
+                    let (facts, old_amounts) =
+                        self.capture_adjustment(scope, source, delta, first_bind)?;
                     if records.iter().any(|record| record.old == Some(source.id)) {
                         return Err(WorkError::Conflict);
                     }
@@ -778,6 +762,7 @@ pub(super) struct PreparedRequest {
     _exit: crate::scope::ReclaimWakeOnExit,
 }
 
+#[cfg(test)]
 pub enum JointClaimChange {
     /// Bind the complete resident control base to its first nonempty domain set.
     /// The source comes only from the original WorkOwner; no new guard is minted.
@@ -796,6 +781,7 @@ pub enum JointClaimChange {
         dependencies: Vec<JointDependency>,
     },
 }
+#[cfg(test)]
 impl JointClaimChange {
     pub fn grow_by(
         source: JointClaimView,

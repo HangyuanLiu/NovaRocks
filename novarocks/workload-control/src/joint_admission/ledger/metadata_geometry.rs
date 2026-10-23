@@ -76,13 +76,10 @@ pub(super) fn backing_bytes(
     let cursor = sum_bytes([arc_bytes::<ProfileKey>()?, array_bytes::<u64>(k)?])?;
     let origin = novarocks_resource_contract::NetworkServiceOrigin::MAX_BYTES;
     let registry = dependency_storage::backing_bytes(m)?;
-    // Current append/dedup authors can temporarily retain old+grown selected
-    // buffers. Do not use the smaller future bounded-builder geometry yet.
-    let selected = array_bytes::<DependencyRef>(
-        k.checked_mul(6)
-            .ok_or(WorkError::ArithmeticOverflow)?
-            .max(4),
-    )?;
+    // Production accepts only the paid capacity-K builder. Its source Vec
+    // coexists with the new exact Arc slice already included in F(K).
+    // The old append/grow constructor exists only in the kernel test harness.
+    let selected = array_bytes::<DependencyRef>(k)?;
     let origin_scratch = sum_bytes([array_bytes::<u8>(origin)?, arc_slice_bytes::<u8>(origin)?])?;
     let construction = sum_bytes([selected, origin_scratch])?;
     let reply = sum_bytes([array_bytes::<u64>(c)?, array_bytes::<JointClaim>(c)?])?;

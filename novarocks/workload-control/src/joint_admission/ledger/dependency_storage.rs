@@ -166,6 +166,12 @@ impl DependencyRegistry {
     pub(super) fn is_empty(&self) -> bool {
         self.canonical.is_empty()
     }
+    #[cfg(test)]
+    pub(super) fn published(&self, fact: &SharedDependency) -> Option<bool> {
+        self.canonical
+            .get(fact)
+            .map(|index| self.slots[*index].published)
+    }
     pub(super) fn has_zero(&self) -> bool {
         self.zero.lock().unwrap().head.is_some()
     }
