@@ -222,6 +222,16 @@ impl Drop for LogicalExecutionSupervisor {
 }
 
 impl LogicalExecutionSupervisor {
+    /// Pure layout facts from this owner's actual logical-role factory.
+    /// No Work, input, task or bank is created. Composition must separately
+    /// fund independent pointees and the real health wrapper overlap before
+    /// installing a complete Native role profile.
+    pub fn logical_role_poll_geometry()
+    -> Result<novarocks_workload_control::PollRoleGeometry, novarocks_workload_control::WorkError>
+    {
+        novarocks_workload_control::PollRoleGeometry::for_factory(&make_logical_role)
+    }
+
     /// Constructs the sole bounded client together with its process owner.
     pub fn new(
         runtime: Handle,

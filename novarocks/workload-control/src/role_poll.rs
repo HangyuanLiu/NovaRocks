@@ -29,6 +29,7 @@ use crate::{
     scope::Inner,
 };
 use std::{
+    alloc::Layout,
     any::Any,
     future::Future,
     marker::PhantomData,
@@ -44,15 +45,21 @@ use std::{
 };
 use tokio::sync::{Notify, futures::OwnedNotified};
 
+/// Pure layout facts for the actual factory's fixed frames and containers.
+///
+/// This is neither a capacity reservation nor installation authority. Independent
+/// input/output/factory pointees, service tasks and complete role custody remain
+/// the composing owner's responsibility.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PollRoleGeometry {
+pub struct PollRoleGeometry {
     per_slot: usize,
     shared: usize,
+    failure_custody: Layout,
 }
 impl PollRoleGeometry {
-    pub(crate) fn for_factory<I, F: Future, M: Fn(WorkOwner, I) -> F>(
-        _: &M,
-    ) -> Result<Self, WorkError> {
+    /// Derive facts from the same concrete factory used by the real bank.
+    /// This does not invoke the factory or construct its input or owner.
+    pub fn for_factory<I, F: Future, M: Fn(WorkOwner, I) -> F>(_: &M) -> Result<Self, WorkError> {
         let per_slot = size_of::<Position<I, F>>()
             .checked_add(size_of::<Option<F>>())
             .and_then(|n| n.checked_add(size_of::<PollBacking>()))
@@ -66,13 +73,27 @@ impl PollRoleGeometry {
             // Pinned macOS mutex backing: ready ring and Notify wait list.
             .and_then(|n| n.checked_add(if cfg!(target_os = "macos") { 128 } else { 0 }))
             .ok_or(WorkError::ArithmeticOverflow)?;
-        Ok(Self { per_slot, shared })
+        Ok(Self {
+            per_slot,
+            shared,
+            failure_custody: Layout::new::<PollOutput<PollFailure<F::Output>>>(),
+        })
     }
-    pub(crate) fn bytes(self, slots: usize) -> Result<usize, WorkError> {
+    /// Fixed bank backing for the actual number of original inventory slots.
+    /// This excludes the separate health wrapper and independent pointees.
+    pub fn bytes(self, slots: usize) -> Result<usize, WorkError> {
         self.per_slot
             .checked_mul(slots)
             .and_then(|n| n.checked_add(self.shared))
             .ok_or(WorkError::ArithmeticOverflow)
+    }
+
+    /// One Box request for the whole original failure packet, including footer.
+    /// This is a separate layout fact, not an amount already included in bytes().
+    /// Payload pointees and retained-first/incoming overlap must be funded by
+    /// the actual receiving owner before that owner can install a complete role.
+    pub fn failure_custody_layout(&self) -> &Layout {
+        &self.failure_custody
     }
 }
 

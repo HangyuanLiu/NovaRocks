@@ -92,6 +92,7 @@ pub use result_window::{
     ResultCapacityConfig, ResultCapacityHandle, ResultCapacitySnapshot, ResultClosingCut,
     ResultWindowAlias, ResultWindowClass, ResultWindowGrant,
 };
+pub use role_poll::PollRoleGeometry;
 pub use scope::{
     BusinessPermit, CountedWorkloadControlParts, DeadlineExpiryHandle, PendingQueryRoot,
     QueryConcurrencyPermit, RootAdmissionHandle, RootWork, ServingState,
