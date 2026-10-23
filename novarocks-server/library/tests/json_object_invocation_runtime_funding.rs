@@ -16,7 +16,7 @@
 // under the License.
 
 //! Original complete JSON invocation under the sole shipping GLOBAL.
-//! Safe record identities observe whole groups, never hidden Buffer tails.
+//! Safe record identities observe each backing, never hidden Buffer tails.
 #[path = "support/shift_runtime_funding.rs"]
 mod support;
 use arrow::{
@@ -155,7 +155,7 @@ fn assert_original_date32_data(data: &ScalarInvocationData, rows: &[usize]) {
 }
 
 #[test]
-fn json_object_actual_runtime_whole_groups_keep_query_facts_until_cross_thread_last_alias() {
+fn json_object_actual_runtime_buffer_aliases_keep_query_facts_until_cross_thread_last_drop() {
     let _ = novarocks_server_application::memory_observation::snapshot();
     for data in [false, true] {
         let binding = json_binding();
@@ -226,7 +226,7 @@ fn json_object_actual_runtime_whole_groups_keep_query_facts_until_cross_thread_l
                 strings.nulls().unwrap().buffer().clone(),
             ];
             assert!(buffers.iter().all(|b| b.len() >= 512));
-            // These custom views all retain the ONE original backing group.
+            // Each custom view retains its own backing and the shared grant.
             // Their hidden capacities cannot qualify a physical tail reader.
             Alias::Buffers(buffers)
         };
@@ -261,7 +261,7 @@ fn json_object_actual_runtime_whole_groups_keep_query_facts_until_cross_thread_l
         assert_eq!(
             live(&snapshots(&records, &binding)),
             physical,
-            "nonlast group alias preserves physical facts"
+            "nonlast aliases preserve each backing's physical facts"
         );
         let commitment = binding.authority().root().committed_bytes();
         let transfer = binding
@@ -286,9 +286,21 @@ fn json_object_actual_runtime_whole_groups_keep_query_facts_until_cross_thread_l
         );
         match alias {
             Alias::Buffers(mut buffers) => {
+                let mut previous = physical;
                 while buffers.len() > 1 {
-                    drop(buffers.pop().unwrap());
-                    assert_eq!(live(&snapshots(&records, &binding)), physical);
+                    let buffer = buffers.pop().unwrap();
+                    let visible_bytes = i64::try_from(buffer.len()).unwrap();
+                    drop(buffer);
+                    let remaining = live(&snapshots(&records, &binding));
+                    assert_eq!(remaining.1, previous.1 - 1);
+                    assert!(previous.0 - remaining.0 >= visible_bytes);
+                    assert!(remaining.0 > 0 && remaining.1 > 0);
+                    assert_eq!(
+                        binding.authority().root().committed_bytes(),
+                        retained_commitment,
+                        "remaining backing keeps the shared admission grant"
+                    );
+                    previous = remaining;
                 }
                 let last = buffers.pop().unwrap();
                 std::thread::spawn(move || drop(last)).join().unwrap();

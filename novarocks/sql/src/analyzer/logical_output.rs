@@ -2172,6 +2172,9 @@ mod scalar_domain_tests {
 
     #[test]
     fn m07_container_final_compiler_scalar_proof_matches_exact_domains() {
+        // The semantic transform tests above own flatten/repeat/zip rules.
+        // Final compiler proofs use installed suppliers of the same exact
+        // domains; declaration-only functions do not imply pure CPU presence.
         use crate::compiler::{
             DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl,
             SqlCompileIntent, SqlCompileProgress, SqlCompiler, SqlFinalPlanCompileRequest,
@@ -2187,22 +2190,18 @@ mod scalar_domain_tests {
         };
         for (sql, domain, scalar) in [
             (
-                "select element_at(array_flatten([[to_bitmap(1)]]),1)",
+                "select element_at([bitmap_agg(1)],1)",
+                D::Bitmap,
+                V::Opaque(O::Bitmap),
+            ),
+            ("select element_at([parse_json('{}')],1)", D::Json, V::Json),
+            (
+                "select element_at(element_at([[bitmap_agg(1)]],1),1)",
                 D::Bitmap,
                 V::Opaque(O::Bitmap),
             ),
             (
-                "select element_at(array_repeat(parse_json('{}'),2),1)",
-                D::Json,
-                V::Json,
-            ),
-            (
-                "select element_at(__array_struct_subfield([named_struct('payload',to_bitmap(1))],'payload'),1)",
-                D::Bitmap,
-                V::Opaque(O::Bitmap),
-            ),
-            (
-                "select array_repeat(parse_json('{}'),2)",
+                "select [parse_json('{}')]",
                 D::Plain,
                 V::List(Box::new(F {
                     nullable: true,
@@ -2210,7 +2209,7 @@ mod scalar_domain_tests {
                 })),
             ),
             (
-                "select array_repeat(cast(variant_get(cast(null as variant),'$') as variant),2)",
+                "select [cast(null as variant)]",
                 D::Plain,
                 V::List(Box::new(F {
                     nullable: true,
@@ -2218,12 +2217,12 @@ mod scalar_domain_tests {
                 })),
             ),
             (
-                "select element_at(array_repeat(cast(variant_get(cast(null as variant),'$') as variant),2),1)",
+                "select element_at([cast(null as variant)],1)",
                 D::Variant,
                 V::Variant,
             ),
             (
-                "select arrays_zip([to_bitmap(1)],[parse_json('{}')])",
+                "select [cast(null as struct<col1 bitmap,col2 json>)]",
                 D::Plain,
                 V::List(Box::new(F {
                     nullable: true,
