@@ -1576,12 +1576,29 @@ impl JointAdjustmentReceipt {
     /// Publish the one child already committed by this exact reply. No second
     /// admission or physical-holder guard is created between grant and Node.
     pub fn install_child(mut self, owner: &WorkOwner) -> Result<WorkOwner, WorkError> {
+        let mut child = None;
+        self.install_child_in(owner, &mut child)?.notify();
+        Ok(child.expect("successful child publication installs the original owner"))
+    }
+
+    /// Install the original child in an existing stable receiver before any
+    /// notification. Borrowing keeps this exact receipt with the caller on
+    /// refusal; success disarms it in the same operation. Neither outcome
+    /// invokes a callback. Notify success only after all receiver locks exit.
+    pub fn install_child_in(
+        &mut self,
+        owner: &WorkOwner,
+        destination: &mut Option<WorkOwner>,
+    ) -> Result<crate::WorkloadProgressNotification, WorkError> {
+        if destination.is_some() {
+            return Err(WorkError::Conflict);
+        }
         let parent_scope = owner.scope();
         if !Arc::ptr_eq(&parent_scope.inner, &self.inner) {
             return Err(WorkError::ForeignAuthority);
         }
-        let id = self.id.expect("live child receipt");
-        let result = self.inner.update(|state| {
+        let id = self.id.ok_or(WorkError::Released)?;
+        let result = self.inner.update_facts_silent(|state| {
             let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
             let request = ledger.requests.get(&id).ok_or(WorkError::Released)?;
             match &request.phase {
@@ -1650,12 +1667,14 @@ impl JointAdjustmentReceipt {
             claim.structure_revision += 1;
             claim.pending = None;
             remove_request(state, id);
-            Ok(child)
+            *destination = Some(child);
+            Ok(())
         });
-        if result.is_ok() {
-            self.id = None;
-        }
-        result
+        result?;
+        self.id = None;
+        Ok(crate::WorkloadProgressNotification::new(Arc::clone(
+            &self.inner,
+        )))
     }
 
     fn install_originals(

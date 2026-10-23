@@ -99,7 +99,8 @@ pub use scope::{
     WorkCancellationRequestOutcome, WorkCancellationRequester, WorkClass, WorkId, WorkOwner,
     WorkRequest, WorkRetirementObserver, WorkScope, WorkSuccessSealOutcome, WorkSuccessSealer,
     WorkloadConfig, WorkloadControl, WorkloadControlParts, WorkloadProgress,
-    WorkloadProgressRevision, WorkloadShutdown, WorkloadShutdownError, WorkloadShutdownFailure,
+    WorkloadProgressNotification, WorkloadProgressRevision, WorkloadShutdown,
+    WorkloadShutdownError, WorkloadShutdownFailure,
 };
 
 mod failure_projection;

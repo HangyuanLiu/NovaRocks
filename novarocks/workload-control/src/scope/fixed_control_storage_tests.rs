@@ -227,6 +227,154 @@ fn binding_receipt(
 }
 
 #[test]
+fn original_joint_child_enters_a_stable_receiver_before_unlocked_notification() {
+    use crate::joint_admission::{JointAdjustmentReceipt, JointClaimChange};
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::{
+            Mutex, Weak,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        task::Wake,
+    };
+    struct Receiving {
+        receipt: Option<JointAdjustmentReceipt>,
+        child: Option<WorkOwner>,
+    }
+    struct ReceiverWake {
+        receiver: Weak<Mutex<Receiving>>,
+        inner: Weak<Inner>,
+        calls: AtomicUsize,
+        panic_once: AtomicBool,
+    }
+    impl Wake for ReceiverWake {
+        fn wake(self: Arc<Self>) {
+            assert!(self.receiver.upgrade().unwrap().try_lock().is_ok());
+            assert!(self.inner.upgrade().unwrap().state.try_lock().is_ok());
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            if self.panic_once.swap(false, Ordering::AcqRel) {
+                panic!("intentional child receiver notification failure");
+            }
+        }
+    }
+    for panic_callback in [false, true] {
+        let (control, handle, mut driver) = prototype_profile(4, 1, 2, 1);
+        let parent = root(&control);
+        let a = selected_dependency(&handle, "a");
+        let b = selected_dependency(&handle, "b");
+        let expected = [a.fact().clone(), b.fact().clone()];
+        let mut binding = handle
+            .request(
+                &parent.owner.scope(),
+                vec![JointClaimChange::FirstBind {
+                    source: parent.owner.control_claim_view().unwrap(),
+                    dependencies: vec![a, b],
+                }],
+            )
+            .unwrap();
+        drain(&mut driver);
+        binding_receipt(&mut binding)
+            .install_control(&parent.owner, &[])
+            .unwrap();
+        let mut request = handle
+            .request_child(&parent.owner, WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        drain(&mut driver);
+        let receiver = Arc::new(Mutex::new(Receiving {
+            receipt: Some(binding_receipt(&mut request)),
+            child: None,
+        }));
+        let original_charge = snapshot(&control).2;
+        let wake = Arc::new(ReceiverWake {
+            receiver: Arc::downgrade(&receiver),
+            inner: Arc::downgrade(&control.inner),
+            calls: AtomicUsize::new(0),
+            panic_once: AtomicBool::new(panic_callback),
+        });
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut waiter = Box::pin(control.wait_progress(control.progress_revision()));
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let foreign = WorkloadControl::try_new_counted(WorkloadConfig::default())
+            .unwrap()
+            .owner;
+        foreign.mark_ready().unwrap();
+        let foreign_root = root(&foreign);
+        let progress = {
+            let mut receiving = receiver.lock().unwrap();
+            let Receiving { receipt, child } = &mut *receiving;
+            assert!(matches!(
+                receipt
+                    .as_mut()
+                    .unwrap()
+                    .install_child_in(&foreign_root.owner, child),
+                Err(WorkError::ForeignAuthority)
+            ));
+            assert!(child.is_none());
+            let progress = receipt
+                .as_mut()
+                .unwrap()
+                .install_child_in(&parent.owner, child)
+                .unwrap();
+            assert!(child.is_some());
+            assert_eq!(wake.calls.load(Ordering::Acquire), 0);
+            progress
+        };
+        assert_eq!(
+            catch_unwind(AssertUnwindSafe(|| progress.notify())).is_err(),
+            panic_callback
+        );
+        drop(waiter);
+        assert_eq!(wake.calls.load(Ordering::Acquire), 1);
+        assert_eq!(snapshot(&control).2, original_charge);
+        let child_id = receiver
+            .lock()
+            .unwrap()
+            .child
+            .as_ref()
+            .unwrap()
+            .scope()
+            .id();
+        {
+            let state = control.inner.state.lock().unwrap();
+            assert_eq!(state.nodes[&child_id].owner, OwnerState::Active);
+            let slot = state.nodes[&child_id].cancellation;
+            assert!(state.joint.as_ref().unwrap().control_has_domains_for_test(
+                state.cancellations.slots[slot.0].claim.unwrap(),
+                &expected
+            ));
+        }
+        // The exact receipt is now inert, including after callback unwind.
+        let receipt = receiver.lock().unwrap().receipt.take();
+        drop(receipt);
+        assert!(
+            control
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .nodes
+                .contains_key(&child_id)
+        );
+        let child = receiver.lock().unwrap().child.take().unwrap();
+        child.complete();
+        parent.business.release();
+        parent.owner.complete();
+        foreign_root.business.release();
+        foreign_root.owner.complete();
+        foreign.close_admission();
+        assert!(foreign.shutdown().is_ok());
+        control.close_admission();
+        drain(&mut driver);
+        assert_eq!(snapshot(&control).3, 0);
+    }
+}
+
+#[test]
 fn first_bind_preserves_base_and_requires_the_exact_original_owner_at_install() {
     let (control, handle, mut driver) = prototype_full(4, 1);
     let dependency = selected_dependency(&handle, "a");

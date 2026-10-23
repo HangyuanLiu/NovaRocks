@@ -21,6 +21,7 @@
 //! cohort/proof and this unique capability in a finite, funded stable location.
 
 use super::*;
+use crate::WorkloadProgressNotification;
 
 /// Drop never releases a retained responsibility. This is nevertheless the
 /// sole positive settlement capability; no numeric-ID lookup can recreate it.
@@ -34,20 +35,6 @@ pub(crate) struct OwnerRetainedClaimReceipt {
     release_revision: u64,
 }
 
-/// A committed transition has already updated the original level facts. The
-/// receiver carries this notification out of its own locks before waking any
-/// callback. Dropping it supplies no release, rollback or completion fact.
-#[must_use = "Notify committed progress after releasing the receiving owner's locks"]
-pub(crate) struct RetainedClaimProgress {
-    inner: Arc<Inner>,
-}
-
-impl RetainedClaimProgress {
-    pub(crate) fn notify(self) {
-        self.inner.notify_reclaim_progress();
-    }
-}
-
 /// Both slots belong to a stable receiver before this call. Refusal leaves
 /// them untouched and invokes no callbacks. Successful handoff installs the
 /// receipt and disarms the original guard under the same original State lock.
@@ -56,7 +43,7 @@ pub(crate) fn retain_claim_in(
     owner: &WorkOwner,
     source: &mut Option<JointClaim>,
     target: &mut Option<OwnerRetainedClaimReceipt>,
-) -> Result<RetainedClaimProgress, WorkError> {
+) -> Result<WorkloadProgressNotification, WorkError> {
     if target.is_some() {
         return Err(WorkError::Conflict);
     }
@@ -110,7 +97,7 @@ pub(crate) fn retain_claim_in(
     };
     // This guard is inert; its Inner alias leaves only after State unlocks.
     drop(retired);
-    Ok(RetainedClaimProgress { inner })
+    Ok(WorkloadProgressNotification::new(inner))
 }
 
 /// The receipt itself supplies the unique settlement capability. Cancellation,
@@ -120,7 +107,7 @@ pub(crate) fn retain_claim_in(
 /// Carry the returned progress out of every receiver lock before notifying.
 pub(crate) fn settle_retained_claim_in(
     slot: &mut Option<OwnerRetainedClaimReceipt>,
-) -> Result<RetainedClaimProgress, WorkError> {
+) -> Result<WorkloadProgressNotification, WorkError> {
     let receipt = slot.as_ref().ok_or(WorkError::Released)?;
     let inner = receipt.inner.upgrade().ok_or(WorkError::Released)?;
     let retired = {
@@ -149,7 +136,7 @@ pub(crate) fn settle_retained_claim_in(
         retired
     };
     drop(retired);
-    Ok(RetainedClaimProgress { inner })
+    Ok(WorkloadProgressNotification::new(inner))
 }
 
 #[cfg(test)]

@@ -671,6 +671,24 @@ pub struct WorkloadProgressRevision {
     reclaim_generation: u64,
 }
 
+/// Notification for facts already committed in the original authority.
+/// Carry it out of every receiving lock before calling notify. It owns no
+/// capacity or completion right; Drop does not roll back or release anything.
+#[must_use = "Notify committed progress after releasing the receiving owner's locks"]
+pub struct WorkloadProgressNotification {
+    inner: Arc<Inner>,
+}
+
+impl WorkloadProgressNotification {
+    pub(crate) fn new(inner: Arc<Inner>) -> Self {
+        Self { inner }
+    }
+
+    pub fn notify(self) {
+        self.inner.notify_reclaim_progress();
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkloadProgress {
     ControlReady(WorkloadProgressRevision),
