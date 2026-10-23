@@ -103,7 +103,7 @@ impl JointProgressDriver {
             let (start, idle_revision) = {
                 let mut guard = self.inner.state.lock().unwrap();
                 let state = &mut *guard;
-                let idle_revision = state.progress_marker();
+                let idle_revision = self.inner.capture_progress(state);
                 let start = (|| {
                     let ledger = state.joint.as_mut().expect("installed joint driver");
                     if self.scan_left == 0 {

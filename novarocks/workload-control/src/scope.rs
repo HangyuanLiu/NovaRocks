@@ -27,7 +27,10 @@ use crate::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use tokio::{sync::Notify, time::Instant};
@@ -305,10 +308,6 @@ pub(crate) struct State {
 }
 
 impl State {
-    pub(crate) fn progress_marker(&self) -> WorkloadProgressRevision {
-        WorkloadProgressRevision(self.progress_revision)
-    }
-
     pub(crate) fn waiting_records(&self) -> usize {
         self.requests.len() + self.resource_waiters.len()
     }
@@ -391,9 +390,49 @@ pub(crate) struct Inner {
     pub resource_config: Option<Arc<ResourceConfig>>,
     pub state: Mutex<State>,
     pub changed: Notify,
+    reclaim_generation: AtomicU64,
+}
+
+/// A raw cancellation alias may outlive the State transaction that cloned it.
+/// Declare this before every escaping alias so unwind drops those aliases first.
+/// This weak observer cannot keep a Work node or the process authority alive.
+struct ReclaimWakeOnExit {
+    inner: Weak<Inner>,
+}
+
+impl ReclaimWakeOnExit {
+    fn new(inner: &Arc<Inner>) -> Self {
+        Self {
+            inner: Arc::downgrade(inner),
+        }
+    }
+}
+
+impl Drop for ReclaimWakeOnExit {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner.notify_reclaim_progress();
+        }
+    }
 }
 
 impl Inner {
+    /// Capture both event sources while the caller holds the original State lock.
+    /// Equality only: neither wrapping counter expresses elapsed work or order.
+    pub(crate) fn capture_progress(&self, state: &State) -> WorkloadProgressRevision {
+        WorkloadProgressRevision {
+            state_revision: state.progress_revision,
+            reclaim_generation: self.reclaim_generation.load(Ordering::Acquire),
+        }
+    }
+
+    /// Called only after the notifying cancellation Arc has actually exited.
+    /// Notify only outside State; this does not release resources or author terminal facts.
+    pub(crate) fn notify_reclaim_progress(&self) {
+        self.reclaim_generation.fetch_add(1, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
     /// Allocation and observation facts do not drive policy queues. Keep their
     /// hot path independent of the number of scopes and admission requests.
     pub(crate) fn update_facts<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
@@ -511,13 +550,15 @@ pub struct WorkloadShutdownFailure {
     owner: WorkloadControl,
 }
 
-/// Monotonic process-local token used to await a later governance event.
+/// Opaque process-local token used to await a later governance event.
 ///
-/// Equality is the only supported interpretation. The counter may wrap after
-/// `u64::MAX` authority transactions; callers must never derive elapsed work
-/// or ordering distances from it.
+/// Equality is the only supported interpretation. Both counters may wrap;
+/// callers must never derive elapsed work or ordering distances from them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WorkloadProgressRevision(u64);
+pub struct WorkloadProgressRevision {
+    state_revision: u64,
+    reclaim_generation: u64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkloadProgress {
@@ -720,6 +761,7 @@ impl WorkloadControl {
                 resource_config: Some(Arc::new(resources)),
                 state: Mutex::new(State::default()),
                 changed: Notify::new(),
+                reclaim_generation: AtomicU64::new(0),
             }),
         })
     }
@@ -751,6 +793,7 @@ impl WorkloadControl {
                 resource_config: None,
                 state: Mutex::new(State::default()),
                 changed: Notify::new(),
+                reclaim_generation: AtomicU64::new(0),
             }),
         };
         Ok(CountedWorkloadControlParts {
@@ -807,6 +850,7 @@ impl WorkloadControl {
     /// deliberately separate lifecycle facts: callers use this only after a
     /// bounded drain has elapsed.
     pub fn cancel_active_roots(&self, reason: CancellationReason) -> usize {
+        let _reclaim = ReclaimWakeOnExit::new(&self.inner);
         let roots = {
             let state = self.inner.state.lock().unwrap();
             state
@@ -905,7 +949,8 @@ impl WorkloadControl {
     /// Capture the current event revision before attempting a state-dependent
     /// owner operation such as shutdown.
     pub fn progress_revision(&self) -> WorkloadProgressRevision {
-        WorkloadProgressRevision(self.inner.state.lock().unwrap().progress_revision)
+        self.inner
+            .capture_progress(&self.inner.state.lock().unwrap())
     }
 
     /// Await a later authority event without dedicating a thread or polling.
@@ -921,7 +966,7 @@ impl WorkloadControl {
             changed.as_mut().enable();
             let progress = {
                 let state = self.inner.state.lock().unwrap();
-                let revision = WorkloadProgressRevision(state.progress_revision);
+                let revision = self.inner.capture_progress(&state);
                 if state.is_drained() {
                     Some(WorkloadProgress::Drained(revision))
                 } else if !state.control_ready.is_empty()
@@ -967,6 +1012,7 @@ impl DeadlineExpiryHandle {
     /// work owns an OS waiting thread, and timeout only creates cancellation
     /// intent.
     pub fn expire_deadlines(&self) {
+        let _reclaim = ReclaimWakeOnExit::new(&self.inner);
         let notifications = self.inner.update(|state| {
             let cancelled = state
                 .nodes
@@ -999,7 +1045,7 @@ impl DeadlineExpiryHandle {
             .nodes
             .values()
             .filter(|node| !node.completed && !node.cancellation_signalled)
-            .filter_map(|node| node.cancellation.view().deadline())
+            .filter_map(|node| node.cancellation.deadline())
             .chain(
                 state
                     .requests
@@ -1015,7 +1061,8 @@ impl DeadlineExpiryHandle {
     /// Capture the current event revision before waiting for a later deadline
     /// or state transition.
     pub fn progress_revision(&self) -> WorkloadProgressRevision {
-        WorkloadProgressRevision(self.inner.state.lock().unwrap().progress_revision)
+        self.inner
+            .capture_progress(&self.inner.state.lock().unwrap())
     }
 
     /// Wait for any state revision without treating an idle, open authority as
@@ -1026,8 +1073,11 @@ impl DeadlineExpiryHandle {
             let changed = self.inner.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if WorkloadProgressRevision(self.inner.state.lock().unwrap().progress_revision) != after
-            {
+            let advanced = {
+                let state = self.inner.state.lock().unwrap();
+                self.inner.capture_progress(&state) != after
+            };
+            if advanced {
                 return;
             }
             changed.await;
@@ -1088,24 +1138,32 @@ impl WorkScope {
             .get(&self.id)
             .ok_or(WorkError::Released)?
             .cancellation
-            .view())
+            .view(&self.inner))
     }
 
     /// Derivation preserves responsibility and the earliest parent deadline.
     /// It does not acquire another business or execution permit.
     pub fn child(&self, request: WorkRequest) -> Result<WorkOwner, WorkError> {
         self.inner.update(|state| {
-            let parent = state.nodes.get(&self.id).ok_or(WorkError::Released)?;
-            parent.check()?;
+            let root = {
+                let parent = state.nodes.get(&self.id).ok_or(WorkError::Released)?;
+                parent.check()?;
+                parent.root
+            };
             if state.nodes.len() >= self.inner.config.scope_records_limit {
                 return Err(WorkError::Capacity("scope records"));
             }
-            let root = parent.root;
-            let cancellation = parent.cancellation.child(request.deadline);
-            if let Some(reason) = cancellation.reason() {
+            // Mint the original identity before registering any cancellation
+            // edge. State serializes this sequence with child publication.
+            let id = WorkId(state.next_id()?);
+            let cancellation = state.nodes[&self.id]
+                .cancellation
+                .child_with_sequence(request.deadline, id);
+            if let Some(reason) = cancellation.check_reason() {
+                // No Node was published; collect cannot own this rollback.
+                cancellation.detach();
                 return Err(WorkError::Cancelled(reason));
             }
-            let id = WorkId(state.next_id()?);
             state.nodes.insert(
                 id,
                 Node::new(Some(self.id), root, request.class, cancellation),
@@ -1280,6 +1338,7 @@ pub enum WorkSuccessSealOutcome {
 
 impl WorkSuccessSealer {
     pub fn seal(&self) -> Result<WorkSuccessSealOutcome, WorkError> {
+        let _reclaim = ReclaimWakeOnExit::new(&self.inner);
         let cancellation = {
             let state = self.inner.state.lock().unwrap();
             let node = state.nodes.get(&self.id).ok_or(WorkError::Released)?;
@@ -1312,6 +1371,7 @@ impl WorkCancellationRequester {
         &self,
         reason: CancellationReason,
     ) -> Result<WorkCancellationRequestOutcome, WorkError> {
+        let _reclaim = ReclaimWakeOnExit::new(&self.inner);
         let cancellation = {
             let state = self.inner.state.lock().unwrap();
             Arc::clone(
@@ -1346,6 +1406,7 @@ impl WorkCancellationRequester {
 impl Drop for WorkOwner {
     fn drop(&mut self) {
         if let Some(scope) = self.scope.take() {
+            let _reclaim = ReclaimWakeOnExit::new(&scope.inner);
             let cancellation =
                 Arc::clone(&scope.inner.state.lock().unwrap().nodes[&scope.id].cancellation);
             let cancellation_outcome = cancellation.request(CancellationReason::OwnerDropped);
@@ -1660,5 +1721,353 @@ mod tests {
         ));
         assert_eq!(control.snapshot().root_responsibilities, 0);
         assert_eq!(control.snapshot().businesses, 0);
+    }
+
+    #[test]
+    fn child_identity_exhaustion_registers_no_cancellation_edge() {
+        let control = controller();
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let scope = work.owner.scope();
+        let cancellation = {
+            let mut state = control.inner.state.lock().unwrap();
+            state.next_id = u64::MAX;
+            Arc::clone(&state.nodes[&scope.id].cancellation)
+        };
+        assert!(matches!(
+            scope.child(WorkRequest::new(WorkClass::Query)),
+            Err(WorkError::ArithmeticOverflow)
+        ));
+        assert_eq!(cancellation.linked_children_for_test(), 0);
+        assert_eq!(
+            control.inner.state.lock().unwrap().nodes[&scope.id].children,
+            0
+        );
+        work.business.release();
+        work.owner.complete();
+    }
+
+    #[test]
+    fn unpublished_cancelled_child_detaches_its_registered_edge() {
+        let control = controller();
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let scope = work.owner.scope();
+        let cancellation = {
+            let state = control.inner.state.lock().unwrap();
+            Arc::clone(&state.nodes[&scope.id].cancellation)
+        };
+        assert!(matches!(
+            scope.child(WorkRequest {
+                class: WorkClass::Query,
+                deadline: Some(Instant::now()),
+            }),
+            Err(WorkError::Cancelled(CancellationReason::DeadlineExceeded))
+        ));
+        assert_eq!(cancellation.linked_children_for_test(), 0);
+        assert_eq!(
+            control.inner.state.lock().unwrap().nodes[&scope.id].children,
+            0
+        );
+        assert_eq!(control.snapshot().root_responsibilities, 1);
+        work.business.release();
+        work.owner.complete();
+        assert_eq!(control.snapshot().root_responsibilities, 0);
+    }
+
+    struct InspectReclaimWake {
+        authority: Weak<Inner>,
+        cancellation: Weak<Cancellation>,
+        wakes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Wake for InspectReclaimWake {
+        fn wake(self: Arc<Self>) {
+            let inner = self.authority.upgrade().unwrap();
+            assert!(inner.state.try_lock().is_ok(), "reclaim wake held State");
+            assert_eq!(
+                self.cancellation.strong_count(),
+                0,
+                "the final view must drop its actual Arc before notifying"
+            );
+            self.wakes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_view_exit_wakes_both_waiters_after_actual_arc_exit() {
+        let control = controller();
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let scope = work.owner.scope();
+        let first = scope.cancellation().unwrap();
+        let before_clone_drop = control.progress_revision();
+        let view = first.clone();
+        let cell =
+            Arc::downgrade(&control.inner.state.lock().unwrap().nodes[&scope.id].cancellation);
+        assert_eq!(
+            control.progress_revision(),
+            before_clone_drop,
+            "clones allocate no event"
+        );
+        drop(first);
+        work.business.release();
+        work.owner.complete();
+        assert!(
+            !control
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .nodes
+                .contains_key(&scope.id)
+        );
+        assert!(
+            cell.upgrade().is_some(),
+            "only the retained view keeps cancellation facts"
+        );
+
+        let after = control.progress_revision();
+        let deadline_owner = control.deadline_expiry_handle();
+        let wakes = Arc::new(InspectReclaimWake {
+            authority: Arc::downgrade(&control.inner),
+            cancellation: cell.clone(),
+            wakes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut progress = Box::pin(control.wait_progress(after));
+        let mut deadlines = Box::pin(deadline_owner.wait_state_change(after));
+        assert!(
+            progress
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        assert!(
+            deadlines
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        drop(view);
+        assert!(cell.upgrade().is_none());
+        let now = control.progress_revision();
+        assert_eq!(now.state_revision, after.state_revision);
+        assert_ne!(now.reclaim_generation, after.reclaim_generation);
+        assert!(wakes.wakes.load(Ordering::Relaxed) > 0);
+        assert!(
+            matches!(progress.as_mut().poll(&mut Context::from_waker(&waker)),
+            std::task::Poll::Ready(WorkloadProgress::StateChanged(revision)) if revision == now)
+        );
+        assert!(
+            deadlines
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready()
+        );
+    }
+
+    #[tokio::test]
+    async fn view_exit_before_wait_registration_is_not_lost_and_does_not_pin_authority() {
+        let control = controller();
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let view = work.owner.scope().cancellation().unwrap();
+        let survivor = view.clone();
+        work.business.release();
+        work.owner.complete();
+        let after = control.progress_revision();
+        drop(view);
+        let deadlines = control.deadline_expiry_handle();
+        let mut changed = Box::pin(deadlines.wait_state_change(after));
+        assert!(
+            changed
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+        let mut progress = Box::pin(control.wait_progress(after));
+        assert!(
+            progress
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+        drop(progress);
+        drop(changed);
+        drop(deadlines);
+        let original_authority = Arc::downgrade(&control.inner);
+        drop(control);
+        assert!(
+            original_authority.upgrade().is_none(),
+            "a retained view is non-owning"
+        );
+        drop(survivor);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_original_raw_author_reports_exit_and_repeated_deadline_reads_are_silent() {
+        for action in 0..5 {
+            let control = controller();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let work = control
+                .try_begin_root(WorkRequest {
+                    class: WorkClass::Query,
+                    deadline: Some(deadline),
+                })
+                .unwrap();
+            let scope = work.owner.scope();
+            let view = scope.cancellation().unwrap();
+            let cell =
+                Arc::downgrade(&control.inner.state.lock().unwrap().nodes[&scope.id].cancellation);
+            let mut owner = Some(work.owner);
+            let before = control.progress_revision();
+            assert_eq!(control.next_deadline(), Some(deadline));
+            assert_eq!(control.next_deadline(), Some(deadline));
+            assert_eq!(
+                control.progress_revision(),
+                before,
+                "deadline getters cannot create dropping views"
+            );
+            if action == 1 {
+                tokio::time::advance(Duration::from_secs(2)).await;
+            }
+            match action {
+                0 => {
+                    control.cancel_active_roots(CancellationReason::Requested);
+                }
+                1 => control.expire_deadlines(),
+                2 => {
+                    assert_eq!(
+                        owner.as_ref().unwrap().success_sealer().seal().unwrap(),
+                        WorkSuccessSealOutcome::Sealed
+                    );
+                }
+                3 => {
+                    owner
+                        .as_ref()
+                        .unwrap()
+                        .cancellation_requester()
+                        .request(CancellationReason::Requested)
+                        .unwrap();
+                }
+                4 => drop(owner.take()),
+                _ => unreachable!(),
+            }
+            let after = control.progress_revision();
+            assert_eq!(
+                after.reclaim_generation,
+                before.reclaim_generation.wrapping_add(1),
+                "raw author {action}"
+            );
+            assert_eq!(
+                cell.strong_count(),
+                2,
+                "only original node and view survive raw author {action}"
+            );
+            if action == 2 {
+                assert_eq!(
+                    after.state_revision, before.state_revision,
+                    "seal's raw exit must be observable without a State mutation"
+                );
+            }
+            let owner = owner.unwrap_or_else(|| control.adopt(scope.id).unwrap());
+            work.business.release();
+            owner.complete_after_terminal_cancel_settled();
+            drop(view);
+        }
+    }
+
+    struct PanicOnceCancellationWake(std::sync::atomic::AtomicBool);
+    impl Wake for PanicOnceCancellationWake {
+        fn wake(self: Arc<Self>) {
+            if !self.0.swap(true, Ordering::Relaxed) {
+                panic!("injected cancellation wake unwind");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn original_request_unwind_drops_raw_arc_before_publishing_reclaim_revision() {
+        let control = controller();
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let scope = work.owner.scope();
+        let view = scope.cancellation().unwrap();
+        let cell =
+            Arc::downgrade(&control.inner.state.lock().unwrap().nodes[&scope.id].cancellation);
+        let requester = work.owner.cancellation_requester();
+        let mut observer = Box::pin(view.cancelled());
+        let waker = Waker::from(Arc::new(PanicOnceCancellationWake(
+            std::sync::atomic::AtomicBool::new(false),
+        )));
+        assert!(
+            observer
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let after = control.progress_revision();
+        let mut progress = Box::pin(control.wait_progress(after));
+        assert!(
+            progress
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            requester.request(CancellationReason::Requested)
+        }));
+        assert!(
+            result.is_err(),
+            "actual cancellation notification unwinds the original request"
+        );
+        assert_eq!(
+            cell.strong_count(),
+            2,
+            "the escaping raw request Arc was actually dropped"
+        );
+        let now = control.progress_revision();
+        assert_eq!(
+            now.state_revision, after.state_revision,
+            "unwind preceded the request's State update"
+        );
+        assert_ne!(now.reclaim_generation, after.reclaim_generation);
+        assert!(
+            progress
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+        drop(progress);
+        drop(observer);
+        work.business.release();
+        work.owner.complete_after_terminal_cancel_settled();
+    }
+
+    #[test]
+    fn raw_author_error_return_also_advances_the_observable_pair() {
+        let control = controller();
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let child = work
+            .owner
+            .scope()
+            .child(WorkRequest::new(WorkClass::Management))
+            .unwrap();
+        let after = control.progress_revision();
+        assert_eq!(child.success_sealer().seal(), Err(WorkError::Conflict));
+        let now = control.progress_revision();
+        assert_eq!(now.state_revision, after.state_revision);
+        assert_ne!(now.reclaim_generation, after.reclaim_generation);
+        child.complete();
+        work.business.release();
+        work.owner.complete();
     }
 }
