@@ -577,7 +577,7 @@ fn validate_suffix_freeze(freeze: &Freeze, case: Case) -> Result<()> {
                 && freeze.expected_mutated_body_sha256.as_deref()
                     == Some("112eb22b8f4cb517da83112c0bcc142bfbb7c37e4d09dfe5b2e0b1f0df53fbd7")
                 && freeze.contract_reason
-                    == "malformed root client rows: client-row prefix has no payload in the same body",
+                    == "[query.execution.invalid_data] client-row prefix has no payload in the same body",
             "unsupported frozen valid-row prefix-only suffix"
         );
     } else {
