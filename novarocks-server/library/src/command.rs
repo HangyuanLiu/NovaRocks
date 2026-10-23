@@ -114,6 +114,10 @@ fn run_frontend(
     memory_authority: Arc<MemoryAuthority>,
     runtime: &tokio::runtime::Runtime,
 ) -> anyhow::Result<()> {
+    let filesystem = composition::compose_connector_file_planning_resources(
+        &role.config,
+        runtime.handle().clone(),
+    )?;
     let frontend = composition::compose_frontend_role_config(
         &role.config,
         build,
@@ -125,6 +129,7 @@ fn run_frontend(
         provider_manifest,
         memory_authority,
         runtime.handle().clone(),
+        filesystem,
         #[cfg(novarocks_dev_controls)]
         role.test_session.clone(),
     )?;
@@ -150,6 +155,10 @@ fn run_backend(
     runtime: &tokio::runtime::Runtime,
 ) -> anyhow::Result<()> {
     initialize_backend_file_caches(&role.config);
+    let filesystem = composition::compose_connector_file_planning_resources(
+        &role.config,
+        runtime.handle().clone(),
+    )?;
     let scan_io = ScanIoRuntime::start(&role.config.runtime)?;
     let backend = match composition::compose_backend_server_config(
         &role.config,
@@ -161,6 +170,7 @@ fn run_backend(
         provider_manifest,
         memory_authority,
         runtime.handle().clone(),
+        filesystem,
         &scan_io.services(),
         #[cfg(novarocks_dev_controls)]
         role.test_session.clone(),
@@ -219,6 +229,10 @@ async fn run_all_in_one(
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
     initialize_backend_file_caches(&be.config);
+    let fe_filesystem =
+        composition::compose_connector_file_planning_resources(&fe.config, runtime.clone())?;
+    let be_filesystem =
+        composition::compose_connector_file_planning_resources(&be.config, runtime.clone())?;
     let frontend = composition::compose_frontend_role_config(
         &fe.config,
         build,
@@ -231,6 +245,7 @@ async fn run_all_in_one(
         // Both roles consume the same authority: one OS process, one bound.
         Arc::clone(&memory_authority),
         runtime.clone(),
+        fe_filesystem,
         #[cfg(novarocks_dev_controls)]
         fe.test_session.clone(),
     )?;
@@ -245,6 +260,7 @@ async fn run_all_in_one(
         provider_manifest,
         memory_authority,
         runtime.clone(),
+        be_filesystem,
         &scan_io.services(),
         #[cfg(novarocks_dev_controls)]
         be.test_session.clone(),

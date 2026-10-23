@@ -19,6 +19,7 @@ use std::convert::Infallible;
 use std::future;
 use std::mem;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -62,7 +63,7 @@ impl HttpTransport for Reqwest012Transport {
         if !body.is_empty() {
             #[cfg(not(target_arch = "wasm32"))]
             {
-                request = request.body(reqwest::Body::wrap(HttpBufferBody(body)));
+                request = request.body(reqwest::Body::wrap(HttpBufferBody::bridge(body)));
             }
             #[cfg(target_arch = "wasm32")]
             {
@@ -113,7 +114,44 @@ fn is_temporary_error(error: &reqwest::Error) -> bool {
     error.is_request() || error.is_body() || error.is_decode()
 }
 
-struct HttpBufferBody(Buffer);
+struct HttpBufferBody {
+    data: Buffer,
+    custody: Option<Arc<dyn Send + Sync>>,
+}
+
+impl HttpBufferBody {
+    // Temporary existing reqwest bridge; the owned connection path always
+    // supplies its original request custody below.
+    fn bridge(data: Buffer) -> Self {
+        Self {
+            data,
+            custody: None,
+        }
+    }
+
+    /// The original admission must cover the actual upload backing and at
+    /// most data.count() retention cells before dispatch. Sharing this guard
+    /// preserves custody; it never grants bytes or a physical position.
+    fn retained<G: Send + Sync + 'static>(data: Buffer, custody: Arc<G>) -> Self {
+        Self {
+            data,
+            custody: Some(custody),
+        }
+    }
+}
+
+// Field order keeps the original bytes alive under the same custody until
+// every Hyper queue, clone and slice of this frame has actually released it.
+struct RetainedUploadFrame {
+    data: Bytes,
+    _custody: Arc<dyn Send + Sync>,
+}
+
+impl AsRef<[u8]> for RetainedUploadFrame {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
 
 impl http_body::Body for HttpBufferBody {
     type Data = Bytes;
@@ -123,17 +161,38 @@ impl http_body::Body for HttpBufferBody {
         mut self: Pin<&mut Self>,
         _: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        match self.0.next() {
-            Some(bytes) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
+        match self.data.next() {
+            Some(bytes) => {
+                let bytes = match &self.custody {
+                    Some(custody) => Bytes::from_owner(RetainedUploadFrame {
+                        data: bytes,
+                        _custody: Arc::clone(custody),
+                    }),
+                    None => bytes,
+                };
+                Poll::Ready(Some(Ok(Frame::data(bytes))))
+            }
             None => Poll::Ready(None),
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.0.is_empty()
+        self.data.is_empty()
     }
 
     fn size_hint(&self) -> SizeHint {
-        SizeHint::with_exact(self.0.len() as u64)
+        SizeHint::with_exact(self.data.len() as u64)
     }
 }
+
+mod connector;
+mod route;
+
+#[cfg(test)]
+#[path = "http_transport/upload_tests.rs"]
+mod upload_tests;
+
+mod connection;
+mod process;
+mod process_cell;
+mod response;

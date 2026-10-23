@@ -49,6 +49,7 @@ type ContractBuilder = fn() -> Result<ProviderContractDefinition, ConnectorCodec
 struct ProviderFactoryInput<'a> {
     config: &'a NovaRocksConfig,
     runtime: tokio::runtime::Handle,
+    filesystem: &'a novarocks_fs::FsAccessResources,
     #[cfg(novarocks_dev_controls)]
     test_slots: &'a crate::provider_test_slots::ProviderTestSlots,
 }
@@ -165,11 +166,13 @@ impl ServerProviderManifest {
         &self,
         config: &NovaRocksConfig,
         runtime: tokio::runtime::Handle,
+        filesystem: &novarocks_fs::FsAccessResources,
         #[cfg(novarocks_dev_controls)] test_slots: &crate::provider_test_slots::ProviderTestSlots,
     ) -> anyhow::Result<Vec<Arc<dyn ConnectorControlRoleBindingFactory>>> {
         let input = ProviderFactoryInput {
             config,
             runtime,
+            filesystem,
             #[cfg(novarocks_dev_controls)]
             test_slots,
         };
@@ -225,12 +228,18 @@ impl ServerProviderManifest {
         &self,
         config: &NovaRocksConfig,
         runtime: tokio::runtime::Handle,
+        filesystem: &novarocks_fs::FsAccessResources,
         scan_io: &ScanIoServices,
         #[cfg(novarocks_dev_controls)] test_slots: &crate::provider_test_slots::ProviderTestSlots,
     ) -> anyhow::Result<Vec<Arc<dyn ConnectorExecutionRoleBindingFactory>>> {
+        #[cfg(novarocks_dev_controls)]
+        test_slots
+            .register_storage(filesystem.storage_authority_registry().clone())
+            .map_err(anyhow::Error::msg)?;
         let input = ProviderFactoryInput {
             config,
             runtime,
+            filesystem,
             #[cfg(novarocks_dev_controls)]
             test_slots,
         };
@@ -270,8 +279,10 @@ fn build_iceberg_control_factory(
 ) -> anyhow::Result<Arc<dyn ConnectorControlRoleBindingFactory>> {
     let config = input.config;
     let runtime = input.runtime.clone();
-    let metadata_binding =
-        crate::composition::compose_iceberg_metadata_access_template(config, runtime.clone())?;
+    let metadata_binding = crate::composition::compose_iceberg_metadata_access_template(
+        config,
+        input.filesystem.clone(),
+    )?;
     let max_inflight = NonZeroUsize::new(config.runtime.catalog_materialization_max_inflight)
         .ok_or_else(|| anyhow::anyhow!("catalog materialization max inflight must be nonzero"))?;
     let resources = IcebergMetadataResources::new(metadata_binding, runtime);
@@ -290,13 +301,9 @@ fn build_iceberg_execution_factory(
     let resources = crate::composition::compose_iceberg_execution_resources(
         input.config,
         input.runtime.clone(),
+        input.filesystem.clone(),
         scan_io,
     )?;
-    #[cfg(novarocks_dev_controls)]
-    input
-        .test_slots
-        .register_storage(resources.test_storage_authority_registry())
-        .map_err(anyhow::Error::msg)?;
     #[cfg(novarocks_dev_controls)]
     let resources = resources.with_test_observation(input.test_slots.iceberg.clone());
     let options = iceberg_execution_reader_options(input.config);
@@ -337,7 +344,7 @@ fn build_paimon_control_factory(
 ) -> anyhow::Result<Arc<dyn ConnectorControlRoleBindingFactory>> {
     let access = crate::composition::compose_paimon_control_access_factory(
         input.config,
-        input.runtime.clone(),
+        input.filesystem.clone(),
     )?;
     Ok(Arc::new(PaimonControlRoleBindingFactory::new(
         access,
@@ -351,10 +358,8 @@ fn build_paimon_execution_factory(
 ) -> anyhow::Result<Arc<dyn ConnectorExecutionRoleBindingFactory>> {
     let access = crate::composition::compose_paimon_execution_access_factory(
         input.config,
-        input.runtime.clone(),
+        input.filesystem.clone(),
         scan_io,
-        #[cfg(novarocks_dev_controls)]
-        input.test_slots,
     )?;
     Ok(Arc::new(PaimonExecutionRoleBindingFactory::new(access)))
 }
@@ -556,12 +561,18 @@ mod tests {
         }])
         .expect("contract-only sealing must not invoke factories");
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let filesystem = crate::composition::compose_connector_file_planning_resources(
+            &NovaRocksConfig::default(),
+            runtime.handle().clone(),
+        )
+        .expect("explicit FS resources");
         #[cfg(novarocks_dev_controls)]
         let test_slots = crate::provider_test_slots::ProviderTestSlots::default();
         let error = manifest
             .compose_control_factories(
                 &NovaRocksConfig::default(),
                 runtime.handle().clone(),
+                &filesystem,
                 #[cfg(novarocks_dev_controls)]
                 &test_slots,
             )
@@ -586,12 +597,18 @@ mod tests {
         assert_eq!(EXECUTION_BUILDS.load(Ordering::Acquire), 0);
 
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let filesystem = crate::composition::compose_connector_file_planning_resources(
+            &NovaRocksConfig::default(),
+            runtime.handle().clone(),
+        )
+        .expect("explicit FS resources");
         #[cfg(novarocks_dev_controls)]
         let test_slots = crate::provider_test_slots::ProviderTestSlots::default();
         manifest
             .compose_control_factories(
                 &NovaRocksConfig::default(),
                 runtime.handle().clone(),
+                &filesystem,
                 #[cfg(novarocks_dev_controls)]
                 &test_slots,
             )
@@ -604,6 +621,11 @@ mod tests {
     fn native_carriers_and_both_role_projections_share_one_manifest() {
         let manifest = ServerProviderManifest::seal().expect("server provider manifest");
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let filesystem = crate::composition::compose_connector_file_planning_resources(
+            &NovaRocksConfig::default(),
+            runtime.handle().clone(),
+        )
+        .expect("explicit FS resources");
         #[cfg(novarocks_dev_controls)]
         let test_slots = crate::provider_test_slots::ProviderTestSlots::default();
         let config = NovaRocksConfig::default();
@@ -623,6 +645,7 @@ mod tests {
             .compose_control_factories(
                 &config,
                 runtime.handle().clone(),
+                &filesystem,
                 #[cfg(novarocks_dev_controls)]
                 &test_slots,
             )
@@ -636,6 +659,7 @@ mod tests {
             .compose_execution_factories(
                 &config,
                 runtime.handle().clone(),
+                &filesystem,
                 &scan_io.services(),
                 #[cfg(novarocks_dev_controls)]
                 &test_slots,

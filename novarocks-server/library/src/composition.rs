@@ -360,6 +360,7 @@ pub fn compose_backend_server_config(
     provider_manifest: std::sync::Arc<ServerProviderManifest>,
     memory_authority: std::sync::Arc<novarocks_memory::MemoryAuthority>,
     runtime: tokio::runtime::Handle,
+    filesystem: FsAccessResources,
     scan_io: &ScanIoServices,
     #[cfg(novarocks_dev_controls)] test_session: Option<
         novarocks_failpoint::liveness::PreparedRoleSession,
@@ -486,6 +487,7 @@ pub fn compose_backend_server_config(
         execution_role_binding_factories: provider_manifest.compose_execution_factories(
             config,
             runtime,
+            &filesystem,
             scan_io,
             #[cfg(novarocks_dev_controls)]
             &test_slots,
@@ -562,6 +564,7 @@ pub fn compose_frontend_role_config(
     provider_manifest: std::sync::Arc<ServerProviderManifest>,
     memory_authority: std::sync::Arc<novarocks_memory::MemoryAuthority>,
     runtime: tokio::runtime::Handle,
+    filesystem: FsAccessResources,
     #[cfg(novarocks_dev_controls)] test_session: Option<
         novarocks_failpoint::liveness::PreparedRoleSession,
     >,
@@ -739,6 +742,7 @@ pub fn compose_frontend_role_config(
             connector_control_role_factories: provider_manifest.compose_control_factories(
                 config,
                 runtime,
+                &filesystem,
                 #[cfg(novarocks_dev_controls)]
                 &test_slots,
             )?,
@@ -1034,9 +1038,9 @@ fn backend_execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntim
 pub fn compose_iceberg_execution_resources(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
+    write_resources: FsAccessResources,
     scan_io: &ScanIoServices,
 ) -> anyhow::Result<IcebergExecutionResources> {
-    let write_resources = compose_connector_file_planning_resources(config, runtime.clone())?;
     // Read and write are I/O views of the same BE storage authority. Moving
     // reads onto scan I/O must not mint another credential registry or pool.
     let read_resources =
@@ -1073,7 +1077,7 @@ fn compose_iceberg_access_template_from_resources(
 /// planning FileIO.
 pub(crate) fn compose_iceberg_metadata_access_template(
     config: &NovaRocksConfig,
-    runtime: tokio::runtime::Handle,
+    resources: FsAccessResources,
 ) -> anyhow::Result<IcebergReadBinding> {
     let resolver: std::sync::Arc<
         dyn novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver,
@@ -1083,7 +1087,6 @@ pub(crate) fn compose_iceberg_metadata_access_template(
             .credential_registry(ClusterRole::Fe)
             .map_err(|error| anyhow::anyhow!("resolve FE metadata credentials: {error}"))?,
     );
-    let resources = compose_connector_file_planning_resources(config, runtime)?;
     Ok(IcebergReadBinding::with_static_metadata_credential_resolver(resources, resolver))
 }
 
@@ -1091,9 +1094,8 @@ pub(crate) fn compose_iceberg_metadata_access_template(
 /// runtime, outside the scan I/O services.
 pub(crate) fn compose_paimon_control_access_factory(
     config: &NovaRocksConfig,
-    runtime: tokio::runtime::Handle,
+    resources: FsAccessResources,
 ) -> anyhow::Result<std::sync::Arc<ServerPaimonRoleFileIoFactory>> {
-    let resources = compose_connector_file_planning_resources(config, runtime)?;
     Ok(std::sync::Arc::new(
         compose_paimon_access_factory_with_resources(config, ClusterRole::Fe, resources)?,
     ))
@@ -1103,16 +1105,10 @@ pub(crate) fn compose_paimon_control_access_factory(
 /// provider's execution reads, so its HEADs and GETs share their windows.
 pub(crate) fn compose_paimon_execution_access_factory(
     config: &NovaRocksConfig,
-    runtime: tokio::runtime::Handle,
+    resources: FsAccessResources,
     scan_io: &ScanIoServices,
-    #[cfg(novarocks_dev_controls)] test_slots: &crate::provider_test_slots::ProviderTestSlots,
 ) -> anyhow::Result<std::sync::Arc<ServerPaimonRoleFileIoFactory>> {
-    let resources = compose_connector_file_planning_resources(config, runtime)?
-        .with_file_io(scan_io.file_runtime(), scan_io.file_task_spawner());
-    #[cfg(novarocks_dev_controls)]
-    test_slots
-        .register_storage(resources.storage_authority_registry().clone())
-        .map_err(anyhow::Error::msg)?;
+    let resources = resources.with_file_io(scan_io.file_runtime(), scan_io.file_task_spawner());
     Ok(std::sync::Arc::new(
         compose_paimon_access_factory_with_resources(config, ClusterRole::Be, resources)?
             .with_range_service(scan_io.range_service()),
