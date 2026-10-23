@@ -39,7 +39,6 @@ mod paid_proposal;
 pub(crate) mod retained_claim;
 pub use paid_proposal::JointProposal;
 pub(crate) mod proposal_storage;
-#[cfg(test)]
 pub(crate) use control_storage::control_storage_base;
 use dependency_storage::{DependencyRef, DependencyRegistry};
 pub use proposal_storage::JointGrantedClaims;

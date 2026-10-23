@@ -17,10 +17,10 @@
 
 //! Fixed poll backing within the original control inventory.
 //!
-//! This private substrate quotes its frame/container storage only. It does not
+//! This substrate quotes its frame/container storage only. It does not
 //! provide a complete role profile, reserve input pointees, or activate Server.
 
-mod ingress;
+pub(crate) mod ingress;
 mod ready_queue;
 use ingress::{MountedInput, SharedIngress};
 use ready_queue::ReadyQueue;
@@ -211,35 +211,35 @@ impl Drop for MountPin {
 
 /// A completed value keeps its original footer until the value actually exits.
 /// There is no consuming callback or raw take API.
-pub(crate) struct PollOutput<O> {
+pub struct PollOutput<O> {
     value: O,
     footer: Footer,
 }
 impl<O> PollOutput<O> {
-    pub(crate) fn value(&self) -> &O {
+    pub fn value(&self) -> &O {
         &self.value
     }
 }
 /// The two real catch sites retain their original payloads. If frame cleanup
 /// fails after Ready, the original output remains under this same footer too.
 /// Borrowing reveals facts; it cannot detach an owned value from its custody.
-pub(crate) struct PollFailure<O> {
+pub struct PollFailure<O> {
     primary: Box<dyn Any + Send>,
     cleanup: Option<Box<dyn Any + Send>>,
     output: Option<O>,
 }
 impl<O> PollFailure<O> {
-    pub(crate) fn primary(&self) -> &(dyn Any + Send) {
+    pub fn primary(&self) -> &(dyn Any + Send) {
         self.primary.as_ref()
     }
-    pub(crate) fn cleanup(&self) -> Option<&(dyn Any + Send)> {
+    pub fn cleanup(&self) -> Option<&(dyn Any + Send)> {
         self.cleanup.as_deref()
     }
-    pub(crate) fn output(&self) -> Option<&O> {
+    pub fn output(&self) -> Option<&O> {
         self.output.as_ref()
     }
 }
-pub(crate) enum PollCompletion<O> {
+pub enum PollCompletion<O> {
     Ready(PollOutput<O>),
     Panicked(PollOutput<PollFailure<O>>),
 }
@@ -249,9 +249,11 @@ pub(crate) struct MountRejected<I> {
     pub(crate) error: WorkError,
 }
 
-/// Only original fixed-profile composition can construct this bank. It has no
+/// Only the unique workload owner can install this bank in fixed storage. It has no
 /// independent admission queue, free list, public mount guard, or capacity decision.
-pub(crate) struct RolePollBank<I, F: Future, M> {
+/// The composing application separately owns complete-profile validation and
+/// the root task's actual exit; this generic bank certifies neither.
+pub struct RolePollBank<I, F: Future, M> {
     inner: Arc<Inner>,
     role: usize,
     make: M,
@@ -263,11 +265,7 @@ pub(crate) struct RolePollBank<I, F: Future, M> {
     shared: Arc<SharedIngress<I>>,
 }
 impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
-    pub(crate) fn install(
-        control: &mut WorkloadControl,
-        role: usize,
-        make: M,
-    ) -> Result<Self, WorkError> {
+    pub fn install(control: &mut WorkloadControl, role: usize, make: M) -> Result<Self, WorkError> {
         // Only the original unique startup owner can install. No shared Inner
         // entry point can allocate competing banks against the same paid base.
         let inner = &control.inner;
@@ -367,7 +365,7 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
         })
     }
 
-    pub(crate) fn retirement_observer(&self) -> RoleBackingRetirementObserver {
+    pub fn retirement_observer(&self) -> RoleBackingRetirementObserver {
         RoleBackingRetirementObserver {
             inner: Arc::downgrade(&self.inner),
             role: self.role,
@@ -378,7 +376,7 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
     /// Exporting an ingress permanently forbids pre-ready reinstallation of
     /// this role on the same authority. The original process/client owner keeps
     /// its weak header until clients actually exit; this is not hot restart.
-    pub(crate) fn ingress(&self) -> Result<ingress::RoleIngress<I>, WorkError> {
+    pub fn ingress(&self) -> Result<ingress::RoleIngress<I>, WorkError> {
         self.shared.export()
     }
 
@@ -402,13 +400,13 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
         }
     }
 
-    pub(crate) fn stop_ingress(&self) {
+    pub fn stop_ingress(&self) {
         self.shared.stop();
     }
 
     /// Level-triggered readiness. Register before reading the real queue;
     /// a consumed Notify permit never stands in for the queue's contents.
-    pub(crate) fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+    pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         self.waiter.as_mut().enable();
         if !self.ready.is_empty() {
             return Poll::Ready(());
@@ -427,10 +425,7 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
 
     /// Poll at most the given number of actual ready hints. None means no
     /// completion in this turn; poll_ready still checks any remaining items.
-    pub(crate) fn progress_turn(
-        &mut self,
-        budget: NonZeroUsize,
-    ) -> Option<PollCompletion<F::Output>> {
+    pub fn progress_turn(&mut self, budget: NonZeroUsize) -> Option<PollCompletion<F::Output>> {
         for _ in 0..budget.get() {
             let Some(wake) = self.ready.pop() else {
                 break;
@@ -560,13 +555,13 @@ impl Drop for BankRegistration {
 /// Exported ingress Weak headers remain with their process/client owner. They
 /// forbid reinstallation, and this observer does not prove those headers free.
 /// This finite, allocation-free scan is intended for shutdown observation.
-pub(crate) struct RoleBackingRetirementObserver {
+pub struct RoleBackingRetirementObserver {
     inner: Weak<Inner>,
     role: usize,
     generation: u64,
 }
 impl RoleBackingRetirementObserver {
-    pub(crate) fn is_reclaimed(&self) -> Result<bool, WorkError> {
+    pub fn is_reclaimed(&self) -> Result<bool, WorkError> {
         let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
         let state = inner.state.lock().unwrap();
         if !state.cancellations.fixed {

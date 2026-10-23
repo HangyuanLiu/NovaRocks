@@ -16,8 +16,8 @@
 // under the License.
 
 //! The original State's backing inventory, not another Work registry.
-//! Fixed storage is an internal substrate only. Paid role requests,
-//! Complete role geometry and production composition remain unimplemented.
+//! This storage envelope does not certify an application's complete role or
+//! I/O profile. Application composition owns those additional contracts.
 
 use crate::{
     WorkClass, WorkError, WorkId,
@@ -72,16 +72,45 @@ pub(crate) struct CancellationStorage {
     pub(crate) legacy_vacant: Option<SlotId>,
 }
 
-/// Crate-private: this is not a public partial-safe admission profile.
+/// Fixed local containers in the original workload authority.
+///
+/// This quotes storage only. Application composition must separately validate
+/// its required roles, payloads, dependencies, physical adapters and services.
+/// Installing this storage does not establish application readiness.
 #[derive(Clone, Copy)]
-pub(crate) struct ControlStorageConfig<'a> {
+pub struct ControlStorageConfig<'a> {
     pub(crate) slots_per_class: [usize; 5],
     pub(crate) children_per_slot: usize,
     pub(crate) proposals_per_slot: usize,
     pub(crate) poll_roles: &'a [crate::role_poll::PollRoleGeometry],
 }
 
-impl ControlStorageConfig<'_> {
+impl<'a> ControlStorageConfig<'a> {
+    /// Class order follows WorkClass: Query, MaterializedView, Statistics,
+    /// TableMaintenance, Management. Zero slots explicitly disable a class.
+    pub fn new(
+        slots_per_class: [usize; 5],
+        children_per_slot: usize,
+        proposals_per_slot: usize,
+        poll_roles: &'a [crate::PollRoleGeometry],
+    ) -> Self {
+        Self {
+            slots_per_class,
+            children_per_slot,
+            proposals_per_slot,
+            poll_roles,
+        }
+    }
+
+    /// Pure per-slot charge for these actual containers and the original
+    /// ledger's metadata. This neither allocates storage nor grants capacity.
+    pub fn base_charge(
+        self,
+        joint: &crate::joint_admission::JointCapacityConfig,
+    ) -> Result<JointResources, WorkError> {
+        crate::joint_admission::ledger::control_storage_base(self, joint)
+    }
+
     pub(crate) fn count(self) -> Result<usize, WorkError> {
         self.slots_per_class.into_iter().try_fold(0usize, |sum, n| {
             sum.checked_add(n).ok_or(WorkError::ArithmeticOverflow)

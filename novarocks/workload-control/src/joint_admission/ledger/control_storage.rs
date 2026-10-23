@@ -100,9 +100,10 @@ pub(crate) fn control_storage_base(
 }
 
 impl WorkloadControl {
-    /// Internal storage-only composition. There is deliberately no Server call
-    /// or public safe-profile API until FirstBind/roles/Provider closure exists.
-    pub(crate) fn configure_control_storage(
+    /// Prepay and install fixed local containers in this original authority.
+    /// This validates storage and ledger limits only; the application owner
+    /// must install its required services and complete profile before Ready.
+    pub fn configure_control_storage(
         &self,
         config: ControlStorageConfig<'_>,
     ) -> Result<(), WorkError> {

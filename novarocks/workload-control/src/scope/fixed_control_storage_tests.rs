@@ -76,12 +76,7 @@ pub(crate) fn prototype_profile_with_roles(
     crate::joint_admission::JointAdmissionHandle,
     JointProgressDriver,
 ) {
-    let storage = ControlStorageConfig {
-        slots_per_class: [count, 0, 0, 0, 0],
-        children_per_slot,
-        proposals_per_slot: 2,
-        poll_roles,
-    };
+    let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], children_per_slot, 2, poll_roles);
     let mut config = JointCapacityConfig {
         global: JointResourceLimits::default(),
         classes: [JointResourceLimits::default(); 5],
@@ -103,7 +98,7 @@ pub(crate) fn prototype_profile_with_roles(
         + 2 * max_changes
         + 1)
         * max_dependencies;
-    let base = crate::joint_admission::ledger::control_storage_base(storage, &config).unwrap();
+    let base = storage.base_charge(&config).unwrap();
     let metadata = base.get(JointResource::MetadataBytes);
     let global = JointResources::ZERO
         .with(JointResource::ScopeRecords, count as u64)

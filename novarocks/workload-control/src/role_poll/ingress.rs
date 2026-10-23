@@ -37,7 +37,7 @@ pub(super) struct SharedIngress<I> {
     pub(super) _registration: BankRegistration,
 }
 
-pub(crate) struct RoleIngress<I> {
+pub struct RoleIngress<I> {
     shared: Weak<SharedIngress<I>>,
 }
 impl<I> Clone for RoleIngress<I> {
@@ -53,13 +53,13 @@ impl<I> Clone for RoleIngress<I> {
 /// receiving/source lock before finish or Drop. Drop supplies no rollback,
 /// completion or settlement; the original committed level facts remain.
 #[must_use = "Finish or drop the original sender only after all caller locks exit"]
-pub(crate) struct MountAttempt<I> {
+pub struct MountAttempt<I> {
     result: Result<(), WorkError>,
     shared: Option<Arc<SharedIngress<I>>>,
     notification_pending: bool,
 }
 impl<I> MountAttempt<I> {
-    pub(crate) fn result(&self) -> &Result<(), WorkError> {
+    pub fn result(&self) -> &Result<(), WorkError> {
         &self.result
     }
 
@@ -76,7 +76,7 @@ impl<I> MountAttempt<I> {
         }
     }
 
-    pub(crate) fn finish(mut self) -> Result<(), WorkError> {
+    pub fn finish(mut self) -> Result<(), WorkError> {
         self.notify();
         // Refusal can be the last strong sender after bank teardown. Its
         // implicit callbacks run here, outside the caller's receiving locks.
@@ -97,7 +97,7 @@ impl<I> RoleIngress<I> {
     /// publication futures. Refusal preserves both sources even if its sender
     /// tail panics. Success moves both into the original shared cell before
     /// notification, including when a notification callback panics.
-    pub(crate) fn try_mount_in(
+    pub fn try_mount_in(
         &self,
         owner: &mut Option<WorkOwner>,
         input: &mut Option<I>,

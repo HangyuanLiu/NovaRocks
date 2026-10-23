@@ -149,3 +149,9 @@ impl std::error::Error for WorkError {}
 
 mod control_storage;
 mod role_poll;
+
+pub use control_storage::ControlStorageConfig;
+pub use role_poll::ingress::{MountAttempt, RoleIngress};
+pub use role_poll::{
+    PollCompletion, PollFailure, PollOutput, RoleBackingRetirementObserver, RolePollBank,
+};
