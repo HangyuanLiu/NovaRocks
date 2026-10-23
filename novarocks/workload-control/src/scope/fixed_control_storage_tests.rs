@@ -276,9 +276,8 @@ fn original_joint_child_enters_a_stable_receiver_before_unlocked_notification() 
         binding_receipt(&mut binding)
             .install_control(&parent.owner, &[])
             .unwrap();
-        let mut request = handle
-            .request_child(&parent.owner, WorkRequest::new(WorkClass::Query))
-            .unwrap();
+        let parent_scope = parent.owner.scope();
+        let mut request = parent_scope.request_joint_child().unwrap();
         drain(&mut driver);
         let receiver = Arc::new(Mutex::new(Receiving {
             receipt: Some(binding_receipt(&mut request)),
@@ -311,14 +310,14 @@ fn original_joint_child_enters_a_stable_receiver_before_unlocked_notification() 
                 receipt
                     .as_mut()
                     .unwrap()
-                    .install_child_in(&foreign_root.owner, child),
+                    .install_child_in(&foreign_root.owner.scope(), child),
                 Err(WorkError::ForeignAuthority)
             ));
             assert!(child.is_none());
             let progress = receipt
                 .as_mut()
                 .unwrap()
-                .install_child_in(&parent.owner, child)
+                .install_child_in(&parent_scope, child)
                 .unwrap();
             assert!(child.is_some());
             assert_eq!(wake.calls.load(Ordering::Acquire), 0);
@@ -372,6 +371,51 @@ fn original_joint_child_enters_a_stable_receiver_before_unlocked_notification() 
         drain(&mut driver);
         assert_eq!(snapshot(&control).3, 0);
     }
+}
+
+#[test]
+fn delegated_child_authority_cannot_outlive_the_original_sealed_parent_owner() {
+    let (control, handle, mut driver) = prototype_profile(4, 1, 1, 1);
+    let parent = root(&control);
+    let scope = parent.owner.scope();
+    let a = selected_dependency(&handle, "a");
+    let mut binding = first_bind(&handle, &parent.owner, &a);
+    drain(&mut driver);
+    binding_receipt(&mut binding)
+        .install_control(&parent.owner, &[])
+        .unwrap();
+    drop(binding);
+    drain(&mut driver);
+    let mut request = scope.request_joint_child().unwrap();
+    drain(&mut driver);
+    let mut receipt = binding_receipt(&mut request);
+    parent.business.release();
+    assert_eq!(
+        parent.owner.success_sealer().seal().unwrap(),
+        WorkSuccessSealOutcome::Sealed
+    );
+    drop(parent.owner);
+    // A sealed cancellation observation remains successful. It is not
+    // delegation authority after its actual WorkOwner has been abandoned.
+    assert!(scope.check().is_ok());
+    let mut destination = None;
+    assert!(matches!(
+        receipt.install_child_in(&scope, &mut destination),
+        Err(WorkError::Conflict)
+    ));
+    assert!(destination.is_none());
+    assert!(scope.request_joint_child().is_err());
+    assert_eq!(control.inner.state.lock().unwrap().nodes.len(), 1);
+    drop(receipt);
+    drop(request);
+    drain(&mut driver);
+    control
+        .adopt(scope.id())
+        .unwrap()
+        .complete_after_terminal_cancel_settled();
+    control.close_admission();
+    drain(&mut driver);
+    assert_eq!(snapshot(&control).3, 0);
 }
 
 #[test]

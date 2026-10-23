@@ -401,18 +401,17 @@ impl JointAdmissionHandle {
         owner: &WorkOwner,
         request: WorkRequest,
     ) -> Result<JointAdmission, JointAdmissionFailure> {
-        self.prepare_child(owner, request)
+        self.prepare_child(&owner.scope(), Some(request))
             .and_then(|prepared| self.queue_request(prepared))
             .map_err(|error| JointAdmissionFailure { error })
     }
 
     fn prepare_child(
         &self,
-        owner: &WorkOwner,
-        request: WorkRequest,
+        scope: &WorkScope,
+        request: Option<WorkRequest>,
     ) -> Result<PreparedRequest, WorkError> {
-        let scope = owner.scope();
-        let custody = self.reserve_proposal(&scope)?;
+        let custody = self.reserve_proposal(scope)?;
         if !Arc::ptr_eq(&self.inner, &scope.inner) {
             return Err(WorkError::ForeignAuthority);
         }
@@ -427,6 +426,10 @@ impl JointAdmissionHandle {
             }
             let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
             node.check(&state.cancellations)?;
+            if node.owner != crate::OwnerState::Active {
+                return Err(WorkError::Conflict);
+            }
+            let request = request.unwrap_or_else(|| WorkRequest::new(node.class));
             if node.class != request.class {
                 return Err(WorkError::Conflict);
             }
@@ -494,7 +497,7 @@ impl JointAdmissionHandle {
             budget: RequestBudget::Finite {
                 remaining: work_limit,
             },
-            scope,
+            scope: scope.clone(),
             changes: self.store_proposal(&custody, vec![change])?,
             custody,
             _exit: crate::scope::ReclaimWakeOnExit::observe(&Arc::downgrade(&self.inner)),
@@ -812,6 +815,9 @@ fn authenticate_parent(
     let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
     let node = state.nodes.get(&work).ok_or(WorkError::Released)?;
     node.check(&state.cancellations)?;
+    if node.owner != crate::OwnerState::Active {
+        return Err(WorkError::Conflict);
+    }
     let slot = state
         .cancellations
         .slots
@@ -925,6 +931,22 @@ pub(super) fn validate_waiting(
         }
     }
     Ok(())
+}
+
+impl WorkScope {
+    /// Request one same-class child with the parent's complete admitted
+    /// dependency set. This uses the original fixed proposal and proof driver;
+    /// it grants neither an I/O stage nor physical execution capacity.
+    /// The original parent owner must remain Active through installation.
+    pub fn request_joint_child(&self) -> Result<JointAdmission, JointAdmissionFailure> {
+        let handle = JointAdmissionHandle {
+            inner: Arc::clone(&self.inner),
+        };
+        handle
+            .prepare_child(self, None)
+            .and_then(|prepared| handle.queue_request(prepared))
+            .map_err(|error| JointAdmissionFailure { error })
+    }
 }
 
 impl WorkOwner {
@@ -1577,7 +1599,7 @@ impl JointAdjustmentReceipt {
     /// admission or physical-holder guard is created between grant and Node.
     pub fn install_child(mut self, owner: &WorkOwner) -> Result<WorkOwner, WorkError> {
         let mut child = None;
-        self.install_child_in(owner, &mut child)?.notify();
+        self.install_child_in(&owner.scope(), &mut child)?.notify();
         Ok(child.expect("successful child publication installs the original owner"))
     }
 
@@ -1587,13 +1609,12 @@ impl JointAdjustmentReceipt {
     /// invokes a callback. Notify success only after all receiver locks exit.
     pub fn install_child_in(
         &mut self,
-        owner: &WorkOwner,
+        parent_scope: &WorkScope,
         destination: &mut Option<WorkOwner>,
     ) -> Result<crate::WorkloadProgressNotification, WorkError> {
         if destination.is_some() {
             return Err(WorkError::Conflict);
         }
-        let parent_scope = owner.scope();
         if !Arc::ptr_eq(&parent_scope.inner, &self.inner) {
             return Err(WorkError::ForeignAuthority);
         }
