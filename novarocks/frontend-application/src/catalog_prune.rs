@@ -92,11 +92,11 @@ impl FrontendCatalogPruneService {
     pub(crate) async fn shutdown(&self, timeout: Duration) {
         self.request_stop_for_process_exit();
         let handle = self.worker.lock().ok().and_then(|mut worker| worker.take());
-        if let Some(mut handle) = handle {
-            if tokio::time::timeout(timeout, &mut handle).await.is_err() {
-                handle.abort();
-                let _ = handle.await;
-            }
+        if let Some(mut handle) = handle
+            && tokio::time::timeout(timeout, &mut handle).await.is_err()
+        {
+            handle.abort();
+            let _ = handle.await;
         }
     }
 

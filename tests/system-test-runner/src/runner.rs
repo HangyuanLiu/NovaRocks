@@ -670,11 +670,7 @@ fn run_one_inner(
         let fixture_cleanup = settlement.teardown(scenario);
         if bounded_original {
             return finish_exact_mysql_scenario(
-                Some(
-                    result
-                        .err()
-                        .expect("failed scenario retains its original error"),
-                ),
+                Some(result.expect_err("failed scenario retains its original error")),
                 cluster_cleanup,
                 fixture_cleanup,
             );
@@ -1134,7 +1130,12 @@ mod exact_mysql_presentation_tests {
             scenarios.len()
         );
         let name = scenarios[0].name().to_owned();
-        assert_eq!(select_exact(&scenarios, &[name.clone()]).unwrap().len(), 1);
+        assert_eq!(
+            select_exact(&scenarios, std::slice::from_ref(&name))
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(select_exact(&scenarios, &[name.clone(), name]).is_err());
         assert!(select_exact(&scenarios, &["foreign-original-case".into()]).is_err());
     }

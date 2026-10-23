@@ -1843,26 +1843,25 @@ impl<'a> ContractLoweringVisitor<'a> {
         if matches!(
             expression.kind,
             ExprKind::Literal(_) | ExprKind::Constant(_)
-        ) {
-            if let Some(captured) = logical.captured() {
-                let captured_argument = captured.request().arguments.get(ordinal);
-                self.work.step()?;
-                let novarocks_functions::FunctionArgument::Value {
-                    constant: Some(value),
-                    ..
-                } = captured_argument.ok_or(ContractLoweringError::InvalidAggregate {
-                    detail: "captured aggregate argument ordinal is absent",
-                })?
-                else {
-                    return Err(ContractLoweringError::InvalidAggregate {
-                        detail: "literal aggregate argument has no captured constant source",
-                    });
-                };
-                self.work.step()?;
-                // Reuse the admitted literal/constant handle. The original
-                // factory is not called a second time for physical lowering.
-                return self.lower_constant_expression(owner, value, expression_type(expression));
-            }
+        ) && let Some(captured) = logical.captured()
+        {
+            let captured_argument = captured.request().arguments.get(ordinal);
+            self.work.step()?;
+            let novarocks_functions::FunctionArgument::Value {
+                constant: Some(value),
+                ..
+            } = captured_argument.ok_or(ContractLoweringError::InvalidAggregate {
+                detail: "captured aggregate argument ordinal is absent",
+            })?
+            else {
+                return Err(ContractLoweringError::InvalidAggregate {
+                    detail: "literal aggregate argument has no captured constant source",
+                });
+            };
+            self.work.step()?;
+            // Reuse the admitted literal/constant handle. The original
+            // factory is not called a second time for physical lowering.
+            return self.lower_constant_expression(owner, value, expression_type(expression));
         }
         self.lower_expression(owner, expression, visible)
     }

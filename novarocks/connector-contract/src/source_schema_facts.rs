@@ -577,12 +577,12 @@ fn validate_empty_metadata_shape<E: From<ConnectorError>>(
             &mut scratch,
             |visit| {
                 work(1).map_err(ShapeFailure::Caller)?;
-                if let ValueTypeVisit::Field(field) = visit {
-                    if !field.metadata().is_empty() {
-                        return Err(ShapeFailure::Source(invalid(
-                            "source/execution nested shape field retains generic attributes",
-                        )));
-                    }
+                if let ValueTypeVisit::Field(field) = visit
+                    && !field.metadata().is_empty()
+                {
+                    return Err(ShapeFailure::Source(invalid(
+                        "source/execution nested shape field retains generic attributes",
+                    )));
                 }
                 Ok(())
             },

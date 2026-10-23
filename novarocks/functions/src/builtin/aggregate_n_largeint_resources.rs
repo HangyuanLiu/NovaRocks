@@ -233,8 +233,7 @@ impl NEmissionGeometry {
                 _ => {
                     return Err(internal(
                         "min_n/max_n emission has an invalid private scalar producer",
-                    )
-                    .into());
+                    ));
                 }
             };
             self.encoded = add(self.encoded, encoded)?;

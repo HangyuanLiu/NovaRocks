@@ -2847,8 +2847,7 @@ mod tests {
             functions: &functions,
             control: SqlCompileControl::unbounded(),
         })
-        .err()
-        .expect("unsupported persisted semantics");
+        .expect_err("unsupported persisted semantics");
         assert!(error.to_string().starts_with("Unsupported:"));
         assert!(error.to_string().contains("GROUP_CONCAT_LEGACY"));
         assert!(

@@ -147,7 +147,7 @@ fn admitted_write_input_columns(
     input
         .fields()
         .into_iter()
-        .map(|field| admitted_write_column(field))
+        .map(admitted_write_column)
         .collect()
 }
 

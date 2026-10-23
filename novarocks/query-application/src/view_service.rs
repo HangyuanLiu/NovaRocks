@@ -196,8 +196,7 @@ impl QueryViewService {
                     key.catalog == DEFAULT_CATALOG && key.database == normalized_database
                 }) {
                     bytes = bytes
-                        .checked_add(crate::api::LocalResultBound::cell_bytes(key.view.len()))
-                        .unwrap_or(usize::MAX);
+                        .saturating_add(crate::api::LocalResultBound::cell_bytes(key.view.len()));
                     bound
                         .admit(names.len() + 1, bytes)
                         .map_err(|error| format!("SHOW VIEWS: {error}"))?;

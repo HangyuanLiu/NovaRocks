@@ -346,10 +346,10 @@ impl WriterMultiplexRelationSchema {
 
 fn plain_relation_value(value: &novarocks_type_contract::ValueTypeRef) -> bool {
     novarocks_type_contract::visit_value_type_observed(value, |visit| {
-        if let novarocks_type_contract::ValueSemanticVisit::Node(value) = visit {
-            if value.domain().is_some() {
-                return Err(());
-            }
+        if let novarocks_type_contract::ValueSemanticVisit::Node(value) = visit
+            && value.domain().is_some()
+        {
+            return Err(());
         }
         Ok(())
     })
@@ -590,13 +590,13 @@ impl WriterRelationPreparation {
             &std::sync::Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
         >,
     ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
-        if let Self::Compiled { template, prepared } = self {
-            if prepared.is_none() {
-                let factory = factory
-                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
-                let schema = template.prepare(factory.as_ref())?;
-                *prepared = Some(schema);
-            }
+        if let Self::Compiled { template, prepared } = self
+            && prepared.is_none()
+        {
+            let factory = factory
+                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+            let schema = template.prepare(factory.as_ref())?;
+            *prepared = Some(schema);
         }
         Ok(())
     }

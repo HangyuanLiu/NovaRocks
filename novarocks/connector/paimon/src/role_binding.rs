@@ -1545,12 +1545,12 @@ impl ConnectorReadWireDecoder for PaimonConnectorReadWireAdapter {
         let view = self.decode_private(
             relation.view(),
             ConnectorCodecCategory::ReadView,
-            |payload, context| decode_read_view(payload, context),
+            decode_read_view,
         )?;
         let table = self.decode_private(
             relation.table(),
             ConnectorCodecCategory::ReadTable,
-            |payload, context| decode_table(payload, context),
+            decode_table,
         )?;
         let bound = PaimonBoundTable::decoded(table, view.clone()).map_err(|error| {
             self.inconsistent(
@@ -1569,11 +1569,8 @@ impl ConnectorReadWireDecoder for PaimonConnectorReadWireAdapter {
         &self,
         column: &ConnectorEncodedPayload,
     ) -> Result<ConnectorReadColumnHandle, ConnectorCodecError> {
-        let value = self.decode_private(
-            column,
-            ConnectorCodecCategory::ReadColumn,
-            |payload, context| decode_column(payload, context),
-        )?;
+        let value =
+            self.decode_private(column, ConnectorCodecCategory::ReadColumn, decode_column)?;
         Ok(self.adapter.wrap_column(value))
     }
 
@@ -1584,7 +1581,7 @@ impl ConnectorReadWireDecoder for PaimonConnectorReadWireAdapter {
         let value = self.decode_private(
             transaction,
             ConnectorCodecCategory::ReadView,
-            |payload, context| decode_read_view(payload, context),
+            decode_read_view,
         )?;
         Ok(self.adapter.wrap_transaction(Some(value)))
     }

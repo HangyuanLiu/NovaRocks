@@ -989,7 +989,7 @@ mod tests {
             frontend_config: &frontend,
             backend_configs: &backend_configs,
             frontend_environment: &environments,
-            backend_environments: &[environments.clone()],
+            backend_environments: std::slice::from_ref(&environments),
             native_proxy_config: &proxy,
             native_root_reply_fault: None,
             advertised_backend_grpc_ports: &[1105],

@@ -123,15 +123,14 @@ pub(super) fn validate_typed_argument(
                 "aggregate typed source differs from complete selected semantics/layout",
             ));
         }
-        if let Some(value) = argument.constant_value() {
-            if !value
+        if let Some(value) = argument.constant_value()
+            && !value
                 .value_type()
                 .fits_value_type_observed(source, || work.step())?
-            {
-                return Err(invalid(
-                    "aggregate constant differs from caller's typed source",
-                ));
-            }
+        {
+            return Err(invalid(
+                "aggregate constant differs from caller's typed source",
+            ));
         }
         let actual = argument.array();
         work.step()?;

@@ -668,12 +668,12 @@ mod tests {
             }
             let count = bytes.len().min(remaining);
             let result = std::pin::Pin::new(&mut self.inner).poll_write(cx, &bytes[..count]);
-            if let std::task::Poll::Ready(Ok(written)) = &result {
-                if remaining != usize::MAX {
-                    self.gate
-                        .remaining
-                        .fetch_sub(*written, std::sync::atomic::Ordering::SeqCst);
-                }
+            if let std::task::Poll::Ready(Ok(written)) = &result
+                && remaining != usize::MAX
+            {
+                self.gate
+                    .remaining
+                    .fetch_sub(*written, std::sync::atomic::Ordering::SeqCst);
             }
             result
         }

@@ -3428,8 +3428,11 @@ mod tests {
             "spec-id":0,"fields":[{"field-id":1000,"source-id":1,"name":"p","transform":"identity"}]
         }))
         .unwrap();
-        let partition =
-            crate::partition_row::UnifiedPartitionRow::of(&table_schema, &[spec.clone()]).unwrap();
+        let partition = crate::partition_row::UnifiedPartitionRow::of(
+            &table_schema,
+            std::slice::from_ref(&spec),
+        )
+        .unwrap();
         let manifest = TrinoManifestFile::try_new(TrinoManifestFileParams {
             path: "s3://warehouse/db/t/metadata/m0.avro".into(),
             length: 1024,
@@ -3551,7 +3554,7 @@ mod tests {
                 "s3://warehouse/metadata/identifiers.json",
                 11,
                 &schema,
-                &[spec.clone()],
+                std::slice::from_ref(&spec),
             )
             .unwrap(),
         ));

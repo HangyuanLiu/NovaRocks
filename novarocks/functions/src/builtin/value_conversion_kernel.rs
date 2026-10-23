@@ -659,7 +659,7 @@ fn largeint_decimal(
                 "conversion Decimal128 coefficient escaped its precision"
             )))
     } else {
-        convert!(Decimal256Type, |value| Ok::<_, KernelFailure>(value))
+        convert!(Decimal256Type, Ok::<_, KernelFailure>)
     }
 }
 

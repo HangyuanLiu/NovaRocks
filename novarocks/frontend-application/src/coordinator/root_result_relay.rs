@@ -290,7 +290,7 @@ async fn drive(
                 }
                 match receipts.recv().await {
                     Some(actual) if actual == sequence => {
-                        if let Err(error) = frontier.receipt(actual) {
+                        if let Err(_error) = frontier.receipt(actual) {
                             let _ = send(local_failure(
                                 frontier.root(),
                                 QueryFailureReason::ResultProtocol,

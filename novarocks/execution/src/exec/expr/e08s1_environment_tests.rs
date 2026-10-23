@@ -39,26 +39,26 @@ fn original_concat_binding(
             .unwrap();
     for fragment in owner.plan().fragments().values() {
         for node in fragment.nodes().values() {
-            if let NodeKind::Aggregate { calls, .. } = &node.kind {
-                if let Some(source) = calls.first() {
-                    let loan = owner
-                        .borrow_call_dependency_observed(
-                            SqlCallDependencySite::Aggregate {
-                                fragment,
-                                node,
-                                site: PhysicalCallSite::Aggregate {
-                                    node: node.id,
-                                    call: 0,
-                                },
-                                source,
+            if let NodeKind::Aggregate { calls, .. } = &node.kind
+                && let Some(source) = calls.first()
+            {
+                let loan = owner
+                    .borrow_call_dependency_observed(
+                        SqlCallDependencySite::Aggregate {
+                            fragment,
+                            node,
+                            site: PhysicalCallSite::Aggregate {
+                                node: node.id,
+                                call: 0,
                             },
-                            &mut work,
-                        )
-                        .unwrap();
-                    let binding = loan.original_binding().resolved().clone();
-                    work.finish().unwrap();
-                    return binding;
-                }
+                            source,
+                        },
+                        &mut work,
+                    )
+                    .unwrap();
+                let binding = loan.original_binding().resolved().clone();
+                work.finish().unwrap();
+                return binding;
             }
         }
     }

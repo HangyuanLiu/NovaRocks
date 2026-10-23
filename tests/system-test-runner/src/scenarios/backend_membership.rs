@@ -259,10 +259,10 @@ const DML_SQL: &str = "INSERT INTO pre_ready_dml.ns.orders VALUES (1, 10), (2, 2
 struct MembershipActor(Option<thread::JoinHandle<()>>);
 impl Drop for MembershipActor {
     fn drop(&mut self) {
-        if let Some(actor) = self.0.take() {
-            if actor.join().is_err() {
-                eprintln!("Original membership SQL actor panicked during join");
-            }
+        if let Some(actor) = self.0.take()
+            && actor.join().is_err()
+        {
+            eprintln!("Original membership SQL actor panicked during join");
         }
     }
 }

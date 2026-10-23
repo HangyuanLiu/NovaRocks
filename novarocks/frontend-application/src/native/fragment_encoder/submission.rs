@@ -65,7 +65,7 @@ pub(crate) fn freeze_completed_packages(
 ) -> Result<BTreeMap<FragmentId, Arc<FragmentArtifact>>, PhysicalEncodeError> {
     let mut frozen = BTreeMap::new();
     for (packaged_id, package) in &packages {
-        let fragment_id = u32::from(packaged_id.get());
+        let fragment_id = packaged_id.get();
         if package.fragment().id() != *packaged_id {
             return Err(format!(
                 "package filed under fragment {fragment_id} packages fragment {}",

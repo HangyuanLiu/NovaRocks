@@ -35,10 +35,7 @@ impl From<CompileControlError> for TemporalSourceProjectionError {
     }
 }
 pub use novarocks_type_contract::{NonCanonicalNativeV1FunctionName, native_v1_function_name};
-fn dtype<'a>(
-    arena: &'a ExprArena,
-    id: ExprId,
-) -> Result<&'a DataType, TemporalSourceProjectionError> {
+fn dtype(arena: &ExprArena, id: ExprId) -> Result<&DataType, TemporalSourceProjectionError> {
     Ok(&arena
         .get(id)
         .ok_or(TemporalSourceProjectionError::Invalid(

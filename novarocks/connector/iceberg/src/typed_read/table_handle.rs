@@ -1428,7 +1428,7 @@ pub(super) mod tests {
         let mut other_snapshot = coherent.clone();
         other_snapshot.read_domain = Some(crate::delete_semantics::test_read_domain(
             &schema,
-            &[spec.clone()],
+            std::slice::from_ref(&spec),
             12,
         ));
         assert!(IcebergTableHandle::try_new(other_snapshot).is_err());

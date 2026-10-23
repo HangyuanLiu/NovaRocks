@@ -1988,7 +1988,7 @@ fn base_field_name(
         .bases
         .iter()
         .find(|base| base.occurrence_id == occurrence)
-        .and_then(|base| base.fields.iter().find(|field| &field.field_id == field_id))
+        .and_then(|base| base.fields.iter().find(|field| field.field_id == field_id))
         .map(|field| field.name_at_create.clone())
         .ok_or_else(|| {
             format!(

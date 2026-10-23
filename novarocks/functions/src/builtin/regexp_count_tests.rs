@@ -115,10 +115,10 @@ impl KernelEvaluationControl for Trace {
         let mut calls = self.calls.lock().unwrap();
         let at = calls.len();
         calls.push(units);
-        if let Some((fail, cause)) = &self.refusal {
-            if at == *fail {
-                return Err(cause.clone());
-            }
+        if let Some((fail, cause)) = &self.refusal
+            && at == *fail
+        {
+            return Err(cause.clone());
         }
         Ok(())
     }
@@ -362,10 +362,10 @@ impl PureCompileControl for CompileTrace {
         let mut calls = self.calls.lock().unwrap();
         let at = calls.len();
         calls.push((phase, units));
-        if let Some((fail, cause)) = &self.refusal {
-            if *fail == at {
-                return Err(cause.clone());
-            }
+        if let Some((fail, cause)) = &self.refusal
+            && *fail == at
+        {
+            return Err(cause.clone());
         }
         Ok(())
     }

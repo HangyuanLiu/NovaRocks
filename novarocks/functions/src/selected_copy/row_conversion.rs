@@ -318,9 +318,9 @@ impl<H> Model<'_, '_, '_, '_, H> {
         let count = types.len();
         self.null_conversion_borrowed(&mut types.into_iter(), count, rows_bound)
     }
-    fn null_conversion_borrowed<'s>(
+    fn null_conversion_borrowed(
         &mut self,
-        types: &mut dyn Iterator<Item = &'s DataType>,
+        types: &mut dyn Iterator<Item = &DataType>,
         count: usize,
         rows_bound: usize,
     ) -> Result<(), RowConversionStructureFailure<H>> {

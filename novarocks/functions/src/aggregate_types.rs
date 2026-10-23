@@ -813,6 +813,62 @@ pub fn mangle_distinct_aggregate_name(name: &str, distinct: bool) -> String {
     }
 }
 
+fn recipe_list_child<'a>(
+    actual: novarocks_type_contract::BorrowedTypedValueBinding<'a>,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<
+    Option<novarocks_type_contract::BorrowedTypedValueBinding<'a>>,
+    crate::FunctionBindingError,
+> {
+    work.step()?;
+    let DataType::List(field) = actual.data_type() else {
+        return Ok(None);
+    };
+    if !matches!(
+        actual.value_type().kind(),
+        novarocks_type_contract::ValueKind::List(_)
+    ) || !field.is_nullable()
+        || field.name() != "item"
+    {
+        return Ok(None);
+    }
+    Ok(actual
+        .child_at(0)
+        .filter(|child| child.value_type().nullable()))
+}
+fn ordinal_field_name_matches(
+    actual: &str,
+    index: usize,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<bool, crate::FunctionBindingError> {
+    let mut digits = [0u8; std::mem::size_of::<usize>() * 3];
+    let mut at = digits.len();
+    let mut value = index;
+    loop {
+        work.step()?;
+        at -= 1;
+        digits[at] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    work.step()?;
+    if actual.len() != digits.len() - at + 1 {
+        return Ok(false);
+    }
+    for (a, b) in actual
+        .bytes()
+        .zip(std::iter::once(b'c').chain(digits[at..].iter().copied()))
+    {
+        work.step()?;
+        if a != b {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -992,60 +1048,4 @@ mod tests {
             (output, Some(intermediate))
         );
     }
-}
-
-fn recipe_list_child<'a>(
-    actual: novarocks_type_contract::BorrowedTypedValueBinding<'a>,
-    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
-) -> Result<
-    Option<novarocks_type_contract::BorrowedTypedValueBinding<'a>>,
-    crate::FunctionBindingError,
-> {
-    work.step()?;
-    let DataType::List(field) = actual.data_type() else {
-        return Ok(None);
-    };
-    if !matches!(
-        actual.value_type().kind(),
-        novarocks_type_contract::ValueKind::List(_)
-    ) || !field.is_nullable()
-        || field.name() != "item"
-    {
-        return Ok(None);
-    }
-    Ok(actual
-        .child_at(0)
-        .filter(|child| child.value_type().nullable()))
-}
-fn ordinal_field_name_matches(
-    actual: &str,
-    index: usize,
-    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
-) -> Result<bool, crate::FunctionBindingError> {
-    let mut digits = [0u8; std::mem::size_of::<usize>() * 3];
-    let mut at = digits.len();
-    let mut value = index;
-    loop {
-        work.step()?;
-        at -= 1;
-        digits[at] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            break;
-        }
-    }
-    work.step()?;
-    if actual.len() != digits.len() - at + 1 {
-        return Ok(false);
-    }
-    for (a, b) in actual
-        .bytes()
-        .zip(std::iter::once(b'c').chain(digits[at..].iter().copied()))
-    {
-        work.step()?;
-        if a != b {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }

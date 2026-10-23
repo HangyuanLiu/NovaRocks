@@ -417,12 +417,12 @@ fn permanent() {
     let mut filter_fragment = None;
     for (&id, fragment) in source.plan().fragments() {
         for node in fragment.nodes().values() {
-            if let NodeKind::Filter { predicates } = &node.kind {
-                if predicates.len() > 1 {
-                    assert_eq!(node.inputs.len(), 1);
-                    assert_eq!(predicates.len(), 2);
-                    assert!(filter_fragment.replace((id, node.id)).is_none());
-                }
+            if let NodeKind::Filter { predicates } = &node.kind
+                && predicates.len() > 1
+            {
+                assert_eq!(node.inputs.len(), 1);
+                assert_eq!(predicates.len(), 2);
+                assert!(filter_fragment.replace((id, node.id)).is_none());
             }
         }
     }

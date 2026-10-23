@@ -819,15 +819,14 @@ impl TaskRound {
             }
         }
 
-        if dispatch {
-            if !self.normal_drain_started
-                && !self.terminal_cleanup_started
-                && self.execution.failure_cause().is_none()
-            {
-                for pump in &mut self.pumps {
-                    if !pump.closing {
-                        report.pumped += pump.owner.drive(&mut self.execution)?;
-                    }
+        if dispatch
+            && !self.normal_drain_started
+            && !self.terminal_cleanup_started
+            && self.execution.failure_cause().is_none()
+        {
+            for pump in &mut self.pumps {
+                if !pump.closing {
+                    report.pumped += pump.owner.drive(&mut self.execution)?;
                 }
             }
         }
@@ -969,12 +968,12 @@ impl TaskRound {
         for pump in &mut self.pumps {
             pump.begin_close();
         }
-        self.pending_success_seal.take().map(|request| {
+        if let Some(request) = self.pending_success_seal.take() {
             request.reject(QueryExecutionError::new(
                 QueryExecutionErrorKind::Failed,
                 "success seal closed by terminal cleanup",
             ));
-        });
+        }
         for &context in self.execution.graph().contexts() {
             if let Some(subscriber) = &self.covered_subscriber {
                 if !self.needs_covered_observation(context) {
@@ -1621,6 +1620,77 @@ fn participant_observation_failure(state: SubscriptionState) -> ParticipantObser
 }
 
 #[cfg(test)]
+pub(super) async fn pending_task_failure_then_invalid_covered_frame_round() -> TaskRound {
+    use novarocks_execution_contract::{
+        SafeDetail, TaskFailure, TaskFailurePhase, TaskOutputFacts, TaskState, TaskStatus,
+        TaskStatusVersion, TerminationDetail,
+    };
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_query_application::execution_error::QueryFailureReason;
+    use novarocks_task_codec::operation::{CoveredStatusStreamEvent, CoveredStatusStreamFact};
+    let mut round = super::tests::manifest_preparing_observation_round();
+    let root = round.execution().graph().root_identity();
+    let context = round
+        .execution()
+        .graph()
+        .task(root.task_id())
+        .unwrap()
+        .context();
+    let foreign_task = novarocks_types::TaskId::new(u32::MAX).unwrap();
+    assert!(round.execution().graph().task(foreign_task).is_none());
+    let foreign = novarocks_execution_contract::TaskIdentity::new(
+        root.query_execution_id(),
+        root.stage_id(),
+        foreign_task,
+        root.backend_process_id(),
+    );
+    let intake = Arc::new(
+        ObservationIntake::for_task_attempt(
+            Arc::new(super::status_intake::CountingWake::default()),
+            Arc::new(super::clock::ManualClock::new()),
+        )
+        .unwrap(),
+    );
+    round.observation_intake = Some(Arc::clone(&intake));
+    // Each real bounded subscription owns one pending frame. Publish in this
+    // exact order before the single receiver turn, without sleeps or retries.
+    let first = intake.subscribe().unwrap();
+    let second = intake.subscribe().unwrap();
+    for (publisher, identity) in [(&first, root), (&second, foreign)] {
+        let failure = TaskFailure::new_in_phase(
+            QueryFailureReason::PreparationFailed.failure_fact(),
+            SafeDetail::truncating("original Task before invalid frame"),
+            TaskFailurePhase::Preparation,
+        );
+        let status = TaskStatus::try_new_with_installed(
+            identity,
+            TaskStatusVersion::new(2).unwrap(),
+            TaskState::Failing,
+            Some(TerminationDetail::Failed(failure)),
+            TaskOutputFacts::new(false),
+            false,
+        )
+        .unwrap();
+        publisher
+            .reserve_read()
+            .await
+            .publish(
+                super::status_intake::ObservationFrame::Covered {
+                    context,
+                    generation: 1,
+                    event: CoveredStatusStreamEvent {
+                        fact: CoveredStatusStreamFact::Status(status),
+                        source_revision: None,
+                    },
+                },
+                256,
+            )
+            .unwrap();
+    }
+    round
+}
+
+#[cfg(test)]
 mod pre_ready_receiver_tests {
     use super::*;
     use novarocks_execution_contract::{SafeDetail, TaskFailure, TaskFailurePhase};
@@ -1694,75 +1764,4 @@ mod pre_ready_receiver_tests {
         );
         assert_eq!(input.detail().as_str(), "original preparation producer");
     }
-}
-
-#[cfg(test)]
-pub(super) async fn pending_task_failure_then_invalid_covered_frame_round() -> TaskRound {
-    use novarocks_execution_contract::{
-        SafeDetail, TaskFailure, TaskFailurePhase, TaskOutputFacts, TaskState, TaskStatus,
-        TaskStatusVersion, TerminationDetail,
-    };
-    use novarocks_failure_contract::FailureProjection;
-    use novarocks_query_application::execution_error::QueryFailureReason;
-    use novarocks_task_codec::operation::{CoveredStatusStreamEvent, CoveredStatusStreamFact};
-    let mut round = super::tests::manifest_preparing_observation_round();
-    let root = round.execution().graph().root_identity();
-    let context = round
-        .execution()
-        .graph()
-        .task(root.task_id())
-        .unwrap()
-        .context();
-    let foreign_task = novarocks_types::TaskId::new(u32::MAX).unwrap();
-    assert!(round.execution().graph().task(foreign_task).is_none());
-    let foreign = novarocks_execution_contract::TaskIdentity::new(
-        root.query_execution_id(),
-        root.stage_id(),
-        foreign_task,
-        root.backend_process_id(),
-    );
-    let intake = Arc::new(
-        ObservationIntake::for_task_attempt(
-            Arc::new(super::status_intake::CountingWake::default()),
-            Arc::new(super::clock::ManualClock::new()),
-        )
-        .unwrap(),
-    );
-    round.observation_intake = Some(Arc::clone(&intake));
-    // Each real bounded subscription owns one pending frame. Publish in this
-    // exact order before the single receiver turn, without sleeps or retries.
-    let first = intake.subscribe().unwrap();
-    let second = intake.subscribe().unwrap();
-    for (publisher, identity) in [(&first, root), (&second, foreign)] {
-        let failure = TaskFailure::new_in_phase(
-            QueryFailureReason::PreparationFailed.failure_fact(),
-            SafeDetail::truncating("original Task before invalid frame"),
-            TaskFailurePhase::Preparation,
-        );
-        let status = TaskStatus::try_new_with_installed(
-            identity,
-            TaskStatusVersion::new(2).unwrap(),
-            TaskState::Failing,
-            Some(TerminationDetail::Failed(failure)),
-            TaskOutputFacts::new(false),
-            false,
-        )
-        .unwrap();
-        publisher
-            .reserve_read()
-            .await
-            .publish(
-                super::status_intake::ObservationFrame::Covered {
-                    context,
-                    generation: 1,
-                    event: CoveredStatusStreamEvent {
-                        fact: CoveredStatusStreamFact::Status(status),
-                        source_revision: None,
-                    },
-                },
-                256,
-            )
-            .unwrap();
-    }
-    round
 }

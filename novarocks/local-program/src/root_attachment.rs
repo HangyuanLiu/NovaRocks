@@ -244,7 +244,7 @@ fn attach_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             ProgramTypedExpressions::try_new_with_creator_in(
                 calls,
                 types,
-                temporary.as_deref_mut().expect("strong temporary scope"),
+                temporary.expect("strong temporary scope"),
                 &mut retained,
                 work.control(),
             )

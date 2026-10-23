@@ -779,8 +779,7 @@ impl ObservationReadPermit {
             _ => 0,
         };
         let charged_bytes = std::mem::size_of::<ObservationFrame>()
-            .checked_add(encoded_bytes.max(dynamic_bytes))
-            .unwrap_or(usize::MAX);
+            .saturating_add(encoded_bytes.max(dynamic_bytes));
         if charged_bytes > self.inner.max_frame_bytes {
             return Err(OversizedObservationFrame {
                 charged_bytes,

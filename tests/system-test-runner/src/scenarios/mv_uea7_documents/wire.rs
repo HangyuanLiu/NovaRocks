@@ -471,15 +471,15 @@ impl Graph {
             );
         }
         for (id, p) in &graph.snapshots {
-            if let Some(p) = p {
-                if let Err(e) = graph.record_logical_rows(p) {
-                    if Some(*id) == graph.current {
-                        return Err(e);
-                    }
-                    graph.diagnostics.push(format!(
-                        "history cannot be interpreted: snapshot {id}: {e:#}"
-                    ));
+            if let Some(p) = p
+                && let Err(e) = graph.record_logical_rows(p)
+            {
+                if Some(*id) == graph.current {
+                    return Err(e);
                 }
+                graph.diagnostics.push(format!(
+                    "history cannot be interpreted: snapshot {id}: {e:#}"
+                ));
             }
         }
         ensure!(

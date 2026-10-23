@@ -120,6 +120,40 @@ pub fn test_memory_authority() -> Arc<MemoryAuthority> {
     )
 }
 
+/// Inspect the original source rather than its mutable diagnostic spelling.
+#[cfg(test)]
+pub(crate) fn find_source<'a, T: std::error::Error + 'static>(
+    mut error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a T> {
+    loop {
+        if let Some(original) = error.downcast_ref::<T>() {
+            return Some(original);
+        }
+        error = error.source()?;
+    }
+}
+
+/// Pure decoder fixtures borrow their declared connector stop control. They
+/// do not manufacture a Task just to satisfy an unrelated runtime API.
+#[cfg(any(test, novarocks_dev_controls))]
+pub(crate) struct PureConnectorCompileControl(
+    pub(crate) novarocks_spi::connector::ConnectorStopView,
+);
+#[cfg(any(test, novarocks_dev_controls))]
+impl novarocks_type_contract::PureCompileControl for PureConnectorCompileControl {
+    fn checkpoint(
+        &self,
+        _: novarocks_type_contract::CompilePhase,
+        _: u32,
+    ) -> Result<(), novarocks_type_contract::CompileControlError> {
+        if self.0.is_stopped() {
+            Err(novarocks_type_contract::CompileControlError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BackendDataRuntime, BackendNativeTransport, test_backend_native_trust};
@@ -165,39 +199,5 @@ mod tests {
         runtime.block_on(async move {
             assert_eq!(active_adapter.block_on(async { 11_u8 }), 11);
         });
-    }
-}
-
-/// Inspect the original source rather than its mutable diagnostic spelling.
-#[cfg(test)]
-pub(crate) fn find_source<'a, T: std::error::Error + 'static>(
-    mut error: &'a (dyn std::error::Error + 'static),
-) -> Option<&'a T> {
-    loop {
-        if let Some(original) = error.downcast_ref::<T>() {
-            return Some(original);
-        }
-        error = error.source()?;
-    }
-}
-
-/// Pure decoder fixtures borrow their declared connector stop control. They
-/// do not manufacture a Task just to satisfy an unrelated runtime API.
-#[cfg(any(test, novarocks_dev_controls))]
-pub(crate) struct PureConnectorCompileControl(
-    pub(crate) novarocks_spi::connector::ConnectorStopView,
-);
-#[cfg(any(test, novarocks_dev_controls))]
-impl novarocks_type_contract::PureCompileControl for PureConnectorCompileControl {
-    fn checkpoint(
-        &self,
-        _: novarocks_type_contract::CompilePhase,
-        _: u32,
-    ) -> Result<(), novarocks_type_contract::CompileControlError> {
-        if self.0.is_stopped() {
-            Err(novarocks_type_contract::CompileControlError::Cancelled)
-        } else {
-            Ok(())
-        }
     }
 }

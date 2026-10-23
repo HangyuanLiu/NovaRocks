@@ -371,7 +371,9 @@ impl LocalUtf8Column {
     fn missing_bytes(&self, value_bytes: usize, row: usize) -> usize {
         self.values.missing_bytes(value_bytes)
             + self.offsets.missing_bytes(1)
-            + self.validity.missing_bytes(usize::from(row % 8 == 0))
+            + self
+                .validity
+                .missing_bytes(usize::from(row.is_multiple_of(8)))
     }
     fn compact_tails(&mut self, growth: &mut Growth) -> Result<(), String> {
         self.values.compact_tail(growth)?;
@@ -390,7 +392,7 @@ impl LocalUtf8Column {
         let offset = i32::try_from(self.values.len())
             .map_err(|_| "local UTF-8 column offset overflows".to_string())?;
         self.offsets.append(&[offset], growth)?;
-        if row % 8 == 0 {
+        if row.is_multiple_of(8) {
             self.validity.append(&[0], growth)?;
         }
         if value.is_some() {
@@ -493,9 +495,21 @@ mod tests {
     fn prebuilt_arrays_are_checked_against_rows_bytes_and_columns() {
         let column: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
         let bytes = column.get_array_memory_size();
-        assert!(bound(3, bytes).check_arrays(&[column.clone()]).is_ok());
-        assert!(bound(2, bytes).check_arrays(&[column.clone()]).is_err());
-        assert!(bound(3, bytes - 1).check_arrays(&[column.clone()]).is_err());
+        assert!(
+            bound(3, bytes)
+                .check_arrays(std::slice::from_ref(&column))
+                .is_ok()
+        );
+        assert!(
+            bound(2, bytes)
+                .check_arrays(std::slice::from_ref(&column))
+                .is_err()
+        );
+        assert!(
+            bound(3, bytes - 1)
+                .check_arrays(std::slice::from_ref(&column))
+                .is_err()
+        );
         let wide = vec![column; 5];
         assert!(bound(3, usize::MAX).check_arrays(&wide).is_err());
     }

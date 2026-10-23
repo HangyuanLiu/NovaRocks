@@ -120,7 +120,7 @@ fn null_or_empty_owner_stable_exact_profiles_and_called_on_null_effects() {
             .unwrap(),
     );
     for ty in types {
-        let prepared = prepared_for_test("null_or_empty", &[ty.clone()]).unwrap();
+        let prepared = prepared_for_test("null_or_empty", std::slice::from_ref(&ty)).unwrap();
         assert_eq!(
             prepared.contract().selected().argument_types.as_ref(),
             &[crate::FunctionArgumentType::Value(ty)]

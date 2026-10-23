@@ -87,7 +87,8 @@ impl MvLocalProjectionInventory {
 
 fn local_inventory_bound() -> novarocks_mv_application::repository::MvProjectionInventoryBound {
     use novarocks_mv_application::repository::MvProjectionInventoryBound;
-    let bound = MvProjectionInventoryBound {
+
+    MvProjectionInventoryBound {
         entries: novarocks_query_application::api::LocalResultBound::V1.rows,
         snapshot_bytes: 16 * 1024 * 1024,
         raw_page_bytes: 1024 * 1024,
@@ -98,8 +99,7 @@ fn local_inventory_bound() -> novarocks_mv_application::repository::MvProjection
             max_working_set_bytes: 4 * 1024 * 1024,
             ..Default::default()
         },
-    };
-    bound
+    }
 }
 
 /// Read-only inventory for query-local MV candidate discovery.

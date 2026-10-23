@@ -322,23 +322,21 @@ pub(crate) fn summarize_source_node<W: crate::array_backing_geometry::MetadataWo
     // Include force_validate's lawful superset. Cheap child validation recurses;
     // only this build root runs its full null/value checks.
     let mut validation = cheap_validation;
-    if let DataType::FixedSizeList(field, width) = node.data_type {
-        if !field.is_nullable() {
-            if let Some(nulls) = node.nulls {
-                let width = usize::try_from(*width)
-                    .map_err(|_| invalid("source FixedSizeList has a negative Arrow width"))?;
-                let bits = multiply(nulls.len(), width)?;
-                let bytes = bits / 8 + usize::from(bits % 8 != 0);
-                let payload = Layout::from_size_align(bytes, arrow_buffer::alloc::ALIGNMENT)
-                    .map_err(|_| KernelFailure::ResourceExhausted)?;
-                validation = validation
-                    .plus(SourceCustodyAllocationFacts::layout(payload))?
-                    .plus(shared(
-                        Layout::from_size_align(48, 8)
-                            .map_err(|_| KernelFailure::ResourceExhausted)?,
-                    )?)?;
-            }
-        }
+    if let DataType::FixedSizeList(field, width) = node.data_type
+        && !field.is_nullable()
+        && let Some(nulls) = node.nulls
+    {
+        let width = usize::try_from(*width)
+            .map_err(|_| invalid("source FixedSizeList has a negative Arrow width"))?;
+        let bits = multiply(nulls.len(), width)?;
+        let bytes = bits / 8 + usize::from(bits % 8 != 0);
+        let payload = Layout::from_size_align(bytes, arrow_buffer::alloc::ALIGNMENT)
+            .map_err(|_| KernelFailure::ResourceExhausted)?;
+        validation = validation
+            .plus(SourceCustodyAllocationFacts::layout(payload))?
+            .plus(shared(
+                Layout::from_size_align(48, 8).map_err(|_| KernelFailure::ResourceExhausted)?,
+            )?)?;
     }
     if matches!(node.data_type, DataType::RunEndEncoded(..)) {
         validation = validation.plus(table::<Buffer>(1)?)?;

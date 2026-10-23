@@ -201,6 +201,50 @@ fn external_cache_options(policy: ConnectorDataCacheOptions) -> novarocks_fs::Ca
     }
 }
 
+pub struct IcebergExecutionReadBinding {
+    admitted_provider_factory: Arc<dyn ConnectorAdmittedReadProviderFactory>,
+    decoder: Arc<dyn ConnectorReadWireDecoder>,
+    private_read_codecs: IcebergReadCodecs,
+}
+
+impl IcebergExecutionReadBinding {
+    pub fn admitted_provider_factory(&self) -> Arc<dyn ConnectorAdmittedReadProviderFactory> {
+        Arc::clone(&self.admitted_provider_factory)
+    }
+
+    pub fn decoder(&self) -> Arc<dyn ConnectorReadWireDecoder> {
+        Arc::clone(&self.decoder)
+    }
+
+    /// Provider-owned codec facet consumed by the UEA role adapters after the
+    /// atomic public-envelope cutover.
+    pub const fn private_read_codecs(&self) -> IcebergReadCodecs {
+        self.private_read_codecs
+    }
+}
+
+/// Rebuild the provider descriptor from the catalog runtime identity. The
+/// provider is static because this factory is installed only in Iceberg's
+/// sealed provider-kind slot; only the catalog name belongs in this diagnostic
+/// descriptor. The full 32-byte content version remains in `CatalogHandle`.
+pub(crate) fn iceberg_descriptor(catalog_handle: &CatalogHandle) -> ConnectorInstanceDescriptor {
+    ConnectorInstanceDescriptor {
+        provider_id: ConnectorProviderId::parse(crate::PROVIDER_ID)
+            .expect("static Iceberg provider ID is valid"),
+        instance_id: catalog_handle.catalog_name().clone(),
+    }
+}
+
+/// Iceberg's pre-existing transaction marker is a fixed 16-byte field, while
+/// catalog identity is the complete 32-byte content version. This value is
+/// only the marker required by the Iceberg transaction handle; all catalog
+/// lookup and relation validation use the untruncated `CatalogHandle` above.
+fn catalog_transaction_marker(catalog_handle: &CatalogHandle) -> [u8; 16] {
+    let mut marker = [0; 16];
+    marker.copy_from_slice(&catalog_handle.version().as_bytes()[..16]);
+    marker
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -385,48 +429,4 @@ mod tests {
 
         assert_request_binding_uses_vended_resolver(&factory, &request, &resolver);
     }
-}
-
-pub struct IcebergExecutionReadBinding {
-    admitted_provider_factory: Arc<dyn ConnectorAdmittedReadProviderFactory>,
-    decoder: Arc<dyn ConnectorReadWireDecoder>,
-    private_read_codecs: IcebergReadCodecs,
-}
-
-impl IcebergExecutionReadBinding {
-    pub fn admitted_provider_factory(&self) -> Arc<dyn ConnectorAdmittedReadProviderFactory> {
-        Arc::clone(&self.admitted_provider_factory)
-    }
-
-    pub fn decoder(&self) -> Arc<dyn ConnectorReadWireDecoder> {
-        Arc::clone(&self.decoder)
-    }
-
-    /// Provider-owned codec facet consumed by the UEA role adapters after the
-    /// atomic public-envelope cutover.
-    pub const fn private_read_codecs(&self) -> IcebergReadCodecs {
-        self.private_read_codecs
-    }
-}
-
-/// Rebuild the provider descriptor from the catalog runtime identity. The
-/// provider is static because this factory is installed only in Iceberg's
-/// sealed provider-kind slot; only the catalog name belongs in this diagnostic
-/// descriptor. The full 32-byte content version remains in `CatalogHandle`.
-pub(crate) fn iceberg_descriptor(catalog_handle: &CatalogHandle) -> ConnectorInstanceDescriptor {
-    ConnectorInstanceDescriptor {
-        provider_id: ConnectorProviderId::parse(crate::PROVIDER_ID)
-            .expect("static Iceberg provider ID is valid"),
-        instance_id: catalog_handle.catalog_name().clone(),
-    }
-}
-
-/// Iceberg's pre-existing transaction marker is a fixed 16-byte field, while
-/// catalog identity is the complete 32-byte content version. This value is
-/// only the marker required by the Iceberg transaction handle; all catalog
-/// lookup and relation validation use the untruncated `CatalogHandle` above.
-fn catalog_transaction_marker(catalog_handle: &CatalogHandle) -> [u8; 16] {
-    let mut marker = [0; 16];
-    marker.copy_from_slice(&catalog_handle.version().as_bytes()[..16]);
-    marker
 }

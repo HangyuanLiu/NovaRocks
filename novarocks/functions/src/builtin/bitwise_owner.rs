@@ -347,6 +347,76 @@ pub(super) fn prepared_for_test_with_policy(
     tests::prepared_for_test_with_policy(name, sources, policy)
 }
 
+impl BitwiseOwner {
+    fn refine_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(FunctionEffectOwnerError::Control)?;
+        work.step().map_err(FunctionEffectOwnerError::Control)?;
+        if input.function_id != self.declaration.function_id() || input.kind != FunctionKind::Scalar
+        {
+            return Err(FunctionBindingError::UnknownFunction.into());
+        }
+        if !input.environment.is_empty()
+            || !matches!(input.proof_scope, CallProofScope::Unconditional)
+                && input.proof_scope != CallProofScope::Domain(input.context.domain)
+        {
+            return Err(FunctionBindingError::InvalidBinding(
+                "bitwise has no environment dependencies and requires an exact proof scope".into(),
+            )
+            .into());
+        }
+        work.flush().map_err(FunctionEffectOwnerError::Control)?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+            other => FunctionEffectOwnerError::Owner(other),
+        })?;
+        let result = self.call_effects(input.proof_scope);
+        work.finish().map_err(FunctionEffectOwnerError::Control)?;
+        Ok(result)
+    }
+    fn prepare_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(compile_failure)?;
+        work.step().map_err(compile_failure)?;
+        if input.function_id != self.declaration.function_id()
+            || input.kind != FunctionKind::Scalar
+            || contract.function_id() != input.function_id
+            || !std::ptr::eq(contract.selected(), input.selected)
+            || contract.context() != input.context
+            || contract.decimal_overflow_policy() != input.decimal_overflow_policy
+            || contract.effects() != &self.call_effects(input.proof_scope)
+            || !input.environment.is_empty()
+        {
+            return Err(invalid(
+                "bitwise preparation differs from its exact checked call",
+            ));
+        }
+        work.flush().map_err(compile_failure)?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => compile_failure(error),
+            _ => invalid("bitwise preparation has a stale selected binding"),
+        })?;
+        work.finish().map_err(compile_failure)?;
+        // The prepared object retains the same canonical contract. Its body is
+        // a static pure implementation and needs no live resolver or authority.
+        Ok(Arc::new(PreparedBitwise {
+            contract,
+            operation: self.operation,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1149,75 +1219,5 @@ mod tests {
             )
             .is_err()
         );
-    }
-}
-
-impl BitwiseOwner {
-    fn refine_selected_core(
-        &self,
-        input: CallEffectInput<'_>,
-        control: &dyn PureCompileControl,
-        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
-    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(FunctionEffectOwnerError::Control)?;
-        work.step().map_err(FunctionEffectOwnerError::Control)?;
-        if input.function_id != self.declaration.function_id() || input.kind != FunctionKind::Scalar
-        {
-            return Err(FunctionBindingError::UnknownFunction.into());
-        }
-        if !input.environment.is_empty()
-            || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                && input.proof_scope != CallProofScope::Domain(input.context.domain)
-        {
-            return Err(FunctionBindingError::InvalidBinding(
-                "bitwise has no environment dependencies and requires an exact proof scope".into(),
-            )
-            .into());
-        }
-        work.flush().map_err(FunctionEffectOwnerError::Control)?;
-        validate().map_err(|error| match error {
-            FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
-            other => FunctionEffectOwnerError::Owner(other),
-        })?;
-        let result = self.call_effects(input.proof_scope);
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        Ok(result)
-    }
-    fn prepare_selected_core(
-        &self,
-        input: CallEffectInput<'_>,
-        contract: Arc<ScalarCallContract>,
-        control: &dyn PureCompileControl,
-        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
-    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(compile_failure)?;
-        work.step().map_err(compile_failure)?;
-        if input.function_id != self.declaration.function_id()
-            || input.kind != FunctionKind::Scalar
-            || contract.function_id() != input.function_id
-            || !std::ptr::eq(contract.selected(), input.selected)
-            || contract.context() != input.context
-            || contract.decimal_overflow_policy() != input.decimal_overflow_policy
-            || contract.effects() != &self.call_effects(input.proof_scope)
-            || !input.environment.is_empty()
-        {
-            return Err(invalid(
-                "bitwise preparation differs from its exact checked call",
-            ));
-        }
-        work.flush().map_err(compile_failure)?;
-        validate().map_err(|error| match error {
-            FunctionBindingError::Control(error) => compile_failure(error),
-            _ => invalid("bitwise preparation has a stale selected binding"),
-        })?;
-        work.finish().map_err(compile_failure)?;
-        // The prepared object retains the same canonical contract. Its body is
-        // a static pure implementation and needs no live resolver or authority.
-        Ok(Arc::new(PreparedBitwise {
-            contract,
-            operation: self.operation,
-        }))
     }
 }

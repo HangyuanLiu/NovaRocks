@@ -409,9 +409,7 @@ fn cleanup_candidate_locations(
     loop {
         let page = engine.read_cleanup_candidate_page(session, offset, 1024)?;
         for key in page.display_keys() {
-            bytes = bytes
-                .checked_add(LocalResultBound::cell_bytes(key.len()))
-                .unwrap_or(usize::MAX);
+            bytes = bytes.saturating_add(LocalResultBound::cell_bytes(key.len()));
             bound
                 .admit(locations.len() + 1, bytes)
                 .map_err(|error| format!("orphan cleanup report: {error}"))?;

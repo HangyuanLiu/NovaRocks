@@ -113,21 +113,22 @@ pub(crate) fn namespace_declarations(source: &str) -> Result<BTreeSet<String>> {
     let mut shell = false;
     for line in source.lines() {
         if let Some(command) = shell_line(line, &mut shell) {
-            if let Some(capture) = producer.captures(command) {
-                if !matches!(&capture[1], "observe" | "unchanged") {
-                    declared.insert(capture[2].to_string());
-                }
+            if let Some(capture) = producer.captures(command)
+                && !matches!(&capture[1], "observe" | "unchanged")
+            {
+                declared.insert(capture[2].to_string());
             }
-            if let Some(capture) = hms.captures(command) {
-                if &capture[1] == "prepare" {
-                    declared.insert(capture[2].to_string());
-                    declared.insert(format!("{}_new", &capture[2]));
-                }
+            if let Some(capture) = hms.captures(command)
+                && &capture[1] == "prepare"
+            {
+                declared.insert(capture[2].to_string());
+                declared.insert(format!("{}_new", &capture[2]));
             }
-            if let Some(capture) = trino.captures(command) {
-                if &capture[1] == "create-parent" && !command.trim_end().ends_with(" id 4 3 1 3") {
-                    declared.insert(capture[2].to_string());
-                }
+            if let Some(capture) = trino.captures(command)
+                && &capture[1] == "create-parent"
+                && !command.trim_end().ends_with(" id 4 3 1 3")
+            {
+                declared.insert(capture[2].to_string());
             }
         }
     }
@@ -607,14 +608,14 @@ pub(crate) fn rewrite_namespaces(
                     .trim_start()
                     .strip_prefix("shell:")
                     .unwrap_or(&rewritten);
-                if let Some(capture) = producer.captures(command) {
-                    if let Some(name) = mapping.get(&capture[2]) {
-                        let argument = capture.get(2).unwrap();
-                        let offset = rewritten.len() - command.len();
-                        let range = offset + argument.start()..offset + argument.end();
-                        let name = name.clone();
-                        rewritten.replace_range(range, &name);
-                    }
+                if let Some(capture) = producer.captures(command)
+                    && let Some(name) = mapping.get(&capture[2])
+                {
+                    let argument = capture.get(2).unwrap();
+                    let offset = rewritten.len() - command.len();
+                    let range = offset + argument.start()..offset + argument.end();
+                    let name = name.clone();
+                    rewritten.replace_range(range, &name);
                 }
                 result.push_str(&rewritten);
             }
@@ -634,48 +635,44 @@ pub(crate) fn rewrite_namespaces(
                 .map(|capture| capture[2].to_string())
         })
         .collect();
-    if !families.is_empty() {
-        if let Some(warehouse) = variables.get("iceberg_hms_warehouse") {
-            use novarocks_parser::ast::{
-                IcebergStatement, IcebergTableAction, LiteralKind, Statement,
-            };
-            let masked = crate::catalog_symbol::sql_source(&result);
-            let mut edits = Vec::new();
-            for range in crate::catalog_symbol::ranges(&masked)? {
-                let sql = &masked[range.clone()];
-                if let Ok(statements) = novarocks_parser::parse(sql) {
-                    for statement in statements {
-                        if let Statement::Iceberg(IcebergStatement::AlterTable(table)) = statement {
-                            if let IcebergTableAction::AddFiles(files) = table.action {
-                                if let LiteralKind::String(value) = &files.location.kind {
-                                    for family in &families {
-                                        if value
-                                            == &format!(
-                                                "{}/iru7/{family}/v1/data",
-                                                warehouse.trim_end_matches('/')
-                                            )
-                                        {
-                                            if let Some(mapped) = mapping.get(family) {
-                                                edits.push((
-                                                    range.start + files.location.span.start(),
-                                                    range.start + files.location.span.end(),
-                                                    format!(
-                                                        "'{}/iru7/{mapped}/v1/data'",
-                                                        warehouse.trim_end_matches('/')
-                                                    ),
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
+    if !families.is_empty()
+        && let Some(warehouse) = variables.get("iceberg_hms_warehouse")
+    {
+        use novarocks_parser::ast::{IcebergStatement, IcebergTableAction, LiteralKind, Statement};
+        let masked = crate::catalog_symbol::sql_source(&result);
+        let mut edits = Vec::new();
+        for range in crate::catalog_symbol::ranges(&masked)? {
+            let sql = &masked[range.clone()];
+            if let Ok(statements) = novarocks_parser::parse(sql) {
+                for statement in statements {
+                    if let Statement::Iceberg(IcebergStatement::AlterTable(table)) = statement
+                        && let IcebergTableAction::AddFiles(files) = table.action
+                        && let LiteralKind::String(value) = &files.location.kind
+                    {
+                        for family in &families {
+                            if value
+                                == &format!(
+                                    "{}/iru7/{family}/v1/data",
+                                    warehouse.trim_end_matches('/')
+                                )
+                                && let Some(mapped) = mapping.get(family)
+                            {
+                                edits.push((
+                                    range.start + files.location.span.start(),
+                                    range.start + files.location.span.end(),
+                                    format!(
+                                        "'{}/iru7/{mapped}/v1/data'",
+                                        warehouse.trim_end_matches('/')
+                                    ),
+                                ));
                             }
                         }
                     }
                 }
             }
-            for (start, end, value) in edits.into_iter().rev() {
-                result.replace_range(start..end, &value);
-            }
+        }
+        for (start, end, value) in edits.into_iter().rev() {
+            result.replace_range(start..end, &value);
         }
     }
     Ok(result)
@@ -697,20 +694,18 @@ fn rewrite_delta_namespace_refs(
                 && call.name.parts[0]
                     .value
                     .eq_ignore_ascii_case("__nr_ivm_delta")
+                && let Some(Expr::Literal(literal)) = call.arguments.first()
+                && let LiteralKind::String(value) = &literal.kind
             {
-                if let Some(Expr::Literal(literal)) = call.arguments.first() {
-                    if let LiteralKind::String(value) = &literal.kind {
-                        let parts: Vec<_> = value.split('.').collect();
-                        if parts.len() == 3 {
-                            if let Some(namespace) = self.mapping.get(parts[1]) {
-                                self.edits.push((
-                                    literal.span.start(),
-                                    literal.span.end(),
-                                    format!("'{}.{namespace}.{}'", parts[0], parts[2]),
-                                ));
-                            }
-                        }
-                    }
+                let parts: Vec<_> = value.split('.').collect();
+                if parts.len() == 3
+                    && let Some(namespace) = self.mapping.get(parts[1])
+                {
+                    self.edits.push((
+                        literal.span.start(),
+                        literal.span.end(),
+                        format!("'{}.{namespace}.{}'", parts[0], parts[2]),
+                    ));
                 }
             }
             walk_function_call(self, call);

@@ -454,10 +454,10 @@ fn source_dictionary_ids_do_not_change_static_value_binding_and_invalid_nominals
         &Control::default(),
     )
     .unwrap();
-    assert!(matches!(
-        FunctionValueType::try_with_logical_type(DataType::Boolean, true, ValueLogicalType::Json),
-        Err(_)
-    ));
+    assert!(
+        FunctionValueType::try_with_logical_type(DataType::Boolean, true, ValueLogicalType::Json)
+            .is_err()
+    );
 }
 
 #[test]

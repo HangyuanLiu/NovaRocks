@@ -165,7 +165,7 @@ impl FragmentArtifact {
         control: &dyn PureCompileControl,
     ) -> Result<Arc<Self>, PackageFreezeError> {
         let fragment = package.fragment();
-        let fragment_id = u32::from(fragment.id().get());
+        let fragment_id = fragment.id().get();
         let root_plan_node_id = i32::try_from(fragment.root().get()).map_err(|_| {
             PackageFreezeError::Facts(format!(
                 "fragment {fragment_id} root node {} exceeds the wire node identity",
@@ -250,7 +250,7 @@ fn package_sink_targets(
                     ))
                 })?;
             Ok(StaticSinkTarget {
-                target_fragment_id: u32::from(edge.destination.fragment.get()),
+                target_fragment_id: edge.destination.fragment.get(),
                 target_exchange_node_id,
             })
         })

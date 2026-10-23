@@ -806,7 +806,7 @@ fn entry_and_bounded_wrapper_or_owner_refinement_failures_keep_typed_compile_cat
 fn bounded_prepare_control_failures_are_outer_kernel_failures_and_allocate_no_instance() {
     let owner = Owner::new(300, ArgumentControl::Eager);
     let input = owner.input();
-    for (failure, expected) in [
+    for (failure, _expected) in [
         (CompileControlError::Cancelled, KernelFailure::Cancelled),
         (
             CompileControlError::DeadlineExceeded,

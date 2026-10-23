@@ -90,7 +90,7 @@ fn parse_frontend(line: &[u8]) -> Result<FrontendProcessId> {
     FrontendProcessId::try_from_bytes(bytes).map_err(anyhow::Error::new)
 }
 
-fn number<'a>(rest: &mut &'a [u8], field: &[u8], max: u64) -> Result<u64> {
+fn number(rest: &mut &[u8], field: &[u8], max: u64) -> Result<u64> {
     let digits = rest
         .strip_prefix(field)
         .ok_or_else(|| anyhow::anyhow!("original target marker field order or name is invalid"))?;

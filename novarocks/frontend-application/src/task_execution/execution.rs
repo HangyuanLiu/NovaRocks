@@ -836,13 +836,13 @@ impl QueryTaskExecution {
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         for (&context, owner) in &mut self.owners {
-            if self.normal_drain_started {
-                if let Some(intent) = owner.quiesce_intent() {
-                    lifecycle.push(AdmissionCandidate::minted(
-                        OperationTarget::Context(context),
-                        intent,
-                    ));
-                }
+            if self.normal_drain_started
+                && let Some(intent) = owner.quiesce_intent()
+            {
+                lifecycle.push(AdmissionCandidate::minted(
+                    OperationTarget::Context(context),
+                    intent,
+                ));
             }
             if let Some(intent) = owner.renew_intent(now)? {
                 lifecycle.push(AdmissionCandidate::minted(
@@ -1395,10 +1395,11 @@ impl QueryTaskExecution {
                     // to be handed out again by the next pump.
                     return Ok(());
                 }
-                if !was_owned && task.create_ownership_proven() {
-                    if let Some(owner) = self.owners.get_mut(&context) {
-                        owner.note_create_owned();
-                    }
+                if !was_owned
+                    && task.create_ownership_proven()
+                    && let Some(owner) = self.owners.get_mut(&context)
+                {
+                    owner.note_create_owned();
                 }
                 self.reconcile_destination_input(identity)?;
                 self.settle_task_drain(stage_id, task_id);

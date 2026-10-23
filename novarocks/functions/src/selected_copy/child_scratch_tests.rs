@@ -47,10 +47,10 @@ impl AggregateStateAllocator for HeapHost {
         let mut ledger = self.0.lock().unwrap();
         let at = ledger.attempts;
         ledger.attempts += 1;
-        if let Some((stop, cause)) = &ledger.refusal {
-            if at == *stop {
-                return Err(cause.clone());
-            }
+        if let Some((stop, cause)) = &ledger.refusal
+            && at == *stop
+        {
+            return Err(cause.clone());
         }
         // SAFETY: the exact nonzero Layout is passed to the physical allocator.
         let pointer = NonNull::new(unsafe { std::alloc::alloc(layout) })

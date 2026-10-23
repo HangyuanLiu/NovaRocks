@@ -1769,13 +1769,13 @@ fn scan_data<E: PoolFailure>(
                 }
             }
         }
-        DataType::FixedSizeList(_, width) => {
-            if checked_mul(extent, *width as u64)? > data.child_data()[0].len() as u64 {
-                return Err(ConstantError::Invalid(
-                    "constant FixedSizeList offset exceeds child extent",
-                )
-                .into());
-            }
+        DataType::FixedSizeList(_, width)
+            if checked_mul(extent, *width as u64)? > data.child_data()[0].len() as u64 =>
+        {
+            return Err(ConstantError::Invalid(
+                "constant FixedSizeList offset exceeds child extent",
+            )
+            .into());
         }
         _ => {}
     }
@@ -1891,7 +1891,7 @@ fn scan_data<E: PoolFailure>(
     }
     let elements = value_elements::<E>(data.data_type(), children.into_iter().map(Ok));
     observer.step(work)?;
-    Ok(elements?)
+    elements
 }
 
 fn scan_child<E: PoolFailure>(
@@ -1952,9 +1952,9 @@ fn value_elements<E: PoolFailure>(
 ) -> Result<u64, E> {
     let child =
         |children: &mut dyn Iterator<Item = Result<ElementMetric, E>>| -> Result<ElementMetric, E> {
-            Ok(children.next().ok_or(ConstantError::Invalid(
+            children.next().ok_or(ConstantError::Invalid(
                 "constant array lacks an expected child",
-            ))??)
+            ))?
         };
     match ty {
         DataType::Struct(_) => {

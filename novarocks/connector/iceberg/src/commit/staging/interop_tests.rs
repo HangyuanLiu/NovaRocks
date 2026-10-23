@@ -165,16 +165,15 @@ fn interop_storage_belongs(storage: &Value, context: &Value, location: &str) -> 
         }
         if let Some(relative) = location.strip_prefix(warehouse) {
             let namespace = relative.split('/').next().unwrap_or_default();
-            if let Some(purpose) = namespace.strip_prefix(&format!("{run}_")) {
-                if namespace.len() <= 63
-                    && !purpose.is_empty()
-                    && purpose.as_bytes()[0].is_ascii_lowercase()
-                    && purpose
-                        .bytes()
-                        .all(|v| v.is_ascii_lowercase() || v.is_ascii_digit())
-                {
-                    return true;
-                }
+            if let Some(purpose) = namespace.strip_prefix(&format!("{run}_"))
+                && namespace.len() <= 63
+                && !purpose.is_empty()
+                && purpose.as_bytes()[0].is_ascii_lowercase()
+                && purpose
+                    .bytes()
+                    .all(|v| v.is_ascii_lowercase() || v.is_ascii_digit())
+            {
+                return true;
             }
         }
     }

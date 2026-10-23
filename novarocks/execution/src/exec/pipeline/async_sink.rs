@@ -1085,14 +1085,13 @@ async fn drain_loop<B: AsyncSinkBackend>(
     let aborted = shared.failure().is_some()
         || shared.stop.load(Ordering::Acquire)
         || shared.unresolved.load(Ordering::Acquire);
-    if aborted {
-        if let Err(_error) = backend_call(SinkPhase::Abort, &shared, &control, || {
+    if aborted
+        && let Err(_error) = backend_call(SinkPhase::Abort, &shared, &control, || {
             start.backend.as_mut().unwrap().abort()
         })
         .await
-        {
-            // The same backend operation already reported this cleanup event.
-        }
+    {
+        // The same backend operation already reported this cleanup event.
     }
     if let Err(_error) = backend_call(SinkPhase::Close, &shared, &control, || {
         start.backend.as_mut().unwrap().close()

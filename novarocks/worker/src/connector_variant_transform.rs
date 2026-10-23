@@ -83,10 +83,10 @@ impl ConnectorVariantPathTransform {
         ) -> Result<Vec<T>, E> {
             let layout = std::alloc::Layout::array::<T>(count)
                 .map_err(|_| LayoutResourceError::Arithmetic)?;
-            if count != 0 {
-                if let Some(request) = request.as_mut() {
-                    request(layout)?;
-                }
+            if count != 0
+                && let Some(request) = request.as_mut()
+            {
+                request(layout)?;
             }
             Ok(Vec::with_capacity(count))
         }

@@ -1507,10 +1507,10 @@ pub(crate) mod source_control_tests {
                         if line == "\r\n" || line.is_empty() {
                             break;
                         }
-                        if let Some((name, value)) = line.split_once(':') {
-                            if name.eq_ignore_ascii_case("range") {
-                                range = Some(value.trim().to_string());
-                            }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("range")
+                        {
+                            range = Some(value.trim().to_string());
                         }
                     }
                     requests.lock().unwrap().push(SourceRequest {

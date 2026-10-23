@@ -1808,15 +1808,14 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                 resolved.calls().get(&ProgramCallSite::Expression(parent.occurrence)).map(|call|call.specialization().prepared()),
                 Some(PreparedPureKernel::ScalarInvocation(prepared)) if scalar_invocation::PreparedCall::Invocation(prepared).input_domain_policy() == novarocks_functions::InvocationInputDomainPolicy::OriginalActualDomain
             );
-            if parent_requires_original {
-                if let OwnedValue::Selected(_, errors) = value.uncontinued() {
-                    if let Some(error) = errors.first() {
-                        work.control
-                            .operation_aborted
-                            .store(true, Ordering::Relaxed);
-                        return Err(E::required(root, output_selection, error.clone()));
-                    }
-                }
+            if parent_requires_original
+                && let OwnedValue::Selected(_, errors) = value.uncontinued()
+                && let Some(error) = errors.first()
+            {
+                work.control
+                    .operation_aborted
+                    .store(true, Ordering::Relaxed);
+                return Err(E::required(root, output_selection, error.clone()));
             }
         }
         // Preserve the original leaf/required-child failure before any new

@@ -414,16 +414,15 @@ impl ActorGateOwner {
         for intent in &intents {
             match intent {
                 OperationIntent::AcquireQueryContextAdmissionTicket(request) => {
-                    if !self
+                    if let std::collections::btree_map::Entry::Vacant(e) = self
                         .admission_issues
-                        .contains_key(&request.envelope().operation_id())
+                        .entry(request.envelope().operation_id())
                     {
                         let receipt = drive
                             .begin_admission_issue(*request)
                             .await
                             .map_err(actor_error)?;
-                        self.admission_issues
-                            .insert(request.envelope().operation_id(), receipt);
+                        e.insert(receipt);
                     }
                 }
                 OperationIntent::EstablishQueryContext(establish) => {

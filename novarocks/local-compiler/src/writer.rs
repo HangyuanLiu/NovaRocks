@@ -129,14 +129,14 @@ pub(crate) fn admit_writer_family(
                     _ => None,
                 };
                 let mut exact = false;
-                if let Some(input) = input {
-                    if matches!(input.kind, NodeKind::ExchangeSource { .. }) {
-                        for cut in package.cuts().inbound.iter() {
-                            let addressed = cut.destination_node == input.id;
-                            let same = cut.partitioning.destination == target.required_distribution;
-                            work.step()?;
-                            exact |= addressed && same;
-                        }
+                if let Some(input) = input
+                    && matches!(input.kind, NodeKind::ExchangeSource { .. })
+                {
+                    for cut in package.cuts().inbound.iter() {
+                        let addressed = cut.destination_node == input.id;
+                        let same = cut.partitioning.destination == target.required_distribution;
+                        work.step()?;
+                        exact |= addressed && same;
                     }
                 }
                 if !exact {

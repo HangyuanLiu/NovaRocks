@@ -126,57 +126,6 @@ pub(crate) fn connector_schema_error(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use novarocks_spi::connector::ConnectorStopOwner;
-
-    #[test]
-    fn original_schema_control_source_keeps_its_author_and_interruption_role() {
-        use novarocks_failure_contract::FailureProjection;
-        use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
-        let raw = LayoutResourceError::SourceModel;
-        let expected = raw.failure_fact();
-        let cause = CompileControlError::from_domain(raw);
-        let error = connector_schema_error(PureProviderCompileError::Control(cause.clone()));
-        assert_eq!(error.kind(), ConnectorErrorKind::Interrupted);
-        assert_eq!(error.failure_fact(), expected);
-        assert!(!error.retryable_before_progress());
-    }
-
-    #[test]
-    fn a_provider_refusal_keeps_its_original_classification_when_stop_arrives_at_return() {
-        let stop = ConnectorStopOwner::new();
-        let context = crate::connector::connector_request_context(None, stop.view()).unwrap();
-        let failure = with_schema_creation::<()>(&context, |_| {
-            stop.request_stop();
-            Err(PureProviderCompileError::Provider(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "original provider schema refusal",
-            )))
-        })
-        .unwrap_err();
-        let failure = connector_schema_error(failure);
-        assert_eq!(failure.kind(), ConnectorErrorKind::InvalidRequest);
-        assert_eq!(failure.message(), "original provider schema refusal");
-    }
-
-    #[test]
-    fn successful_preparation_observes_the_original_stop_before_returning() {
-        let stop = ConnectorStopOwner::new();
-        let context = crate::connector::connector_request_context(None, stop.view()).unwrap();
-        let failure = with_schema_creation(&context, |_| {
-            stop.request_stop();
-            Ok(())
-        })
-        .unwrap_err();
-        assert!(matches!(
-            failure,
-            PureProviderCompileError::Control(CompileControlError::Cancelled,)
-        ));
-    }
-}
-
 /// Test provider authors supply complete declarations; source Fields carry
 /// only the provider's physical/attribute facts, never semantic defaults.
 #[cfg(test)]
@@ -226,4 +175,55 @@ pub(crate) fn declared_test_metadata_with_creation(
         )?
     };
     ConnectorTableMetadata::try_new_typed(header, source, execution, creation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks_spi::connector::ConnectorStopOwner;
+
+    #[test]
+    fn original_schema_control_source_keeps_its_author_and_interruption_role() {
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+        let raw = LayoutResourceError::SourceModel;
+        let expected = raw.failure_fact();
+        let cause = CompileControlError::from_domain(raw);
+        let error = connector_schema_error(PureProviderCompileError::Control(cause.clone()));
+        assert_eq!(error.kind(), ConnectorErrorKind::Interrupted);
+        assert_eq!(error.failure_fact(), expected);
+        assert!(!error.retryable_before_progress());
+    }
+
+    #[test]
+    fn a_provider_refusal_keeps_its_original_classification_when_stop_arrives_at_return() {
+        let stop = ConnectorStopOwner::new();
+        let context = crate::connector::connector_request_context(None, stop.view()).unwrap();
+        let failure = with_schema_creation::<()>(&context, |_| {
+            stop.request_stop();
+            Err(PureProviderCompileError::Provider(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "original provider schema refusal",
+            )))
+        })
+        .unwrap_err();
+        let failure = connector_schema_error(failure);
+        assert_eq!(failure.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(failure.message(), "original provider schema refusal");
+    }
+
+    #[test]
+    fn successful_preparation_observes_the_original_stop_before_returning() {
+        let stop = ConnectorStopOwner::new();
+        let context = crate::connector::connector_request_context(None, stop.view()).unwrap();
+        let failure = with_schema_creation(&context, |_| {
+            stop.request_stop();
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(matches!(
+            failure,
+            PureProviderCompileError::Control(CompileControlError::Cancelled,)
+        ));
+    }
 }

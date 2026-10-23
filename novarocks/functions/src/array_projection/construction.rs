@@ -109,7 +109,7 @@ fn arc<T, E: From<ArrayProjectionFailure>>(request: &mut Request<'_, E>) -> Resu
 fn bitmap_bound(rows: usize) -> Result<usize, ArrayProjectionFailure> {
     // MutableBuffer's locked source rounds a nonzero bitmap payload to 64 B.
     let bytes = add(rows, 7)? / 8;
-    Ok(mul(add(bytes, 63)? / 64, 64)?)
+    mul(add(bytes, 63)? / 64, 64)
 }
 fn clone_parameters<E: From<ArrayProjectionFailure>>(
     ty: &DataType,

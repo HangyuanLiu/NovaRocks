@@ -741,28 +741,46 @@ impl ConnectorMetadata for Fixture {
             prepared_files: self.files_for_table(table).cloned().unwrap_or_default(),
             explicit_files: None,
         };
-        Ok(crate::connector::schema_creation::declared_test_metadata_with_creation(novarocks_spi::connector::ConnectorTableMetadataHeader { identity: request.table.clone(),
-planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::try_new(
-                &fixture_read_schema_for_table(table),
-                (0..fixture_read_value_types_for_table(table).len()).map(|ordinal|
-                    novarocks_spi::connector::ConnectorTableColumnPlanningFact::new(ordinal as u32,
-                        if table == FIXTURE_HIDDEN_KEY_TABLE && ordinal == 2 {
-                            novarocks_spi::connector::ConnectorTableColumnVisibility::Hidden
-                        } else { novarocks_spi::connector::ConnectorTableColumnVisibility::Sql },
-                        novarocks_spi::connector::ConnectorTableColumnSemanticKind::None,
-                        novarocks_spi::connector::ConnectorTableColumnRole::Ordinary)).collect(),
-                vec![], vec![], vec![], &request.context)?,
-definition_facts: novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
-version: None,
-statistics_data_version: None,
-table: ConnectorTableHandle::try_new(
-                self.instance_id.clone(),
-                encode_payload(
-                    &payload,
-                    "table handle",
-                    request.context.max_handle_payload_bytes(),
+        crate::connector::schema_creation::declared_test_metadata_with_creation(
+            novarocks_spi::connector::ConnectorTableMetadataHeader {
+                identity: request.table.clone(),
+                planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::try_new(
+                    &fixture_read_schema_for_table(table),
+                    (0..fixture_read_value_types_for_table(table).len())
+                        .map(|ordinal| {
+                            novarocks_spi::connector::ConnectorTableColumnPlanningFact::new(
+                                ordinal as u32,
+                                if table == FIXTURE_HIDDEN_KEY_TABLE && ordinal == 2 {
+                                    novarocks_spi::connector::ConnectorTableColumnVisibility::Hidden
+                                } else {
+                                    novarocks_spi::connector::ConnectorTableColumnVisibility::Sql
+                                },
+                                novarocks_spi::connector::ConnectorTableColumnSemanticKind::None,
+                                novarocks_spi::connector::ConnectorTableColumnRole::Ordinary,
+                            )
+                        })
+                        .collect(),
+                    vec![],
+                    vec![],
+                    vec![],
+                    &request.context,
                 )?,
-            )? }, fixture_read_schema_for_table(table), fixture_read_value_types_for_table(table), creation)?)
+                definition_facts: novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
+                version: None,
+                statistics_data_version: None,
+                table: ConnectorTableHandle::try_new(
+                    self.instance_id.clone(),
+                    encode_payload(
+                        &payload,
+                        "table handle",
+                        request.context.max_handle_payload_bytes(),
+                    )?,
+                )?,
+            },
+            fixture_read_schema_for_table(table),
+            fixture_read_value_types_for_table(table),
+            creation,
+        )
     }
 }
 

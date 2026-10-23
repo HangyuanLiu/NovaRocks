@@ -323,35 +323,34 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                             novarocks_table_maintenance::OptimizeCompletionMode::AwaitTerminal,
                         ..
                     }
-                ) {
-                    if let Some(handle) = submission.handle() {
-                        let control = engine
-                            .statement_cancellation()
-                            .expect("AwaitTerminal verified statement control before submission");
-                        let wait = self.product.wait_optimize_terminal_record(handle);
-                        tokio::pin!(wait);
-                        let mut cancelled = false;
-                        let mut cancellation_error = None;
-                        let terminal = tokio::select! {
-                            terminal = &mut wait => terminal,
-                            _ = control.0.stopped() => {
-                                cancelled = true;
-                                cancellation_error = self.product.request_cancel_optimize(handle).await.err();
-                                wait.await
-                            },
-                            _ = tokio::time::sleep_until(control.1.into()) => {
-                                cancelled = true;
-                                cancellation_error = self.product.request_cancel_optimize(handle).await.err();
-                                wait.await
-                            },
-                        }?;
-                        optimize_statement_terminal_result(
-                            handle,
-                            terminal,
-                            cancelled,
-                            cancellation_error,
-                        )?;
-                    }
+                ) && let Some(handle) = submission.handle()
+                {
+                    let control = engine
+                        .statement_cancellation()
+                        .expect("AwaitTerminal verified statement control before submission");
+                    let wait = self.product.wait_optimize_terminal_record(handle);
+                    tokio::pin!(wait);
+                    let mut cancelled = false;
+                    let mut cancellation_error = None;
+                    let terminal = tokio::select! {
+                        terminal = &mut wait => terminal,
+                        _ = control.0.stopped() => {
+                            cancelled = true;
+                            cancellation_error = self.product.request_cancel_optimize(handle).await.err();
+                            wait.await
+                        },
+                        _ = tokio::time::sleep_until(control.1.into()) => {
+                            cancelled = true;
+                            cancellation_error = self.product.request_cancel_optimize(handle).await.err();
+                            wait.await
+                        },
+                    }?;
+                    optimize_statement_terminal_result(
+                        handle,
+                        terminal,
+                        cancelled,
+                        cancellation_error,
+                    )?;
                 }
                 Ok(MaintenanceStatementResult::Ok)
             }

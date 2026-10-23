@@ -129,10 +129,10 @@ impl Scenario for ConcurrentResults {
         // Cancel failed setup while actors are still held, before any join.
         if causal.is_some() {
             for (_, connection, job) in &actors {
-                if !job.is_finished() {
-                    if let Err(error) = context.handle().kill_query_until(*connection, deadline) {
-                        cleanup.push(format!("cancel client {connection}: {error:#}"));
-                    }
+                if !job.is_finished()
+                    && let Err(error) = context.handle().kill_query_until(*connection, deadline)
+                {
+                    cleanup.push(format!("cancel client {connection}: {error:#}"));
                 }
             }
         }
@@ -179,12 +179,11 @@ impl Scenario for ConcurrentResults {
                 if first_failure {
                     // A wire/oracle failure cancels every still-live peer before its join.
                     for (_, connection, job) in &actors {
-                        if !job.is_finished() {
-                            if let Err(error) =
+                        if !job.is_finished()
+                            && let Err(error) =
                                 context.handle().kill_query_until(*connection, deadline)
-                            {
-                                cleanup.push(format!("cancel peer {connection}: {error:#}"));
-                            }
+                        {
+                            cleanup.push(format!("cancel peer {connection}: {error:#}"));
                         }
                     }
                 }

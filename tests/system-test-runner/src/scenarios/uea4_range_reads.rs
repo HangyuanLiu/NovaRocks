@@ -90,7 +90,7 @@ struct CheckedFixture {
 impl CheckedFixture {
     fn load_source(path: &Path, allow_a4: bool) -> Result<Self> {
         let bytes =
-            fs::read(&path).with_context(|| format!("read UEA-4A-2 fixture {}", path.display()))?;
+            fs::read(path).with_context(|| format!("read UEA-4A-2 fixture {}", path.display()))?;
         let digest = sha256(&bytes);
         let root = path
             .parent()

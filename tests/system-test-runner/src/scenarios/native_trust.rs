@@ -905,7 +905,7 @@ fn raw_grpc_probe_with_deadline(
                 let (mut sender, connection) = client::handshake(stream)
                     .await
                     .context("perform Native raw probe HTTP/2 handshake")?;
-                driver = Some(tokio::spawn(async move { connection.await }));
+                driver = Some(tokio::spawn(connection));
                 let mut request = Request::builder()
                     .method("POST")
                     .uri(path)

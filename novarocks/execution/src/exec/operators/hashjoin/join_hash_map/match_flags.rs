@@ -126,7 +126,7 @@ impl BuildMatchMerge {
                 self.merged.len()
             )));
         }
-        for (slot, matched) in self.merged.iter_mut().zip(local.into_iter()) {
+        for (slot, matched) in self.merged.iter_mut().zip(local) {
             *slot = *slot || matched;
         }
         self.drivers_merged += 1;

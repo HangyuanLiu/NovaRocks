@@ -671,7 +671,7 @@ impl OperatorLifecycle for TableWriterOperator {
         if result.is_err() {
             self.state = TableWriterState::Failed;
         }
-        Ok(result?)
+        result
     }
 
     fn begin_exit(&mut self) -> ExecutionResult<()> {
@@ -843,16 +843,15 @@ impl TransformKernel for TableWriterOperator {
             self.state = TableWriterState::Draining;
             self.finish_blocked_intervals();
             #[cfg(novarocks_dev_controls)]
-            if self.partial_aggregate.is_some() {
-                if let Err(error) = self
+            if self.partial_aggregate.is_some()
+                && let Err(error) = self
                     .aggregate_guard
                     .check(TableWriteAggregateBoundary::PartialFinalize)
-                {
-                    let error: crate::runtime::fragment::ExecutionFailure = crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(crate::runtime::fragment::connector_failure::ConnectorOperation::CheckPartialAggregateFinalize,error).into();
-                    ctx.report_failure(error.clone());
-                    self.fail_attempt();
-                    return Err(error);
-                }
+            {
+                let error: crate::runtime::fragment::ExecutionFailure = crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(crate::runtime::fragment::connector_failure::ConnectorOperation::CheckPartialAggregateFinalize,error).into();
+                ctx.report_failure(error.clone());
+                self.fail_attempt();
+                return Err(error);
             }
             if let Some(child) = self.partial_aggregate.as_mut() {
                 child.finish_input();
@@ -930,77 +929,83 @@ impl TableWriterOperator {
         if !ctx.work().try_consume(1) {
             return Ok(StepResult::new(None, NextStep::Yield, 0));
         }
-        if let Some(mut chunk) = self.input.take() {
-            if !chunk.is_empty() {
-                let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
-                let next_rows = self.logical_rows.checked_add(rows).ok_or_else(|| crate::runtime::fragment::ExecutionFailure::from(crate::exec::pipeline::writer_failure::WriterFailure::AcceptedRowsOverflow {current:self.logical_rows,incoming:chunk.len()}))?;
-                let projected = self.projection.project(&chunk)?;
-                let batch = projected.record_batch();
-                let reservation = self.writer.try_reserve_input(
-                    batch.num_rows(),
-                    record_batch_bytes(batch),
-                    chunk.take_memory_lease(),
-                    crate::exec::chunk::record_batch_shared_owner_bytes(
-                        batch,
-                        chunk.record_batch(),
-                    ),
-                    record_batch_additional_bytes(batch, chunk.record_batch()),
-                )?;
-                let append = if projected.chunk_schema().is_typed() {
-                    let factory = self.construction.as_ref().ok_or(
-                        crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
-                    )?;
-                    let owner = factory.begin_typed_construction(projected.chunk_schema())?;
-                    crate::exec::pipeline::async_writer::WriterAppendBatch::try_new(
+        if let Some(mut chunk) = self.input.take()
+            && !chunk.is_empty()
+        {
+            let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+            let next_rows = self.logical_rows.checked_add(rows).ok_or_else(|| {
+                crate::runtime::fragment::ExecutionFailure::from(
+                    crate::exec::pipeline::writer_failure::WriterFailure::AcceptedRowsOverflow {
+                        current: self.logical_rows,
+                        incoming: chunk.len(),
+                    },
+                )
+            })?;
+            let projected = self.projection.project(&chunk)?;
+            let batch = projected.record_batch();
+            let reservation = self.writer.try_reserve_input(
+                batch.num_rows(),
+                record_batch_bytes(batch),
+                chunk.take_memory_lease(),
+                crate::exec::chunk::record_batch_shared_owner_bytes(batch, chunk.record_batch()),
+                record_batch_additional_bytes(batch, chunk.record_batch()),
+            )?;
+            let append = if projected.chunk_schema().is_typed() {
+                let factory = self
+                    .construction
+                    .as_ref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+                let owner = factory.begin_typed_construction(projected.chunk_schema())?;
+                crate::exec::pipeline::async_writer::WriterAppendBatch::try_new(
+                    projected.batch_projection(),
+                    owner.as_ref(),
+                )?
+            } else {
+                #[cfg(test)]
+                {
+                    crate::exec::pipeline::async_writer::WriterAppendBatch::from_fixture_projection(
                         projected.batch_projection(),
-                        owner.as_ref(),
-                    )?
-                } else {
-                    #[cfg(test)]
-                    {
-                        crate::exec::pipeline::async_writer::WriterAppendBatch::from_fixture_projection(projected.batch_projection())
-                    }
-                    #[cfg(not(test))]
-                    return Err(
-                        crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(
-                            "writer append requires its complete execution bindings".into(),
-                        )
-                        .into(),
-                    );
-                };
-                drop(chunk);
-                if let Some(child) = self.partial_aggregate.as_mut() {
-                    #[cfg(novarocks_dev_controls)]
+                    )
+                }
+                #[cfg(not(test))]
+                return Err(
+                    crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(
+                        "writer append requires its complete execution bindings".into(),
+                    )
+                    .into(),
+                );
+            };
+            drop(chunk);
+            if let Some(child) = self.partial_aggregate.as_mut() {
+                #[cfg(novarocks_dev_controls)]
                     self.aggregate_guard
                         .check(TableWriteAggregateBoundary::PartialUpdate)
                         .map_err(|source| ExecutionFailure::from(crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(crate::runtime::fragment::connector_failure::ConnectorOperation::CheckPartialAggregateUpdate,source)))?;
-                    child.offer(projected)?;
-                    self.pending_append = Some(PendingAppend {
-                        batch: append,
-                        reservation,
-                        rows: next_rows,
-                    });
-                } else {
-                    reservation.send(append)?;
-                    self.logical_rows = next_rows;
-                    self.pending_rows = Some(rows);
-                }
+                child.offer(projected)?;
+                self.pending_append = Some(PendingAppend {
+                    batch: append,
+                    reservation,
+                    rows: next_rows,
+                });
+            } else {
+                reservation.send(append)?;
+                self.logical_rows = next_rows;
+                self.pending_rows = Some(rows);
             }
         }
         if self.aggregate_output.is_none()
             && let Some(child) = self.partial_aggregate.as_mut()
             && child.runnable()
+            && let Some(mut output) = child.advance(ctx)?
         {
-            if let Some(mut output) = child.advance(ctx)? {
-                if let Some(tracker) = self.aggregate_tracker.as_ref() {
-                    output
-                        .try_transfer_to(tracker)
-                        .map_err(ExecutionFailure::from_domain)?;
-                }
-                self.aggregate_output = Some(output);
-                self.aggregate_output_row = 0;
-                self.next_auxiliary = 0;
+            if let Some(tracker) = self.aggregate_tracker.as_ref() {
+                output
+                    .try_transfer_to(tracker)
+                    .map_err(ExecutionFailure::from_domain)?;
             }
+            self.aggregate_output = Some(output);
+            self.aggregate_output_row = 0;
+            self.next_auxiliary = 0;
         }
         if self.pending_append.is_some()
             && self
@@ -3374,7 +3379,7 @@ pub(crate) mod tests {
             crate::exec::chunk::typed_fixture::chunk(
                 batch,
                 layout.slots(),
-                &[node.projection.ty.clone()],
+                std::slice::from_ref(&node.projection.ty),
             )
         })
         .expect("push projected page");

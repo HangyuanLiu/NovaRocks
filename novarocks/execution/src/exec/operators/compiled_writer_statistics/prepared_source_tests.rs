@@ -280,9 +280,7 @@ fn plan_tree_prepared_partial_preserves_first_memory_and_original_caller_without
         .begin_compiled_layout_construction(&source.output)
         .unwrap();
     let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Internal(
-        novarocks_functions::KernelDiagnostic::new(
-            &("original writer preparation stop".to_owned()),
-        ),
+        novarocks_functions::KernelDiagnostic::new("original writer preparation stop"),
     ))
     .at_operator(2, crate::runtime::fragment::PipelineOperation::Admission);
     source.state.error_state().set_error(original.clone());

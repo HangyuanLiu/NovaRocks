@@ -268,10 +268,10 @@ pub fn verify_text_assertions(step: &SqlStep, execution: &QueryExecution) -> (bo
     if let Err(reason) = verify_result_rows(&step.meta, &execution.header, &execution.rows) {
         return (false, reason);
     }
-    if let Some(contract) = &step.meta.query_stats_contract {
-        if let Err(error) = contract.verify(&step.sql, haystack) {
-            return (false, format!("query stats contract failed: {error:#}"));
-        }
+    if let Some(contract) = &step.meta.query_stats_contract
+        && let Err(error) = contract.verify(&step.sql, haystack)
+    {
+        return (false, format!("query stats contract failed: {error:#}"));
     }
     (true, String::new())
 }

@@ -1716,7 +1716,7 @@ mod force_drop_admission_tests {
         fn load_table(
             &self,
             _: ConnectorTableRequest,
-            creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+            _creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
         ) -> Result<
             ConnectorTableMetadata,
             novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
@@ -2455,7 +2455,7 @@ pub(crate) mod external_listing_tests {
         fn load_table(
             &self,
             _: ConnectorTableRequest,
-            creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+            _creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
         ) -> Result<
             ConnectorTableMetadata,
             novarocks_connector_contract::PureProviderCompileError<ConnectorError>,

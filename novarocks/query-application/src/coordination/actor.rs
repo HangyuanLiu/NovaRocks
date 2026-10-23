@@ -2806,12 +2806,12 @@ fn synchronize_all_stand_down(
     abort_effect_port: Option<&dyn AbortQueryContextEffectPort>,
 ) {
     for attempt in attempts.values_mut() {
-        if !attempt.stand_down.started() && state.conclusion() == Some(LogicalConclusion::Succeeded)
+        if !attempt.stand_down.started()
+            && state.conclusion() == Some(LogicalConclusion::Succeeded)
+            && let Err(error) = begin_or_refresh_successful_cleanup(attempt)
         {
-            if let Err(error) = begin_or_refresh_successful_cleanup(attempt) {
-                stand_down_error.get_or_insert(error);
-                attempt.stand_down_error.get_or_insert(error);
-            }
+            stand_down_error.get_or_insert(error);
+            attempt.stand_down_error.get_or_insert(error);
         }
         let replacement_failed = matches!(
             state.phase(),
@@ -2830,11 +2830,11 @@ fn synchronize_all_stand_down(
                 LogicalConclusion::Succeeded => None,
             })
         };
-        if let Some(cause) = cause {
-            if let Err(error) = begin_or_refresh_stand_down(attempt, cause) {
-                stand_down_error.get_or_insert(error);
-                attempt.stand_down_error.get_or_insert(error);
-            }
+        if let Some(cause) = cause
+            && let Err(error) = begin_or_refresh_stand_down(attempt, cause)
+        {
+            stand_down_error.get_or_insert(error);
+            attempt.stand_down_error.get_or_insert(error);
         }
         if attempt.stand_down.started() && attempt.stand_down.responsibility_settled() {
             if let Err(error) = cancel_pending_abort_issues(
@@ -3902,7 +3902,7 @@ fn conclude_for_work_cancellation(
     conclude_or_interrupt_success(state, replacement, None, conclusion);
     if was_unconcluded
         && state.conclusion() == Some(conclusion)
-        && let Some(runtime) = runtime.as_deref_mut()
+        && let Some(runtime) = runtime
     {
         let (kind, message) = match reason {
             CancellationReason::DeadlineExceeded
@@ -4509,10 +4509,9 @@ fn handle_command(
                         if state
                             .conclude(&capability, LogicalConclusion::Failed)
                             .is_ok()
+                            && let (Some(runtime), Some(error)) = (result_runtime, terminal_error)
                         {
-                            if let (Some(runtime), Some(error)) = (result_runtime, terminal_error) {
-                                runtime.accepted_error = Some(error);
-                            }
+                            runtime.accepted_error = Some(error);
                         }
                         lifetime.settle();
                         let _ = reply.send(Err(error.into()));

@@ -283,6 +283,85 @@ pub(super) fn prepared_for_test(
 ) -> Result<Arc<dyn PreparedScalarKernel>, crate::FunctionSpecializationFailure> {
     tests::prepared_for_test(sources, literals, policy)
 }
+
+impl TruncateOwner {
+    fn refine_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(FunctionEffectOwnerError::Control)?;
+        work.step().map_err(FunctionEffectOwnerError::Control)?;
+        if input.function_id != self.declaration.function_id() || input.kind != FunctionKind::Scalar
+        {
+            return Err(FunctionBindingError::UnknownFunction.into());
+        }
+        if !input.environment.is_empty()
+            || !matches!(input.proof_scope, CallProofScope::Unconditional)
+                && input.proof_scope != CallProofScope::Domain(input.context.domain)
+        {
+            return Err(FunctionBindingError::InvalidBinding(
+                "truncate has no environment dependencies and requires an exact proof scope".into(),
+            )
+            .into());
+        }
+        work.flush().map_err(FunctionEffectOwnerError::Control)?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+            other => FunctionEffectOwnerError::Owner(other),
+        })?;
+        let result = self.call_effects(input);
+        work.finish().map_err(FunctionEffectOwnerError::Control)?;
+        Ok(result)
+    }
+    fn prepare_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(compile_failure)?;
+        work.step().map_err(compile_failure)?;
+        if input.function_id != self.declaration.function_id()
+            || input.kind != FunctionKind::Scalar
+            || contract.function_id() != input.function_id
+            || !std::ptr::eq(contract.selected(), input.selected)
+            || contract.context() != input.context
+            || contract.decimal_overflow_policy() != input.decimal_overflow_policy
+            || contract.effects() != &self.call_effects(input)
+            || !input.environment.is_empty()
+        {
+            return Err(invalid(
+                "truncate preparation differs from its exact checked call",
+            ));
+        }
+        work.flush().map_err(compile_failure)?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => compile_failure(error),
+            _ => invalid("truncate preparation has a stale selected binding"),
+        })?;
+        let operation = match input.selected.argument_types.len() {
+            1 => TruncateOp::Unary,
+            2 => TruncateOp::Binary,
+            _ => {
+                return Err(invalid(
+                    "TRUNCATE preparation has an invalid selected arity",
+                ));
+            }
+        };
+        work.finish().map_err(compile_failure)?;
+        // The prepared object retains the same canonical contract. Its body is
+        // a static pure implementation and needs no live resolver or authority.
+        Ok(Arc::new(PreparedTruncate {
+            contract,
+            operation,
+        }))
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::super::catalogue::constant_binding_tests as cv;
@@ -889,84 +968,5 @@ mod tests {
                 assert_eq!(control.calls.lock().unwrap().len(), at + 1);
             }
         }
-    }
-}
-
-impl TruncateOwner {
-    fn refine_selected_core(
-        &self,
-        input: CallEffectInput<'_>,
-        control: &dyn PureCompileControl,
-        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
-    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(FunctionEffectOwnerError::Control)?;
-        work.step().map_err(FunctionEffectOwnerError::Control)?;
-        if input.function_id != self.declaration.function_id() || input.kind != FunctionKind::Scalar
-        {
-            return Err(FunctionBindingError::UnknownFunction.into());
-        }
-        if !input.environment.is_empty()
-            || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                && input.proof_scope != CallProofScope::Domain(input.context.domain)
-        {
-            return Err(FunctionBindingError::InvalidBinding(
-                "truncate has no environment dependencies and requires an exact proof scope".into(),
-            )
-            .into());
-        }
-        work.flush().map_err(FunctionEffectOwnerError::Control)?;
-        validate().map_err(|error| match error {
-            FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
-            other => FunctionEffectOwnerError::Owner(other),
-        })?;
-        let result = self.call_effects(input);
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        Ok(result)
-    }
-    fn prepare_selected_core(
-        &self,
-        input: CallEffectInput<'_>,
-        contract: Arc<ScalarCallContract>,
-        control: &dyn PureCompileControl,
-        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
-    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(compile_failure)?;
-        work.step().map_err(compile_failure)?;
-        if input.function_id != self.declaration.function_id()
-            || input.kind != FunctionKind::Scalar
-            || contract.function_id() != input.function_id
-            || !std::ptr::eq(contract.selected(), input.selected)
-            || contract.context() != input.context
-            || contract.decimal_overflow_policy() != input.decimal_overflow_policy
-            || contract.effects() != &self.call_effects(input)
-            || !input.environment.is_empty()
-        {
-            return Err(invalid(
-                "truncate preparation differs from its exact checked call",
-            ));
-        }
-        work.flush().map_err(compile_failure)?;
-        validate().map_err(|error| match error {
-            FunctionBindingError::Control(error) => compile_failure(error),
-            _ => invalid("truncate preparation has a stale selected binding"),
-        })?;
-        let operation = match input.selected.argument_types.len() {
-            1 => TruncateOp::Unary,
-            2 => TruncateOp::Binary,
-            _ => {
-                return Err(invalid(
-                    "TRUNCATE preparation has an invalid selected arity",
-                ));
-            }
-        };
-        work.finish().map_err(compile_failure)?;
-        // The prepared object retains the same canonical contract. Its body is
-        // a static pure implementation and needs no live resolver or authority.
-        Ok(Arc::new(PreparedTruncate {
-            contract,
-            operation,
-        }))
     }
 }

@@ -426,6 +426,97 @@ fn run(
     }
 }
 
+/// Reports the same complete-definition pure seal used by production composition.
+/// No configuration, listener, provider I/O or runtime resource is opened.
+fn build_information_value(
+    build: &crate::build_information::BuildInformation,
+) -> anyhow::Result<serde_json::Value> {
+    let functions = composition::compose_process_function_set()?;
+    let seal = crate::compiled_composition::seal_pure_catalog(functions.catalog())?;
+    let mut value = crate::build_information::value(build);
+    value["static_plan_interpreter"] = serde_json::json!({
+        "name": "compiled_package",
+        "pure_function_catalog_digest": hex::encode(seal.catalog.digest()),
+        "sealed_definition_count": seal.installed_definitions,
+        "excluded_definitions": seal.excluded,
+    });
+    Ok(value)
+}
+
+pub fn main(build: crate::build_information::BuildInformation) {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.as_slice() == ["--build-info"] {
+        match build_information_value(&build) {
+            Ok(value) => println!("{value}"),
+            Err(error) => {
+                eprintln!("build information composition failed: {error:#}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    if args.as_slice() == ["--mem-1-m07-hms-listing-build-identity"] {
+        println!(
+            "NOVAROCKS_MEM_1_M07_HMS_LISTING_BUILD commit={} build_identity={} hms_listing_observe=true",
+            build.source_commit, build.native_build_identity
+        );
+        return;
+    }
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    if args.as_slice() == ["--mem-1-m07-closing-pressure-build-identity"] {
+        println!(
+            "NOVAROCKS_MEM_1_M07_CLOSING_PRESSURE_BUILD commit={} build_identity={} closing_pressure=true",
+            build.source_commit, build.native_build_identity
+        );
+        return;
+    }
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+    if args.as_slice() == ["--mem-1-m07-build-identity"] {
+        println!(
+            "NOVAROCKS_MEM_1_M07_BUILD commit={} build_identity={} exact_mysql_write=true",
+            build.source_commit, build.native_build_identity
+        );
+        return;
+    }
+    #[cfg(feature = "mem-1-m07-root-observation")]
+    if args.as_slice() == ["--mem-1-m07-root-observation-build-identity"] {
+        println!(
+            "NOVAROCKS_MEM_1_M07_ROOT_OBSERVATION_BUILD commit={} build_identity={} root_observation=true",
+            build.source_commit, build.native_build_identity
+        );
+        return;
+    }
+    if args
+        .first()
+        .is_none_or(|command| command == "--help" || command == "-h")
+    {
+        usage();
+        return;
+    }
+    if args.first().is_none_or(|command| command != "standalone") {
+        eprintln!("the only server command is `standalone`");
+        usage();
+        process::exit(1);
+    }
+    let parsed = match launch::parse_standalone_launch_args(&args[1..]) {
+        Ok(Some(parsed)) => parsed,
+        Ok(None) => {
+            usage();
+            return;
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            usage();
+            process::exit(1);
+        }
+    };
+    if let Err(error) = run(parsed, &build) {
+        eprintln!("{error:#}");
+        process::exit(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::compose_memory_authority;
@@ -609,96 +700,5 @@ mod tests {
             assert!(installed.effects().environment_dependencies.is_empty());
         }
         assert_ne!(catalog.digest(), [0; 32]);
-    }
-}
-
-/// Reports the same complete-definition pure seal used by production composition.
-/// No configuration, listener, provider I/O or runtime resource is opened.
-fn build_information_value(
-    build: &crate::build_information::BuildInformation,
-) -> anyhow::Result<serde_json::Value> {
-    let functions = composition::compose_process_function_set()?;
-    let seal = crate::compiled_composition::seal_pure_catalog(functions.catalog())?;
-    let mut value = crate::build_information::value(build);
-    value["static_plan_interpreter"] = serde_json::json!({
-        "name": "compiled_package",
-        "pure_function_catalog_digest": hex::encode(seal.catalog.digest()),
-        "sealed_definition_count": seal.installed_definitions,
-        "excluded_definitions": seal.excluded,
-    });
-    Ok(value)
-}
-
-pub fn main(build: crate::build_information::BuildInformation) {
-    let args = env::args().skip(1).collect::<Vec<_>>();
-    if args.as_slice() == ["--build-info"] {
-        match build_information_value(&build) {
-            Ok(value) => println!("{value}"),
-            Err(error) => {
-                eprintln!("build information composition failed: {error:#}");
-                std::process::exit(1);
-            }
-        }
-        return;
-    }
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    if args.as_slice() == ["--mem-1-m07-hms-listing-build-identity"] {
-        println!(
-            "NOVAROCKS_MEM_1_M07_HMS_LISTING_BUILD commit={} build_identity={} hms_listing_observe=true",
-            build.source_commit, build.native_build_identity
-        );
-        return;
-    }
-    #[cfg(feature = "mem-1-m07-closing-pressure")]
-    if args.as_slice() == ["--mem-1-m07-closing-pressure-build-identity"] {
-        println!(
-            "NOVAROCKS_MEM_1_M07_CLOSING_PRESSURE_BUILD commit={} build_identity={} closing_pressure=true",
-            build.source_commit, build.native_build_identity
-        );
-        return;
-    }
-    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-    if args.as_slice() == ["--mem-1-m07-build-identity"] {
-        println!(
-            "NOVAROCKS_MEM_1_M07_BUILD commit={} build_identity={} exact_mysql_write=true",
-            build.source_commit, build.native_build_identity
-        );
-        return;
-    }
-    #[cfg(feature = "mem-1-m07-root-observation")]
-    if args.as_slice() == ["--mem-1-m07-root-observation-build-identity"] {
-        println!(
-            "NOVAROCKS_MEM_1_M07_ROOT_OBSERVATION_BUILD commit={} build_identity={} root_observation=true",
-            build.source_commit, build.native_build_identity
-        );
-        return;
-    }
-    if args
-        .first()
-        .is_none_or(|command| command == "--help" || command == "-h")
-    {
-        usage();
-        return;
-    }
-    if args.first().is_none_or(|command| command != "standalone") {
-        eprintln!("the only server command is `standalone`");
-        usage();
-        process::exit(1);
-    }
-    let parsed = match launch::parse_standalone_launch_args(&args[1..]) {
-        Ok(Some(parsed)) => parsed,
-        Ok(None) => {
-            usage();
-            return;
-        }
-        Err(error) => {
-            eprintln!("{error}");
-            usage();
-            process::exit(1);
-        }
-    };
-    if let Err(error) = run(parsed, &build) {
-        eprintln!("{error:#}");
-        process::exit(1);
     }
 }

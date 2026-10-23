@@ -387,7 +387,7 @@ async fn build_frontend_role_products(
             )
             .map_err(FrontendApplicationError::server)?,
             novarocks_mv_application::management::ProcessIncarnation::parse(
-                &uuid::Uuid::now_v7().to_string(),
+                uuid::Uuid::now_v7().to_string(),
             )
             .expect("UUIDv7 process incarnation is a valid management identity"),
         ),
@@ -2331,7 +2331,8 @@ mod tests {
             }];
             // These bind grants freeze statement ownership without inventing a BE
             // receipt or a QueryExecutionId. This test fails before placement.
-            for token in ["first-entry"] {
+            {
+                let token = "first-entry";
                 grants.push(DomainGrant {
                     domain: "native".into(),
                     grant_id: format!("bind-{token}"),

@@ -1469,7 +1469,7 @@ pub(crate) fn stage_prepared_update_mutation(
                         &connector_context,
                         "COW UPDATE",
                     );
-                    return Err(error.into());
+                    return Err(error);
                 }
             };
             let execution_handle = Arc::new(DistributedCowUpdateExecutor {
@@ -3193,7 +3193,7 @@ fn run_one_cow_target(
             plan.original.clone(),
         )
     })?;
-    Ok(assembly.finish()?)
+    assembly.finish()
 }
 
 #[cfg(test)]
@@ -3632,11 +3632,11 @@ fn execute_exact_cow_match_query(
     )
     .and_then(|request| request.with_cow_match_consumer(consumer))
     .map_err(crate::dml::error::DmlExecutionError::from_distributed)?;
-    Ok(state
+    state
         .query_execution()
         .execute(request)
         .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_cow_match)
-        .map_err(crate::dml::error::DmlExecutionError::from_distributed)?)
+        .map_err(crate::dml::error::DmlExecutionError::from_distributed)
 }
 
 #[cfg(test)]
@@ -4167,7 +4167,7 @@ pub(crate) fn stage_prepared_merge_mutation(
         Ok(write) => write,
         Err(error) => {
             release_unplanned_write_session(&write_session, &connector_context, "COW MERGE");
-            return Err(error.into());
+            return Err(error);
         }
     };
     let execution_handle = Arc::new(DistributedCowUpdateExecutor {

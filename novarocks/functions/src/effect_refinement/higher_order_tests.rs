@@ -80,11 +80,12 @@ fn type_only_preparation_rejects_malformed_or_unbounded_lambda_metadata() {
         )
         .is_err()
     );
-    for (parameter_types, result_type, resource_failure) in [(
-        vec![FunctionValueType::new(DataType::Int64, false); MAX_CALL_EFFECT_ARGUMENTS + 1],
-        FunctionValueType::new(DataType::Boolean, true),
-        true,
-    )] {
+    {
+        let (parameter_types, result_type, resource_failure) = (
+            vec![FunctionValueType::new(DataType::Int64, false); MAX_CALL_EFFECT_ARGUMENTS + 1],
+            FunctionValueType::new(DataType::Boolean, true),
+            true,
+        );
         let mut fixture = Fixture::new(vec![FunctionArgument::Lambda {
             parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
                 parameter_types.into_boxed_slice(),

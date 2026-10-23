@@ -213,10 +213,10 @@ impl NativeAttemptConvergenceOwner {
             );
             self.begin(round, split_delivery, NativeAttemptConvergenceMode::Cleanup);
         }
-        if round.pumps_closed() {
-            if let Some(contexts) = self.observed_contexts(round) {
-                return Ok(NativeAttemptConvergenceStep::Ready(contexts));
-            }
+        if round.pumps_closed()
+            && let Some(contexts) = self.observed_contexts(round)
+        {
+            return Ok(NativeAttemptConvergenceStep::Ready(contexts));
         }
         match round.turn() {
             Ok(report) => Ok(NativeAttemptConvergenceStep::Pending {
@@ -252,10 +252,10 @@ impl NativeAttemptConvergenceOwner {
             self.begin(round, split_delivery, mode);
             self.observe_local_close(round)?;
             self.observe_remote_closure(round, deadline);
-            if round.pumps_closed() {
-                if let Some(closure) = &self.remote_closure {
-                    return Ok(closure.clone());
-                }
+            if round.pumps_closed()
+                && let Some(closure) = &self.remote_closure
+            {
+                return Ok(closure.clone());
             }
             let moved = match self.step(
                 round,
@@ -269,10 +269,10 @@ impl NativeAttemptConvergenceOwner {
             };
             self.observe_local_close(round)?;
             self.observe_remote_closure(round, deadline);
-            if round.pumps_closed() {
-                if let Some(closure) = &self.remote_closure {
-                    return Ok(closure.clone());
-                }
+            if round.pumps_closed()
+                && let Some(closure) = &self.remote_closure
+            {
+                return Ok(closure.clone());
             }
             if moved {
                 continue;

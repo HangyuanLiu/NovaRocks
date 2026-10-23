@@ -604,14 +604,13 @@ impl QueryContextOwner {
                 ));
             };
             self.context.verify_matches(receipt.context())?;
-            if let Some(previous) = &self.quiesce_receipt {
-                if previous.fence_version() != receipt.fence_version()
-                    || previous.accepted_tasks() != receipt.accepted_tasks()
-                {
-                    return Err(TaskExecutionError::DomainReceipt(
-                        "a replayed Quiesce changed its cumulative accepted set".to_owned(),
-                    ));
-                }
+            if let Some(previous) = &self.quiesce_receipt
+                && (previous.fence_version() != receipt.fence_version()
+                    || previous.accepted_tasks() != receipt.accepted_tasks())
+            {
+                return Err(TaskExecutionError::DomainReceipt(
+                    "a replayed Quiesce changed its cumulative accepted set".to_owned(),
+                ));
             }
             self.state = receipt.state();
             self.quiesce_receipt = Some(receipt.clone());
@@ -625,7 +624,7 @@ impl QueryContextOwner {
         if ack.dispatch_result() == OperationDispatchResult::TransportUnknown {
             return Ok(None);
         }
-        if let Some(outcome) = ack.worker_outcome() {
+        if let Some(_outcome) = ack.worker_outcome() {
             return Err(TaskExecutionError::OperationFailed {
                 context: self.context,
                 operation_id: ack.operation_id(),
@@ -843,7 +842,7 @@ impl QueryContextOwner {
         }
         if !ack.is_applied() {
             self.fail_admission();
-            let Some(outcome) = ack.worker_outcome() else {
+            let Some(_outcome) = ack.worker_outcome() else {
                 return Err(TaskExecutionError::DispatchRejected {
                     kind: OperationKind::AcquireQueryContextAdmissionTicket,
                     result: ack.dispatch_result(),
@@ -1017,7 +1016,7 @@ impl QueryContextOwner {
         } else {
             self.renewal = None;
         }
-        let Some(outcome) = ack.worker_outcome() else {
+        let Some(_outcome) = ack.worker_outcome() else {
             // The admission grant may still occupy Worker capacity. Keep the
             // context open so failure cleanup issues its exact Abort.
             return Err(TaskExecutionError::DispatchRejected {

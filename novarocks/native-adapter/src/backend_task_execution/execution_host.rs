@@ -846,8 +846,8 @@ impl NativeTaskExecutionHost {
             .with_result_identity(identity)
             .with_edge_gates(Arc::clone(&edges));
         #[cfg(novarocks_dev_controls)]
-        if let Some(observations) = self.queries.observation_controls() {
-            if let Some(observer) = observations
+        if let Some(observations) = self.queries.observation_controls()
+            && let Some(observer) = observations
                 .observation_for("exchange-snapshot", execution)
                 .map_err(|detail| {
                     internal_failure(NativePreparationContractFailure::new(
@@ -855,12 +855,11 @@ impl NativeTaskExecutionHost {
                         detail,
                     ))
                 })?
-            {
-                let receiver = novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort::new(self.execution_runtime.clone()).with_test_observer(observer.clone());
-                context = context
-                    .with_exchange_test_observer(Some(observer))
-                    .with_exchange_receiver_port(Arc::new(receiver));
-            }
+        {
+            let receiver = novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort::new(self.execution_runtime.clone()).with_test_observer(observer.clone());
+            context = context
+                .with_exchange_test_observer(Some(observer))
+                .with_exchange_receiver_port(Arc::new(receiver));
         }
         if let Some(session) = root_session {
             context = context.with_root_result_session(session);
@@ -888,8 +887,8 @@ impl NativeTaskExecutionHost {
         let dormant = prepared.map_err(|error| preparation_failure_to_host(identity, &error))?;
         kernel_construction.install(dormant, registration, kernel_control);
         #[cfg(novarocks_dev_controls)]
-        if let Some(controls) = self.test_controls.as_deref() {
-            if let Some(cause) = preparation_child
+        if let Some(controls) = self.test_controls.as_deref()
+            && let Some(cause) = preparation_child
                 .inject_prepared_exit_failure(controls)
                 .map_err(|detail| {
                     internal_failure(NativePreparationContractFailure::new(
@@ -897,9 +896,8 @@ impl NativeTaskExecutionHost {
                         detail,
                     ))
                 })?
-            {
-                return Err(HostRejection::from_failure(failure_category(&cause), cause));
-            }
+        {
+            return Err(HostRejection::from_failure(failure_category(&cause), cause));
         }
 
         tracing::debug!(resource_scope = "project-prepare-metadata", receipt = ?project_journal, "Project preparation resource receipt");
@@ -1162,19 +1160,17 @@ impl NativeTaskExecutionHost {
             .lock()
             .expect("task replay gate lock")
             .as_ref()
+            && assignment.no_more_splits()
+            && !sequences.is_empty()
+            && preflight.duplicate_sequences().len() == sequences.len()
         {
-            if assignment.no_more_splits()
-                && !sequences.is_empty()
-                && preflight.duplicate_sequences().len() == sequences.len()
-            {
-                gate.observe_duplicate(
-                    identity,
-                    _operation,
-                    node,
-                    sequences.first().expect("nonempty").sequence_id(),
-                    sequences.last().expect("nonempty").sequence_id(),
-                );
-            }
+            gate.observe_duplicate(
+                identity,
+                _operation,
+                node,
+                sequences.first().expect("nonempty").sequence_id(),
+                sequences.last().expect("nonempty").sequence_id(),
+            );
         }
         Ok(queue.stats().queued_splits as u64)
     }
@@ -1859,17 +1855,15 @@ impl NativeRunnableTask {
         #[cfg(novarocks_dev_controls)]
         let initial_failure = if stopped_before_start {
             None
-        } else if let Some(claim) =
-            injected_execution_failure.filter(|claim| claim.cancellation().is_active())
-        {
-            Some(
-                match fault::record_task_execution_failure(self.identity, &claim) {
-                    Ok(()) => fault::injected_task_execution_failure(),
-                    Err(error) => error,
-                },
-            )
         } else {
-            None
+            injected_execution_failure
+                .filter(|claim| claim.cancellation().is_active())
+                .map(
+                    |claim| match fault::record_task_execution_failure(self.identity, &claim) {
+                        Ok(()) => fault::injected_task_execution_failure(),
+                        Err(error) => error,
+                    },
+                )
         };
         #[cfg(not(novarocks_dev_controls))]
         let initial_failure = None;
@@ -2009,17 +2003,16 @@ impl RunnableTask for NativeRunnableTask {
         self.accept_control(StandDown::Abort(cause));
         // Receiver construction follows the registration's lifetime, not the
         // first kernel stand-down. A later true abort must still stop it.
-        if let Some(runtime) = self.receiver_runtime.as_ref().and_then(Weak::upgrade) {
-            if let Some(retirement) = runtime
+        if let Some(runtime) = self.receiver_runtime.as_ref().and_then(Weak::upgrade)
+            && let Some(retirement) = runtime
                 .exchange_retirement
                 .lock()
                 .expect(DORMANT_LOCK)
                 .as_ref()
-            {
-                retirement.stop_construction(ExecutionFailure::from_domain(
-                    ReceiverConstructionAborted(cause),
-                ));
-            }
+        {
+            retirement.stop_construction(ExecutionFailure::from_domain(
+                ReceiverConstructionAborted(cause),
+            ));
         }
         // Release the retirement lock before reaching the original latch or
         // kernel cancellation, which may run completion callbacks.
@@ -2290,7 +2283,7 @@ fn compiled_scan_assignments(
             NativePreparationReason::CompiledSplitCoverage,
             format_args!(
                 "task {identity} names split-driven nodes {:?}, but its compiled scans are {:?}",
-                &split_nodes, &scan_nodes
+                split_nodes, scan_nodes
             ),
         )));
     }
@@ -2526,7 +2519,7 @@ fn memory_admission_failure_to_host(
 }
 
 fn native_type_construction_failure_to_host(
-    identity: TaskIdentity,
+    _identity: TaskIdentity,
     error: &crate::native_type_construction::NativeTypeConstructionError,
 ) -> HostRejection {
     HostRejection::from_domain(
@@ -7505,8 +7498,7 @@ pub(crate) mod tests {
             .unwrap();
         let refusal = host
             .submit_runnable(&descriptor, reporter)
-            .err()
-            .expect("actual late completion refusal");
+            .expect_err("actual late completion refusal");
         let original = refusal.clone().into_failure();
         let novarocks_execution::runtime::fragment::ExecutionFailureCause::Domain(source) =
             original.cause()

@@ -89,8 +89,7 @@ impl WindowOutputScalars {
         if self.values.len() == self.values.capacity() {
             return Err(crate::kernel_control::invalid(
                 "window scalar staging exceeds its exact frame/output extent",
-            )
-            .into());
+            ));
         }
         self.charge
             .reconcile_under_reservation(retained, &mut reservation)?;

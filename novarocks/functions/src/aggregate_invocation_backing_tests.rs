@@ -65,10 +65,10 @@ impl AggregateStateAllocator for Host {
         let mut ledger = self.ledger.lock().unwrap();
         let at = ledger.attempts;
         ledger.attempts += 1;
-        if let Some((stop, cause)) = &*self.refusal.lock().unwrap() {
-            if *stop == at {
-                return Err(cause.clone());
-            }
+        if let Some((stop, cause)) = &*self.refusal.lock().unwrap()
+            && *stop == at
+        {
+            return Err(cause.clone());
         }
         let pointer = NonNull::new(unsafe { std::alloc::alloc(layout) })
             .ok_or(KernelFailure::ResourceExhausted)?;
@@ -127,7 +127,7 @@ fn prepare(
 ) -> Result<HostDiagnostic, KernelFailure> {
     let mut work = EvaluationCheckpoints::new(control);
     let result = HostDiagnostic::prepare(host, &mut work, |writer| {
-        write!(writer, "{}:{}", "original diagnostic ".repeat(97), "µ𝄞")
+        write!(writer, "{}:µ𝄞", "original diagnostic ".repeat(97))
     });
     if result.is_err() {
         return result;

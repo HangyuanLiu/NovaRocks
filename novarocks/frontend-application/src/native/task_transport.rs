@@ -3456,7 +3456,7 @@ mod tests {
                             outcome: encode_operation_outcome(outcome),
                             safe_detail: String::new(),
                             safe_field_path: None,
-                            ack: ack,
+                            ack,
                         },
                     )),
                 })

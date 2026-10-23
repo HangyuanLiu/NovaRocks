@@ -2993,6 +2993,92 @@ fn manifest_spec(
         .clone())
 }
 
+/// Check the complete declaration supplied by the frozen system source. Generic
+/// field attributes never establish a scalar or nested value domain.
+pub(crate) fn validate_system_column_value(
+    kind: IcebergSystemTableType,
+    field: &Field,
+    binding: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), PureProviderCompileError<ConnectorError>> {
+    if field.is_nullable() != binding.nullable() {
+        return Err(invalid("system root NULL declaration differs").into());
+    }
+    system_value(
+        field.data_type(),
+        binding.value_type(),
+        system_column_domain(kind, field.name()),
+        work,
+    )
+}
+fn system_value(
+    layout: &DataType,
+    value: &novarocks_type_contract::ValueTypeRef,
+    domain: ValueLogicalType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), PureProviderCompileError<ConnectorError>> {
+    use novarocks_type_contract::ValueKind;
+    work.step()?;
+    if domain != ValueLogicalType::Physical {
+        if matches!(value.kind(), ValueKind::Nominal(actual) if *actual == domain)
+            && *layout == DataType::Utf8
+        {
+            return Ok(());
+        }
+        return Err(invalid("system nominal declaration differs from its source author").into());
+    }
+    let child = |field: &Field,
+                 value: &novarocks_type_contract::ValueTypeRef,
+                 work: &mut CompileCheckpoints<'_>| {
+        if field.is_nullable() != value.nullable() {
+            return Err(invalid("system child NULL declaration differs").into());
+        }
+        system_value(field.data_type(), value, ValueLogicalType::Physical, work)
+    };
+    match (layout, value.kind()) {
+        (DataType::Utf8, ValueKind::String) | (DataType::Binary, ValueKind::Binary) => Ok(()),
+        (layout, ValueKind::Scalar(scalar)) => {
+            let same =
+                novarocks_type_contract::arrow_data_types_exact_observed::<SystemMirrorError>(
+                    layout,
+                    scalar,
+                    || work.step().map_err(SystemMirrorError::Control),
+                )
+                .map_err(|error| match error {
+                    SystemMirrorError::Control(cause) => PureProviderCompileError::Control(cause),
+                    SystemMirrorError::Source(cause) => PureProviderCompileError::Provider(cause),
+                })?;
+            if same {
+                Ok(())
+            } else {
+                Err(invalid("system scalar declaration differs").into())
+            }
+        }
+        (DataType::List(field), ValueKind::List(value)) => child(field, value, work),
+        (DataType::Struct(fields), ValueKind::Struct(values)) if fields.len() == values.len() => {
+            for (field, value) in fields.iter().zip(values) {
+                work.step()?;
+                if field.name() != value.name() {
+                    return Err(invalid("system named child declaration differs").into());
+                }
+                child(field, value.value_type(), work)?;
+            }
+            Ok(())
+        }
+        (DataType::Map(entries, false), ValueKind::Map { key, value }) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(invalid("system map entries is not a row").into());
+            };
+            if fields.len() != 2 || entries.is_nullable() {
+                return Err(invalid("system map entries declaration differs").into());
+            }
+            child(&fields[0], key, work)?;
+            child(&fields[1], value, work)
+        }
+        _ => Err(invalid("system complete value declaration differs from source").into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -5514,91 +5600,5 @@ mod tests {
             .block_on(stream.close())
             .expect("closing a drained stream");
         assert_eq!(task_operations.live_operations(), 0);
-    }
-}
-
-/// Check the complete declaration supplied by the frozen system source. Generic
-/// field attributes never establish a scalar or nested value domain.
-pub(crate) fn validate_system_column_value(
-    kind: IcebergSystemTableType,
-    field: &Field,
-    binding: &FunctionValueType,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<(), PureProviderCompileError<ConnectorError>> {
-    if field.is_nullable() != binding.nullable() {
-        return Err(invalid("system root NULL declaration differs").into());
-    }
-    system_value(
-        field.data_type(),
-        binding.value_type(),
-        system_column_domain(kind, field.name()),
-        work,
-    )
-}
-fn system_value(
-    layout: &DataType,
-    value: &novarocks_type_contract::ValueTypeRef,
-    domain: ValueLogicalType,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<(), PureProviderCompileError<ConnectorError>> {
-    use novarocks_type_contract::ValueKind;
-    work.step()?;
-    if domain != ValueLogicalType::Physical {
-        if matches!(value.kind(), ValueKind::Nominal(actual) if *actual == domain)
-            && *layout == DataType::Utf8
-        {
-            return Ok(());
-        }
-        return Err(invalid("system nominal declaration differs from its source author").into());
-    }
-    let child = |field: &Field,
-                 value: &novarocks_type_contract::ValueTypeRef,
-                 work: &mut CompileCheckpoints<'_>| {
-        if field.is_nullable() != value.nullable() {
-            return Err(invalid("system child NULL declaration differs").into());
-        }
-        system_value(field.data_type(), value, ValueLogicalType::Physical, work)
-    };
-    match (layout, value.kind()) {
-        (DataType::Utf8, ValueKind::String) | (DataType::Binary, ValueKind::Binary) => Ok(()),
-        (layout, ValueKind::Scalar(scalar)) => {
-            let same =
-                novarocks_type_contract::arrow_data_types_exact_observed::<SystemMirrorError>(
-                    layout,
-                    scalar,
-                    || work.step().map_err(SystemMirrorError::Control),
-                )
-                .map_err(|error| match error {
-                    SystemMirrorError::Control(cause) => PureProviderCompileError::Control(cause),
-                    SystemMirrorError::Source(cause) => PureProviderCompileError::Provider(cause),
-                })?;
-            if same {
-                Ok(())
-            } else {
-                Err(invalid("system scalar declaration differs").into())
-            }
-        }
-        (DataType::List(field), ValueKind::List(value)) => child(field, value, work),
-        (DataType::Struct(fields), ValueKind::Struct(values)) if fields.len() == values.len() => {
-            for (field, value) in fields.iter().zip(values) {
-                work.step()?;
-                if field.name() != value.name() {
-                    return Err(invalid("system named child declaration differs").into());
-                }
-                child(field, value.value_type(), work)?;
-            }
-            Ok(())
-        }
-        (DataType::Map(entries, false), ValueKind::Map { key, value }) => {
-            let DataType::Struct(fields) = entries.data_type() else {
-                return Err(invalid("system map entries is not a row").into());
-            };
-            if fields.len() != 2 || entries.is_nullable() {
-                return Err(invalid("system map entries declaration differs").into());
-            }
-            child(&fields[0], key, work)?;
-            child(&fields[1], value, work)
-        }
-        _ => Err(invalid("system complete value declaration differs from source").into()),
     }
 }

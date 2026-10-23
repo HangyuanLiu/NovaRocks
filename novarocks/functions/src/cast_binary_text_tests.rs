@@ -44,10 +44,10 @@ impl KernelEvaluationControl for Control {
             assert!(at <= *stop, "callback after refusal");
         }
         t.push(n);
-        if let Some((stop, cause)) = &self.refuse {
-            if at == *stop {
-                return Err(cause.clone());
-            }
+        if let Some((stop, cause)) = &self.refuse
+            && at == *stop
+        {
+            return Err(cause.clone());
         }
         Ok(())
     }

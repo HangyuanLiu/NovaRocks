@@ -475,12 +475,12 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
         schema: &Schema,
         id: i64,
     ) -> Result<(), ReaderStructureFailure<H>> {
-        fn find<'a>(field: &'a arrow_schema::Field, id: i64) -> Option<&'a DataType> {
+        fn find(field: &arrow_schema::Field, id: i64) -> Option<&DataType> {
             #[allow(deprecated)]
-            if field.dict_id() == Some(id) {
-                if let DataType::Dictionary(_, value) = field.data_type() {
-                    return Some(value);
-                }
+            if field.dict_id() == Some(id)
+                && let DataType::Dictionary(_, value) = field.data_type()
+            {
+                return Some(value);
             }
             match field.data_type() {
                 DataType::Struct(fields) => fields.iter().find_map(|field| find(field, id)),
@@ -611,10 +611,10 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
         // ArrayDataBuilder::validate_data calls validate_nulls once for its
         // own root. It does not recurse child validate_nulls: child data has
         // already passed its separate original decoder constructor.
-        if let DataType::FixedSizeList(field, _) = ty {
-            if !field.is_nullable() {
-                self.private_headers(1, ReaderArrayHeaderClass::Temporary)?;
-            }
+        if let DataType::FixedSizeList(field, _) = ty
+            && !field.is_nullable()
+        {
+            self.private_headers(1, ReaderArrayHeaderClass::Temporary)?;
         }
         Ok(())
     }
@@ -634,13 +634,7 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
             | DataType::LargeBinary
             | DataType::ListView(_)
             | DataType::LargeListView(_) => 2,
-            DataType::Union(_, mode) => {
-                if *mode == arrow_schema::UnionMode::Dense {
-                    2
-                } else {
-                    1
-                }
-            }
+            DataType::Union(_, mode) if *mode == arrow_schema::UnionMode::Dense => 2,
             _ => 1,
         };
         self.array::<arrow_data::BufferSpec>(count, ReaderArrayHeaderClass::Temporary)?;
@@ -962,14 +956,14 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
             value: &mut Option<&'a DataType>,
         ) -> Result<(), LayoutResourceError> {
             #[allow(deprecated)]
-            if field.dict_id() == Some(id) {
-                if let DataType::Dictionary(_, values) = field.data_type() {
-                    *count = count
-                        .checked_add(1)
-                        .ok_or(LayoutResourceError::Arithmetic)?;
-                    if value.is_none() {
-                        *value = Some(values.as_ref());
-                    }
+            if field.dict_id() == Some(id)
+                && let DataType::Dictionary(_, values) = field.data_type()
+            {
+                *count = count
+                    .checked_add(1)
+                    .ok_or(LayoutResourceError::Arithmetic)?;
+                if value.is_none() {
+                    *value = Some(values.as_ref());
                 }
             }
             match field.data_type() {
@@ -1039,10 +1033,10 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
     ) -> Result<(), ReaderStructureFailure<H>> {
         self.buffer_branches(batch, body, root_class)?;
         let counts = batch.variadicBufferCounts();
-        if let Some(counts) = counts {
-            if !counts.is_empty() {
-                self.array::<i64>(counts.len().max(4), ReaderArrayHeaderClass::Temporary)?;
-            }
+        if let Some(counts) = counts
+            && !counts.is_empty()
+        {
+            self.array::<i64>(counts.len().max(4), ReaderArrayHeaderClass::Temporary)?;
         }
         let mut variadic = counts.into_iter().flat_map(|counts| counts.iter());
         for field in schema.fields() {

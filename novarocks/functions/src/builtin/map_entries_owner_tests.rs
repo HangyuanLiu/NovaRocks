@@ -372,7 +372,7 @@ fn map_entries_owner_compile_success_and_original_admission_rejection_all_actual
         assert_eq!(
             prepared_for_test_with_control(
                 "map_entries",
-                &[ty.clone()],
+                std::slice::from_ref(&ty),
                 DecimalOverflowPolicy::OutputNull,
                 &good
             )
@@ -393,7 +393,7 @@ fn map_entries_owner_compile_success_and_original_admission_rejection_all_actual
                 };
                 let error = prepared_for_test_with_control(
                     "map_entries",
-                    &[ty.clone()],
+                    std::slice::from_ref(&ty),
                     DecimalOverflowPolicy::OutputNull,
                     &control,
                 )

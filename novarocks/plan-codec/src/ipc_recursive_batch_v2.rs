@@ -109,7 +109,7 @@ fn require(
     if condition {
         Ok(())
     } else {
-        Err(shape(message).into())
+        Err(shape(message))
     }
 }
 

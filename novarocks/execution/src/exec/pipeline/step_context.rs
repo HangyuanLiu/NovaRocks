@@ -182,6 +182,18 @@ impl<'a> StepContext<'a> {
     }
 }
 
+/// Test callers get a real turn and the complete native step result. Quota and
+/// cross-step custody tests retain their own explicit TurnWork instead.
+#[cfg(test)]
+pub(super) fn with_test_step<T>(
+    state: &crate::runtime::runtime_state::RuntimeState,
+    action: impl FnOnce(&mut StepContext<'_>) -> T,
+) -> T {
+    let control = state.error_state();
+    let mut turn = TurnWork::new(std::num::NonZeroU64::MIN, DEFAULT_TURN_WORK_UNITS);
+    action(&mut StepContext::new(&control, &mut turn))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,16 +240,4 @@ mod tests {
         assert!(!work.try_consume(1));
         assert_eq!(work.generation().get(), 9);
     }
-}
-
-/// Test callers get a real turn and the complete native step result. Quota and
-/// cross-step custody tests retain their own explicit TurnWork instead.
-#[cfg(test)]
-pub(super) fn with_test_step<T>(
-    state: &crate::runtime::runtime_state::RuntimeState,
-    action: impl FnOnce(&mut StepContext<'_>) -> T,
-) -> T {
-    let control = state.error_state();
-    let mut turn = TurnWork::new(std::num::NonZeroU64::MIN, DEFAULT_TURN_WORK_UNITS);
-    action(&mut StepContext::new(&control, &mut turn))
 }

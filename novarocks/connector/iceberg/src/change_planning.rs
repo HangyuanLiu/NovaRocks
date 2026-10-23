@@ -1022,7 +1022,13 @@ mod tests {
         assert_eq!(from.deletes.member_count(), 1);
         assert_eq!(pruned.deletes.member_count(), 0);
         assert!(matches!(
-            endpoint_admission(&metadata, &[from.clone()], &[pruned], &request_context()).unwrap(),
+            endpoint_admission(
+                &metadata,
+                std::slice::from_ref(&from),
+                &[pruned],
+                &request_context()
+            )
+            .unwrap(),
             ConnectorChangeWindowAdmission::MetadataOnly
         ));
         let changed = endpoint_file(&metadata, 20, 3, false);
@@ -1045,7 +1051,13 @@ mod tests {
             ConnectorChangeWindowAdmission::MetadataOnly
         ));
         assert!(matches!(
-            endpoint_admission(&metadata, &[], &[file.clone()], &request_context()).unwrap(),
+            endpoint_admission(
+                &metadata,
+                &[],
+                std::slice::from_ref(&file),
+                &request_context()
+            )
+            .unwrap(),
             ConnectorChangeWindowAdmission::Incremental {
                 has_inserts: true,
                 has_deletes: false,
@@ -1053,7 +1065,13 @@ mod tests {
             }
         ));
         assert!(matches!(
-            endpoint_admission(&metadata, &[file.clone()], &[], &request_context()).unwrap(),
+            endpoint_admission(
+                &metadata,
+                std::slice::from_ref(&file),
+                &[],
+                &request_context()
+            )
+            .unwrap(),
             ConnectorChangeWindowAdmission::Incremental {
                 has_inserts: false,
                 has_deletes: true,

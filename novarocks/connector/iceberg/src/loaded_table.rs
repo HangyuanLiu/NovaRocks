@@ -1439,25 +1439,23 @@ mod tests {
         }
     }
 
-    fn retryable_loopback_get(
+    async fn retryable_loopback_get(
         client: reqwest::Client,
         endpoint: String,
-    ) -> impl std::future::Future<Output = crate::iceberg::Result<()>> + Send {
-        async move {
-            let response = client.get(endpoint).send().await.map_err(|error| {
-                crate::iceberg::Error::new(
-                    crate::iceberg::ErrorKind::Unexpected,
-                    format!("loopback credential request failed: {error}"),
-                )
-            })?;
-            if response.status().is_server_error() {
-                return Err(crate::iceberg::Error::new(
-                    crate::iceberg::ErrorKind::Unexpected,
-                    "loopback credential request received retryable HTTP status",
-                ));
-            }
-            Ok(())
+    ) -> crate::iceberg::Result<()> {
+        let response = client.get(endpoint).send().await.map_err(|error| {
+            crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::Unexpected,
+                format!("loopback credential request failed: {error}"),
+            )
+        })?;
+        if response.status().is_server_error() {
+            return Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::Unexpected,
+                "loopback credential request received retryable HTTP status",
+            ));
         }
+        Ok(())
     }
 
     fn input(prefix: &str, expiration: u64, suffix: &str) -> RestCredentialInput {

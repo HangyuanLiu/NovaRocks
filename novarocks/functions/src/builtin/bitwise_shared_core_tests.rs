@@ -33,10 +33,10 @@ impl KernelEvaluationControl for Trace {
         let mut calls = self.calls.lock().unwrap();
         let index = calls.len();
         calls.push(units);
-        if let Some((at, failure)) = &self.refusal {
-            if index == *at {
-                return Err(failure.clone());
-            }
+        if let Some((at, failure)) = &self.refusal
+            && index == *at
+        {
+            return Err(failure.clone());
         }
         Ok(())
     }

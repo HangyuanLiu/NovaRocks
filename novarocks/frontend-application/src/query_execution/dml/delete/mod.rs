@@ -199,10 +199,7 @@ impl DeleteEngine for DmlExecutionKernel {
     ) -> Result<DeleteWriteReport, crate::dml::error::DmlExecutionError> {
         let prepared = downcast_prepared(prepared)?;
         let result = prepared.execution.run()?;
-        Ok(delete_write_report_from_result(
-            result,
-            prepared.execution.terminal_request_context(),
-        )?)
+        delete_write_report_from_result(result, prepared.execution.terminal_request_context())
     }
 
     fn commit_delete_terminal(

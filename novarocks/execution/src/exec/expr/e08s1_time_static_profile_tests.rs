@@ -163,10 +163,10 @@ impl PureCompileControl for Trace {
             assert!(i <= stop, "callback after first originating cause")
         }
         events.push((phase, units));
-        if let Some((stop, cause)) = self.refuse.clone() {
-            if i == stop {
-                return Err(cause);
-            }
+        if let Some((stop, cause)) = self.refuse.clone()
+            && i == stop
+        {
+            return Err(cause);
         }
         Ok(())
     }

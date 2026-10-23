@@ -144,7 +144,8 @@ mod required_value_source_properties {
         let column: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None]));
         let column_owner = Arc::downgrade(&column);
         let failure =
-            validate_writer_projection_requiredness(&schema, &[column.clone()]).unwrap_err();
+            validate_writer_projection_requiredness(&schema, std::slice::from_ref(&column))
+                .unwrap_err();
         assert_eq!(failure.failure_fact().class(), FailureClass::Data);
         assert_eq!(failure.failure_fact().reason().code(), 498);
         let crate::runtime::fragment::ExecutionFailureCause::Domain(source) = failure.cause()

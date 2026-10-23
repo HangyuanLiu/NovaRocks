@@ -196,7 +196,7 @@ pub(crate) fn extract_checked_packages(
         uses.insert(id, authored.expression_uses);
         calls.insert(id, authored.calls);
         pruning.insert(id, authored.pruning);
-        admissions.insert(id, admission.clone());
+        admissions.insert(id, *admission);
     }
     extract_fragment_packages(
         plan,

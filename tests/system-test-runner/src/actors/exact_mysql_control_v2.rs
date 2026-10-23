@@ -105,10 +105,9 @@ pub fn encode_request(
         cut_bytes,
         ..
     } = command
+        && (connection_id == 0 || cut_bytes == 0 || cut_bytes > MAX_CUT_BYTES)
     {
-        if connection_id == 0 || cut_bytes == 0 || cut_bytes > MAX_CUT_BYTES {
-            return Err(DecodeError::Fields);
-        }
+        return Err(DecodeError::Fields);
     }
     let mut at = HEADER_BYTES;
     out[at..at + 2].copy_from_slice(&[VERSION, command.opcode() as u8]);
@@ -428,10 +427,10 @@ impl Reader<'_> {
                 output_rows: r.u64()?,
             })
         })?;
-        if let Some(end) = end_after_data {
-            if native_sequence.checked_add(1) != Some(end.sequence) {
-                return Err(DecodeError::Fields);
-            }
+        if let Some(end) = end_after_data
+            && native_sequence.checked_add(1) != Some(end.sequence)
+        {
+            return Err(DecodeError::Fields);
         }
         Ok(RootDataFacts {
             root,

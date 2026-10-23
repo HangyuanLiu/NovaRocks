@@ -121,7 +121,7 @@ impl Drop for TrackedArcCharge {
 }
 fn metadata_request<T>(tracker: &Arc<MemTracker>) -> Result<TrackedArcCharge, ConstructionFailure> {
     let layout = novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<T>())
-        .map_err(|error| ConstructionFailure::from(error))?;
+        .map_err(ConstructionFailure::from)?;
     let bytes = i64::try_from(layout.size()).map_err(|_| {
         ConstructionFailure::Control(
             novarocks_type_contract::CompileControlError::ResourceExhausted,

@@ -142,10 +142,8 @@ fn observe_original_custody(case: CustodyCase) {
 
     // In the queued case this is the actual spawn_blocking AbortHandle.
     // It is a cancellation request, never an original join observation.
-    if queued {
-        if let Some(handle) = &original_abort {
-            handle.abort();
-        }
+    if queued && let Some(handle) = &original_abort {
+        handle.abort();
     }
     drop(original_abort);
     drop(slot);

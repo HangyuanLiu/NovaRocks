@@ -675,14 +675,14 @@ mod tests {
                 requests.push(request.to_rest_json().unwrap());
                 requests.len()
             };
-            if let Dispatch::ConflictThen(metadata) = &self.dispatch {
-                if call == 1 {
-                    *self.metadata.lock().unwrap() = metadata.clone();
-                    return CatalogOutcome::uncommitted(
-                        ConnectorMutationFailureKind::Conflict,
-                        "Injected concurrent catalog commit",
-                    );
-                }
+            if let Dispatch::ConflictThen(metadata) = &self.dispatch
+                && call == 1
+            {
+                *self.metadata.lock().unwrap() = metadata.clone();
+                return CatalogOutcome::uncommitted(
+                    ConnectorMutationFailureKind::Conflict,
+                    "Injected concurrent catalog commit",
+                );
             }
             match self.dispatch {
                 Dispatch::Unknown => {

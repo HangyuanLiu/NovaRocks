@@ -553,7 +553,7 @@ impl StorageAuthority {
         executor: Arc<dyn RefreshExecutor>,
         policy: RefreshPolicy,
     ) -> Self {
-        let authority = Self {
+        Self {
             shared: Arc::new(AuthorityShared {
                 id,
                 source,
@@ -571,8 +571,7 @@ impl StorageAuthority {
                 counters: AuthorityCounters::default(),
             }),
             executor,
-        };
-        authority
+        }
     }
 
     pub fn id(&self) -> &StorageAuthorityId {

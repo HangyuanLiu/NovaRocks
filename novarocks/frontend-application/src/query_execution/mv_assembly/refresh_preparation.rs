@@ -849,10 +849,7 @@ fn prepare_frontend_first_refresh_write(
         &connector_context,
     )?;
     let mut admitted_publication = crate::mv::domain::staged_create::admit_mv_publication(
-        source
-            .management_entrance()
-            .map_err(|error| error)?
-            .as_ref(),
+        source.management_entrance()?.as_ref(),
         &planning_lease,
         &projection,
         attempt.publication_id,

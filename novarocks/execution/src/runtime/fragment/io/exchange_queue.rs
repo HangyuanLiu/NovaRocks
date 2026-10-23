@@ -466,7 +466,7 @@ impl ExchangeSendQueue {
             && test_observer
                 .as_ref()
                 .is_some_and(|observer| observer.is_active()))
-        .then(|| {
+        .then_some({
             (
                 task.frame.sender_fragment_instance_id,
                 task.frame.sender_ordinal,

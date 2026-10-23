@@ -1261,7 +1261,7 @@ fn partial_body_deadline(
     tokio::runtime::Runtime::new()?.block_on(async move {
         let stream = connector.connect().await.map_err(anyhow::Error::msg)?;
         let (mut sender, connection) = client::handshake(stream).await?;
-        let driver = tokio::spawn(async move { connection.await });
+        let driver = tokio::spawn(connection);
         let request = Request::builder()
             .method("POST")
             .uri(ORDINARY_PATH)
@@ -2001,7 +2001,7 @@ fn header_rejection(
     tokio::runtime::Runtime::new()?.block_on(async move {
         let stream = connector.connect().await.map_err(anyhow::Error::msg)?;
         let (mut sender, connection) = client::handshake(stream).await?;
-        let driver = tokio::spawn(async move { connection.await });
+        let driver = tokio::spawn(connection);
         let request = Request::builder()
             .method("POST")
             .uri(path)
@@ -2031,7 +2031,7 @@ fn streamed_control_over_limit(
     tokio::runtime::Runtime::new()?.block_on(async move {
         let stream = connector.connect().await.map_err(anyhow::Error::msg)?;
         let (mut sender, connection) = client::handshake(stream).await?;
-        let driver = tokio::spawn(async move { connection.await });
+        let driver = tokio::spawn(connection);
         let request = Request::builder()
             .method("POST")
             .uri(CONTROL_PATH)

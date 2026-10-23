@@ -284,10 +284,10 @@ impl MysqlSession {
                 );
             }
 
-            if let Some(db) = db_override {
-                if let Some(guard) = &mut self.namespace_guard {
-                    guard.set_database(db);
-                }
+            if let Some(db) = db_override
+                && let Some(guard) = &mut self.namespace_guard
+            {
+                guard.set_database(db);
             }
             if let Err(exc) = self
                 .conn
@@ -338,14 +338,14 @@ impl MysqlSession {
                         ),
                     );
                 }
-                if let Some(guard) = &self.namespace_guard {
-                    if let Err(error) = guard.before(statement) {
-                        failed = Some((
-                            statement_index,
-                            format!("fixture namespace write guard: {error:#}"),
-                        ));
-                        break;
-                    }
+                if let Some(guard) = &self.namespace_guard
+                    && let Err(error) = guard.before(statement)
+                {
+                    failed = Some((
+                        statement_index,
+                        format!("fixture namespace write guard: {error:#}"),
+                    ));
+                    break;
                 }
                 match self.conn.query_iter(statement) {
                     Ok(mut query_result) => {
@@ -407,15 +407,14 @@ impl MysqlSession {
                     }
                 }
 
-                if failed.is_none() {
-                    if let Some(guard) = &mut self.namespace_guard {
-                        if let Err(error) = guard.after(statement) {
-                            failed = Some((
-                                statement_index,
-                                format!("fixture namespace placement: {error:#}"),
-                            ));
-                        }
-                    }
+                if failed.is_none()
+                    && let Some(guard) = &mut self.namespace_guard
+                    && let Err(error) = guard.after(statement)
+                {
+                    failed = Some((
+                        statement_index,
+                        format!("fixture namespace placement: {error:#}"),
+                    ));
                 }
                 if failed.is_some() {
                     break;

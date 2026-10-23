@@ -1817,7 +1817,7 @@ fn exchange_probe(
             be_number: 0,
             eos,
             sequence: 0,
-            payload: Vec::new().into(),
+            payload: Vec::new(),
             source_finst_id_hi: 0x5c,
             source_finst_id_lo: create.kernel_key_low,
             sender_ordinal: 0,
@@ -2299,7 +2299,7 @@ fn observe_terminal_stop_and_fence_with_failure(
         tokio::time::timeout(budget, async move {
             let stream = connector.connect().await.map_err(anyhow::Error::msg)?;
             let (mut sender, connection) = h2::client::handshake(stream).await?;
-            let driver = tokio::spawn(async move { connection.await });
+            let driver = tokio::spawn(connection);
             let result = async {
                 let request_headers = http::Request::builder().method("POST")
                     .uri("/novarocks.NovaRocksGrpc/SubscribeTaskStatus")

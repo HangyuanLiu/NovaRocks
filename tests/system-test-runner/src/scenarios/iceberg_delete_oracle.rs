@@ -883,7 +883,7 @@ fn validate_java_metrics(java: &Value, file: &DataFile, schema: &Schema) -> Resu
 
 fn decode_base64(text: &str) -> Result<Vec<u8>> {
     let bytes = text.as_bytes();
-    ensure!(bytes.len() % 4 == 0, "invalid base64 length");
+    ensure!(bytes.len().is_multiple_of(4), "invalid base64 length");
     let mut result = Vec::with_capacity(bytes.len() / 4 * 3);
     let digit = |byte: u8| -> Result<u32> {
         Ok(match byte {
@@ -1049,10 +1049,10 @@ fn metrics(file: &DataFile, id: i32, value_type: &PrimitiveType) -> Option<Metri
         if null.is_some_and(|n| n > count) || nan.is_some_and(|n| n > count) {
             return None;
         }
-        if let (Some(null), Some(nan)) = (null, nan) {
-            if null.checked_add(nan)? > count {
-                return None;
-            }
+        if let (Some(null), Some(nan)) = (null, nan)
+            && null.checked_add(nan)? > count
+        {
+            return None;
         }
     }
     let all_null = matches!((count,null),(Some(c),Some(n)) if c==n);
@@ -1345,10 +1345,20 @@ mod tests {
 
     #[test]
     fn independent_witness_requires_nan_evidence_and_promotes_numeric_values() {
-        let left = bounded(Datum::float(-1.5), Datum::float(-0.25), Some(0), None);
+        let left = bounded(
+            Datum::float(-1.5_f32),
+            Datum::float(-0.25_f32),
+            Some(0),
+            None,
+        );
         let right = bounded(Datum::double(0.25), Datum::double(1.5), Some(0), None);
         assert!(field_disjoint(&left, &right, 1, &PrimitiveType::Double).is_none());
-        let left = bounded(Datum::float(-1.5), Datum::float(-0.25), Some(0), Some(0));
+        let left = bounded(
+            Datum::float(-1.5_f32),
+            Datum::float(-0.25_f32),
+            Some(0),
+            Some(0),
+        );
         assert!(field_disjoint(&left, &right, 1, &PrimitiveType::Double).is_some());
     }
 }

@@ -456,7 +456,9 @@ pub(crate) fn checked_record_source_header(
 ) -> Result<(), Error> {
     work.step().map_err(Error::from)?;
     if record.compression != wire::IpcCompression::Uncompressed as i32 {
-        return Err(Error::InvalidShape("constant IPC compression is not supported").into());
+        return Err(Error::InvalidShape(
+            "constant IPC compression is not supported",
+        ));
     }
     super::required(
         record.value_type_id,
@@ -469,9 +471,9 @@ pub(crate) fn checked_record_source_header(
         work,
     )?;
     if original_source_bytes < record.arrow_ipc.capacity() {
-        return Err(
-            Error::InvalidShape("constant source invoice is below original IPC backing").into(),
-        );
+        return Err(Error::InvalidShape(
+            "constant source invoice is below original IPC backing",
+        ));
     }
     Ok(())
 }

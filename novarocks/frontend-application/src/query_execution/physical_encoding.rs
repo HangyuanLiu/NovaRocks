@@ -344,7 +344,7 @@ fn completed_plan_submission_fragments(
     for edge in plan.edges().values() {
         match edge.kind {
             EdgeKind::Stream => {
-                stream_edge_sources.insert(u32::from(edge.source.fragment.get()));
+                stream_edge_sources.insert(edge.source.fragment.get());
             }
             EdgeKind::CteMulticast => {}
             EdgeKind::ChangeStreamRouter => {}
@@ -367,7 +367,7 @@ fn completed_plan_submission_fragments(
             }
         };
         fragments.push(SubmissionFragmentFacts::for_completed_plan(
-            u32::from(fragment.id().get()),
+            fragment.id().get(),
             role,
             completed_fragment_output_columns(public_result, fragment.id()),
         ));
@@ -429,13 +429,13 @@ pub(crate) fn completed_plan_topology(
     let mut in_degree = plan
         .fragments()
         .keys()
-        .map(|id| (u32::from(id.get()), 0_usize))
+        .map(|id| (id.get(), 0_usize))
         .collect::<BTreeMap<_, _>>();
     let mut consumers_of = BTreeMap::<u32, Vec<u32>>::new();
     let mut producers = BTreeSet::new();
     for edge in plan.edges().values() {
-        let source = u32::from(edge.source.fragment.get());
-        let destination = u32::from(edge.destination.fragment.get());
+        let source = edge.source.fragment.get();
+        let destination = edge.destination.fragment.get();
         *in_degree.entry(destination).or_insert(0) += 1;
         consumers_of.entry(source).or_default().push(destination);
         producers.insert(source);
@@ -483,9 +483,7 @@ pub(crate) fn completed_plan_topology(
     Ok(CompletedPlanTopology {
         order,
         producers: producers.into_iter().collect(),
-        result: plan
-            .result_port()
-            .map(|result| u32::from(result.fragment.get())),
+        result: plan.result_port().map(|result| result.fragment.get()),
         anchor,
     })
 }
@@ -521,18 +519,15 @@ fn completed_plan_scheduling_facts(
                 runtime_splits: Some(encoding.placement),
             });
         }
-        fragments.insert(
-            u32::from(fragment.id().get()),
-            SchedulingFragmentFacts { scans },
-        );
+        fragments.insert(fragment.id().get(), SchedulingFragmentFacts { scans });
     }
     let edges = plan
         .edges()
         .values()
         .map(|edge| {
             Ok(SchedulingEdgeFacts {
-                source: u32::from(edge.source.fragment.get()),
-                target: u32::from(edge.destination.fragment.get()),
+                source: edge.source.fragment.get(),
+                target: edge.destination.fragment.get(),
                 target_exchange_node_id: wire_node_id(edge.destination.node)?,
                 native_hash_partitioned: matches!(
                     edge.partitioning.destination,
@@ -617,7 +612,7 @@ fn completed_plan_scan_facts(
                 )
             })?;
             let node_id = wire_node_id(node.id)?;
-            let fragment_id = u32::from(fragment.id().get());
+            let fragment_id = fragment.id().get();
             let dynamic_filters = runtime_filters
                 .get(&(fragment.id(), node.id))
                 .map_or(&[][..], Vec::as_slice)
@@ -653,8 +648,8 @@ fn completed_plan_edge_facts(plan: &PhysicalPlan) -> Result<Vec<AttemptEdgeFacts
         .values()
         .map(|edge| {
             Ok(AttemptEdgeFacts {
-                source_fragment_id: u32::from(edge.source.fragment.get()),
-                target_fragment_id: u32::from(edge.destination.fragment.get()),
+                source_fragment_id: edge.source.fragment.get(),
+                target_fragment_id: edge.destination.fragment.get(),
                 target_exchange_node_id: wire_node_id(edge.destination.node)?,
                 partition_kind: completed_edge_partition_kind(&edge.partitioning.destination),
             })

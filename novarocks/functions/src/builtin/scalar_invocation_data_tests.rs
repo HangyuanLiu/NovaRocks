@@ -69,10 +69,10 @@ impl AggregateStateAllocator for Host {
         let mut l = self.ledger.lock().unwrap();
         let at = l.attempts;
         l.attempts += 1;
-        if let Some((stop, cause)) = &*self.refusal.lock().unwrap() {
-            if at == *stop {
-                return Err(cause.clone());
-            }
+        if let Some((stop, cause)) = &*self.refusal.lock().unwrap()
+            && at == *stop
+        {
+            return Err(cause.clone());
         }
         if l.opaque + l.blocks.iter().map(|(_, v)| v.size()).sum::<usize>() + layout.size()
             > self.actual_limit

@@ -3450,23 +3450,19 @@ crate::constant::test_constant_policy(),
                     *crosses += 1;
                 }
             }
-            if let LogicalPlanKind::Scan(scan) = &plan.kind {
-                if let ScanSource::Sql(source) = &scan.table.source {
-                    match source.kind {
-                        SqlScanKind::Delta {
-                            from_snapshot_id,
-                            to_snapshot_id,
-                        } => delta.push((
-                            source.table.table.clone(),
-                            from_snapshot_id,
-                            to_snapshot_id,
-                        )),
-                        SqlScanKind::FrozenInputSet {
-                            version: SqlTableVersionSelector::Snapshot(id),
-                            ..
-                        } => versions.push((source.table.table.clone(), id)),
-                        _ => {}
-                    }
+            if let LogicalPlanKind::Scan(scan) = &plan.kind
+                && let ScanSource::Sql(source) = &scan.table.source
+            {
+                match source.kind {
+                    SqlScanKind::Delta {
+                        from_snapshot_id,
+                        to_snapshot_id,
+                    } => delta.push((source.table.table.clone(), from_snapshot_id, to_snapshot_id)),
+                    SqlScanKind::FrozenInputSet {
+                        version: SqlTableVersionSelector::Snapshot(id),
+                        ..
+                    } => versions.push((source.table.table.clone(), id)),
+                    _ => {}
                 }
             }
             for child in &plan.children {

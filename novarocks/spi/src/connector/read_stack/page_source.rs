@@ -240,7 +240,7 @@ impl PageSourceFileMetrics {
 /// provider. It is separate from the provider's generation-scoped resources:
 /// two queries using the same installed connector generation may choose
 /// different physical reader behavior.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub struct ConnectorPageSourceProviderOptions {
     pub enable_parquet_reader_page_index: bool,
     /// Frozen query policy for external file reads. The connector maps these
@@ -274,15 +274,6 @@ impl Default for ConnectorDataCacheOptions {
             datacache_priority: 0,
             datacache_ttl_seconds: 0,
             datacache_sharing_work_period: None,
-        }
-    }
-}
-
-impl Default for ConnectorPageSourceProviderOptions {
-    fn default() -> Self {
-        Self {
-            enable_parquet_reader_page_index: false,
-            data_cache: ConnectorDataCacheOptions::default(),
         }
     }
 }

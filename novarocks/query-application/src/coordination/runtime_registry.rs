@@ -2148,7 +2148,7 @@ mod tests {
         // Poll the real Registry shutdown to actual healthy retirement. The
         // one-second test cap is not a receipt; only removal after join is.
         let healthy_retired = std::future::poll_fn(|cx| {
-            if let Poll::Ready(_) = shutdown.as_mut().poll(cx) {
+            if shutdown.as_mut().poll(cx).is_ready() {
                 return Poll::Ready(false);
             }
             if !handle.lock().entries.contains_key(&healthy.query_id()) {

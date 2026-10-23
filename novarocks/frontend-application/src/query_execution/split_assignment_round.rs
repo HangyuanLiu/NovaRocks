@@ -1749,7 +1749,7 @@ mod tests {
         )
         .unwrap();
         guard.request_stop();
-        let stopped_wake = wake.count();
+        let _stopped_wake = wake.count();
         if terminal_cleanup {
             round.begin_terminal_cleanup();
         } else {

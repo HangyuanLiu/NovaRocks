@@ -634,10 +634,10 @@ impl StatementNativeResidualRegistry {
                 _panic: None,
                 _cause: Some(cause),
             });
-        } else if let Some(first) = state.health.as_mut() {
-            if first._cause.is_none() {
-                first._cause = Some(cause);
-            }
+        } else if let Some(first) = state.health.as_mut()
+            && first._cause.is_none()
+        {
+            first._cause = Some(cause);
         }
         drop(state);
         self.0.changed.notify_one();

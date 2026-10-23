@@ -464,7 +464,7 @@ fn fold_and_real_lowering_share_operational_selection_and_prepared_effects() {
         let call = freeze_fold_call(
             owner.function_catalog().as_ref(),
             &binding,
-            &mut args,
+            &args,
             policy(),
             true,
             &Control::default(),

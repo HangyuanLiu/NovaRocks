@@ -129,7 +129,7 @@ fn check_array_source(
 ) {
     {
         let sql = format!("SELECT [10,20][{index_expression}] AS picked FROM t");
-        let source = sql_source_with_declared_fields(&sql, &[field.clone()]);
+        let source = sql_source_with_declared_fields(&sql, std::slice::from_ref(&field));
         let declaration = source
             .checked_original_result_declaration_observed(&Control)
             .unwrap()
@@ -259,7 +259,7 @@ fn check_array_source(
                 .expressions()
                 .resolved_calls()
                 .snapshot();
-            for (site, _) in snapshot.bindings() {
+            for site in snapshot.bindings().keys() {
                 let ProgramExpressionRootSite::Node {
                     node,
                     role: ProgramNodeExpressionRole::ProjectOutput { .. },

@@ -519,9 +519,11 @@ mod tests {
         let mysql = mysql
             .map(|port| format!("\n[standalone_server]\nmysql_port = {port}\n"))
             .unwrap_or_default();
-        let frontend_endpoint = (role == "be")
-            .then_some("frontend_endpoint = \"127.0.0.1:19080\"\n")
-            .unwrap_or_default();
+        let frontend_endpoint = if role == "be" {
+            "frontend_endpoint = \"127.0.0.1:19080\"\n"
+        } else {
+            Default::default()
+        };
         let control_port = if role == "be" {
             "control_grpc_port = 19082\n"
         } else {

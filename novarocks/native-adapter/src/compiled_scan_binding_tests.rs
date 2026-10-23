@@ -362,7 +362,8 @@ fn layout() -> StaticLayout {
         Field::new("v0", DataType::Int64, false),
         Field::new("v1", DataType::Int64, false),
     ]));
-    let layout = StaticLayout::try_new_typed_for_compile(
+
+    StaticLayout::try_new_typed_for_compile(
         schema,
         Arc::from([SlotId::new(1), SlotId::new(2)]),
         vec![
@@ -377,8 +378,7 @@ fn layout() -> StaticLayout {
         },
         &Unbounded,
     )
-    .unwrap();
-    layout
+    .unwrap()
 }
 
 fn bind(

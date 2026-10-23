@@ -458,9 +458,9 @@ mod tests {
     use super::*;
 
     // Compile the actual dyn/lifetime contract before any production grant.
-    fn borrow_scope<'loan>(
-        scope: &'loan mut impl RuntimeScalarOperationScope,
-    ) -> &'loan mut dyn RuntimeScalarOperationScope {
+    fn borrow_scope(
+        scope: &mut impl RuntimeScalarOperationScope,
+    ) -> &mut dyn RuntimeScalarOperationScope {
         scope
     }
     struct Refuse;

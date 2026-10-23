@@ -552,8 +552,7 @@ impl ExactResultReader {
             );
             // Header+body are constructed only in a fixed stack buffer below.
             ensure!(
-                user.len() <= SMALL
-                    && user.len() + 32 + 2 + b"mysql_native_password".len() + 1 <= SMALL,
+                user.len() <= SMALL && user.len() + 32 + 2 + b"mysql_native_password".len() < SMALL,
                 "original auth user exceeds fixed preallocation bound"
             );
             let socket = TcpSocket::new_v4()?;

@@ -72,7 +72,7 @@ impl NEmissionAccess for NProfileState {
     ) -> Result<(), KernelFailure> {
         match self {
             Self::LargeInt(state) => state.with_core(operation),
-            Self::Physical(_) => Err(mismatch().into()),
+            Self::Physical(_) => Err(mismatch()),
         }
     }
 }
@@ -214,7 +214,7 @@ impl PreparedAggregateKernel for NKernel {
             (Self::LargeInt(k), NProfileState::LargeInt(state), NUpdate::LargeInt(p)) => {
                 k.update_row(state, p, ordinal, control)
             }
-            _ => Err(mismatch().into()),
+            _ => Err(mismatch()),
         }
     }
     fn update_row_evaluation<'a>(
@@ -280,7 +280,7 @@ impl PreparedAggregateKernel for NKernel {
             (Self::LargeInt(k), NProfileState::LargeInt(state), NMerge::LargeInt(p)) => {
                 k.merge_row(state, p, ordinal, control)
             }
-            _ => Err(mismatch().into()),
+            _ => Err(mismatch()),
         }
     }
     fn merge_row_evaluation<'a>(

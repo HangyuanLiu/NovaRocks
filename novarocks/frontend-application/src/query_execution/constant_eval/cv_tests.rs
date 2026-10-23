@@ -1122,7 +1122,7 @@ fn ordinary_row_error_and_invalid_arithmetic_observe_exact_original_completion()
     });
     let mut request = binary(BinOp::Div, vec![i32(1), i32(0)], DataType::Float64);
     request.result_type = request.result_type.with_nullable(false).unwrap();
-    assert_all_callbacks(&request, |result| assert_invalid_arithmetic(result));
+    assert_all_callbacks(&request, assert_invalid_arithmetic);
 }
 #[test]
 fn source_annotations_do_not_mint_a_type_resource_refusal() {

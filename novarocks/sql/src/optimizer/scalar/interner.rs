@@ -516,15 +516,15 @@ fn intern_inner(
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
     let node = ScalarArena::normalize(node);
     let result = (|| -> Result<(u64, Option<ScalarId>), InternerError> {
-        if let ScalarNode::Constant(value) = &node {
-            if !value_type.exactly_equals_observed(value.value_type(), || {
+        if let ScalarNode::Constant(value) = &node
+            && !value_type.exactly_equals_observed(value.value_type(), || {
                 work.step().map_err(InternerError::from)
-            })? {
-                return Err(ConstantError::Invalid(
-                    "interner constant source differs from its frozen value type",
-                )
-                .into());
-            }
+            })?
+        {
+            return Err(ConstantError::Invalid(
+                "interner constant source differs from its frozen value type",
+            )
+            .into());
         }
         let fields = node_fields(&node, &mut work)?;
         let actual = fingerprint(&fields, &value_type, &mut work)?;

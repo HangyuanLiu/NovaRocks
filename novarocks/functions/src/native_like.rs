@@ -297,7 +297,7 @@ impl PreparedNativeLikeRecipe {
                     arg.validate_shape_observed::<KernelFailure>(selection, || work.step())?;
                 }
             }
-            if selection.len() == 0 {
+            if selection.is_empty() {
                 crate::kernel_input::validate_argument_observed(
                     text, selection, &self.text, &observed,
                 )?;

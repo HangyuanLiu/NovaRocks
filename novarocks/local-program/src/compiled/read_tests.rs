@@ -381,7 +381,7 @@ fn finish_with(
         CompiledProgramFacts {
             writes: BTreeMap::new(),
             exchange_inputs: BTreeMap::new(),
-            scan_inputs: scan_inputs,
+            scan_inputs,
             aggregates: BTreeMap::new(),
         },
         control,

@@ -137,7 +137,7 @@ impl<H> ProgramCreation<'_, H> {
         values: Vec<T>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Box<[T]>, ProgramCreationFailure<C, H>> {
-        if values.capacity() != values.len() && values.len() != 0 {
+        if values.capacity() != values.len() && !values.is_empty() {
             self.request(
                 Layout::array::<T>(values.len()).map_err(|_| LayoutResourceError::Arithmetic)?,
                 work,

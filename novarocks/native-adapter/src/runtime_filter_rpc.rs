@@ -508,7 +508,7 @@ fn validate_native_route(
     };
     valid
         .then_some(())
-        .ok_or_else(|| NativeFilterEnvelopeError::Route(kind))
+        .ok_or(NativeFilterEnvelopeError::Route(kind))
 }
 
 fn validate_native_presence(

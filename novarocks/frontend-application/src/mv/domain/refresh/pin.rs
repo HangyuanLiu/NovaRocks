@@ -599,7 +599,7 @@ mod tests {
         validate_refresh_pin_table_object_ids(&projection, &pin, &[base.clone(), base.clone()])
             .expect("both exact occurrences remain present");
         assert!(
-            validate_refresh_pin_table_object_ids(&projection, &pin, &[base.clone()])
+            validate_refresh_pin_table_object_ids(&projection, &pin, std::slice::from_ref(&base))
                 .unwrap_err()
                 .contains("every D relation occurrence")
         );

@@ -45,10 +45,10 @@ impl KernelEvaluationControl for Control {
             assert!(at <= *stop, "callback after original refusal");
         }
         calls.push(n);
-        if let Some((stop, cause)) = &self.refusal {
-            if at == *stop {
-                return Err(cause.clone());
-            }
+        if let Some((stop, cause)) = &self.refusal
+            && at == *stop
+        {
+            return Err(cause.clone());
         }
         Ok(())
     }
@@ -138,7 +138,8 @@ fn float_decimal128_complete_metadata_effect_nullable_and_policy() {
             .is_err()
         );
     }
-    for source in [DataType::Float16] {
+    {
+        let source = DataType::Float16;
         assert_eq!(
             PreparedCastRecipe::try_new(
                 CastOperation::Carrier,
@@ -373,10 +374,10 @@ fn float_decimal128_compile_callbacks_preserve_three_causes_no_tail() {
                 assert!(at <= stop, "callback after primary compile refusal");
             }
             calls.push((phase, items));
-            if let Some((stop, cause)) = self.refusal.clone() {
-                if at == stop {
-                    return Err(cause);
-                }
+            if let Some((stop, cause)) = self.refusal.clone()
+                && at == stop
+            {
+                return Err(cause);
             }
             Ok(())
         }

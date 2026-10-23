@@ -540,14 +540,14 @@ impl StatementObservationOwner {
                 .get(&nomination.statement_run_token)
                 .and_then(|run| run.statement)
         };
-        if let Some(token) = token {
-            if let Some(handle) = self.bound_statement(token) {
-                if handle.nomination().as_ref() != Some(nomination) {
-                    return Err("distributed attempt differs from its nominated statement".into());
-                }
-                handle.bind_attempt(execution);
-                return Ok(handle.nomination_for_exact_execution(execution));
+        if let Some(token) = token
+            && let Some(handle) = self.bound_statement(token)
+        {
+            if handle.nomination().as_ref() != Some(nomination) {
+                return Err("distributed attempt differs from its nominated statement".into());
             }
+            handle.bind_attempt(execution);
+            return Ok(handle.nomination_for_exact_execution(execution));
         }
         Ok(None)
     }
@@ -564,10 +564,10 @@ impl StatementObservationOwner {
         Some(handle)
     }
     pub(crate) fn publish(&self, snapshot: &QueryLifecycleConvergenceSnapshot) {
-        if let Ok(mut state) = self.state.lock() {
-            if self.active(&mut state) {
-                state.publish(snapshot);
-            }
+        if let Ok(mut state) = self.state.lock()
+            && self.active(&mut state)
+        {
+            state.publish(snapshot);
         }
     }
     pub(crate) fn close_observation(&self) {
@@ -642,10 +642,10 @@ impl StatementObservationHandle {
         let Some(owner) = self.owner.as_ref().and_then(Weak::upgrade) else {
             return;
         };
-        if let Ok(mut state) = owner.state.lock() {
-            if owner.active(&mut state) {
-                state.bind_attempt(self, execution);
-            }
+        if let Ok(mut state) = owner.state.lock()
+            && owner.active(&mut state)
+        {
+            state.bind_attempt(self, execution);
         }
     }
 }

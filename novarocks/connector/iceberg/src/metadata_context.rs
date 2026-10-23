@@ -848,15 +848,14 @@ impl IcebergMetadataContext {
         credential_lease_collection: Option<&ConnectorVendedCredentialLeaseCollectionPort>,
         request_context: Option<&ConnectorRequestContext>,
     ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
-        if credential_lease_collection.is_none() {
-            if let Some(table) = self
+        if credential_lease_collection.is_none()
+            && let Some(table) = self
                 .control_state
                 .physical_table_cache()
                 .get(&namespace, &table)
                 .map_err(unavailable)?
-            {
-                return Ok(table);
-            }
+        {
+            return Ok(table);
         }
         self.observe_table_classified(
             namespace,

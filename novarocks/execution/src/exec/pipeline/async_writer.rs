@@ -1225,7 +1225,7 @@ async fn supervise_actor<O: Send + 'static>(mut frame: WriterActorFrame<O>) {
     }
     shared.clear_queue_usage();
     shared.phase(WriterPhase::Publish);
-    match outcome.map(std::mem::ManuallyDrop::into_inner).flatten() {
+    match outcome.and_then(std::mem::ManuallyDrop::into_inner) {
         Some(output) => shared.publish_terminal_success(output),
         None => {
             shared.ensure_terminal_outcome(&signal);

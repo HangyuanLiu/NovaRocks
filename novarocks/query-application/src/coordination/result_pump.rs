@@ -1841,7 +1841,7 @@ mod tests {
         for foreign_scope in [false, true] {
             let (
                 Harness {
-                    control,
+                    control: _,
                     scope,
                     actor,
                     owner,

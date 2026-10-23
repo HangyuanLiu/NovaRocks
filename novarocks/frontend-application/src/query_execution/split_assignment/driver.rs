@@ -688,21 +688,17 @@ impl SplitAssignmentDriver {
             // Sequences are allocated once and the resulting immutable request
             // stays alive until a strict acknowledgement confirms it. A retry
             // never enumerates splits or allocates a replacement sequence.
-            let assignment = self
-                .sequences
-                .entry(target.clone())
-                .or_insert_with(PlanNodeAssignmentState::new)
-                .assign(
-                    delivery.scan.plan_node_id(),
-                    splits,
-                    delivery.no_more_splits,
-                    self.encoders.get(&delivery.scan).cloned().ok_or_else(|| {
-                        SplitAssignmentDriverError::SplitSource {
-                            scan: Some(delivery.scan),
-                            detail: "missing exact connector read encoder".to_owned(),
-                        }
-                    })?,
-                )?;
+            let assignment = self.sequences.entry(target.clone()).or_default().assign(
+                delivery.scan.plan_node_id(),
+                splits,
+                delivery.no_more_splits,
+                self.encoders.get(&delivery.scan).cloned().ok_or_else(|| {
+                    SplitAssignmentDriverError::SplitSource {
+                        scan: Some(delivery.scan),
+                        detail: "missing exact connector read encoder".to_owned(),
+                    }
+                })?,
+            )?;
             let request = super::super::connector_domain::TaskUpdateRequest::new(
                 target.fragment_instance_id,
                 vec![assignment],

@@ -893,13 +893,13 @@ fn validate_old_delete_target(
                 LogicalDeleteReference::File(&reference.path)
             };
             identity.validate(entry_path.clone(), context)?;
-            if let Some(previous) = previous {
-                if previous.compare(identity, context)? != std::cmp::Ordering::Less {
-                    return Err(inconsistent(
-                        entry_path,
-                        "old-delete references must be sorted and unique by logical entry",
-                    ));
-                }
+            if let Some(previous) = previous
+                && previous.compare(identity, context)? != std::cmp::Ordering::Less
+            {
+                return Err(inconsistent(
+                    entry_path,
+                    "old-delete references must be sorted and unique by logical entry",
+                ));
             }
             previous = Some(identity);
             context.observe_compile_step()?;
@@ -1110,13 +1110,13 @@ fn validate_delete_artifact_common(
         for (index, value) in merged.iter().enumerate() {
             let entry_path = path.field("merged_old_references").index(index);
             let identity = validate_merged_reference(value, entry_path.clone(), context)?;
-            if let Some(previous) = previous {
-                if previous.compare(identity, context)? != std::cmp::Ordering::Less {
-                    return Err(inconsistent(
-                        entry_path,
-                        "merged old references must be sorted and unique",
-                    ));
-                }
+            if let Some(previous) = previous
+                && previous.compare(identity, context)? != std::cmp::Ordering::Less
+            {
+                return Err(inconsistent(
+                    entry_path,
+                    "merged old references must be sorted and unique",
+                ));
             }
             previous = Some(identity);
             context.observe_compile_step()?;

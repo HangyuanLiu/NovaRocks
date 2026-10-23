@@ -53,10 +53,10 @@ impl crate::KernelEvaluationControl for Control {
     fn checkpoint(&self, n: u32) -> Result<(), KernelFailure> {
         assert!(n <= 256);
         self.trace.lock().unwrap().push(n);
-        if n > 0 {
-            if let Some(e) = &self.failure {
-                return Err(e.clone());
-            }
+        if n > 0
+            && let Some(e) = &self.failure
+        {
+            return Err(e.clone());
         }
         Ok(())
     }

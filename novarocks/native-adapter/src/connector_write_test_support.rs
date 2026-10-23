@@ -182,6 +182,12 @@ pub struct WriterTerminals {
     pub appended_rows: usize,
 }
 
+impl Default for RecordingWriteExecution {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RecordingWriteExecution {
     pub fn new() -> Self {
         Self {

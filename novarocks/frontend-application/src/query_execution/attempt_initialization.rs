@@ -132,10 +132,9 @@ impl RoundCredentialLeaseSource {
             observed_collected: Some(observed_collected),
             reservation: Some(reservation),
         } = self
+            && reservation.has_collected_credential_leases()
         {
-            if reservation.has_collected_credential_leases() {
-                observed_collected.store(true, Ordering::Release);
-            }
+            observed_collected.store(true, Ordering::Release);
         }
     }
 

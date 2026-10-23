@@ -1833,7 +1833,7 @@ mod tests {
         // Round the exact mass once: 416675010 -> 416675008, index208337504.
         // Centers208305776/208341136 at means35353/35356 independently give
         // the f32 weighted interpolation35355.6875.
-        assert_eq!(state.digest.quantile(0.5).unwrap(), Some(35355.6875));
+        assert_eq!(state.digest.quantile(0.5).unwrap(), Some(35_355.688));
         assert_eq!(state.digest.total_weight(), 416675008.0);
         assert_eq!(state.digest.cumulative.last(), Some(&416675008.0));
         assert_eq!(quantile_value(&state, 0.5).unwrap(), Some(35355.6875));

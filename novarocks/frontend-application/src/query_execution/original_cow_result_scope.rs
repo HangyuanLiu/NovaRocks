@@ -226,7 +226,7 @@ mod tests {
             .and_then(|e| e.source())
             .and_then(|e| e.source())
             .and_then(|e| e.downcast_ref::<Box<Canary>>())
-            .is_some_and(|e| e.as_ref() as *const Canary == raw_pointer);
+            .is_some_and(|e| std::ptr::eq(e.as_ref(), raw_pointer));
         // A neutral holder cannot self-wait. Rescue scope exits before assertions
         // even if the observer proves an accidental activity lease regression.
         let activity_binding = binding.clone();

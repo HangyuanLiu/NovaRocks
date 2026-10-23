@@ -398,8 +398,7 @@ mod tests {
                 batch,
             )
             .await
-            .err()
-            .expect("reject before writing");
+            .expect_err("reject before writing");
             assert!(error.contains(expected), "{error}");
             assert!(!dir.path().join("data").exists());
         }

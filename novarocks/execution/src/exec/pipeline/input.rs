@@ -62,10 +62,10 @@ impl RawInput {
     }
     /// Only the receiver's acceptance path can transfer this responsibility.
     pub(super) fn accept(mut self, tracker: Option<&Arc<MemTracker>>) -> AcceptedInput {
-        if self.permit.is_none() {
-            if let Some(tracker) = tracker {
-                self.chunk.transfer_to(tracker);
-            }
+        if self.permit.is_none()
+            && let Some(tracker) = tracker
+        {
+            self.chunk.transfer_to(tracker);
         }
         AcceptedInput {
             raw: self,

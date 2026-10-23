@@ -1779,8 +1779,7 @@ mod tests {
             .expect("input")
             .read()
             .await
-            .err()
-            .expect("old request must stop");
+            .expect_err("old request must stop");
         let source = std::error::Error::source(&stopped)
             .and_then(|source| source.downcast_ref::<ConnectorError>())
             .expect("typed cancellation");

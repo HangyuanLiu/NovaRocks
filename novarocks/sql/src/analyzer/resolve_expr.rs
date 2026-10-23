@@ -289,7 +289,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         qualifier: None,
                         column: ident.value.to_lowercase(),
                     },
-                    value_type: value_type,
+                    value_type,
                 })
             }
 
@@ -1098,7 +1098,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     qualifier,
                     column: column.to_lowercase(),
                 },
-                value_type: value_type,
+                value_type,
             };
 
         // Form 1: parts[0] is a qualifier, parts[1] is a column, parts[2..] are
@@ -1333,15 +1333,12 @@ impl<'a> super::AnalyzerContext<'a> {
                     typed.value_type.nullable(),
                 );
             }
-            if let Some(target) = &explicit_item_type {
-                if !typed.value_type.same_value_domain(target) {
-                    let value_type = super::helpers::declared_cast_value_type(
-                        &typed,
-                        target.clone(),
-                        self.control,
-                    )?;
-                    typed = self.cast_to_value_type(typed, value_type, item.span())?;
-                }
+            if let Some(target) = &explicit_item_type
+                && !typed.value_type.same_value_domain(target)
+            {
+                let value_type =
+                    super::helpers::declared_cast_value_type(&typed, target.clone(), self.control)?;
+                typed = self.cast_to_value_type(typed, value_type, item.span())?;
             }
             args.push(typed);
         }
@@ -3161,7 +3158,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     order_by: func_order_by,
                     resolved: signature,
                 },
-                value_type: value_type,
+                value_type,
             })
         } else {
             // Scalar function
@@ -3271,7 +3268,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     distinct: is_distinct,
                     binding,
                 },
-                value_type: value_type,
+                value_type,
             })
         }
     }
@@ -3550,7 +3547,7 @@ impl<'a> super::AnalyzerContext<'a> {
             lambda_params.push(LambdaParam {
                 name: param_name.clone(),
                 slot_id: self.alloc_lambda_slot_id(),
-                value_type: value_type,
+                value_type,
             });
             array_args.push(typed);
         }

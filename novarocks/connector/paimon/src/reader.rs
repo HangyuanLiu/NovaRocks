@@ -589,10 +589,9 @@ fn host_connector_error(
         source: Some(source),
         ..
     }) = error.downcast_ref::<paimon::Error>()
+        && let Some(error) = host_connector_error(source.as_ref(), depth + 1)
     {
-        if let Some(error) = host_connector_error(source.as_ref(), depth + 1) {
-            return Some(error);
-        }
+        return Some(error);
     }
     error
         .source()

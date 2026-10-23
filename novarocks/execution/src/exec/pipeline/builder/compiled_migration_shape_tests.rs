@@ -160,7 +160,7 @@ fn mixed_phase_program() -> Arc<LocalProgram> {
         ("sum", PureKernelAbi::AggregateWindowV1),
     ]);
     let logical = int64(false);
-    let sum = bind(&catalog, "sum", &[logical.clone()]);
+    let sum = bind(&catalog, "sum", std::slice::from_ref(&logical));
     let count = bind(&catalog, "count", &[sum.intermediate_type()]);
     let sequence = AggregateSequenceId::new(71);
     let fragment = FragmentId::new(71);
@@ -174,7 +174,7 @@ fn mixed_phase_program() -> Arc<LocalProgram> {
         let columns = super::aggregate_fixture::values(
             &mut builder,
             source,
-            &[logical.clone()],
+            std::slice::from_ref(&logical),
             &[vec![LiteralValue::Int64(value)]],
         );
         let (partial, output) = add_aggregate(

@@ -532,7 +532,12 @@ fn float_key_plan(
             })]
         })
         .collect::<Vec<_>>();
-    let columns = values(&mut only, values_node, &[key_type.clone()], &rows);
+    let columns = values(
+        &mut only,
+        values_node,
+        std::slice::from_ref(&key_type),
+        &rows,
+    );
     let (node, _) = add_aggregate(
         &mut only,
         values_node,
@@ -811,8 +816,7 @@ fn distinct_aggregate_the_owner_does_not_implement_is_an_explicit_compile_refusa
     // refuses it, never a fallback.
     let error =
         super::aggregate_fixture::try_compile(packages.remove(&SOURCE).unwrap(), &catalog, 1, true)
-            .err()
-            .expect("COUNT(DISTINCT) is refused");
+            .expect_err("COUNT(DISTINCT) is refused");
     assert!(error.contains("DISTINCT"), "{error}");
 }
 

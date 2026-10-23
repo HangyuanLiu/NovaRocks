@@ -766,7 +766,7 @@ impl PreparedAggregateKernel for ApproxPercentileKernel {
                 HostAggregateAllocator::try_new(Arc::clone(context.allocator().ok_or_else(
                     || invalid("approximate percentile final requires actual host allocator"),
                 )?))?;
-            let mut sink = FailureSink {
+            let _sink = FailureSink {
                 allocator: &host,
                 domain: FailureDomain::Emission(context),
                 control,

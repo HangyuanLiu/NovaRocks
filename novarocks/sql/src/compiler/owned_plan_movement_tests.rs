@@ -53,18 +53,18 @@ fn first_aggregate(
 ) -> (&Fragment, &PhysicalNode, PhysicalCallSite, &AggregateCall) {
     for fragment in owner.plan().fragments().values() {
         for node in fragment.nodes().values() {
-            if let NodeKind::Aggregate { calls, .. } = &node.kind {
-                if let Some(call) = calls.first() {
-                    return (
-                        fragment,
-                        node,
-                        PhysicalCallSite::Aggregate {
-                            node: node.id,
-                            call: 0,
-                        },
-                        call,
-                    );
-                }
+            if let NodeKind::Aggregate { calls, .. } = &node.kind
+                && let Some(call) = calls.first()
+            {
+                return (
+                    fragment,
+                    node,
+                    PhysicalCallSite::Aggregate {
+                        node: node.id,
+                        call: 0,
+                    },
+                    call,
+                );
             }
         }
     }

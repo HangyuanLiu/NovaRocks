@@ -813,8 +813,7 @@ mod routing_tests {
         drop(peer);
         let h2 = h2::client::handshake(local)
             .await
-            .err()
-            .expect("the actual closed IO refuses the h2 preface");
+            .expect_err("the actual closed IO refuses the h2 preface");
         assert!(h2.get_io().is_some());
         assert!(is_observed_connection_loss(&h2));
     }

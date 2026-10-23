@@ -130,7 +130,7 @@ impl ProviderReadRuntime for IcebergExecutionReadRuntime {
     }
 
     fn transaction(&self) -> Self::Transaction {
-        self.transaction.clone()
+        self.transaction
     }
 }
 

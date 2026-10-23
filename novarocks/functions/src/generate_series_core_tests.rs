@@ -39,7 +39,7 @@ fn generate_series_shared_core_keeps_raw_values_counts_null_and_return_conversio
         DataType::Int64,
         DataType::FixedSizeBinary(16),
     ] {
-        let out = result_column(expansion.values.clone(), &[ty.clone()]).unwrap();
+        let out = result_column(expansion.values.clone(), std::slice::from_ref(&ty)).unwrap();
         assert_eq!(out.data_type(), &ty);
         assert_eq!(
             (0..out.len())
@@ -207,7 +207,7 @@ fn generate_series_shared_core_all_result_conversion_callbacks_keep_seven_causes
     ] {
         let values = vec![Some(1), None, Some(2), Some(3)];
         let mut trace = vec![];
-        result_column_observed(values.clone(), &[ty.clone()], &mut |event| {
+        result_column_observed(values.clone(), std::slice::from_ref(&ty), &mut |event| {
             trace.push(event);
             Ok::<(), KernelFailure>(())
         })
@@ -222,14 +222,18 @@ fn generate_series_shared_core_all_result_conversion_callbacks_keep_seven_causes
         for at in 0..trace.len() {
             for cause in causes() {
                 let mut seen = vec![];
-                let result = result_column_observed(values.clone(), &[ty.clone()], &mut |event| {
-                    seen.push(event);
-                    if seen.len() == at + 1 {
-                        Err(cause.clone())
-                    } else {
-                        Ok(())
-                    }
-                });
+                let result = result_column_observed(
+                    values.clone(),
+                    std::slice::from_ref(&ty),
+                    &mut |event| {
+                        seen.push(event);
+                        if seen.len() == at + 1 {
+                            Err(cause.clone())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                );
                 match result {
                     Err(SeriesFailure::Control(actual)) => assert_eq!(actual, cause),
                     other => panic!("expected exact conversion control, got {other:?}"),

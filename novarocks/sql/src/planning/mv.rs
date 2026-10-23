@@ -1013,10 +1013,11 @@ mod refresh_property_facade_tests {
             same.refresh_contract(crate::optimizer::test_optimizer_control())
                 .is_ok()
         );
-        for (left, right) in [(
-            cv_utf8(ValueLogicalType::Physical, "a"),
-            cv_utf8(ValueLogicalType::Json, "a"),
-        )] {
+        {
+            let (left, right) = (
+                cv_utf8(ValueLogicalType::Physical, "a"),
+                cv_utf8(ValueLogicalType::Json, "a"),
+            );
             let input = cv_refresh_input(left, right);
             assert!(matches!(
                 input.refresh_property(crate::optimizer::test_optimizer_control()),

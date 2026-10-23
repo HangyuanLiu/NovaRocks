@@ -241,8 +241,7 @@ pub(crate) fn build_aggregate_state_merge(
         ctx,
         &aggregate_calls,
         &aggregate_layout,
-    )
-    .map_err(SqlCompileError::from)?;
+    )?;
 
     build_relational_aggregate_change_stream(
         old_input,
@@ -251,7 +250,6 @@ pub(crate) fn build_aggregate_state_merge(
         ctx,
         &aggregate_layout,
     )
-    .map_err(SqlCompileError::from)
 }
 
 #[expect(
@@ -1560,13 +1558,11 @@ fn group_key_names(
                 for (candidate_index, column) in group_outputs.iter().enumerate() {
                     let same = column.column_id == *column_id;
                     work.step()?;
-                    if same {
-                        if matched.replace(candidate_index).is_some() {
-                            return Err(SqlCompileError::Compilation(
+                    if same && matched.replace(candidate_index).is_some() {
+                        return Err(SqlCompileError::Compilation(
                                 "Iceberg IMV aggregate rewrite found ambiguous GROUP BY output column id"
                                     .to_string(),
                             ));
-                        }
                     }
                 }
                 // A rewritten input reference may have a different ID from

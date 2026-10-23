@@ -358,7 +358,7 @@ impl FrontendWorkloadDeadlineSupervisor {
                     _ = deadlines.wait_state_change(after) => {}
                     _ = async {
                         match next_deadline {
-                            Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
                             None => std::future::pending::<()>().await,
                         }
                     } => {}
@@ -1414,18 +1414,18 @@ impl FrontendApplicationHost {
             }
         }
         #[cfg(novarocks_dev_controls)]
-        if let Some(session) = &mut host.test_session {
-            if let Err(error) = session.start_cleanup(
+        if let Some(session) = &mut host.test_session
+            && let Err(error) = session.start_cleanup(
                 host.execution_runtime_owner.lifecycle_diagnostics(),
                 host.catalog_runtime_projection.clone(),
-            ) {
-                return Err(host
-                    .cleanup_open_error(FrontendApplicationError::new(
-                        FrontendApplicationErrorKind::CoordinatorOpen,
-                        error,
-                    ))
-                    .await);
-            }
+            )
+        {
+            return Err(host
+                .cleanup_open_error(FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::CoordinatorOpen,
+                    error,
+                ))
+                .await);
         }
 
         // Unique original Apply owner is now in Host. No Native caller has
@@ -2131,13 +2131,13 @@ impl FrontendApplicationHost {
     /// has exhausted its bounded convergence attempts and committed to exit.
     pub fn abandon_for_process_exit(&mut self) {
         self.serving_lifecycle.mark_stopping();
-        if let Some(topology) = self.topology.as_ref() {
-            if let Err(error) = topology.request_heartbeat_stop_for_process_exit() {
-                tracing::error!(
-                    %error,
-                    "failed to signal frontend heartbeat manager before process exit"
-                );
-            }
+        if let Some(topology) = self.topology.as_ref()
+            && let Err(error) = topology.request_heartbeat_stop_for_process_exit()
+        {
+            tracing::error!(
+                %error,
+                "failed to signal frontend heartbeat manager before process exit"
+            );
         }
         self.execution_runtime_owner.abandon_for_process_exit();
     }

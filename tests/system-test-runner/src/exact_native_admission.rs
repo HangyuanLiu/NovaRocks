@@ -466,22 +466,21 @@ struct OriginalChild {
 }
 impl OriginalChild {
     fn poll(&mut self) -> std::io::Result<()> {
-        if self.status.is_none() {
-            if let Some(child) = self.child.as_mut() {
-                if let Some(status) = child.try_wait()? {
-                    self.status = Some(status);
-                    drop(self.child.take());
-                }
-            }
+        if self.status.is_none()
+            && let Some(child) = self.child.as_mut()
+            && let Some(status) = child.try_wait()?
+        {
+            self.status = Some(status);
+            drop(self.child.take());
         }
         Ok(())
     }
     fn abort_and_reap(&mut self) -> [Option<std::io::Error>; 2] {
         let mut errors = [None, None];
-        if let Some(child) = self.child.as_mut() {
-            if let Err(cause) = child.kill() {
-                errors[0] = Some(cause);
-            }
+        if let Some(child) = self.child.as_mut()
+            && let Err(cause) = child.kill()
+        {
+            errors[0] = Some(cause);
         }
         let deadline = Instant::now() + Duration::from_millis(REAP_MS); // Failure-only cleanup, never admission/scene time.
         loop {
@@ -560,19 +559,20 @@ fn bounded_command(
             if let Err(io) = owner.poll() {
                 return Err((CommandClass::Poll, Some(io)));
             }
-            if let Some(status) = owner.status {
-                if out.eof && err.eof {
-                    if !status.success() {
-                        return Err((CommandClass::Nonzero, None));
-                    }
-                    if err.total != 0 {
-                        return Err((CommandClass::Stderr, None));
-                    }
-                    if Instant::now() >= command_deadline {
-                        return Err((CommandClass::Deadline, None));
-                    }
-                    return Ok(());
+            if let Some(status) = owner.status
+                && out.eof
+                && err.eof
+            {
+                if !status.success() {
+                    return Err((CommandClass::Nonzero, None));
                 }
+                if err.total != 0 {
+                    return Err((CommandClass::Stderr, None));
+                }
+                if Instant::now() >= command_deadline {
+                    return Err((CommandClass::Deadline, None));
+                }
+                return Ok(());
             }
             std::thread::sleep(
                 Duration::from_millis(2)

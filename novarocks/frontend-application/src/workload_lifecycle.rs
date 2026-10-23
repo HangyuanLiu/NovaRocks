@@ -80,23 +80,12 @@ pub struct FrontendCatalogCounts {
     pub unavailable: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Default)]
 pub struct FrontendCatalogServingSnapshot {
     pub source_mode: Option<FrontendCatalogSourceMode>,
     pub bootstrap_complete: bool,
     pub snapshot: Option<FrontendCatalogSnapshotIdentity>,
     pub counts: FrontendCatalogCounts,
-}
-
-impl Default for FrontendCatalogServingSnapshot {
-    fn default() -> Self {
-        Self {
-            source_mode: None,
-            bootstrap_complete: false,
-            snapshot: None,
-            counts: FrontendCatalogCounts::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -317,16 +306,9 @@ fn frontend_totals_from_root(totals: &WorkClassTotals) -> FrontendWorkloadTotals
     }
 }
 
+#[derive(Default)]
 struct Inner {
     catalog: FrontendCatalogServingSnapshot,
-}
-
-impl Default for Inner {
-    fn default() -> Self {
-        Self {
-            catalog: FrontendCatalogServingSnapshot::default(),
-        }
-    }
 }
 
 struct LifecycleShared {

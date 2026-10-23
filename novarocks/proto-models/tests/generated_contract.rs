@@ -102,11 +102,12 @@ fn write_relation_contracts_are_versioned_append_only_fields() {
         assert!(field.reserved_ranges().any(|range| range.contains(&number)));
         assert!(field.reserved_names().any(|reserved| reserved == name));
     }
-    for (message, number, name) in [(
-        "novarocks.arrow_type.ArrowPhysicalSchema",
-        2,
-        "schema_metadata",
-    )] {
+    {
+        let (message, number, name) = (
+            "novarocks.arrow_type.ArrowPhysicalSchema",
+            2,
+            "schema_metadata",
+        );
         let descriptor = pool.get_message_by_name(message).unwrap();
         assert!(descriptor.get_field_by_name(name).is_none());
         assert!(

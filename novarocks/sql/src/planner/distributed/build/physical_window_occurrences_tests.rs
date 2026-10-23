@@ -1213,9 +1213,7 @@ fn window_missing_profiles_are_named_at_actual_sql_binding_before_package_emissi
         "SELECT min('x') OVER ()",
         "SELECT max('x') OVER ()",
     ] {
-        let error = analyze_window_admission_sql(sql)
-            .err()
-            .expect("static capability refusal");
+        let error = analyze_window_admission_sql(sql).expect_err("static capability refusal");
         assert_eq!(
             error.kind(),
             crate::analyze_error::AnalyzeErrorKind::UnavailableImplementation,
@@ -1242,8 +1240,7 @@ fn window_missing_profiles_are_named_at_actual_sql_binding_before_package_emissi
         analyze_window_admission_sql(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
     }
     let error = analyze_window_admission_sql("SELECT lead(missing, 1, 0) OVER ()")
-        .err()
-        .expect("unknown input column");
+        .expect_err("unknown input column");
     assert_eq!(
         error.kind(),
         crate::analyze_error::AnalyzeErrorKind::UnknownColumn

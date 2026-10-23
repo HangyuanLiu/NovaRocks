@@ -323,7 +323,7 @@ impl PreparedAggregateKernel for PayloadKernel {
                         _ => internal("HLL payload violated its exact prepared failure recipe")
                             .into(),
                     },
-                    |cause| EvaluationFailure::Kernel(cause),
+                    EvaluationFailure::Kernel,
                 )
             })
         });
@@ -425,7 +425,7 @@ impl PreparedAggregateKernel for PayloadKernel {
                         )
                         .into(),
                     },
-                    |cause| EvaluationFailure::Kernel(cause),
+                    EvaluationFailure::Kernel,
                 )?;
             }
             Ok(())

@@ -2104,7 +2104,7 @@ impl ChunkSchema {
             .slots
             .iter()
             .cloned()
-            .zip(fields.into_iter())
+            .zip(fields)
             .map(|(slot, field)| slot.with_field(field))
             .collect::<Result<Vec<_>, _>>()?;
         Self::try_new(slots)
@@ -2588,7 +2588,7 @@ mod tests {
                     true,
                 )])),
                 &[SlotId::new(1)],
-                &[declaration.clone()],
+                std::slice::from_ref(&declaration),
             );
             for restored in [
                 ChunkSchema::from_static_layout(&layout).unwrap(),

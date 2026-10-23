@@ -279,10 +279,10 @@ impl Fixture {
                 .flatten()
                 .filter(|entry| entry.directory == directory)
             {
-                if let Err(error) = remove_artifact(artifact) {
-                    if cleanup.is_none() {
-                        cleanup = Some(finite_error("artifact-cleanup", &error));
-                    }
+                if let Err(error) = remove_artifact(artifact)
+                    && cleanup.is_none()
+                {
+                    cleanup = Some(finite_error("artifact-cleanup", &error));
                 }
             }
         }

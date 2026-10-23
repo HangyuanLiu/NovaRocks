@@ -312,10 +312,10 @@ impl LogicalExecutionSupervisor {
             }
         }
 
-        if let Some(error) = self.registry.statement_native_health() {
-            if matches!(self.run_outcome, Some(SupervisorRunOutcome::Completed)) {
-                self.run_outcome = Some(SupervisorRunOutcome::Failed(error));
-            }
+        if let Some(error) = self.registry.statement_native_health()
+            && matches!(self.run_outcome, Some(SupervisorRunOutcome::Completed))
+        {
+            self.run_outcome = Some(SupervisorRunOutcome::Failed(error));
         }
         self.shutdown_complete = true;
         match self
@@ -760,7 +760,7 @@ async fn run_logical_execution(
         (Some(schema), RecoveryMode::RestartAttemptBeforeVisibility) => {
             let replacement = session
                 .replacement_effect_port()
-                .ok_or_else(|| super::LogicalExecutionActorError::InvariantViolation);
+                .ok_or(super::LogicalExecutionActorError::InvariantViolation);
             match replacement {
                 Ok(replacement) => {
                     LogicalExecutionActorConfig::read_only_pre_visibility_recovery_rows(
@@ -2778,7 +2778,7 @@ mod tests {
     }
 
     fn rows_request(
-        control: &WorkloadControl,
+        _control: &WorkloadControl,
         scope: &novarocks_workload_control::WorkScope,
         recovery: RecoveryMode,
         replacements: Option<Arc<dyn super::super::ReplacementQualificationEffectPort>>,
@@ -4445,7 +4445,7 @@ mod tests {
                         super::super::AcceptedAttemptFailure::None,
                     )
                     .unwrap();
-                let fetches = Arc::new(AtomicU64::new(0));
+                let _fetches = Arc::new(AtomicU64::new(0));
                 let binding = test_root_binding(
                     root,
                     window.0,
@@ -5261,7 +5261,7 @@ mod tests {
                         super::super::AcceptedAttemptFailure::None,
                     )
                     .unwrap();
-                let fetches = Arc::new(AtomicU64::new(0));
+                let _fetches = Arc::new(AtomicU64::new(0));
                 let binding = test_root_binding(
                     root,
                     window.0,

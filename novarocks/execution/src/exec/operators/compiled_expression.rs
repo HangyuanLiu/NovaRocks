@@ -172,20 +172,19 @@ impl RuntimeKernelControl {
     // originating fact only when that port actually observes its owner stop;
     // an unrelated kernel failure must not adopt a later fragment failure.
     fn observe_stop_cause(&self) {
-        if self.observed_stop.get().is_none() {
-            if let Some(error) = self.error.error() {
-                let _ = self.observed_stop.set(error);
-            }
+        if self.observed_stop.get().is_none()
+            && let Some(error) = self.error.error()
+        {
+            let _ = self.observed_stop.set(error);
         }
     }
     fn project_required_failure(&self, failure: ExecutionFailure) -> ExecutionFailure {
         if matches!(
             failure.cause(),
             crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
-        ) {
-            if let Some(original) = self.observed_stop.get() {
-                return original.clone();
-            }
+        ) && let Some(original) = self.observed_stop.get()
+        {
+            return original.clone();
         }
         failure
     }
@@ -312,7 +311,7 @@ fn evaluate_selection(
         crate::runtime::scalar_memory::RuntimeScalarMemoryScope::new(control, &mut journal);
     let result = instance
         .evaluate_input_runtime(input, selection, activation, control, &mut scope)
-        .map_err(|cause| control.project_required_failure(cause.into()))?;
+        .map_err(|cause| control.project_required_failure(cause))?;
     let (selection, values, errors) = result.into_parts();
     if let Some(error) = errors.into_vec().into_iter().next() {
         return Err(RequiredExpressionRowError::try_new(site, selection, error)?.into());

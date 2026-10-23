@@ -47,7 +47,7 @@ fn native_carrier_from_contract(
         .first()
         .copied()
         .context("provider contract has no private codec declaration")?;
-    for declaration in declarations.iter().copied() {
+    for declaration in declarations.iter() {
         anyhow::ensure!(
             declaration.provider_id() == contract.provider_id(),
             "provider contract contains a declaration for another provider"

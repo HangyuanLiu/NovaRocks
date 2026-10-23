@@ -1487,7 +1487,7 @@ mod tests {
             .candidate()
             .original_public_result_port()
             .expect("the original SQL public result declaration");
-        let root_fragment = u32::from(result.fragment.get());
+        let root_fragment = result.fragment.get();
         assert!(plan.fragments().contains_key(&result.fragment));
         assert_eq!(result.fields.len(), 1);
         assert_eq!(result.fields[0].ty, ValueType::new(DataType::Int64, false));

@@ -549,12 +549,11 @@ pub fn hydrate_dictionary_columns_except(
     let mut columns = Vec::with_capacity(chunk.columns().len());
     let mut slots = Vec::with_capacity(chunk.chunk_schema().slots().len());
 
-    for (_idx, ((column, field), slot)) in chunk
+    for ((column, field), slot) in chunk
         .columns()
         .iter()
         .zip(chunk.schema().fields().iter())
         .zip(chunk.chunk_schema().slots().iter())
-        .enumerate()
     {
         let column_type = column.data_type();
         match column_type {

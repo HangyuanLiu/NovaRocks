@@ -280,10 +280,8 @@ fn cow_begin_covers_real_collection_backings_and_preserves_attempt_control() {
         .vended_credential_lease_collection()
         .unwrap()
         .catalog_properties();
-    let collection_bytes = installed.execution_properties().len()
-        * std::mem::size_of::<spi::CatalogProperty>()
-        + installed.credential_bindings().len()
-            * std::mem::size_of::<spi::CatalogCredentialBinding>();
+    let collection_bytes = std::mem::size_of_val(installed.execution_properties())
+        + std::mem::size_of_val(installed.credential_bindings());
     assert!(collection_bytes > 0);
     assert_eq!(with_collection_upper - base_upper, collection_bytes as u64);
     assert!(original.vended_credential_lease_collection().is_none());

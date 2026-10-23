@@ -100,7 +100,7 @@ impl PreparedAggregateKernel for PreparedExtrema {
     fn clone_for_local_phase(
         &self,
         contract: Arc<AggregateCallContract>,
-        control: &dyn novarocks_type_contract::PureCompileControl,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Arc<Self>, KernelFailure> {
         Ok(Arc::new(match self {
             Self::Fixed(kernel) => Self::Fixed(ExtremaKernel {

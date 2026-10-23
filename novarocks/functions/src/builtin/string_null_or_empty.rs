@@ -93,7 +93,7 @@ pub fn evaluate_observed(
         let row = address(ordinal, batch_row);
         observe(Observation::Step)?;
         if row >= input.len() {
-            return Err(internal("null_or_empty selected address is out of bounds").into());
+            return Err(internal("null_or_empty selected address is out of bounds"));
         }
         let value = match &source {
             Source::Null | Source::AllNull => true,

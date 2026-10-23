@@ -64,10 +64,11 @@ fn allocation<E>(
     layout: Layout,
     occurrences: usize,
 ) -> Result<(), E> {
-    if layout.size() != 0 && occurrences != 0 {
-        if let Some(loan) = loan.as_deref_mut() {
-            loan(layout, occurrences)?;
-        }
+    if layout.size() != 0
+        && occurrences != 0
+        && let Some(loan) = loan.as_deref_mut()
+    {
+        loan(layout, occurrences)?;
     }
     Ok(())
 }

@@ -219,10 +219,10 @@ fn helper(directory: &Directory) -> Helper {
 
 fn wait_file(path: &Path, deadline: Instant) -> Vec<u8> {
     loop {
-        if let Ok(bytes) = fs::read(path) {
-            if !bytes.is_empty() {
-                return bytes;
-            }
+        if let Ok(bytes) = fs::read(path)
+            && !bytes.is_empty()
+        {
+            return bytes;
         }
         assert!(
             Instant::now() < deadline,

@@ -112,11 +112,11 @@ fn numeric_value_at(
         source.into_failure(PercentileInputDiagnostic::LegacyLabel(context.as_str()))
     })
 }
-fn payload_bytes_at<'a>(
-    array: &'a ArrayRef,
+fn payload_bytes_at(
+    array: &ArrayRef,
     row: usize,
     context: ApproxPercentileDiagnostic,
-) -> Result<Option<&'a [u8]>, crate::KernelFailure> {
+) -> Result<Option<&[u8]>, crate::KernelFailure> {
     percentile_input::payload_bytes_at_with_failure(array, row, &mut |source| {
         source.into_failure(PercentileInputDiagnostic::LegacyLabel(context.as_str()))
     })
@@ -482,11 +482,11 @@ impl WeightedInput {
     }
 }
 
-pub fn payload_for_merge<'a>(
-    array: &'a ArrayRef,
+pub fn payload_for_merge(
+    array: &ArrayRef,
     row: usize,
     context: ApproxPercentileDiagnostic,
-) -> Result<Option<&'a [u8]>, crate::KernelFailure> {
+) -> Result<Option<&[u8]>, crate::KernelFailure> {
     payload_bytes_at(array, row, context)
 }
 pub fn merge_payload<A: Allocator + Clone>(

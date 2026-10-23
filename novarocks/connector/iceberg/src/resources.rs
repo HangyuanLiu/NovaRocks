@@ -286,13 +286,7 @@ mod tests {
                         .expect("explicit runtime table");
                     assert_eq!(table.identifier().name(), "t");
                     let task = sdk.io().spawn(async { 11_u8 });
-                    assert_eq!(
-                        runtime
-                            .block_on(async move { task.await })
-                            .unwrap()
-                            .unwrap(),
-                        11
-                    );
+                    assert_eq!(runtime.block_on(task).unwrap().unwrap(), 11);
                     assert!(tokio::runtime::Handle::try_current().is_err());
                 })
                 .join()

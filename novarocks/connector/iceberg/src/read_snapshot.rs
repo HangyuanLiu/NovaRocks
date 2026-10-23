@@ -428,14 +428,13 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
             )
             .into());
         }
-        if let Some(budget) = budget {
-            if let Some(json) = domain
+        if let Some(budget) = budget
+            && let Some(json) = domain
                 .endpoint()
                 .partition_type_jsons()
                 .get(&spec.spec_id())
-            {
-                budget.json_working(json.len() as u64)?;
-            }
+        {
+            budget.json_working(json.len() as u64)?;
         }
         let partition_type = domain
             .endpoint()

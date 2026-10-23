@@ -734,10 +734,10 @@ impl novarocks_failure_contract::FailureProjection for TopKInputFailure {
 }
 impl novarocks_failure_contract::OuterFailureProjection for TopKInputFailure {}
 pub fn update_input_failure(array: &ArrayRef) -> Option<TopKInputFailure> {
-    if let Some(array) = array.as_any().downcast_ref::<StructArray>() {
-        if array.columns().is_empty() {
-            return Some(TopKInputFailure::EmptyStruct);
-        }
+    if let Some(array) = array.as_any().downcast_ref::<StructArray>()
+        && array.columns().is_empty()
+    {
+        return Some(TopKInputFailure::EmptyStruct);
     }
     None
 }

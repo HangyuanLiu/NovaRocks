@@ -184,7 +184,7 @@ fn profiles(unit: TimeUnit) -> impl Iterator<Item = DataType> {
         Some("opaque-original-zone".into()),
     ]
     .into_iter()
-    .map(move |z| DataType::Timestamp(unit.clone(), z))
+    .map(move |z| DataType::Timestamp(unit, z))
 }
 fn differential(dtype: DataType) {
     for (allow, policy) in modes() {

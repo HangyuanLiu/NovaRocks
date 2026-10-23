@@ -444,7 +444,7 @@ impl PrefixOutputDriver {
         root_schema: crate::exec::chunk::ChunkSchemaRef,
         tracker: Option<Arc<MemTracker>>,
     ) -> ExecutionResult<Self> {
-        let summary_rows = row_count_to_wire(rows).map_err(|error| finish_connector(error))?;
+        let summary_rows = row_count_to_wire(rows).map_err(finish_connector)?;
         validate_root_write_result_row(
             RootRowKind::Summary,
             RootWriteResultRowShape {
@@ -452,7 +452,7 @@ impl PrefixOutputDriver {
                 ..RootWriteResultRowShape::default()
             },
         )
-        .map_err(|error| finish_connector(error))?;
+        .map_err(finish_connector)?;
         Ok(Self {
             summary_rows: Some(summary_rows),
             fragments: fragments.into(),
@@ -562,7 +562,7 @@ impl PrefixOutputDriver {
                     ..RootWriteResultRowShape::default()
                 },
             )
-            .map_err(|error| finish_connector(error))?;
+            .map_err(finish_connector)?;
             kinds.push(RootRowKind::PreparedFragment.to_wire());
             ordinals.push(Some(target));
             payloads.append_value(&fragment.bytes);
@@ -774,7 +774,7 @@ impl TableFinishOperator {
     /// Read one target ordinal off the signed carrier. A negative value is
     /// corrupt data, never a very large unsigned ordinal.
     fn target_in_sealed_set(&self, raw: i32) -> ExecutionResult<WriteTargetOrdinal> {
-        let target = target_ordinal_from_wire(raw).map_err(|error| finish_connector(error))?;
+        let target = target_ordinal_from_wire(raw).map_err(finish_connector)?;
         // An exact set test, not a bound: the query's expected set need not be
         // dense from zero, so "at or below the highest ordinal" would admit a
         // target this query compiled no writer for.
@@ -802,8 +802,7 @@ impl TableFinishOperator {
                 "table finish received a writer row with a null kind",
             ));
         }
-        let kind = WriterRowKind::from_wire(columns.kinds.value(row))
-            .map_err(|error| finish_connector(error))?;
+        let kind = WriterRowKind::from_wire(columns.kinds.value(row)).map_err(finish_connector)?;
         let row_count = (!columns.row_counts.is_null(row)).then(|| columns.row_counts.value(row));
         let fragment_len =
             (!columns.fragments.is_null(row)).then(|| columns.fragments.value(row).len());
@@ -829,7 +828,7 @@ impl TableFinishOperator {
             fragment_len,
             &auxiliary_non_null,
         )
-        .map_err(|error| finish_connector(error))?;
+        .map_err(finish_connector)?;
 
         if columns.ordinals.is_null(row) {
             return Err(finish_contract(
@@ -849,17 +848,17 @@ impl TableFinishOperator {
                 })?;
                 // The SPI count owner rejects a negative trusted protocol count
                 // before it can become the statement's affected row count.
-                let rows = row_count_from_wire(rows).map_err(|error| finish_connector(error))?;
-                self.rows.add(rows).map_err(|error| finish_connector(error))
+                let rows = row_count_from_wire(rows).map_err(finish_connector)?;
+                self.rows.add(rows).map_err(finish_connector)
             }
             WriterRowKind::CommitFragment => {
                 let encoded = columns.fragments.value(row);
                 self.fragment_validator
                     .validate(target, encoded)
-                    .map_err(|error| finish_connector(error))?;
+                    .map_err(finish_connector)?;
                 self.ledger
                     .reserve_fragment(encoded.len())
-                    .map_err(|error| finish_connector(error))?;
+                    .map_err(finish_connector)?;
                 let bytes = encoded.to_vec();
                 let accounting = self
                     .fragment_tracker
@@ -1383,8 +1382,7 @@ fn root_artifact_chunk_core(
                 )
             })
             .collect::<Vec<_>>();
-        validate_artifact_draft_nested_values(&ids, &pairs)
-            .map_err(|error| finish_connector(error))?;
+        validate_artifact_draft_nested_values(&ids, &pairs).map_err(finish_connector)?;
         validate_root_write_result_row(
             RootRowKind::ArtifactDraft,
             RootWriteResultRowShape {
@@ -1396,7 +1394,7 @@ fn root_artifact_chunk_core(
                 ..RootWriteResultRowShape::default()
             },
         )
-        .map_err(|error| finish_connector(error))?;
+        .map_err(finish_connector)?;
     }
     let root_arrow = root_schema.arrow_schema_ref();
     // The reused upstream nested arrays name the upstream layout's child
@@ -1495,7 +1493,7 @@ impl OperatorLifecycle for TableFinishOperator {
     fn prepare(&mut self) -> ExecutionResult<()> {
         if let Some(error) = self.parallelism_error.take() {
             self.phase = FinishPhase::Failed;
-            return Err(error.into());
+            return Err(error);
         }
         if self.coverage.calls.is_empty() != self.coverage.mappings.is_none() {
             self.phase = FinishPhase::Failed;
@@ -1774,7 +1772,7 @@ impl TableFinishOperator {
         // prefix is read at the relation's positions, whatever its slots.
         let columns = match TableWriteRelationColumns::try_from_relation(&chunk) {
             Ok(columns) => columns,
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error),
         };
         let mut partial_rows = vec![false; chunk.len()];
         for (row, is_partial) in partial_rows.iter_mut().enumerate() {
@@ -1784,7 +1782,7 @@ impl TableFinishOperator {
                 Some(columns.kinds.value(row))
             };
             if let Err(error) = self.accept_row(&chunk, &columns, row) {
-                return Err(error.into());
+                return Err(error);
             }
             *is_partial = raw_kind == Some(WriterRowKind::AGGREGATE_PARTIAL);
         }
@@ -2429,7 +2427,7 @@ mod tests {
         ) -> ExecutionResult<StepResult> {
             Ok(StepResult::new(None, NextStep::NeedInput, 0))
         }
-        fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn finish(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
             let failure: ExecutionFailure = novarocks_functions::KernelFailure::Internal(
                 novarocks_functions::KernelDiagnostic::new(
                     "scripted final aggregate synchronous finalize failure",

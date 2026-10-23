@@ -725,36 +725,36 @@ impl FrontendDistributedQueryCoordinator {
                 scheduler.clone()
             };
         #[cfg(novarocks_dev_controls)]
-        if let Some(nomination) = &nominated_execution {
-            if let Some(observations) = &self.test_observations {
-                let execution = novarocks_types::QueryExecutionId::new(
-                    execution_id.query_id(),
-                    novarocks_types::AttemptId::new(execution_id.attempt_id().get())
-                        .map_err(|error| failed(error.to_string()))?,
-                )
-                .map_err(|error| failed(error.to_string()))?;
-                for target in parts.topology.targets() {
-                    for action in [
-                        "grpc-fragment",
-                        "reader-marker",
-                        "writer-marker",
-                        "catalog-materialization",
-                        "catalog-lifecycle",
-                        "exchange-snapshot",
-                        "catalog-hold",
-                        "catalog-failure",
-                    ] {
-                        observations
-                            .publish_nominated_binding(
-                                action,
-                                nomination,
-                                target
-                                    .process_id()
-                                    .map_err(|error| failed(error.to_string()))?,
-                                execution,
-                            )
-                            .map_err(failed)?;
-                    }
+        if let Some(nomination) = &nominated_execution
+            && let Some(observations) = &self.test_observations
+        {
+            let execution = novarocks_types::QueryExecutionId::new(
+                execution_id.query_id(),
+                novarocks_types::AttemptId::new(execution_id.attempt_id().get())
+                    .map_err(|error| failed(error.to_string()))?,
+            )
+            .map_err(|error| failed(error.to_string()))?;
+            for target in parts.topology.targets() {
+                for action in [
+                    "grpc-fragment",
+                    "reader-marker",
+                    "writer-marker",
+                    "catalog-materialization",
+                    "catalog-lifecycle",
+                    "exchange-snapshot",
+                    "catalog-hold",
+                    "catalog-failure",
+                ] {
+                    observations
+                        .publish_nominated_binding(
+                            action,
+                            nomination,
+                            target
+                                .process_id()
+                                .map_err(|error| failed(error.to_string()))?,
+                            execution,
+                        )
+                        .map_err(failed)?;
                 }
             }
         }
@@ -2305,7 +2305,8 @@ impl FrontendDistributedQueryCoordinator {
                 } else {
                     Default::default()
                 };
-                let outcome = (|| match intent {
+
+                (|| match intent {
                     DistributedQueryIntent::CowMatch => completion.cow_match(
                         internal_domain
                             .take()
@@ -2394,8 +2395,7 @@ impl FrontendDistributedQueryCoordinator {
                                 .map_err(failed)?,
                         )
                     }
-                })();
-                outcome
+                })()
             },
         );
         if let Err(error) = &outcome {

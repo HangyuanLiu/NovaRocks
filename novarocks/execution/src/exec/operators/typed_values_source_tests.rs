@@ -164,7 +164,7 @@ fn native_values_keep_original_zero_column_row_count_and_refuse_missing_owner() 
 #[test]
 fn native_values_first_memory_and_original_caller_refusal_have_no_allocation_tail() {
     let factory = TypedValuesSourceFactory::try_new(values(false), 2).unwrap();
-    let (state, tracker, host) = fixture();
+    let (_state, tracker, host) = fixture();
     let mut operator = factory.create(1, 0);
     operator.set_construction_factory(host.clone());
     let baseline = tracker.current();
@@ -182,7 +182,7 @@ fn native_values_first_memory_and_original_caller_refusal_have_no_allocation_tai
     let mut operator = factory.create(1, 0);
     operator.set_construction_factory(host.clone());
     let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Internal(
-        novarocks_functions::KernelDiagnostic::new(&("original Values caller".to_owned())),
+        novarocks_functions::KernelDiagnostic::new("original Values caller"),
     ))
     .at_operator(2, PipelineOperation::Admission);
     state.error_state().set_error(original.clone());

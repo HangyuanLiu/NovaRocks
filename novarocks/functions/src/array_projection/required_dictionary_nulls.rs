@@ -56,9 +56,7 @@ where
     visit_required_paths(source, source, value, &mut path, 0, observe)
 }
 
-fn physical<'a, T: 'static, E: From<ArrayProjectionFailure>>(
-    source: &'a ArrayRef,
-) -> Result<&'a T, E> {
+fn physical<T: 'static, E: From<ArrayProjectionFailure>>(source: &ArrayRef) -> Result<&T, E> {
     source.as_any().downcast_ref::<T>().ok_or_else(|| {
         E::from(ArrayProjectionFailure::Contract(
             ArrayProjectionViolation::PhysicalWrapper,

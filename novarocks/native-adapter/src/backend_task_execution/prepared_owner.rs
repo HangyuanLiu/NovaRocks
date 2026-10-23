@@ -323,12 +323,11 @@ impl NativePreparationChild {
             cause.failure_fact(),
         );
         let control = self.state.lock().unwrap().control.clone();
-        if let Some(control) = control {
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| control.report_cleanup(&cause)))
-            {
-                self.state.lock().unwrap().publication[phase as usize] =
-                    Some(ManuallyDrop::new(payload));
-            }
+        if let Some(control) = control
+            && let Err(payload) = catch_unwind(AssertUnwindSafe(|| control.report_cleanup(&cause)))
+        {
+            self.state.lock().unwrap().publication[phase as usize] =
+                Some(ManuallyDrop::new(payload));
         }
         let mut primary = self.state.lock().unwrap().primary[phase as usize].take();
         if primary.is_some() {
@@ -858,8 +857,7 @@ impl TaskPreparationChild for NativePreparationChild {
             .lock()
             .unwrap()
             .phases
-            .iter()
-            .any(|phase| *phase == Action::Unresolved);
+            .contains(&Action::Unresolved);
         if unknown
             || root == TaskPreparationChildExit::Unresolved
             || kernel == TaskPreparationChildExit::Unresolved
@@ -886,8 +884,7 @@ impl TaskPreparationChild for NativePreparationChild {
                 .lock()
                 .unwrap()
                 .phases
-                .iter()
-                .any(|phase| *phase == Action::Unresolved);
+                .contains(&Action::Unresolved);
             if !already_reported {
                 self.fault(Phase::RootAdopt, None, Some(cause));
             }

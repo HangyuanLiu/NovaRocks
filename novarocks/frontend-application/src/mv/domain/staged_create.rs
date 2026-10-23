@@ -244,7 +244,7 @@ impl StagedMvCreateTarget {
     ) -> StagedPublishOutcome {
         let Self {
             management,
-            document_lease,
+            document_lease: _,
             staged_lease,
             handle,
             admission,
@@ -858,12 +858,12 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
                     .entrance
                     .observe_keyed_admission(&documents, observation, request.decode_budget())
                     .map_err(|e| conflict(format!("observe admitted MV Current: {e}")))?;
-                if let MvConvergence::MetadataOnlyCurrent { expected } = &self.convergence {
-                    if !metadata_only_current_matches(expected, &observed) {
-                        return Err(conflict(
-                            "MV carrier changed during metadata-only Current renewal".into(),
-                        ));
-                    }
+                if let MvConvergence::MetadataOnlyCurrent { expected } = &self.convergence
+                    && !metadata_only_current_matches(expected, &observed)
+                {
+                    return Err(conflict(
+                        "MV carrier changed during metadata-only Current renewal".into(),
+                    ));
                 }
                 return Ok((observed, admission));
             }
@@ -984,13 +984,12 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
             )
             .map_err(|e| conflict(e.to_string()))?;
         }
-        if let Some(published) = self.published {
-            if observed.publication_snapshot != Some(published.snapshot_id) {
-                return Err(conflict(
-                    "MV Current observation did not retain the committed publication carrier"
-                        .into(),
-                ));
-            }
+        if let Some(published) = self.published
+            && observed.publication_snapshot != Some(published.snapshot_id)
+        {
+            return Err(conflict(
+                "MV Current observation did not retain the committed publication carrier".into(),
+            ));
         }
         let admission = self
             .entrance

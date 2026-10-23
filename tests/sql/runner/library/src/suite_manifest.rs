@@ -60,14 +60,11 @@ pub struct ImpactDeclaration {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ReuseScope {
+    #[default]
     Suite,
     Case,
-}
-impl Default for ReuseScope {
-    fn default() -> Self {
-        Self::Suite
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

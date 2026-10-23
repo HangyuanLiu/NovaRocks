@@ -1005,8 +1005,7 @@ fn json_object_checked_creator_keeps_original_owner_and_primary_refusals() {
             &mut creation,
             control,
         )
-        .err()
-        .expect("actual creator refusal precedes checked preparation");
+        .expect_err("actual creator refusal precedes checked preparation");
     let CheckedCallPreparationFailure::Binding(FunctionBindingCreationFailure::Creator(cause)) =
         error
     else {

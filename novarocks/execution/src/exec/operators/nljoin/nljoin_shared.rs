@@ -127,9 +127,7 @@ impl NlJoinSharedState {
                             local.len()
                         );
                     }
-                    for (shared_batch, local_batch) in
-                        shared_flags.iter_mut().zip(local.into_iter())
-                    {
+                    for (shared_batch, local_batch) in shared_flags.iter_mut().zip(local) {
                         if shared_batch.len() != local_batch.len() {
                             panic!(
                                 "nljoin build match flags row mismatch: shared={} local={}",
@@ -137,9 +135,7 @@ impl NlJoinSharedState {
                                 local_batch.len()
                             );
                         }
-                        for (shared_flag, local_flag) in
-                            shared_batch.iter_mut().zip(local_batch.into_iter())
-                        {
+                        for (shared_flag, local_flag) in shared_batch.iter_mut().zip(local_batch) {
                             *shared_flag |= local_flag;
                         }
                     }

@@ -469,7 +469,7 @@ impl OperatorLifecycle for CompiledHashJoinBuildSink {
             return Ok(());
         };
         if let Some(error) = filters.create_error.take() {
-            return Err(error.into());
+            return Err(error);
         }
         match filters.producers.as_mut() {
             Some(producers) => Ok(producers.bind(filters.local_partition_count)?),
@@ -480,7 +480,7 @@ impl OperatorLifecycle for CompiledHashJoinBuildSink {
         let _ = self.fail_runtime_filters(RuntimeFilterProducerFailure::Cancelled);
     }
     fn close(&mut self) -> ExecutionResult<()> {
-        Ok(self.fail_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed)?)
+        self.fail_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed)
     }
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
         self.control.bind_mem_tracker(Arc::clone(&tracker));
@@ -505,12 +505,12 @@ impl crate::exec::pipeline::shape::SinkKernel for CompiledHashJoinBuildSink {
         }
         let chunk = input.into_uncovered_chunk()?;
         let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
-        if !chunk.is_empty() {
-            if let Err(failure) = self.push_build_chunk(chunk) {
-                ctx.report_failure(failure.clone());
-                let _ = self.fail_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed);
-                return Err(failure);
-            }
+        if !chunk.is_empty()
+            && let Err(failure) = self.push_build_chunk(chunk)
+        {
+            ctx.report_failure(failure.clone());
+            let _ = self.fail_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed);
+            return Err(failure);
         }
         Ok(SinkStep::new(NextStep::NeedInput, rows))
     }
@@ -585,8 +585,7 @@ impl CompiledHashJoinBuildSink {
         // The producers observe the same evaluated key arrays the table is
         // built from, after the build accepted the chunk.
         let submitted = self.runtime_filters.is_some().then(|| keys.clone());
-        self.key_batches
-            .push(BuildKeyBatch::new(keys, rows).map_err(ExecutionFailure::from)?);
+        self.key_batches.push(BuildKeyBatch::new(keys, rows)?);
         if self.plan.requirements.requires_row_payload() {
             self.store.push_chunk_owned(&chunk, owner.as_ref())?;
             if let Some(tracker) = self.chunks_tracker.as_ref() {
@@ -624,23 +623,20 @@ impl CompiledHashJoinBuildSink {
                     .iter()
                     .map(|array| array.data_type().clone())
                     .collect::<Vec<_>>();
-                Some(
-                    JoinHashMap::build_from_key_batches_with_tracker(
-                        key_types,
-                        self.plan.eq_null_safe.clone(),
-                        &self.key_batches,
-                        JoinHashMapBuildOptions {
-                            purpose: requirements.join_hash_map_purpose().ok_or_else(|| {
-                                hash_join_contract(
-                                    "compiled hash join lookup purpose missing for keyed build",
-                                )
-                            })?,
-                            ..JoinHashMapBuildOptions::default()
-                        },
-                        self.table_tracker.as_ref().map(Arc::clone),
-                    )
-                    .map_err(ExecutionFailure::from)?,
-                )
+                Some(JoinHashMap::build_from_key_batches_with_tracker(
+                    key_types,
+                    self.plan.eq_null_safe.clone(),
+                    &self.key_batches,
+                    JoinHashMapBuildOptions {
+                        purpose: requirements.join_hash_map_purpose().ok_or_else(|| {
+                            hash_join_contract(
+                                "compiled hash join lookup purpose missing for keyed build",
+                            )
+                        })?,
+                        ..JoinHashMapBuildOptions::default()
+                    },
+                    self.table_tracker.as_ref().map(Arc::clone),
+                )?)
             }
             None => None,
         };
@@ -666,12 +662,8 @@ impl CompiledHashJoinBuildSink {
             self.has_null_key,
             self.null_key_rows.take().map(Arc::new),
         ));
-        artifact
-            .validate_components(requirements)
-            .map_err(ExecutionFailure::from)?;
-        self.state
-            .set_build(artifact)
-            .map_err(ExecutionFailure::from)?;
+        artifact.validate_components(requirements)?;
+        self.state.set_build(artifact)?;
         self.finish_runtime_filters()?;
         Ok(())
     }
@@ -983,8 +975,7 @@ impl CompiledHashJoinProbe {
             .ok_or_else(|| hash_join_contract("compiled hash join build is not ready"))?;
         let row_count = artifact.build_row_count;
         let has_null_key = artifact.build_has_null_key;
-        let view =
-            BuildView::new(artifact, self.plan.requirements).map_err(ExecutionFailure::from)?;
+        let view = BuildView::new(artifact, self.plan.requirements)?;
         self.build = Some(LoadedBuild {
             table: view.build_table(),
             chunk: view.optional_build_chunk(),
@@ -1065,11 +1056,7 @@ impl CompiledHashJoinProbe {
             )
         {
             let matched = match table {
-                Some(table) => table
-                    .search_membership_arrays(&arrays, rows)
-                    .map_err(ExecutionFailure::from)?
-                    .0
-                    .into_vec(),
+                Some(table) => table.search_membership_arrays(&arrays, rows)?.0.into_vec(),
                 None => vec![false; rows],
             };
             let keep = match self.plan.join_type {
@@ -1090,9 +1077,7 @@ impl CompiledHashJoinProbe {
             return self.keep_probe(&chunk, &vec![true; rows]);
         }
         let groups = match table {
-            Some(table) => table
-                .lookup_group_ids_arrays(&arrays, rows)
-                .map_err(ExecutionFailure::from)?,
+            Some(table) => table.lookup_group_ids_arrays(&arrays, rows)?,
             None => vec![None; rows],
         };
         self.cursor = Some(HashProbeCursor {

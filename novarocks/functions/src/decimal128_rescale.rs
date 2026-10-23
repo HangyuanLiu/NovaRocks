@@ -71,11 +71,11 @@ impl novarocks_failure_contract::FailureProjection for DecimalCastFailure {
             Self::FloatFactor(_) => (FailureClass::Invariant, 220),
             _ => (FailureClass::Invariant, 221),
         };
-        let fact = FailureFact::new(
+
+        FailureFact::new(
             class,
             FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(code).unwrap()),
-        );
-        fact
+        )
     }
 }
 /// Value and outer witnesses can only be constructed by this domain's classifier.

@@ -99,17 +99,15 @@ impl MysqlWriteGateHub {
             .scope
             .as_ref()
             .is_some_and(|scope| scope.snapshot().blocked_after_acceptance);
-        if reached {
-            if let Some(observation) = self
+        if reached
+            && let Some(observation) = self
                 .action_observation
                 .lock()
                 .expect("original observation lock")
                 .as_ref()
-            {
-                if observation.record_hit().is_err() {
-                    self.fail(GateFailure::Transition);
-                }
-            }
+            && observation.record_hit().is_err()
+        {
+            self.fail(GateFailure::Transition);
         }
     }
 
@@ -1287,7 +1285,7 @@ mod tests {
                         Case::EarlyStreaming => writer_hub.bind_statement(connection, followup_statement(), HEALTHY_SQL)
                             .err().expect("early streaming query is refused"),
                         Case::EarlyLocal => writer_hub.reject_non_streaming_target(connection, HEALTHY_SQL)
-                            .err().expect("early local query is refused"),
+                            .expect_err("early local query is refused"),
                         _ => unreachable!(),
                     };
                     assert_eq!(failure.kind(), io::ErrorKind::InvalidData);
@@ -1387,13 +1385,14 @@ mod tests {
                         break;
                     }
                     length += n;
-                    if case.has_rows() && length >= prefix_at {
-                        if let Some(sender) = prefix_tx.take() {
-                            let prefix = [observed[prefix_at - 2], observed[prefix_at - 1]];
-                            sender
-                                .send(prefix)
-                                .map_err(|_| io::Error::other("fixture prefix receiver closed"))?;
-                        }
+                    if case.has_rows()
+                        && length >= prefix_at
+                        && let Some(sender) = prefix_tx.take()
+                    {
+                        let prefix = [observed[prefix_at - 2], observed[prefix_at - 1]];
+                        sender
+                            .send(prefix)
+                            .map_err(|_| io::Error::other("fixture prefix receiver closed"))?;
                     }
                 }
                 wire_tx

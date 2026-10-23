@@ -1142,15 +1142,15 @@ impl<R> Drop for DispatchClaim<R> {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(entry) = state.entries.get_mut(&self.key) {
-                if matches!(entry.phase, EntryPhase::Claimed) {
-                    entry.phase = EntryPhase::Concluded(DispatchEvidence::NotDispatched {
-                        failure: ConnectorMutationFailure::new(
-                            ConnectorMutationFailureKind::Unavailable,
-                            "Publication barrier did not grant external dispatch",
-                        ),
-                    });
-                }
+            if let Some(entry) = state.entries.get_mut(&self.key)
+                && matches!(entry.phase, EntryPhase::Claimed)
+            {
+                entry.phase = EntryPhase::Concluded(DispatchEvidence::NotDispatched {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Unavailable,
+                        "Publication barrier did not grant external dispatch",
+                    ),
+                });
             }
         }
     }

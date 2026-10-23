@@ -159,10 +159,10 @@ impl QueryAttemptReservation {
         #[cfg(novarocks_dev_controls)]
         if let Some(nomination) = nomination {
             nomination.validate().map_err(|error| error.to_string())?;
-            if let Err(candidate) = self.test_nomination.set(nomination.clone()) {
-                if self.test_nomination.get() != Some(&candidate) {
-                    return Err("attempt reservation already names another statement".into());
-                }
+            if let Err(candidate) = self.test_nomination.set(nomination.clone())
+                && self.test_nomination.get() != Some(&candidate)
+            {
+                return Err("attempt reservation already names another statement".into());
             }
             let installed =
                 context.request_scope_extension_or_insert_with(|| nomination.as_ref().clone());

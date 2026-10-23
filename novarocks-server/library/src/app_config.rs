@@ -626,22 +626,12 @@ struct NativeTrustConfigWire {
 
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 struct NativeTrustTransportConfigWire {
     mode: Option<String>,
     certificate_chain_path: Option<PathBuf>,
     private_key_path: Option<PathBuf>,
     trust_roots_path: Option<PathBuf>,
-}
-
-impl Default for NativeTrustTransportConfigWire {
-    fn default() -> Self {
-        Self {
-            mode: None,
-            certificate_chain_path: None,
-            private_key_path: None,
-            trust_roots_path: None,
-        }
-    }
 }
 
 fn deserialize_native_trust_config<'de, D>(

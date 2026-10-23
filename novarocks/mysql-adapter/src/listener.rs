@@ -519,9 +519,8 @@ mod tests {
             tokio::select! {
                 result = &mut server, if server_result.is_none() => server_result = Some(result),
                 result = &mut client, if client_result.is_none() => {
-                    if result.is_err() {
-                        if let Some(sender) = drain.lock().unwrap().take() { let _ = sender.send(()); }
-                    }
+                    if result.is_err()
+                        && let Some(sender) = drain.lock().unwrap().take() { let _ = sender.send(()); }
                     client_result = Some(result);
                 },
                 _ = &mut deadline => { timed_out = true; break; },

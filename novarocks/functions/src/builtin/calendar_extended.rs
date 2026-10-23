@@ -149,7 +149,7 @@ impl<'a> DateInput<'a> {
                         "failed to downcast to Date32Array",
                     ))
             }
-            DataType::Timestamp(unit, _) => Ok(Self::RawTimestamp(array, unit.clone())),
+            DataType::Timestamp(unit, _) => Ok(Self::RawTimestamp(array, *unit)),
             DataType::Utf8 => {
                 array
                     .as_any()

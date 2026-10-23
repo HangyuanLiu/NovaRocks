@@ -613,10 +613,10 @@ pub(super) fn validate<H>(
         }
         _ => {
             let actual = scalars::validate(kind, context)?;
-            if let P::Timestamp(value) = kind {
-                if let Some(zone) = &value.timezone {
-                    counts.string(zone.len(), limits)?;
-                }
+            if let P::Timestamp(value) = kind
+                && let Some(zone) = &value.timezone
+            {
+                counts.string(zone.len(), limits)?;
             }
             let expected = logical
                 .get_observed(id, context.work)?

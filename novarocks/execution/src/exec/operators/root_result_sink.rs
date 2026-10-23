@@ -761,9 +761,7 @@ mod tests {
         fn fail(&self) {
             *self.state.lock().unwrap() = RootProducerState::Failed(
                 novarocks_functions::KernelFailure::Internal(
-                    novarocks_functions::KernelDiagnostic::new(
-                        &("root producer failed".to_string()),
-                    ),
+                    novarocks_functions::KernelDiagnostic::new("root producer failed"),
                 )
                 .into(),
             );
@@ -1590,7 +1588,6 @@ mod tests {
                     }
                 }
             })()
-            .map_err(Into::into)
         }
         fn release_root_workspace(&mut self) {
             if self.workspace.is_some() {

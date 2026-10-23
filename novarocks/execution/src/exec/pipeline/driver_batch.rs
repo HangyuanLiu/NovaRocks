@@ -110,12 +110,11 @@ impl Phase {
             }
         }
         for slot in [0, 2, 4] {
-            if let Some(payload) = self.payloads[slot].take() {
-                if let Err(secondary) =
+            if let Some(payload) = self.payloads[slot].take()
+                && let Err(secondary) =
                     catch_unwind(AssertUnwindSafe(|| drop(ManuallyDrop::into_inner(payload))))
-                {
-                    self.payloads[slot + 1] = Some(ManuallyDrop::new(secondary));
-                }
+            {
+                self.payloads[slot + 1] = Some(ManuallyDrop::new(secondary));
             }
         }
     }
@@ -262,11 +261,11 @@ impl DriverBatch {
     pub(crate) fn defer_activation(&self) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         for slot in state.slots.iter_mut().filter_map(Option::as_mut) {
-            if !slot.activation_held {
-                if let Some(completion) = slot.activation.as_ref() {
-                    completion.defer_start();
-                    slot.activation_held = true;
-                }
+            if !slot.activation_held
+                && let Some(completion) = slot.activation.as_ref()
+            {
+                completion.defer_start();
+                slot.activation_held = true;
             }
         }
     }

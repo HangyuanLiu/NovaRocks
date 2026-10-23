@@ -407,9 +407,9 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler_and_sche
                 "compiled root sink width exceeds i32",
             )
         })?;
-    let execution_runtime = runtime_state.execution_runtime().ok_or_else(|| {
-        crate::runtime::runtime_state::RuntimeBindingFailure::MissingExecutionRuntime
-    })?;
+    let execution_runtime = runtime_state
+        .execution_runtime()
+        .ok_or({ crate::runtime::runtime_state::RuntimeBindingFailure::MissingExecutionRuntime })?;
     let ordered = CompiledOrderedFilterContext::for_program(&program, &runtime_state)?;
     let graph = build_compiled_pipeline_graph_typed(
         &program,
@@ -840,9 +840,7 @@ mod tests {
         );
         let previous = running.conclusion().unwrap().unwrap_err();
         running.fail(novarocks_functions::KernelFailure::Internal(
-            novarocks_functions::KernelDiagnostic::new(
-                &("later identical-looking failure".to_owned()),
-            ),
+            novarocks_functions::KernelDiagnostic::new("later identical-looking failure"),
         ));
         assert!(
             running
@@ -1675,9 +1673,7 @@ mod tests {
 
         let running = manually_prepared_execution(driver, runtime_state, None).start_failed(
             novarocks_functions::KernelFailure::Internal(
-                novarocks_functions::KernelDiagnostic::new(
-                    &("injected prestart failure".to_string()),
-                ),
+                novarocks_functions::KernelDiagnostic::new("injected prestart failure"),
             ),
         );
         assert_eq!(
@@ -1816,9 +1812,7 @@ mod tests {
             runtime_state
                 .error_state()
                 .set_error(novarocks_functions::KernelFailure::Internal(
-                    novarocks_functions::KernelDiagnostic::new(
-                        &("test cleanup after timeout".to_string()),
-                    ),
+                    novarocks_functions::KernelDiagnostic::new("test cleanup after timeout"),
                 ));
             ready.store(true, Ordering::Release);
             let notifier = observable.defer_notify();

@@ -72,19 +72,6 @@ fn parse_access_domain(value: &str) -> Result<StorageAccessDomainId> {
     Ok(StorageAccessDomainId::from_bytes(bytes))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_access_domain;
-
-    #[test]
-    fn access_domain_requires_lowercase_32_byte_hex() {
-        assert!(parse_access_domain(&"ab".repeat(32)).is_ok());
-        assert!(parse_access_domain(&"AB".repeat(32)).is_err());
-        assert!(parse_access_domain(&"gg".repeat(32)).is_err());
-        assert!(parse_access_domain(&"a".repeat(63)).is_err());
-    }
-}
-
 fn probe_parquet_bytes(path: &str, bytes: Bytes) -> Result<ParquetProbe> {
     let reader = SerializedFileReader::new(bytes.clone())
         .with_context(|| format!("parquet open: {path}"))?;
@@ -291,4 +278,17 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_access_domain;
+
+    #[test]
+    fn access_domain_requires_lowercase_32_byte_hex() {
+        assert!(parse_access_domain(&"ab".repeat(32)).is_ok());
+        assert!(parse_access_domain(&"AB".repeat(32)).is_err());
+        assert!(parse_access_domain(&"gg".repeat(32)).is_err());
+        assert!(parse_access_domain(&"a".repeat(63)).is_err());
+    }
 }

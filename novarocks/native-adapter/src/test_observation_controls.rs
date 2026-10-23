@@ -744,10 +744,10 @@ impl TestEventObserver for GrantedObservation {
         }
         println!("{event}");
         let _ = std::io::Write::flush(&mut std::io::stdout());
-        if state.events == 0 {
-            if let Some(claim) = state.claim.as_mut() {
-                let _ = claim.record_hit();
-            }
+        if state.events == 0
+            && let Some(claim) = state.claim.as_mut()
+        {
+            let _ = claim.record_hit();
         }
         state.events += 1;
     }

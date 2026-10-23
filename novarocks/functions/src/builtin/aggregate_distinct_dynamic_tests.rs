@@ -45,10 +45,10 @@ impl AggregateStateAllocator for Host {
         let mut ledger = self.ledger.lock().unwrap();
         let at = ledger.attempts;
         ledger.attempts += 1;
-        if let Some((ordinal, error)) = &*self.refusal.lock().unwrap() {
-            if *ordinal == at {
-                return Err(error.clone());
-            }
+        if let Some((ordinal, error)) = &*self.refusal.lock().unwrap()
+            && *ordinal == at
+        {
+            return Err(error.clone());
         }
         let next = ledger
             .bytes

@@ -129,7 +129,7 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 fn exact_positive_milliseconds(duration: Duration) -> io::Result<u64> {
-    if duration.is_zero() || duration.subsec_nanos() % 1_000_000 != 0 {
+    if duration.is_zero() || !duration.subsec_nanos().is_multiple_of(1_000_000) {
         return Err(invalid(
             "MySQL startup duration must be positive exact milliseconds",
         ));

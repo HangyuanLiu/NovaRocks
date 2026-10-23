@@ -23,18 +23,17 @@ pub fn emit_task_fetch_marker(
     if !controls.owns_backend(identity.backend_process_id()) {
         return Err("task fetch observation names another backend process".into());
     }
-    if should_emit_typed_fetch_marker(status, packet_seq, eos) {
-        if let Some(observer) =
+    if should_emit_typed_fetch_marker(status, packet_seq, eos)
+        && let Some(observer) =
             controls.observation_for("grpc-fragment", identity.query_execution_id())?
-        {
-            observer.observe(&typed_fetch_marker(
-                identity,
-                status,
-                packet_seq,
-                eos,
-                payload_bytes,
-            ));
-        }
+    {
+        observer.observe(&typed_fetch_marker(
+            identity,
+            status,
+            packet_seq,
+            eos,
+            payload_bytes,
+        ));
     }
     Ok(())
 }

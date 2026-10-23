@@ -480,17 +480,16 @@ async fn audit_predecessor(
             .previous
             .clone()
             .or_else(|| {
-                if proof.metadata_location.as_deref() == Some(location.as_str()) {
-                    if let MetadataPredecessorObservation::Candidate {
+                if proof.metadata_location.as_deref() == Some(location.as_str())
+                    && let MetadataPredecessorObservation::Candidate {
                         location,
                         timestamp_ms,
                     } = &proof.metadata_predecessor
-                    {
-                        return Some(crate::iceberg::spec::MetadataLog {
-                            metadata_file: location.clone(),
-                            timestamp_ms: *timestamp_ms,
-                        });
-                    }
+                {
+                    return Some(crate::iceberg::spec::MetadataLog {
+                        metadata_file: location.clone(),
+                        timestamp_ms: *timestamp_ms,
+                    });
                 }
                 None
             })

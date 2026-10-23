@@ -4008,10 +4008,10 @@ fn runtime_filter_grouped_parent_observed_control_retains_every_first_refusal() 
             let mut trace = self.trace.lock().unwrap();
             let at = trace.len();
             trace.push(units);
-            if let Some((refuse_at, cause)) = self.refusal.clone() {
-                if at == refuse_at {
-                    return Err(cause);
-                }
+            if let Some((refuse_at, cause)) = self.refusal.clone()
+                && at == refuse_at
+            {
+                return Err(cause);
             }
             Ok(())
         }

@@ -106,6 +106,12 @@ impl novarocks_execution_contract::failure::FailureProjection for ReadExecutionR
     }
 }
 
+impl Default for TypedReadAttemptContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TypedReadAttemptContext {
     pub fn new() -> Self {
         Self {

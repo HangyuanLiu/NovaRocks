@@ -149,13 +149,13 @@ impl CanonicalScalar {
             PrimitiveLiteral::UInt128(v) => Self::Uuid(*v),
             PrimitiveLiteral::String(v) => Self::String(Arc::from(v.as_str())),
             PrimitiveLiteral::Binary(v) => {
-                if let PrimitiveType::Fixed(length) = value_type {
-                    if *length != v.len() as u64 {
-                        return Err(Error::new(
-                            Kind::InvalidFieldBinding,
-                            "Iceberg fixed scalar has the wrong length",
-                        ));
-                    }
+                if let PrimitiveType::Fixed(length) = value_type
+                    && *length != v.len() as u64
+                {
+                    return Err(Error::new(
+                        Kind::InvalidFieldBinding,
+                        "Iceberg fixed scalar has the wrong length",
+                    ));
                 }
                 Self::Binary(Arc::from(v.as_slice()))
             }
@@ -588,10 +588,10 @@ impl DeleteFact {
                 ));
             }
         }
-        if let DeleteKind::Position { exact_target } = &mut params.kind {
-            if exact_target.is_none() {
-                *exact_target = params.metrics.exact_position_target();
-            }
+        if let DeleteKind::Position { exact_target } = &mut params.kind
+            && exact_target.is_none()
+        {
+            *exact_target = params.metrics.exact_position_target();
         }
         Ok(Self {
             application: DeleteApplication {
@@ -727,14 +727,14 @@ impl DeleteObservation {
                     read: entry.file.read,
                     metrics: entry.file.metrics,
                 })?;
-                if let DeleteKind::DeletionVector { exact_target } = fact.kind() {
-                    if !dv_targets.insert(Arc::clone(exact_target)) {
-                        return Err(Error::new(
-                            Kind::MultipleDeletionVectors,
-                            format!("multiple live deletion vector entries target {exact_target}"),
-                        )
-                        .into());
-                    }
+                if let DeleteKind::DeletionVector { exact_target } = fact.kind()
+                    && !dv_targets.insert(Arc::clone(exact_target))
+                {
+                    return Err(Error::new(
+                        Kind::MultipleDeletionVectors,
+                        format!("multiple live deletion vector entries target {exact_target}"),
+                    )
+                    .into());
                 }
                 fact.provenance = Some(ManifestEntryProvenance {
                     manifest_path: Arc::clone(&manifest.manifest_path),
@@ -764,13 +764,13 @@ impl DeleteObservation {
             if !applications.insert(fact.application().clone()) {
                 continue;
             }
-            if let DeleteKind::DeletionVector { exact_target } = fact.kind() {
-                if !dv_targets.insert(Arc::clone(exact_target)) {
-                    return Err(Error::new(
-                        Kind::MultipleDeletionVectors,
-                        "normalized recall contains distinct DVs for one target",
-                    ));
-                }
+            if let DeleteKind::DeletionVector { exact_target } = fact.kind()
+                && !dv_targets.insert(Arc::clone(exact_target))
+            {
+                return Err(Error::new(
+                    Kind::MultipleDeletionVectors,
+                    "normalized recall contains distinct DVs for one target",
+                ));
             }
             retained.push(fact);
         }

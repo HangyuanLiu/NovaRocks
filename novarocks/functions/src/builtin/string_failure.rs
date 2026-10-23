@@ -292,7 +292,7 @@ pub(super) fn regex_syntax(source: &Arc<regex::Error>) -> Result<RegexSyntax, Ke
 }
 
 #[cfg(test)]
-pub(super) fn original_source<'a, E: Error + 'static>(failure: &'a KernelFailure) -> &'a E {
+pub(super) fn original_source<E: Error + 'static>(failure: &KernelFailure) -> &E {
     let mut source: &(dyn Error + 'static) = failure;
     loop {
         if let Some(source) = source.downcast_ref::<E>() {

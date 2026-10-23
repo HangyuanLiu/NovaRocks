@@ -220,7 +220,7 @@ fn absent_snapshot_selection_is_rejected_without_authorizing_property_delete() {
     let view = full(
         Some(30),
         vec![Snapshot::new(30, None)],
-        properties(&[orphan.clone()]),
+        properties(std::slice::from_ref(&orphan)),
         vec![],
     );
     assert_eq!(

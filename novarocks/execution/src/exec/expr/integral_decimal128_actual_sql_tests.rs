@@ -61,13 +61,11 @@ fn integral_decimal128_actual_sql_required_i64_to_four_zero_bound_source_and_fra
                 decimal_overflow_policy,
                 ..
             } = &node.kind
+                && *bound == target
+                && *fragment.expressions().get(*expr).unwrap().ty.data_type() == DataType::Int64
             {
-                if *bound == target
-                    && *fragment.expressions().get(*expr).unwrap().ty.data_type() == DataType::Int64
-                {
-                    count += 1;
-                    assert_eq!(*decimal_overflow_policy, DecimalOverflowPolicy::OutputNull);
-                }
+                count += 1;
+                assert_eq!(*decimal_overflow_policy, DecimalOverflowPolicy::OutputNull);
             }
         }
     }

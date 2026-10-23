@@ -266,7 +266,7 @@ impl IcebergTypedBoundary {
             descriptor: self.descriptor.clone(),
             incarnation: self.incarnation,
             catalog_handle: self.catalog_handle.clone(),
-            transaction: self.transaction.clone(),
+            transaction: self.transaction,
             runtime: Arc::clone(&self.runtime),
             request_context: Some(request_context),
             request_pinned_physical_tables: Some(Arc::new(Mutex::new(HashMap::new()))),
@@ -286,7 +286,7 @@ impl IcebergTypedBoundary {
             descriptor: self.descriptor.clone(),
             incarnation: self.incarnation,
             catalog_handle: self.catalog_handle.clone(),
-            transaction: self.transaction.clone(),
+            transaction: self.transaction,
             runtime: Arc::clone(&self.runtime),
             request_context: Some(request_context),
             request_pinned_physical_tables: Some(tables),
@@ -948,7 +948,7 @@ impl ProviderReadRuntime for IcebergTypedBoundary {
     }
 
     fn transaction(&self) -> Self::Transaction {
-        self.transaction.clone()
+        self.transaction
     }
 }
 
@@ -981,7 +981,7 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
         let mut columns = Vec::new();
         for metadata in ALWAYS_BOUND_METADATA_COLUMNS
             .into_iter()
-            .chain(ROW_LINEAGE_METADATA_COLUMNS.into_iter())
+            .chain(ROW_LINEAGE_METADATA_COLUMNS)
         {
             let Ok(signed) = source
                 .signed_source
@@ -1577,16 +1577,14 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
         constraint: &Constraint<IcebergColumnHandle>,
     ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> {
         match table {
-            crate::typed_read::IcebergRuntimeRelation::ChangeWindow(handle) => {
-                return Ok(Box::new(IcebergRuntimeSplitSource::new(
-                    self.change_window_split_source(handle)?,
-                )));
-            }
+            crate::typed_read::IcebergRuntimeRelation::ChangeWindow(handle) => Ok(Box::new(
+                IcebergRuntimeSplitSource::new(self.change_window_split_source(handle)?),
+            )),
             crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) => {
-                return self.system_relation_runtime_split_source(reference);
+                self.system_relation_runtime_split_source(reference)
             }
             crate::typed_read::IcebergRuntimeRelation::TableExecute(handle) => {
-                return self.table_execute_runtime_split_source(handle);
+                self.table_execute_runtime_split_source(handle)
             }
             crate::typed_read::IcebergRuntimeRelation::Table(handle) => {
                 let enumeration_handle = if columns.is_empty() {
@@ -1608,25 +1606,21 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
                 let initial_dynamic_filter_wait = (!dynamic_filter_columns.is_empty())
                     .then_some(std::time::Duration::from_secs(1))
                     .unwrap_or_default();
-                return Ok(Box::new(
+                Ok(Box::new(
                     IcebergRuntimeSplitSource::new(IcebergSplitSource::try_new(
                         &enumeration_handle,
                         files,
                         self.split_source_options,
                     )?)
                     .with_initial_dynamic_filter_wait(initial_dynamic_filter_wait),
-                ));
+                ))
             }
-            crate::typed_read::IcebergRuntimeRelation::TableFunction(_) => {
-                return Err(unsupported(
-                    "iceberg table-function split enumeration is not implemented",
-                ));
-            }
-            crate::typed_read::IcebergRuntimeRelation::MergeTable(_) => {
-                return Err(unsupported(
-                    "iceberg merge split enumeration is not implemented",
-                ));
-            }
+            crate::typed_read::IcebergRuntimeRelation::TableFunction(_) => Err(unsupported(
+                "iceberg table-function split enumeration is not implemented",
+            )),
+            crate::typed_read::IcebergRuntimeRelation::MergeTable(_) => Err(unsupported(
+                "iceberg merge split enumeration is not implemented",
+            )),
         }
     }
 }

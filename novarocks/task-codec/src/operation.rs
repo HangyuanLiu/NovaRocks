@@ -1415,13 +1415,13 @@ pub fn decode_receipt_header(
                 &verdict.safe_detail,
                 p.clone().field("safe_detail"),
             )?;
-            if let Some(field) = &verdict.safe_field_path {
-                if field.len() > novarocks_execution_contract::status::SAFE_FIELD_PATH_MAX_BYTES {
-                    return Err(out_of_range(
-                        p.field("safe_field_path"),
-                        "safe field path exceeds the redacted text limit",
-                    ));
-                }
+            if let Some(field) = &verdict.safe_field_path
+                && field.len() > novarocks_execution_contract::status::SAFE_FIELD_PATH_MAX_BYTES
+            {
+                return Err(out_of_range(
+                    p.field("safe_field_path"),
+                    "safe field path exceeds the redacted text limit",
+                ));
             }
             OperationResult::Verdict {
                 outcome,

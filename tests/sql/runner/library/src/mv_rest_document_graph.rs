@@ -163,7 +163,7 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
         "last publication can have only one expected physical write shape"
     );
     ensure!(
-        table_commits.is_none_or(|commits| commits >= publications + slot_changes + 1),
+        table_commits.is_none_or(|commits| commits > publications + slot_changes),
         "table-commits cannot be less than CREATE plus publication and slot commits"
     );
     let (namespace, table) = target
@@ -510,21 +510,21 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
         "repartition did not retain two resolvable L versions"
     );
     for slot in [configuration, management] {
-        if let Some(writer) = slot.writer {
-            if let Some(snapshot) = by_id.get(&writer) {
-                ensure!(
-                    slot_ids.contains(&writer),
-                    "slot writer identifies a publication rather than slot snapshot"
-                );
-                let records = wire::records(&snapshot["summary"])?;
-                let parent = snapshot["parent-snapshot-id"]
-                    .as_i64()
-                    .and_then(|id| by_id.get(&id));
-                ensure!(
-                    parent.is_none_or(|p| wire::records(&p["summary"]).is_ok_and(|r| r == records)),
-                    "slot writer does not identify a carrying snapshot"
-                );
-            }
+        if let Some(writer) = slot.writer
+            && let Some(snapshot) = by_id.get(&writer)
+        {
+            ensure!(
+                slot_ids.contains(&writer),
+                "slot writer identifies a publication rather than slot snapshot"
+            );
+            let records = wire::records(&snapshot["summary"])?;
+            let parent = snapshot["parent-snapshot-id"]
+                .as_i64()
+                .and_then(|id| by_id.get(&id));
+            ensure!(
+                parent.is_none_or(|p| wire::records(&p["summary"]).is_ok_and(|r| r == records)),
+                "slot writer does not identify a carrying snapshot"
+            );
         }
     }
     if let Some(last) = last_publication {

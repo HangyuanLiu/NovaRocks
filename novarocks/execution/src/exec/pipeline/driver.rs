@@ -693,18 +693,18 @@ impl PipelineDriver {
         loop {
             let mut added = false;
             for watch in &watches {
-                if let FinishWatch::Notify(observable) = watch {
-                    if !self.is_finish_watched(observable) {
-                        let target = Arc::downgrade(&self.finish_observable);
-                        let subscription = observable.try_subscribe(Arc::new(move || {
-                            if let Some(target) = target.upgrade() {
-                                target.notify_observers();
-                            }
-                        }))?;
-                        self.finish_watched
-                            .push((Arc::downgrade(observable), subscription));
-                        added = true;
-                    }
+                if let FinishWatch::Notify(observable) = watch
+                    && !self.is_finish_watched(observable)
+                {
+                    let target = Arc::downgrade(&self.finish_observable);
+                    let subscription = observable.try_subscribe(Arc::new(move || {
+                        if let Some(target) = target.upgrade() {
+                            target.notify_observers();
+                        }
+                    }))?;
+                    self.finish_watched
+                        .push((Arc::downgrade(observable), subscription));
+                    added = true;
                 }
             }
             if !added {
@@ -1049,12 +1049,11 @@ impl PipelineDriver {
             // The exact returned wait belongs to the receiver, not the source.
             if let Some(AdmissionNext::Wait(wait)) =
                 downstream.and_then(OperatorInstance::admission_next)
+                && !wait.is_ready()
             {
-                if !wait.is_ready() {
-                    output_wait = true;
-                    self.frontier_waits.push(wait.clone());
-                    continue;
-                }
+                output_wait = true;
+                self.frontier_waits.push(wait.clone());
+                continue;
             }
             match operator.work_next() {
                 Some(NextStep::Wait(wait)) => {
@@ -1362,16 +1361,16 @@ impl PipelineDriver {
             self.state = DriverState::PendingFinish;
             return self.state.clone();
         }
-        if matches!(state, DriverState::Finished) {
-            if let Some(error) = self.runtime_state.error() {
-                state = DriverState::Failed(error);
-            }
+        if matches!(state, DriverState::Finished)
+            && let Some(error) = self.runtime_state.error()
+        {
+            state = DriverState::Failed(error);
         }
         self.close_operators();
-        if matches!(state, DriverState::Finished) {
-            if let Some(error) = self.runtime_state.error() {
-                state = DriverState::Failed(error);
-            }
+        if matches!(state, DriverState::Finished)
+            && let Some(error) = self.runtime_state.error()
+        {
+            state = DriverState::Failed(error);
         }
         // A synchronous hook cannot certify an asynchronous owner. Even an
         // exceptional hook which initiated exit remains owned until observed.
@@ -4397,7 +4396,8 @@ mod terminal_signal_tests {
         }
         #[test]
         fn driver_shares_accepted_encoding_without_new_scope_or_owner() {
-            for keep_encoding in [true] {
+            {
+                let keep_encoding = true;
                 let tracker = MemTracker::new_root("typed driver sharing");
                 let received = Arc::new(Mutex::new(None));
                 let factory = factory(&tracker, Arc::new(RuntimeErrorState::default()));

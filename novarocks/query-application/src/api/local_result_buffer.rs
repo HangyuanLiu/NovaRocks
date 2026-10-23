@@ -70,18 +70,18 @@ impl<T: Copy> LocalBuffer<T> {
     /// checked against the same whole logical bound before this call.
     pub(super) fn compact_tail(&mut self, growth: &mut Growth) -> Result<(), String> {
         let metadata = self.tail_metadata_bytes();
-        if let Some(tail) = self.blocks.last_mut() {
-            if tail.capacity() > tail.len() {
-                let old = tail.capacity();
-                growth.preflight_copy(tail.len() * size_of::<T>(), metadata)?;
-                let mut compact = Vec::new();
-                compact
-                    .try_reserve_exact(tail.len())
-                    .map_err(|_| allocation_error())?;
-                compact.extend_from_slice(tail);
-                *tail = compact;
-                self.capacity -= old - tail.capacity();
-            }
+        if let Some(tail) = self.blocks.last_mut()
+            && tail.capacity() > tail.len()
+        {
+            let old = tail.capacity();
+            growth.preflight_copy(tail.len() * size_of::<T>(), metadata)?;
+            let mut compact = Vec::new();
+            compact
+                .try_reserve_exact(tail.len())
+                .map_err(|_| allocation_error())?;
+            compact.extend_from_slice(tail);
+            *tail = compact;
+            self.capacity -= old - tail.capacity();
         }
         Ok(())
     }

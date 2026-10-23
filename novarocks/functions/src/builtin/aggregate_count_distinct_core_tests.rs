@@ -38,7 +38,6 @@ impl ScalarStateAllocator for TestAllocator {
         crate::KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
             operation, source,
         ))
-        .into()
     }
 }
 

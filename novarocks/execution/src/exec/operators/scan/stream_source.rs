@@ -640,10 +640,10 @@ impl OperatorLifecycle for StreamScanSourceOperator {
         let mut unwound = self.end_delivery();
         let (termination, termination_unwound) = self.request_termination_inner();
         unwound |= termination_unwound;
-        if let Err(error) = termination {
-            if let Some(signal) = &self.runtime_error {
-                signal.report_cleanup(&error);
-            }
+        if let Err(error) = termination
+            && let Some(signal) = &self.runtime_error
+        {
+            signal.report_cleanup(&error);
         }
         if unwound {
             resume_exit_unwind();

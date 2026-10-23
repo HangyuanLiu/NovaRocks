@@ -91,28 +91,28 @@ impl<'a> IntArrayView<'a> {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .map(Self::Int64)
-                .ok_or_else(|| AggregateViewFailure::PhysicalWrapper {
+                .ok_or(AggregateViewFailure::PhysicalWrapper {
                     expected: "Int64Array",
                 }),
             DataType::Int32 => array
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .map(Self::Int32)
-                .ok_or_else(|| AggregateViewFailure::PhysicalWrapper {
+                .ok_or(AggregateViewFailure::PhysicalWrapper {
                     expected: "Int32Array",
                 }),
             DataType::Int16 => array
                 .as_any()
                 .downcast_ref::<Int16Array>()
                 .map(Self::Int16)
-                .ok_or_else(|| AggregateViewFailure::PhysicalWrapper {
+                .ok_or(AggregateViewFailure::PhysicalWrapper {
                     expected: "Int16Array",
                 }),
             DataType::Int8 => array
                 .as_any()
                 .downcast_ref::<Int8Array>()
                 .map(Self::Int8)
-                .ok_or_else(|| AggregateViewFailure::PhysicalWrapper {
+                .ok_or(AggregateViewFailure::PhysicalWrapper {
                     expected: "Int8Array",
                 }),
             other => Err(AggregateViewFailure::Unsupported {
@@ -147,14 +147,14 @@ impl<'a> FloatArrayView<'a> {
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .map(Self::Float64)
-                .ok_or_else(|| AggregateViewFailure::PhysicalWrapper {
+                .ok_or(AggregateViewFailure::PhysicalWrapper {
                     expected: "Float64Array",
                 }),
             DataType::Float32 => array
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .map(Self::Float32)
-                .ok_or_else(|| AggregateViewFailure::PhysicalWrapper {
+                .ok_or(AggregateViewFailure::PhysicalWrapper {
                     expected: "Float32Array",
                 }),
             other => Err(AggregateViewFailure::Unsupported {

@@ -191,7 +191,7 @@ impl PreparedAggregateKernel for NdvKernel {
                 address,
                 &mut work,
                 |failure| EvaluationFailure::Kernel(failure.into_kernel()),
-                |cause| EvaluationFailure::Kernel(cause),
+                EvaluationFailure::Kernel,
             )?;
             if let Some(hash) = hash {
                 state.core.has_value = true;
@@ -339,7 +339,7 @@ impl PreparedAggregateKernel for NdvKernel {
                         )
                         .into(),
                     },
-                    |cause| EvaluationFailure::Kernel(cause),
+                    EvaluationFailure::Kernel,
                 )?;
             }
             Ok(())

@@ -479,10 +479,10 @@ fn bootstrap_guard(context: &RunContext, deadline: Instant) -> io::Result<()> {
     let waiter = std::thread::Builder::new()
         .name("test-retention-wait".into())
         .spawn(move || {
-            if let Ok(mut child) = receive.recv() {
-                if let Err(error) = child.wait() {
-                    eprintln!("wait test retention guard: {error}");
-                }
+            if let Ok(mut child) = receive.recv()
+                && let Err(error) = child.wait()
+            {
+                eprintln!("wait test retention guard: {error}");
             }
         })?;
     let absolute = unix::absolute_deadline(deadline)?;

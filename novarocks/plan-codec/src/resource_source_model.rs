@@ -98,15 +98,15 @@ const fn package_version<'a>(source: &'a [u8], name: &[u8]) -> Option<&'a [u8]> 
                 cursor += 1;
             }
             let record = source.split_at(start).1.split_at(cursor - start).0;
-            if let Some(actual) = field(record, b"name = \"") {
-                if equal(actual, name) {
-                    if found.is_some() {
-                        return None;
-                    }
-                    found = field(record, b"version = \"");
-                    if found.is_none() {
-                        return None;
-                    }
+            if let Some(actual) = field(record, b"name = \"")
+                && equal(actual, name)
+            {
+                if found.is_some() {
+                    return None;
+                }
+                found = field(record, b"version = \"");
+                if found.is_none() {
+                    return None;
                 }
             }
         } else {

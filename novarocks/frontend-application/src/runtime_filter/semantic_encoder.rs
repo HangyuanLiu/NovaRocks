@@ -37,7 +37,7 @@ pub(crate) struct EncodedRuntimeFilterDomain {
 
 impl EncodedRuntimeFilterDomain {
     pub(crate) fn value_type(&self) -> common::TypeDesc {
-        self.value_type.clone()
+        self.value_type
     }
 
     pub(crate) fn execution_types(&self) -> plan::ExecutionTypeTable {
@@ -131,9 +131,9 @@ pub(crate) fn encode_logical_domain(
             })?
             .digest();
             let (table, references) = encode_domain_type_refs(&[&value_type])?;
-            let value_type_wire = references[0].clone();
+            let value_type_wire = references[0];
             Ok(EncodedRuntimeFilterDomain {
-                value_type: value_type_wire.clone(),
+                value_type: value_type_wire,
                 execution_types: table.clone(),
                 contract: plan::RuntimeFilterContract {
                     logical_domain: Some(plan::RuntimeFilterTypeDomain {
@@ -226,10 +226,10 @@ pub(crate) fn encode_logical_domain(
             let order_contract_digest: [u8; 32] = order.finalize().into();
             let value_type = wire_keys
                 .first()
-                .and_then(|key| key.r#type.clone())
+                .and_then(|key| key.r#type)
                 .expect("ordered keys are nonempty and encoded");
             Ok(EncodedRuntimeFilterDomain {
-                value_type: value_type.clone(),
+                value_type,
                 execution_types: table.clone(),
                 contract: plan::RuntimeFilterContract {
                     logical_domain: Some(plan::RuntimeFilterTypeDomain {
@@ -294,7 +294,7 @@ fn encode_domain_type_refs(
             Ok(ExecutionTypeRoot {
                 id: u32::try_from(index)
                     .map_err(|_| contract_error("runtime filter type ID overflows"))?,
-                value: *value,
+                value,
             })
         })
         .collect::<Result<Vec<_>, DistributedQueryError>>()?;

@@ -375,6 +375,14 @@ pub fn format_timestamp_for_varchar(unit: &TimeUnit, value: i64, tz: Option<&str
     }
 }
 
+/// The v1 test adapter enters the same observed byte computation.
+pub fn murmur_hash3_32(data: &[u8], seed: u32) -> u32 {
+    let mut work = EvaluationCheckpoints::new(&super::string_extended::DirectStringControl);
+    let value = hash(data, seed, &mut work).expect("unrestricted legacy Murmur3 control");
+    work.finish().expect("unrestricted legacy Murmur3 control");
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,12 +438,4 @@ mod tests {
         ));
         assert_eq!(control.calls.load(Ordering::Relaxed), 2);
     }
-}
-
-/// The v1 test adapter enters the same observed byte computation.
-pub fn murmur_hash3_32(data: &[u8], seed: u32) -> u32 {
-    let mut work = EvaluationCheckpoints::new(&super::string_extended::DirectStringControl);
-    let value = hash(data, seed, &mut work).expect("unrestricted legacy Murmur3 control");
-    work.finish().expect("unrestricted legacy Murmur3 control");
-    value
 }

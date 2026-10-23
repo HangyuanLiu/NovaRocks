@@ -546,24 +546,23 @@ impl PreparedAggregateKernel for TopKKernel {
                 .clone()
                 .ok_or_else(|| invalid("approx_top_k update requires its actual host allocator"))?;
             let (allocator, mapping) = mapped_domain(mapping, input.selection(), host, work)?;
-            if input.logical_arguments().len() == 1 {
-                if let Some(recipe) =
+            if input.logical_arguments().len() == 1
+                && let Some(recipe) =
                     core::update_input_failure(input.logical_arguments()[0].array())
-                {
-                    return Err(topk_error(
-                        KernelFailure::from_domain(recipe),
-                        &mut FailureSink {
-                            allocator: &allocator,
-                            domain: FailureDomain::Mutation {
-                                contract: &self.contract,
-                                phase: AggregateInvocationPhase::Update,
-                                selection: input.selection(),
-                                mapping: &mapping,
-                            },
-                            control,
+            {
+                return Err(topk_error(
+                    KernelFailure::from_domain(recipe),
+                    &mut FailureSink {
+                        allocator: &allocator,
+                        domain: FailureDomain::Mutation {
+                            contract: &self.contract,
+                            phase: AggregateInvocationPhase::Update,
+                            selection: input.selection(),
+                            mapping: &mapping,
                         },
-                    ));
-                }
+                        control,
+                    },
+                ));
             }
             Ok(TopKUpdate {
                 input,

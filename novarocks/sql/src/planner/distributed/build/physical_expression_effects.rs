@@ -744,9 +744,7 @@ fn primitive_own_effects(
 /// kind has no effect author without dumping its operands.
 fn expression_kind_label(kind: &ExprKind) -> Box<str> {
     let debug = format!("{kind:?}");
-    let end = debug
-        .find(|c: char| c == ' ' || c == '{' || c == '(')
-        .unwrap_or(debug.len());
+    let end = debug.find([' ', '{', '(']).unwrap_or(debug.len());
     match kind {
         ExprKind::Unary { op, .. } => format!("Unary({op:?})").into(),
         _ => debug[..end].into(),

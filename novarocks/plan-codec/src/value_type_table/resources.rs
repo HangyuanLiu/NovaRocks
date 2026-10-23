@@ -70,10 +70,10 @@ impl<H> Context<'_, '_, H> {
         self.work.step().map_err(Into::into)
     }
     pub(crate) fn allocate(&mut self, allocation: Layout) -> Result<(), Failure<H>> {
-        if allocation.size() != 0 {
-            if let Some(observe) = self.observe_scope.as_deref_mut() {
-                observe(allocation)?;
-            }
+        if allocation.size() != 0
+            && let Some(observe) = self.observe_scope.as_deref_mut()
+        {
+            observe(allocation)?;
         }
         admit(self.request, allocation)
     }

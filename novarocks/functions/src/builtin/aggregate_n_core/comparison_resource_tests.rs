@@ -44,7 +44,7 @@ impl ScalarStateAllocator for TestAllocator {
         _: &str,
         _source: E,
     ) -> crate::KernelFailure {
-        KernelFailure::ResourceExhausted.into()
+        KernelFailure::ResourceExhausted
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

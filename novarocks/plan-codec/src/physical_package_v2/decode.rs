@@ -1235,7 +1235,7 @@ fn decode_fragment_package_factory_core<
         plan_limits,
         work,
     )?;
-    let fragment = if let Some(creator) = creation.as_deref_mut() {
+    let fragment = if let Some(creator) = creation {
         fragment.with_call_requests_created_in(requests, request_storage, creator, work)?
     } else {
         fragment.with_call_requests_in(requests, work)?

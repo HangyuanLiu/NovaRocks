@@ -203,14 +203,12 @@ fn protocol_type(
         false,
         storage.clone(),
         |_| growth.check(),
-    )
-    .map_err(|e| e)?;
+    )?;
     let layout = novarocks_type_contract::ValueLayout::try_from_normalized_arrow_observed(
         ty,
         storage.clone(),
         |_| growth.check(),
-    )
-    .map_err(|e| e)?;
+    )?;
     let binding = novarocks_type_contract::TypedValueBinding::try_new(value, layout)
         .map_err(BuildError::ValueType)?;
     FunctionValueType::try_from_typed_binding(binding)

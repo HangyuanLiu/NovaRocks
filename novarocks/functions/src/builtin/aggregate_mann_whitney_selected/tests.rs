@@ -333,7 +333,7 @@ fn mann_whitney_selected_real_framework_state_iterator_keeps_order_and_last_alia
         &[Some(false), Some(false), Some(true), Some(true)],
         &["two-sided"; 4],
     );
-    let evaluated = arrays.each_ref().map(|a| EvaluatedArgument::Column(a));
+    let evaluated = arrays.each_ref().map(EvaluatedArgument::Column);
     let input = selected(&kernel, &evaluated, Selection::all(4));
     {
         let mut frame = column
@@ -440,7 +440,7 @@ fn mann_whitney_selected_owns_mapping_and_original_full_update_data() {
     let control = Control::default();
     let invalid_alt = "INVALID-".repeat(150);
     let arrays = args(&[1], &[Some(true)], &[&invalid_alt]);
-    let evaluated = arrays.each_ref().map(|a| EvaluatedArgument::Column(a));
+    let evaluated = arrays.each_ref().map(EvaluatedArgument::Column);
     let input = selected(&kernel, &evaluated, Selection::all(1));
     let mut mapping = vec![7];
     let prepared = kernel
@@ -487,7 +487,7 @@ fn mann_whitney_selected_empty_update_validates_original_setup() {
     let kernel = kernel(AggregateKernelPhase::Single);
     let control = Control::default();
     let arrays = args(&[], &[], &[]);
-    let evaluated = arrays.each_ref().map(|a| EvaluatedArgument::Column(a));
+    let evaluated = arrays.each_ref().map(EvaluatedArgument::Column);
     let input = selected(&kernel, &evaluated, Selection::all(0));
     let prepared = kernel
         .prepare_update_evaluation(input, &[], Some(host.clone()), &control)
@@ -507,7 +507,7 @@ fn mann_whitney_selected_empty_update_validates_original_setup() {
         &Compile,
     )
     .unwrap();
-    let channels = arrays.each_ref().map(|a| EvaluatedArgument::Column(a));
+    let channels = arrays.each_ref().map(EvaluatedArgument::Column);
     let input = selected(&malformed, &channels, Selection::all(0));
     let result = malformed.prepare_update_evaluation(input, &[], Some(host.clone()), &control);
     let Err(EvaluationFailure::Kernel(cause)) = result else {
@@ -544,7 +544,7 @@ fn mann_whitney_selected_original_decode_merge_and_phase_clones_use_target_alloc
         &[Some(false), Some(false), Some(true), Some(true)],
         &["two-sided"; 4],
     );
-    let evaluated = arrays.each_ref().map(|a| EvaluatedArgument::Column(a));
+    let evaluated = arrays.each_ref().map(EvaluatedArgument::Column);
     let prepared = partial
         .prepare_update_evaluation(
             selected(&partial, &evaluated, Selection::all(4)),
@@ -668,7 +668,7 @@ fn mann_whitney_selected_borrow_conflict_keeps_physical_samples_until_actual_dro
     let kernel = kernel(AggregateKernelPhase::Single);
     let control = Control::default();
     let arrays = args(&[1], &[Some(true)], &["two-sided"]);
-    let evaluated = arrays.each_ref().map(|a| EvaluatedArgument::Column(a));
+    let evaluated = arrays.each_ref().map(EvaluatedArgument::Column);
     let prepared = kernel
         .prepare_update_evaluation(
             selected(&kernel, &evaluated, Selection::all(1)),
@@ -711,7 +711,7 @@ fn mann_whitney_selected_each_real_prepare_row_and_emit_callback_keeps_seven_cau
             let kernel = kernel(AggregateKernelPhase::Single);
             let initial = Control::default();
             let arrays = args(&[9], &[Some(true)], &["two-sided"]);
-            let evaluated = arrays.each_ref().map(|a| EvaluatedArgument::Column(a));
+            let evaluated = arrays.each_ref().map(EvaluatedArgument::Column);
             let input = selected(&kernel, &evaluated, Selection::all(1));
             let control = Control::default();
             if operation == 0 {
@@ -762,7 +762,7 @@ fn mann_whitney_selected_each_real_prepare_row_and_emit_callback_keeps_seven_cau
                 let kernel = kernel(AggregateKernelPhase::Single);
                 let initial = Control::default();
                 let arrays = args(&[9], &[Some(true)], &["two-sided"]);
-                let evaluated = arrays.each_ref().map(|a| EvaluatedArgument::Column(a));
+                let evaluated = arrays.each_ref().map(EvaluatedArgument::Column);
                 let input = selected(&kernel, &evaluated, Selection::all(1));
                 let control = Control {
                     trace: Mutex::new(Vec::new()),
@@ -800,7 +800,7 @@ fn mann_whitney_selected_each_real_prepare_row_and_emit_callback_keeps_seven_cau
                                 &context,
                                 &control,
                             )
-                            .map(|array| drop(array))
+                            .map(drop)
                     };
                     assert!(
                         matches!(result,Err(EvaluationFailure::Kernel(actual)) if actual==cause)
@@ -827,7 +827,7 @@ fn mann_whitney_selected_all_real_host_frontiers_keep_seven_causes_and_cleanup()
             &[Some(false), Some(false), Some(true), Some(true)],
             &["two-sided"; 4],
         );
-        let evaluated = arrays.each_ref().map(|a| EvaluatedArgument::Column(a));
+        let evaluated = arrays.each_ref().map(EvaluatedArgument::Column);
         let mut state = None;
         let mut update = None;
         let mut merge = None;

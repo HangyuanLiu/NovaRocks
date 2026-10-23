@@ -429,8 +429,8 @@ impl<'a> SortCreation<'a> {
                     .map_err(|source| failure::arrow(Operation::Take, source))?,
             );
         }
-        Ok(RecordBatch::try_new(batch.schema(), columns)
-            .map_err(|source| failure::arrow(Operation::Batch, source))?)
+        RecordBatch::try_new(batch.schema(), columns)
+            .map_err(|source| failure::arrow(Operation::Batch, source))
     }
 
     pub(crate) fn normalize_key(
@@ -652,10 +652,8 @@ impl<'a> SortCreation<'a> {
         }
         // Original payload algorithm and SchemeS are unchanged. Complete
         // declarations are already exact; there is no NULL/name inference.
-        Ok(
-            arrow::compute::concat_batches(&schema, chunks.iter().map(Chunk::record_batch))
-                .map_err(|source| failure::arrow(Operation::ConcatBatches, source))?,
-        )
+        arrow::compute::concat_batches(&schema, chunks.iter().map(Chunk::record_batch))
+            .map_err(|source| failure::arrow(Operation::ConcatBatches, source))
     }
 
     pub(crate) fn source_type_storage(

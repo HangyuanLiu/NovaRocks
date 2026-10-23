@@ -561,8 +561,7 @@ fn original_peer_groups(
         let mut equal = true;
         for key in keys {
             control.checkpoint(1)?;
-            if !super::analytic_shared::row_equal_on_keys(std::slice::from_ref(key), row - 1, row)
-                .map_err(ExecutionFailure::from)?
+            if !super::analytic_shared::row_equal_on_keys(std::slice::from_ref(key), row - 1, row)?
             {
                 equal = false;
                 break;
@@ -1707,9 +1706,7 @@ pub fn prepare_window_factory_for_test(
     node: ProgramNodeId,
     error: Arc<RuntimeErrorState>,
 ) -> ExecutionResult<CompiledWindowProcessorFactory> {
-    Ok(CompiledWindowProcessorFactory::try_new(
-        program, node, error,
-    )?)
+    CompiledWindowProcessorFactory::try_new(program, node, error)
 }
 
 #[derive(Debug)]

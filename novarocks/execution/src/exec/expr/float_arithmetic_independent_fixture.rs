@@ -154,7 +154,7 @@ pub(super) fn scalar(rhs: usize, reversed: bool, op: usize) -> &'static [Expecte
 }
 
 // Dimensions: Float32/64 x peer mathematical class x order x operator x source row.
-const COMPLETE: [[[[[Expected; 12]; 5]; 2]; 44]; 2] = [
+static COMPLETE: [[[[[Expected; 12]; 5]; 2]; 44]; 2] = [
     [
         [
             [

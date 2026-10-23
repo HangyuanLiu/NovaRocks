@@ -293,10 +293,8 @@ impl WriteCompletionTracker {
             if status.state() == TaskState::Finished {
                 continue;
             }
-            if status.state() == TaskState::Canceled {
-                if status.is_success_compatible_terminal() {
-                    continue;
-                }
+            if status.state() == TaskState::Canceled && status.is_success_compatible_terminal() {
+                continue;
             }
             return WriteVerdict::TaskNotFinished {
                 task,

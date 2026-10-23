@@ -449,11 +449,11 @@ impl SourceKernel for ExchangeSourceOperator {
                     input_rows,
                     chunk.len()
                 );
-                return Ok(StepResult::new(
+                Ok(StepResult::new(
                     Some(chunk),
                     NextStep::Runnable,
                     input_rows as u64,
-                ));
+                ))
             }
             Some(exchange::ExchangePopResult::Finished(stats)) => {
                 self.idle_deadline.cancel();
@@ -490,7 +490,7 @@ impl SourceKernel for ExchangeSourceOperator {
                     stats.chunks_received,
                     stats.rows_received
                 );
-                return Ok(StepResult::new(None, NextStep::Finished, 0));
+                Ok(StepResult::new(None, NextStep::Finished, 0))
             }
             None => {
                 if self.idle_deadline.is_expired() {
@@ -568,7 +568,7 @@ impl SourceKernel for ExchangeSourceOperator {
                         self.node.node_id, self.driver_id
                     );
                 }
-                return Ok(self.waiting(observed_generation));
+                Ok(self.waiting(observed_generation))
             }
         }
     }
@@ -1047,7 +1047,7 @@ mod tests {
                 Duration::from_secs(1),
                 novarocks_functions::KernelFailure::Internal(
                     novarocks_functions::KernelDiagnostic::new(
-                        &("shared exchange EOS did not finish every parked driver".to_string()),
+                        "shared exchange EOS did not finish every parked driver",
                     ),
                 )
                 .into(),

@@ -867,14 +867,14 @@ fn execute_drop_table(
             .runtime()
             .control_state()
             .invalidate_table_cache(&table.namespace, &table.table);
-        if *data_disposition == ConnectorDropTableDataDisposition::Purge {
-            if let Some(cleanup) = witness.as_ref().and_then(|witness| {
+        if *data_disposition == ConnectorDropTableDataDisposition::Purge
+            && let Some(cleanup) = witness.as_ref().and_then(|witness| {
                 crate::catalog_control::drop_cleanup::PostCommitCleanupRequest::from_journal_drop(
                     canonical, &captured, witness,
                 )
-            }) {
-                provider.runtime().drop_cleanup().enqueue(cleanup);
-            }
+            })
+        {
+            provider.runtime().drop_cleanup().enqueue(cleanup);
         }
     }
     Ok(outcome)
@@ -5511,7 +5511,7 @@ mod tests {
                 .unwrap(),
             ExternalMutationOutcome::KnownCommitted { .. }
         ));
-        for (key, _) in &markers.markers {
+        for key in markers.markers.keys() {
             let mut mismatch = properties.clone();
             mismatch.insert(
                 crate::document_storage::keyed::keys::marker_key(key),
@@ -8419,7 +8419,7 @@ mod tests {
         .build()
         .unwrap()
         .metadata;
-        let ident = || TableIdent::from_strs(["atomic", "events"]).unwrap();
+        let _ident = || TableIdent::from_strs(["atomic", "events"]).unwrap();
         let path = || ConnectorColumnPath {
             segments: vec!["payload".into()],
         };

@@ -204,12 +204,11 @@ impl FrozenRequest {
                         validate_document_expiry_update(update)?;
                     }
                     for update in &parts.updates {
-                        if let TableUpdate::RemoveSnapshots { snapshot_ids } = update {
-                            if parts.requirements.iter().any(|requirement| matches!(requirement,
+                        if let TableUpdate::RemoveSnapshots { snapshot_ids } = update
+                            && parts.requirements.iter().any(|requirement| matches!(requirement,
                                 TableRequirement::RefSnapshotIdMatch{snapshot_id:Some(id),..} if snapshot_ids.contains(id))) {
                                 return Err(invalid("Document expiry cannot remove an observed ref head"));
                             }
-                        }
                     }
                 }
                 if parts.shape == RequestShape::RefRetention {
@@ -220,11 +219,10 @@ impl FrozenRequest {
                             | TableUpdate::RemoveSnapshotRef { ref_name } => Some(ref_name),
                             _ => None,
                         };
-                        if let Some(name) = ref_name {
-                            if !parts.requirements.iter().any(|requirement| matches!(requirement, TableRequirement::RefSnapshotIdMatch { r#ref, .. } if r#ref == name)) {
+                        if let Some(name) = ref_name
+                            && !parts.requirements.iter().any(|requirement| matches!(requirement, TableRequirement::RefSnapshotIdMatch { r#ref, .. } if r#ref == name)) {
                                 return Err(invalid("Ref-retention publication must assert each changed ref"));
                             }
-                        }
                     }
                 }
                 if parts.shape == RequestShape::MetadataOnly
@@ -373,6 +371,26 @@ fn canonical_json(value: Value) -> Value {
         }
         Value::Array(values) => Value::Array(values.into_iter().map(canonical_json).collect()),
         value => value,
+    }
+}
+
+/// Expiry has no property write, snapshot creation, ref mutation or file effect.
+pub(crate) fn validate_document_expiry_update(update: &TableUpdate) -> Result<()> {
+    match update {
+        TableUpdate::RemoveSnapshots { .. } => Ok(()),
+        TableUpdate::RemoveProperties { removals }
+            if removals.iter().all(|key| {
+                key.strip_prefix("novarocks.doc.v2.rev.")
+                    .is_some_and(|identity| {
+                        novarocks_spi::connector::DocumentIdentity::parse_hex(identity).is_ok()
+                    })
+            }) =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid(
+            "Document expiry only permits snapshot removal and document-version property removal",
+        )),
     }
 }
 
@@ -615,25 +633,5 @@ mod tests {
             .updates
             .push(TableUpdate::SetCurrentSchema { schema_id: 0 });
         assert!(FrozenRequest::new(schema).is_err());
-    }
-}
-
-/// Expiry has no property write, snapshot creation, ref mutation or file effect.
-pub(crate) fn validate_document_expiry_update(update: &TableUpdate) -> Result<()> {
-    match update {
-        TableUpdate::RemoveSnapshots { .. } => Ok(()),
-        TableUpdate::RemoveProperties { removals }
-            if removals.iter().all(|key| {
-                key.strip_prefix("novarocks.doc.v2.rev.")
-                    .is_some_and(|identity| {
-                        novarocks_spi::connector::DocumentIdentity::parse_hex(identity).is_ok()
-                    })
-            }) =>
-        {
-            Ok(())
-        }
-        _ => Err(invalid(
-            "Document expiry only permits snapshot removal and document-version property removal",
-        )),
     }
 }

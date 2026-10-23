@@ -304,10 +304,9 @@ impl RegistryTaskExecutionIngress {
                         },
                     );
                     if matches!(&dropped, Err(status) if status.code() == tonic::Code::DeadlineExceeded)
+                        && let Some(gate) = replay_gate.as_mut()
                     {
-                        if let Some(gate) = replay_gate.as_mut() {
-                            gate.acknowledgement_dropped();
-                        }
+                        gate.acknowledgement_dropped();
                     }
                     dropped?;
                 }

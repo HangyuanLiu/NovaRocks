@@ -260,7 +260,7 @@ fn compiled_grouped_topn_actual_n_final_child_keeps_original_stock_until_last_al
                 .downcast_ref::<ListArray>()
                 .unwrap()
         })
-        .find(|lists| lists.values().len() > 0)
+        .find(|lists| !lists.values().is_empty())
         .unwrap();
     let child = lists.values().clone();
     let alias = child.to_data().buffers()[0].clone();

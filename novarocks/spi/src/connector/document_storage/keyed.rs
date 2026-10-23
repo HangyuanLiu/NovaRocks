@@ -676,6 +676,24 @@ impl std::error::Error for KeyedDocumentReadError {
     }
 }
 
+impl KeyedDocumentView {
+    pub fn validate_for(
+        &self,
+        request: &KeyedDocumentObservationRequest,
+    ) -> Result<(), ConnectorError> {
+        self.metadata_version.validate()?;
+        if self.owner != request.owner
+            || self.table != request.target
+            || self.object_id != request.object_id
+        {
+            return Err(invalid(
+                "keyed observation returned a different table or control generation",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,23 +855,5 @@ mod tests {
             }
             .is_empty()
         );
-    }
-}
-
-impl KeyedDocumentView {
-    pub fn validate_for(
-        &self,
-        request: &KeyedDocumentObservationRequest,
-    ) -> Result<(), ConnectorError> {
-        self.metadata_version.validate()?;
-        if self.owner != request.owner
-            || self.table != request.target
-            || self.object_id != request.object_id
-        {
-            return Err(invalid(
-                "keyed observation returned a different table or control generation",
-            ));
-        }
-        Ok(())
     }
 }

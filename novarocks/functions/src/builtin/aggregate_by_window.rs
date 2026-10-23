@@ -388,7 +388,6 @@ impl TrackedByWindow {
                         |scalar_work| {
                             self.aggregate
                                 .build_final_scalar(std::iter::once(&state), scalar_work)
-                                .map_err(Into::into)
                         },
                     );
                     output.map_err(WindowEvaluationFailure::from)
@@ -428,7 +427,6 @@ impl TrackedByWindow {
                             values,
                             scalar_work,
                         )
-                        .map_err(Into::into)
                     }
                 },
             );
@@ -552,7 +550,6 @@ impl WindowKernelPartition for ByPartition<'_> {
                             values,
                             scalar_work,
                         )
-                        .map_err(Into::into)
                     },
                 );
                 drop(staging_charge);

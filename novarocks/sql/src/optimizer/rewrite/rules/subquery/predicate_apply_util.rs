@@ -428,7 +428,7 @@ mod legacy {
                     right: Box::new(normalize_correlated_on_predicate_inner(*right, outer_ids)),
                     decimal_overflow_policy,
                 },
-                value_type: value_type,
+                value_type,
             },
             ExprKind::BinaryOp {
                 left,
@@ -461,7 +461,7 @@ mod legacy {
                             right,
                             decimal_overflow_policy,
                         },
-                        value_type: value_type,
+                        value_type,
                     },
                     (false, true) => {
                         let inner_type = left.value_type.data_type().clone();
@@ -489,7 +489,7 @@ mod legacy {
                                 right: Box::new(inner_expr),
                                 decimal_overflow_policy,
                             },
-                            value_type: value_type,
+                            value_type,
                         }
                     }
                     _ => TypedExpr {
@@ -499,14 +499,11 @@ mod legacy {
                             right,
                             decimal_overflow_policy,
                         },
-                        value_type: value_type,
+                        value_type,
                     },
                 }
             }
-            kind => TypedExpr {
-                kind,
-                value_type: value_type,
-            },
+            kind => TypedExpr { kind, value_type },
         }
     }
 

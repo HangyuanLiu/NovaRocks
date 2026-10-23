@@ -505,10 +505,10 @@ impl Scenario for ExactNativeCase {
             .map_err(|_| anyhow::anyhow!("private launch owner poisoned"))?;
         let mut failure = None;
         if let Some(value) = owner.as_ref() {
-            if let Some(prepared) = &value.prepared {
-                if let Err(error) = prepared.verify_original_file() {
-                    retain_secondary(&mut failure, error);
-                }
+            if let Some(prepared) = &value.prepared
+                && let Err(error) = prepared.verify_original_file()
+            {
+                retain_secondary(&mut failure, error);
             }
             if let Err(error) = value.remove_empty_parent() {
                 retain_secondary(&mut failure, error);
@@ -823,15 +823,14 @@ async fn run_case(
     errors[0] = primary.err();
     // A failed held probe still asks original query control to cancel this actual handshake.
     // No external Resume command exists; original cancellation records and locally resumes.
-    if submitted && !kill_attempted {
-        if let Some(reader) = reader.as_ref() {
-            if let Err(error) = context
-                .handle()
-                .kill_query_until(reader.connection_id(), deadline)
-            {
-                errors[1] = Some(error);
-            }
-        }
+    if submitted
+        && !kill_attempted
+        && let Some(reader) = reader.as_ref()
+        && let Err(error) = context
+            .handle()
+            .kill_query_until(reader.connection_id(), deadline)
+    {
+        errors[1] = Some(error);
     }
     if let Some(reader) = reader.as_mut() {
         receipt.reader = Some(reader.snapshot());

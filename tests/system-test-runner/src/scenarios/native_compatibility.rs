@@ -1127,7 +1127,6 @@ pub(super) fn raw_acquire_admission_ticket(
 fn raw_create_task(query_context: proto::QueryContextRef) -> proto::TaskOperation {
     let execution = query_context
         .query_execution_id
-        .clone()
         .expect("raw query context carries an execution identity");
     let backend = query_context
         .backend_process_id

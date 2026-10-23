@@ -837,7 +837,7 @@ impl OperatorLifecycle for NativeRuntimeFilterProcessor {
     }
 
     fn activate(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        Ok(self.consumers.state().bind(state)?)
+        self.consumers.state().bind(state)
     }
 }
 impl crate::exec::pipeline::operator::InputEncodingPolicy for NativeRuntimeFilterProcessor {}

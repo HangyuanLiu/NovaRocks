@@ -129,7 +129,7 @@ pub(crate) fn frozen_result_metadata(
         largest = largest.max(size);
     }
     if !capabilities.contains(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
-        total = total.checked_add(5 + overhead).unwrap_or(usize::MAX);
+        total = total.saturating_add(5 + overhead);
         largest = largest.max(5);
     }
     if total > limits.metadata_bytes {

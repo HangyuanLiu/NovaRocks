@@ -54,10 +54,10 @@ pub fn history_window(
     start: Option<i64>,
     parent: Option<i64>,
 ) -> Result<HistoryWindow, HistoryGap> {
-    if let Some(start) = start {
-        if metadata.snapshot_by_id(start).is_none() {
-            return Err(HistoryGap::StartExpired(start));
-        }
+    if let Some(start) = start
+        && metadata.snapshot_by_id(start).is_none()
+    {
+        return Err(HistoryGap::StartExpired(start));
     }
     let mut next = parent;
     let mut visited = BTreeSet::new();

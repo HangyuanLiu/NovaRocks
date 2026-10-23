@@ -2086,13 +2086,13 @@ impl OperatorLifecycle for CompiledWriterFinalAggregate {
                     )
                     .into());
                 }
-                if let FinalCallSource::Prepared(calls) = &self.calls {
-                    if calls.calls()[position].output_position() != position + 1 {
-                        return Err(ConstructionFailure::InvalidSource(
-                            "writer final output occurrence changed".into(),
-                        )
-                        .into());
-                    }
+                if let FinalCallSource::Prepared(calls) = &self.calls
+                    && calls.calls()[position].output_position() != position + 1
+                {
+                    return Err(ConstructionFailure::InvalidSource(
+                        "writer final output occurrence changed".into(),
+                    )
+                    .into());
                 }
             }
         }

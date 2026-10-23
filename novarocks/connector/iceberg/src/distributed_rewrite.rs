@@ -1439,7 +1439,7 @@ fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> Result<(), Conne
         Value::Object(values) => {
             output.push(b'{');
             let mut fields = values.iter().collect::<Vec<_>>();
-            fields.sort_by(|(left, _), (right, _)| left.cmp(right));
+            fields.sort_by_key(|(left, _)| *left);
             for (index, (key, value)) in fields.into_iter().enumerate() {
                 if index != 0 {
                     output.push(b',');
@@ -2076,7 +2076,7 @@ mod tests {
             Type::Variant(VariantType),
             Type::Primitive(PrimitiveType::Uuid),
         ] {
-            let (executor, warehouse, runtime, _listener) = admission_runtime("hadoop");
+            let (_executor, warehouse, runtime, _listener) = admission_runtime("hadoop");
             // Model a table authored by another engine. Product CREATE/ALTER
             // admission remains closed to new Variant and uuid columns.
             let table_root = warehouse.path().join("db/t");

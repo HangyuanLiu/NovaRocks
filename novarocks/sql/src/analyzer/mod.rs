@@ -1674,8 +1674,7 @@ impl<'a> AnalyzerContext<'a> {
         // non-nullable declared output and be refused while adapting it.
         let nulled_keys: std::collections::HashSet<crate::column_id::ColumnId> = grouping_ids
             .iter()
-            .enumerate()
-            .flat_map(|(_, bitmap)| {
+            .flat_map(|bitmap| {
                 (0..total_grouping_columns).filter_map(move |idx| {
                     let bit = total_grouping_columns - 1 - idx;
                     (bitmap & (1u64 << bit) != 0).then_some(idx)
@@ -2646,10 +2645,7 @@ impl<'a> AnalyzerContext<'a> {
             // as-is. This mirrors substitute_select_aliases_inner's coverage.
             other => other,
         };
-        TypedExpr {
-            kind,
-            value_type: value_type,
-        }
+        TypedExpr { kind, value_type }
     }
 }
 

@@ -1103,7 +1103,7 @@ fn key_domains() -> Vec<(FunctionValueType, Vec<LiteralValue>)> {
     ] {
         for zone in [None, Some("UTC".into()), Some("Asia/Shanghai".into())] {
             domains.push((
-                FunctionValueType::new(DataType::Timestamp(unit.clone(), zone), true),
+                FunctionValueType::new(DataType::Timestamp(unit, zone), true),
                 vec![
                     LiteralValue::Null,
                     LiteralValue::Timestamp(i64::MIN),

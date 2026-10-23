@@ -211,177 +211,6 @@ pub(crate) fn pure<T>(
     operation(&mut creation).map_err(FragmentCreationError::into_compile)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use novarocks_type_contract::{
-        CompilePhase, PureCompileControl, ValueTypeStorageHold, ValueTypeStorageLifetime,
-    };
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    };
-    struct Control(AtomicBool);
-    impl PureCompileControl for Control {
-        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-            if self.0.load(Ordering::SeqCst) {
-                Err(CompileControlError::Cancelled)
-            } else {
-                Ok(())
-            }
-        }
-    }
-    #[derive(Debug, Eq, PartialEq)]
-    struct Refusal(u32);
-    #[test]
-    fn typed_layout_creator_refusal_is_not_replaced_by_later_control() {
-        let control = Control(AtomicBool::new(false));
-        let mut request = |_: Layout| {
-            control.0.store(true, Ordering::SeqCst);
-            Err(Refusal(73))
-        };
-        let mut opaque = |_: usize| Ok::<_, Refusal>(());
-        let mut creation =
-            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
-        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
-        assert!(matches!(
-            crate::typed_layout::TypedLayoutBuilder::new_with_creation(1, &mut work, &mut creation),
-            Err(LayoutCreationFailure::Creator(Refusal(73)))
-        ));
-    }
-    #[test]
-    fn typed_array_resource_refusal_precedes_later_compilation_control() {
-        use novarocks_failure_contract::{FailureClass, FailureProjection};
-        use novarocks_functions::array_projection::{
-            ArrayProjectionFailure, ArrayProjectionOperation,
-        };
-        for original in [
-            ArrayProjectionFailure::ValueType(novarocks_type_contract::ValueTypeError::TooDeep),
-            ArrayProjectionFailure::RequestArithmetic,
-            ArrayProjectionFailure::Arrow {
-                operation: ArrayProjectionOperation::RebuildArray,
-                source: arrow_schema::ArrowError::MemoryError("original array request".into()),
-            },
-        ] {
-            let expected = original.failure_fact();
-            assert_eq!(expected.class(), FailureClass::Resource);
-            let control = Control(AtomicBool::new(false));
-            let mut work =
-                CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
-            work.step().unwrap();
-            control.0.store(true, Ordering::SeqCst);
-            let result: Result<(), FragmentCreationError<Refusal>> = finish_attempt(
-                Err(FragmentCompileError::ArrayProjection(original).into()),
-                work,
-            );
-            let Err(FragmentCreationError::Compile(FragmentCompileError::ArrayProjection(cause))) =
-                result
-            else {
-                panic!("a later footer must not replace the originating array refusal: {result:?}");
-            };
-            assert_eq!(cause.failure_fact(), expected);
-        }
-    }
-    struct Hold(Arc<AtomicUsize>);
-    impl ValueTypeStorageHold for Hold {}
-    impl Drop for Hold {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-    #[test]
-    fn independently_retained_compiled_layout_keeps_its_real_new_creation_hold() {
-        let drops = Arc::new(AtomicUsize::new(0));
-        let control = Control(AtomicBool::new(false));
-        let mut request = |_: Layout| Ok::<_, std::convert::Infallible>(());
-        let mut opaque = |_: usize| Ok::<_, std::convert::Infallible>(());
-        let mut creation = ValueSchemaCreation::new(
-            ValueTypeStorageLifetime::held(Arc::new(Hold(drops.clone()))),
-            &mut request,
-            &mut opaque,
-        );
-        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
-        let mut builder =
-            crate::typed_layout::TypedLayoutBuilder::new_with_creation(1, &mut work, &mut creation)
-                .unwrap();
-        builder
-            .push_with_creation(
-                &novarocks_type_contract::FunctionValueType::new(
-                    arrow_schema::DataType::Int64,
-                    false,
-                ),
-                "v".to_owned(),
-                &mut work,
-                &mut creation,
-            )
-            .unwrap();
-        let layout = builder
-            .finish_with_creation(&[novarocks_types::SlotId::new(1)], &mut work, &mut creation)
-            .unwrap();
-        let cloned = layout.clone();
-        drop(layout);
-        drop(creation);
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            cloned.value_binding_at(0).unwrap().data_type(),
-            &arrow_schema::DataType::Int64
-        );
-        drop(cloned);
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-    #[test]
-    fn expression_type_backing_request_refusal_has_no_control_tail() {
-        let control = Control(AtomicBool::new(false));
-        let mut request = |_: Layout| {
-            control.0.store(true, Ordering::SeqCst);
-            Err(Refusal(79))
-        };
-        let mut opaque = |_: usize| Ok::<(), Refusal>(());
-        let mut creation =
-            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
-        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
-        let mut types = Vec::<novarocks_type_contract::FunctionArgumentType>::new();
-        assert!(matches!(
-            reserve_vec(&mut types, 1, Some(&mut creation), &mut work),
-            Err(FragmentCreationError::Creator(Refusal(79)))
-        ));
-        assert!(types.is_empty());
-        assert_eq!(types.capacity(), 0);
-    }
-    #[test]
-    fn independently_cloned_argument_types_keep_only_their_arena_creator() {
-        use novarocks_type_contract::{FunctionArgumentType, FunctionValueType};
-        let arena_drops = Arc::new(AtomicUsize::new(0));
-        let unrelated_drops = Arc::new(AtomicUsize::new(0));
-        let unrelated = ValueTypeStorageLifetime::held(Arc::new(Hold(unrelated_drops.clone())));
-        let control = Control(AtomicBool::new(false));
-        let mut request = |_: Layout| Ok::<(), std::convert::Infallible>(());
-        let mut opaque = |_: usize| Ok::<(), std::convert::Infallible>(());
-        let mut creation = ValueSchemaCreation::new(
-            ValueTypeStorageLifetime::held(Arc::new(Hold(arena_drops.clone()))),
-            &mut request,
-            &mut opaque,
-        );
-        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
-        let mut types = Vec::new();
-        reserve_vec(&mut types, 1, Some(&mut creation), &mut work).unwrap();
-        types.push(FunctionArgumentType::Value(FunctionValueType::new(
-            arrow_schema::DataType::Int64,
-            false,
-        )));
-        let types = publish_argument_types(types, Some(&mut creation), &mut work).unwrap();
-        let last = types.clone();
-        drop(types);
-        drop(creation);
-        drop(unrelated);
-        assert_eq!(unrelated_drops.load(Ordering::SeqCst), 1);
-        assert_eq!(arena_drops.load(Ordering::SeqCst), 0);
-        assert_eq!(last.len(), 1);
-        drop(last);
-        assert_eq!(arena_drops.load(Ordering::SeqCst), 1);
-    }
-}
-
 impl<C, H> From<novarocks_local_program::ProgramCreationFailure<C, H>> for FragmentCreationError<H>
 where
     FragmentCompileError: From<C>,
@@ -570,5 +399,176 @@ pub(crate) fn borrow_scope<'borrow, H>(
     match scope {
         Some(scope) => Some(&mut **scope),
         None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks_type_contract::{
+        CompilePhase, PureCompileControl, ValueTypeStorageHold, ValueTypeStorageLifetime,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    struct Control(AtomicBool);
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            if self.0.load(Ordering::SeqCst) {
+                Err(CompileControlError::Cancelled)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[derive(Debug, Eq, PartialEq)]
+    struct Refusal(u32);
+    #[test]
+    fn typed_layout_creator_refusal_is_not_replaced_by_later_control() {
+        let control = Control(AtomicBool::new(false));
+        let mut request = |_: Layout| {
+            control.0.store(true, Ordering::SeqCst);
+            Err(Refusal(73))
+        };
+        let mut opaque = |_: usize| Ok::<_, Refusal>(());
+        let mut creation =
+            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+        assert!(matches!(
+            crate::typed_layout::TypedLayoutBuilder::new_with_creation(1, &mut work, &mut creation),
+            Err(LayoutCreationFailure::Creator(Refusal(73)))
+        ));
+    }
+    #[test]
+    fn typed_array_resource_refusal_precedes_later_compilation_control() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        use novarocks_functions::array_projection::{
+            ArrayProjectionFailure, ArrayProjectionOperation,
+        };
+        for original in [
+            ArrayProjectionFailure::ValueType(novarocks_type_contract::ValueTypeError::TooDeep),
+            ArrayProjectionFailure::RequestArithmetic,
+            ArrayProjectionFailure::Arrow {
+                operation: ArrayProjectionOperation::RebuildArray,
+                source: arrow_schema::ArrowError::MemoryError("original array request".into()),
+            },
+        ] {
+            let expected = original.failure_fact();
+            assert_eq!(expected.class(), FailureClass::Resource);
+            let control = Control(AtomicBool::new(false));
+            let mut work =
+                CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+            work.step().unwrap();
+            control.0.store(true, Ordering::SeqCst);
+            let result: Result<(), FragmentCreationError<Refusal>> = finish_attempt(
+                Err(FragmentCompileError::ArrayProjection(original).into()),
+                work,
+            );
+            let Err(FragmentCreationError::Compile(FragmentCompileError::ArrayProjection(cause))) =
+                result
+            else {
+                panic!("a later footer must not replace the originating array refusal: {result:?}");
+            };
+            assert_eq!(cause.failure_fact(), expected);
+        }
+    }
+    struct Hold(Arc<AtomicUsize>);
+    impl ValueTypeStorageHold for Hold {}
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[test]
+    fn independently_retained_compiled_layout_keeps_its_real_new_creation_hold() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let control = Control(AtomicBool::new(false));
+        let mut request = |_: Layout| Ok::<_, std::convert::Infallible>(());
+        let mut opaque = |_: usize| Ok::<_, std::convert::Infallible>(());
+        let mut creation = ValueSchemaCreation::new(
+            ValueTypeStorageLifetime::held(Arc::new(Hold(drops.clone()))),
+            &mut request,
+            &mut opaque,
+        );
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+        let mut builder =
+            crate::typed_layout::TypedLayoutBuilder::new_with_creation(1, &mut work, &mut creation)
+                .unwrap();
+        builder
+            .push_with_creation(
+                &novarocks_type_contract::FunctionValueType::new(
+                    arrow_schema::DataType::Int64,
+                    false,
+                ),
+                "v".to_owned(),
+                &mut work,
+                &mut creation,
+            )
+            .unwrap();
+        let layout = builder
+            .finish_with_creation(&[novarocks_types::SlotId::new(1)], &mut work, &mut creation)
+            .unwrap();
+        let cloned = layout.clone();
+        drop(layout);
+        drop(creation);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            cloned.value_binding_at(0).unwrap().data_type(),
+            &arrow_schema::DataType::Int64
+        );
+        drop(cloned);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn expression_type_backing_request_refusal_has_no_control_tail() {
+        let control = Control(AtomicBool::new(false));
+        let mut request = |_: Layout| {
+            control.0.store(true, Ordering::SeqCst);
+            Err(Refusal(79))
+        };
+        let mut opaque = |_: usize| Ok::<(), Refusal>(());
+        let mut creation =
+            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+        let mut types = Vec::<novarocks_type_contract::FunctionArgumentType>::new();
+        assert!(matches!(
+            reserve_vec(&mut types, 1, Some(&mut creation), &mut work),
+            Err(FragmentCreationError::Creator(Refusal(79)))
+        ));
+        assert!(types.is_empty());
+        assert_eq!(types.capacity(), 0);
+    }
+    #[test]
+    fn independently_cloned_argument_types_keep_only_their_arena_creator() {
+        use novarocks_type_contract::{FunctionArgumentType, FunctionValueType};
+        let arena_drops = Arc::new(AtomicUsize::new(0));
+        let unrelated_drops = Arc::new(AtomicUsize::new(0));
+        let unrelated = ValueTypeStorageLifetime::held(Arc::new(Hold(unrelated_drops.clone())));
+        let control = Control(AtomicBool::new(false));
+        let mut request = |_: Layout| Ok::<(), std::convert::Infallible>(());
+        let mut opaque = |_: usize| Ok::<(), std::convert::Infallible>(());
+        let mut creation = ValueSchemaCreation::new(
+            ValueTypeStorageLifetime::held(Arc::new(Hold(arena_drops.clone()))),
+            &mut request,
+            &mut opaque,
+        );
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+        let mut types = Vec::new();
+        reserve_vec(&mut types, 1, Some(&mut creation), &mut work).unwrap();
+        types.push(FunctionArgumentType::Value(FunctionValueType::new(
+            arrow_schema::DataType::Int64,
+            false,
+        )));
+        let types = publish_argument_types(types, Some(&mut creation), &mut work).unwrap();
+        let last = types.clone();
+        drop(types);
+        drop(creation);
+        drop(unrelated);
+        assert_eq!(unrelated_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(arena_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(last.len(), 1);
+        drop(last);
+        assert_eq!(arena_drops.load(Ordering::SeqCst), 1);
     }
 }

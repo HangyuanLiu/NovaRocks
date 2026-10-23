@@ -735,6 +735,28 @@ pub(crate) fn borrow_leaf_at<'a>(
     })
 }
 
+impl novarocks_execution_contract::failure::FailureProjection for NativeScalarLeafError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        let (class, code) = match self {
+            Self::Shape => (FailureClass::Invariant, 400),
+            Self::EmptyInput => (FailureClass::Invariant, 401),
+            Self::Slot => (FailureClass::Invariant, 402),
+            Self::Type => (FailureClass::Invariant, 403),
+            Self::LogicalMetadata => (FailureClass::Invariant, 404),
+            Self::UnsupportedContainer => (FailureClass::Invariant, 405),
+            Self::ScratchLimit => (FailureClass::Resource, 406),
+            Self::Leaf(cause) => return cause.failure_fact(),
+            Self::ChangedInput => (FailureClass::Invariant, 408),
+            Self::Failed => (FailureClass::Invariant, 409),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1578,27 +1600,5 @@ mod tests {
             assert!(weak_array.upgrade().is_none());
             assert!(weak_field.upgrade().is_none());
         }
-    }
-}
-
-impl novarocks_execution_contract::failure::FailureProjection for NativeScalarLeafError {
-    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
-        use novarocks_execution_contract::failure::*;
-        let (class, code) = match self {
-            Self::Shape => (FailureClass::Invariant, 400),
-            Self::EmptyInput => (FailureClass::Invariant, 401),
-            Self::Slot => (FailureClass::Invariant, 402),
-            Self::Type => (FailureClass::Invariant, 403),
-            Self::LogicalMetadata => (FailureClass::Invariant, 404),
-            Self::UnsupportedContainer => (FailureClass::Invariant, 405),
-            Self::ScratchLimit => (FailureClass::Resource, 406),
-            Self::Leaf(cause) => return cause.failure_fact(),
-            Self::ChangedInput => (FailureClass::Invariant, 408),
-            Self::Failed => (FailureClass::Invariant, 409),
-        };
-        FailureFact::new(
-            class,
-            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(code).unwrap()),
-        )
     }
 }

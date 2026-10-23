@@ -373,7 +373,7 @@ impl Service<http::Uri> for NativeEndpointConnector {
                 .connect()
                 .await
                 .map(TokioIo::new)
-                .map_err(|failure| io::Error::other(failure))
+                .map_err(io::Error::other)
         })
     }
 }

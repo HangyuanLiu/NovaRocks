@@ -305,7 +305,7 @@ impl FileTaskSpawner for TokioFileTaskSpawner {
     fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
         // `spawn_blocking` rather than `spawn`: an acquisition is a synchronous
         // provider call, so an async worker would move the stall, not remove it.
-        self.handle.spawn_blocking(move || job());
+        self.handle.spawn_blocking(job);
     }
 }
 

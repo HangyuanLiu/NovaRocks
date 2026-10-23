@@ -769,7 +769,7 @@ mod tests {
             target_observation(0, "__agg_state_avg_avg_sum", 11),
             target_observation(1, "__agg_state_avg_avg_count", 12),
         ];
-        let columns = vec![
+        let columns = [
             MvAggregateStateColumn::new(
                 "__agg_state_avg_avg_sum".to_string(),
                 novarocks_type_contract::FunctionValueType::new(
@@ -926,7 +926,7 @@ mod tests {
         ];
         let prepared = prepared_target(&[11, 12, 13]);
         let targets = target_field_map(&observations, &prepared).expect("exact target");
-        let avg_columns = vec![
+        let avg_columns = [
             MvAggregateStateColumn::new(
                 "__agg_state_avg_avg_sum".to_string(),
                 novarocks_type_contract::FunctionValueType::new(

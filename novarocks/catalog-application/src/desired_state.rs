@@ -977,7 +977,8 @@ mod tests {
 
     #[test]
     fn managed_controller_never_borrows_the_dynamic_authority() {
-        for mode in [CatalogDesiredStateSourceMode::ManagedController] {
+        {
+            let mode = CatalogDesiredStateSourceMode::ManagedController;
             assert_eq!(
                 mode.require_implemented()
                     .expect_err("an unimplemented mode must be rejected before startup")

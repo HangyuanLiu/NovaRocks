@@ -670,7 +670,7 @@ mod tests {
         );
         assert_eq!(row.last_refresh_time.as_deref(), Some("1700000001234"),);
         assert_eq!(row.last_refresh_rows.as_deref(), Some("7"));
-        let Some(published) = projection.facts.publication() else {
+        let Some(_published) = projection.facts.publication() else {
             panic!("expected a published projection");
         };
     }

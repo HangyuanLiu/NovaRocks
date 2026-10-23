@@ -120,7 +120,7 @@ impl PreparedNativeBitNotRecipe {
             } else {
                 argument.validate_shape_observed::<KernelFailure>(selection, || work.step())?;
             }
-            if selection.len() == 0 {
+            if selection.is_empty() {
                 // Shape/type obligations remain observable on an empty demand;
                 // the existing validator inspects no inactive row in this domain.
                 crate::kernel_input::validate_argument_observed(

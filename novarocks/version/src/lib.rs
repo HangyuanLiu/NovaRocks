@@ -742,7 +742,8 @@ mod tests {
             compiled.static_plan_interpreter_digest(),
             other_catalog.static_plan_interpreter_digest()
         );
-        for material in [&other_catalog] {
+        {
+            let material = &other_catalog;
             assert_eq!(material.descriptor_digest(), compiled.descriptor_digest());
             assert_eq!(
                 material.function_catalog_digest(),

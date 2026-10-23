@@ -642,10 +642,10 @@ pub(crate) fn resident_tail<'a>(
         return Some(Vec::new());
     }
     let current = current?;
-    if let Some(next) = &next {
-        if next.before() != current.after() {
-            return None;
-        }
+    if let Some(next) = &next
+        && next.before() != current.after()
+    {
+        return None;
     }
     let mut parts = Vec::with_capacity(2);
     let mut total = 0usize;

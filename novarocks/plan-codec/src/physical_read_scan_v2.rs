@@ -2178,12 +2178,12 @@ fn decode_read_scans_core<H>(
                 bindings.push(binding.clone());
                 work.step()?;
             }
-            if bindings_layout.size() != 0 {
-                if let Some(creation) = creation.as_deref_mut() {
-                    creation
-                        .observe_opaque_upper_bound(bindings_layout.size())
-                        .map_err(ProjectionFailure::Host)?;
-                }
+            if bindings_layout.size() != 0
+                && let Some(creation) = creation.as_deref_mut()
+            {
+                creation
+                    .observe_opaque_upper_bound(bindings_layout.size())
+                    .map_err(ProjectionFailure::Host)?;
             }
             request_read_layout(
                 &mut creation,

@@ -986,8 +986,7 @@ fn build_output_typed(
         },
         |literal, field, rows| {
             observe_literal(literal, rows, temporary.as_ref(), control)?;
-            let result =
-                materialize_literal(literal, field, rows).map_err(ExecutionFailure::from)?;
+            let result = materialize_literal(literal, field, rows)?;
             control.checkpoint(0)?;
             Ok(result)
         },

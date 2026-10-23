@@ -749,14 +749,14 @@ fn merge_wide_nested_state_uses_real_type_walk_quantum_and_exact_metadata() {
     let control = Control::default();
     let mut work =
         CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization).unwrap();
-    assert!(matches!(
+    assert!(
         crate::aggregate_call::align_aggregate_merge_state_observed(
             &changed,
             data.state.clone(),
             &mut work
-        ),
-        Ok(_)
-    ));
+        )
+        .is_ok()
+    );
     work.finish().unwrap();
     let DataType::Struct(fields) = changed.data_type() else {
         unreachable!()

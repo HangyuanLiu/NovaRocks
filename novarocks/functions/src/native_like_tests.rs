@@ -39,10 +39,10 @@ impl KernelEvaluationControl for Control {
             assert!(t.len() < *at, "no callback after original refusal");
         }
         t.push(n);
-        if let Some((at, c)) = &self.fail {
-            if t.len() == *at {
-                return Err(c.clone());
-            }
+        if let Some((at, c)) = &self.fail
+            && t.len() == *at
+        {
+            return Err(c.clone());
         }
         Ok(())
     }

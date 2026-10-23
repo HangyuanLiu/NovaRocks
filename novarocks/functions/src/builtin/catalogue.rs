@@ -455,18 +455,18 @@ impl BuiltinAggregateResolver {
         {
             return Err(FunctionBindingError::NoMatchingOverload);
         }
-        if let Some(overload) = selected {
-            if !builtin_identity_matches(
+        if let Some(overload) = selected
+            && !builtin_identity_matches(
                 overload.as_str(),
                 "builtin.aggregate/",
                 name,
                 "/derived-v1",
                 work,
-            )? {
-                return Err(FunctionBindingError::InvalidBinding(
-                    "builtin aggregate references a foreign overload".into(),
-                ));
-            }
+            )?
+        {
+            return Err(FunctionBindingError::InvalidBinding(
+                "builtin aggregate references a foreign overload".into(),
+            ));
         }
         if matches!(
             name,
@@ -2315,8 +2315,8 @@ fn dynamic_scalar_data_type_with_construction<E>(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             creation.arc_slice::<Arc<arrow_schema::Field>>(fields.len())?;
-            let result = DataType::Struct(fields.into());
-            result
+
+            DataType::Struct(fields.into())
         }
         "null_or_empty" => DataType::Boolean,
         "row" | "struct" => {
@@ -2330,8 +2330,8 @@ fn dynamic_scalar_data_type_with_construction<E>(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             creation.arc_slice::<Arc<arrow_schema::Field>>(fields.len())?;
-            let result = DataType::Struct(fields.into());
-            result
+
+            DataType::Struct(fields.into())
         }
         "str_to_map" => map_type_with_construction(DataType::Utf8, DataType::Utf8, creation)?,
         "try_variant_get" | "variant_get" => DataType::LargeBinary,

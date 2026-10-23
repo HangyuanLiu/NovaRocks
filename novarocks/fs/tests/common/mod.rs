@@ -81,7 +81,7 @@ impl FileTaskSpawner for TestIo {
     }
 
     fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
-        self.runtime.spawn_blocking(move || job());
+        self.runtime.spawn_blocking(job);
     }
 }
 

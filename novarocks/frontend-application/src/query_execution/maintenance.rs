@@ -1696,7 +1696,7 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
 /// read and write contracts retained by its exact composite lease. Native
 /// assembly remains a Frontend-only step after this sealed Core preparation.
 fn prepare_frozen_rewrite_cohort_with_ports(
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    _connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     static_plan_carrier: &crate::query_execution::package_freeze::CompiledPackageCarrier,

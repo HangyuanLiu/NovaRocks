@@ -553,12 +553,12 @@ impl<'call, 'a> SelectedAggregateUpdateInput<'call, 'a> {
         self,
         owner: Option<&dyn crate::aggregate_erasure::ErasedAggregateOps>,
     ) -> Result<(), KernelFailure> {
-        if let Some(expected) = self.installed_owner {
-            if !owner.is_some_and(|actual| std::ptr::addr_eq(expected, actual)) {
-                return Err(invalid(
-                    "aggregate typed input differs from actual installed adapter",
-                ));
-            }
+        if let Some(expected) = self.installed_owner
+            && !owner.is_some_and(|actual| std::ptr::addr_eq(expected, actual))
+        {
+            return Err(invalid(
+                "aggregate typed input differs from actual installed adapter",
+            ));
         }
         Ok(())
     }

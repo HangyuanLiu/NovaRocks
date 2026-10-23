@@ -739,6 +739,28 @@ fn normalize_field<E>(
     Ok(Arc::new(field))
 }
 
+/// Only immutable validated bindings invoke this borrowed structural projection.
+pub(crate) fn normalized_child_type_at(data_type: &DataType, index: usize) -> Option<&DataType> {
+    match data_type {
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+            if index == 0 =>
+        {
+            Some(field.data_type())
+        }
+        DataType::Struct(fields) => fields.get(index).map(|field| field.data_type()),
+        DataType::Map(entries, _) => match entries.data_type() {
+            DataType::Struct(fields) => fields.get(index).map(|field| field.data_type()),
+            _ => None,
+        },
+        DataType::Union(fields, _) => fields.iter().nth(index).map(|(_, field)| field.data_type()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1175,27 +1197,5 @@ mod tests {
             ValueLayout::try_new(&wide, ValueTypeStorageLifetime::pure()),
             Err(ExecutionValueTypeError::Nodes)
         ));
-    }
-}
-
-/// Only immutable validated bindings invoke this borrowed structural projection.
-pub(crate) fn normalized_child_type_at(data_type: &DataType, index: usize) -> Option<&DataType> {
-    match data_type {
-        DataType::List(field)
-        | DataType::LargeList(field)
-        | DataType::ListView(field)
-        | DataType::LargeListView(field)
-        | DataType::FixedSizeList(field, _)
-            if index == 0 =>
-        {
-            Some(field.data_type())
-        }
-        DataType::Struct(fields) => fields.get(index).map(|field| field.data_type()),
-        DataType::Map(entries, _) => match entries.data_type() {
-            DataType::Struct(fields) => fields.get(index).map(|field| field.data_type()),
-            _ => None,
-        },
-        DataType::Union(fields, _) => fields.iter().nth(index).map(|(_, field)| field.data_type()),
-        _ => None,
     }
 }

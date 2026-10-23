@@ -194,7 +194,7 @@ where
         Ok(ConnectorReadRelation::new(
             public_kind,
             self.adapter.wrap_table(table),
-            self.adapter.wrap_transaction(view.transaction().clone()),
+            self.adapter.wrap_transaction(*view.transaction()),
         ))
     }
 
@@ -219,7 +219,7 @@ where
             ConnectorCodecCategory::ReadView,
             |payload, context| IcebergReadTypes::wire_codecs().decode_read_view(payload, context),
         )?;
-        Ok(self.adapter.wrap_transaction(view.transaction().clone()))
+        Ok(self.adapter.wrap_transaction(*view.transaction()))
     }
 
     fn decode_split_payload(
@@ -288,7 +288,7 @@ where
             .map_err(|error| self.private_rejection(error))?;
         let table_payload = self.envelope(ConnectorCodecCategory::ReadTable, table_bytes);
         let view_bytes = IcebergReadTypes::wire_codecs()
-            .encode_read_view(&IcebergReadView::new(transaction.clone()))
+            .encode_read_view(&IcebergReadView::new(*transaction))
             .map_err(|error| self.private_rejection(error))?;
         Ok(ConnectorReadRelationPayload::new(
             relation.kind(),
@@ -321,7 +321,7 @@ where
             )
         })?;
         let bytes = IcebergReadTypes::wire_codecs()
-            .encode_read_view(&IcebergReadView::new(transaction.clone()))
+            .encode_read_view(&IcebergReadView::new(*transaction))
             .map_err(|error| self.private_rejection(error))?;
         Ok(self.envelope(ConnectorCodecCategory::ReadView, bytes))
     }

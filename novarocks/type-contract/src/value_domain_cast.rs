@@ -94,6 +94,34 @@ fn preserves<E>(
     }
 }
 
+/// The original default JSON-text parser CAST dispatch. This is a carrier
+/// capability, not a value-domain authorization or a second conversion rule.
+/// The existing runtime owns parsing, positional/named projection and NULLs.
+pub fn default_json_structure_carrier_cast_supported(source: &DataType, target: &DataType) -> bool {
+    source == &DataType::Utf8
+        && matches!(
+            target,
+            DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
+        )
+}
+
+/// Complete typed source/target admission for that existing intrinsic. Both
+/// authored JSON text and ordinary UTF8 text used the original parser CAST;
+/// target child domains are supplied by the explicit target, never inferred
+/// from observed values. Non-text nominal domains cannot enter this port.
+pub fn is_default_json_structure_cast(
+    source: &FunctionValueType,
+    target: &FunctionValueType,
+) -> bool {
+    (!source.nullable() || target.nullable())
+        && matches!(
+            source.logical_type(),
+            ValueLogicalType::Json | ValueLogicalType::Physical
+        )
+        && target.logical_type() == ValueLogicalType::Physical
+        && default_json_structure_carrier_cast_supported(source.data_type(), target.data_type())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,32 +166,4 @@ mod tests {
             assert_eq!(seen, stop);
         }
     }
-}
-
-/// The original default JSON-text parser CAST dispatch. This is a carrier
-/// capability, not a value-domain authorization or a second conversion rule.
-/// The existing runtime owns parsing, positional/named projection and NULLs.
-pub fn default_json_structure_carrier_cast_supported(source: &DataType, target: &DataType) -> bool {
-    source == &DataType::Utf8
-        && matches!(
-            target,
-            DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
-        )
-}
-
-/// Complete typed source/target admission for that existing intrinsic. Both
-/// authored JSON text and ordinary UTF8 text used the original parser CAST;
-/// target child domains are supplied by the explicit target, never inferred
-/// from observed values. Non-text nominal domains cannot enter this port.
-pub fn is_default_json_structure_cast(
-    source: &FunctionValueType,
-    target: &FunctionValueType,
-) -> bool {
-    (!source.nullable() || target.nullable())
-        && matches!(
-            source.logical_type(),
-            ValueLogicalType::Json | ValueLogicalType::Physical
-        )
-        && target.logical_type() == ValueLogicalType::Physical
-        && default_json_structure_carrier_cast_supported(source.data_type(), target.data_type())
 }

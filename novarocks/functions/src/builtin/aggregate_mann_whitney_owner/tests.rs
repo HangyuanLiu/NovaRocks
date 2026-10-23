@@ -431,8 +431,7 @@ fn mann_whitney_checked_creator_preserves_four_phases_and_original_control() {
                 &mut creation,
                 &stop,
             )
-            .err()
-            .expect("the original control must refuse checked preparation");
+            .expect_err("the original control must refuse checked preparation");
         assert!(matches!(
             error,
             CheckedCallPreparationFailure::Preparation(CheckedOwnerFailure::Original(

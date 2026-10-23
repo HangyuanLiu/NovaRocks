@@ -677,27 +677,26 @@ impl IcebergMetadataMaintenanceAdapter {
                 Ok(Err(error)) => public_outcome(journal.catalog_bridge_failure(error.to_string())),
                 Err(message) => public_outcome(journal.catalog_bridge_failure(message.to_string())),
             };
-            if let ExternalMutationOutcome::KnownUncommitted { ref failure, .. } = outcome {
-                if failure.kind() == ConnectorMutationFailureKind::Conflict
-                    && ordinal < policy.retries()
-                {
-                    let wait = policy.backoff(ordinal);
-                    if wait >= policy.total_timeout().saturating_sub(started.elapsed()) {
-                        return Ok(outcome);
-                    }
-                    if let Err(error) = runtime
-                        .block_on({
-                            let waiting = operation.clone();
-                            async move { waiting.pause(wait).await }
-                        })
-                        .map_err(unavailable)
-                        .and_then(|r| r.map_err(iceberg_error))
-                    {
-                        return Ok(rejected(error));
-                    }
-                    ordinal += 1;
-                    continue;
+            if let ExternalMutationOutcome::KnownUncommitted { ref failure, .. } = outcome
+                && failure.kind() == ConnectorMutationFailureKind::Conflict
+                && ordinal < policy.retries()
+            {
+                let wait = policy.backoff(ordinal);
+                if wait >= policy.total_timeout().saturating_sub(started.elapsed()) {
+                    return Ok(outcome);
                 }
+                if let Err(error) = runtime
+                    .block_on({
+                        let waiting = operation.clone();
+                        async move { waiting.pause(wait).await }
+                    })
+                    .map_err(unavailable)
+                    .and_then(|r| r.map_err(iceberg_error))
+                {
+                    return Ok(rejected(error));
+                }
+                ordinal += 1;
+                continue;
             }
             self.runtime
                 .control_state()
@@ -2261,7 +2260,7 @@ mod tests {
             // objects are now absent from its live head, but serve source.
             let bytes = source
                 .file_io()
-                .new_input(&format!(
+                .new_input(format!(
                     "{}/data/real-11.parquet",
                     source.metadata().location()
                 ))

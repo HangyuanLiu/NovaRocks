@@ -460,8 +460,7 @@ fn field_kernel_real_public_compile_binding_refuses_unsupported_shape_before_cpu
             &[FunctionValueType::new(DataType::Utf8, true)][..count],
             DecimalOverflowPolicy::ReportError,
         )
-        .err()
-        .expect("no CPU preparation for an unsupported shape");
+        .expect_err("no CPU preparation for an unsupported shape");
         assert!(matches!(
             error,
             crate::FunctionSpecializationFailure::Binding(

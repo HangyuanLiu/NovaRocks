@@ -1079,7 +1079,7 @@ mod tests {
         ] {
             let fact = original.failure_fact();
             let selected = novarocks_query_application::coordination::SelectedTaskTermination::new(
-                identity.clone(),
+                identity,
                 novarocks_execution_contract::TerminationDetail::Failed(
                     novarocks_execution_contract::TaskFailure::new_in_phase(
                         fact,

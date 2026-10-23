@@ -225,10 +225,8 @@ async fn original_eager_tls_reconnect(retire_before_bracket: bool) -> Result<Out
             tokio::task::yield_now().await;
         };
         let state = runtime.transport_admission().frontend_outgoing_snapshot()?;
-        if retire_before_bracket {
-            if !runtime.invalidate_channel_if_current(original) {
-                return Err("original current cache invalidation failed".into());
-            }
+        if retire_before_bracket && !runtime.invalidate_channel_if_current(original) {
+            return Err("original current cache invalidation failed".into());
         }
         let cached = runtime.cached_channel(&original.slot).ok_or(CacheRetired)?;
         let bracket = Bracket {
@@ -297,15 +295,15 @@ async fn actual_fe_eager_cache_reconnects_same_slot_into_withheld_tls() {
         .expect("bounded component construction");
     // All assertions follow actual original peer join and public drain; errors
     // and the original panic object remain owned, with only finite presentation.
-    if let Ok(Err(error)) = &outcome.operation {
-        if let Some(failure) = error.downcast_ref::<BracketFailure>() {
-            // Static reason and fixed public counters only; never format an
-            // arbitrary original transport/TLS/provider cause.
-            eprintln!(
-                "bracket refusal: {} actual={:?}",
-                failure.reason, failure.actual
-            );
-        }
+    if let Ok(Err(error)) = &outcome.operation
+        && let Some(failure) = error.downcast_ref::<BracketFailure>()
+    {
+        // Static reason and fixed public counters only; never format an
+        // arbitrary original transport/TLS/provider cause.
+        eprintln!(
+            "bracket refusal: {} actual={:?}",
+            failure.reason, failure.actual
+        );
     }
     assert!(
         matches!(&outcome.operation, Ok(Ok(_))),

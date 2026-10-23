@@ -417,7 +417,7 @@ fn sender_writer_metadata_uses_original_source_field_and_exact_canonical_wire() 
     let control = Control::default();
     let encoded = projected(&[], &[], &writers, &control).unwrap();
     let expected_field = wire_field(u32::MAX, 0, "根\0writer", false);
-    let original = recipe.input().fields_iter().next().unwrap().field();
+    let _original = recipe.input().fields_iter().next().unwrap().field();
     let source_wire = original_source_wire(&recipe, u32::MAX);
     assert_eq!(
         source_wire.field_facts[0].metadata,
@@ -611,7 +611,7 @@ fn sender_sparse_ids_dictionary_attributes_and_role_order_are_original_source_fa
     let values = [(u32::MAX, FunctionValueType::new(DataType::Int32, true))];
     let control = Control::default();
     let encoded = projected(&values, &strict, &writers, &control).unwrap();
-    let original_dict = recipe.input().fields_iter().next().unwrap().field();
+    let _original_dict = recipe.input().fields_iter().next().unwrap().field();
     let source_wire = original_source_wire(&recipe, u32::MAX);
     assert_eq!(source_wire.field_facts[0].dictionary_id, Some(17));
     assert_eq!(

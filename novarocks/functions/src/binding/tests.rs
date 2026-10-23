@@ -165,8 +165,7 @@ impl FunctionBindingResolver for EchoResolver {
         };
         if selected.overload != identity("test/echo/T/v1")
             || selected.result_type != FunctionResultType::Scalar(value_type.clone())
-            || selected.argument_types.as_ref()
-                != &[FunctionArgumentType::Value(value_type.clone())]
+            || selected.argument_types.as_ref() != [FunctionArgumentType::Value(value_type.clone())]
         {
             return Err(invalid(
                 "selected echo signature does not match its concrete input",

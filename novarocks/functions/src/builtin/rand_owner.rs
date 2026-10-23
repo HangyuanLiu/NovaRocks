@@ -358,6 +358,87 @@ fn test_context() -> novarocks_type_contract::ExpressionEffectContext {
     }
 }
 
+impl RandOwner {
+    fn refine_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(FunctionEffectOwnerError::Control)?;
+        work.step().map_err(FunctionEffectOwnerError::Control)?;
+        if input.function_id != self.declaration.function_id() || input.kind != FunctionKind::Scalar
+        {
+            return Err(FunctionBindingError::UnknownFunction.into());
+        }
+        if !input.environment.is_empty()
+            || !matches!(input.proof_scope, CallProofScope::Unconditional)
+                && input.proof_scope != CallProofScope::Domain(input.context.domain)
+        {
+            return Err(FunctionBindingError::InvalidBinding(
+                "RAND/RANDOM has no environment dependencies and requires an exact proof scope"
+                    .into(),
+            )
+            .into());
+        }
+        work.flush().map_err(FunctionEffectOwnerError::Control)?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+            other => FunctionEffectOwnerError::Owner(other),
+        })?;
+        work.step().map_err(FunctionEffectOwnerError::Control)?;
+        let recipe = seed_recipe(input.request, &mut work)?;
+        let result = self.call_effects(recipe, input.proof_scope);
+        work.finish().map_err(FunctionEffectOwnerError::Control)?;
+        Ok(result)
+    }
+    fn prepare_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(compile_failure)?;
+        work.step().map_err(compile_failure)?;
+        if input.function_id != self.declaration.function_id()
+            || input.kind != FunctionKind::Scalar
+            || contract.function_id() != input.function_id
+            || !std::ptr::eq(contract.selected(), input.selected)
+            || contract.context() != input.context
+            || contract.decimal_overflow_policy() != input.decimal_overflow_policy
+            || !input.environment.is_empty()
+        {
+            return Err(invalid(
+                "RAND/RANDOM preparation differs from its exact checked call",
+            ));
+        }
+        work.flush().map_err(compile_failure)?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => compile_failure(error),
+            _ => invalid("RAND/RANDOM preparation has a stale selected binding"),
+        })?;
+        work.step().map_err(compile_failure)?;
+        work.flush().map_err(compile_failure)?;
+        let recipe = seed_recipe(input.request, &mut work).map_err(|error| {
+            if let Some(cause) = error.control_error() {
+                compile_failure(cause)
+            } else {
+                invalid("RAND/RANDOM preparation has stale constant seed facts")
+            }
+        })?;
+        if contract.effects() != &self.call_effects(recipe, input.proof_scope) {
+            return Err(invalid(
+                "RAND/RANDOM preparation has different exact recipe effects",
+            ));
+        }
+        work.finish().map_err(compile_failure)?;
+        Ok(Arc::new(PreparedRand { contract, recipe }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::catalogue::constant_binding_tests as cv;
@@ -780,86 +861,5 @@ mod tests {
                 matches!(specialize_scalar(&owner, input, selected.clone(), ScopedExpressionEffects::pure_value(test_context()), &Fail(error.clone())), Err(FunctionSpecializationFailure::Control(actual)) if actual == error)
             );
         }
-    }
-}
-
-impl RandOwner {
-    fn refine_selected_core(
-        &self,
-        input: CallEffectInput<'_>,
-        control: &dyn PureCompileControl,
-        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
-    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(FunctionEffectOwnerError::Control)?;
-        work.step().map_err(FunctionEffectOwnerError::Control)?;
-        if input.function_id != self.declaration.function_id() || input.kind != FunctionKind::Scalar
-        {
-            return Err(FunctionBindingError::UnknownFunction.into());
-        }
-        if !input.environment.is_empty()
-            || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                && input.proof_scope != CallProofScope::Domain(input.context.domain)
-        {
-            return Err(FunctionBindingError::InvalidBinding(
-                "RAND/RANDOM has no environment dependencies and requires an exact proof scope"
-                    .into(),
-            )
-            .into());
-        }
-        work.flush().map_err(FunctionEffectOwnerError::Control)?;
-        validate().map_err(|error| match error {
-            FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
-            other => FunctionEffectOwnerError::Owner(other),
-        })?;
-        work.step().map_err(FunctionEffectOwnerError::Control)?;
-        let recipe = seed_recipe(input.request, &mut work)?;
-        let result = self.call_effects(recipe, input.proof_scope);
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        Ok(result)
-    }
-    fn prepare_selected_core(
-        &self,
-        input: CallEffectInput<'_>,
-        contract: Arc<ScalarCallContract>,
-        control: &dyn PureCompileControl,
-        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
-    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(compile_failure)?;
-        work.step().map_err(compile_failure)?;
-        if input.function_id != self.declaration.function_id()
-            || input.kind != FunctionKind::Scalar
-            || contract.function_id() != input.function_id
-            || !std::ptr::eq(contract.selected(), input.selected)
-            || contract.context() != input.context
-            || contract.decimal_overflow_policy() != input.decimal_overflow_policy
-            || !input.environment.is_empty()
-        {
-            return Err(invalid(
-                "RAND/RANDOM preparation differs from its exact checked call",
-            ));
-        }
-        work.flush().map_err(compile_failure)?;
-        validate().map_err(|error| match error {
-            FunctionBindingError::Control(error) => compile_failure(error),
-            _ => invalid("RAND/RANDOM preparation has a stale selected binding"),
-        })?;
-        work.step().map_err(compile_failure)?;
-        work.flush().map_err(compile_failure)?;
-        let recipe = seed_recipe(input.request, &mut work).map_err(|error| {
-            if let Some(cause) = error.control_error() {
-                compile_failure(cause)
-            } else {
-                invalid("RAND/RANDOM preparation has stale constant seed facts")
-            }
-        })?;
-        if contract.effects() != &self.call_effects(recipe, input.proof_scope) {
-            return Err(invalid(
-                "RAND/RANDOM preparation has different exact recipe effects",
-            ));
-        }
-        work.finish().map_err(compile_failure)?;
-        Ok(Arc::new(PreparedRand { contract, recipe }))
     }
 }

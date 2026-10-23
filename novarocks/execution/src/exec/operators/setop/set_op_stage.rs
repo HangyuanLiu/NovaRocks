@@ -67,7 +67,7 @@ impl SetOpStageController {
         let stage_total = stage_producer_counts.len();
         let remaining_producers = stage_producer_counts
             .into_iter()
-            .map(|n| AtomicUsize::new(n))
+            .map(AtomicUsize::new)
             .collect::<Vec<_>>();
         Ok(Self {
             inner: Arc::new(SetOpStageControllerInner {

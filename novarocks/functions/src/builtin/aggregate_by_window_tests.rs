@@ -40,12 +40,12 @@ impl WindowHost {
         assert!(!gate.refused, "no host request after first refusal");
         let at = gate.events.len();
         gate.events.push((opaque, bytes));
-        if let Some((stop, cause)) = &gate.refusal {
-            if *stop == at {
-                let cause = cause.clone();
-                gate.refused = true;
-                return Err(cause);
-            }
+        if let Some((stop, cause)) = &gate.refusal
+            && *stop == at
+        {
+            let cause = cause.clone();
+            gate.refused = true;
+            return Err(cause);
         }
         if opaque {
             gate.opaque += bytes;

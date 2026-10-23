@@ -335,21 +335,23 @@ impl FrozenExecutionDescription {
             .fragments()
             .values()
             .flat_map(|fragment| {
-                fragment.nodes().values().filter_map(|node| {
-                    matches!(&node.kind, novarocks_physical_plan::NodeKind::Scan { .. }).then(
-                        || {
-                            let node_id = i32::try_from(node.id.get()).map_err(|_| {
-                                "completed plan scan node id exceeds native scheduling range"
-                                    .to_string()
-                            })?;
-                            Ok(crate::api::PlanScanIdentity::new(
-                                crate::api::PlanSeal::Version(plan),
-                                fragment.id().get(),
-                                node_id,
-                            ))
-                        },
-                    )
-                })
+                fragment
+                    .nodes()
+                    .values()
+                    .filter(|&node| {
+                        matches!(&node.kind, novarocks_physical_plan::NodeKind::Scan { .. })
+                    })
+                    .map(|node| {
+                        let node_id = i32::try_from(node.id.get()).map_err(|_| {
+                            "completed plan scan node id exceeds native scheduling range"
+                                .to_string()
+                        })?;
+                        Ok(crate::api::PlanScanIdentity::new(
+                            crate::api::PlanSeal::Version(plan),
+                            fragment.id().get(),
+                            node_id,
+                        ))
+                    })
             })
             .collect::<Result<std::collections::BTreeSet<_>, String>>()?;
         let supplied_scans = scan_identities

@@ -1630,15 +1630,14 @@ impl IcebergWriteSessionControl {
                 .summary()
                 .additional_properties
                 .get(ICEBERG_WRITE_SESSION_MARKER_PROPERTY);
-            if marker.is_some_and(|value| *value == expected) {
-                if matched
+            if marker.is_some_and(|value| *value == expected)
+                && matched
                     .replace((snapshot.snapshot_id(), marker.unwrap().clone()))
                     .is_some()
-                {
-                    return Err(corrupt(
-                        "Iceberg write session marker matches multiple snapshots",
-                    ));
-                }
+            {
+                return Err(corrupt(
+                    "Iceberg write session marker matches multiple snapshots",
+                ));
             }
         }
         let Some((snapshot_id, marker_value)) = matched else {
@@ -3441,7 +3440,7 @@ mod statistics_contract_tests {
         let metadata = metadata
             .into_builder(None)
             .set_ref(
-                "dev".into(),
+                "dev",
                 SnapshotReference::new(
                     main,
                     SnapshotRetention::Branch {

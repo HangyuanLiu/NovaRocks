@@ -153,37 +153,38 @@ impl CompletionWork {
             }
         }
         // Each holder is taken exactly once. A failed destructor is never retried.
-        if let Some(action) = self.action.take() {
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(action))) {
+        if let Some(action) = self.action.take()
+            && let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(action)))
+        {
+            failed = true;
+            self.dispose_panic(payload);
+        }
+        if let Some(fact) = self.fact.take()
+            && let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(fact)))
+        {
+            failed = true;
+            self.dispose_panic(payload);
+        }
+        if !failed
+            && !withdrawn
+            && let Some(reporter) = self.reporter.as_ref()
+        {
+            // The executable action and its original fact have actually
+            // exited. Notification remains supervised by this same slot.
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                reporter.note_actual_stopped();
+                reporter.note_resources_converged();
+            }));
+            if let Err(payload) = result {
                 failed = true;
                 self.dispose_panic(payload);
             }
         }
-        if let Some(fact) = self.fact.take() {
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(fact))) {
-                failed = true;
-                self.dispose_panic(payload);
-            }
-        }
-        if !failed && !withdrawn {
-            if let Some(reporter) = self.reporter.as_ref() {
-                // The executable action and its original fact have actually
-                // exited. Notification remains supervised by this same slot.
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    reporter.note_actual_stopped();
-                    reporter.note_resources_converged();
-                }));
-                if let Err(payload) = result {
-                    failed = true;
-                    self.dispose_panic(payload);
-                }
-            }
-        }
-        if let Some(reporter) = self.reporter.take() {
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(reporter))) {
-                failed = true;
-                self.dispose_panic(payload);
-            }
+        if let Some(reporter) = self.reporter.take()
+            && let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(reporter)))
+        {
+            failed = true;
+            self.dispose_panic(payload);
         }
         !failed
     }
@@ -561,13 +562,13 @@ impl TaskCompletionSupervisor {
         action: TaskCompletionAction,
         reporter: Option<crate::TaskStatusReporter>,
     ) -> Result<TaskCompletionReservation, CompletionReservationError> {
-        if let Some(reporter) = reporter.as_ref() {
-            if reporter.identity() != identity {
-                return Err(CompletionReservationError::StatusIdentity {
-                    reserved: identity,
-                    reporter: reporter.identity(),
-                });
-            }
+        if let Some(reporter) = reporter.as_ref()
+            && reporter.identity() != identity
+        {
+            return Err(CompletionReservationError::StatusIdentity {
+                reserved: identity,
+                reporter: reporter.identity(),
+            });
         }
         let mut state = self.shared.state.lock().expect(COMPLETION_STATE_LOCK);
         if state.accepting && self.shared.ready.is_closed() {
@@ -691,22 +692,22 @@ impl TaskCompletionSupervisor {
                 .all(|slot| slot.phase == CompletionPhase::Unresolved)
         {
             let join = self.join.lock().expect(COMPLETION_STATE_LOCK).take();
-            if let Some(join) = join {
-                if let Err(error) = join.await {
-                    if error.is_panic() {
-                        let payload = std::mem::ManuallyDrop::new(error.into_panic());
-                        let mut state = self.shared.state.lock().expect(COMPLETION_STATE_LOCK);
-                        state.owner_panic = Some(payload);
-                        if state.custody.is_none() {
-                            state.custody = Some(Arc::clone(&self.shared));
-                        }
-                        CompletionShared::fail_locked(
-                            &mut state,
-                            "task completion owner panicked before a trustworthy drain",
-                        );
+            if let Some(join) = join
+                && let Err(error) = join.await
+            {
+                if error.is_panic() {
+                    let payload = std::mem::ManuallyDrop::new(error.into_panic());
+                    let mut state = self.shared.state.lock().expect(COMPLETION_STATE_LOCK);
+                    state.owner_panic = Some(payload);
+                    if state.custody.is_none() {
+                        state.custody = Some(Arc::clone(&self.shared));
                     }
-                    return Err("task completion owner stopped unexpectedly".to_string());
+                    CompletionShared::fail_locked(
+                        &mut state,
+                        "task completion owner panicked before a trustworthy drain",
+                    );
                 }
+                return Err("task completion owner stopped unexpectedly".to_string());
             }
         }
         result

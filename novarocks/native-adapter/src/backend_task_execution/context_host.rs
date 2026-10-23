@@ -1374,6 +1374,292 @@ impl novarocks_execution_contract::failure::FailureProjection for DynamicFilterN
     }
 }
 
+/// The query-scoped facts one task's preparation needs.
+///
+/// The execution side only ever holds a `&TaskDescriptor`, and a `TaskIdentity`
+/// carries no frontend process id, so it structurally cannot name a
+/// `QueryContextRef`. This maps the execution id it does have onto the context
+/// that installed the facts, and refuses when there is none: an unestablished
+/// or released context has no runtime filter, no catalog lease, and no
+/// storage credential, and there is no process-level substitute for any of
+/// them that a task could legitimately fall back to.
+use novarocks_execution::runtime::fragment::io::{FragmentEvent, FragmentEventSink};
+use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
+use novarocks_execution_contract::task_execution::domain::{CodecOwnedContent, DomainVersion};
+use novarocks_proto_models::filter;
+use novarocks_types::UniqueId;
+
+use crate::backend_task_execution::execution_host::TaskQueryContextFacts;
+use novarocks_spi::connector::{
+    CatalogHandle, ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding,
+};
+
+impl TaskQueryContextFacts for NativeQueryContextHost {
+    fn query_options(
+        &self,
+        execution: QueryExecutionId,
+    ) -> Result<QueryContextOptions, HostRejection> {
+        let context = self.context_for_execution(execution).ok_or_else(|| {
+            context_facts_rejection(ContextFactsFailure::TaskContextUnavailable(execution))
+        })?;
+        let installed = self.active_context(context)?;
+        let facts = installed
+            .facts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if facts.released {
+            return Err(context_facts_rejection(ContextFactsFailure::Released));
+        }
+        facts
+            .query_options
+            .clone()
+            .ok_or_else(|| context_facts_rejection(ContextFactsFailure::QueryOptionsMissing))
+    }
+
+    fn runtime_filter_session(
+        &self,
+        execution: QueryExecutionId,
+        fragment_instance_id: UniqueId,
+        expects_bindings: bool,
+    ) -> Result<Option<RuntimeFilterSessionRef>, novarocks_worker::RuntimeFilterContractError> {
+        let Some(participant) = self.participant_for_execution(execution) else {
+            // A query that installs no filter on this backend is the ordinary
+            // case; a task whose plan binds one and finds none is not, because
+            // it would otherwise read unfiltered and call that success.
+            return if expects_bindings {
+                Err(
+                    novarocks_worker::RuntimeFilterContractError::invalid_contract(format!(
+                        "task of {execution:?} binds a runtime filter but its query context installed \
+                     none on this backend"
+                    )),
+                )
+            } else {
+                Ok(None)
+            };
+        };
+        participant.session_for_fragment(execution, fragment_instance_id, expects_bindings)
+    }
+
+    fn runtime_filter_session_for_bindings(
+        &self,
+        execution: QueryExecutionId,
+        fragment_instance_id: UniqueId,
+        bindings: &BTreeSet<u32>,
+    ) -> Result<Option<RuntimeFilterSessionRef>, novarocks_worker::RuntimeFilterContractError> {
+        let Some(participant) = self.participant_for_execution(execution) else {
+            // As for a plan-tree task: no participant hosts nothing, which is
+            // the ordinary answer only for a program that binds nothing.
+            return if bindings.is_empty() {
+                Ok(None)
+            } else {
+                Err(
+                    novarocks_worker::RuntimeFilterContractError::invalid_contract(format!(
+                        "task of {execution:?} binds runtime filters {bindings:?} but its query \
+                     context installed none on this backend"
+                    )),
+                )
+            };
+        };
+        participant.session_for_fragment_bindings(execution, fragment_instance_id, bindings)
+    }
+
+    fn runtime_filter_event_sink(
+        &self,
+        execution: QueryExecutionId,
+        fragment_instance_id: UniqueId,
+    ) -> Arc<dyn FragmentEventSink> {
+        Arc::new(ContextRuntimeFilterEventSink {
+            participant: self.participant_for_execution(execution),
+            fragment_instance_id,
+        })
+    }
+
+    fn bind_runtime_filter_feedback(
+        &self,
+        execution: QueryExecutionId,
+        carrier: TaskIdentity,
+        reporter: &TaskStatusReporter,
+    ) -> bool {
+        let Some(context) = self.context_for_execution(execution) else {
+            return false;
+        };
+        let installed = {
+            let contexts = self
+                .contexts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            match contexts.get(context) {
+                Some(installed) => Arc::clone(installed),
+                None => return false,
+            }
+        };
+        let mut facts = installed
+            .facts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if facts.released {
+            return false;
+        }
+        // First-wins. A second carrier would replace the sink on every channel
+        // session of the participant, so which task publishes a domain would
+        // depend on submission order and the frontend would poll a task that
+        // no longer publishes.
+        if facts.feedback.is_some() {
+            return false;
+        }
+        // A query with no participant on this backend has no channel that could
+        // ever reduce, so there is nothing to carry.
+        let Some(participant) = facts.participant.clone() else {
+            return false;
+        };
+        let sink = TaskRuntimeFilterFeedbackEgress::new(carrier, reporter.clone());
+        #[cfg(novarocks_dev_controls)]
+        let sink = {
+            let sink = if let Some(controls) = self.test_controls.clone() {
+                sink.with_test_controls(controls)
+            } else {
+                sink
+            };
+            sink.with_observation_controls(self.observations.clone())
+        };
+        let sink = Arc::new(sink);
+        // The participant holds this weakly, exactly as the lifecycle egress
+        // was held: a background publisher must not be able to keep the query
+        // context alive through its own sink.
+        participant.set_frontend_feedback_sink(Arc::downgrade(
+            &(Arc::clone(&sink) as Arc<dyn BackendFrontendFeedbackSink>),
+        ));
+        facts.feedback = Some(sink);
+        true
+    }
+
+    fn deliver_task_dynamic_filter(
+        &self,
+        execution: QueryExecutionId,
+        _fragment_instance_id: UniqueId,
+        version: DomainVersion,
+        payload: &Arc<dyn CodecOwnedContent>,
+    ) -> Result<(), HostRejection> {
+        let envelope = stored_message::<filter::RuntimeFilterEnvelope>(payload.as_ref())
+            .ok_or_else(|| context_facts_rejection(ContextFactsFailure::FilterCarrier(version)))?
+            .clone();
+        let participant = self.participant_for_execution(execution).ok_or_else(|| {
+            context_facts_rejection(ContextFactsFailure::FilterParticipantUnavailable(execution))
+        })?;
+        // The one decoder that turns a wire envelope into a backend one lives
+        // in the runtime-filter transport. Reusing it is what keeps this from
+        // becoming a second authority over the same wire shape.
+        let response = novarocks_native_adapter::runtime_filter_rpc::handle_runtime_filter_envelope_typed(
+            participant as Arc<dyn novarocks_native_adapter::runtime_filter_rpc::BackendRuntimeFilterEnvelopeIngress>,
+            envelope,
+        )
+        .map_err(|source| HostRejection::from_domain(super::execution_host::failure_category(&source), source))?;
+        // A duplicate is a legal answer to a replayed push; only a rejection
+        // or an unknown status means the filter did not land.
+        let accepted = matches!(
+            filter::RuntimeFilterAcceptStatus::try_from(response.accept_status),
+            Ok(filter::RuntimeFilterAcceptStatus::Accepted
+                | filter::RuntimeFilterAcceptStatus::Duplicate)
+        );
+        if !accepted {
+            let source = DynamicFilterNotAccepted {
+                version,
+                status: response.accept_status,
+                detail: novarocks_execution_contract::failure::BoundedDetail::truncating(
+                    &response.rejection_reason,
+                ),
+            };
+            return Err(HostRejection::from_domain(
+                super::execution_host::failure_category(&source),
+                source,
+            ));
+        }
+        Ok(())
+    }
+
+    fn catalog_read_execution(
+        &self,
+        execution: QueryExecutionId,
+        handle: &CatalogHandle,
+    ) -> Result<ConnectorExecutionReadBinding, novarocks_worker::CatalogExecutionAccessError> {
+        let runtime = self
+            .catalog_manager
+            .resolve_for_query(execution, handle)
+            .ok_or_else(
+                || novarocks_worker::CatalogExecutionAccessError::LeaseUnavailable {
+                    catalog: handle.clone(),
+                },
+            )?;
+        runtime.read().cloned().ok_or_else(|| {
+            novarocks_worker::CatalogExecutionAccessError::ReadUnavailable {
+                catalog: handle.clone(),
+            }
+        })
+    }
+
+    fn catalog_write_execution(
+        &self,
+        execution: QueryExecutionId,
+        handle: &CatalogHandle,
+    ) -> Result<ConnectorExecutionWriteBinding, novarocks_worker::CatalogExecutionAccessError> {
+        let runtime = self
+            .catalog_manager
+            .resolve_for_query(execution, handle)
+            .ok_or_else(
+                || novarocks_worker::CatalogExecutionAccessError::LeaseUnavailable {
+                    catalog: handle.clone(),
+                },
+            )?;
+        runtime.write().cloned().ok_or_else(|| {
+            novarocks_worker::CatalogExecutionAccessError::WriteUnavailable {
+                catalog: handle.clone(),
+            }
+        })
+    }
+
+    fn storage_resolver(
+        &self,
+        execution: QueryExecutionId,
+    ) -> Result<Arc<dyn ConnectorStorageResolver>, HostRejection> {
+        // Deliberately a refusal, not a permissive default: a scan that
+        // reached read time with no vended credential would fail there anyway,
+        // and failing here says which context is missing.
+        self.context_for_execution(execution)
+            .and_then(|context| self.storage_resolver_for_context(context))
+            .ok_or_else(|| {
+                context_facts_rejection(ContextFactsFailure::StorageContextUnavailable(execution))
+            })
+    }
+}
+
+/// Folds a running fragment's runtime-filter evidence into the participant
+/// that owns the installed consumer identity.
+///
+/// Progress and profile events are dropped here: they belong to the task's own
+/// metrics owner, which is a different sink. Silently folding them into the
+/// filter participant would put two unrelated facts behind one identity.
+struct ContextRuntimeFilterEventSink {
+    /// Resolved once, when the fragment is installed: the context has
+    /// materialized by then, and a query with no filter on this backend has
+    /// nothing to fold into.
+    participant: Option<Arc<RuntimeFilterParticipant>>,
+    fragment_instance_id: UniqueId,
+}
+
+impl FragmentEventSink for ContextRuntimeFilterEventSink {
+    fn record(&self, event: FragmentEvent) {
+        let Some(participant) = self.participant.as_ref() else {
+            return;
+        };
+        match event {
+            FragmentEvent::RuntimeFilterRowEffect(effect) => {
+                participant.record_row_effect(self.fragment_instance_id, effect);
+            }
+            FragmentEvent::Progress(_) | FragmentEvent::ProfileSnapshot(_) => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::NativeQueryContextHost;
@@ -2867,292 +3153,6 @@ mod tests {
                     "a credential-shaped token appeared in a rendering: {rendered}"
                 );
             }
-        }
-    }
-}
-
-/// The query-scoped facts one task's preparation needs.
-///
-/// The execution side only ever holds a `&TaskDescriptor`, and a `TaskIdentity`
-/// carries no frontend process id, so it structurally cannot name a
-/// `QueryContextRef`. This maps the execution id it does have onto the context
-/// that installed the facts, and refuses when there is none: an unestablished
-/// or released context has no runtime filter, no catalog lease, and no
-/// storage credential, and there is no process-level substitute for any of
-/// them that a task could legitimately fall back to.
-use novarocks_execution::runtime::fragment::io::{FragmentEvent, FragmentEventSink};
-use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
-use novarocks_execution_contract::task_execution::domain::{CodecOwnedContent, DomainVersion};
-use novarocks_proto_models::filter;
-use novarocks_types::UniqueId;
-
-use crate::backend_task_execution::execution_host::TaskQueryContextFacts;
-use novarocks_spi::connector::{
-    CatalogHandle, ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding,
-};
-
-impl TaskQueryContextFacts for NativeQueryContextHost {
-    fn query_options(
-        &self,
-        execution: QueryExecutionId,
-    ) -> Result<QueryContextOptions, HostRejection> {
-        let context = self.context_for_execution(execution).ok_or_else(|| {
-            context_facts_rejection(ContextFactsFailure::TaskContextUnavailable(execution))
-        })?;
-        let installed = self.active_context(context)?;
-        let facts = installed
-            .facts
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if facts.released {
-            return Err(context_facts_rejection(ContextFactsFailure::Released));
-        }
-        facts
-            .query_options
-            .clone()
-            .ok_or_else(|| context_facts_rejection(ContextFactsFailure::QueryOptionsMissing))
-    }
-
-    fn runtime_filter_session(
-        &self,
-        execution: QueryExecutionId,
-        fragment_instance_id: UniqueId,
-        expects_bindings: bool,
-    ) -> Result<Option<RuntimeFilterSessionRef>, novarocks_worker::RuntimeFilterContractError> {
-        let Some(participant) = self.participant_for_execution(execution) else {
-            // A query that installs no filter on this backend is the ordinary
-            // case; a task whose plan binds one and finds none is not, because
-            // it would otherwise read unfiltered and call that success.
-            return if expects_bindings {
-                Err(
-                    novarocks_worker::RuntimeFilterContractError::invalid_contract(format!(
-                        "task of {execution:?} binds a runtime filter but its query context installed \
-                     none on this backend"
-                    )),
-                )
-            } else {
-                Ok(None)
-            };
-        };
-        participant.session_for_fragment(execution, fragment_instance_id, expects_bindings)
-    }
-
-    fn runtime_filter_session_for_bindings(
-        &self,
-        execution: QueryExecutionId,
-        fragment_instance_id: UniqueId,
-        bindings: &BTreeSet<u32>,
-    ) -> Result<Option<RuntimeFilterSessionRef>, novarocks_worker::RuntimeFilterContractError> {
-        let Some(participant) = self.participant_for_execution(execution) else {
-            // As for a plan-tree task: no participant hosts nothing, which is
-            // the ordinary answer only for a program that binds nothing.
-            return if bindings.is_empty() {
-                Ok(None)
-            } else {
-                Err(
-                    novarocks_worker::RuntimeFilterContractError::invalid_contract(format!(
-                        "task of {execution:?} binds runtime filters {bindings:?} but its query \
-                     context installed none on this backend"
-                    )),
-                )
-            };
-        };
-        participant.session_for_fragment_bindings(execution, fragment_instance_id, bindings)
-    }
-
-    fn runtime_filter_event_sink(
-        &self,
-        execution: QueryExecutionId,
-        fragment_instance_id: UniqueId,
-    ) -> Arc<dyn FragmentEventSink> {
-        Arc::new(ContextRuntimeFilterEventSink {
-            participant: self.participant_for_execution(execution),
-            fragment_instance_id,
-        })
-    }
-
-    fn bind_runtime_filter_feedback(
-        &self,
-        execution: QueryExecutionId,
-        carrier: TaskIdentity,
-        reporter: &TaskStatusReporter,
-    ) -> bool {
-        let Some(context) = self.context_for_execution(execution) else {
-            return false;
-        };
-        let installed = {
-            let contexts = self
-                .contexts
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            match contexts.get(context) {
-                Some(installed) => Arc::clone(installed),
-                None => return false,
-            }
-        };
-        let mut facts = installed
-            .facts
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if facts.released {
-            return false;
-        }
-        // First-wins. A second carrier would replace the sink on every channel
-        // session of the participant, so which task publishes a domain would
-        // depend on submission order and the frontend would poll a task that
-        // no longer publishes.
-        if facts.feedback.is_some() {
-            return false;
-        }
-        // A query with no participant on this backend has no channel that could
-        // ever reduce, so there is nothing to carry.
-        let Some(participant) = facts.participant.clone() else {
-            return false;
-        };
-        let sink = TaskRuntimeFilterFeedbackEgress::new(carrier, reporter.clone());
-        #[cfg(novarocks_dev_controls)]
-        let sink = {
-            let sink = if let Some(controls) = self.test_controls.clone() {
-                sink.with_test_controls(controls)
-            } else {
-                sink
-            };
-            sink.with_observation_controls(self.observations.clone())
-        };
-        let sink = Arc::new(sink);
-        // The participant holds this weakly, exactly as the lifecycle egress
-        // was held: a background publisher must not be able to keep the query
-        // context alive through its own sink.
-        participant.set_frontend_feedback_sink(Arc::downgrade(
-            &(Arc::clone(&sink) as Arc<dyn BackendFrontendFeedbackSink>),
-        ));
-        facts.feedback = Some(sink);
-        true
-    }
-
-    fn deliver_task_dynamic_filter(
-        &self,
-        execution: QueryExecutionId,
-        _fragment_instance_id: UniqueId,
-        version: DomainVersion,
-        payload: &Arc<dyn CodecOwnedContent>,
-    ) -> Result<(), HostRejection> {
-        let envelope = stored_message::<filter::RuntimeFilterEnvelope>(payload.as_ref())
-            .ok_or_else(|| context_facts_rejection(ContextFactsFailure::FilterCarrier(version)))?
-            .clone();
-        let participant = self.participant_for_execution(execution).ok_or_else(|| {
-            context_facts_rejection(ContextFactsFailure::FilterParticipantUnavailable(execution))
-        })?;
-        // The one decoder that turns a wire envelope into a backend one lives
-        // in the runtime-filter transport. Reusing it is what keeps this from
-        // becoming a second authority over the same wire shape.
-        let response = novarocks_native_adapter::runtime_filter_rpc::handle_runtime_filter_envelope_typed(
-            participant as Arc<dyn novarocks_native_adapter::runtime_filter_rpc::BackendRuntimeFilterEnvelopeIngress>,
-            envelope,
-        )
-        .map_err(|source| HostRejection::from_domain(super::execution_host::failure_category(&source), source))?;
-        // A duplicate is a legal answer to a replayed push; only a rejection
-        // or an unknown status means the filter did not land.
-        let accepted = matches!(
-            filter::RuntimeFilterAcceptStatus::try_from(response.accept_status),
-            Ok(filter::RuntimeFilterAcceptStatus::Accepted
-                | filter::RuntimeFilterAcceptStatus::Duplicate)
-        );
-        if !accepted {
-            let source = DynamicFilterNotAccepted {
-                version,
-                status: response.accept_status,
-                detail: novarocks_execution_contract::failure::BoundedDetail::truncating(
-                    &response.rejection_reason,
-                ),
-            };
-            return Err(HostRejection::from_domain(
-                super::execution_host::failure_category(&source),
-                source,
-            ));
-        }
-        Ok(())
-    }
-
-    fn catalog_read_execution(
-        &self,
-        execution: QueryExecutionId,
-        handle: &CatalogHandle,
-    ) -> Result<ConnectorExecutionReadBinding, novarocks_worker::CatalogExecutionAccessError> {
-        let runtime = self
-            .catalog_manager
-            .resolve_for_query(execution, handle)
-            .ok_or_else(
-                || novarocks_worker::CatalogExecutionAccessError::LeaseUnavailable {
-                    catalog: handle.clone(),
-                },
-            )?;
-        runtime.read().cloned().ok_or_else(|| {
-            novarocks_worker::CatalogExecutionAccessError::ReadUnavailable {
-                catalog: handle.clone(),
-            }
-        })
-    }
-
-    fn catalog_write_execution(
-        &self,
-        execution: QueryExecutionId,
-        handle: &CatalogHandle,
-    ) -> Result<ConnectorExecutionWriteBinding, novarocks_worker::CatalogExecutionAccessError> {
-        let runtime = self
-            .catalog_manager
-            .resolve_for_query(execution, handle)
-            .ok_or_else(
-                || novarocks_worker::CatalogExecutionAccessError::LeaseUnavailable {
-                    catalog: handle.clone(),
-                },
-            )?;
-        runtime.write().cloned().ok_or_else(|| {
-            novarocks_worker::CatalogExecutionAccessError::WriteUnavailable {
-                catalog: handle.clone(),
-            }
-        })
-    }
-
-    fn storage_resolver(
-        &self,
-        execution: QueryExecutionId,
-    ) -> Result<Arc<dyn ConnectorStorageResolver>, HostRejection> {
-        // Deliberately a refusal, not a permissive default: a scan that
-        // reached read time with no vended credential would fail there anyway,
-        // and failing here says which context is missing.
-        self.context_for_execution(execution)
-            .and_then(|context| self.storage_resolver_for_context(context))
-            .ok_or_else(|| {
-                context_facts_rejection(ContextFactsFailure::StorageContextUnavailable(execution))
-            })
-    }
-}
-
-/// Folds a running fragment's runtime-filter evidence into the participant
-/// that owns the installed consumer identity.
-///
-/// Progress and profile events are dropped here: they belong to the task's own
-/// metrics owner, which is a different sink. Silently folding them into the
-/// filter participant would put two unrelated facts behind one identity.
-struct ContextRuntimeFilterEventSink {
-    /// Resolved once, when the fragment is installed: the context has
-    /// materialized by then, and a query with no filter on this backend has
-    /// nothing to fold into.
-    participant: Option<Arc<RuntimeFilterParticipant>>,
-    fragment_instance_id: UniqueId,
-}
-
-impl FragmentEventSink for ContextRuntimeFilterEventSink {
-    fn record(&self, event: FragmentEvent) {
-        let Some(participant) = self.participant.as_ref() else {
-            return;
-        };
-        match event {
-            FragmentEvent::RuntimeFilterRowEffect(effect) => {
-                participant.record_row_effect(self.fragment_instance_id, effect);
-            }
-            FragmentEvent::Progress(_) | FragmentEvent::ProfileSnapshot(_) => {}
         }
     }
 }

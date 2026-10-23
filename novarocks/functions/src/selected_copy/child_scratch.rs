@@ -43,13 +43,15 @@ impl<T> ChildScratchVec<T> {
         allocator: Option<&HostAggregateAllocator>,
         request: &mut Option<&mut dyn FnMut(std::alloc::Layout) -> Result<(), E>>,
     ) -> Result<Self, E> {
-        if allocator.is_none() && capacity != 0 && size_of::<T>() != 0 {
-            if let Some(request) = request {
-                request(
-                    std::alloc::Layout::array::<T>(capacity)
-                        .map_err(|source| CopyError::layout::<T>(capacity, source))?,
-                )?;
-            }
+        if allocator.is_none()
+            && capacity != 0
+            && size_of::<T>() != 0
+            && let Some(request) = request
+        {
+            request(
+                std::alloc::Layout::array::<T>(capacity)
+                    .map_err(|source| CopyError::layout::<T>(capacity, source))?,
+            )?;
         }
         Self::try_with_capacity(capacity, allocator).map_err(Into::into)
     }
@@ -58,34 +60,34 @@ impl<T> ChildScratchVec<T> {
         value: T,
         request: &mut Option<&mut dyn FnMut(std::alloc::Layout) -> Result<(), E>>,
     ) -> Result<(), E> {
-        if let Self::Original(values) = self {
-            if values.len() == values.capacity() && size_of::<T>() != 0 {
-                if let Some(request) = request {
-                    // The original std Vec::push growth uses the pinned RawVec
-                    // max(double capacity, required, min_non_zero_cap) rule.
-                    let minimum = if size_of::<T>() == 1 {
-                        8
-                    } else if size_of::<T>() <= 1024 {
-                        4
-                    } else {
-                        1
-                    };
-                    let required = values
-                        .len()
-                        .checked_add(1)
-                        .ok_or_else(|| CopyError::arithmetic(Some(values.len() as u128 + 1)))?;
-                    let count = values
-                        .capacity()
-                        .checked_mul(2)
-                        .ok_or_else(|| CopyError::arithmetic(Some(values.capacity() as u128 * 2)))?
-                        .max(required)
-                        .max(minimum);
-                    request(
-                        std::alloc::Layout::array::<T>(count)
-                            .map_err(|source| CopyError::layout::<T>(count, source))?,
-                    )?;
-                }
-            }
+        if let Self::Original(values) = self
+            && values.len() == values.capacity()
+            && size_of::<T>() != 0
+            && let Some(request) = request
+        {
+            // The original std Vec::push growth uses the pinned RawVec
+            // max(double capacity, required, min_non_zero_cap) rule.
+            let minimum = if size_of::<T>() == 1 {
+                8
+            } else if size_of::<T>() <= 1024 {
+                4
+            } else {
+                1
+            };
+            let required = values
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| CopyError::arithmetic(Some(values.len() as u128 + 1)))?;
+            let count = values
+                .capacity()
+                .checked_mul(2)
+                .ok_or_else(|| CopyError::arithmetic(Some(values.capacity() as u128 * 2)))?
+                .max(required)
+                .max(minimum);
+            request(
+                std::alloc::Layout::array::<T>(count)
+                    .map_err(|source| CopyError::layout::<T>(count, source))?,
+            )?;
         }
         self.try_push(value).map_err(Into::into)
     }

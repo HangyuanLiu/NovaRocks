@@ -121,16 +121,15 @@ fn compute_rows(
         }
         let row = address(ordinal, batch);
         if nullable.is_some() && row >= values.len() {
-            return Err(
-                internal("string measurement selected row is outside its checked carrier").into(),
-            );
+            return Err(internal(
+                "string measurement selected row is outside its checked carrier",
+            ));
         }
         if values.is_null(row) {
             if nullable == Some(false) {
                 return Err(internal(
                     "string measurement non-null input contains selected SQL NULL",
-                )
-                .into());
+                ));
             }
             output(None)?;
             continue;

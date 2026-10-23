@@ -257,10 +257,10 @@ impl FrozenCatalogPublication {
         }
     }
     pub(super) fn table_drop_policy(&self) -> Result<(bool, bool)> {
-        if self.operation == CatalogOperation::DropTable {
-            if let Some(policy) = self.table_drop_policy {
-                return Ok(policy);
-            }
+        if self.operation == CatalogOperation::DropTable
+            && let Some(policy) = self.table_drop_policy
+        {
+            return Ok(policy);
         }
         Err(Error::new(
             ErrorKind::DataInvalid,

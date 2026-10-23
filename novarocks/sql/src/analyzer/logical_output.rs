@@ -1967,7 +1967,8 @@ mod scalar_domain_tests {
                 Some(SqlType::Variant)
             ],
         );
-        for sql in ["select array_repeat(cast('x' as variant),2)"] {
+        {
+            let sql = "select array_repeat(cast('x' as variant),2)";
             let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
             assert!(
                 error.to_string().contains("no matching declared overload"),

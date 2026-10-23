@@ -1518,7 +1518,7 @@ mod scalar_binding_tests {
                 errors.is_empty(),
                 json,
                 "actual result publication checks complete child semantics: {:?}",
-                &*errors
+                *errors
             );
         }
     }

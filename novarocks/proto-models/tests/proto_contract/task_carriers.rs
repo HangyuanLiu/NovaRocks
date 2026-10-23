@@ -135,7 +135,7 @@ fn destination() -> novarocks::TaskExchangeDestination {
             stage_id: 2,
             task_id: 1,
             backend_process_id: Some(novarocks::BackendProcessId {
-                value: vec![1, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1].into(),
+                value: vec![1, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1],
             }),
         }),
         fragment_instance_id: Some(id(3, 4)),

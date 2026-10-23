@@ -141,8 +141,7 @@ mod tests {
         let weak = Arc::downgrade(&field);
         let unsupported = DataType::Map(field.clone(), false);
         let source = arrow::row::RowConverter::new(vec![arrow::row::SortField::new(unsupported)])
-            .err()
-            .expect("Map is not a sort-row carrier");
+            .expect_err("Map is not a sort-row carrier");
         let failure = arrow(Operation::RowConverter, source);
         assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
         assert_eq!(failure.failure_fact().resource(), None);

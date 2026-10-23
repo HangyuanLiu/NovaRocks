@@ -330,8 +330,7 @@ fn by_copy_root_scratch_host_actual_unwind_releases_without_retyping() {
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         preflight_take_root_scratch_in(array.as_ref(), &indices, host, &control)
     }))
-    .err()
-    .expect("original panic propagates through the granted root scope");
+    .expect_err("original panic propagates through the granted root scope");
     let text = panic
         .downcast_ref::<&str>()
         .copied()

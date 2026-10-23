@@ -113,7 +113,6 @@ where
                 values,
                 &mut scalar_work,
             )
-            .map_err(Into::into)
         } else {
             scalar_work.flush()?;
             let mut builder = crate::aggregate_scalar::BinaryResultBuilder::new();
@@ -129,7 +128,7 @@ where
                     core.serialize_with_codec_resources(&mut bytes, &mut codec, &mut scalar_work)?;
                     scalar_work.flush()?;
                     builder.append_value(&bytes.0)?;
-                    scalar_work.flush().map_err(Into::into)
+                    scalar_work.flush()
                 })?;
             }
             scalar_work.flush()?;

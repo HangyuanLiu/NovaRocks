@@ -704,7 +704,7 @@ fn run_stage(
     let mut start = Some(start);
     let mut start = || start.take().expect("one actual operation frontier")();
     let phase_id = match stage {
-        3 | 4 | 5 => AggregateKernelPhase::Final,
+        3..=5 => AggregateKernelPhase::Final,
         6 => AggregateKernelPhase::Partial,
         _ => AggregateKernelPhase::Single,
     };
@@ -976,7 +976,7 @@ fn a_real_null_limit_origin_survives_a_refused_diagnostic_and_keeps_both_typed_s
         let control = control(&host, Some((0, KernelFailure::DeadlineExceeded)));
         let mut work = crate::kernel_input::EvaluationCheckpoints::new(&control);
         let error = project_failure(
-            origin.clone().into(),
+            origin.clone(),
             &NDataDomain::Mutation {
                 contract: &kernel.contract,
                 phase: AggregateInvocationPhase::Update,

@@ -94,7 +94,7 @@ impl UnifiedPartitionRow {
                             field_id: part.field_id,
                             source_id: part.source_id,
                             name: part.name.clone(),
-                            effective_transform: part.transform.clone(),
+                            effective_transform: part.transform,
                             data_type,
                         });
                     }
@@ -118,7 +118,7 @@ impl UnifiedPartitionRow {
                             ))));
                         }
                         if previous_void && !current_void {
-                            field.effective_transform = part.transform.clone();
+                            field.effective_transform = part.transform;
                             field.data_type = data_type;
                         }
                     }

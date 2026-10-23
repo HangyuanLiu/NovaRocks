@@ -146,16 +146,17 @@ impl Material {
 
 impl Drop for Material {
     fn drop(&mut self) {
-        if self.release.load(std::sync::atomic::Ordering::Acquire) && !self.run.formal {
-            if let Err(error) = fs::remove_dir_all(&self.path) {
-                // A blocked inherited stderr must never hold lifecycle/pins.
-                let _ = fs::write(
-                    self.run
-                        .root
-                        .join(format!("release-error-{}", run_retention::unique())),
-                    format!("release {}: {error}\n", self.path.display()),
-                );
-            }
+        if self.release.load(std::sync::atomic::Ordering::Acquire)
+            && !self.run.formal
+            && let Err(error) = fs::remove_dir_all(&self.path)
+        {
+            // A blocked inherited stderr must never hold lifecycle/pins.
+            let _ = fs::write(
+                self.run
+                    .root
+                    .join(format!("release-error-{}", run_retention::unique())),
+                format!("release {}: {error}\n", self.path.display()),
+            );
         }
     }
 }
@@ -716,10 +717,10 @@ impl OwnedMonitor {
                 "original deadline expired waiting for managed process; diagnostics={}",
                 self.material.path.display()
             );
-            if let Err(error) = self.final_record() {
-                if diagnostic.is_none() {
-                    diagnostic = Some(error);
-                }
+            if let Err(error) = self.final_record()
+                && diagnostic.is_none()
+            {
+                diagnostic = Some(error);
             }
             if let Some(status) = self.poll_monitor()? {
                 if let Some(error) = diagnostic {

@@ -1529,12 +1529,10 @@ fn decode_body<'source, H, F: novarocks_type_contract::ValueSchemaCreationFactor
     };
     for field in &table.fields {
         work.step()?;
-        if let Some(id) = field.logical_type_id {
-            if definitions.get(id, work)?.nullable != field.nullable {
-                return Err(
-                    E::InvalidShape("field nullability conflicts with logical owner").into(),
-                );
-            }
+        if let Some(id) = field.logical_type_id
+            && definitions.get(id, work)?.nullable != field.nullable
+        {
+            return Err(E::InvalidShape("field nullability conflicts with logical owner").into());
         }
         if let Some(binding_id) = field.value_binding_id {
             // Explicit binding identity selects physical layout independently

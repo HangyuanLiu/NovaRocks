@@ -50,7 +50,7 @@ pub(crate) fn selected_scalar_control(
     let selected_control = if abi == PureKernelAbi::ScalarInvocationV1 {
         declaration
             .selected_argument_control_observed(function, selected, logical_argument_count, control)
-            .map_err(|e| FunctionSpecializationFailure::Binding(e.into()))?
+            .map_err(FunctionSpecializationFailure::Binding)?
     } else {
         declaration.effects().argument_control
     };
@@ -673,19 +673,13 @@ pub(crate) fn freeze_conversion(
         PlannedConversion::Carrier(step) => Ok(ConversionPlan::Carrier(step)),
         PlannedConversion::ValueConversion { binding, tail } => {
             let mut args = [source.clone()];
-            let call = freeze_fold_call(
-                functions,
-                &binding,
-                &mut args,
-                constant_policy,
-                false,
-                control,
-            )?
-            .ok_or_else(|| {
-                super::SqlCompileError::InvalidRequest(
-                    "value conversion unexpectedly requires temporal sources".into(),
-                )
-            })?;
+            let call =
+                freeze_fold_call(functions, &binding, &args, constant_policy, false, control)?
+                    .ok_or_else(|| {
+                        super::SqlCompileError::InvalidRequest(
+                            "value conversion unexpectedly requires temporal sources".into(),
+                        )
+                    })?;
             Ok(ConversionPlan::ValueConversion { call, tail })
         }
     }
@@ -738,7 +732,7 @@ mod tests {
         let call = freeze_fold_call(
             catalog,
             &binding,
-            &mut args,
+            &args,
             crate::constant::test_constant_policy(),
             true,
             control(),
@@ -791,7 +785,7 @@ mod tests {
         let call = freeze_fold_call(
             crate::functions::builtin_sql_function_catalog(),
             &binding,
-            &mut args,
+            &args,
             crate::constant::test_constant_policy(),
             true,
             control(),
@@ -913,7 +907,7 @@ mod tests {
             let call = freeze_fold_call(
                 catalog,
                 &binding,
-                &mut args,
+                &args,
                 crate::constant::test_constant_policy(),
                 true,
                 control(),

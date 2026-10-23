@@ -921,7 +921,7 @@ impl StaticLayout {
                                 construction_bytes: 96 * 1024 * 1024,
                             },
                         )
-                        .map_err(|_| LayoutError::MetadataOwnerConflict.into())
+                        .map_err(|_| LayoutError::MetadataOwnerConflict)
                 })?;
                 (Arc::clone(derived.schema()), Some(derived))
             } else {

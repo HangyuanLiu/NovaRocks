@@ -128,19 +128,13 @@ fn whole_data_project(node: &OptimizedOperatorNode) -> bool {
     })
 }
 fn subtree_has_whole_data(node: &OptimizedOperatorNode) -> bool {
-    whole_data_project(node)
-        || node
-            .children
-            .iter()
-            .any(|child| subtree_has_whole_data(child))
+    whole_data_project(node) || node.children.iter().any(subtree_has_whole_data)
 }
 fn count_preserved_filter(node: &OptimizedOperatorNode) -> usize {
     let own = match &node.op {
-        Operator::PhysicalFilter(_) => usize::from(
-            node.children
-                .iter()
-                .any(|child| subtree_has_whole_data(child)),
-        ),
+        Operator::PhysicalFilter(_) => {
+            usize::from(node.children.iter().any(subtree_has_whole_data))
+        }
         Operator::PhysicalScan(scan) => {
             assert!(
                 scan.predicates.is_empty(),
@@ -153,7 +147,7 @@ fn count_preserved_filter(node: &OptimizedOperatorNode) -> usize {
     own + node
         .children
         .iter()
-        .map(|child| count_preserved_filter(child))
+        .map(count_preserved_filter)
         .sum::<usize>()
 }
 
@@ -249,12 +243,7 @@ fn c16_p1_json_object_native_nested_index_keeps_accurate_types_and_whole_data_fo
                 count += 1;
             }
         }
-        count
-            + node
-                .children
-                .iter()
-                .map(|child| check(child))
-                .sum::<usize>()
+        count + node.children.iter().map(check).sum::<usize>()
     }
     {
         for filtered in [false, true] {

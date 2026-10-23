@@ -37,10 +37,10 @@ pub enum ExtremaOperation {
 }
 type ErrorBoundary<'a> = Option<&'a dyn Fn(&str) -> Result<(), KernelFailure>>;
 fn raw_error(message: String, boundary: ErrorBoundary<'_>) -> KernelFailure {
-    if let Some(boundary) = boundary {
-        if let Err(failure) = boundary(&message) {
-            return failure;
-        }
+    if let Some(boundary) = boundary
+        && let Err(failure) = boundary(&message)
+    {
+        return failure;
     }
     internal(&message)
 }
@@ -361,7 +361,7 @@ fn cast(
     out: ArrayRef,
     target: Option<&DataType>,
     work: &mut EvaluationCheckpoints<'_>,
-    boundary: ErrorBoundary<'_>,
+    _boundary: ErrorBoundary<'_>,
 ) -> Result<ArrayRef, KernelFailure> {
     work.flush()?;
     let out = cast_output_observed(out, target, &mut |event| match event {

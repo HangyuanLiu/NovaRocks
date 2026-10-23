@@ -546,7 +546,7 @@ fn constrain_literal_in(
                     if target.logical_type()
                         == novarocks_type_contract::ValueLogicalType::Variant =>
                 {
-                    if let Some(syntax) = constant_variant_in(&expr, encoded.as_deref_mut())? {
+                    if let Some(syntax) = constant_variant_in(&expr, encoded)? {
                         expr = syntax;
                     }
                 }

@@ -1315,10 +1315,9 @@ impl FrontendQuerySession {
         if matches!(
             error,
             GovernedQueryStatementBeginError::Admission(WorkError::Closed)
-        ) {
-            if let Some(admission) = self.service.serving_admission.admission_error() {
-                return query_service_admission_error(admission);
-            }
+        ) && let Some(admission) = self.service.serving_admission.admission_error()
+        {
+            return query_service_admission_error(admission);
         }
         governed_statement_begin_error(error)
     }
@@ -1738,10 +1737,10 @@ impl FrontendQuerySession {
             .await
             .map_err(|error| self.governed_statement_begin_error(error))?;
         #[cfg(novarocks_dev_controls)]
-        if let Some(owner) = &self.service.statement_observation {
-            if let Err(error) = owner.bind_statement(statement.token(), &source) {
-                return Ok(self.governed_typed_error(internal_error(error), statement));
-            }
+        if let Some(owner) = &self.service.statement_observation
+            && let Err(error) = owner.bind_statement(statement.token(), &source)
+        {
+            return Ok(self.governed_typed_error(internal_error(error), statement));
         }
         // The staged/live session overlap and every scalar child belong to
         // this one whole window, acquired before copying or compiling them.
@@ -1960,10 +1959,10 @@ impl FrontendQuerySession {
             .await
             .map_err(|error| self.governed_statement_begin_error(error))?;
         #[cfg(novarocks_dev_controls)]
-        if let Some(owner) = &self.service.statement_observation {
-            if let Err(error) = owner.bind_statement(statement.token(), &sql) {
-                return Ok(self.governed_typed_error(internal_error(error), statement));
-            }
+        if let Some(owner) = &self.service.statement_observation
+            && let Err(error) = owner.bind_statement(statement.token(), &sql)
+        {
+            return Ok(self.governed_typed_error(internal_error(error), statement));
         }
 
         let state = self.state.lock().map_err(poisoned_state)?.clone();
@@ -2881,10 +2880,10 @@ fn with_query_hints(
 ) -> QueryOptions {
     let mut raw = *query_options.as_proto();
     raw.allow_throw_exception = sql_semantics.sql_mode().allow_throw_exception();
-    if let Some(query) = query {
-        if let Some(limit) = novarocks_sql::admission::query_mem_limit_hint(query) {
-            raw.query_mem_limit = limit;
-        }
+    if let Some(query) = query
+        && let Some(limit) = novarocks_sql::admission::query_mem_limit_hint(query)
+    {
+        raw.query_mem_limit = limit;
     }
     QueryOptions::from_proto(raw)
 }
@@ -3426,7 +3425,7 @@ mod tests {
         ] {
             let fact = original.failure_fact();
             let selected = novarocks_query_application::coordination::SelectedTaskTermination::new(
-                identity.clone(),
+                identity,
                 novarocks_execution_contract::TerminationDetail::Failed(
                     novarocks_execution_contract::TaskFailure::new_in_phase(
                         fact,

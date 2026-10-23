@@ -167,11 +167,15 @@ fn kernel_path<'a>(
     segments: &'a [VariantPathSegment],
     owner: Option<&dyn crate::exec::pipeline::operator::InputConstructionOwner>,
 ) -> Result<parquet::variant::VariantPath<'a>, VariantMaterializationFailure> {
-    if let Some(owner) = owner {
-        if !segments.is_empty() {
-            owner.request(std::alloc::Layout::array::<parquet::variant::VariantPathElement<'a>>(segments.len())
-                .map_err(|_| novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic)?)?;
-        }
+    if let Some(owner) = owner
+        && !segments.is_empty()
+    {
+        owner.request(
+            std::alloc::Layout::array::<parquet::variant::VariantPathElement<'a>>(segments.len())
+                .map_err(|_| {
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic
+            })?,
+        )?;
     }
     let mut elems = Vec::with_capacity(segments.len());
     for seg in segments {

@@ -641,10 +641,10 @@ mod pure_schema_tests {
             assert!(units <= 256);
             let mut calls = self.trace.lock().unwrap();
             calls.push(units);
-            if let Some((at, error)) = self.refusal.clone() {
-                if calls.len() == at {
-                    return Err(error);
-                }
+            if let Some((at, error)) = self.refusal.clone()
+                && calls.len() == at
+            {
+                return Err(error);
             }
             Ok(())
         }

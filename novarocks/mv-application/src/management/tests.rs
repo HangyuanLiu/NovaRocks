@@ -150,10 +150,9 @@ impl novarocks_spi::connector::ConnectorDocumentStorageObservation
         if matches!(
             conclusion,
             novarocks_spi::connector::CommitConclusion::Committed(_)
-        ) {
-            if let Some(view) = self.after_resolution.lock().unwrap().take() {
-                *self.reply.lock().unwrap() = Ok(view);
-            }
+        ) && let Some(view) = self.after_resolution.lock().unwrap().take()
+        {
+            *self.reply.lock().unwrap() = Ok(view);
         }
         Ok(conclusion)
     }

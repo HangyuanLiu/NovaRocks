@@ -91,7 +91,7 @@ fn exhausted() -> ConstructionFailure {
 }
 fn arc_layout<T>() -> Result<Layout, ConstructionFailure> {
     novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<T>())
-        .map_err(|error| ConstructionFailure::from(error))
+        .map_err(ConstructionFailure::from)
 }
 impl CreatorGuard {
     fn request(&self, layout: Layout) -> Result<(), ConstructionFailure> {

@@ -1431,10 +1431,10 @@ pub fn load_suite_hook(
     }
     let catalogs = crate::catalog_symbol::CatalogSymbols::from_variables(variables)?;
     let sql = catalogs.rewrite_source(&sql)?;
-    if let Some(value) = &mut catalog {
-        if let Some(mapped) = catalogs.lookup(value) {
-            *value = mapped.into();
-        }
+    if let Some(value) = &mut catalog
+        && let Some(mapped) = catalogs.lookup(value)
+    {
+        *value = mapped.into();
     }
 
     Ok(Some(SuiteHook {

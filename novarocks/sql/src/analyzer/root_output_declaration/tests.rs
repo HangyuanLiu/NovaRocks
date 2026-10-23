@@ -114,7 +114,7 @@ fn root_output_fixed_self_assignment_and_case_keep_exact_width() {
         ] {
             let (mut query, mut factory) = query(expr);
             let old = query.output_columns[0].column_id;
-            apply(&mut query, &mut factory, &[declared.clone()]).unwrap();
+            apply(&mut query, &mut factory, std::slice::from_ref(&declared)).unwrap();
             assert_eq!(projection(&query).expr.value_type, actual);
             assert_eq!(query.output_columns[0].column_id, old);
             assert!(!matches!(

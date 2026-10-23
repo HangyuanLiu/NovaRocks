@@ -979,9 +979,9 @@ fn finish_root_value<'a, E: scalar_invocation::FrameFailure>(
                 {
                     errors.next();
                 } else if is_null {
-                    return Err(
-                        internal("non-null compiled root returned a successful SQL NULL").into(),
-                    );
+                    return Err(internal(
+                        "non-null compiled root returned a successful SQL NULL",
+                    ));
                 }
                 Ok(())
             },
@@ -1144,7 +1144,7 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
             work.control
                 .operation_aborted
                 .store(true, Ordering::Relaxed);
-            return Err(cause.into());
+            return Err(cause);
         }
     };
     let (_, array, own_errors) = output.into_parts();

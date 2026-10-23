@@ -967,7 +967,7 @@ mod tests {
         let schema = partitioned_schema();
         let spec = identity_partition_spec(&schema);
         let values = Struct::from_iter([Some(IcebergLiteral::string("emea"))]);
-        let domain = test_read_domain(&schema, &[spec.clone()], 11);
+        let domain = test_read_domain(&schema, std::slice::from_ref(&spec), 11);
         let data = DataFileFact::try_new(
             path,
             DataSequenceNumber::try_new(9).unwrap(),

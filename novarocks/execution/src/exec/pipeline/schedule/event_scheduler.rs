@@ -1227,31 +1227,29 @@ impl EventScheduler {
             let mut blocked = self.blocked.lock().expect("event scheduler blocked lock");
             let entry = blocked.remove(&key);
             #[cfg(novarocks_dev_controls)]
-            if let Some(entry) = entry.as_ref() {
-                if entry.task.source_name().contains("EXCHANGE") {
-                    if let Some(observer) = entry
-                        .task
-                        .exchange_test_observer()
-                        .filter(|observer| observer.is_active())
-                    {
-                        let (blocked_generation, current_generation) = entry
-                            .observable
-                            .as_ref()
-                            .and_then(|(observable, blocked_generation)| {
-                                observable.upgrade().map(|observable| {
-                                    (*blocked_generation, observable.generation())
-                                })
-                            })
-                            .unwrap_or((0, 0));
-                        if blocked_generation == 0 {
-                            exchange_marker = Some((
-                                observer,
-                                blocked_generation,
-                                current_generation,
-                                entry.block_epoch,
-                            ));
-                        }
-                    }
+            if let Some(entry) = entry.as_ref()
+                && entry.task.source_name().contains("EXCHANGE")
+                && let Some(observer) = entry
+                    .task
+                    .exchange_test_observer()
+                    .filter(|observer| observer.is_active())
+            {
+                let (blocked_generation, current_generation) = entry
+                    .observable
+                    .as_ref()
+                    .and_then(|(observable, blocked_generation)| {
+                        observable
+                            .upgrade()
+                            .map(|observable| (*blocked_generation, observable.generation()))
+                    })
+                    .unwrap_or((0, 0));
+                if blocked_generation == 0 {
+                    exchange_marker = Some((
+                        observer,
+                        blocked_generation,
+                        current_generation,
+                        entry.block_epoch,
+                    ));
                 }
             }
             let mut state = self

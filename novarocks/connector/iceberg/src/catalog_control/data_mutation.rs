@@ -823,15 +823,14 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
             .cloned()
         {
             if record.plan_digest == request.plan.plan_digest() {
-                if let ExternalMutationOutcome::CommitUnknown { evidence, .. } = &record.outcome {
-                    if let Some((journal, entry)) =
+                if let ExternalMutationOutcome::CommitUnknown { evidence, .. } = &record.outcome
+                    && let Some((journal, entry)) =
                         crate::commit::attempt::observation::PublicationJournal::<DataPublication>::from_evidence(evidence)?
                     {
                         return Ok(publication::project_external(
                             journal.catalog_entry_outcome(entry),
                         ));
                     }
-                }
                 return Ok(record.outcome);
             }
             return Err(invalid(

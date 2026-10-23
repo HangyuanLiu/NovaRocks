@@ -443,7 +443,7 @@ pub(crate) fn evaluate_with_port<P: SortByPort>(
         port.step()?;
         let src_row = super::map_lookup_core::row_index(row, src.len());
         if src.is_null(src_row) {
-            out_offsets.push(current as i32);
+            out_offsets.push(current);
             null_builder.append_null();
             continue;
         }
@@ -493,7 +493,7 @@ pub(crate) fn evaluate_with_port<P: SortByPort>(
             current = next;
         }
 
-        out_offsets.push(current as i32);
+        out_offsets.push(current);
         null_builder.append_non_null();
     }
 

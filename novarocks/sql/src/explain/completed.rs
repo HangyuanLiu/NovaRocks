@@ -710,11 +710,11 @@ impl Write for BoundedStringWriter<'_, '_> {
                 end -= 1;
             }
             self.output.push_str(&value[start..end]);
-            if let Some(work) = &mut self.work {
-                if let Err(error) = work.step() {
-                    *self.control_error = Some(error.into());
-                    return Err(fmt::Error);
-                }
+            if let Some(work) = &mut self.work
+                && let Err(error) = work.step()
+            {
+                *self.control_error = Some(error.into());
+                return Err(fmt::Error);
             }
             start = end;
         }

@@ -51,10 +51,10 @@ impl LiteralQuery {
     ) -> Result<(), RuntimeFilterControlledQueryError> {
         control.checkpoint(1)?;
         let row = self.calls.fetch_add(1, Ordering::SeqCst);
-        if let Some((at, cause)) = &self.failure {
-            if row == *at {
-                return Err(cause.clone().into());
-            }
+        if let Some((at, cause)) = &self.failure
+            && row == *at
+        {
+            return Err(cause.clone().into());
         }
         Ok(())
     }

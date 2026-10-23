@@ -221,9 +221,7 @@ fn original_count_overflow_real_driver_owner_stops_without_replay_and_releases_b
         .wait_timeout(
             Duration::from_secs(5),
             novarocks_functions::KernelFailure::Internal(
-                novarocks_functions::KernelDiagnostic::new(
-                    &("COUNT host test timed out".to_owned()),
-                ),
+                novarocks_functions::KernelDiagnostic::new("COUNT host test timed out"),
             )
             .into(),
         )

@@ -939,11 +939,10 @@ impl GovernedQueryStatementOwner {
         self.finished = true;
         self.complete_local_owner_after_terminal();
         self.release_terminal_concurrency();
-        let outcome = self
-            .service
+
+        self.service
             .port
-            .fail_governed_statement(self.registration.token());
-        outcome
+            .fail_governed_statement(self.registration.token())
     }
 
     fn finish_inner(&mut self) -> GovernedStatementFinishOutcome {
@@ -956,11 +955,10 @@ impl GovernedQueryStatementOwner {
         self.finished = true;
         self.complete_local_owner_after_terminal();
         self.release_terminal_concurrency();
-        let outcome = self
-            .service
+
+        self.service
             .port
-            .finish_governed_statement(self.registration.token());
-        outcome
+            .finish_governed_statement(self.registration.token())
     }
 
     // A root still held here never reached the logical execution supervisor.

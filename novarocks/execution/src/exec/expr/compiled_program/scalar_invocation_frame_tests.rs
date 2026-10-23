@@ -392,7 +392,7 @@ fn invocation_program_with(
         author(&functions, "__array_struct_subfield", arguments, demand),
         definitions,
     );
-    let ty = builder.expressions().get(projected).unwrap().ty.clone();
+    let _ty = builder.expressions().get(projected).unwrap().ty.clone();
     let expr = match guard {
         Guard::Direct => projected,
         Guard::And | Guard::Or => {

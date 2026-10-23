@@ -209,6 +209,45 @@ impl Drop for ActivityGuard {
     }
 }
 
+impl crate::resources::IcebergCatalogRuntime {
+    /// Observe one explicit mutation preparation segment. The caller retains
+    /// its original error and remains the sole publication/cleanup authority.
+    /// `classify` must be a pure projection of the existing typed error.
+    pub(crate) fn observe_preparation<T, E>(
+        &self,
+        prepare: impl FnOnce() -> Result<T, E>,
+        classify: impl FnOnce(&E) -> novarocks_spi::connector::ConnectorMutationFailure,
+    ) -> Result<T, E> {
+        let _preparing = self
+            .activity()
+            .map(|owner| owner.enter(novarocks_spi::connector::CatalogActivityPhase::PreDispatch));
+        let result = prepare();
+        if let (Some(owner), Err(error)) = (self.activity(), &result) {
+            owner.preparation_failed(&classify(error));
+        }
+        result
+    }
+
+    /// The guard lives until the supplied future returns or actually drops.
+    /// This does not make non-abortable work cancellation-safe: the existing
+    /// I/O owner must still retain and join that work to its actual exit.
+    /// Do not wrap dispatch/finalization/cleanup or a runtime's ordinary reads.
+    pub(crate) async fn observe_preparation_async<T, E>(
+        &self,
+        preparation: impl std::future::Future<Output = Result<T, E>>,
+        classify: impl FnOnce(&E) -> novarocks_spi::connector::ConnectorMutationFailure,
+    ) -> Result<T, E> {
+        let _preparing = self
+            .activity()
+            .map(|owner| owner.enter(novarocks_spi::connector::CatalogActivityPhase::PreDispatch));
+        let result = preparation.await;
+        if let (Some(owner), Err(error)) = (self.activity(), &result) {
+            owner.preparation_failed(&classify(error));
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,44 +347,5 @@ mod tests {
             (0, 1, 1)
         );
         assert_eq!(other.snapshot().phases[Phase::Bridge as usize].started, 1);
-    }
-}
-
-impl crate::resources::IcebergCatalogRuntime {
-    /// Observe one explicit mutation preparation segment. The caller retains
-    /// its original error and remains the sole publication/cleanup authority.
-    /// `classify` must be a pure projection of the existing typed error.
-    pub(crate) fn observe_preparation<T, E>(
-        &self,
-        prepare: impl FnOnce() -> Result<T, E>,
-        classify: impl FnOnce(&E) -> novarocks_spi::connector::ConnectorMutationFailure,
-    ) -> Result<T, E> {
-        let _preparing = self
-            .activity()
-            .map(|owner| owner.enter(novarocks_spi::connector::CatalogActivityPhase::PreDispatch));
-        let result = prepare();
-        if let (Some(owner), Err(error)) = (self.activity(), &result) {
-            owner.preparation_failed(&classify(error));
-        }
-        result
-    }
-
-    /// The guard lives until the supplied future returns or actually drops.
-    /// This does not make non-abortable work cancellation-safe: the existing
-    /// I/O owner must still retain and join that work to its actual exit.
-    /// Do not wrap dispatch/finalization/cleanup or a runtime's ordinary reads.
-    pub(crate) async fn observe_preparation_async<T, E>(
-        &self,
-        preparation: impl std::future::Future<Output = Result<T, E>>,
-        classify: impl FnOnce(&E) -> novarocks_spi::connector::ConnectorMutationFailure,
-    ) -> Result<T, E> {
-        let _preparing = self
-            .activity()
-            .map(|owner| owner.enter(novarocks_spi::connector::CatalogActivityPhase::PreDispatch));
-        let result = preparation.await;
-        if let (Some(owner), Err(error)) = (self.activity(), &result) {
-            owner.preparation_failed(&classify(error));
-        }
-        result
     }
 }

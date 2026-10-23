@@ -178,7 +178,7 @@ fn array_difference_selected_origin_null_slice_empty_nonzero_pool_and_full_targe
     let ty = FunctionValueType::from_legacy_declared_projection(a.data_type().clone(), true);
     let prepared = prepared_for_test_with_policy(
         "array_difference",
-        &[ty.clone()],
+        std::slice::from_ref(&ty),
         DecimalOverflowPolicy::ReportError,
     )
     .unwrap();
@@ -378,7 +378,7 @@ fn array_difference_compile_callbacks_preserve_primary_causes_on_success_and_rej
             assert_eq!(
                 prepared_for_test_with_control(
                     name,
-                    &[source.clone()],
+                    std::slice::from_ref(&source),
                     DecimalOverflowPolicy::OutputNull,
                     &good,
                 )
@@ -399,12 +399,11 @@ fn array_difference_compile_callbacks_preserve_primary_causes_on_success_and_rej
                     };
                     let error = prepared_for_test_with_control(
                         name,
-                        &[source.clone()],
+                        std::slice::from_ref(&source),
                         DecimalOverflowPolicy::OutputNull,
                         &control,
                     )
-                    .err()
-                    .expect("refused compilation must not publish a prepared kernel");
+                    .expect_err("refused compilation must not publish a prepared kernel");
                     let actual = match error {
                         crate::FunctionSpecializationFailure::Control(actual) => Some(actual),
                         crate::FunctionSpecializationFailure::Kernel(KernelFailure::Cancelled) => {

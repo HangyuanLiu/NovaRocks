@@ -2771,7 +2771,7 @@ mod tests {
             snapshot_id: Some(11),
             read_domain: Some(crate::delete_semantics::test_read_domain(
                 schema,
-                &[spec.clone()],
+                std::slice::from_ref(&spec),
                 11,
             )),
             table_schema_json: serde_json::to_string(schema).expect("serialize schema"),

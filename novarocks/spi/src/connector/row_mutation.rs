@@ -2320,34 +2320,31 @@ fn validate_recipe_against_route(
                     "rewrite recipe match tokens differ from the signed uniqueness tuple",
                 ));
             }
-            match written_version_token {
-                Some(token) => {
-                    let field = route_fields.get(token).ok_or_else(|| {
-                        ConnectorError::new(
-                            ConnectorErrorKind::InvalidRequest,
-                            "rewrite written-version token is foreign to its route",
-                        )
-                    })?;
-                    let is_row_identity = matches!(
-                        route.input(),
-                        ConnectorWriteInputShape::RowLineage {
-                            row_identity_fields,
-                            ..
-                        } if row_identity_fields.iter().any(|binding| binding.token() == *token)
-                    );
-                    if !binding_tokens.contains(token)
-                        || expected_matches.contains(token)
-                        || !is_row_identity
-                        || field.data_type() != &DataType::Int64
-                        || field.is_nullable()
-                    {
-                        return Err(ConnectorError::new(
-                            ConnectorErrorKind::InvalidRequest,
-                            "rewrite written-version token must be signed non-null Int64",
-                        ));
-                    }
+            if let Some(token) = written_version_token {
+                let field = route_fields.get(token).ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "rewrite written-version token is foreign to its route",
+                    )
+                })?;
+                let is_row_identity = matches!(
+                    route.input(),
+                    ConnectorWriteInputShape::RowLineage {
+                        row_identity_fields,
+                        ..
+                    } if row_identity_fields.iter().any(|binding| binding.token() == *token)
+                );
+                if !binding_tokens.contains(token)
+                    || expected_matches.contains(token)
+                    || !is_row_identity
+                    || field.data_type() != &DataType::Int64
+                    || field.is_nullable()
+                {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "rewrite written-version token must be signed non-null Int64",
+                    ));
                 }
-                None => {}
             }
         }
     }

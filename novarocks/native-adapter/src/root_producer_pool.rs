@@ -221,18 +221,18 @@ impl RootProducerExitObservation {
                 RootProducerPoolFailure::Metadata.failure_fact(),
             );
         }
-        if let Some(payload) = payload {
-            if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
-                let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-                let entry = &mut state.faults[cell];
-                // A failed role is disabled; each role's same-phase operation
-                // has only one caller before disablement under its contract.
-                assert!(
-                    entry.is_none(),
-                    "one secondary metadata fault per role phase"
-                );
-                *entry = Some(ManuallyDrop::new(secondary));
-            }
+        if let Some(payload) = payload
+            && let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload)))
+        {
+            let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+            let entry = &mut state.faults[cell];
+            // A failed role is disabled; each role's same-phase operation
+            // has only one caller before disablement under its contract.
+            assert!(
+                entry.is_none(),
+                "one secondary metadata fault per role phase"
+            );
+            *entry = Some(ManuallyDrop::new(secondary));
         }
     }
     fn drop_waker(&self, role: usize, waker: Waker) {
@@ -1357,16 +1357,14 @@ fn run(core: Arc<Core>) {
                     slot.plan.len() + 2,
                 )
             };
-            if !failed {
-                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(work))) {
-                    execution_fault(
-                        &core,
-                        ticket,
-                        RootProducerPoolFailure::JobDrop,
-                        cell,
-                        payload,
-                    );
-                }
+            if !failed && let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(work))) {
+                execution_fault(
+                    &core,
+                    ticket,
+                    RootProducerPoolFailure::JobDrop,
+                    cell,
+                    payload,
+                );
             }
             let unknown = core.state.lock().expect("root producer pool lock").slots[ticket.index]
                 .execution_failed;

@@ -1688,14 +1688,14 @@ pub(crate) struct ChangeStreamWriteTestObserverGuard;
 )]
 impl ChangeStreamWriteTestObserverGuard {
     fn take_observations(&self) -> Vec<ChangeStreamWriteBuildObservation> {
-        change_stream_write_test_observer()
-            .lock()
-            .expect("change-stream write test observer lock")
-            .as_mut()
-            .expect("change-stream write test observer installed")
-            .observations
-            .drain(..)
-            .collect()
+        std::mem::take(
+            &mut change_stream_write_test_observer()
+                .lock()
+                .expect("change-stream write test observer lock")
+                .as_mut()
+                .expect("change-stream write test observer installed")
+                .observations,
+        )
     }
 }
 

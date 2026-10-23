@@ -194,10 +194,9 @@ impl Fixture {
                     .published_bindings
                     .as_ref()
                     .and_then(|bindings| bindings.get(ordinal))
+                    && original.data_type() == layout.data_type()
                 {
-                    if original.data_type() == layout.data_type() {
-                        return original.with_nullable(field.is_nullable()).unwrap();
-                    }
+                    return original.with_nullable(field.is_nullable()).unwrap();
                 }
                 let domain = self
                     .domains

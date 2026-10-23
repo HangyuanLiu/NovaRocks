@@ -1001,7 +1001,7 @@ fn wide_merge_semantic_comparison_preserves_mid_work_control_failures() {
             &CompileControl(None),
         )
         .unwrap();
-        for (failure, expected) in [
+        for (failure, _expected) in [
             (CompileControlError::Cancelled, KernelFailure::Cancelled),
             (
                 CompileControlError::DeadlineExceeded,

@@ -237,7 +237,7 @@ impl NativeFragmentQueryRuntime {
         let query_mem_tracker = self
             .manager
             .query_mem_tracker_execution(execution)
-            .ok_or_else(|| NativeFragmentAdmissionError::MissingTracker)?;
+            .ok_or(NativeFragmentAdmissionError::MissingTracker)?;
         let query_memory_account = if let Some(limit) = exec_mem_limit {
             query_mem_tracker
                 .install_limit_once(limit)
@@ -286,7 +286,7 @@ impl NativeFragmentQueryRuntime {
         let tracker = self
             .manager
             .query_mem_tracker_execution(execution_key(execution_id))
-            .ok_or_else(|| NativeFragmentAdmissionError::MissingTracker)?;
+            .ok_or(NativeFragmentAdmissionError::MissingTracker)?;
         if let Some(limit) = exec_mem_limit {
             tracker
                 .install_limit_once(limit)
@@ -310,8 +310,7 @@ impl NativeFragmentQueryRuntime {
             query_expire,
             exec_mem_limit,
         )?;
-        let query_memory =
-            query_memory.ok_or_else(|| NativeFragmentAdmissionError::MissingBinding)?;
+        let query_memory = query_memory.ok_or(NativeFragmentAdmissionError::MissingBinding)?;
         Ok(NativeQueryPreparationMemory {
             query_memory,
             query_mem_tracker,
@@ -335,13 +334,13 @@ impl NativeFragmentQueryRuntime {
             fragment_instance_id.low()
         );
         let fragment_mem_tracker = MemTracker::new_child(fragment_label, &query_mem_tracker);
-        let resources = NativeFragmentAdmissionResources {
+
+        NativeFragmentAdmissionResources {
             query_memory: Some(query_memory),
             query_mem_tracker,
             fragment_mem_tracker,
             runtime_filter,
-        };
-        resources
+        }
     }
 
     pub(crate) fn register_fragment_execution(

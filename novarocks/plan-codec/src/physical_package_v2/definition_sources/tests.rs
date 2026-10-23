@@ -1069,7 +1069,8 @@ fn writer_recipe() -> c::ConnectorWriteRecipeDraft {
     let provider = c::ConnectorProviderId::parse("iceberg").unwrap();
     let instance = c::ConnectorInstanceId::try_from_canonical("lake").unwrap();
     let catalog = c::CatalogHandle::new(instance.clone(), c::CatalogVersion::from_bytes([7; 32]));
-    let recipe = c::ConnectorWriteRecipeDraft::try_new(
+
+    c::ConnectorWriteRecipeDraft::try_new(
         c::ConnectorWriteBinding::new(
             c::ConnectorInstanceDescriptor {
                 provider_id: provider.clone(),
@@ -1097,8 +1098,7 @@ fn writer_recipe() -> c::ConnectorWriteRecipeDraft {
             ],
         },
     )
-    .unwrap();
-    recipe
+    .unwrap()
 }
 
 fn view_limits() -> TypeViewLimits {

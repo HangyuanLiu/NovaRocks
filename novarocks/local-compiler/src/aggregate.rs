@@ -346,7 +346,7 @@ pub(crate) fn freeze_binding_with_creation<H>(
 }
 
 pub(crate) fn lower_call<H>(
-    node: &PhysicalNode,
+    _node: &PhysicalNode,
     call: &AggregateCall,
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     work: &mut CompileCheckpoints<'_>,

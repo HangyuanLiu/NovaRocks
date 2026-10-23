@@ -236,7 +236,7 @@ impl StagingState {
             base: self.identity,
             requirements: self.requirements,
             updates: self.updates,
-            artifacts: artifacts,
+            artifacts,
         })?
         .with_base_facts(&self.base)
     }

@@ -1436,7 +1436,7 @@ fn normalize_exchange_array_for_field(
 fn check_exchange_data_type(
     expected: &arrow::datatypes::DataType,
     actual: &arrow::datatypes::DataType,
-    root_label: &str,
+    _root_label: &str,
 ) -> Result<(), ExchangeFailure> {
     check_exact(expected, actual).map_err(Into::into)
 }

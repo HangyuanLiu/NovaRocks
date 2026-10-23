@@ -191,46 +191,6 @@ pub(super) fn keyed_dependencies(
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::persistence::{keyed_documents::*, validation::PersistenceDecodeBudget};
-    #[tokio::test]
-    async fn keyed_projection_roundtrips_on_existing_owner_with_guarded_cas() {
-        let (_, repository) = super::super::tests_definition::repository().await;
-        let (catalog, view) = crate::persistence::keyed_documents::tests::fixture(Some(17), true);
-        let observed =
-            decode_current_keyed_documents(view, catalog, PersistenceDecodeBudget::default())
-                .unwrap();
-        let facts = MvKeyedDocumentProjection::try_from_current(observed).unwrap();
-        let target = facts.target();
-        let first = repository
-            .install_keyed_projection(Uuid::now_v7(), facts.clone(), None)
-            .await
-            .unwrap();
-        assert_eq!(
-            repository
-                .find_keyed_by_target(&target, PersistenceDecodeBudget::default())
-                .await
-                .unwrap(),
-            Some(first.clone())
-        );
-        let second = repository
-            .install_keyed_projection(Uuid::now_v7(), facts.clone(), Some(first.clone()))
-            .await
-            .unwrap();
-        assert_eq!(second.projection.mv_id, first.projection.mv_id);
-        assert_eq!(
-            repository
-                .install_keyed_projection(Uuid::now_v7(), facts, Some(first))
-                .await
-                .unwrap_err()
-                .kind(),
-            MvRepositoryErrorKind::Conflict
-        );
-    }
-}
-
 impl StateStoreMvRepository {
     pub async fn list_keyed_projections(
         &self,
@@ -535,5 +495,45 @@ impl StateStoreMvRepository {
             .collect::<Vec<_>>();
         crate::bounded_dependencies::classify(&mut dependencies, &inventory);
         Ok(dependencies)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::{keyed_documents::*, validation::PersistenceDecodeBudget};
+    #[tokio::test]
+    async fn keyed_projection_roundtrips_on_existing_owner_with_guarded_cas() {
+        let (_, repository) = super::super::tests_definition::repository().await;
+        let (catalog, view) = crate::persistence::keyed_documents::tests::fixture(Some(17), true);
+        let observed =
+            decode_current_keyed_documents(view, catalog, PersistenceDecodeBudget::default())
+                .unwrap();
+        let facts = MvKeyedDocumentProjection::try_from_current(observed).unwrap();
+        let target = facts.target();
+        let first = repository
+            .install_keyed_projection(Uuid::now_v7(), facts.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .find_keyed_by_target(&target, PersistenceDecodeBudget::default())
+                .await
+                .unwrap(),
+            Some(first.clone())
+        );
+        let second = repository
+            .install_keyed_projection(Uuid::now_v7(), facts.clone(), Some(first.clone()))
+            .await
+            .unwrap();
+        assert_eq!(second.projection.mv_id, first.projection.mv_id);
+        assert_eq!(
+            repository
+                .install_keyed_projection(Uuid::now_v7(), facts, Some(first))
+                .await
+                .unwrap_err()
+                .kind(),
+            MvRepositoryErrorKind::Conflict
+        );
     }
 }

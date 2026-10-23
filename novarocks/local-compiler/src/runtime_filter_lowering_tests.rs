@@ -285,7 +285,7 @@ fn frozen_read_declared_typed(
         ["v0", "v1"][..width]
             .iter()
             .zip(types)
-            .map(|(name, ty)| StaticScanAssignment::new(Arc::from(*name), ty.clone()))
+            .map(|(name, ty)| StaticScanAssignment::new(Arc::from(*name), *ty))
             .collect(),
         TupleDomain::all(),
         TupleDomain::all(),
@@ -1443,7 +1443,11 @@ fn aggregate_topn() -> Arc<FragmentPackage> {
 
 fn aggregate_topn_typed(ty: ValueType, domain: ValueType) -> Arc<FragmentPackage> {
     let mut builder = FragmentBuilder::new(PROBE);
-    let scan = add_scan_typed(&mut builder, Distribution::Singleton, &[ty.clone()]);
+    let scan = add_scan_typed(
+        &mut builder,
+        Distribution::Singleton,
+        std::slice::from_ref(&ty),
+    );
     // The group key republishes the scan value itself.
     let grouped = scan[0];
     let group_key = builder

@@ -616,7 +616,7 @@ mod tests {
         ] {
             let fact = original.failure_fact();
             let selected = novarocks_query_application::coordination::SelectedTaskTermination::new(
-                identity.clone(),
+                identity,
                 novarocks_execution_contract::TerminationDetail::Failed(
                     novarocks_execution_contract::TaskFailure::new_in_phase(
                         fact,
@@ -632,7 +632,7 @@ mod tests {
             assert_eq!(
                 input.site(),
                 novarocks_query_application::execution_error::ExecutionFailureSite::Task {
-                    identity: identity.clone(),
+                    identity: identity,
                     phase: novarocks_execution_contract::TaskFailurePhase::Preparation
                 }
             );

@@ -31,17 +31,16 @@ use super::binding::{SessionBinding, protocol_headers};
 use super::evidence::{BindingFailure, DispatchStage};
 use super::http::{RequestContext, RestRequest};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub(crate) enum IdempotencyCapability {
-    Supported { lifetime: Duration },
+    Supported {
+        lifetime: Duration,
+    },
+    #[default]
     Absent,
-    Invalid { reason: &'static str },
-}
-
-impl Default for IdempotencyCapability {
-    fn default() -> Self {
-        Self::Absent
-    }
+    Invalid {
+        reason: &'static str,
+    },
 }
 
 #[derive(Deserialize)]

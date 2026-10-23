@@ -161,8 +161,7 @@ impl AggregateTopNProducerSessionFactory {
         host: &OrderedTopNAllocationHost,
         control: &dyn KernelEvaluationControl,
     ) -> ExecutionResult<Self> {
-        let local_partition_count =
-            validate_partition_count(actual_dop).map_err(ExecutionFailure::from)?;
+        let local_partition_count = validate_partition_count(actual_dop)?;
         control.checkpoint(0)?;
         let mut bindings = AggregateVec::new_in(host.vector_allocator());
         bindings
@@ -230,9 +229,7 @@ impl AggregateTopNProducerSessionFactory {
         local_index: i32,
         control: &dyn KernelEvaluationControl,
     ) -> ExecutionResult<AggregateTopNProducerSession> {
-        let partition = self
-            .driver_partition(actual_dop, local_index)
-            .map_err(ExecutionFailure::from)?;
+        let partition = self.driver_partition(actual_dop, local_index)?;
         let host = self.host.as_ref().ok_or_else(|| {
             SessionFailure::contract("compiled aggregate TopN producer has no creating host".into())
                 .execution()
@@ -610,10 +607,10 @@ impl AggregateTopNProducerStream {
             Err(cause) => return Err(self.error("contribution failed", cause)),
         }
         self.next_sequence = self.next_sequence.checked_add(1).ok_or_else(|| {
-            SessionFailure::Execution(
-                execution::producer_sequence_extent(self.binding.binding_id, self.next_sequence)
-                    .into(),
-            )
+            SessionFailure::Execution(execution::producer_sequence_extent(
+                self.binding.binding_id,
+                self.next_sequence,
+            ))
         })?;
         Ok(())
     }

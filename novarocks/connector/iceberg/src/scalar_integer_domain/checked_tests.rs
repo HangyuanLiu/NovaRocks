@@ -106,7 +106,7 @@ fn collect_cause<T>(
 ) -> (bool, bool) {
     match result {
         Err(Cause::Check(raw)) => {
-            let same = (&*raw) as *const Canary == identity;
+            let same = std::ptr::eq((&*raw), identity);
             let held = drops.load(Ordering::SeqCst) == 0;
             drop(raw);
             (same, held)

@@ -205,6 +205,127 @@ impl FragmentPlanSource for SubmissionFragmentPlans {
     }
 }
 
+/// The credential domain every attempt installs.
+///
+/// One query context has exactly one, so the value only has to be stable and
+/// nonzero. It is the protocol's own numbering, unrelated to a vended lease's
+/// sixteen-byte storage identity.
+const ATTEMPT_CREDENTIAL_DOMAIN: CredentialLeaseId = CredentialLeaseId::new(1);
+
+/// The shared facts one attempt establishes on every backend it scheduled.
+///
+/// The catalog set and the credential table are query-wide; the runtime-filter
+/// contribution is not. A filter deployment gives each backend the role
+/// bindings its own tasks play, so handing one backend another's contribution
+/// would install the wrong producer and consumer identities. That is why this
+/// is keyed by backend and why a scheduled backend with no contribution is an
+/// error rather than an empty install.
+pub struct AttemptEstablishFacts {
+    catalog_binding: Arc<dyn CodecOwnedContent>,
+    filters: BTreeMap<BackendProcessId, Arc<dyn CodecOwnedContent>>,
+    query_options: Arc<dyn CodecOwnedContent>,
+    credential: CredentialUpdate,
+}
+
+impl fmt::Debug for AttemptEstablishFacts {
+    /// Renders only the shape: this transitively holds credential material.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AttemptEstablishFacts")
+            .field("backends", &self.filters.len())
+            .field("query_options", &self.query_options.fingerprint())
+            .finish()
+    }
+}
+
+impl AttemptEstablishFacts {
+    /// Freezes one attempt's shared facts.
+    ///
+    /// The credential progression token names the lease whose rotation this
+    /// update represents; an initial install carries the whole table at its
+    /// starting epochs, so the token is the lowest lease id present. An
+    /// attempt with no vended credential carries an empty table rather than a
+    /// missing one, because the backend installs what it is given and an
+    /// absent domain would be a different statement.
+    pub fn freeze(
+        catalog_set: CatalogSet,
+        filters: impl IntoIterator<Item = (BackendProcessId, RuntimeFilterContribution)>,
+        query_options: QueryOptions,
+        leases: &QueryCredentialLeases,
+    ) -> Result<Self, TaskExecutionError> {
+        let mut descriptors = Vec::new();
+        for lease in leases.leases() {
+            descriptors.push(encode_credential_lease_descriptor(lease.descriptor()));
+        }
+        let material = WireCredential::decode(&descriptors, FieldPath::root("initial_credential"))
+            .map_err(|error| {
+                TaskExecutionError::Schedule(format!(
+                    "credential announcement is not installable: {error}"
+                ))
+            })?;
+
+        Ok(Self {
+            catalog_binding: Arc::new(WireContent::new(ESTABLISH_CATALOG_DOMAIN_TAG, catalog_set)),
+            filters: filters
+                .into_iter()
+                .map(|(backend, contribution)| {
+                    (
+                        backend,
+                        Arc::new(WireContent::new(ESTABLISH_FILTER_DOMAIN_TAG, contribution))
+                            as Arc<dyn CodecOwnedContent>,
+                    )
+                })
+                .collect(),
+            query_options: Arc::new(WireContent::new(
+                ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG,
+                query_options,
+            )),
+            // The protocol's lease id names the attempt's credential domain,
+            // not a storage lease: a query context has exactly one such
+            // domain, and each vended lease keeps its own sixteen-byte
+            // identity inside the table. The refresh owner adopts this value
+            // from the establish, so an install and its first rotation are
+            // provably the same domain.
+            credential: CredentialUpdate::new(
+                ATTEMPT_CREDENTIAL_DOMAIN,
+                CredentialEpoch::FIRST,
+                Arc::new(material),
+            ),
+        })
+    }
+}
+
+impl AttemptEstablishFacts {
+    /// The credential domain every context of this attempt installs.
+    ///
+    /// The rotation owner adopts exactly this, so an install and its first
+    /// rotation are provably the same domain at the same starting epoch.
+    pub fn credential(&self) -> &CredentialUpdate {
+        &self.credential
+    }
+}
+
+impl ContextEstablishSource for AttemptEstablishFacts {
+    fn facts_for(
+        &self,
+        context: QueryContextRef,
+    ) -> Result<ContextEstablishFacts, TaskExecutionError> {
+        let backend = context.backend_process_id();
+        let initial_runtime_filter = self.filters.get(&backend).cloned().ok_or_else(|| {
+            TaskExecutionError::Schedule(format!(
+                "backend {backend} hosts tasks but this attempt compiled no runtime filter \
+                 contribution for it"
+            ))
+        })?;
+        Ok(ContextEstablishFacts {
+            catalog_binding: Arc::clone(&self.catalog_binding),
+            initial_runtime_filter,
+            query_options: Arc::clone(&self.query_options),
+            initial_credential: self.credential.clone(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,126 +577,5 @@ mod tests {
 
         // And nothing about the facts renders the material.
         assert!(!format!("{facts:?}").contains("secret"));
-    }
-}
-
-/// The credential domain every attempt installs.
-///
-/// One query context has exactly one, so the value only has to be stable and
-/// nonzero. It is the protocol's own numbering, unrelated to a vended lease's
-/// sixteen-byte storage identity.
-const ATTEMPT_CREDENTIAL_DOMAIN: CredentialLeaseId = CredentialLeaseId::new(1);
-
-/// The shared facts one attempt establishes on every backend it scheduled.
-///
-/// The catalog set and the credential table are query-wide; the runtime-filter
-/// contribution is not. A filter deployment gives each backend the role
-/// bindings its own tasks play, so handing one backend another's contribution
-/// would install the wrong producer and consumer identities. That is why this
-/// is keyed by backend and why a scheduled backend with no contribution is an
-/// error rather than an empty install.
-pub struct AttemptEstablishFacts {
-    catalog_binding: Arc<dyn CodecOwnedContent>,
-    filters: BTreeMap<BackendProcessId, Arc<dyn CodecOwnedContent>>,
-    query_options: Arc<dyn CodecOwnedContent>,
-    credential: CredentialUpdate,
-}
-
-impl fmt::Debug for AttemptEstablishFacts {
-    /// Renders only the shape: this transitively holds credential material.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AttemptEstablishFacts")
-            .field("backends", &self.filters.len())
-            .field("query_options", &self.query_options.fingerprint())
-            .finish()
-    }
-}
-
-impl AttemptEstablishFacts {
-    /// Freezes one attempt's shared facts.
-    ///
-    /// The credential progression token names the lease whose rotation this
-    /// update represents; an initial install carries the whole table at its
-    /// starting epochs, so the token is the lowest lease id present. An
-    /// attempt with no vended credential carries an empty table rather than a
-    /// missing one, because the backend installs what it is given and an
-    /// absent domain would be a different statement.
-    pub fn freeze(
-        catalog_set: CatalogSet,
-        filters: impl IntoIterator<Item = (BackendProcessId, RuntimeFilterContribution)>,
-        query_options: QueryOptions,
-        leases: &QueryCredentialLeases,
-    ) -> Result<Self, TaskExecutionError> {
-        let mut descriptors = Vec::new();
-        for lease in leases.leases() {
-            descriptors.push(encode_credential_lease_descriptor(lease.descriptor()));
-        }
-        let material = WireCredential::decode(&descriptors, FieldPath::root("initial_credential"))
-            .map_err(|error| {
-                TaskExecutionError::Schedule(format!(
-                    "credential announcement is not installable: {error}"
-                ))
-            })?;
-
-        Ok(Self {
-            catalog_binding: Arc::new(WireContent::new(ESTABLISH_CATALOG_DOMAIN_TAG, catalog_set)),
-            filters: filters
-                .into_iter()
-                .map(|(backend, contribution)| {
-                    (
-                        backend,
-                        Arc::new(WireContent::new(ESTABLISH_FILTER_DOMAIN_TAG, contribution))
-                            as Arc<dyn CodecOwnedContent>,
-                    )
-                })
-                .collect(),
-            query_options: Arc::new(WireContent::new(
-                ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG,
-                query_options,
-            )),
-            // The protocol's lease id names the attempt's credential domain,
-            // not a storage lease: a query context has exactly one such
-            // domain, and each vended lease keeps its own sixteen-byte
-            // identity inside the table. The refresh owner adopts this value
-            // from the establish, so an install and its first rotation are
-            // provably the same domain.
-            credential: CredentialUpdate::new(
-                ATTEMPT_CREDENTIAL_DOMAIN,
-                CredentialEpoch::FIRST,
-                Arc::new(material),
-            ),
-        })
-    }
-}
-
-impl AttemptEstablishFacts {
-    /// The credential domain every context of this attempt installs.
-    ///
-    /// The rotation owner adopts exactly this, so an install and its first
-    /// rotation are provably the same domain at the same starting epoch.
-    pub fn credential(&self) -> &CredentialUpdate {
-        &self.credential
-    }
-}
-
-impl ContextEstablishSource for AttemptEstablishFacts {
-    fn facts_for(
-        &self,
-        context: QueryContextRef,
-    ) -> Result<ContextEstablishFacts, TaskExecutionError> {
-        let backend = context.backend_process_id();
-        let initial_runtime_filter = self.filters.get(&backend).cloned().ok_or_else(|| {
-            TaskExecutionError::Schedule(format!(
-                "backend {backend} hosts tasks but this attempt compiled no runtime filter \
-                 contribution for it"
-            ))
-        })?;
-        Ok(ContextEstablishFacts {
-            catalog_binding: Arc::clone(&self.catalog_binding),
-            initial_runtime_filter,
-            query_options: Arc::clone(&self.query_options),
-            initial_credential: self.credential.clone(),
-        })
     }
 }

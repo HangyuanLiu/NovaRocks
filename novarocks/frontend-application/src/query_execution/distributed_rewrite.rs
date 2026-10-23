@@ -506,6 +506,35 @@ fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message)
 }
 
+/// SQL declarations are projected from complete signed execution bindings.
+/// Source annotations and physical binary/string resemblance confer no domain.
+pub(crate) fn connector_execution_columns(
+    schema: &novarocks_connector_contract::ConnectorReadExecutionSchema,
+) -> Result<Vec<novarocks_types::schema::ColumnDef>, String> {
+    schema
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, field)| {
+            let binding = schema
+                .binding(ordinal)
+                .ok_or_else(|| "connector execution field has no complete binding".to_string())?;
+            novarocks_types::schema::ColumnDef::from_value_type(
+                field.name().clone(),
+                binding.clone(),
+                None,
+            )
+            .map_err(|error| {
+                format!(
+                    "invalid connector execution column `{}`: {error}",
+                    field.name()
+                )
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -694,7 +723,7 @@ mod tests {
         fn load_table(
             &self,
             _request: novarocks_spi::connector::ConnectorTableRequest,
-            creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+            _creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
         ) -> Result<
             novarocks_spi::connector::ConnectorTableMetadata,
             novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
@@ -1106,33 +1135,4 @@ mod tests {
             ConnectorErrorKind::Internal
         );
     }
-}
-
-/// SQL declarations are projected from complete signed execution bindings.
-/// Source annotations and physical binary/string resemblance confer no domain.
-pub(crate) fn connector_execution_columns(
-    schema: &novarocks_connector_contract::ConnectorReadExecutionSchema,
-) -> Result<Vec<novarocks_types::schema::ColumnDef>, String> {
-    schema
-        .schema()
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(ordinal, field)| {
-            let binding = schema
-                .binding(ordinal)
-                .ok_or_else(|| "connector execution field has no complete binding".to_string())?;
-            novarocks_types::schema::ColumnDef::from_value_type(
-                field.name().clone(),
-                binding.clone(),
-                None,
-            )
-            .map_err(|error| {
-                format!(
-                    "invalid connector execution column `{}`: {error}",
-                    field.name()
-                )
-            })
-        })
-        .collect()
 }

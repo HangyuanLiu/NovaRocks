@@ -1013,17 +1013,11 @@ fn build_join_key_pairs(
         .collect()
 }
 
-fn predicate_lineage_for_actual_sides<'a>(
-    predicate: &'a SqlImvJoinPredicateLineage,
+fn predicate_lineage_for_actual_sides(
+    predicate: &SqlImvJoinPredicateLineage,
     left_occurrence: crate::compiler::SqlMvRelationOccurrenceId,
     right_occurrence: crate::compiler::SqlMvRelationOccurrenceId,
-) -> Result<
-    (
-        &'a SqlImvQualifiedFieldLineage,
-        &'a SqlImvQualifiedFieldLineage,
-    ),
-    String,
-> {
+) -> Result<(&SqlImvQualifiedFieldLineage, &SqlImvQualifiedFieldLineage), String> {
     if predicate.left.occurrence_id == left_occurrence
         && predicate.right.occurrence_id == right_occurrence
     {
@@ -1043,10 +1037,10 @@ fn predicate_lineage_for_actual_sides<'a>(
     ))
 }
 
-fn base_contract_for_occurrence<'a>(
-    bases: &'a [SqlImvBaseContract],
+fn base_contract_for_occurrence(
+    bases: &[SqlImvBaseContract],
     occurrence: crate::compiler::SqlMvRelationOccurrenceId,
-) -> Result<&'a SqlImvBaseContract, String> {
+) -> Result<&SqlImvBaseContract, String> {
     let matches = bases
         .iter()
         .filter(|base| base.occurrence_id == occurrence)

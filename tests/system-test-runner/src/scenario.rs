@@ -743,25 +743,6 @@ fn scenario_platform_identity() -> Result<ScenarioPlatformIdentity> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::source_tree_sha256;
-
-    #[test]
-    fn source_tree_identity_changes_with_each_git_input() {
-        let baseline = source_tree_sha256("revision", "", b"tracked", b"diff", b"staged");
-        for changed in [
-            source_tree_sha256("other-revision", "", b"tracked", b"diff", b"staged"),
-            source_tree_sha256("revision", " M file", b"tracked", b"diff", b"staged"),
-            source_tree_sha256("revision", "", b"other-tracked", b"diff", b"staged"),
-            source_tree_sha256("revision", "", b"tracked", b"other-diff", b"staged"),
-            source_tree_sha256("revision", "", b"tracked", b"diff", b"other-staged"),
-        ] {
-            assert_ne!(baseline, changed);
-        }
-    }
-}
-
 fn unix_millis(time: SystemTime) -> Result<u128> {
     Ok(time
         .duration_since(UNIX_EPOCH)
@@ -812,4 +793,23 @@ pub(crate) fn resolve_backend_binaries(
                 .map(|binary| binary.unwrap_or_else(|| primary.to_path_buf()))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_tree_sha256;
+
+    #[test]
+    fn source_tree_identity_changes_with_each_git_input() {
+        let baseline = source_tree_sha256("revision", "", b"tracked", b"diff", b"staged");
+        for changed in [
+            source_tree_sha256("other-revision", "", b"tracked", b"diff", b"staged"),
+            source_tree_sha256("revision", " M file", b"tracked", b"diff", b"staged"),
+            source_tree_sha256("revision", "", b"other-tracked", b"diff", b"staged"),
+            source_tree_sha256("revision", "", b"tracked", b"other-diff", b"staged"),
+            source_tree_sha256("revision", "", b"tracked", b"diff", b"other-staged"),
+        ] {
+            assert_ne!(baseline, changed);
+        }
+    }
 }

@@ -1920,7 +1920,8 @@ fn preflight_extend_multi_with_observation<E: From<CopyError>>(
     work: &mut CopyObservation<'_, E>,
 ) -> Result<(), E> {
     work.boundary()?;
-    let result = (|| {
+
+    (|| {
         let first = *sources.first().ok_or(CopyError::Invalid(
             "mutable copy requires constructor sources",
         ))?;
@@ -1981,15 +1982,14 @@ fn preflight_extend_multi_with_observation<E: From<CopyError>>(
         visit(
             sources,
             &Selection {
-                blocks: blocks.into(),
+                blocks,
                 nulls,
                 null_ops,
             },
             CopyMode::Extend,
             work,
         )
-    })();
-    result
+    })()
 }
 
 /// Observe the original MutableArrayData multi-source constructor/extend/freeze

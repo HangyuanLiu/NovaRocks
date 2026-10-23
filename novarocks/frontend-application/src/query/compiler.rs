@@ -578,7 +578,7 @@ impl FrontendQueryCompiler {
         query_options: Option<QueryOptions>,
         connector_planning_context: novarocks_spi::connector::ConnectorPlanningContext,
         execution: &QueryExecutionContext,
-        context: &RequestContext,
+        _context: &RequestContext,
         scope: &novarocks_workload_control::WorkScope,
         level: ExplainLevel,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
@@ -641,8 +641,7 @@ impl FrontendQueryCompiler {
                 &control,
             )
             .map_err(|error| FrontendQueryCompilerError::from_completion(&error))?;
-        Ok(PreparedQueryOperation::explain_lines(lines)
-            .map_err(FrontendQueryCompilerError::Engine)?)
+        PreparedQueryOperation::explain_lines(lines).map_err(FrontendQueryCompilerError::Engine)
     }
 
     /// Compile one plain read into a completed plan, and hand the execution
@@ -668,7 +667,7 @@ impl FrontendQueryCompiler {
         query_options: Option<QueryOptions>,
         connector_planning_context: novarocks_spi::connector::ConnectorPlanningContext,
         execution: &QueryExecutionContext,
-        context: &RequestContext,
+        _context: &RequestContext,
         scope: &novarocks_workload_control::WorkScope,
         #[cfg(novarocks_dev_controls)] rewrite_statement: Option<
             &crate::mv::test_controls::MvRewriteStatementTarget,
@@ -835,7 +834,7 @@ impl FrontendQueryCompiler {
         query_options: Option<QueryOptions>,
         connector_planning_context: &novarocks_spi::connector::ConnectorPlanningContext,
         execution: &QueryExecutionContext,
-        context: &RequestContext,
+        _context: &RequestContext,
         scope: &novarocks_workload_control::WorkScope,
         planning_started_at: std::time::Instant,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {

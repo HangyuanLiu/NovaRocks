@@ -2850,7 +2850,7 @@ mod terminal_observation_tests {
     ) -> ResultWriteCredit {
         let (mut lower, mut upper) = (0, cap);
         while lower < upper {
-            let requested = lower + (upper - lower + 1) / 2;
+            let requested = lower + (upper - lower).div_ceil(2);
             match budget.try_reserve_process(requested).unwrap() {
                 ResultWriteAdmission::Granted(credit) => {
                     drop(credit);

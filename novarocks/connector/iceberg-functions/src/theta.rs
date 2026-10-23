@@ -746,7 +746,7 @@ mod tests {
             ),
         ] {
             let signature = family
-                .resolve_signature(&[data_type.clone()])
+                .resolve_signature(std::slice::from_ref(&data_type))
                 .expect("logical signature");
             assert_eq!(signature.argument_types, vec![data_type]);
             assert!(format!("{:?}", signature.overload).contains(suffix));

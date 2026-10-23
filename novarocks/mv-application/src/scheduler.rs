@@ -143,12 +143,11 @@ pub fn mv_keyed_scheduler_semantic_decision(
     now: i64,
     inputs: Option<&[PublicationInput]>,
 ) -> MvSchedulerSemanticDecision {
-    if let Some(inputs) = inputs {
-        if let Err(reason) =
+    if let Some(inputs) = inputs
+        && let Err(reason) =
             validate_current_inputs(&facts.definition().relation_occurrences, inputs)
-        {
-            return MvSchedulerSemanticDecision::Invalid { reason };
-        }
+    {
+        return MvSchedulerSemanticDecision::Invalid { reason };
     }
     semantic_decision(
         facts.configuration(),

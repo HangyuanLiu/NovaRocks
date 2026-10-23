@@ -1548,7 +1548,7 @@ mod tests {
         };
         let outcome = IcebergChangeWindowPlan::try_plan(
             change_window_handle(),
-            IcebergEndpointVisibility::Unproven(reason.clone()),
+            IcebergEndpointVisibility::Unproven(reason),
             vec![],
         )
         .unwrap();

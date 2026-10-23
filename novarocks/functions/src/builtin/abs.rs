@@ -713,10 +713,10 @@ mod shared_core_failure_tests {
             let mut calls = self.calls.lock().unwrap();
             let at = calls.len();
             calls.push(units);
-            if let Some((wanted, error)) = &self.refusal {
-                if at == *wanted {
-                    return Err(error.clone());
-                }
+            if let Some((wanted, error)) = &self.refusal
+                && at == *wanted
+            {
+                return Err(error.clone());
             }
             Ok(())
         }
@@ -752,7 +752,7 @@ mod shared_core_failure_tests {
         let values = baseline.evaluate(selection, &args, &control).unwrap();
         assert!(values.errors().is_empty());
         let expected = control.calls.lock().unwrap().clone();
-        assert!(expected.iter().any(|n| *n == 256));
+        assert!(expected.contains(&256));
         for failure in failures() {
             for at in 0..expected.len() {
                 let control = Control {

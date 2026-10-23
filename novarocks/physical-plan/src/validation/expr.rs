@@ -1679,7 +1679,8 @@ mod value_arithmetic_tests {
             DataType::Float64,
             DataType::Decimal128(18, 4),
         ] {
-            for nullable in [true] {
+            {
+                let nullable = true;
                 assert!(
                     unary_fragment(
                         ValueType::new(carrier.clone(), nullable),

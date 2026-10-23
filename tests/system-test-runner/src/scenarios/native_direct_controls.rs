@@ -52,7 +52,7 @@ impl DeclaredQuery {
     pub fn context(&self, backend: BackendProcessId) -> proto::QueryContextRef {
         proto::QueryContextRef {
             query_execution_id: Some(proto::QueryExecutionId {
-                query_id: Some(self.query_id.clone()),
+                query_id: Some(self.query_id),
                 attempt_id: 1,
             }),
             frontend_process_id: Some(proto::FrontendProcessId {

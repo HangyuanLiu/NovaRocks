@@ -223,10 +223,10 @@ impl ListingUriContext {
                         .ok_or_else(listing_workspace_exhausted)?,
                 )?;
                 let mut joined = PathBuf::with_capacity(length);
-                if !Path::new(path).is_absolute() {
-                    if let Some(root) = root {
-                        joined.push(root);
-                    }
+                if !Path::new(path).is_absolute()
+                    && let Some(root) = root
+                {
+                    joined.push(root);
                 }
                 joined.push(path);
                 self.bounds.check_path_length(joined.capacity())?;

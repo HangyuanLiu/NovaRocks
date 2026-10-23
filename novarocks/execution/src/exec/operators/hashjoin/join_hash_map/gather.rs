@@ -56,7 +56,7 @@ impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
 impl JoinGatherError {
     pub(crate) fn into_execution(self) -> ExecutionFailure {
         match self {
-            Self::Source(cause) => cause.into(),
+            Self::Source(cause) => cause,
             Self::Construction(cause) => cause.into(),
             Self::Kernel(cause) => cause.into(),
         }
@@ -248,7 +248,6 @@ impl TypedJoinBatch {
             |layout| owner.request(layout).map_err(Into::into),
             |step| owner.observe(0, &[], step).map_err(Into::into),
         )
-        .map_err(Into::into)
     }
 }
 
