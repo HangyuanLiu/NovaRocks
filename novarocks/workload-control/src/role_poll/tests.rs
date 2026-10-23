@@ -387,6 +387,7 @@ async fn original_driver_reclaims_output_after_bank_exit_including_silent_stale_
         let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
         let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
         let mut bank = RolePollBank::install(&mut control, 0, run).unwrap();
+        let bank_observer = bank.retirement_observer();
         control.mark_ready().unwrap();
         let root = new_root(&control);
         let observer = root.owner.retirement_observer().unwrap();
@@ -418,11 +419,13 @@ async fn original_driver_reclaims_output_after_bank_exit_including_silent_stale_
             Ok(false),
             "the real output still holds its footer"
         );
+        assert_eq!(bank_observer.is_reclaimed(), Ok(false));
         assert_eq!(*output.value(), 7);
         drop(output);
         drain(&mut driver);
         if retain_stale {
             assert_eq!(observer.is_reclaimed(), Ok(false));
+            assert_eq!(bank_observer.is_reclaimed(), Ok(false));
             let marker = control.progress_revision();
             driver.recheck_retired_backing();
             drain(&mut driver);
@@ -441,6 +444,7 @@ async fn original_driver_reclaims_output_after_bank_exit_including_silent_stale_
             drain(&mut driver);
         }
         assert_eq!(observer.is_reclaimed(), Ok(true));
+        assert_eq!(bank_observer.is_reclaimed(), Ok(true));
         assert!(control.inner.state.lock().unwrap().is_drained());
     }
 }
@@ -450,12 +454,15 @@ async fn startup_bank_exit_revokes_registration_and_allows_only_serial_reinstall
     let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
     let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
     let bank = RolePollBank::install(&mut control, 0, run).unwrap();
+    let first = bank.retirement_observer();
+    assert_eq!(first.is_reclaimed(), Ok(false));
     assert!(matches!(
         RolePollBank::install(&mut control, 0, run),
         Err(WorkError::Conflict)
     ));
     let old_notify = Arc::as_ptr(&bank.ready);
     drop(bank);
+    assert_eq!(first.is_reclaimed(), Ok(true));
     assert!(
         control
             .inner
@@ -470,9 +477,15 @@ async fn startup_bank_exit_revokes_registration_and_allows_only_serial_reinstall
     );
     assert_eq!(control.mark_ready(), Err(WorkError::NotReady));
     let bank = RolePollBank::install(&mut control, 0, run).unwrap();
+    let second = bank.retirement_observer();
+    assert!(second.generation > first.generation);
+    assert_eq!(first.is_reclaimed(), Ok(true));
+    assert_eq!(second.is_reclaimed(), Ok(false));
     control.mark_ready().unwrap();
     drop(bank);
     assert_eq!(control.mark_ready(), Err(WorkError::Closed));
+    assert_eq!(first.is_reclaimed(), Ok(true));
+    assert_eq!(second.is_reclaimed(), Ok(true));
     drain(&mut driver);
     assert!(control.inner.state.lock().unwrap().is_drained());
 }
@@ -482,6 +495,7 @@ async fn dropping_a_mounted_bank_preserves_orphaned_work_until_the_original_owne
     let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
     let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
     let mut bank = RolePollBank::install(&mut control, 0, run).unwrap();
+    let bank_observer = bank.retirement_observer();
     control.mark_ready().unwrap();
     let root = new_root(&control);
     let work = root.owner.scope().id();
@@ -498,6 +512,7 @@ async fn dropping_a_mounted_bank_preserves_orphaned_work_until_the_original_owne
         assert!(!state.nodes[&work].completed);
         assert_eq!(state.cancellations.retired_polls, 0);
     }
+    assert_eq!(bank_observer.is_reclaimed(), Ok(true));
     assert_eq!(observer.is_reclaimed(), Ok(false));
     control.adopt(work).unwrap().complete();
     drain(&mut driver);
@@ -540,9 +555,11 @@ async fn startup_teardown_refuses_readiness_while_actual_factory_destructor_is_p
     let roles = [PollRoleGeometry::for_factory(&make).unwrap()];
     let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
     let bank = RolePollBank::install(&mut control, 0, make).unwrap();
+    let observer = bank.retirement_observer();
     std::thread::scope(|threads| {
         let dropping = threads.spawn(move || drop(bank));
         entered.wait();
+        assert_eq!(observer.is_reclaimed(), Ok(false));
         assert_eq!(control.mark_ready(), Err(WorkError::NotReady));
         {
             let state = control.inner.state.lock().unwrap();
@@ -574,6 +591,7 @@ async fn startup_teardown_refuses_readiness_while_actual_factory_destructor_is_p
             .iter()
             .all(|slot| slot.polls[0].registration == RegistrationPhase::Absent)
     );
+    assert_eq!(observer.is_reclaimed(), Ok(true));
     control.close_admission();
     drain(&mut driver);
     assert!(control.inner.state.lock().unwrap().is_drained());
@@ -980,4 +998,112 @@ async fn original_poll_and_cleanup_causes_and_ready_output_keep_the_same_footer(
         assert_eq!(observer.is_reclaimed(), Ok(true));
         assert!(control.inner.state.lock().unwrap().is_drained());
     }
+}
+
+#[tokio::test]
+async fn registration_generation_max_refuses_replacement_without_wrapping() {
+    let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
+    let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
+    {
+        let mut state = control.inner.state.lock().unwrap();
+        for slot in &mut state.cancellations.slots {
+            slot.polls[0].registration_generation = u64::MAX - 1;
+        }
+    }
+    let bank = RolePollBank::install(&mut control, 0, run).unwrap();
+    let observer = bank.retirement_observer();
+    assert_eq!(observer.generation, u64::MAX);
+    assert_eq!(observer.is_reclaimed(), Ok(false));
+    drop(bank);
+    assert_eq!(observer.is_reclaimed(), Ok(true));
+    let revision = control.progress_revision();
+    assert!(matches!(
+        RolePollBank::install(&mut control, 0, run),
+        Err(WorkError::ArithmeticOverflow)
+    ));
+    assert_eq!(control.progress_revision(), revision);
+    assert!(
+        control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .cancellations
+            .slots
+            .iter()
+            .all(|slot| {
+                let role = &slot.polls[0];
+                role.registration_generation == u64::MAX
+                    && role.registration == RegistrationPhase::Absent
+                    && role.phase == PollPhase::Free
+            })
+    );
+    control.close_admission();
+    drain(&mut driver);
+}
+
+#[tokio::test]
+async fn vanished_original_authority_is_not_a_role_backing_exit_proof() {
+    let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
+    let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
+    let bank = RolePollBank::install(&mut control, 0, run).unwrap();
+    let observer = bank.retirement_observer();
+    drop(bank);
+    assert_eq!(observer.is_reclaimed(), Ok(true));
+    control.close_admission();
+    drain(&mut driver);
+    drop(driver);
+    drop(control);
+    assert_eq!(observer.is_reclaimed(), Err(WorkError::Released));
+}
+
+#[tokio::test]
+async fn backing_exit_does_not_claim_the_registration_notification_tail_has_joined() {
+    struct PausedWake {
+        entered: std::sync::Barrier,
+        resume: std::sync::Barrier,
+    }
+    impl Wake for PausedWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.entered.wait();
+            self.resume.wait();
+        }
+    }
+    let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
+    let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
+    let bank = RolePollBank::install(&mut control, 0, run).unwrap();
+    let observer = bank.retirement_observer();
+    let paused = Arc::new(PausedWake {
+        entered: std::sync::Barrier::new(2),
+        resume: std::sync::Barrier::new(2),
+    });
+    let waker = Waker::from(Arc::clone(&paused));
+    let mut progress = Box::pin(control.wait_progress(control.progress_revision()));
+    assert!(
+        progress
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    std::thread::scope(|threads| {
+        let original = threads.spawn(move || drop(bank));
+        paused.entered.wait();
+        let reclaimed = observer.is_reclaimed();
+        let actually_exited = original.is_finished();
+        // Always let the real notification finish before asserting the join
+        // boundary, so a failing assertion cannot strand the scoped thread.
+        paused.resume.wait();
+        original.join().unwrap();
+        assert_eq!(reclaimed, Ok(true));
+        assert!(
+            !actually_exited,
+            "backing retirement alone is not actual root join"
+        );
+    });
+    drop(progress);
+    control.close_admission();
+    drain(&mut driver);
 }

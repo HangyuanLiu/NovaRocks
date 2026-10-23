@@ -95,6 +95,7 @@ pub(crate) struct PollBacking {
     wake: Arc<PollWake>,
     pub(crate) phase: PollPhase,
     registration: RegistrationPhase,
+    registration_generation: u64,
 }
 impl PollBacking {
     pub(crate) fn is_installed(&self) -> bool {
@@ -124,6 +125,7 @@ impl PollBacking {
             }),
             phase: PollPhase::Free,
             registration: RegistrationPhase::Absent,
+            registration_generation: 0,
         }
     }
 }
@@ -222,7 +224,7 @@ pub(crate) struct MountRejected<I> {
 }
 
 /// Only original fixed-profile composition can construct this bank. It has no
-/// queue, free list, public mount guard, or independent capacity decision.
+/// independent admission queue, free list, public mount guard, or capacity decision.
 pub(crate) struct RolePollBank<I, F: Future, M> {
     inner: Arc<Inner>,
     role: usize,
@@ -245,15 +247,26 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
         // entry point can allocate competing banks against the same paid base.
         let inner = &control.inner;
         let geometry = PollRoleGeometry::for_factory(&make)?;
-        let validate = |state: &mut crate::scope::State| -> Result<usize, WorkError> {
+        let validate = |state: &mut crate::scope::State| -> Result<(usize, u64), WorkError> {
             if state.ready || state.closed || !state.cancellations.fixed || !state.nodes.is_empty()
             {
                 return Err(WorkError::Conflict);
             }
+            let generation = state
+                .cancellations
+                .slots
+                .first()
+                .and_then(|slot| slot.polls.get(role))
+                .ok_or(WorkError::NotReady)?
+                .registration_generation;
+            let next_generation = generation
+                .checked_add(1)
+                .ok_or(WorkError::ArithmeticOverflow)?;
             for slot in &mut state.cancellations.slots {
                 let backing = slot.polls.get_mut(role).ok_or(WorkError::NotReady)?;
                 if slot.phase != SlotPhase::Free
                     || backing.registration != RegistrationPhase::Absent
+                    || backing.registration_generation != generation
                     || backing.phase != PollPhase::Free
                     || backing.geometry != geometry
                     || Arc::get_mut(&mut backing.wake).is_none()
@@ -261,9 +274,9 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
                     return Err(WorkError::Conflict);
                 }
             }
-            Ok(state.cancellations.slots.len())
+            Ok((state.cancellations.slots.len(), next_generation))
         };
-        let count = validate(&mut inner.state.lock().unwrap())?;
+        let (count, generation) = validate(&mut inner.state.lock().unwrap())?;
         let changed = Arc::new(Notify::new());
         {
             let mut notified = std::pin::pin!(changed.notified());
@@ -287,11 +300,13 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
         // This is startup registration, with all backing already funded by
         // the original fixed base. It executes no runtime notification callback.
         inner.update_facts_silent(|state| {
-            validate(state)?;
+            let (_, current_generation) = validate(state)?;
+            assert_eq!(current_generation, generation);
             for slot in &mut state.cancellations.slots {
                 let backing = &mut slot.polls[role];
                 Arc::get_mut(&mut backing.wake).unwrap().changed = Arc::downgrade(&ready);
                 backing.registration = RegistrationPhase::Installed;
+                backing.registration_generation = generation;
             }
             Ok::<(), WorkError>(())
         })?;
@@ -307,8 +322,17 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
             _registration: BankRegistration {
                 inner: Arc::clone(inner),
                 role,
+                generation,
             },
         })
+    }
+
+    pub(crate) fn retirement_observer(&self) -> RoleBackingRetirementObserver {
+        RoleBackingRetirementObserver {
+            inner: Arc::downgrade(&self.inner),
+            role: self.role,
+            generation: self._registration.generation,
+        }
     }
 
     pub(crate) fn mount_owned(
@@ -505,6 +529,7 @@ impl<I, F: Future, M> Drop for RolePollBank<I, F, M> {
         for slot in &mut state.cancellations.slots {
             let role = &mut slot.polls[self.role];
             assert_eq!(role.registration, RegistrationPhase::Installed);
+            assert_eq!(role.registration_generation, self._registration.generation);
             role.registration = RegistrationPhase::Stopping;
         }
         if state.ready {
@@ -518,6 +543,7 @@ impl<I, F: Future, M> Drop for RolePollBank<I, F, M> {
 struct BankRegistration {
     inner: Arc<Inner>,
     role: usize,
+    generation: u64,
 }
 impl Drop for BankRegistration {
     fn drop(&mut self) {
@@ -526,6 +552,7 @@ impl Drop for BankRegistration {
             for slot in &mut state.cancellations.slots {
                 let role = &mut slot.polls[self.role];
                 assert_eq!(role.registration, RegistrationPhase::Stopping);
+                assert_eq!(role.registration_generation, self.generation);
                 if let Some(wake) = Arc::get_mut(&mut role.wake) {
                     // A Weak retains the old Notify allocation after its value
                     // exits. Destroy it before a replacement bank may allocate.
@@ -538,6 +565,48 @@ impl Drop for BankRegistration {
         // Original inventory/driver survives this bank, including external
         // PollOutput and silent stale Wakers that still retain its old slot.
         self.inner.notify_reclaim_progress();
+    }
+}
+
+/// Non-owning proof for one original role bank's backing only. The caller must
+/// separately retain and join its actual root task: this proof does not cover
+/// the registration notification tail or the root future that contained it.
+/// This finite, allocation-free scan is intended for shutdown observation.
+pub(crate) struct RoleBackingRetirementObserver {
+    inner: Weak<Inner>,
+    role: usize,
+    generation: u64,
+}
+impl RoleBackingRetirementObserver {
+    pub(crate) fn is_reclaimed(&self) -> Result<bool, WorkError> {
+        let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
+        let state = inner.state.lock().unwrap();
+        if !state.cancellations.fixed {
+            return Err(WorkError::NotReady);
+        }
+        let generation = state
+            .cancellations
+            .slots
+            .first()
+            .and_then(|slot| slot.polls.get(self.role))
+            .ok_or(WorkError::Conflict)?
+            .registration_generation;
+        if generation < self.generation {
+            return Err(WorkError::Conflict);
+        }
+        let mut reclaimed = true;
+        for slot in &state.cancellations.slots {
+            let backing = slot.polls.get(self.role).ok_or(WorkError::Conflict)?;
+            if backing.registration_generation != generation {
+                return Err(WorkError::Conflict);
+            }
+            reclaimed &= backing.registration == RegistrationPhase::Absent
+                && backing.phase == PollPhase::Free;
+        }
+        // A later registration can be minted only after every old Wake has
+        // really reset and the previous bank's fields have left. MAX refuses
+        // installation instead of wrapping this original registration epoch.
+        Ok(generation > self.generation || reclaimed)
     }
 }
 
