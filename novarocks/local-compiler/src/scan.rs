@@ -69,7 +69,9 @@ pub(crate) fn admit_scan(
         Relation::Data(data) => {
             if !matches!(
                 data.read.relation.kind(),
-                ConnectorReadRelationKind::Table | ConnectorReadRelationKind::TableExecute
+                ConnectorReadRelationKind::Table
+                    | ConnectorReadRelationKind::TableExecute
+                    | ConnectorReadRelationKind::ChangeWindow
             ) {
                 return Err(unsupported("provider relation other than a table"));
             }

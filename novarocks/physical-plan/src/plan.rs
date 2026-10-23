@@ -46,6 +46,10 @@ pub const ROOT_WRITE_RESULT_SCHEMA_REVISION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ValueOrigin {
+    /// A Task summary output; never a row in the relational root node.
+    LogicalSummary {
+        field: crate::LogicalChangeCountField,
+    },
     ProviderField {
         scan_node: NodeId,
         field: ProviderColumnReference,
@@ -240,10 +244,31 @@ pub enum Distribution {
         keys: Box<[ValueId]>,
         scheme: HashPartitionScheme,
     },
+    /// TRUE rows are colocated by the exact key tuple; FALSE and NULL rows
+    /// bypass key hashing and are distributed round-robin per row. This is
+    /// never evidence that all input rows are colocated by `keys`.
+    ConditionalKey {
+        applies: ValueId,
+        keys: Box<[ValueId]>,
+        scheme: HashPartitionScheme,
+    },
     BucketShuffle {
         keys: Box<[ValueId]>,
         scheme: BucketPartitionScheme,
     },
+}
+
+impl Distribution {
+    /// Every value required to interpret this contract. The applicability
+    /// mask is a reference, but is not part of the canonical hash key tuple.
+    pub fn value_references(&self) -> impl Iterator<Item = ValueId> + '_ {
+        let (applies, keys): (Option<ValueId>, &[ValueId]) = match self {
+            Self::ConditionalKey { applies, keys, .. } => (Some(*applies), keys),
+            Self::Hash { keys, .. } | Self::BucketShuffle { keys, .. } => (None, keys),
+            _ => (None, &[]),
+        };
+        applies.into_iter().chain(keys.iter().copied())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -336,6 +361,20 @@ pub fn remap_properties_through_values(
                 scheme: scheme.clone(),
             })
             .unwrap_or(Distribution::Unconstrained),
+        Distribution::ConditionalKey {
+            applies,
+            keys,
+            scheme,
+        } => values
+            .get(applies)
+            .copied()
+            .zip(remap_keys(keys))
+            .map(|(applies, keys)| Distribution::ConditionalKey {
+                applies,
+                keys,
+                scheme: scheme.clone(),
+            })
+            .unwrap_or(Distribution::Unconstrained),
         Distribution::BucketShuffle { keys, scheme } => remap_keys(keys)
             .map(|keys| Distribution::BucketShuffle {
                 keys,
@@ -375,9 +414,15 @@ pub fn derive_project_output_properties(
         {
             input.distribution.clone()
         }
-        Distribution::Hash { .. } | Distribution::BucketShuffle { .. } => {
-            Distribution::Unconstrained
+        Distribution::ConditionalKey { applies, keys, .. }
+            if output_values.contains(applies)
+                && keys.iter().all(|key| output_values.contains(key)) =>
+        {
+            input.distribution.clone()
         }
+        Distribution::Hash { .. }
+        | Distribution::ConditionalKey { .. }
+        | Distribution::BucketShuffle { .. } => Distribution::Unconstrained,
         Distribution::Broadcast if !expressions_replica_deterministic => {
             Distribution::Unconstrained
         }
@@ -641,6 +686,9 @@ pub struct WriterGroupedUnpivotSpec {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WriterFinishSpec {
+    pub count_mode: crate::FinishCountMode,
+    pub inputs: crate::FinishInputs,
+    pub logical_summary: Option<crate::LogicalSummaryColumns>,
     pub expected_target_ordinals: Box<[WriteTargetOrdinal]>,
     pub input_schema: WriterRelationSchema,
     pub output_schema: WriterRelationSchema,
@@ -727,6 +775,7 @@ pub enum RowCountAssertionSpec {
         comparison: RowCountAssertion,
     },
     PerKeyAtMostOne {
+        applicability: crate::AssertionApplicability,
         keys: Box<[ValueId]>,
         labels: Box<[Box<str>]>,
         message: Box<str>,
@@ -753,7 +802,7 @@ pub struct ChangeStreamRoute {
     pub write_target_ordinal: WriteTargetOrdinal,
     pub accepted_effects: Box<[ConnectorRowMutationEffect]>,
     pub input_mapping: Box<[(ConnectorWriteFieldToken, ValueId)]>,
-    pub partition_by: Box<[ValueId]>,
+    pub requirements: crate::WriteRouteRequirements,
     pub edge: EdgeId,
 }
 
@@ -1052,6 +1101,7 @@ pub enum FragmentSink {
     Router {
         effect: ValueId,
         routes: Box<[ChangeStreamRoute]>,
+        summary: crate::LogicalSummaryOutput,
     },
     Noop,
 }
@@ -1065,6 +1115,7 @@ pub struct Fragment {
     nodes: BTreeMap<NodeId, PhysicalNode>,
     sink: FragmentSink,
     dop_domain: PipelineDopDomain,
+    stage_placement: crate::StagePlacementPolicy,
     runtime_filters: Box<[RuntimeFilterId]>,
     pub(crate) call_requests: crate::FragmentCallRequests,
 }
@@ -1079,6 +1130,7 @@ impl Fragment {
             nodes: self.nodes,
             sink: self.sink,
             dop_domain: self.dop_domain,
+            stage_placement: self.stage_placement,
             runtime_filters: self.runtime_filters,
             call_requests: self.call_requests,
         }
@@ -1108,6 +1160,10 @@ impl Fragment {
         &self.sink
     }
 
+    pub const fn stage_placement(&self) -> &crate::StagePlacementPolicy {
+        &self.stage_placement
+    }
+
     pub const fn dop_domain(&self) -> PipelineDopDomain {
         self.dop_domain
     }
@@ -1131,6 +1187,7 @@ pub enum EdgeKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EdgeSource {
     pub fragment: FragmentId,
+    pub port: crate::FragmentOutputPort,
     pub projection: Box<[ValueId]>,
 }
 
@@ -1145,6 +1202,8 @@ pub struct EdgeDestination {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Edge {
     pub id: EdgeId,
+    pub role: crate::OutputRole,
+    pub delivery: crate::DeliveryRequirement,
     pub kind: EdgeKind,
     pub source: EdgeSource,
     pub destination: EdgeDestination,
@@ -1220,8 +1279,9 @@ pub struct InboundFragmentCut {
     pub destination_node: NodeId,
     pub imports: Box<[CutImport]>,
     pub partitioning: EdgePartitioning,
-    pub change_stream_writer: Option<ChangeStreamWriterCut>,
-    pub writer_result: Option<WriterResultCut>,
+    pub source_port: crate::FragmentOutputPort,
+    pub payload: crate::ExchangePayloadContract,
+    pub delivery: crate::DeliveryRequirement,
 }
 
 /// Complete outbound cut supplied with one independently validated fragment.
@@ -1237,8 +1297,9 @@ pub struct OutboundFragmentCut {
     /// Exact source-to-destination value mapping at the peer boundary.
     pub destination_imports: Box<[CutImport]>,
     pub partitioning: EdgePartitioning,
-    pub change_stream_writer: Option<ChangeStreamWriterCut>,
-    pub writer_result: Option<WriterResultCut>,
+    pub source_port: crate::FragmentOutputPort,
+    pub payload: crate::ExchangePayloadContract,
+    pub delivery: crate::DeliveryRequirement,
 }
 
 /// Which endpoint of one runtime filter a binding identity names.
@@ -1708,6 +1769,7 @@ pub(crate) struct FragmentParts {
     pub nodes: BTreeMap<NodeId, PhysicalNode>,
     pub sink: FragmentSink,
     pub dop_domain: PipelineDopDomain,
+    pub stage_placement: crate::StagePlacementPolicy,
     pub runtime_filters: Box<[RuntimeFilterId]>,
     pub call_requests: crate::FragmentCallRequests,
 }
@@ -1722,8 +1784,70 @@ impl From<FragmentParts> for Fragment {
             nodes: parts.nodes,
             sink: parts.sink,
             dop_domain: parts.dop_domain,
+            stage_placement: parts.stage_placement,
             runtime_filters: parts.runtime_filters,
             call_requests: parts.call_requests,
         }
+    }
+}
+
+#[cfg(test)]
+mod conditional_partition_contract_tests {
+    use super::*;
+
+    fn distribution() -> Distribution {
+        Distribution::ConditionalKey {
+            applies: ValueId::new(1),
+            keys: Box::new([ValueId::new(2)]),
+            scheme: HashPartitionScheme {
+                space: novarocks_type_contract::PartitionSpaceId::try_new([1; 32]).unwrap(),
+                count: PartitionCountParameter {
+                    id: novarocks_type_contract::PartitionCountParameterId::try_new([2; 32])
+                        .unwrap(),
+                    admissible: PartitionCountDomain {
+                        min: 1,
+                        max: 16,
+                        requires_power_of_two: false,
+                    },
+                },
+                definition: HashDefinition {
+                    algorithm:
+                        novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn conditional_partition_references_mask_without_claiming_an_all_rows_hash() {
+        let distribution = distribution();
+        assert_eq!(
+            distribution.value_references().collect::<Vec<_>>(),
+            [ValueId::new(1), ValueId::new(2)]
+        );
+        let Distribution::ConditionalKey { keys, scheme, .. } = distribution.clone() else {
+            unreachable!()
+        };
+        assert_ne!(distribution, Distribution::Hash { keys, scheme });
+        let props = PhysicalProperties {
+            distribution,
+            row_multiplicity: RowMultiplicity::SingleCopy,
+            ordering: Box::default(),
+        };
+        assert_eq!(
+            derive_project_output_properties(&props, &[ValueId::new(2)], true).distribution,
+            Distribution::Unconstrained
+        );
+        let remap = BTreeMap::from([
+            (ValueId::new(1), ValueId::new(3)),
+            (ValueId::new(2), ValueId::new(4)),
+        ]);
+        assert_eq!(
+            remap_properties_through_values(&props, &remap)
+                .distribution
+                .value_references()
+                .collect::<Vec<_>>(),
+            [ValueId::new(3), ValueId::new(4)]
+        );
     }
 }

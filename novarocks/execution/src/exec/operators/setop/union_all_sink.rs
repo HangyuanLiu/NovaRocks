@@ -33,9 +33,9 @@ use crate::runtime::fragment::ExecutionResult;
 use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
-    input::PreparedInput,
-    shape::{SinkKernel, SinkStep, Transform},
-    step::NextStep,
+    input::{PreparedInput, RawInput},
+    shape::{ControlStep, SinkKernel, SinkStep, Transform},
+    step::{AdmissionNext, NextStep, WaitFact, WaitReason},
     step_context::StepContext,
 };
 use crate::runtime::mem_tracker::MemTracker;
@@ -71,6 +71,7 @@ impl OperatorFactory for UnionAllSinkFactory {
             name: self.name.clone(),
             state: self.state.clone(),
             memory: None,
+            producer_finished: false,
         }))
     }
 
@@ -83,16 +84,42 @@ struct UnionAllSinkOperator {
     name: String,
     state: UnionAllSharedState,
     memory: Option<QueueInputMemory>,
+    producer_finished: bool,
 }
 struct QueueInputMemory {
     tracker: Option<Arc<MemTracker>>,
 }
 
+impl UnionAllSinkOperator {
+    fn finish_producer(&mut self, normal: bool) {
+        if !self.producer_finished {
+            self.producer_finished = true;
+            if normal {
+                self.state.producer_finished();
+            } else {
+                self.state.producer_abandoned();
+            }
+        }
+    }
+}
 impl OperatorLifecycle for UnionAllSinkOperator {
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.finish_producer(false);
+        Ok(())
+    }
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.finish_producer(false);
+        Ok(())
+    }
+    fn cancel(&mut self) {
+        self.finish_producer(false);
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.state.bind_runtime(state)?;
         self.memory = Some(QueueInputMemory {
             tracker: self.state.queue_mem_tracker(state),
         });
@@ -101,6 +128,38 @@ impl OperatorLifecycle for UnionAllSinkOperator {
 }
 impl InputEncodingPolicy for UnionAllSinkOperator {}
 impl SinkKernel for UnionAllSinkOperator {
+    fn poll_control(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+        if self.state.consumer_closed() {
+            self.finish_producer(false);
+            Ok(ControlStep::Withdrawn)
+        } else {
+            Ok(ControlStep::Active)
+        }
+    }
+    fn control_observable(
+        &self,
+    ) -> Option<Arc<crate::exec::pipeline::schedule::observer::Observable>> {
+        Some(self.state.observable())
+    }
+    fn admission(
+        &self,
+        _: &mut StepContext<'_>,
+        _: &RawInput,
+    ) -> ExecutionResult<Option<AdmissionNext>> {
+        let observable = self.state.observable();
+        let observed_generation = observable.generation();
+        if !self.state.need_input() && !self.state.consumer_closed() {
+            Ok(Some(AdmissionNext::Wait(WaitFact {
+                reason: WaitReason::Output,
+                observable,
+                observed_generation,
+                deadline: None,
+            })))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn consume(
         &mut self,
         _: &mut StepContext<'_>,
@@ -116,12 +175,12 @@ impl SinkKernel for UnionAllSinkOperator {
         let chunk = input.into_uncovered_chunk()?;
         let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
         if !chunk.is_empty() {
-            self.state.push_chunk(memory.tracker.as_ref(), chunk);
+            self.state.push_chunk(memory.tracker.as_ref(), chunk)?;
         }
         Ok(SinkStep::new(NextStep::NeedInput, rows))
     }
     fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
-        self.state.producer_finished();
+        self.finish_producer(true);
         Ok(SinkStep::new(NextStep::Finished, 0))
     }
 }

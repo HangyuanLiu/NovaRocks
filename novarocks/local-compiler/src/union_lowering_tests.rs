@@ -374,6 +374,7 @@ fn finish_package(
             },
             PlanLimits::FROZEN,
             &Control,
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();

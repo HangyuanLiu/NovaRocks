@@ -69,6 +69,10 @@ impl PureCompileControl for FixtureControl {
 enum Shape {
     /// Stream edge, Singleton to Singleton, consumer publishes the result.
     Gather,
+    Hierarchical,
+    Conditional,
+    RepeatedConditional,
+    RoundRobin,
     /// Stream edge hashed on both produced columns; consumer is a Noop sink.
     Hash,
     /// Hash keys `[a, b]` with the received value `b` published twice.
@@ -109,14 +113,27 @@ fn dop() -> PipelineDopDomain {
 /// the consumer receives `[ib, ia]` positionally at `RECEIVER`.
 fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
     let ty = ValueType::new(DataType::Int64, false);
+    let conditional = matches!(shape, Shape::Conditional | Shape::RepeatedConditional);
+    let repeated = matches!(shape, Shape::RepeatedHash | Shape::RepeatedConditional);
+    let b_type = if conditional {
+        ValueType::new(DataType::Boolean, true)
+    } else {
+        ty.clone()
+    };
     let mut producer = FragmentBuilder::new(PRODUCER);
     let mut outputs = Vec::new();
     let mut cells = Vec::new();
     for (ordinal, literal) in [11, 22].into_iter().enumerate() {
+        let field_type = if ordinal == 1 { &b_type } else { &ty };
+        let literal = if conditional && ordinal == 1 {
+            LiteralValue::Null
+        } else {
+            LiteralValue::Int64(literal)
+        };
         outputs.push(
             producer
                 .add_value(
-                    ty.clone(),
+                    field_type.clone(),
                     ValueOrigin::NodeOutput {
                         node: VALUES,
                         output_ordinal: ordinal as u32,
@@ -126,11 +143,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
         );
         cells.push(
             producer
-                .add_expression(
-                    VALUES,
-                    ty.clone(),
-                    ExprKind::Literal(LiteralValue::Int64(literal)),
-                )
+                .add_expression(VALUES, field_type.clone(), ExprKind::Literal(literal))
                 .unwrap(),
         );
     }
@@ -142,13 +155,13 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
             outputs.into_boxed_slice(),
         )
         .unwrap();
-    let root = if shape == Shape::RepeatedHash {
+    let root = if repeated {
         let project = NodeId::new(11);
         let read_a = producer
             .add_expression(project, ty.clone(), ExprKind::Value(a))
             .unwrap();
         let read_b = producer
-            .add_expression(project, ty.clone(), ExprKind::Value(b))
+            .add_expression(project, b_type.clone(), ExprKind::Value(b))
             .unwrap();
         producer
             .add_project(
@@ -170,7 +183,14 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
     } else {
         FragmentSink::Stream { edge: EDGE }
     };
-    let producer = producer.finish_definition(root, sink, dop()).unwrap();
+    let producer = producer
+        .finish_definition(
+            root,
+            sink,
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
 
     let mut consumer = FragmentBuilder::new(CONSUMER);
     let import = |builder: &mut FragmentBuilder, source_value| {
@@ -186,11 +206,11 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
                 source_value,
             }
         };
-        builder.add_value(ty.clone(), origin).unwrap()
+        let field_type = if source_value == b { &b_type } else { &ty };
+        builder.add_value(field_type.clone(), origin).unwrap()
     };
     let ib = import(&mut consumer, b);
     let ia = import(&mut consumer, a);
-    let repeated = shape == Shape::RepeatedHash;
     let mapping: Box<[_]> = if repeated {
         Box::from([(b, ib), (a, ia), (b, ib)])
     } else {
@@ -210,6 +230,33 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
         Shape::Gather => (Distribution::Singleton, Distribution::Singleton),
         Shape::Hash => (hash([b, a]), hash([ib, ia])),
         Shape::RepeatedHash => (hash([a, b]), hash([ia, ib])),
+        Shape::Hierarchical => {
+            let hierarchical = |keys| {
+                let Distribution::Hash { keys, mut scheme } = hash(keys) else {
+                    unreachable!()
+                };
+                scheme.definition.algorithm =
+                    novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1;
+                Distribution::Hash { keys, scheme }
+            };
+            (hierarchical([b, a]), hierarchical([ib, ia]))
+        }
+        Shape::Conditional | Shape::RepeatedConditional => {
+            let conditional = |keys, applies| {
+                let Distribution::Hash { keys, mut scheme } = hash(keys) else {
+                    unreachable!()
+                };
+                scheme.definition.algorithm =
+                    novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1;
+                Distribution::ConditionalKey {
+                    keys: if repeated { keys } else { Box::from([keys[1]]) },
+                    applies,
+                    scheme,
+                }
+            };
+            (conditional([b, a], b), conditional([ib, ia], ib))
+        }
+        Shape::RoundRobin => (Distribution::RoundRobin, Distribution::RoundRobin),
         Shape::Unconstrained | Shape::Multicast => {
             (Distribution::Unconstrained, Distribution::Unconstrained)
         }
@@ -224,20 +271,35 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
             RowMultiplicity::SingleCopy,
         )
         .unwrap();
-    let gather = matches!(shape, Shape::Gather | Shape::RepeatedHash);
+    let gather = matches!(
+        shape,
+        Shape::Gather
+            | Shape::RepeatedHash
+            | Shape::Hierarchical
+            | Shape::Conditional
+            | Shape::RepeatedConditional
+            | Shape::RoundRobin
+    );
     let consumer_sink = if gather {
         FragmentSink::Result
     } else {
         FragmentSink::Noop
     };
     let consumer = consumer
-        .finish_definition(RECEIVER, consumer_sink, dop())
+        .finish_definition(
+            RECEIVER,
+            consumer_sink,
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(Edge {
+        role: novarocks_physical_plan::OutputRole::Relational,
+        delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
         id: EDGE,
         kind: if multicast {
             EdgeKind::CteMulticast
@@ -245,6 +307,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
             EdgeKind::Stream
         },
         source: EdgeSource {
+            port: novarocks_physical_plan::FragmentOutputPort::Root,
             fragment: PRODUCER,
             projection: projected,
         },
@@ -268,7 +331,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
                 name: "b".into(),
                 alias: Some("bee".into()),
                 value: ib,
-                ty: ty.clone(),
+                ty: b_type.clone(),
             },
             ResultField {
                 domain: novarocks_physical_plan::ResultValueDomain::Plain,
@@ -284,7 +347,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
                 name: "b".into(),
                 alias: Some("bee_again".into()),
                 value: ib,
-                ty: ty.clone(),
+                ty: b_type.clone(),
             });
         }
         plan.set_result_port(ResultPort {
@@ -491,7 +554,7 @@ fn gather_producer_streams_and_consumer_receives_one_addressed_edge() {
     assert_eq!(requirements.len(), 1);
     assert!(matches!(
         &requirements[0],
-        BindingRequirement::ExchangeOutput { branch: 0, layout }
+        BindingRequirement::ExchangeOutput { branch: 0, layout , ..}
             if layout.slots() == [root_slots[1], root_slots[0]]
     ));
     // The empty Sink arena still owns its (empty) flow.
@@ -533,6 +596,9 @@ fn gather_producer_streams_and_consumer_receives_one_addressed_edge() {
         &BTreeMap::from([(
             ProgramNodeId::new(0),
             CompiledExchangeInput {
+                role: novarocks_local_program::ProgramOutputRole::Relational,
+                delivery: novarocks_local_program::ExchangeDeliveryRequirement::DemandDriven,
+                routing: novarocks_local_program::CompiledExchangeRouting::Unpartitioned,
                 receiver_node: RECEIVER.get(),
                 edge: EDGE.get(),
                 source_fragment: PRODUCER.get(),
@@ -544,7 +610,7 @@ fn gather_producer_streams_and_consumer_receives_one_addressed_edge() {
     assert_eq!(requirements.len(), 2);
     assert!(requirements.iter().any(|requirement| matches!(
         requirement,
-        BindingRequirement::ExchangeInput { node, layout: required }
+        BindingRequirement::ExchangeInput { node, layout: required , ..}
             if *node == ProgramNodeId::new(0) && required.slots() == layout.slots()
     )));
     assert!(
@@ -645,16 +711,16 @@ fn repeated_hash_imports_keep_each_channel_and_the_ordered_key_representative() 
 fn unsupported_sinks_and_partitionings_are_refused() {
     refused(
         compile(packages(Shape::Multicast).remove(&PRODUCER).unwrap(), None),
-        "multicast, router or noop sink",
+        "multicast or noop sink",
     );
     let mut unconstrained = packages(Shape::Unconstrained);
     refused(
         compile(unconstrained.remove(&PRODUCER).unwrap(), None),
-        "unconstrained or round-robin stream partitioning",
+        "unconstrained stream partitioning",
     );
     refused(
         compile(unconstrained.remove(&CONSUMER).unwrap(), None),
-        "multicast, router or noop sink",
+        "multicast or noop sink",
     );
     // A hash receiver is not a singleton source tree yet.
     let hash_consumer = packages(Shape::Hash).remove(&CONSUMER).unwrap();
@@ -674,4 +740,120 @@ fn result_sink_without_result_port_never_reaches_lowering() {
         .into_input();
     assert!(input.result.take().is_some());
     assert!(FragmentPackage::try_new(input, package_admission(), &FixtureControl).is_err());
+}
+
+#[test]
+fn hierarchical_conditional_and_round_robin_keep_their_exact_sender_and_receiver_facts() {
+    use novarocks_local_program::{CompiledExchangeRouting, StaticStreamRouting};
+    use novarocks_type_contract::{EvaluationDemand, PartitionHashAlgorithm};
+    for shape in [Shape::Hierarchical, Shape::Conditional, Shape::RoundRobin] {
+        let mut packages = packages(shape);
+        let producer = compile(packages.remove(&PRODUCER).unwrap(), None)
+            .expect("the exact sender contract compiles");
+        let Some(StaticSinkProgram::DataStream { branch, arena }) = producer.graph().sink() else {
+            panic!("stream")
+        };
+        let consumer = compile(packages.remove(&CONSUMER).unwrap(), Some(1))
+            .expect("the exact receiver contract compiles");
+        let facts = &consumer.exchange_inputs()[&ProgramNodeId::new(0)];
+        let slots = consumer.graph().nodes()[0].output_layout().slots();
+        match shape {
+            Shape::Hierarchical => {
+                assert_eq!(
+                    branch.contract().routing,
+                    StaticStreamRouting::HierarchicalHashV1
+                );
+                assert_eq!(
+                    facts.routing,
+                    CompiledExchangeRouting::Hash {
+                        algorithm: PartitionHashAlgorithm::NativeHierarchicalV1
+                    }
+                );
+                assert_eq!(facts.hash_partition_slots.as_ref(), slots);
+            }
+            Shape::Conditional => {
+                let StaticStreamRouting::ConditionalKeyV1 { applies } = branch.contract().routing
+                else {
+                    panic!("conditional routing must not become ordinary Hash")
+                };
+                assert_eq!(arena.node(applies).unwrap().data_type(), &DataType::Boolean);
+                assert_eq!(
+                    facts.routing,
+                    CompiledExchangeRouting::ConditionalKey {
+                        applies: slots[0],
+                        algorithm: PartitionHashAlgorithm::NativeHierarchicalV1
+                    }
+                );
+                assert_eq!(facts.hash_partition_slots.as_ref(), &slots[1..]);
+                let snapshot = producer
+                    .checked()
+                    .channels()
+                    .expressions()
+                    .resolved_calls()
+                    .snapshot();
+                let id = snapshot.bindings()
+                    [&ProgramExpressionRootSite::SinkApplicability { branch: 0 }];
+                assert_eq!(
+                    snapshot.flows()[&ProgramExpressionArena::Sink].uses()[&id]
+                        .context
+                        .demand,
+                    EvaluationDemand::TruthOnly
+                );
+                assert_eq!(
+                    snapshot.flows()[&ProgramExpressionArena::Sink].uses().len(),
+                    2
+                );
+            }
+            Shape::RoundRobin => {
+                assert_eq!(branch.partition_type(), DataStreamPartitionType::Random);
+                assert_eq!(branch.contract().routing, StaticStreamRouting::Ordinary);
+                assert_eq!(facts.routing, CompiledExchangeRouting::RoundRobin);
+                assert!(facts.hash_partition_slots.is_empty());
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            facts.role,
+            novarocks_local_program::ProgramOutputRole::Relational
+        );
+    }
+}
+
+#[test]
+fn repeated_conditional_imports_use_the_same_first_mask_and_hash_key_occurrence() {
+    use novarocks_local_program::{CompiledExchangeRouting, StaticStreamRouting};
+    use novarocks_type_contract::PartitionHashAlgorithm;
+    let mut packages = packages(Shape::RepeatedConditional);
+    let producer = compile(packages.remove(&PRODUCER).unwrap(), None).unwrap();
+    let root = &producer.graph().nodes()[producer.graph().root().index()];
+    let Some(StaticSinkProgram::DataStream { branch, arena }) = producer.graph().sink() else {
+        panic!("stream sink");
+    };
+    let StaticStreamRouting::ConditionalKeyV1 { applies } = branch.contract().routing else {
+        panic!("conditional stream");
+    };
+    let slots = root.output_layout().slots();
+    assert_eq!(slots.len(), 3);
+    assert_ne!(slots[0], slots[2]);
+    assert!(
+        matches!(arena.node(applies).unwrap().kind(), StaticExprKind::SlotId(slot) if *slot == slots[0])
+    );
+    assert!(
+        matches!(arena.node(branch.partition_exprs()[0]).unwrap().kind(), StaticExprKind::SlotId(slot) if *slot == slots[0])
+    );
+    assert_eq!(branch.output_columns(), slots);
+
+    let consumer = compile(packages.remove(&CONSUMER).unwrap(), Some(1)).unwrap();
+    let (id, input) = consumer.exchange_inputs().iter().next().unwrap();
+    let slots = consumer.graph().nodes()[id.index()].output_layout().slots();
+    assert_eq!(slots.len(), 3);
+    assert_ne!(slots[0], slots[2]);
+    assert_eq!(
+        input.routing,
+        CompiledExchangeRouting::ConditionalKey {
+            applies: slots[0],
+            algorithm: PartitionHashAlgorithm::NativeHierarchicalV1,
+        }
+    );
+    assert_eq!(input.hash_partition_slots.as_ref(), &[slots[0], slots[1]]);
 }

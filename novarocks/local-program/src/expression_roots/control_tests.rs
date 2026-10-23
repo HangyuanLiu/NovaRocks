@@ -801,6 +801,11 @@ fn three_scope_program(
         vec![ProgramExprId::new(definition)],
         vec![SlotId::new(1)],
         None,
+        crate::StaticStreamContract {
+            role: crate::ProgramOutputRole::Relational,
+            delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+            routing: crate::StaticStreamRouting::Ordinary,
+        },
     )
     .unwrap();
     let sink = StaticSinkProgram::try_data_stream(branch, arenas[2].clone()).unwrap();
@@ -846,7 +851,12 @@ fn three_scope_program(
                 node: ProgramNodeId::new(2),
                 layout: layout.clone(),
             },
-            BindingRequirement::ExchangeOutput { branch: 0, layout },
+            BindingRequirement::ExchangeOutput {
+                role: crate::ProgramOutputRole::Relational,
+                delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                branch: 0,
+                layout,
+            },
         ])
         .unwrap(),
         Some(sink),

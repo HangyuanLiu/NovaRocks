@@ -356,7 +356,12 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
         })
         .expect("writer");
     let producer = builder
-        .finish_definition(writer, p::FragmentSink::Stream { edge }, dop())
+        .finish_definition(
+            writer,
+            p::FragmentSink::Stream { edge },
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .expect("writer fragment");
 
     let mut builder = p::FragmentBuilder::new(finish_fragment);
@@ -415,6 +420,12 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
                 columns: outputs.iter().map(|field| field.value).collect(),
             },
             kind: p::NodeKind::TableFinish(p::WriterFinishSpec {
+                count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
+                inputs: novarocks_physical_plan::FinishInputs {
+                    writer_results: 0,
+                    logical_summary: None,
+                },
+                logical_summary: None,
                 expected_target_ordinals: Box::from([ordinal]),
                 input_schema: p::WriterRelationSchema {
                     revision: p::WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -430,7 +441,12 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
         })
         .expect("finish");
     let consumer = builder
-        .finish_definition(finish, p::FragmentSink::Result, dop())
+        .finish_definition(
+            finish,
+            p::FragmentSink::Result,
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .expect("finish fragment");
 
     let mut plan = p::PlanBuilder::new(p::PlanVersionId::try_new([4; 16]).expect("version"));
@@ -455,9 +471,12 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
     plan.add_fragment(producer).expect("add writer fragment");
     plan.add_fragment(consumer).expect("add finish fragment");
     plan.add_edge(p::Edge {
+        role: p::OutputRole::WriterResults,
+        delivery: p::DeliveryRequirement::MustDrain,
         id: edge,
         kind: p::EdgeKind::Stream,
         source: p::EdgeSource {
+            port: novarocks_physical_plan::FragmentOutputPort::Root,
             fragment: writer_fragment,
             projection: fields.iter().map(|field| field.value).collect(),
         },

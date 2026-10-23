@@ -169,7 +169,12 @@ fn plan_with_key_order(
         .add_values(values, rows.into_boxed_slice(), Box::from([a, b]))
         .unwrap();
     let producer = producer
-        .finish_definition(values, FragmentSink::Stream { edge }, dop())
+        .finish_definition(
+            values,
+            FragmentSink::Stream { edge },
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut consumer = FragmentBuilder::new(consumer_id);
@@ -211,7 +216,12 @@ fn plan_with_key_order(
         )
         .unwrap();
     let consumer = consumer
-        .finish_definition(exchange, FragmentSink::Result, dop())
+        .finish_definition(
+            exchange,
+            FragmentSink::Result,
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let (source_distribution, destination_distribution) = if hashed {
         (
@@ -231,9 +241,12 @@ fn plan_with_key_order(
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(Edge {
+        role: novarocks_physical_plan::OutputRole::Relational,
+        delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
         id: edge,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: novarocks_physical_plan::FragmentOutputPort::Root,
             fragment: producer_id,
             projection: Box::from([b, a]),
         },
@@ -498,6 +511,14 @@ impl ExchangeFrameTransmitter for LoopbackTransmitter {
                     node_id: frame.destination_node_id,
                 },
                 ExchangeReceiverFrame {
+                    stream: frame.stream.unwrap_or_else(|| {
+                        crate::runtime::fragment::io::exchange::fixture_stream(
+                            frame.sender_fragment_instance_id,
+                            frame.destination_fragment_instance_id,
+                            frame.destination_node_id,
+                            frame.sender_ordinal,
+                        )
+                    }),
                     source_fragment_instance_id: frame.sender_fragment_instance_id,
                     sender_ordinal: frame.sender_ordinal,
                     sender_count: frame.sender_count,
@@ -1053,7 +1074,12 @@ fn drop_distribution_key_project_plan(
         .add_values(values, rows.into_boxed_slice(), Box::from([a, b]))
         .unwrap();
     let producer = producer
-        .finish_definition(values, FragmentSink::Stream { edge }, dop())
+        .finish_definition(
+            values,
+            FragmentSink::Stream { edge },
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut consumer = FragmentBuilder::new(consumer_id);
@@ -1103,7 +1129,12 @@ fn drop_distribution_key_project_plan(
         )
         .unwrap();
     let consumer = consumer
-        .finish_definition(project, FragmentSink::Result, dop())
+        .finish_definition(
+            project,
+            FragmentSink::Result,
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     assert_eq!(
         consumer.nodes()[&project].output_properties.distribution,
@@ -1131,9 +1162,12 @@ fn drop_distribution_key_project_plan(
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(Edge {
+        role: novarocks_physical_plan::OutputRole::Relational,
+        delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
         id: edge,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: novarocks_physical_plan::FragmentOutputPort::Root,
             fragment: producer_id,
             projection: Box::from([b, a]),
         },

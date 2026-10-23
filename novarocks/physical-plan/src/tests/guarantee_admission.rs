@@ -346,6 +346,7 @@ fn fixture_with_guarantee_count(
             dop(),
             PlanLimits::FROZEN,
             &Control,
+            crate::StagePlacementPolicy::Singleton,
         )
         .expect("the real construction stage must accept the source structure");
     if sparse_last {

@@ -90,7 +90,12 @@ fn diamond() -> Fragment {
         )
         .unwrap();
     builder
-        .finish_definition(NodeId::new(1), FragmentSink::Noop, dop())
+        .finish_definition(
+            NodeId::new(1),
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap()
 }
 fn wide() -> Fragment {
@@ -105,7 +110,12 @@ fn wide() -> Fragment {
         child = parent;
     }
     builder
-        .finish_definition(child, FragmentSink::Noop, dop())
+        .finish_definition(
+            child,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap()
 }
 fn collect(fragment: &Fragment) -> (Option<usize>, Vec<NodeId>) {

@@ -257,10 +257,19 @@ fn resolved(
                 vec![],
                 vec![],
                 None,
+                crate::StaticStreamContract {
+                    role: crate::ProgramOutputRole::Relational,
+                    delivery:
+                        novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                    routing: crate::StaticStreamRouting::Ordinary,
+                },
             )
             .unwrap();
             (
                 vec![BindingRequirement::ExchangeOutput {
+                    role: crate::ProgramOutputRole::Relational,
+                    delivery:
+                        novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
                     branch: 0,
                     layout: layout.clone(),
                 }],

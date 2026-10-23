@@ -342,7 +342,12 @@ fn build_fragment(edge: EdgeId, nullable: bool) -> (Fragment, ValueId) {
         .collect();
     build.add_values(VALUES, rows, Box::from([column])).unwrap();
     let fragment = build
-        .finish_definition(VALUES, FragmentSink::Stream { edge }, dop())
+        .finish_definition(
+            VALUES,
+            FragmentSink::Stream { edge },
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     (fragment, column)
 }
@@ -393,9 +398,12 @@ fn edge(
 ) -> Edge {
     let replicated = destination == Distribution::Broadcast;
     Edge {
+        role: novarocks_physical_plan::OutputRole::Relational,
+        delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
         id,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: novarocks_physical_plan::FragmentOutputPort::Root,
             fragment: from.0,
             projection: Box::from(from.1),
         },
@@ -737,7 +745,12 @@ pub(super) fn broadcast(rf: Rf) -> Arc<FragmentPackage> {
     );
     builder.attach_runtime_filter(FILTER).unwrap();
     let probe = builder
-        .finish_definition(JOIN, FragmentSink::Stream { edge: EDGE }, dop())
+        .finish_definition(
+            JOIN,
+            FragmentSink::Stream { edge: EDGE },
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut gather = FragmentBuilder::new(GATHER);
@@ -751,7 +764,12 @@ pub(super) fn broadcast(rf: Rf) -> Arc<FragmentPackage> {
         RowMultiplicity::SingleCopy,
     );
     let gather = gather
-        .finish_definition(RECEIVER, FragmentSink::Result, dop())
+        .finish_definition(
+            RECEIVER,
+            FragmentSink::Result,
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
@@ -834,7 +852,12 @@ fn partitioned() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
     let scan = add_scan(&mut builder, Distribution::Unconstrained);
     builder.attach_runtime_filter(FILTER).unwrap();
     let probe = builder
-        .finish_definition(SCAN, FragmentSink::Stream { edge: PROBE_EDGE }, dop())
+        .finish_definition(
+            SCAN,
+            FragmentSink::Stream { edge: PROBE_EDGE },
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let (build, build_column) = build_fragment(BUILD_EDGE, false);
 
@@ -866,7 +889,12 @@ fn partitioned() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
     );
     joiner.attach_runtime_filter(FILTER).unwrap();
     let joiner = joiner
-        .finish_definition(JOIN, FragmentSink::Result, dop())
+        .finish_definition(
+            JOIN,
+            FragmentSink::Result,
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
@@ -1482,7 +1510,12 @@ fn aggregate_topn_typed(ty: ValueType, domain: ValueType) -> Arc<FragmentPackage
         .unwrap();
     builder.attach_runtime_filter(FILTER).unwrap();
     let fragment = builder
-        .finish_definition(TOPN, FragmentSink::Result, dop())
+        .finish_definition(
+            TOPN,
+            FragmentSink::Result,
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let mut result = result_port(PROBE, TOPN, &[grouped]);
     result.fields[0].ty = ty.clone();
@@ -1696,7 +1729,14 @@ fn add_count(
 
 /// Finish a fragment with one original request per relational call.
 fn finish_with_requests(builder: FragmentBuilder, root: NodeId, sink: FragmentSink) -> Fragment {
-    let fragment = builder.finish_definition(root, sink, dop()).unwrap();
+    let fragment = builder
+        .finish_definition(
+            root,
+            sink,
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
     let mut entries = fragment
         .call_requests()
         .entries()

@@ -511,6 +511,13 @@ impl DmlFinalWritePlanContext {
 }
 
 impl DmlWritePlanInput {
+    /// Preserve the admitted application's logical affected-row owner.
+    /// The physical writer's row and artifact checks still apply.
+    pub fn with_external_count_owner(mut self) -> Self {
+        self.0.finish_count_mode = novarocks_physical_plan::FinishCountMode::ExternalOwner;
+        self
+    }
+
     /// What the provider calls each field this target accepts, by the token it
     /// issued for it.
     ///
@@ -566,6 +573,7 @@ impl DmlWritePlanInput {
             crate::planner::distributed::write::contract::SqlWritePlanInput {
                 contract: SqlWriteSinkContract::try_new(mode.into(), target, input_columns)?,
                 input,
+                finish_count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
                 root_output_exprs: None,
             },
         ))
@@ -1126,7 +1134,8 @@ pub struct DmlChangeStreamRoute {
     /// output occurrence. SQL validates these ordinals against the completed
     /// producer; it never recovers them from display names.
     pub input_ordinals: Vec<novarocks_spi::connector::ConnectorMutationRouteInput>,
-    pub partition_input_tokens: Vec<novarocks_spi::connector::ConnectorWriteFieldToken>,
+    pub requirements: novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements,
+
     pub sink: DmlWritePlanInput,
 }
 
@@ -1158,6 +1167,10 @@ pub enum DmlChangeStreamKind {
 /// connector fencing remain application-owned.
 #[derive(Clone, Debug)]
 pub struct DmlPreExpandKeyedAssert {
+    /// Exact output occurrence in the native ChangeEventExpand child.
+    /// None explicitly preserves the existing all-row assertion.
+    /// Some names an already materialized Boolean; SQL never reevaluates it.
+    pub applicability_output_ordinal: Option<usize>,
     pub key_column_name: String,
     pub key_label: String,
     pub message_prefix: String,
@@ -1339,6 +1352,7 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
         crate::planner::pipeline::insert_pre_expand_keyed_assert(
             &mut physical,
             &crate::planner::physical::PreExpandKeyedAssertSpec {
+                applicability_output_ordinal: assertion.applicability_output_ordinal,
                 key_column_name: assertion.key_column_name,
                 key_label: assertion.key_label,
                 message_prefix: assertion.message_prefix,
@@ -1409,6 +1423,7 @@ pub fn begin_final_dml_change_stream(
     let compiled = crate::compiler::SqlCompiler::optimize(request.optimize_request)?
         .into_optimized_output()
         .map_err(|_| "change-stream intent did not produce an optimized SQL plan".to_string())?;
+    let mut keyed_assert = request.pre_expand_keyed_assert;
     let producer = match request.kind {
         DmlChangeStreamKind::Update { target_columns } => {
             build_update_change_event_expand(compiled.optimized_tree, &target_columns, &control)?
@@ -1418,14 +1433,20 @@ pub fn begin_final_dml_change_stream(
             matched_update,
             matched_delete,
             not_matched_insert,
-        } => build_merge_change_event_expand(
-            compiled.optimized_tree,
-            &target_columns,
-            matched_update,
-            matched_delete,
-            not_matched_insert,
-            &control,
-        )?,
+        } => {
+            let (producer, applicability_ordinal) = build_merge_change_event_expand(
+                compiled.optimized_tree,
+                &target_columns,
+                matched_update,
+                matched_delete,
+                not_matched_insert,
+                &control,
+            )?;
+            if let Some(assertion) = &mut keyed_assert {
+                assertion.applicability_output_ordinal = Some(applicability_ordinal);
+            }
+            producer
+        }
     };
     let effect_output_ordinal = producer
         .output_columns
@@ -1439,7 +1460,7 @@ pub fn begin_final_dml_change_stream(
         request.statistics_targets,
         effect_output_ordinal,
         compiled.function_catalog,
-        request.pre_expand_keyed_assert,
+        keyed_assert,
         request.shape,
         decimal_overflow_policy,
         compiled.root_allow_throw_exception,
@@ -1458,6 +1479,7 @@ pub fn compile_final_dml_change_stream(
     let compiled = crate::compiler::SqlCompiler::optimize(request.optimize_request)?
         .into_optimized_output()
         .map_err(|_| "change-stream intent did not produce an optimized SQL plan".to_string())?;
+    let mut keyed_assert = request.pre_expand_keyed_assert;
     let producer = match request.kind {
         DmlChangeStreamKind::Update { target_columns } => {
             build_update_change_event_expand(compiled.optimized_tree, &target_columns, &control)?
@@ -1467,14 +1489,20 @@ pub fn compile_final_dml_change_stream(
             matched_update,
             matched_delete,
             not_matched_insert,
-        } => build_merge_change_event_expand(
-            compiled.optimized_tree,
-            &target_columns,
-            matched_update,
-            matched_delete,
-            not_matched_insert,
-            &control,
-        )?,
+        } => {
+            let (producer, applicability_ordinal) = build_merge_change_event_expand(
+                compiled.optimized_tree,
+                &target_columns,
+                matched_update,
+                matched_delete,
+                not_matched_insert,
+                &control,
+            )?;
+            if let Some(assertion) = &mut keyed_assert {
+                assertion.applicability_output_ordinal = Some(applicability_ordinal);
+            }
+            producer
+        }
     };
     seal_final_change_stream_producer(
         producer,
@@ -1483,7 +1511,7 @@ pub fn compile_final_dml_change_stream(
         request.statistics_targets,
         compiled.function_catalog,
         DmlFinalChangeStreamSealContext {
-            pre_expand_keyed_assert: request.pre_expand_keyed_assert,
+            pre_expand_keyed_assert: keyed_assert,
             shape: request.shape,
             final_write: request.final_write,
         },
@@ -1586,6 +1614,7 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     let dag = bind_route_layout(&producer.output_columns, routes, effect_output_ordinal)?;
     let keyed_assert = context.pre_expand_keyed_assert.map(|assertion| {
         crate::planner::physical::PreExpandKeyedAssertSpec {
+            applicability_output_ordinal: assertion.applicability_output_ordinal,
             key_column_name: assertion.key_column_name,
             key_label: assertion.key_label,
             message_prefix: assertion.message_prefix,
@@ -1776,7 +1805,8 @@ fn bind_route_layout(
                 write_target_ordinal: route.write_target_ordinal,
                 accepted_effects: route.accepted_effects,
                 input_ordinals: route.input_ordinals,
-                partition_input_tokens: route.partition_input_tokens,
+                requirements: route.requirements,
+
                 sink: route.sink.0,
             })
         })
@@ -1865,13 +1895,14 @@ fn build_merge_change_event_expand(
     matched_delete: bool,
     not_matched_insert: bool,
     control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<crate::optimizer::OptimizedOperatorNode, crate::compiler::SqlCompileError> {
+) -> Result<(crate::optimizer::OptimizedOperatorNode, usize), crate::compiler::SqlCompileError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     let mut arena = clone_scalar_arena(&optimized_tree, "MOR MERGE")?;
-    let child_outputs = optimized_tree.output_columns.clone();
-    let assert_key =
-        output_column_by_name(&child_outputs, "__nr_merge_assert_key", "MERGE assert key")?;
-    let distributed = distribute_producer(optimized_tree, assert_key.column_id);
+    // The selected action is already materialized by the optimized match
+    // producer. This projection reads its identity; it never re-evaluates WHEN.
+    let (distributed, applicability_ordinal) =
+        project_merge_assertion_applicability(optimized_tree, &mut arena, control)?;
+    let child_outputs = distributed.output_columns.clone();
     let (file, pos, targets, row_id, last_sequence, effect) =
         allocate_change_outputs(&distributed, target_columns, control)?;
     let mut delete_assignments = vec![
@@ -1994,14 +2025,102 @@ fn build_merge_change_event_expand(
             .to_string()
             .into());
     }
-    build_change_expand(
+    let expanded = build_change_expand(
         distributed,
         arena,
         change_output_columns(&file, &pos, &targets, &row_id, &last_sequence, &effect),
         effect.column_id,
         events,
     )
-    .map_err(crate::compiler::SqlCompileError::Compilation)
+    .map_err(crate::compiler::SqlCompileError::Compilation)?;
+    Ok((expanded, applicability_ordinal))
+}
+
+/// Append the Boolean assertion scope after action selection, preserving the
+/// exact output occurrence for the assertion handoff.
+fn project_merge_assertion_applicability(
+    child: crate::optimizer::OptimizedOperatorNode,
+    arena: &mut crate::optimizer::scalar::ScalarArena,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(crate::optimizer::OptimizedOperatorNode, usize), crate::compiler::SqlCompileError> {
+    use crate::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem};
+    let no_action = merge_action_predicate(arena, &child.output_columns, 0, control)?;
+    let selected = arena.intern_observed(
+        crate::optimizer::scalar::ScalarNode::UnaryOp {
+            op: crate::common::UnOp::Not,
+            child: no_action,
+        },
+        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Boolean, false),
+        control,
+    )?;
+    let child = crate::optimizer::OptimizedOperatorNode {
+        op: Operator::PhysicalFilter(crate::optimizer::operator::FilterOp {
+            predicate: selected,
+        }),
+        stats: child.stats.clone(),
+        output_columns: child.output_columns.clone(),
+        children: vec![child],
+        explain_stats: Default::default(),
+        execution_props: Default::default(),
+    };
+    let mut output_columns = child.output_columns.clone();
+    let ordinal = output_columns.len();
+    let next_column = max_physical_column_id(&child)
+        .checked_add(1)
+        .ok_or_else(|| "MERGE applicability column identity space exhausted".to_string())?;
+    let mask = crate::analysis::OutputColumn {
+        column_id: crate::column_id::ColumnId(next_column),
+        name: "__nr_merge_assert_applies".into(),
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Boolean,
+            false,
+        ),
+        is_internal: true,
+    };
+    let mut items = output_columns
+        .iter()
+        .map(|column| {
+            Ok(ScalarProjectItem {
+                expr: intern_column(arena, column, control)?,
+                output_name: column.name.clone(),
+                output_column_id: column.column_id,
+                expr_display: None,
+            })
+        })
+        .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
+    let update = merge_action_predicate(arena, &output_columns, 1, control)?;
+    let delete = merge_action_predicate(arena, &output_columns, 2, control)?;
+    let expr = arena.intern_observed(
+        crate::optimizer::scalar::ScalarNode::BinaryOp {
+            op: crate::common::BinOp::Or,
+            left: update,
+            right: delete,
+            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        },
+        mask.value_type.clone(),
+        control,
+    )?;
+    items.push(ScalarProjectItem {
+        expr,
+        output_name: mask.name.clone(),
+        output_column_id: mask.column_id,
+        expr_display: None,
+    });
+    output_columns.push(mask);
+    Ok((
+        crate::optimizer::OptimizedOperatorNode {
+            op: Operator::PhysicalProject(ProjectOp {
+                items,
+                output_qualifier: None,
+            }),
+            stats: child.stats.clone(),
+            children: vec![child],
+            explain_stats: Default::default(),
+            output_columns,
+            execution_props: Default::default(),
+        },
+        ordinal,
+    ))
 }
 
 fn clone_scalar_arena(
@@ -2814,7 +2933,6 @@ mod tests {
             ("__nr_file", DataType::Utf8),
             ("__nr_pos", DataType::Int64),
             ("__nr_row_id", DataType::Int64),
-            ("__nr_merge_assert_key", DataType::Int64),
             ("__nr_merge_action", DataType::Int64),
             ("id", DataType::Int64),
             ("__nr_new_id", DataType::Int64),
@@ -2917,7 +3035,7 @@ mod tests {
             write_default: None,
             logical_type: None,
         }];
-        let producer = super::build_merge_change_event_expand(
+        let (producer, applicability_ordinal) = super::build_merge_change_event_expand(
             mor_match_producer(),
             &columns,
             true,
@@ -2927,11 +3045,46 @@ mod tests {
         )
         .unwrap();
         assert_replace_inherits_sequence_and_preserves_row_id(&producer);
+        let child = &producer.children[0];
+        assert_eq!(applicability_ordinal, 7);
+        assert_eq!(
+            child.output_columns[applicability_ordinal]
+                .value_type
+                .data_type(),
+            &arrow::datatypes::DataType::Boolean
+        );
         let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
         else {
             unreachable!()
         };
         assert_eq!(expand.events.len(), 3);
+        let arena = producer.execution_props.scalar_arena.as_deref().unwrap();
+        let crate::optimizer::operator::Operator::PhysicalProject(project) = &child.op else {
+            panic!("expected selected-action applicability projection")
+        };
+        let selected_action = crate::column_id::ColumnId(4);
+        let expected = std::collections::HashSet::from([selected_action]);
+        assert_eq!(
+            crate::optimizer::scalar_expr::collect_column_ids_strict(
+                arena,
+                project.items[applicability_ordinal].expr,
+            )
+            .unwrap(),
+            expected,
+            "assertion scope reads the already selected action, not WHEN or target nullability"
+        );
+        for event in &expand.events {
+            assert_eq!(
+                crate::optimizer::scalar_expr::collect_column_ids_strict(
+                    arena,
+                    event
+                        .predicate
+                        .expect("each MERGE effect reads selected action"),
+                )
+                .unwrap(),
+                expected,
+            );
+        }
     }
 
     #[test]
@@ -2970,7 +3123,7 @@ mod tests {
             unreachable!()
         };
         values.columns.push(original.clone());
-        let expanded = super::build_merge_change_event_expand(
+        let (expanded, _) = super::build_merge_change_event_expand(
             producer,
             &columns,
             true,
@@ -3841,6 +3994,10 @@ mod tests {
 
     fn statistics_route(target: u32) -> DmlChangeStreamRoute {
         DmlChangeStreamRoute {
+            requirements: novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
+                layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             route_id: novarocks_spi::connector::ConnectorWriteRouteId::from_bytes([
                 u8::try_from(target + 1).expect("small target");
                 32
@@ -3852,7 +4009,7 @@ mod tests {
                 novarocks_spi::connector::ConnectorRowMutationEffect::Insert,
             ],
             input_ordinals: Vec::new(),
-            partition_input_tokens: Vec::new(),
+
             sink: DmlWritePlanInput(
                 crate::planner::distributed::write::contract::test_support::simple_sql_write_plan_input(
                     crate::planner::distributed::write::ConnectorWriteInputBinding::RootOutputByOrdinal,

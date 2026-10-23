@@ -107,6 +107,30 @@ fn wrap(kind: wire::value_origin::Kind) -> wire::ValueOrigin {
 fn nonprovider_cases() -> Vec<(physical::ValueOrigin, wire::ValueOrigin)> {
     vec![
         (
+            physical::ValueOrigin::LogicalSummary {
+                field: physical::LogicalChangeCountField::Inserted,
+            },
+            wrap(wire::value_origin::Kind::LogicalSummary(
+                wire::LogicalChangeCountField::Inserted as i32,
+            )),
+        ),
+        (
+            physical::ValueOrigin::LogicalSummary {
+                field: physical::LogicalChangeCountField::Replaced,
+            },
+            wrap(wire::value_origin::Kind::LogicalSummary(
+                wire::LogicalChangeCountField::Replaced as i32,
+            )),
+        ),
+        (
+            physical::ValueOrigin::LogicalSummary {
+                field: physical::LogicalChangeCountField::Deleted,
+            },
+            wrap(wire::value_origin::Kind::LogicalSummary(
+                wire::LogicalChangeCountField::Deleted as i32,
+            )),
+        ),
+        (
             physical::ValueOrigin::Expr {
                 node: physical::NodeId::new(u32::MAX),
                 expr: physical::ExprId::new(0),
@@ -501,6 +525,9 @@ fn value_origin_every_required_reference_kind_phase_and_writer_enum_refuses_with
                 kind,
             },
         )));
+    }
+    for field in [0, -1, 4, i32::MAX] {
+        invalids.push(wrap(wire::value_origin::Kind::LogicalSummary(field)));
     }
     for invalid in invalids {
         assert!(decode_value_origin(&invalid, &namespace, SOURCE, limits()).is_err());

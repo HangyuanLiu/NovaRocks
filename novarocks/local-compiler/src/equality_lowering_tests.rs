@@ -348,6 +348,7 @@ fn fixture(
             max: 1,
             requires_power_of_two: false,
         },
+        novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
     Ok(Fixture {
         fragment,

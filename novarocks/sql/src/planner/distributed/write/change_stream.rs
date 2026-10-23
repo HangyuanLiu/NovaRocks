@@ -21,17 +21,19 @@
 //! It neither names nor infers a table-format strategy, row identity layout,
 //! or a physical data/delete branch.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
 use novarocks_spi::connector::{
-    ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteFieldToken,
-    ConnectorWriteRouteId,
+    ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteRouteId,
 };
 
 use crate::analysis::OutputColumn;
 
 use super::contract::SqlWritePlanInput;
+
+#[cfg(test)]
+use novarocks_spi::connector::ConnectorWriteFieldToken;
 
 /// One provider-signed route projected into a SQL router. The route id is
 /// opaque; its effect set and token-to-output-ordinal mapping are the only
@@ -46,8 +48,9 @@ pub(crate) struct ChangeStreamWriteLayoutRoute {
     /// In provider input-field order, map each token to a producer output
     /// ordinal. SQL never recovers that mapping from an internal column name.
     pub(crate) input_ordinals: Vec<ConnectorMutationRouteInput>,
-    /// The provider-selected subset of `input_ordinals` used for partitioning.
-    pub(crate) partition_input_tokens: Vec<ConnectorWriteFieldToken>,
+    /// Independent provider colocation requirements and layout preferences.
+    pub(crate) requirements: novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements,
+
     pub(crate) sink: SqlWritePlanInput,
 }
 
@@ -67,11 +70,10 @@ pub(crate) struct ChangeStreamWriteRouteSpec {
     pub(crate) write_target_ordinal: WriteTargetOrdinal,
     pub(crate) accepted_effects: Vec<ConnectorRowMutationEffect>,
     pub(crate) input_ordinals: Vec<ConnectorMutationRouteInput>,
-    /// Positions in `input_ordinals` selected by the Provider's ordered
-    /// partition-token list. This retains the exact route-field occurrence even
-    /// when multiple fields read the same producer output ordinal.
-    pub(crate) partition_input_positions: Vec<usize>,
-    pub(crate) output_partition_ordinals: Vec<usize>,
+    /// Requirements refer directly to exact input tokens, retaining field
+    /// occurrences even when multiple fields read the same producer ordinal.
+    pub(crate) requirements: novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements,
+
     pub(crate) sink: SqlWritePlanInput,
 }
 
@@ -121,11 +123,7 @@ pub(crate) fn validate_route_set(routes: &[ChangeStreamWriteRouteSpec]) -> Resul
         }
         validate_effects(&route.accepted_effects)?;
         validate_route_inputs(&route.input_ordinals)?;
-        validate_partition_input_positions(
-            &route.partition_input_positions,
-            &route.input_ordinals,
-            &route.output_partition_ordinals,
-        )?;
+        validate_requirement_tokens(&route.requirements, &route.input_ordinals)?;
     }
     Ok(())
 }
@@ -164,48 +162,17 @@ pub(crate) fn bind_change_stream_write_layout(
             &route.sink.contract.input_columns,
         )?;
 
-        let by_token: HashMap<_, _> = route
-            .input_ordinals
-            .iter()
-            .enumerate()
-            .map(|(position, binding)| {
-                (
-                    binding.token(),
-                    (position, binding.input_ordinal() as usize),
-                )
-            })
-            .collect();
-        let mut partition_tokens = HashSet::new();
-        let partition_bindings = route
-            .partition_input_tokens
-            .iter()
-            .map(|token| {
-                if !partition_tokens.insert(*token) {
-                    return Err(
-                        "row-mutation route has a duplicate partition input token".to_string()
-                    );
-                }
-                by_token.get(token).copied().ok_or_else(|| {
-                    "row-mutation route partition token is not bound to an input ordinal"
-                        .to_string()
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let partition_input_positions = partition_bindings
-            .iter()
-            .map(|(position, _)| *position)
-            .collect();
-        let output_partition_ordinals = partition_bindings
-            .into_iter()
-            .map(|(_, ordinal)| ordinal)
-            .collect();
+        route
+            .requirements
+            .validate()
+            .map_err(|error| error.to_string())?;
+        validate_requirement_tokens(&route.requirements, &route.input_ordinals)?;
         routes.push(ChangeStreamWriteRouteSpec {
             route_id: route.route_id,
             write_target_ordinal: route.write_target_ordinal,
             accepted_effects: route.accepted_effects,
             input_ordinals: route.input_ordinals,
-            partition_input_positions,
-            output_partition_ordinals,
+            requirements: route.requirements,
             sink: route.sink,
         });
     }
@@ -312,35 +279,28 @@ fn validate_route_inputs(bindings: &[ConnectorMutationRouteInput]) -> Result<(),
     Ok(())
 }
 
-fn validate_partition_input_positions(
-    positions: &[usize],
+fn validate_requirement_tokens(
+    requirements: &novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements,
     inputs: &[ConnectorMutationRouteInput],
-    output_partition_ordinals: &[usize],
 ) -> Result<(), String> {
-    if positions.len() != output_partition_ordinals.len() {
-        return Err(
-            "row-mutation route partition input positions/ordinals have different arity"
-                .to_string(),
-        );
-    }
-    let mut seen = HashSet::new();
-    if positions
-        .iter()
-        .any(|position| *position >= inputs.len() || !seen.insert(*position))
-    {
-        return Err(
-            "row-mutation route partition input position is out of range or duplicate".to_string(),
-        );
-    }
-    if positions
-        .iter()
-        .zip(output_partition_ordinals)
-        .any(|(position, ordinal)| inputs[*position].input_ordinal() as usize != *ordinal)
-    {
-        return Err(
-            "row-mutation route partition input occurrence disagrees with its output ordinal"
-                .to_string(),
-        );
+    use novarocks_spi::connector::write_stack::{
+        ConnectorWriteColocation, ConnectorWriteLayoutPreference,
+    };
+    requirements.validate().map_err(|error| error.to_string())?;
+    let colocation = match &requirements.colocation {
+        ConnectorWriteColocation::ByKey(keys) => keys.as_slice(),
+        ConnectorWriteColocation::None | ConnectorWriteColocation::Singleton => &[],
+    };
+    let layout = match &requirements.layout {
+        ConnectorWriteLayoutPreference::ClusterBy(keys) => keys.as_slice(),
+        ConnectorWriteLayoutPreference::None => &[],
+    };
+    for token in colocation.iter().chain(layout) {
+        if !inputs.iter().any(|input| input.token() == *token) {
+            return Err(
+                "row-mutation route requirement token is not bound to an input ordinal".into(),
+            );
+        }
     }
     Ok(())
 }
@@ -420,6 +380,10 @@ mod tests {
         effects: Vec<ConnectorRowMutationEffect>,
     ) -> ChangeStreamWriteLayoutRoute {
         ChangeStreamWriteLayoutRoute {
+            requirements: novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
+                layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             route_id: ConnectorWriteRouteId::from_bytes([byte; 32]),
             write_target_ordinal: ordinal(write_target_ordinal),
             accepted_effects: effects,
@@ -427,7 +391,6 @@ mod tests {
                 ConnectorWriteFieldToken::from_bytes([byte; 32]),
                 0,
             )],
-            partition_input_tokens: Vec::new(),
             sink: simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal),
         }
     }
@@ -540,14 +503,17 @@ mod tests {
     #[test]
     fn bind_layout_rejects_foreign_partition_token() {
         let mut route = route(1, vec![ConnectorRowMutationEffect::Delete]);
-        route.partition_input_tokens = vec![ConnectorWriteFieldToken::from_bytes([9; 32])];
+        route.requirements.colocation =
+            novarocks_spi::connector::write_stack::ConnectorWriteColocation::ByKey(vec![
+                ConnectorWriteFieldToken::from_bytes([9; 32]),
+            ]);
         let error = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
             producer_output_columns: &output_columns(),
             effect_output_ordinal: 1,
             routes: vec![route],
         })
         .expect_err("foreign partition token");
-        assert!(error.contains("partition token is not bound"));
+        assert!(error.contains("requirement token is not bound"));
     }
 
     /// A begin session may hand its targets over in any order. Binding puts the
@@ -650,7 +616,8 @@ mod tests {
             ConnectorMutationRouteInput::new(first, 0),
             ConnectorMutationRouteInput::new(second, 0),
         ];
-        repeated.partition_input_tokens = vec![second];
+        repeated.requirements.colocation =
+            novarocks_spi::connector::write_stack::ConnectorWriteColocation::ByKey(vec![second]);
 
         let dag = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
             producer_output_columns: &output_columns(),
@@ -660,8 +627,11 @@ mod tests {
         .expect("distinct tokens may select the same producer occurrence");
 
         assert_eq!(route_output_ordinals(&dag.routes[0]), vec![0, 0]);
-        assert_eq!(dag.routes[0].partition_input_positions, vec![1]);
-        assert_eq!(dag.routes[0].output_partition_ordinals, vec![0]);
+        assert_eq!(
+            dag.routes[0].requirements.colocation,
+            novarocks_spi::connector::write_stack::ConnectorWriteColocation::ByKey(vec![second])
+        );
+        assert_eq!(dag.routes[0].input_ordinals[1].token(), second);
     }
 
     #[test]

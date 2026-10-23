@@ -179,7 +179,12 @@ fn finish_unpivot(shape: UnpivotShape) -> Result<Fragment, ValidationErrors> {
             },
         })
         .unwrap();
-    builder.finish_definition(unpivot, FragmentSink::Noop, dop())
+    builder.finish_definition(
+        unpivot,
+        FragmentSink::Noop,
+        dop(),
+        crate::StagePlacementPolicy::Singleton,
+    )
 }
 
 #[test]

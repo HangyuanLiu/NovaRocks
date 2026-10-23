@@ -707,6 +707,27 @@ pub(crate) fn encode_group_key_row_tracked(
     Ok(Some(out))
 }
 
+/// Append one precisely framed component using the existing grouping author.
+/// The complete tuple's exact column types are frozen separately by its owner.
+pub(crate) fn append_canonical_nullable_tracked(
+    array: &ArrayRef,
+    row: usize,
+    out: &mut AggregateVec<u8>,
+) -> ExecutionResult<()> {
+    let count = if array.is_null(row) {
+        1
+    } else {
+        5usize
+            .checked_add(encoded_group_key_non_null_len(array, row)?)
+            .ok_or_else(|| group_key_encoding_contract("canonical tuple extent overflow"))?
+    };
+    out.try_reserve_exact(count).map_err(|source| {
+        out.allocator()
+            .allocation_error("reserve canonical tuple component", source)
+    })?;
+    encode_nullable_nested(array, row, out, "tuple component")
+}
+
 trait KeyByteSink {
     fn push_byte(&mut self, value: u8) -> ExecutionResult<()>;
     fn extend_bytes(&mut self, values: &[u8]) -> ExecutionResult<()>;
@@ -882,11 +903,158 @@ pub(crate) fn canonical_group_key_crc32_hash(
     Ok(Some(sink.finish()))
 }
 
+/// Legacy callers retain the same byte author without adding a runtime
+/// control dependency. The observed entry points instantiate this same walk.
+trait CanonicalKeyWork {
+    fn step(&mut self) -> ExecutionResult<()>;
+    fn push<S: KeyByteSink>(&mut self, out: &mut S, byte: u8) -> ExecutionResult<()> {
+        out.push_byte(byte)
+    }
+    fn extend<S: KeyByteSink>(&mut self, out: &mut S, bytes: &[u8]) -> ExecutionResult<()>;
+}
+struct UnobservedCanonicalKeyWork;
+impl CanonicalKeyWork for UnobservedCanonicalKeyWork {
+    fn step(&mut self) -> ExecutionResult<()> {
+        Ok(())
+    }
+    fn extend<S: KeyByteSink>(&mut self, out: &mut S, bytes: &[u8]) -> ExecutionResult<()> {
+        out.extend_bytes(bytes)
+    }
+}
+struct ObservedCanonicalKeyWork<'a> {
+    checkpoint: &'a dyn Fn() -> ExecutionResult<()>,
+    pending_nodes: usize,
+    pending_bytes: usize,
+}
+impl<'a> ObservedCanonicalKeyWork<'a> {
+    fn new(checkpoint: &'a dyn Fn() -> ExecutionResult<()>) -> Self {
+        Self {
+            checkpoint,
+            pending_nodes: 0,
+            pending_bytes: 0,
+        }
+    }
+}
+impl CanonicalKeyWork for ObservedCanonicalKeyWork<'_> {
+    fn push<S: KeyByteSink>(&mut self, out: &mut S, byte: u8) -> ExecutionResult<()> {
+        self.extend(out, &[byte])
+    }
+    fn step(&mut self) -> ExecutionResult<()> {
+        self.pending_nodes += 1;
+        if self.pending_nodes == 256 {
+            self.pending_nodes = 0;
+            self.pending_bytes = 0;
+            (self.checkpoint)()?;
+        }
+        Ok(())
+    }
+    fn extend<S: KeyByteSink>(&mut self, out: &mut S, mut bytes: &[u8]) -> ExecutionResult<()> {
+        while !bytes.is_empty() {
+            let length = (64 * 1024 - self.pending_bytes).min(bytes.len());
+            out.extend_bytes(&bytes[..length])?;
+            self.pending_bytes += length;
+            bytes = &bytes[length..];
+            if self.pending_bytes == 64 * 1024 {
+                (self.checkpoint)()?;
+                self.pending_bytes = 0;
+                self.pending_nodes = 0;
+            }
+        }
+        Ok(())
+    }
+}
+
 fn encode_group_key_non_null_value<S: KeyByteSink>(
     array: &ArrayRef,
     row: usize,
     out: &mut S,
 ) -> ExecutionResult<()> {
+    encode_group_key_non_null_value_with(array, row, out, &mut UnobservedCanonicalKeyWork)
+}
+fn encode_nullable_nested<S: KeyByteSink>(
+    array: &ArrayRef,
+    row: usize,
+    out: &mut S,
+    context: &'static str,
+) -> ExecutionResult<()> {
+    encode_nullable_nested_with(array, row, out, context, &mut UnobservedCanonicalKeyWork)
+}
+fn encoded_group_key_non_null_len(array: &ArrayRef, row: usize) -> ExecutionResult<usize> {
+    encoded_group_key_non_null_len_with(array, row, &mut UnobservedCanonicalKeyWork)
+}
+
+/// Cooperative control on the original FNV canonical writer, including the
+/// lengths computed recursively while encoding nested components.
+pub(crate) fn canonical_group_key_fnv_hash_observed(
+    array: &ArrayRef,
+    row: usize,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<Option<u64>> {
+    checkpoint()?;
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    let mut sink = HashingKeyByteSink::new(0);
+    let mut work = ObservedCanonicalKeyWork::new(checkpoint);
+    encode_group_key_non_null_value_with(array, row, &mut sink, &mut work)?;
+    checkpoint()?;
+    Ok(Some(sink.finish()))
+}
+
+/// Exact old tuple bytes, with bounded sizing and writing work. Bounded fixed
+/// scalar leaves keep the original fast path; byte/nested values use the same
+/// canonical walker with actual caller control, never a replacement codec.
+pub(crate) fn append_canonical_nullable_tracked_observed(
+    array: &ArrayRef,
+    row: usize,
+    out: &mut AggregateVec<u8>,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<()> {
+    checkpoint()?;
+    if matches!(
+        array.data_type(),
+        DataType::Null
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Date32
+            | DataType::Timestamp(..)
+            | DataType::Decimal128(..)
+            | DataType::Decimal256(..)
+            | DataType::FixedSizeBinary(16)
+    ) {
+        append_canonical_nullable_tracked(array, row, out)?;
+        return checkpoint();
+    }
+    let mut work = ObservedCanonicalKeyWork::new(checkpoint);
+    let count = if array.is_null(row) {
+        1
+    } else {
+        5usize
+            .checked_add(encoded_group_key_non_null_len_with(array, row, &mut work)?)
+            .ok_or_else(|| group_key_encoding_contract("canonical tuple extent overflow"))?
+    };
+    checkpoint()?;
+    out.try_reserve_exact(count).map_err(|source| {
+        out.allocator()
+            .allocation_error("reserve canonical tuple component", source)
+    })?;
+    checkpoint()?;
+    encode_nullable_nested_with(array, row, out, "tuple component", &mut work)?;
+    checkpoint()
+}
+
+fn encode_group_key_non_null_value_with<S: KeyByteSink, W: CanonicalKeyWork>(
+    array: &ArrayRef,
+    row: usize,
+    out: &mut S,
+    work: &mut W,
+) -> ExecutionResult<()> {
+    work.step()?;
     match array.data_type() {
         DataType::Boolean => {
             let arr = array
@@ -897,8 +1065,8 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                         "failed to downcast BooleanArray while encoding group key",
                     )
                 })?;
-            out.push_byte(1)?;
-            out.push_byte(arr.value(row) as u8)?;
+            work.push(out, 1)?;
+            work.push(out, arr.value(row) as u8)?;
             Ok(())
         }
         DataType::Int8 => {
@@ -910,8 +1078,8 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                         "failed to downcast Int8Array while encoding group key",
                     )
                 })?;
-            out.push_byte(2)?;
-            out.extend_bytes(&arr.value(row).to_le_bytes())?;
+            work.push(out, 2)?;
+            work.extend(out, &arr.value(row).to_le_bytes())?;
             Ok(())
         }
         DataType::Int16 => {
@@ -923,8 +1091,8 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                         "failed to downcast Int16Array while encoding group key",
                     )
                 })?;
-            out.push_byte(3)?;
-            out.extend_bytes(&arr.value(row).to_le_bytes())?;
+            work.push(out, 3)?;
+            work.extend(out, &arr.value(row).to_le_bytes())?;
             Ok(())
         }
         DataType::Int32 => {
@@ -936,8 +1104,8 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                         "failed to downcast Int32Array while encoding group key",
                     )
                 })?;
-            out.push_byte(4)?;
-            out.extend_bytes(&arr.value(row).to_le_bytes())?;
+            work.push(out, 4)?;
+            work.extend(out, &arr.value(row).to_le_bytes())?;
             Ok(())
         }
         DataType::Int64 => {
@@ -949,8 +1117,8 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                         "failed to downcast Int64Array while encoding group key",
                     )
                 })?;
-            out.push_byte(5)?;
-            out.extend_bytes(&arr.value(row).to_le_bytes())?;
+            work.push(out, 5)?;
+            work.extend(out, &arr.value(row).to_le_bytes())?;
             Ok(())
         }
         DataType::Float32 => {
@@ -962,8 +1130,8 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                         "failed to downcast Float32Array while encoding group key",
                     )
                 })?;
-            out.push_byte(6)?;
-            out.extend_bytes(&canonical_f32_bits(arr.value(row)).to_le_bytes())?;
+            work.push(out, 6)?;
+            work.extend(out, &canonical_f32_bits(arr.value(row)).to_le_bytes())?;
             Ok(())
         }
         DataType::Float64 => {
@@ -975,8 +1143,8 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                         "failed to downcast Float64Array while encoding group key",
                     )
                 })?;
-            out.push_byte(7)?;
-            out.extend_bytes(&canonical_f64_bits(arr.value(row)).to_le_bytes())?;
+            work.push(out, 7)?;
+            work.extend(out, &canonical_f64_bits(arr.value(row)).to_le_bytes())?;
             Ok(())
         }
         DataType::Utf8 => {
@@ -988,11 +1156,11 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                         "failed to downcast StringArray while encoding group key",
                     )
                 })?;
-            out.push_byte(8)?;
+            work.push(out, 8)?;
             let value = arr.value(row).as_bytes();
             let len = value.len() as u32;
-            out.extend_bytes(&len.to_le_bytes())?;
-            out.extend_bytes(value)?;
+            work.extend(out, &len.to_le_bytes())?;
+            work.extend(out, value)?;
             Ok(())
         }
         DataType::Binary => {
@@ -1004,11 +1172,11 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                         "failed to downcast BinaryArray while encoding group key",
                     )
                 })?;
-            out.push_byte(20)?;
+            work.push(out, 20)?;
             let value = arr.value(row);
             let len = group_key_component_len(value.len(), "Binary")?;
-            out.extend_bytes(&len.to_le_bytes())?;
-            out.extend_bytes(value)?;
+            work.extend(out, &len.to_le_bytes())?;
+            work.extend(out, value)?;
             Ok(())
         }
         DataType::LargeBinary => {
@@ -1020,11 +1188,11 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                         "failed to downcast LargeBinaryArray while encoding group key",
                     )
                 })?;
-            out.push_byte(21)?;
+            work.push(out, 21)?;
             let value = arr.value(row);
             let len = group_key_component_len(value.len(), "LargeBinary")?;
-            out.extend_bytes(&len.to_le_bytes())?;
-            out.extend_bytes(value)?;
+            work.extend(out, &len.to_le_bytes())?;
+            work.extend(out, value)?;
             Ok(())
         }
         DataType::Date32 => {
@@ -1036,8 +1204,8 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                         "failed to downcast Date32Array while encoding group key",
                     )
                 })?;
-            out.push_byte(9)?;
-            out.extend_bytes(&arr.value(row).to_le_bytes())?;
+            work.push(out, 9)?;
+            work.extend(out, &arr.value(row).to_le_bytes())?;
             Ok(())
         }
         DataType::Timestamp(unit, _) => {
@@ -1087,8 +1255,8 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                     arr.value(row)
                 }
             };
-            out.push_byte(marker)?;
-            out.extend_bytes(&value.to_le_bytes())?;
+            work.push(out, marker)?;
+            work.extend(out, &value.to_le_bytes())?;
             Ok(())
         }
         DataType::Decimal128(_, _) => {
@@ -1100,8 +1268,8 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                         "failed to downcast Decimal128Array while encoding group key",
                     )
                 })?;
-            out.push_byte(14)?;
-            out.extend_bytes(&arr.value(row).to_le_bytes())?;
+            work.push(out, 14)?;
+            work.extend(out, &arr.value(row).to_le_bytes())?;
             Ok(())
         }
         DataType::Decimal256(_, _) => {
@@ -1113,8 +1281,8 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                         "failed to downcast Decimal256Array while encoding group key",
                     )
                 })?;
-            out.push_byte(19)?;
-            out.extend_bytes(&arr.value(row).to_le_bytes())?;
+            work.push(out, 19)?;
+            work.extend(out, &arr.value(row).to_le_bytes())?;
             Ok(())
         }
         DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
@@ -1136,8 +1304,8 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                 .try_into()
                 .expect("checked canonical LARGEINT physical width");
             let value = i128::from_be_bytes(fixed);
-            out.push_byte(15)?;
-            out.extend_bytes(&value.to_le_bytes())?;
+            work.push(out, 15)?;
+            work.extend(out, &value.to_le_bytes())?;
             Ok(())
         }
         DataType::List(_) => {
@@ -1148,11 +1316,11 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
             let start = offsets[row] as usize;
             let end = offsets[row + 1] as usize;
             let values = list.values();
-            out.push_byte(16)?;
+            work.push(out, 16)?;
             let len = group_key_component_len(end.saturating_sub(start), "List")?;
-            out.extend_bytes(&len.to_le_bytes())?;
+            work.extend(out, &len.to_le_bytes())?;
             for idx in start..end {
-                encode_nullable_nested(values, idx, out, "group key list item")?;
+                encode_nullable_nested_with(values, idx, out, "group key list item", work)?;
             }
             Ok(())
         }
@@ -1165,11 +1333,11 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
                         "failed to downcast StructArray while encoding group key",
                     )
                 })?;
-            out.push_byte(17)?;
+            work.push(out, 17)?;
             let field_count = group_key_component_len(struct_arr.num_columns(), "Struct")?;
-            out.extend_bytes(&field_count.to_le_bytes())?;
+            work.extend(out, &field_count.to_le_bytes())?;
             for column in struct_arr.columns() {
-                encode_nullable_nested(column, row, out, "group key struct field")?;
+                encode_nullable_nested_with(column, row, out, "group key struct field", work)?;
             }
             Ok(())
         }
@@ -1183,12 +1351,12 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
             let entries = map.entries();
             let keys = entries.column(0).clone();
             let values = entries.column(1).clone();
-            out.push_byte(18)?;
+            work.push(out, 18)?;
             let len = group_key_component_len(end.saturating_sub(start), "Map")?;
-            out.extend_bytes(&len.to_le_bytes())?;
+            work.extend(out, &len.to_le_bytes())?;
             for idx in start..end {
-                encode_nullable_nested(&keys, idx, out, "group key map key")?;
-                encode_nullable_nested(&values, idx, out, "group key map value")?;
+                encode_nullable_nested_with(&keys, idx, out, "group key map key", work)?;
+                encode_nullable_nested_with(&values, idx, out, "group key map value", work)?;
             }
             Ok(())
         }
@@ -1199,24 +1367,31 @@ fn encode_group_key_non_null_value<S: KeyByteSink>(
     }
 }
 
-fn encode_nullable_nested<S: KeyByteSink>(
+fn encode_nullable_nested_with<S: KeyByteSink, W: CanonicalKeyWork>(
     array: &ArrayRef,
     row: usize,
     out: &mut S,
     context: &'static str,
+    work: &mut W,
 ) -> ExecutionResult<()> {
+    work.step()?;
     if matches!(array.data_type(), DataType::Null) || array.is_null(row) {
-        out.push_byte(0)?;
+        work.push(out, 0)?;
         return Ok(());
     }
-    out.push_byte(1)?;
-    let len = encoded_group_key_non_null_len(array, row)?;
+    work.push(out, 1)?;
+    let len = encoded_group_key_non_null_len_with(array, row, work)?;
     let len = group_key_component_len(len, context)?;
-    out.extend_bytes(&len.to_le_bytes())?;
-    encode_group_key_non_null_value(array, row, out)
+    work.extend(out, &len.to_le_bytes())?;
+    encode_group_key_non_null_value_with(array, row, out, work)
 }
 
-fn encoded_group_key_non_null_len(array: &ArrayRef, row: usize) -> ExecutionResult<usize> {
+fn encoded_group_key_non_null_len_with<W: CanonicalKeyWork>(
+    array: &ArrayRef,
+    row: usize,
+    work: &mut W,
+) -> ExecutionResult<usize> {
+    work.step()?;
     let fixed = match array.data_type() {
         DataType::Boolean | DataType::Int8 => Some(2),
         DataType::Int16 => Some(3),
@@ -1272,7 +1447,7 @@ fn encoded_group_key_non_null_len(array: &ArrayRef, row: usize) -> ExecutionResu
             let start = offsets[row] as usize;
             let end = offsets[row + 1] as usize;
             let values = list.values();
-            nested_sequence_encoded_len(values, start..end, 5)
+            nested_sequence_encoded_len_with(values, start..end, 5, work)
         }
         DataType::Struct(_) => {
             let values = array
@@ -1284,7 +1459,7 @@ fn encoded_group_key_non_null_len(array: &ArrayRef, row: usize) -> ExecutionResu
                     )
                 })?;
             values.columns().iter().try_fold(5usize, |total, column| {
-                nested_value_encoded_len(column, row)
+                nested_value_encoded_len_with(column, row, work)
                     .and_then(|len| checked_encoded_len_add(total, len))
             })
         }
@@ -1299,8 +1474,8 @@ fn encoded_group_key_non_null_len(array: &ArrayRef, row: usize) -> ExecutionResu
             let keys = entries.column(0);
             let values = entries.column(1);
             (start..end).try_fold(5usize, |total, index| {
-                let key_len = nested_value_encoded_len(keys, index)?;
-                let value_len = nested_value_encoded_len(values, index)?;
+                let key_len = nested_value_encoded_len_with(keys, index, work)?;
+                let value_len = nested_value_encoded_len_with(values, index, work)?;
                 checked_encoded_len_add(total, key_len)
                     .and_then(|total| checked_encoded_len_add(total, value_len))
             })
@@ -1312,21 +1487,28 @@ fn encoded_group_key_non_null_len(array: &ArrayRef, row: usize) -> ExecutionResu
     }
 }
 
-fn nested_sequence_encoded_len(
+fn nested_sequence_encoded_len_with<W: CanonicalKeyWork>(
     values: &ArrayRef,
     mut rows: std::ops::Range<usize>,
     initial: usize,
+    work: &mut W,
 ) -> ExecutionResult<usize> {
     rows.try_fold(initial, |total, row| {
-        nested_value_encoded_len(values, row).and_then(|len| checked_encoded_len_add(total, len))
+        nested_value_encoded_len_with(values, row, work)
+            .and_then(|len| checked_encoded_len_add(total, len))
     })
 }
 
-fn nested_value_encoded_len(array: &ArrayRef, row: usize) -> ExecutionResult<usize> {
+fn nested_value_encoded_len_with<W: CanonicalKeyWork>(
+    array: &ArrayRef,
+    row: usize,
+    work: &mut W,
+) -> ExecutionResult<usize> {
+    work.step()?;
     if matches!(array.data_type(), DataType::Null) || array.is_null(row) {
         Ok(1)
     } else {
-        encoded_group_key_non_null_len(array, row)?
+        encoded_group_key_non_null_len_with(array, row, work)?
             .checked_add(5)
             .ok_or_else(group_key_request_arithmetic)
     }
@@ -2898,6 +3080,156 @@ mod decoding_failure_tests {
                 assert_eq!(extent.required, Some(required));
                 assert_eq!(extent.extent_limit, Some(i32::MAX as u64));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cooperative_canonical_work_tests {
+    use super::*;
+    use arrow::array::{Int64Builder, ListBuilder};
+    use std::cell::Cell;
+
+    fn one_large_nested_row() -> ArrayRef {
+        let mut outer = ListBuilder::new(ListBuilder::new(Int64Builder::new()));
+        for value in 0..4096 {
+            outer.values().values().append_value(value);
+        }
+        outer.values().append(true);
+        outer.append(true);
+        let array = Arc::new(outer.finish()) as ArrayRef;
+        assert_eq!(array.len(), 1);
+        assert!(matches!(array.data_type(), DataType::List(item)
+            if matches!(item.data_type(), DataType::List(child) if child.data_type() == &DataType::Int64)));
+        array
+    }
+    fn original_stop() -> ExecutionFailure {
+        novarocks_functions::KernelFailure::Operational(novarocks_functions::KernelDiagnostic::new(
+            "canonical nested original stop",
+        ))
+        .into()
+    }
+
+    #[test]
+    fn one_nested_row_observes_original_stop_during_recursive_sizing() {
+        let array = one_large_nested_row();
+        let calls = Cell::new(0usize);
+        let original = original_stop();
+        let checkpoint = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                Err(original.clone())
+            } else {
+                Ok(())
+            }
+        };
+        let mut work = ObservedCanonicalKeyWork::new(&checkpoint);
+        let failure = encoded_group_key_non_null_len_with(&array, 0, &mut work).unwrap_err();
+        assert_eq!(failure, original);
+        assert_eq!(
+            calls.get(),
+            2,
+            "the stop is observed before completing one row"
+        );
+    }
+
+    #[test]
+    fn one_nested_row_hash_observes_stop_inside_its_encoder_length_walk() {
+        let array = one_large_nested_row();
+        let calls = Cell::new(0usize);
+        let original = original_stop();
+        let failure = canonical_group_key_fnv_hash_observed(&array, 0, &|| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 3 {
+                Err(original.clone())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(failure, original);
+        assert_eq!(calls.get(), 3);
+    }
+
+    struct MeasuringSink<'a> {
+        output: Vec<u8>,
+        since_checkpoint: &'a Cell<usize>,
+        largest_write: &'a Cell<usize>,
+    }
+    impl KeyByteSink for MeasuringSink<'_> {
+        fn push_byte(&mut self, value: u8) -> ExecutionResult<()> {
+            self.extend_bytes(&[value])
+        }
+        fn extend_bytes(&mut self, value: &[u8]) -> ExecutionResult<()> {
+            self.largest_write
+                .set(self.largest_write.get().max(value.len()));
+            self.since_checkpoint
+                .set(self.since_checkpoint.get() + value.len());
+            self.output.extend_from_slice(value);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn encoding_has_an_observable_stop_after_output_started_before_nested_child_finishes() {
+        let array = one_large_nested_row();
+        let written = Cell::new(0usize);
+        let largest = Cell::new(0usize);
+        let original = original_stop();
+        let mut sink = MeasuringSink {
+            output: Vec::new(),
+            since_checkpoint: &written,
+            largest_write: &largest,
+        };
+        let checkpoint = || {
+            if written.get() > 0 {
+                Err(original.clone())
+            } else {
+                Ok(())
+            }
+        };
+        let mut work = ObservedCanonicalKeyWork::new(&checkpoint);
+        let failure =
+            encode_group_key_non_null_value_with(&array, 0, &mut sink, &mut work).unwrap_err();
+        assert_eq!(failure, original);
+        assert!(!sink.output.is_empty());
+        assert!(
+            sink.output.len() < 4096,
+            "control interrupts nested sizing within the encoder"
+        );
+    }
+
+    #[test]
+    fn observed_author_preserves_nested_bytes_and_hash_and_chunks_wide_bytes() {
+        for array in [
+            one_large_nested_row(),
+            Arc::new(StringArray::from(vec!["x".repeat(200_000)])) as ArrayRef,
+        ] {
+            let expected = encode_group_key_row(&array, 0).unwrap().unwrap();
+            let since = Cell::new(0usize);
+            let largest = Cell::new(0usize);
+            let mut sink = MeasuringSink {
+                output: Vec::new(),
+                since_checkpoint: &since,
+                largest_write: &largest,
+            };
+            let checkpoint = || {
+                assert!(
+                    since.get() <= 64 * 1024,
+                    "actual canonical bytes between checkpoints"
+                );
+                since.set(0);
+                Ok(())
+            };
+            let mut work = ObservedCanonicalKeyWork::new(&checkpoint);
+            encode_group_key_non_null_value_with(&array, 0, &mut sink, &mut work).unwrap();
+            checkpoint().unwrap();
+            assert_eq!(sink.output, expected);
+            assert!(largest.get() <= 64 * 1024);
+            assert_eq!(
+                canonical_group_key_fnv_hash_observed(&array, 0, &|| Ok(())).unwrap(),
+                canonical_group_key_fnv_hash(&array, 0).unwrap()
+            );
         }
     }
 }

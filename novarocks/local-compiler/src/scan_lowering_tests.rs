@@ -456,7 +456,12 @@ fn fixture(spec: Spec) -> Fixture {
             .add_values(VALUES, Box::from([Box::from([cell])]), Box::from([column]))
             .unwrap();
         let fragment = build
-            .finish_definition(VALUES, FragmentSink::Stream { edge: BUILD_EDGE }, dop)
+            .finish_definition(
+                VALUES,
+                FragmentSink::Stream { edge: BUILD_EDGE },
+                dop,
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            )
             .unwrap();
         let imported = builder
             .add_value(
@@ -605,16 +610,26 @@ fn fixture(spec: Spec) -> Fixture {
         Sink::Gather => FragmentSink::Stream { edge: EDGE },
         Sink::Result(_) => FragmentSink::Result,
     };
-    let producer = builder.finish_definition(root, producer_sink, dop).unwrap();
+    let producer = builder
+        .finish_definition(
+            root,
+            producer_sink,
+            dop,
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
 
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
     plan.add_fragment(producer).unwrap();
     if let Some((fragment, column, imported)) = build_fragment {
         plan.add_fragment(fragment).unwrap();
         plan.add_edge(Edge {
+            role: novarocks_physical_plan::OutputRole::Relational,
+            delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
             id: BUILD_EDGE,
             kind: EdgeKind::Stream,
             source: EdgeSource {
+                port: novarocks_physical_plan::FragmentOutputPort::Root,
                 fragment: BUILD,
                 projection: Box::from([column]),
             },
@@ -666,14 +681,22 @@ fn fixture(spec: Spec) -> Fixture {
                 .unwrap();
             plan.add_fragment(
                 consumer
-                    .finish_definition(RECEIVER, FragmentSink::Result, dop)
+                    .finish_definition(
+                        RECEIVER,
+                        FragmentSink::Result,
+                        dop,
+                        novarocks_physical_plan::StagePlacementPolicy::Singleton,
+                    )
                     .unwrap(),
             )
             .unwrap();
             plan.add_edge(Edge {
+                role: novarocks_physical_plan::OutputRole::Relational,
+                delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
                 id: EDGE,
                 kind: EdgeKind::Stream,
                 source: EdgeSource {
+                    port: novarocks_physical_plan::FragmentOutputPort::Root,
                     fragment: PRODUCER,
                     projection: output.clone().into_boxed_slice(),
                 },
@@ -1385,13 +1408,23 @@ fn unsupported_scan_shapes_are_refused_explicitly() {
             "provider relation other than a table",
         );
     }
-    refused(
-        Spec {
-            kind: ConnectorReadRelationKind::ChangeWindow,
-            ..Spec::slice()
-        },
-        "provider relation other than a table",
-    );
+}
+
+#[test]
+fn change_window_uses_the_frozen_provider_work_unit_and_exact_output_types() {
+    let source = Spec {
+        kind: ConnectorReadRelationKind::ChangeWindow,
+        ..Spec::slice()
+    };
+    let program = compile(source).expect("a frozen ChangeWindow compiles through the scan owner");
+    assert_eq!(program.scan_inputs().len(), 1);
+    let graph = program.graph();
+    let scan = graph
+        .nodes()
+        .iter()
+        .find(|node| matches!(node.kind(), ProgramNodeKind::Scan { .. }))
+        .expect("a provider scan");
+    assert_eq!(scan.output_layout().schema().as_ref(), &public_schema());
 }
 
 #[test]

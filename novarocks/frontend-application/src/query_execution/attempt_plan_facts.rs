@@ -100,7 +100,7 @@ pub(crate) struct AttemptScanFacts {
 
 /// One exchange edge, as the pieces that place and connect tasks read it.
 ///
-/// Four fields, which is what the task graph and the runtime-filter compiler
+/// The placement and delivery fields are what the task graph and the runtime-filter compiler
 /// actually read. The sealed plan's own edge additionally carries the
 /// analyzer expressions a hash partition was derived from and the payloads
 /// of the CTE and change-stream edge kinds; nothing on this path reads
@@ -113,6 +113,7 @@ pub(crate) struct AttemptEdgeFacts {
     pub(crate) target_fragment_id: FragmentId,
     pub(crate) target_exchange_node_id: i32,
     pub(crate) partition_kind: AttemptPartitionKind,
+    pub(crate) delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
 }
 
 /// The transport topology choice needed by Task placement for one edge.

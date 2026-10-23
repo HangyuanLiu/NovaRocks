@@ -36,9 +36,15 @@ use novarocks_failure_contract::{
 #[derive(Debug)]
 enum AssertRowsFailure {
     Contract(BoundedDetail),
-    Mismatch { detail: BoundedDetail },
+    Mismatch {
+        detail: BoundedDetail,
+    },
     DuplicateKey(BoundedDetail),
-    CounterOverflow { current: u64, incoming: u64 },
+    CounterOverflow {
+        current: u64,
+        incoming: u64,
+    },
+    #[cfg(test)]
     KeyDisplay(arrow::error::ArrowError),
 }
 impl std::fmt::Display for AssertRowsFailure {
@@ -50,6 +56,7 @@ impl std::fmt::Display for AssertRowsFailure {
             Self::CounterOverflow { current, incoming } => {
                 write!(f, "assert row counter cannot add {incoming} to {current}")
             }
+            #[cfg(test)]
             Self::KeyDisplay(source) => {
                 write!(f, "display keyed assert_num_rows value failed: {source}")
             }
@@ -59,6 +66,7 @@ impl std::fmt::Display for AssertRowsFailure {
 impl std::error::Error for AssertRowsFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            #[cfg(test)]
             Self::KeyDisplay(source) => Some(source),
             _ => None,
         }
@@ -86,10 +94,12 @@ impl FailureProjection for AssertRowsFailure {
                     committed: None,
                 });
             }
+            #[cfg(test)]
             Self::KeyDisplay(arrow::error::ArrowError::MemoryError(_)) => (
                 FailureClass::Resource,
                 ExecutionReason::AssertRowsDisplayMemory,
             ),
+            #[cfg(test)]
             Self::KeyDisplay(_) => (FailureClass::Invariant, ExecutionReason::AssertRowsDisplay),
         };
         FailureFact::new(class, reason.reason())
@@ -101,10 +111,24 @@ fn assert_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
     ))
 }
 
-use std::collections::HashSet;
+use crate::exec::hash_table::{
+    allocation::{AggregateAllocator, AggregateVec},
+    partition_keys::{native_tuple_hashes_observed, prepare_canonical_tuple, source_key_owner},
+};
+use crate::exec::pipeline::operator::{
+    ConstructionFailure, InputConstructionFactory, InputConstructionOwner,
+};
+use crate::runtime::mem_tracker::MemTracker;
+use arrow::array::{ArrayRef, BooleanArray};
+use hashbrown::raw::RawTable;
+use novarocks_type_contract::FunctionValueType;
+use novarocks_value_arrays::reachability::ReachableRows;
+use std::sync::Arc;
 
 use arrow::array::Array;
+#[cfg(test)]
 use arrow::util::display::array_value_to_string;
+use arrow::util::display::{ArrayFormatter, FormatOptions};
 
 use crate::exec::chunk::Chunk;
 use crate::exec::node::assert::{AssertNumRowsMode, Assertion};
@@ -122,6 +146,8 @@ use novarocks_types::SlotId;
 pub struct AssertNumRowsProcessorFactory {
     name: String,
     mode: AssertNumRowsMode,
+    applicability: Option<SlotId>,
+    key_types: Option<Arc<[FunctionValueType]>>,
 }
 
 impl AssertNumRowsProcessorFactory {
@@ -133,7 +159,43 @@ impl AssertNumRowsProcessorFactory {
         } else {
             "AssertNumRows".to_string()
         };
-        Ok(Self { name, mode })
+        Ok(Self {
+            name,
+            mode,
+            applicability: None,
+            key_types: None,
+        })
+    }
+    pub fn with_key_types(mut self, key_types: Vec<FunctionValueType>) -> ExecutionResult<Self> {
+        let AssertNumRowsMode::PerKeyAtMostOne { key_slots, .. } = &self.mode else {
+            return Err(assert_contract(
+                "frozen key types require keyed assertion mode",
+            ));
+        };
+        if key_types.len() != key_slots.len() {
+            return Err(assert_contract(
+                "keyed assertion frozen key type arity differs from key slots",
+            ));
+        }
+        self.key_types = Some(Arc::from(key_types));
+        Ok(self)
+    }
+
+    /// Applicability is already materialized by the planner. FALSE and NULL
+    /// bypass before any key value is inspected; TRUE requires a real key.
+    pub fn new_with_applicability(
+        node_id: i32,
+        mode: AssertNumRowsMode,
+        applicability: SlotId,
+    ) -> ExecutionResult<Self> {
+        if !matches!(mode, AssertNumRowsMode::PerKeyAtMostOne { .. }) {
+            return Err(assert_contract(
+                "applicability requires keyed assertion mode",
+            ));
+        }
+        let mut factory = Self::new(node_id, mode)?;
+        factory.applicability = Some(applicability);
+        Ok(factory)
     }
 }
 
@@ -145,6 +207,10 @@ impl OperatorFactory for AssertNumRowsProcessorFactory {
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
         Box::new(Transform::hydrating(AssertNumRowsProcessorKernel {
             name: self.name.clone(),
+            applicability: self.applicability,
+            key_types: self.key_types.clone(),
+            tracker: None,
+            construction: None,
             mode: RuntimeAssertNumRowsMode::from_plan(&self.mode)
                 .expect("validated assert_num_rows processor mode"),
         }))
@@ -154,14 +220,20 @@ impl OperatorFactory for AssertNumRowsProcessorFactory {
 struct AssertNumRowsProcessorKernel {
     name: String,
     mode: RuntimeAssertNumRowsMode,
+    applicability: Option<SlotId>,
+    key_types: Option<Arc<[FunctionValueType]>>,
+    tracker: Option<Arc<MemTracker>>,
+    construction: Option<Arc<dyn InputConstructionFactory>>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum KeyValue {
     Null,
     NonNull { data_type: String, display: String },
 }
 
+#[cfg(test)]
 impl KeyValue {
     fn message_value(&self) -> String {
         match self {
@@ -186,7 +258,7 @@ enum RuntimeAssertNumRowsMode {
         key_slots: Vec<SlotId>,
         key_labels: Vec<String>,
         message_prefix: String,
-        seen_keys: HashSet<Vec<KeyValue>>,
+        seen_keys: Option<TypedKeyState>,
     },
 }
 
@@ -214,7 +286,7 @@ impl RuntimeAssertNumRowsMode {
                 key_slots: key_slots.clone(),
                 key_labels: key_labels.clone(),
                 message_prefix: message_prefix.clone(),
-                seen_keys: HashSet::new(),
+                seen_keys: None,
             },
         })
     }
@@ -319,40 +391,9 @@ impl RuntimeAssertNumRowsMode {
                     *rows_seen,
                 )
             }
-            Self::PerKeyAtMostOne {
-                key_slots,
-                key_labels,
-                message_prefix,
-                seen_keys,
-            } => {
-                let key_columns = key_slots
-                    .iter()
-                    .map(|slot| {
-                        chunk
-                            .column_by_slot_id(*slot)
-                            .map_err(ExecutionFailure::from)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                for row in 0..chunk.len() {
-                    let key = key_columns
-                        .iter()
-                        .map(|column| key_value(column.as_ref(), row))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    if !seen_keys.insert(key.clone()) {
-                        return Err(ExecutionFailure::from_domain(
-                            AssertRowsFailure::DuplicateKey(BoundedDetail::truncating_display(
-                                format_args!(
-                                    "{}: duplicate {}",
-                                    message_prefix,
-                                    format_key_message(key_labels, &key)?
-                                ),
-                            )),
-                        ));
-                    }
-                }
-                Ok(())
-            }
+            Self::PerKeyAtMostOne { .. } => Err(assert_contract(
+                "keyed assertion requires its installed state owner",
+            )),
         }
     }
 
@@ -401,6 +442,7 @@ impl RuntimeAssertNumRowsMode {
     }
 }
 
+#[cfg(test)]
 fn key_value(column: &dyn Array, row: usize) -> ExecutionResult<KeyValue> {
     if row >= column.len() {
         return Err(assert_contract(format_args!(
@@ -436,6 +478,7 @@ fn validate_keyed_invariants(key_slots: &[SlotId], key_labels: &[String]) -> Exe
     Ok(())
 }
 
+#[cfg(test)]
 fn format_key_message(labels: &[String], key: &[KeyValue]) -> ExecutionResult<String> {
     if labels.len() != key.len() {
         return Err(assert_contract(format_args!(
@@ -456,25 +499,315 @@ fn format_key_message(labels: &[String], key: &[KeyValue]) -> ExecutionResult<St
         .join(", "))
 }
 
+#[cfg(test)]
 fn is_string_key_type(data_type: &str) -> bool {
     matches!(data_type, "Utf8" | "LargeUtf8" | "Utf8View")
 }
 
+struct DuplicateKeyDisplay<'a, 'input> {
+    prefix: &'a str,
+    labels: &'a [String],
+    columns: &'a [ArrayRef],
+    tuples: &'a crate::exec::hash_table::partition_keys::CanonicalTupleBatch<'input>,
+    row: usize,
+}
+impl std::fmt::Display for DuplicateKeyDisplay<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: duplicate ", self.prefix)?;
+        for (index, column) in self.columns.iter().enumerate() {
+            if index != 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{}=", self.labels[index])?;
+            match self.tuples.string_component(index, self.row) {
+                Ok(Some(Some(value))) => write!(f, "{value:?}")?,
+                Ok(Some(None)) => f.write_str("<NULL>")?,
+                Ok(None) if column.is_null(self.row) => f.write_str("<NULL>")?,
+                Ok(None) => {
+                    // Arrow's byte formatter writes one hex byte at a time;
+                    // nested formatters forward the same bounded writer.
+                    let options = FormatOptions::default();
+                    match ArrayFormatter::try_new(column.as_ref(), &options) {
+                        Ok(formatter) => write!(f, "{}", formatter.value(self.row))?,
+                        Err(_) => f.write_str("<unavailable>")?,
+                    }
+                }
+                Err(_) => f.write_str("<unavailable>")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+struct StoredKey {
+    hash: u64,
+    bytes: AggregateVec<u8>,
+}
+struct TypedKeyState {
+    types: AggregateVec<FunctionValueType>,
+    keys: RawTable<StoredKey, AggregateAllocator>,
+}
+impl TypedKeyState {
+    fn insert(
+        &mut self,
+        key: AggregateVec<u8>,
+        hash: u64,
+        allocator: &AggregateAllocator,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<bool> {
+        checkpoint()?;
+        let mut original_failure = None;
+        let duplicate = self
+            .keys
+            .get(hash, |stored| {
+                if let Err(original) = checkpoint() {
+                    original_failure = Some(original);
+                    return true;
+                }
+                if stored.bytes.len() != key.len() {
+                    return false;
+                }
+                for (retained, incoming) in
+                    stored.bytes.chunks(64 * 1024).zip(key.chunks(64 * 1024))
+                {
+                    if let Err(original) = checkpoint() {
+                        original_failure = Some(original);
+                        // Stop the collision walk immediately. The caller
+                        // propagates this failure before interpreting a hit.
+                        return true;
+                    }
+                    if retained != incoming {
+                        return false;
+                    }
+                }
+                true
+            })
+            .is_some();
+        if let Some(original) = original_failure {
+            return Err(original);
+        }
+        checkpoint()?;
+        if duplicate {
+            return Ok(false);
+        }
+        self.keys
+            .try_reserve(1, |stored| stored.hash)
+            .map_err(|source| {
+                allocator.allocation_error("reserve keyed assertion buckets", source)
+            })?;
+        self.keys
+            .insert(hash, StoredKey { hash, bytes: key }, |stored| stored.hash);
+        Ok(true)
+    }
+}
+impl AssertNumRowsProcessorKernel {
+    fn clear_state(&mut self) {
+        if let RuntimeAssertNumRowsMode::PerKeyAtMostOne { seen_keys, .. } = &mut self.mode {
+            *seen_keys = None;
+        }
+    }
+    fn observe_keyed(&mut self, chunk: &Chunk, ctx: &mut StepContext<'_>) -> ExecutionResult<()> {
+        let RuntimeAssertNumRowsMode::PerKeyAtMostOne {
+            key_slots,
+            key_labels,
+            message_prefix,
+            seen_keys,
+        } = &mut self.mode
+        else {
+            return self.mode.observe_chunk(chunk);
+        };
+        ctx.checkpoint()?;
+        let frozen = self
+            .key_types
+            .as_deref()
+            .ok_or_else(|| assert_contract("keyed assertion frozen key types are missing"))?;
+        let factory = self
+            .construction
+            .as_deref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let original_owner = factory.begin_input_construction(chunk)?;
+        let owner = source_key_owner(chunk, original_owner.as_ref())?;
+        let allocator = AggregateAllocator::new(
+            self.tracker
+                .clone()
+                .ok_or_else(|| assert_contract("keyed assertion tracker is not installed"))?,
+        );
+        owner.request(
+            std::alloc::Layout::array::<usize>(chunk.len()).map_err(|_| {
+                ConstructionFailure::from(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic)
+            })?,
+        )?;
+        let mut selected = Vec::new();
+        selected.try_reserve_exact(chunk.len()).map_err(|source| {
+            allocator.allocation_error("reserve assertion applicability rows", source)
+        })?;
+        let applies = self
+            .applicability
+            .map(|slot| chunk.column_by_slot_id(slot))
+            .transpose()?;
+        let applies = applies
+            .as_ref()
+            .map(|array| {
+                array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| assert_contract("keyed assertion applicability must be Boolean"))
+            })
+            .transpose()?;
+        for row in 0..chunk.len() {
+            if row.is_multiple_of(256) {
+                ctx.checkpoint()?;
+            }
+            if applies.is_none_or(|mask| !mask.is_null(row) && mask.value(row)) {
+                selected.push(row);
+            }
+        }
+        if selected.is_empty() {
+            return Ok(());
+        }
+        owner.request(std::alloc::Layout::array::<ArrayRef>(key_slots.len()).map_err(|_| ConstructionFailure::from(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
+        let mut columns = Vec::new();
+        let mut types = AggregateVec::new_in(allocator.clone());
+        columns
+            .try_reserve_exact(key_slots.len())
+            .map_err(|source| {
+                allocator.allocation_error("reserve assertion key columns", source)
+            })?;
+        types
+            .try_reserve_exact(key_slots.len())
+            .map_err(|source| allocator.allocation_error("reserve assertion key types", source))?;
+        for (slot, expected) in key_slots.iter().zip(frozen) {
+            columns.push(chunk.column_by_slot_id(*slot)?);
+            let signed = chunk
+                .chunk_schema()
+                .slot(*slot)
+                .ok_or_else(|| assert_contract("keyed assertion slot declaration is missing"))?;
+            if signed.field_schema().value_type() != expected.value_type() {
+                return Err(assert_contract(
+                    "keyed assertion source semantics differ from frozen key type",
+                ));
+            }
+            types.push(expected.clone());
+        }
+        if let Some(state) = seen_keys.as_ref()
+            && state.types.as_slice() != types.as_slice()
+        {
+            return Err(assert_contract(
+                "keyed assertion exact key types changed between batches",
+            ));
+        }
+        let (control, conversions) = ctx.value_conversion_scope();
+        let checkpoint = || match control.error() {
+            Some(original) => Err(original),
+            None if control.is_stopped() => {
+                Err(novarocks_functions::KernelFailure::Cancelled.into())
+            }
+            None => Ok(()),
+        };
+        let hashes = native_tuple_hashes_observed(
+            &columns,
+            &types,
+            &ReachableRows::indices(chunk.len(), &selected),
+            conversions,
+            owner.as_ref(),
+            &checkpoint,
+        )?;
+        let tuples = prepare_canonical_tuple(
+            &columns,
+            &types,
+            &ReachableRows::indices(chunk.len(), &selected),
+            conversions,
+            owner.as_ref(),
+            &checkpoint,
+        )?;
+        let state = seen_keys.get_or_insert_with(|| TypedKeyState {
+            types,
+            keys: RawTable::new_in(allocator.clone()),
+        });
+        for row in selected {
+            checkpoint()?;
+            if self.applicability.is_some() && tuples.row_has_null(row)? {
+                return Err(assert_contract(
+                    "applicable keyed assertion row has a NULL target key",
+                ));
+            }
+            let key = tuples.encode_row(row, allocator.clone(), &checkpoint)?;
+            let hash = hashes.as_slice()[row]
+                .ok_or_else(|| assert_contract("selected assertion key hash is missing"))?;
+            if !state.insert(key, hash, &allocator, &checkpoint)? {
+                // Streaming diagnostics cannot materialize an unbounded key
+                // String or replace the already proven duplicate Data fact.
+                return Err(ExecutionFailure::from_domain(
+                    AssertRowsFailure::DuplicateKey(BoundedDetail::truncating_display(
+                        DuplicateKeyDisplay {
+                            prefix: message_prefix,
+                            labels: key_labels,
+                            columns: &columns,
+                            tuples: &tuples,
+                            row,
+                        },
+                    )),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl OperatorLifecycle for AssertNumRowsProcessorKernel {
+    fn prepare(&mut self) -> ExecutionResult<()> {
+        if matches!(self.mode, RuntimeAssertNumRowsMode::PerKeyAtMostOne { .. })
+            && self.key_types.is_none()
+        {
+            return Err(assert_contract(
+                "keyed assertion frozen key types are missing",
+            ));
+        }
+        Ok(())
+    }
+
+    fn creates_typed_storage(&self) -> bool {
+        matches!(self.mode, RuntimeAssertNumRowsMode::PerKeyAtMostOne { .. })
+    }
+    fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
+        self.tracker = Some(tracker);
+    }
+    fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        self.construction = Some(factory);
+    }
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.clear_state();
+        Ok(())
+    }
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.clear_state();
+        Ok(())
+    }
+    fn cancel(&mut self) {
+        self.clear_state();
+    }
     fn name(&self) -> &str {
         &self.name
     }
 }
-impl InputEncodingPolicy for AssertNumRowsProcessorKernel {}
+impl InputEncodingPolicy for AssertNumRowsProcessorKernel {
+    fn retains_encoded_path(
+        &self,
+        _: crate::exec::pipeline::operator::EncodedValueOccurrence<'_>,
+    ) -> bool {
+        true
+    }
+}
 impl TransformKernel for AssertNumRowsProcessorKernel {
     fn apply(
         &mut self,
-        _: &mut StepContext<'_>,
+        ctx: &mut StepContext<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         let chunk = input.into_uncovered_chunk()?;
         let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
-        self.mode.observe_chunk(&chunk)?;
+        self.observe_keyed(&chunk, ctx)?;
         Ok(StepResult::new(Some(chunk), NextStep::NeedInput, rows))
     }
     fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
@@ -503,12 +836,11 @@ mod tests {
         )]));
         let array = Arc::new(Int32Array::from(values)) as _;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
-        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-            batch.schema().as_ref(),
+        crate::exec::chunk::typed_fixture::chunk(
+            batch,
             &[SlotId::new(7)],
+            &[FunctionValueType::new(DataType::Int32, true)],
         )
-        .expect("chunk schema");
-        Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 
     fn make_chunk(rows: usize) -> Chunk {
@@ -535,6 +867,10 @@ mod tests {
         let rt = RuntimeState::default();
         let mut op = Transform::hydrating(AssertNumRowsProcessorKernel {
             name: "test".to_string(),
+            applicability: None,
+            key_types: None,
+            tracker: None,
+            construction: None,
             mode: RuntimeAssertNumRowsMode::from_plan(&AssertNumRowsMode::Global {
                 desired_num_rows: desired,
                 assertion,
@@ -559,6 +895,10 @@ mod tests {
         let rt = RuntimeState::default();
         let mut op = Transform::hydrating(AssertNumRowsProcessorKernel {
             name: "test".to_string(),
+            applicability: None,
+            key_types: None,
+            tracker: None,
+            construction: None,
             mode: RuntimeAssertNumRowsMode::from_plan(&AssertNumRowsMode::Global {
                 desired_num_rows: desired,
                 assertion,
@@ -682,7 +1022,13 @@ mod tests {
             },
         )
         .expect("factory")
+        .with_key_types(vec![FunctionValueType::new(DataType::Int32, true)])
+        .unwrap()
         .create(1, 0);
+        let tracker = MemTracker::new_root("keyed assertion fixture");
+        op.set_mem_tracker(tracker.clone());
+        op.set_construction_factory(crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(), tracker, rt.error_state()).unwrap());
         let mut op = TestDriver::new(op.as_mut(), &rt);
 
         let err = op
@@ -703,7 +1049,13 @@ mod tests {
             },
         )
         .expect("factory")
+        .with_key_types(vec![FunctionValueType::new(DataType::Int32, true)])
+        .unwrap()
         .create(1, 0);
+        let tracker = MemTracker::new_root("keyed assertion fixture");
+        op.set_mem_tracker(tracker.clone());
+        op.set_construction_factory(crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(), tracker, rt.error_state()).unwrap());
         let mut op = TestDriver::new(op.as_mut(), &rt);
 
         let output = op
@@ -729,7 +1081,13 @@ mod tests {
             },
         )
         .expect("factory")
+        .with_key_types(vec![FunctionValueType::new(DataType::Int32, true)])
+        .unwrap()
         .create(1, 0);
+        let tracker = MemTracker::new_root("keyed assertion fixture");
+        op.set_mem_tracker(tracker.clone());
+        op.set_construction_factory(crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(), tracker, rt.error_state()).unwrap());
         let mut op = TestDriver::new(op.as_mut(), &rt);
 
         let output = op
@@ -751,11 +1109,9 @@ mod tests {
     #[test]
     fn keyed_assert_num_rows_formats_sql_null_and_string_null_distinctly() {
         let labels = vec!["_row_id".to_string()];
-        let sql_null = vec![KeyValue::Null];
-        let string_null = vec![KeyValue::NonNull {
-            data_type: "Utf8".to_string(),
-            display: "NULL".to_string(),
-        }];
+        let values = arrow::array::StringArray::from(vec![None, Some("NULL")]);
+        let sql_null = vec![key_value(&values, 0).unwrap()];
+        let string_null = vec![key_value(&values, 1).unwrap()];
 
         assert_eq!(
             format_key_message(&labels, &sql_null).expect("format sql null"),
@@ -828,5 +1184,487 @@ mod failure_fact_tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod typed_state_tests {
+    use super::*;
+    use crate::exec::pipeline::test_driver::TestDriver;
+    use crate::runtime::runtime_state::RuntimeState;
+    use arrow::{
+        array::{BooleanArray, Int32Array},
+        datatypes::Field,
+    };
+
+    fn chunk(columns: Vec<ArrayRef>, types: &[FunctionValueType]) -> Chunk {
+        let names = (0..types.len())
+            .map(|index| format!("c{index}"))
+            .collect::<Vec<_>>();
+        let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+        let slots = (0..types.len())
+            .map(|i| SlotId::new(i as u32 + 1))
+            .collect::<Vec<_>>();
+        let rows = columns.first().map_or(0, |column| column.len());
+        crate::exec::chunk::typed_fixture::columns(&names, &slots, types, columns, rows)
+    }
+    fn operator(
+        rt: &RuntimeState,
+        tracker: Arc<MemTracker>,
+        conditional: bool,
+    ) -> Box<dyn Operator> {
+        operator_typed(
+            rt,
+            tracker,
+            conditional,
+            FunctionValueType::new(arrow::datatypes::DataType::Int32, true),
+        )
+    }
+    fn operator_typed(
+        rt: &RuntimeState,
+        tracker: Arc<MemTracker>,
+        conditional: bool,
+        key_type: FunctionValueType,
+    ) -> Box<dyn Operator> {
+        let mode = AssertNumRowsMode::PerKeyAtMostOne {
+            key_slots: vec![SlotId::new(1)],
+            key_labels: vec!["target".into()],
+            message_prefix: "duplicate target".into(),
+        };
+        let factory = if conditional {
+            AssertNumRowsProcessorFactory::new_with_applicability(1, mode, SlotId::new(2))
+        } else {
+            AssertNumRowsProcessorFactory::new(1, mode)
+        }
+        .unwrap();
+        let mut op = factory.with_key_types(vec![key_type]).unwrap().create(1, 0);
+        op.set_mem_tracker(tracker.clone());
+        op.set_construction_factory(crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(), tracker, rt.error_state()).unwrap());
+        op
+    }
+    fn conditional(keys: Vec<Option<i32>>, mask: Vec<Option<bool>>) -> Chunk {
+        chunk(
+            vec![
+                Arc::new(Int32Array::from(keys)),
+                Arc::new(BooleanArray::from(mask)),
+            ],
+            &[
+                FunctionValueType::new(arrow::datatypes::DataType::Int32, true),
+                FunctionValueType::new(arrow::datatypes::DataType::Boolean, true),
+            ],
+        )
+    }
+    #[test]
+    fn materialized_applicability_bypasses_false_and_null_before_key_identity() {
+        for mask in [
+            vec![Some(true), Some(false)],
+            vec![Some(true), None],
+            vec![Some(false), None],
+        ] {
+            let rt = RuntimeState::default();
+            let tracker = MemTracker::new_root("applicability");
+            let mut op = operator(&rt, tracker, true);
+            let mut calls = TestDriver::new(op.as_mut(), &rt);
+            calls
+                .input_and_collect(conditional(vec![Some(9), Some(9)], mask))
+                .unwrap();
+        }
+        let rt = RuntimeState::default();
+        let tracker = MemTracker::new_root("duplicate applicable");
+        let mut op = operator(&rt, tracker, true);
+        let mut calls = TestDriver::new(op.as_mut(), &rt);
+        let error = calls
+            .input_and_collect(conditional(
+                vec![Some(9), Some(9)],
+                vec![Some(true), Some(true)],
+            ))
+            .unwrap_err();
+        assert_eq!(error.failure_fact().class(), FailureClass::Data);
+        assert_eq!(
+            error.failure_fact().reason(),
+            ExecutionReason::AssertRowsDuplicateKey.reason()
+        );
+    }
+    #[test]
+    fn applicable_null_is_contract_failure_and_bypassed_null_allocates_no_state() {
+        let rt = RuntimeState::default();
+        let tracker = MemTracker::new_root("null applicability");
+        let mut op = operator(&rt, tracker.clone(), true);
+        let before = tracker.current();
+        {
+            let mut calls = TestDriver::new(op.as_mut(), &rt);
+            calls
+                .input_and_collect(conditional(vec![None, None], vec![Some(false), None]))
+                .unwrap();
+        }
+        assert_eq!(tracker.current(), before);
+        let mut calls = TestDriver::new(op.as_mut(), &rt);
+        let error = calls
+            .input_and_collect(conditional(vec![None], vec![Some(true)]))
+            .unwrap_err();
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    }
+    #[test]
+    fn equal_display_text_does_not_define_nested_typed_identity() {
+        use arrow::array::ListBuilder;
+        use arrow::array::StringBuilder;
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        for values in [["a, b", "c"], ["a", "b, c"]] {
+            for value in values {
+                builder.values().append_value(value);
+            }
+            builder.append(true);
+        }
+        let array = Arc::new(builder.finish()) as ArrayRef;
+        assert_eq!(
+            array_value_to_string(array.as_ref(), 0).unwrap(),
+            array_value_to_string(array.as_ref(), 1).unwrap()
+        );
+        let rt = RuntimeState::default();
+        let tracker = MemTracker::new_root("display collision");
+        let frozen = FunctionValueType::new(
+            arrow::datatypes::DataType::List(Arc::new(Field::new(
+                "item",
+                arrow::datatypes::DataType::Utf8,
+                true,
+            ))),
+            true,
+        );
+        let mut op = operator_typed(&rt, tracker, false, frozen.clone());
+        let mut calls = TestDriver::new(op.as_mut(), &rt);
+        assert_eq!(
+            calls
+                .input_and_collect(chunk(vec![array], &[frozen]))
+                .unwrap()[0]
+                .len(),
+            2
+        );
+    }
+    #[test]
+    fn bucket_hash_collision_compares_exact_framed_keys() {
+        let tracker = MemTracker::new_root("collision");
+        let allocator = AggregateAllocator::new(tracker.clone());
+        let mut state = TypedKeyState {
+            types: AggregateVec::new_in(allocator.clone()),
+            keys: RawTable::new_in(allocator.clone()),
+        };
+        for value in [b"first".as_slice(), b"second".as_slice()] {
+            let key =
+                crate::exec::hash_table::allocation::aggregate_bytes(allocator.clone(), value)
+                    .unwrap();
+            assert!(state.insert(key, 17, &allocator, &|| Ok(())).unwrap());
+        }
+        let key = crate::exec::hash_table::allocation::aggregate_bytes(allocator.clone(), b"first")
+            .unwrap();
+        assert!(!state.insert(key, 17, &allocator, &|| Ok(())).unwrap());
+        assert_eq!(state.keys.len(), 2);
+        drop(state);
+        assert_eq!(tracker.current(), 0);
+    }
+    #[test]
+    fn large_equal_and_long_prefix_key_comparisons_preserve_stop_without_insertion() {
+        use std::cell::Cell;
+        for incoming_tail in *b"ac" {
+            let tracker = MemTracker::new_root("cooperative assertion equality");
+            let allocator = AggregateAllocator::new(tracker.clone());
+            let mut state = TypedKeyState {
+                types: AggregateVec::new_in(allocator.clone()),
+                keys: RawTable::new_in(allocator.clone()),
+            };
+            // Both candidates share a hash and a long prefix. A stop must
+            // end lookup even when another candidate remains in the chain.
+            for tail in *b"ab" {
+                let mut bytes = vec![b'x'; 3 * 64 * 1024];
+                *bytes.last_mut().unwrap() = tail;
+                let key =
+                    crate::exec::hash_table::allocation::aggregate_bytes(allocator.clone(), &bytes)
+                        .unwrap();
+                assert!(state.insert(key, 17, &allocator, &|| Ok(())).unwrap());
+            }
+            let baseline = tracker.current();
+            let mut bytes = vec![b'x'; 3 * 64 * 1024];
+            *bytes.last_mut().unwrap() = incoming_tail;
+            let key =
+                crate::exec::hash_table::allocation::aggregate_bytes(allocator.clone(), &bytes)
+                    .unwrap();
+            let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Operational(
+                novarocks_functions::KernelDiagnostic::new("key equality stop origin"),
+            ));
+            let calls = Cell::new(0usize);
+            let error = state
+                .insert(key, 17, &allocator, &|| {
+                    calls.set(calls.get() + 1);
+                    assert!(calls.get() <= 4, "failure must stop the collision walk");
+                    if calls.get() == 4 {
+                        Err(original.clone())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+            assert_eq!(calls.get(), 4);
+            assert!(error.same_occurrence(&original));
+            assert_eq!(state.keys.len(), 2, "a stopped candidate is never inserted");
+            assert_eq!(tracker.current(), baseline);
+            let retry =
+                crate::exec::hash_table::allocation::aggregate_bytes(allocator.clone(), &bytes)
+                    .unwrap();
+            assert_eq!(
+                state.insert(retry, 17, &allocator, &|| Ok(())).unwrap(),
+                incoming_tail == b'c',
+                "the last chunk still distinguishes a long common prefix"
+            );
+            drop(state);
+            assert_eq!(tracker.current(), 0);
+        }
+    }
+
+    #[test]
+    fn different_length_collision_candidates_observe_stop_before_length_comparison() {
+        use std::cell::Cell;
+        let tracker = MemTracker::new_root("different-length assertion collision");
+        let allocator = AggregateAllocator::new(tracker.clone());
+        let mut state = TypedKeyState {
+            types: AggregateVec::new_in(allocator.clone()),
+            keys: RawTable::new_in(allocator.clone()),
+        };
+        for bytes in [b"a".as_slice(), b"bb".as_slice(), b"ccc".as_slice()] {
+            let key =
+                crate::exec::hash_table::allocation::aggregate_bytes(allocator.clone(), bytes)
+                    .unwrap();
+            assert!(state.insert(key, 17, &allocator, &|| Ok(())).unwrap());
+        }
+        let baseline = tracker.current();
+        let key = crate::exec::hash_table::allocation::aggregate_bytes(allocator.clone(), b"dddd")
+            .unwrap();
+        let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Operational(
+            novarocks_functions::KernelDiagnostic::new("different-length collision stop"),
+        ));
+        let calls = Cell::new(0usize);
+        let error = state
+            .insert(key, 17, &allocator, &|| {
+                calls.set(calls.get() + 1);
+                assert!(calls.get() <= 2, "failure must stop the collision walk");
+                if calls.get() == 2 {
+                    Err(original.clone())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(calls.get(), 2);
+        assert!(error.same_occurrence(&original));
+        assert_eq!(state.keys.len(), 3);
+        assert_eq!(tracker.current(), baseline);
+        let retry =
+            crate::exec::hash_table::allocation::aggregate_bytes(allocator.clone(), b"dddd")
+                .unwrap();
+        let retry_calls = Cell::new(0usize);
+        assert!(
+            state
+                .insert(retry, 17, &allocator, &|| {
+                    retry_calls.set(retry_calls.get() + 1);
+                    Ok(())
+                })
+                .unwrap()
+        );
+        assert_eq!(
+            retry_calls.get(),
+            5,
+            "each different-length collision is observed before final insertion"
+        );
+        assert_eq!(state.keys.len(), 4);
+        drop(state);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn installed_parent_limit_refuses_state_and_cancel_releases_retained_layouts() {
+        let rt = RuntimeState::default();
+        let parent = MemTracker::new_root("keyed state parent");
+        parent.install_limit_once(4096).unwrap();
+        let tracker = MemTracker::new_child("assertion operator", &parent);
+        let mut op = operator(&rt, tracker.clone(), false);
+        let mut retained = 0;
+        let error = {
+            let mut calls = TestDriver::new(op.as_mut(), &rt);
+            (0..10_000)
+                .find_map(|value| {
+                    match calls.input_and_collect(chunk(
+                        vec![Arc::new(Int32Array::from(vec![value]))],
+                        &[FunctionValueType::new(
+                            arrow::datatypes::DataType::Int32,
+                            true,
+                        )],
+                    )) {
+                        Ok(_) => {
+                            retained = retained.max(tracker.current());
+                            None
+                        }
+                        Err(error) => Some(error),
+                    }
+                })
+                .expect("persistent keys must eventually meet the installed parent limit")
+        };
+        assert!(retained > 0);
+        assert_eq!(error.failure_fact().class(), FailureClass::Resource);
+        op.cancel();
+        op.close().unwrap();
+        drop(op);
+        assert_eq!(tracker.current(), 0);
+        assert_eq!(parent.current(), 0);
+    }
+    #[test]
+    fn rehash_reserves_replacement_while_original_buckets_remain_live() {
+        let tracker = MemTracker::new_root("assertion rehash");
+        let allocator = AggregateAllocator::new(tracker.clone());
+        let mut keys = RawTable::<StoredKey, _>::new_in(allocator.clone());
+        keys.try_reserve(3, |stored| stored.hash).unwrap();
+        for value in 0..keys.capacity() {
+            let bytes = crate::exec::hash_table::allocation::aggregate_bytes(
+                allocator.clone(),
+                &(value as u64).to_le_bytes(),
+            )
+            .unwrap();
+            keys.insert(
+                value as u64,
+                StoredKey {
+                    hash: value as u64,
+                    bytes,
+                },
+                |stored| stored.hash,
+            );
+        }
+        let baseline = tracker.current();
+        // New buckets alone fit below 3*current, while old+new do not. The
+        // allocator's exact replacement charge must preserve the live table.
+        let probe = MemTracker::new_root("replacement geometry");
+        let probe_allocator = AggregateAllocator::new(probe.clone());
+        let mut replacement = RawTable::<StoredKey, _>::new_in(probe_allocator);
+        replacement
+            .try_reserve(keys.len() + 1, |stored| stored.hash)
+            .unwrap();
+        let replacement_bytes = probe.current();
+        tracker
+            .install_limit_once(baseline + replacement_bytes - 1)
+            .unwrap();
+        let length = keys.len();
+        assert!(keys.try_reserve(1, |stored| stored.hash).is_err());
+        assert_eq!(keys.len(), length);
+        assert_eq!(tracker.current(), baseline);
+        drop(keys);
+        assert_eq!(tracker.current(), 0);
+    }
+    #[test]
+    fn frozen_logical_string_layout_accepts_actual_dictionary_and_detects_cross_batch_identity() {
+        use arrow::{
+            array::{DictionaryArray, StringArray},
+            datatypes::{DataType, Int32Type},
+        };
+        let rt = RuntimeState::default();
+        let tracker = MemTracker::new_root("frozen string identity");
+        // Utf8View and Utf8 share D(L)=Utf8. The consumer receives L itself;
+        // it never guesses that declaration by looking at dictionary values.
+        let frozen = FunctionValueType::new(DataType::Utf8View, true);
+        let mut op = operator_typed(&rt, tracker, false, frozen.clone());
+        let mut calls = TestDriver::new(op.as_mut(), &rt);
+        let first = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![0, 1]),
+                Arc::new(StringArray::from(vec!["alpha", "beta"])) as ArrayRef,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let first = crate::exec::hash_table::partition_keys::typed_encoded_tuple_fixture(
+            &["target"],
+            &[SlotId::new(1)],
+            std::slice::from_ref(&frozen),
+            vec![first],
+            2,
+        );
+        assert_eq!(calls.input_and_collect(first).unwrap()[0].len(), 2);
+        let next = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![1]),
+                Arc::new(StringArray::from(vec!["other", "alpha"])) as ArrayRef,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let next = crate::exec::hash_table::partition_keys::typed_encoded_tuple_fixture(
+            &["target"],
+            &[SlotId::new(1)],
+            &[frozen],
+            vec![next],
+            1,
+        );
+        let error = calls.input_and_collect(next).unwrap_err();
+        assert_eq!(
+            error.failure_fact().reason(),
+            ExecutionReason::AssertRowsDuplicateKey.reason()
+        );
+    }
+    #[test]
+    fn keyed_mode_refuses_missing_or_wrong_arity_frozen_declaration() {
+        let mode = AssertNumRowsMode::PerKeyAtMostOne {
+            key_slots: vec![SlotId::new(1)],
+            key_labels: vec!["target".into()],
+            message_prefix: "duplicate".into(),
+        };
+        let error = AssertNumRowsProcessorFactory::new(1, mode.clone())
+            .unwrap()
+            .with_key_types(vec![])
+            .err()
+            .unwrap();
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        let mut kernel = AssertNumRowsProcessorKernel {
+            name: "missing declaration".into(),
+            mode: RuntimeAssertNumRowsMode::from_plan(&mode).unwrap(),
+            applicability: None,
+            key_types: None,
+            tracker: None,
+            construction: None,
+        };
+        let error = kernel.prepare().unwrap_err();
+        assert_eq!(
+            error.detail(),
+            "keyed assertion frozen key types are missing"
+        );
+    }
+    #[test]
+    fn duplicate_diagnostic_streams_large_string_and_binary_into_bounded_detail() {
+        use arrow::array::{BinaryArray, StringArray};
+        let large = "x".repeat(1024 * 1024);
+        for (array, frozen) in [
+            (
+                Arc::new(StringArray::from(vec![large.as_str(), large.as_str()])) as ArrayRef,
+                FunctionValueType::new(arrow::datatypes::DataType::Utf8, true),
+            ),
+            (
+                Arc::new(BinaryArray::from(vec![large.as_bytes(), large.as_bytes()])) as ArrayRef,
+                FunctionValueType::new(arrow::datatypes::DataType::Binary, true),
+            ),
+        ] {
+            let rt = RuntimeState::default();
+            let tracker = MemTracker::new_root("bounded duplicate diagnostic");
+            let mut op = operator_typed(&rt, tracker, false, frozen.clone());
+            let mut calls = TestDriver::new(op.as_mut(), &rt);
+            let error = calls
+                .input_and_collect(chunk(vec![array], &[frozen]))
+                .unwrap_err();
+            assert_eq!(
+                error.failure_fact().reason(),
+                ExecutionReason::AssertRowsDuplicateKey.reason()
+            );
+            assert!(
+                error
+                    .detail()
+                    .starts_with("duplicate target: duplicate target=")
+            );
+            assert_eq!(
+                error.detail().len(),
+                novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES
+            );
+        }
     }
 }

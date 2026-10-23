@@ -89,6 +89,9 @@ impl FailureProjection for StaticSinkError {
                 crate::sink::MAX_STATIC_SINK_BRANCHES,
             ),
             Self::SplitArityMismatch => fact(FailureClass::Invariant, 28),
+            Self::InvalidRouter => fact(FailureClass::Invariant, 29),
+            Self::InvalidSummaryLayout => fact(FailureClass::Invariant, 30),
+            Self::InvalidDeliveryRequirement => fact(FailureClass::Invariant, 31),
         }
     }
 }
@@ -129,6 +132,11 @@ mod tests {
             vec![],
             vec![SlotId::new(7), SlotId::new(7)],
             None,
+            crate::StaticStreamContract {
+                role: crate::ProgramOutputRole::Relational,
+                delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                routing: crate::StaticStreamRouting::Ordinary,
+            },
         )
         .unwrap_err();
         assert_eq!(duplicate, StaticSinkError::DuplicateOutputColumn);
@@ -139,6 +147,11 @@ mod tests {
             vec![],
             vec![SlotId::new(7); crate::sink::MAX_STATIC_SINK_COLUMNS + 1],
             None,
+            crate::StaticStreamContract {
+                role: crate::ProgramOutputRole::Relational,
+                delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                routing: crate::StaticStreamRouting::Ordinary,
+            },
         )
         .unwrap_err();
         assert_eq!(oversized, StaticSinkError::TooManyColumns);

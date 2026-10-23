@@ -349,22 +349,25 @@ fn add_writer(
                 destination: Distribution::Unconstrained,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
             },
-            change_stream_writer: None,
-            writer_result: Some(WriterResultCut {
-                write_target_ordinal: ordinal,
-                schema_revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
-                fields: fields
-                    .iter()
-                    .zip(imports)
-                    .map(|(f, i)| WriterResultCutField {
-                        source: f.value,
-                        destination: i.destination,
-                        name: f.name.clone(),
-                        ty: f.ty.clone(),
-                        role: f.role,
-                    })
-                    .collect(),
-            }),
+            source_port: novarocks_physical_plan::FragmentOutputPort::Root,
+            delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
+            payload: novarocks_physical_plan::ExchangePayloadContract::WriterResults(
+                WriterResultCut {
+                    write_target_ordinal: ordinal,
+                    schema_revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
+                    fields: fields
+                        .iter()
+                        .zip(imports)
+                        .map(|(f, i)| WriterResultCutField {
+                            source: f.value,
+                            destination: i.destination,
+                            name: f.name.clone(),
+                            ty: f.ty.clone(),
+                            role: f.role,
+                        })
+                        .collect(),
+                },
+            ),
         }]),
     };
     let draft = ConnectorWriteRecipeDraft::try_new(
@@ -472,6 +475,7 @@ fn checked_package(
                 max: 8,
                 requires_power_of_two: true,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let flow = ExpressionControlFlow::try_new(

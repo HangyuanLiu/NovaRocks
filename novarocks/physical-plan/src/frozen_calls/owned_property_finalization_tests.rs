@@ -365,8 +365,9 @@ fn owned_finalization_runs_final_package_constants_parameters_pruning_contract_a
                         destination: Distribution::Unconstrained,
                         destination_multiplicity: RowMultiplicity::Replicated,
                     },
-                    change_stream_writer: None,
-                    writer_result: None,
+                    source_port: crate::FragmentOutputPort::Root,
+                    delivery: crate::DeliveryRequirement::DemandDriven,
+                    payload: crate::ExchangePayloadContract::Relational,
                 }])
             }
             _ => unreachable!(),
@@ -406,7 +407,12 @@ fn owned_finalization_real_wide_project_source_preserves_all_definitions_and_qua
     }
     let mut fixture = frozen_fixture(
         builder
-            .finish_definition(child, FragmentSink::Noop, dop())
+            .finish_definition(
+                child,
+                FragmentSink::Noop,
+                dop(),
+                crate::StagePlacementPolicy::Singleton,
+            )
             .unwrap(),
     );
     replace_properties(&mut fixture, |parts| {

@@ -30,6 +30,12 @@
 //!
 //! Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 
+#[expect(
+    dead_code,
+    reason = "P07 dual-input kernels await P08 Task binding and P09 builder integration."
+)]
+pub(crate) mod logical_input;
+
 use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 
@@ -335,6 +341,9 @@ impl TableFinishOperatorFactory {
     }
 
     fn create_operator(&self, dop: i32, driver_id: i32) -> TableFinishStep {
+        Transform::hydrating(self.create_kernel(dop, driver_id))
+    }
+    fn create_kernel(&self, dop: i32, driver_id: i32) -> TableFinishOperator {
         // The builder creates this factory's pipeline at DOP 1, converging every
         // writer input into it first, so any other degree of parallelism means
         // the plan and the pipeline disagree about who owns the complete
@@ -346,7 +355,7 @@ impl TableFinishOperatorFactory {
                 "table finish must run at DOP 1 on a single driver, but was created with dop={dop} driver_id={driver_id}"
             ))
         });
-        Transform::hydrating(TableFinishOperator {
+        TableFinishOperator {
             name: self.name.clone(),
             expected_targets: Arc::clone(&self.expected_targets),
             fragment_validator: Arc::clone(&self.fragment_validator),
@@ -370,6 +379,7 @@ impl TableFinishOperatorFactory {
                 .collect(),
             parallelism_error,
             rows: WriteRowCountAccumulator::new(),
+            logical_rows: None,
             ledger: PreparedWriteSetLedger::new(),
             fragments: Vec::new(),
             aggregate: None,
@@ -389,7 +399,7 @@ impl TableFinishOperatorFactory {
             source_observable: Arc::new(Observable::new()),
             input: None,
             pending_rows: 0,
-        })
+        }
     }
 }
 
@@ -642,6 +652,8 @@ struct TableFinishOperator {
     channel_to_call: Vec<Option<usize>>,
     parallelism_error: Option<ExecutionFailure>,
     rows: WriteRowCountAccumulator,
+    // Set only by the finish-owned logical input after both inputs reach EOS.
+    logical_rows: Option<novarocks_local_program::LogicalChangeCounts>,
     ledger: PreparedWriteSetLedger,
     fragments: Vec<BufferedFragment>,
     aggregate: Option<ChildStep>,
@@ -957,7 +969,8 @@ impl TableFinishOperator {
     fn begin_finalize(&mut self) -> ExecutionResult<()> {
         self.validate_coverage()?;
         self.prefix_output = Some(PrefixOutputDriver::try_new(
-            self.rows.get(),
+            self.logical_rows
+                .map_or(self.rows.get(), |counts| counts.affected_rows()),
             std::mem::take(&mut self.fragments),
             Arc::clone(self.prepared_root_schema()?.chunk_schema()),
             self.output_tracker.as_ref().map(Arc::clone),
@@ -1816,7 +1829,12 @@ impl TableFinishOperator {
         if let Some(error) = self.runtime_error() {
             return Err(error);
         }
-        if !ctx.work().try_consume(1) {
+        let delegates = self.input.is_none()
+            && self.phase != FinishPhase::Finalizing
+            && self.prefix_output.is_none()
+            && (self.grouped_unpivot.is_some()
+                || self.aggregate.as_ref().is_some_and(ChildStep::runnable));
+        if ctx.work().remaining() == 0 || !delegates && !ctx.work().try_consume(1) {
             return Ok(self.result(None, NextStep::Yield));
         }
         if self.phase == FinishPhase::Finalizing {
@@ -5474,7 +5492,12 @@ mod tests {
                     .unwrap();
                 let fragment = with_requests(
                     producer
-                        .finish_definition(writer, FragmentSink::Stream { edge }, dop())
+                        .finish_definition(
+                            writer,
+                            FragmentSink::Stream { edge },
+                            dop(),
+                            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+                        )
                         .unwrap(),
                     partial.iter().enumerate().map(|(call, item)| {
                         (
@@ -5531,9 +5554,12 @@ mod tests {
                     })
                     .unwrap();
                 plan.add_edge(Edge {
+                    role: novarocks_physical_plan::OutputRole::WriterResults,
+                    delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
                     id: edge,
                     kind: EdgeKind::Stream,
                     source: EdgeSource {
+                        port: novarocks_physical_plan::FragmentOutputPort::Root,
                         fragment: fragment_id,
                         projection: fields.iter().map(|field| field.value).collect(),
                     },
@@ -5678,6 +5704,12 @@ mod tests {
                         columns: outputs.iter().map(|field| field.value).collect(),
                     },
                     kind: NodeKind::TableFinish(WriterFinishSpec {
+                        count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
+                        inputs: novarocks_physical_plan::FinishInputs {
+                            writer_results: 0,
+                            logical_summary: None,
+                        },
+                        logical_summary: None,
                         expected_target_ordinals: ordinals.clone(),
                         input_schema: WriterRelationSchema {
                             revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -5709,7 +5741,12 @@ mod tests {
                 .unwrap();
             let consumer = with_requests(
                 consumer
-                    .finish_definition(finish, FragmentSink::Result, dop())
+                    .finish_definition(
+                        finish,
+                        FragmentSink::Result,
+                        dop(),
+                        novarocks_physical_plan::StagePlacementPolicy::Singleton,
+                    )
                     .unwrap(),
                 finals.iter().enumerate().map(|(call, item)| {
                     (
@@ -6125,5 +6162,393 @@ mod tests {
                 .expect("actual local compiler accepts frozen any_value writer statistics"),
             )
         }
+    }
+    fn prepare_logical_finish(operator: &mut dyn Operator, state: &RuntimeState) {
+        operator.set_mem_tracker(MemTracker::new_root("logical finish driver"));
+        install_composite_construction(
+            operator,
+            state,
+            MemTracker::new_root("logical finish creator"),
+        );
+        operator.bind_runtime_state(state).unwrap();
+        operator.prepare().unwrap();
+    }
+    #[test]
+    fn logical_change_summary_finish_one_unit_turns_drain_writers_before_summary_end() {
+        use crate::exec::operators::{
+            logical_change_summary::tests::IngressFixture,
+            setop::union_all_shared::UnionAllSharedState,
+        };
+        use crate::exec::pipeline::step_context::TurnWork;
+        for summary_first in [true, false] {
+            let state = RuntimeState::default();
+            let shared = UnionAllSharedState::new_with_limits(1, 901, 1, 1);
+            let ingress = IngressFixture::new(1, &state);
+            shared
+                .push_chunk(
+                    None,
+                    writer_rows(vec![row_count_row(0, 5), row_count_row(1, 7)]),
+                )
+                .unwrap();
+            assert!(!shared.need_input());
+            let factory = factory(2).with_logical_input(shared.clone(), ingress.input());
+            let mut source = factory.create(1, 0);
+            prepare_logical_finish(source.as_mut(), &state);
+            let errors = state.error_state();
+            let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 1);
+            let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+            let mut outputs = Vec::new();
+            for _ in 0..20 {
+                work.begin_turn(1).unwrap();
+                let step = source
+                    .drive(&mut StepContext::new(&errors, &mut work, &mut conversions))
+                    .unwrap();
+                assert!(step.output.is_none());
+            }
+            assert!(
+                shared.need_input(),
+                "writer input must drain while the independent summary is pending"
+            );
+            if summary_first {
+                ingress.send(
+                    0,
+                    0,
+                    Some(novarocks_local_program::LogicalChangeCounts::try_new(2, 3, 4).unwrap()),
+                    true,
+                );
+            } else {
+                shared.producer_finished();
+            }
+            for _ in 0..20 {
+                work.begin_turn(1).unwrap();
+                let step = source
+                    .drive(&mut StepContext::new(&errors, &mut work, &mut conversions))
+                    .unwrap();
+                assert!(
+                    step.output.is_none(),
+                    "one normal EOS cannot finalize both roles"
+                );
+            }
+            if summary_first {
+                shared.producer_finished();
+            } else {
+                ingress.send(
+                    0,
+                    0,
+                    Some(novarocks_local_program::LogicalChangeCounts::try_new(2, 3, 4).unwrap()),
+                    true,
+                );
+            }
+            let mut done = false;
+            for _ in 0..100 {
+                work.begin_turn(1).unwrap();
+                let step = source
+                    .drive(&mut StepContext::new(&errors, &mut work, &mut conversions))
+                    .unwrap();
+                outputs.extend(step.output);
+                if matches!(step.next, NextStep::Finished) {
+                    done = true;
+                    break;
+                }
+            }
+            assert!(
+                done,
+                "one-unit turns must preserve the service cursor and finish"
+            );
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(
+                finish_columns(&outputs[0]).2.value(0),
+                9,
+                "physical 5+7 is not the logical 2+3+4"
+            );
+        }
+    }
+    #[test]
+    fn logical_change_summary_finish_real_driver_drains_early_statistics_under_a_tiny_waterline() {
+        use crate::exec::operators::{
+            ResultSinkFactory, ResultSinkHandle, logical_change_summary::tests::IngressFixture,
+            setop::union_all_shared::UnionAllSharedState,
+        };
+        use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
+        let (fixture, state, schema) = composite_fixture(2, 1, 1);
+        let state = Arc::new(state);
+        let shared = UnionAllSharedState::new_with_limits(1, 902, 1, 1);
+        let ingress = Arc::new(IngressFixture::new(1, &state));
+        // Each legal partial is larger than the whole local waterline. The
+        // producer cannot reach its logical summary until finish dequeues it.
+        shared
+            .push_chunk(
+                None,
+                composite_rows(
+                    &schema,
+                    vec![(
+                        WriterRowKind::AggregatePartial.to_wire(),
+                        0,
+                        None,
+                        None,
+                        vec![Some(b"early-zero".to_vec())],
+                    )],
+                ),
+            )
+            .unwrap();
+        let more = vec![
+            composite_rows(
+                &schema,
+                vec![(
+                    WriterRowKind::AggregatePartial.to_wire(),
+                    1,
+                    None,
+                    None,
+                    vec![Some(b"early-one".to_vec())],
+                )],
+            ),
+            composite_rows(
+                &schema,
+                vec![
+                    (
+                        WriterRowKind::RowCount.to_wire(),
+                        0,
+                        Some(5),
+                        None,
+                        vec![None],
+                    ),
+                    (
+                        WriterRowKind::RowCount.to_wire(),
+                        1,
+                        Some(7),
+                        None,
+                        vec![None],
+                    ),
+                ],
+            ),
+        ];
+        let factory = fixture
+            .inner
+            .with_logical_input(shared.clone(), ingress.input());
+        let mut source = factory.create(1, 0);
+        prepare_logical_finish(source.as_mut(), &state);
+        let output = ResultSinkHandle::new();
+        let mut sink = ResultSinkFactory::new(output.clone()).create(1, 0);
+        sink.set_construction_factory(super::super::logical_change_summary::tests::creator(&state));
+        sink.prepare().unwrap();
+        let mut driver = PipelineDriver::new(0, vec![source, sink], None, vec![], state, None);
+        std::thread::scope(|scope| {
+            let shared = shared.clone();
+            let ingress = ingress.clone();
+            let producer = scope.spawn(move || {
+                for chunk in more {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !shared.need_input() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "finish must free writer partial capacity before summary exists"
+                        );
+                        std::thread::yield_now();
+                    }
+                    shared.push_chunk(None, chunk).unwrap();
+                }
+                shared.producer_finished();
+                ingress.send(
+                    0,
+                    0,
+                    Some(novarocks_local_program::LogicalChangeCounts::try_new(2, 3, 4).unwrap()),
+                    true,
+                );
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut done = false;
+            while Instant::now() < deadline {
+                match driver.process(Duration::from_millis(2)) {
+                    DriverState::Finished => {
+                        done = true;
+                        break;
+                    }
+                    DriverState::Failed(error) => panic!("actual finish driver failed: {error}"),
+                    _ => std::thread::yield_now(),
+                }
+            }
+            producer.join().unwrap();
+            assert!(
+                done,
+                "both independently progressing inputs must reach real driver completion"
+            );
+        });
+        let chunks = output.take_chunks();
+        let mut summaries = 0;
+        let mut artifacts = 0;
+        for chunk in &chunks {
+            let (kinds, _, counts, _) = finish_columns(chunk);
+            for row in 0..chunk.len() {
+                if kinds.value(row) == RootRowKind::Summary.to_wire() {
+                    summaries += 1;
+                    assert_eq!(counts.value(row), 9);
+                } else if kinds.value(row) == RootRowKind::ArtifactDraft.to_wire() {
+                    artifacts += 1;
+                }
+            }
+        }
+        assert_eq!(summaries, 1);
+        assert_eq!(
+            artifacts, 2,
+            "existing final aggregate and grouped Unpivot remain the statistics owners"
+        );
+    }
+    #[test]
+    fn logical_change_summary_finish_rejects_normal_missing_and_withdrawn_writer_but_preserves_original_control()
+     {
+        use crate::exec::operators::{
+            logical_change_summary::tests::IngressFixture,
+            setop::union_all_shared::UnionAllSharedState,
+        };
+        for abandoned in [false, true] {
+            let state = RuntimeState::default();
+            let shared = UnionAllSharedState::new_with_limits(1, 903, 1024, 1024);
+            let ingress = IngressFixture::new(1, &state);
+            if abandoned {
+                shared.producer_abandoned();
+            } else {
+                shared.producer_finished();
+            }
+            ingress.send(0, 0, None, true);
+            let mut source = factory(1)
+                .with_logical_input(shared, ingress.input())
+                .create(1, 0);
+            prepare_logical_finish(source.as_mut(), &state);
+            let mut calls = TestDriver::new(source.as_mut(), &state);
+            let error = calls.collect_until_finished().unwrap_err();
+            assert!(
+                error.detail().contains(if abandoned {
+                    "withdrew"
+                } else {
+                    "incomplete source coverage"
+                }),
+                "{error}"
+            );
+        }
+        let state = RuntimeState::default();
+        let shared = UnionAllSharedState::new_with_limits(1, 904, 1024, 1024);
+        let ingress = IngressFixture::new(1, &state);
+        shared.producer_finished();
+        ingress.send(0, 0, None, true);
+        let mut source = factory(1)
+            .with_logical_input(shared, ingress.input())
+            .create(1, 0);
+        prepare_logical_finish(source.as_mut(), &state);
+        let original = finish_contract(
+            FinishContractSite::Relation,
+            "original required input failure",
+        );
+        crate::runtime::fragment::ExecutionFailureReporter::report_failure(
+            state.error_state().as_ref(),
+            original.clone(),
+        );
+        assert!(
+            source
+                .drive_for_test(&state)
+                .unwrap_err()
+                .same_occurrence(&original)
+        );
+    }
+    #[test]
+    fn logical_change_summary_finish_one_unit_turns_include_real_statistics_and_grouped_unpivot() {
+        use crate::exec::operators::{
+            logical_change_summary::tests::IngressFixture,
+            setop::union_all_shared::UnionAllSharedState,
+        };
+        use crate::exec::pipeline::step_context::TurnWork;
+        let (fixture, state, schema) = composite_fixture(2, 1, 1);
+        let shared = UnionAllSharedState::new_with_limits(1, 905, 1, 1);
+        let ingress = IngressFixture::new(1, &state);
+        shared
+            .push_chunk(
+                None,
+                composite_rows(
+                    &schema,
+                    vec![
+                        (
+                            WriterRowKind::AggregatePartial.to_wire(),
+                            0,
+                            None,
+                            None,
+                            vec![Some(b"group-zero".to_vec())],
+                        ),
+                        (
+                            WriterRowKind::AggregatePartial.to_wire(),
+                            1,
+                            None,
+                            None,
+                            vec![Some(b"group-one".to_vec())],
+                        ),
+                        (
+                            WriterRowKind::RowCount.to_wire(),
+                            0,
+                            Some(5),
+                            None,
+                            vec![None],
+                        ),
+                        (
+                            WriterRowKind::RowCount.to_wire(),
+                            1,
+                            Some(7),
+                            None,
+                            vec![None],
+                        ),
+                    ],
+                ),
+            )
+            .unwrap();
+        shared.producer_finished();
+        ingress.send(
+            0,
+            0,
+            Some(novarocks_local_program::LogicalChangeCounts::try_new(2, 3, 4).unwrap()),
+            true,
+        );
+        let mut source = fixture
+            .inner
+            .with_logical_input(shared, ingress.input())
+            .create(1, 0);
+        prepare_logical_finish(source.as_mut(), &state);
+        let errors = state.error_state();
+        let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 0);
+        let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+        assert!(matches!(
+            source
+                .drive(&mut StepContext::new(&errors, &mut work, &mut conversions))
+                .unwrap()
+                .next,
+            NextStep::Yield
+        ));
+        let mut chunks = Vec::new();
+        let mut done = false;
+        for _ in 0..1024 {
+            work.begin_turn(1).unwrap();
+            let step = source
+                .drive(&mut StepContext::new(&errors, &mut work, &mut conversions))
+                .unwrap();
+            chunks.extend(step.output);
+            if matches!(step.next, NextStep::Finished) {
+                done = true;
+                break;
+            }
+        }
+        assert!(
+            done,
+            "real final aggregate and grouped Unpivot must receive their quantum"
+        );
+        let mut summaries = 0;
+        let mut artifacts = 0;
+        for chunk in &chunks {
+            let (kinds, _, counts, _) = finish_columns(chunk);
+            for row in 0..chunk.len() {
+                if kinds.value(row) == RootRowKind::Summary.to_wire() {
+                    summaries += 1;
+                    assert_eq!(counts.value(row), 9);
+                } else if kinds.value(row) == RootRowKind::ArtifactDraft.to_wire() {
+                    artifacts += 1;
+                }
+            }
+        }
+        assert_eq!((summaries, artifacts), (1, 2));
     }
 }

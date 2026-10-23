@@ -333,6 +333,7 @@ fn try_fixture(
         },
         PlanLimits::FROZEN,
         &Control,
+        novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
     let domain = EvaluationDomainId::new(u32::MAX);
@@ -541,8 +542,8 @@ fn mandatory_source_refuses_repeated_node_output_before_compiler() {
 }
 
 #[test]
-fn small_success_and_ordinary_refusal_keep_every_original_compile_callback_prefix() {
-    for invalid_dop in [false, true] {
+fn change_events_preserve_parallel_driver_width_and_every_compile_callback_prefix() {
+    for parallel in [false, true] {
         let source = fixture(3, false, false);
         let invoke = |control: &dyn PureCompileControl| {
             let providers =
@@ -551,7 +552,7 @@ fn small_success_and_ordinary_refusal_keep_every_original_compile_callback_prefi
             let checked =
                 validate_fragment_providers(source.package.clone(), &providers, &Control).unwrap();
             let mut selected_options = options();
-            if invalid_dop {
+            if parallel {
                 selected_options.root_sink_dop = None;
                 selected_options.pipeline_dop = NonZeroUsize::new(2).unwrap();
             }
@@ -559,12 +560,11 @@ fn small_success_and_ordinary_refusal_keep_every_original_compile_callback_prefi
         };
         let baseline = Trace::new(None, CompileControlError::Cancelled);
         let result = invoke(&baseline);
-        assert_eq!(result.is_ok(), !invalid_dop);
-        if invalid_dop {
-            assert!(
-                matches!(result, Err(FragmentCompileError::Unsupported { node: Some(id), feature: "change-event source-chain distribution or driver count" }) if id == NodeId::new(901))
-            );
-        }
+        let program = result.expect("change events preserve the admitted driver width");
+        assert_eq!(
+            program.graph().profile().pipeline_dop().get(),
+            if parallel { 2 } else { 1 }
+        );
         let expected = baseline.events.lock().unwrap().clone();
         for at in 0..expected.len() {
             for cause in [

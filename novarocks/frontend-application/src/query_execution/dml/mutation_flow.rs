@@ -438,7 +438,7 @@ fn compile_dml_change_stream_write(
             write_target_ordinal: write_target.ordinal(),
             accepted_effects: route.accepted_effects().to_vec(),
             input_ordinals: route.input_ordinals().to_vec(),
-            partition_input_tokens: route.partition_fields().to_vec(),
+            requirements: route.requirements().clone(),
             sink,
         });
         statistics_targets.push(
@@ -1767,6 +1767,7 @@ fn build_update_mor_change_stream_write_plan(
             target_columns: target_columns.to_vec(),
         },
         Some(DmlPreExpandKeyedAssert {
+            applicability_output_ordinal: None,
             key_column_name: "__nr_row_id".to_string(),
             key_label: novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
             message_prefix: "MOR UPDATE matched target row".to_string(),
@@ -3141,7 +3142,8 @@ fn run_one_cow_target(
         target_binding,
         sink_mode,
         novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
-    )?;
+    )?
+    .with_external_count_owner();
     let assembly = match plan.frozen_read {
         Some(frozen) => {
             crate::query_execution::pinned_connector_read::admit_pinned_file_set_scan_binding(
@@ -4844,6 +4846,7 @@ fn build_merge_mor_change_stream_write_plan(
             not_matched_insert: has_not_matched_insert,
         },
         (has_matched_update || has_matched_delete).then(|| DmlPreExpandKeyedAssert {
+            applicability_output_ordinal: None,
             // Matched rows use the real target `_row_id`; unmatched rows use
             // a generated negative row number so fresh-only rows do not
             // collide under the same NULL key before expansion.
@@ -5794,7 +5797,10 @@ mod tests {
             route.route_id(),
             route.accepted_effects().to_vec(),
             route.input_ordinals().to_vec(),
-            route.partition_fields().to_vec(),
+            novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
+                layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             vec![
                 novarocks_spi::connector::write_stack::ConnectorWriteSelectionBinding::new(
                     id_token,
@@ -6033,7 +6039,7 @@ mod tests {
                     )
                 })
                 .collect(),
-            fixture.route_facts.partition_fields().to_vec(),
+            fixture.route_facts.requirements().clone(),
             fixture.route_facts.selection_bindings().to_vec(),
         )
         .expect("route");
@@ -6088,7 +6094,10 @@ mod tests {
                     0,
                 ),
             ],
-            Vec::new(),
+            novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
+                layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             fixture.route_facts.selection_bindings()[..2].to_vec(),
         )
         .expect("append route");
@@ -7343,7 +7352,10 @@ mod tests {
             ),
             effects,
             input_ordinals,
-            Vec::new(),
+            novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
+                layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             Vec::new(),
         )?))
     }

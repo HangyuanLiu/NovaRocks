@@ -135,7 +135,12 @@ pub(super) fn unsafe_filter() -> Fixture {
         .unwrap();
     let mut fixture = frozen_fixture(
         builder
-            .finish_definition(repeat, FragmentSink::Noop, dop())
+            .finish_definition(
+                repeat,
+                FragmentSink::Noop,
+                dop(),
+                crate::StagePlacementPolicy::Singleton,
+            )
             .unwrap()
             .with_call_requests_observed(
                 vec![(PhysicalCallDefinition::Expression(predicate), request)],
@@ -359,7 +364,12 @@ pub(super) fn single_copy_dag() -> Fixture {
         .unwrap();
     let mut fixture = frozen_fixture(
         builder
-            .finish_definition(join, FragmentSink::Noop, dop())
+            .finish_definition(
+                join,
+                FragmentSink::Noop,
+                dop(),
+                crate::StagePlacementPolicy::Singleton,
+            )
             .unwrap()
             .with_call_requests_observed(requests, &Control::default())
             .unwrap(),
@@ -477,7 +487,12 @@ pub(super) fn exchange() -> (Fixture, FragmentCuts) {
         .unwrap();
     let fixture = frozen_fixture(
         builder
-            .finish_definition(node, FragmentSink::Noop, dop())
+            .finish_definition(
+                node,
+                FragmentSink::Noop,
+                dop(),
+                crate::StagePlacementPolicy::Singleton,
+            )
             .unwrap(),
     );
     let cuts = FragmentCuts {
@@ -493,8 +508,9 @@ pub(super) fn exchange() -> (Fixture, FragmentCuts) {
                 destination: Distribution::RoundRobin,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
             },
-            change_stream_writer: None,
-            writer_result: None,
+            source_port: crate::FragmentOutputPort::Root,
+            delivery: crate::DeliveryRequirement::DemandDriven,
+            payload: crate::ExchangePayloadContract::Relational,
         }]),
         outbound: Box::default(),
         runtime_filters: Box::default(),
@@ -585,7 +601,12 @@ fn all_derivation_wide_real_project_graph_quantum_uses_same_immutable_source() {
     }
     let mut fixture = frozen_fixture(
         builder
-            .finish_definition(child, FragmentSink::Noop, dop())
+            .finish_definition(
+                child,
+                FragmentSink::Noop,
+                dop(),
+                crate::StagePlacementPolicy::Singleton,
+            )
             .unwrap(),
     );
     replace_properties(&mut fixture, |parts| {

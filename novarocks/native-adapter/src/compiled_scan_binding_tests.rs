@@ -899,7 +899,12 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
     .unwrap();
     plan.add_fragment(
         builder
-            .finish_definition(SCAN, FragmentSink::Stream { edge: EDGE }, dop)
+            .finish_definition(
+                SCAN,
+                FragmentSink::Stream { edge: EDGE },
+                dop,
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            )
             .unwrap(),
     )
     .unwrap();
@@ -935,14 +940,22 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
         .unwrap();
     plan.add_fragment(
         consumer
-            .finish_definition(RECEIVER, FragmentSink::Result, dop)
+            .finish_definition(
+                RECEIVER,
+                FragmentSink::Result,
+                dop,
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            )
             .unwrap(),
     )
     .unwrap();
     plan.add_edge(Edge {
+        role: novarocks_physical_plan::OutputRole::Relational,
+        delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
         id: EDGE,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: novarocks_physical_plan::FragmentOutputPort::Root,
             fragment: PRODUCER,
             projection: provider.clone().into_boxed_slice(),
         },

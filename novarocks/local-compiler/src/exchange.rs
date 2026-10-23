@@ -85,17 +85,17 @@ fn lower_core_with_creation<H>(
         ))
         .into());
     }
-    if cut.kind != EdgeKind::Stream || cut.change_stream_writer.is_some() {
+    if cut.kind != EdgeKind::Stream && cut.kind != EdgeKind::ChangeStreamRouter {
         return Err((FragmentCompileError::Unsupported {
             node: Some(node.id),
-            feature: "inbound CTE or change-stream edge",
+            feature: "inbound CTE edge",
         })
         .into());
     }
     // A writer-result receiver presents the writer relation positionally,
     // named by its frozen relation fields; the finish admission proved that
     // it feeds exactly one finish.
-    let relation = cut.writer_result.as_ref().map(|relation| &relation.fields);
+    let relation = cut.writer_result().map(|relation| &relation.fields);
     if relation.is_some_and(|fields| fields.len() != node.output.columns.len()) {
         return Err((FragmentCompileError::Invalid(
             "writer-result cut width differs from its receiver",
@@ -127,15 +127,18 @@ fn lower_core_with_creation<H>(
             .into());
         }
     }
-    // The edge names keys in the destination value domain. Repeated imports
-    // carry the same sent value, with a fresh channel per output occurrence.
-    // Use the first occurrence, as channel planning does, preserving key order.
+    // Repeated imports retain independent output channels. Routing reads the
+    // first occurrence of each destination value, as channel planning does,
+    // preserving the declared key order. Applicability follows the same rule.
     let keys = match &cut.partitioning.destination {
-        Distribution::Hash { keys, .. } | Distribution::BucketShuffle { keys, .. } => {
+        Distribution::Hash { keys, .. }
+        | Distribution::ConditionalKey { keys, .. }
+        | Distribution::BucketShuffle { keys, .. } => {
             if keys.is_empty() {
-                return Err(
-                    (FragmentCompileError::Invalid("ExchangeSource hash cut has no keys")).into(),
-                );
+                return Err((FragmentCompileError::Invalid(
+                    "ExchangeSource keyed cut has no keys",
+                ))
+                .into());
             }
             keys.as_ref()
         }
@@ -201,6 +204,45 @@ fn lower_core_with_creation<H>(
                     creation,
                 )?
             }
+            (None, None)
+                if matches!(
+                    cut.payload,
+                    novarocks_physical_plan::ExchangePayloadContract::LogicalSummary(_)
+                ) =>
+            {
+                let names = ["inserted", "replaced", "deleted"];
+                let name = names.get(ordinal).ok_or(FragmentCompileError::Invalid(
+                    "summary receiver width differs",
+                ))?;
+                crate::typed_layout::copy_name_with_creation(name, work, creation)?
+            }
+            (None, None) if cut.change_stream_writer().is_some() => {
+                let root = package
+                    .fragment()
+                    .nodes()
+                    .get(&package.fragment().root())
+                    .ok_or(FragmentCompileError::Invalid("missing route writer root"))?;
+                let NodeKind::TableWriter { target } = &root.kind else {
+                    return Err(FragmentCompileError::Invalid(
+                        "provider route receiver has no writer",
+                    )
+                    .into());
+                };
+                let field =
+                    target
+                        .target_fields
+                        .get(ordinal)
+                        .ok_or(FragmentCompileError::Invalid(
+                            "provider route field is absent",
+                        ))?;
+                if field.input != *value {
+                    return Err(FragmentCompileError::Invalid(
+                        "provider route field occurrence differs",
+                    )
+                    .into());
+                }
+                crate::typed_layout::copy_name_with_creation(&field.provider_name, work, creation)?
+            }
             (None, None) => crate::typed_layout::local_name_with_creation(
                 "local_exchange",
                 node.id.get(),
@@ -224,6 +266,41 @@ fn lower_core_with_creation<H>(
         },
         layout,
         input: CompiledExchangeInput {
+            role: crate::stream_sink::cut_role(cut.payload.role()),
+            delivery: crate::stream_sink::cut_delivery(cut.delivery),
+            routing: match &cut.partitioning.destination {
+                Distribution::Hash { scheme, .. } => {
+                    novarocks_local_program::CompiledExchangeRouting::Hash {
+                        algorithm: scheme.definition.algorithm,
+                    }
+                }
+                Distribution::BucketShuffle { scheme, .. } => {
+                    novarocks_local_program::CompiledExchangeRouting::BucketShuffle {
+                        algorithm: scheme.hash,
+                    }
+                }
+                Distribution::ConditionalKey {
+                    applies, scheme, ..
+                } => {
+                    let mut mask = None;
+                    for (ordinal, value) in node.output.columns.iter().enumerate() {
+                        if value == applies && mask.is_none() {
+                            mask = Some(slots[ordinal]);
+                        }
+                        work.step()?;
+                    }
+                    novarocks_local_program::CompiledExchangeRouting::ConditionalKey {
+                        applies: mask.ok_or(FragmentCompileError::Invalid(
+                            "conditional mask is absent from receiver",
+                        ))?,
+                        algorithm: scheme.definition.algorithm,
+                    }
+                }
+                Distribution::RoundRobin => {
+                    novarocks_local_program::CompiledExchangeRouting::RoundRobin
+                }
+                _ => novarocks_local_program::CompiledExchangeRouting::Unpartitioned,
+            },
             receiver_node: node.id.get(),
             edge: edge.get(),
             source_fragment: cut.source_fragment.get(),

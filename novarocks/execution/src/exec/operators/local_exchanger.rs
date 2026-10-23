@@ -35,6 +35,7 @@ use crate::exec::chunk::Chunk;
 #[cfg(test)]
 use crate::exec::operators::data_stream_sink::partition_chunk_by_hash_arrays;
 use crate::exec::pipeline::chunk_buffer_memory_manager::ChunkBufferMemoryManager;
+use crate::exec::pipeline::operator::InputConstructionOwner;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
@@ -78,6 +79,19 @@ struct LocalExchangerState {
 pub(crate) enum LocalExchangePartitionSpec {
     Single,
     InputSlotIds(Vec<SlotId>),
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "staged P09 builder integration")
+    )]
+    HierarchicalInputSlotIds(Vec<(SlotId, novarocks_type_contract::FunctionValueType)>),
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "staged P09 builder integration")
+    )]
+    ConditionalKey {
+        applies: SlotId,
+        keys: Vec<(SlotId, novarocks_type_contract::FunctionValueType)>,
+    },
 }
 
 /// How a local exchange bounds the chunks it queues.
@@ -268,6 +282,14 @@ impl LocalExchanger {
         Arc::clone(&self.closed_observable)
     }
 
+    pub(crate) fn retains_encoded_partition_input(&self) -> bool {
+        matches!(
+            &self.partition_spec,
+            LocalExchangePartitionSpec::HierarchicalInputSlotIds(_)
+                | LocalExchangePartitionSpec::ConditionalKey { .. }
+        )
+    }
+
     pub(crate) const fn consumer_count(&self) -> usize {
         self.consumer_count
     }
@@ -404,11 +426,12 @@ impl LocalExchanger {
         queue_tracker: Option<&Arc<MemTracker>>,
         chunk: Chunk,
         factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
-        ctx: &crate::exec::pipeline::step_context::StepContext<'_>,
+        ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        bypass_cursor: &mut usize,
     ) -> crate::runtime::fragment::ExecutionResult<()> {
         ctx.checkpoint()?;
         self.accept_with(queue_tracker, chunk, |chunk| {
-            self.partition_chunk_created(chunk, factory, ctx)
+            self.partition_chunk_created(chunk, factory, ctx, bypass_cursor)
         })
     }
     fn accept_with(
@@ -423,7 +446,12 @@ impl LocalExchanger {
         if chunk.is_empty() || self.all_consumers_closed() {
             return Ok(());
         }
-        if self.partition_count <= 1 {
+        if self.partition_count <= 1
+            && matches!(
+                &self.partition_spec,
+                LocalExchangePartitionSpec::Single | LocalExchangePartitionSpec::InputSlotIds(_)
+            )
+        {
             let mut chunk = chunk;
             if let Some(tracker) = queue_tracker {
                 chunk.transfer_to(tracker);
@@ -542,7 +570,8 @@ impl LocalExchanger {
         &self,
         chunk: &Chunk,
         factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
-        control: &crate::exec::pipeline::step_context::StepContext<'_>,
+        control: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        bypass_cursor: &mut usize,
     ) -> crate::runtime::fragment::ExecutionResult<Vec<(usize, Chunk)>> {
         let partitioned = match &self.partition_spec {
             LocalExchangePartitionSpec::InputSlotIds(slots) => {
@@ -559,6 +588,26 @@ impl LocalExchanger {
                     &|| control.checkpoint(),
                 )?
             }
+            LocalExchangePartitionSpec::HierarchicalInputSlotIds(slots) => {
+                return self.partition_hierarchical(
+                    chunk,
+                    slots,
+                    None,
+                    bypass_cursor,
+                    factory,
+                    control,
+                );
+            }
+            LocalExchangePartitionSpec::ConditionalKey { applies, keys } => {
+                return self.partition_hierarchical(
+                    chunk,
+                    keys,
+                    Some(*applies),
+                    bypass_cursor,
+                    factory,
+                    control,
+                );
+            }
             LocalExchangePartitionSpec::Single => {
                 return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
                     LocalPartitionContract,
@@ -566,6 +615,152 @@ impl LocalExchanger {
             }
         };
         Ok(partitioned.into_iter().enumerate().collect())
+    }
+
+    fn partition_hierarchical(
+        &self,
+        chunk: &Chunk,
+        slots: &[(SlotId, novarocks_type_contract::FunctionValueType)],
+        applies: Option<SlotId>,
+        bypass_cursor: &mut usize,
+        factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+        ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> crate::runtime::fragment::ExecutionResult<Vec<(usize, Chunk)>> {
+        use crate::exec::hash_table::partition_keys::{
+            native_tuple_hashes_observed, require_non_null_keys, source_key_owner,
+        };
+        use crate::exec::pipeline::operator::ConstructionFailure;
+        use crate::runtime::fragment::ExecutionFailure;
+        use arrow::array::{Array, ArrayRef, BooleanArray};
+        use novarocks_type_contract::{FunctionValueType, PartitionHashDomain};
+        use novarocks_value_arrays::reachability::ReachableRows;
+        let original_owner = factory.begin_input_construction(chunk)?;
+        let owner = source_key_owner(chunk, original_owner.as_ref())?;
+        let request = |layout: Result<std::alloc::Layout, std::alloc::LayoutError>| -> crate::runtime::fragment::ExecutionResult<()> {
+            owner.request(layout.map_err(|_| ConstructionFailure::from(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
+            Ok(())
+        };
+        request(std::alloc::Layout::array::<usize>(chunk.len()))?;
+        let mut selected = Vec::new();
+        selected.try_reserve_exact(chunk.len()).map_err(|source| {
+            ExecutionFailure::from_domain(novarocks_value_arrays::ValueError::Allocation {
+                requested: chunk.len().saturating_mul(size_of::<usize>()),
+                source,
+            })
+        })?;
+        let mask = applies
+            .map(|slot| chunk.column_by_slot_id(slot))
+            .transpose()?;
+        let mask = mask
+            .as_ref()
+            .map(|array| {
+                array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| ExecutionFailure::from_domain(LocalPartitionContract))
+            })
+            .transpose()?;
+        for row in 0..chunk.len() {
+            if row.is_multiple_of(256) {
+                ctx.checkpoint()?;
+            }
+            if mask.is_none_or(|mask| !mask.is_null(row) && mask.value(row)) {
+                selected.push(row);
+            }
+        }
+        let (control, conversions) = ctx.value_conversion_scope();
+        let checkpoint = || match control.error() {
+            Some(original) => Err(original),
+            None if control.is_stopped() => {
+                Err(novarocks_functions::KernelFailure::Cancelled.into())
+            }
+            None => Ok(()),
+        };
+        let hashes = if selected.is_empty() {
+            None
+        } else {
+            request(std::alloc::Layout::array::<ArrayRef>(slots.len()))?;
+            request(std::alloc::Layout::array::<FunctionValueType>(slots.len()))?;
+            let arrays = slots
+                .iter()
+                .map(|(slot, _)| chunk.column_by_slot_id(*slot))
+                .collect::<Result<Vec<_>, _>>()?;
+            let types = slots
+                .iter()
+                .map(|(slot, expected)| {
+                    let signed = chunk
+                        .chunk_schema()
+                        .slot(*slot)
+                        .ok_or_else(|| ExecutionFailure::from_domain(LocalPartitionContract))?;
+                    if signed.field_schema().value_type() != expected.value_type() {
+                        return Err(ExecutionFailure::from_domain(LocalPartitionContract));
+                    }
+                    Ok(expected.clone())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let rows = ReachableRows::indices(chunk.len(), &selected);
+            if applies.is_some() {
+                require_non_null_keys(&arrays, &types, &rows, &checkpoint)?;
+            }
+            Some(native_tuple_hashes_observed(
+                &arrays,
+                &types,
+                &rows,
+                conversions,
+                owner.as_ref(),
+                &checkpoint,
+            )?)
+        };
+        request(std::alloc::Layout::array::<Vec<u32>>(self.partition_count))?;
+        request(std::alloc::Layout::array::<usize>(self.partition_count))?;
+        request(std::alloc::Layout::array::<usize>(chunk.len()))?;
+        let mut destinations = Vec::with_capacity(chunk.len());
+        let mut counts = vec![0usize; self.partition_count];
+        for row in 0..chunk.len() {
+            if row.is_multiple_of(256) {
+                checkpoint()?;
+            }
+            let hash = hashes.as_ref().and_then(|batch| batch.as_slice()[row]);
+            let partition = if let Some(hash) = hash {
+                (PartitionHashDomain::DriverV1.mix(hash) % self.partition_count as u64) as usize
+            } else {
+                let partition = *bypass_cursor;
+                *bypass_cursor = (*bypass_cursor + 1) % self.partition_count;
+                partition
+            };
+            destinations.push(partition);
+            counts[partition] += 1;
+        }
+        let mut partition_rows = Vec::with_capacity(self.partition_count);
+        for count in counts {
+            request(std::alloc::Layout::array::<u32>(count))?;
+            partition_rows.push(Vec::with_capacity(count));
+        }
+        for (row, partition) in destinations.into_iter().enumerate() {
+            partition_rows[partition].push(
+                u32::try_from(row)
+                    .map_err(|_| ExecutionFailure::from_domain(LocalPartitionContract))?,
+            );
+        }
+        request(std::alloc::Layout::array::<(usize, Chunk)>(
+            self.partition_count,
+        ))?;
+        let mut result = Vec::with_capacity(self.partition_count);
+        for (partition, rows) in partition_rows.into_iter().enumerate() {
+            if !rows.is_empty() {
+                result.push((
+                    partition,
+                    super::data_stream_sink::take_partition_rows_created(
+                        chunk,
+                        &rows,
+                        factory,
+                        &checkpoint,
+                    )?,
+                ));
+            }
+        }
+        Ok(result)
     }
 
     #[cfg(test)]
@@ -581,7 +776,9 @@ impl LocalExchanger {
                 }
                 partition_chunk_by_hash_arrays(chunk, &arrays, self.partition_count, false)?
             }
-            LocalExchangePartitionSpec::Single => {
+            LocalExchangePartitionSpec::Single
+            | LocalExchangePartitionSpec::HierarchicalInputSlotIds(_)
+            | LocalExchangePartitionSpec::ConditionalKey { .. } => {
                 return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
                     LocalPartitionContract,
                 ));
@@ -833,5 +1030,159 @@ impl novarocks_failure_contract::FailureProjection for LocalPartitionContract {
             FailureClass::Invariant,
             crate::runtime::fragment::ExecutionReason::LocalPartitionContract.reason(),
         )
+    }
+}
+
+#[cfg(test)]
+mod hierarchical_tests {
+    use super::*;
+    use crate::exec::{
+        hash_table::partition_keys::native_tuple_hashes_observed,
+        pipeline::step_context::{StepContext, TurnWork},
+    };
+    use arrow::{
+        array::{ArrayRef, Int32Array},
+        datatypes::DataType,
+    };
+    use novarocks_type_contract::{FunctionValueType, PartitionHashDomain};
+    use novarocks_value_arrays::{decode::ValueConversionContext, reachability::ReachableRows};
+    use std::collections::{HashMap, HashSet};
+
+    fn with_test_step<T>(rt: &RuntimeState, action: impl FnOnce(&mut StepContext<'_>) -> T) -> T {
+        let control = rt.error_state();
+        let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        action(&mut StepContext::new(
+            &control,
+            &mut work,
+            &mut ValueConversionContext::default(),
+        ))
+    }
+    fn input(keys: Vec<i32>) -> Chunk {
+        let rows = keys.len();
+        crate::exec::chunk::typed_fixture::columns(
+            &["key"],
+            &[SlotId::new(1)],
+            &[FunctionValueType::new(DataType::Int32, false)],
+            vec![Arc::new(Int32Array::from(keys)) as ArrayRef],
+            rows,
+        )
+    }
+    #[test]
+    fn instance_and_driver_levels_keep_one_author_and_use_multiple_drivers() {
+        let rt = RuntimeState::default();
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(), MemTracker::new_root("two-level partition fixture"),rt.error_state()).unwrap();
+        let source = input((0..1024).collect());
+        let owner = factory.begin_input_construction(&source).unwrap();
+        let hashes = native_tuple_hashes_observed(
+            source.columns(),
+            &[FunctionValueType::new(DataType::Int32, false)],
+            &ReachableRows::all(source.len()),
+            &mut ValueConversionContext::default(),
+            owner.as_ref(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        for (instances, drivers) in [(4, 4), (4, 2), (3, 4)] {
+            let mut authors = HashMap::new();
+            let mut coverage = vec![HashSet::new(); instances];
+            for (instance, instance_coverage) in coverage.iter_mut().enumerate() {
+                let exchanger = LocalExchanger::new_with_limits(
+                    drivers,
+                    4,
+                    LocalExchangePartitionSpec::HierarchicalInputSlotIds(vec![(
+                        SlotId::new(1),
+                        FunctionValueType::new(DataType::Int32, false),
+                    )]),
+                    1 << 30,
+                    -1,
+                );
+                let keys = (0..1024)
+                    .filter(|&key| {
+                        PartitionHashDomain::InstanceV1.mix(hashes.as_slice()[key].unwrap())
+                            % instances as u64
+                            == instance as u64
+                    })
+                    .map(|key| key as i32)
+                    .collect::<Vec<_>>();
+                for _producer in 0..4 {
+                    let chunk = input(keys.clone());
+                    let mut cursor = 0;
+                    let parts = with_test_step(&rt, |ctx| {
+                        exchanger.partition_chunk_created(
+                            &chunk,
+                            factory.as_ref(),
+                            ctx,
+                            &mut cursor,
+                        )
+                    })
+                    .unwrap();
+                    for (driver, part) in parts {
+                        instance_coverage.insert(driver);
+                        for &key in part.columns()[0]
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .values()
+                        {
+                            if let Some(author) = authors.insert(key, (instance, driver)) {
+                                assert_eq!(author, (instance, driver));
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(authors.len(), 1024);
+            assert!(coverage.iter().all(|drivers| drivers.len() > 1));
+        }
+    }
+    #[test]
+    fn conditional_local_uses_explicit_l_when_actual_string_is_dictionary() {
+        use arrow::array::{BooleanArray, DictionaryArray, StringArray};
+        use arrow::datatypes::Int32Type;
+        let rt = RuntimeState::default();
+        let frozen = FunctionValueType::new(DataType::Utf8View, true);
+        let dictionary = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![0, 1]),
+                Arc::new(StringArray::from(vec![Some("matched"), None])) as ArrayRef,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let source = crate::exec::hash_table::partition_keys::typed_encoded_tuple_fixture(
+            &["key", "applies"],
+            &[SlotId::new(1), SlotId::new(2)],
+            &[
+                frozen.clone(),
+                FunctionValueType::new(DataType::Boolean, false),
+            ],
+            vec![dictionary, Arc::new(BooleanArray::from(vec![true, false]))],
+            2,
+        );
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),MemTracker::new_root("local frozen L fixture"),rt.error_state()).unwrap();
+        let exchanger = LocalExchanger::new_with_limits(
+            4,
+            1,
+            LocalExchangePartitionSpec::ConditionalKey {
+                applies: SlotId::new(2),
+                keys: vec![(SlotId::new(1), frozen)],
+            },
+            1 << 30,
+            -1,
+        );
+        let mut cursor = 0;
+        let output = with_test_step(&rt, |ctx| {
+            exchanger.partition_chunk_created(&source, factory.as_ref(), ctx, &mut cursor)
+        })
+        .unwrap();
+        assert_eq!(
+            output.iter().map(|(_, chunk)| chunk.len()).sum::<usize>(),
+            2
+        );
+        assert_eq!(
+            cursor, 1,
+            "excluded dictionary NULL follows the explicit bypass stream"
+        );
     }
 }

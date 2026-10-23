@@ -261,6 +261,7 @@ fn plan() -> (PhysicalPlan, FrozenConnectorRead) {
                 max: 4,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
 

@@ -26,11 +26,13 @@ pub(crate) fn insert_pre_expand_keyed_assert(
 ) -> Result<(), String> {
     let mut expand_count = 0usize;
     let mut key_column_id = None;
+    let mut applicability_column_id = None;
     validate_pre_expand_keyed_assert_in_node(
         physical,
         keyed_assert,
         &mut expand_count,
         &mut key_column_id,
+        &mut applicability_column_id,
     )?;
     if expand_count != 1 {
         return Err(format!(
@@ -38,7 +40,12 @@ pub(crate) fn insert_pre_expand_keyed_assert(
         ));
     }
     let key_column_id = key_column_id.expect("one validated ChangeEventExpand has one key");
-    apply_pre_expand_keyed_assert_in_node(physical, keyed_assert, key_column_id);
+    apply_pre_expand_keyed_assert_in_node(
+        physical,
+        keyed_assert,
+        key_column_id,
+        applicability_column_id,
+    );
     Ok(())
 }
 
@@ -47,9 +54,16 @@ fn validate_pre_expand_keyed_assert_in_node(
     keyed_assert: &PreExpandKeyedAssertSpec,
     expand_count: &mut usize,
     key_column_id: &mut Option<ColumnId>,
+    applicability_column_id: &mut Option<ColumnId>,
 ) -> Result<(), String> {
     for child in &node.children {
-        validate_pre_expand_keyed_assert_in_node(child, keyed_assert, expand_count, key_column_id)?;
+        validate_pre_expand_keyed_assert_in_node(
+            child,
+            keyed_assert,
+            expand_count,
+            key_column_id,
+            applicability_column_id,
+        )?;
     }
 
     let PhysicalPlanKind::ChangeEventExpand(expand) = &node.kind else {
@@ -63,6 +77,15 @@ fn validate_pre_expand_keyed_assert_in_node(
         ));
     };
     *key_column_id = Some(find_pre_expand_key_column_id(child, expand, keyed_assert)?);
+    *applicability_column_id = keyed_assert.applicability_output_ordinal.map(|ordinal| {
+        let column = effective_physical_output_columns(child).get(ordinal).ok_or_else(|| {
+            format!("DML change-stream applicability output ordinal {ordinal} is outside the native child")
+        })?;
+        if column.value_type.data_type() != &arrow::datatypes::DataType::Boolean {
+            return Err("DML change-stream applicability output must be Boolean".to_string());
+        }
+        Ok(column.column_id)
+    }).transpose()?;
     Ok(())
 }
 
@@ -70,9 +93,15 @@ fn apply_pre_expand_keyed_assert_in_node(
     node: &mut PhysicalPlanNode,
     keyed_assert: &PreExpandKeyedAssertSpec,
     key_column_id: ColumnId,
+    applicability_column_id: Option<ColumnId>,
 ) -> bool {
     for child in &mut node.children {
-        if apply_pre_expand_keyed_assert_in_node(child, keyed_assert, key_column_id) {
+        if apply_pre_expand_keyed_assert_in_node(
+            child,
+            keyed_assert,
+            key_column_id,
+            applicability_column_id,
+        ) {
             return true;
         }
     }
@@ -88,6 +117,7 @@ fn apply_pre_expand_keyed_assert_in_node(
             vec![key_column_id],
             vec![keyed_assert.key_label.clone()],
             keyed_assert.message_prefix.clone(),
+            applicability_column_id,
         )),
         children: vec![child],
         output_columns,

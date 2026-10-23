@@ -325,6 +325,107 @@ fn count_partition(
     }
     Ok(())
 }
+closed!(
+    source_port,
+    read_source_port,
+    FragmentOutputPort,
+    FragmentOutputPort,
+    Root,
+    LogicalSummary
+);
+closed!(
+    delivery,
+    read_delivery,
+    DeliveryRequirement,
+    DeliveryRequirement,
+    DemandDriven,
+    MustDrain
+);
+
+#[derive(Clone, Copy)]
+enum RawPayload<'a> {
+    Relational,
+    ProviderRoute(&'a wire::ChangeStreamWriterCut),
+    WriterResults(&'a wire::WriterResultCut),
+    LogicalSummary(&'a wire::LogicalSummaryCut),
+}
+fn raw_inbound_payload(
+    value: Option<&wire::inbound_fragment_cut::Payload>,
+) -> Result<RawPayload<'_>, E> {
+    use wire::inbound_fragment_cut::Payload as P;
+    Ok(match req(value)? {
+        P::Relational(_) => RawPayload::Relational,
+        P::ChangeStreamWriter(v) => RawPayload::ProviderRoute(v),
+        P::WriterResult(v) => RawPayload::WriterResults(v),
+        P::LogicalSummary(v) => RawPayload::LogicalSummary(v),
+    })
+}
+fn raw_outbound_payload(
+    value: Option<&wire::outbound_fragment_cut::Payload>,
+) -> Result<RawPayload<'_>, E> {
+    use wire::outbound_fragment_cut::Payload as P;
+    Ok(match req(value)? {
+        P::Relational(_) => RawPayload::Relational,
+        P::ChangeStreamWriter(v) => RawPayload::ProviderRoute(v),
+        P::WriterResult(v) => RawPayload::WriterResults(v),
+        P::LogicalSummary(v) => RawPayload::LogicalSummary(v),
+    })
+}
+fn summary_columns(value: &wire::LogicalSummaryColumns) -> Result<p::LogicalSummaryColumns, E> {
+    Ok(p::LogicalSummaryColumns {
+        inserted: p::ValueId::new(req(value.inserted_value_id)?),
+        replaced: p::ValueId::new(req(value.replaced_value_id)?),
+        deleted: p::ValueId::new(req(value.deleted_value_id)?),
+    })
+}
+fn encode_summary_columns(value: p::LogicalSummaryColumns) -> wire::LogicalSummaryColumns {
+    wire::LogicalSummaryColumns {
+        inserted_value_id: Some(value.inserted.get()),
+        replaced_value_id: Some(value.replaced.get()),
+        deleted_value_id: Some(value.deleted.get()),
+    }
+}
+fn decode_summary(value: &wire::LogicalSummaryCut) -> Result<p::LogicalSummaryCut, E> {
+    Ok(p::LogicalSummaryCut {
+        source: summary_columns(req(value.source.as_ref())?)?,
+        destination: summary_columns(req(value.destination.as_ref())?)?,
+    })
+}
+fn count_payload(
+    c: &mut Count,
+    physical: Option<&p::ExchangePayloadContract>,
+    raw: Option<RawPayload<'_>>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<(), E> {
+    let (change, result, rawchange, rawresult, summary) = match (physical, raw) {
+        (Some(p::ExchangePayloadContract::Relational), None)
+        | (None, Some(RawPayload::Relational)) => (None, None, None, None, false),
+        (Some(p::ExchangePayloadContract::ProviderRoute(v)), None) => {
+            (Some(v), None, None, None, false)
+        }
+        (Some(p::ExchangePayloadContract::WriterResults(v)), None) => {
+            (None, Some(v), None, None, false)
+        }
+        (Some(p::ExchangePayloadContract::LogicalSummary(_)), None) => {
+            (None, None, None, None, true)
+        }
+        (None, Some(RawPayload::ProviderRoute(v))) => (None, None, Some(v), None, false),
+        (None, Some(RawPayload::WriterResults(v))) => (None, None, None, Some(v), false),
+        (None, Some(RawPayload::LogicalSummary(v))) => {
+            decode_summary(v)?;
+            (None, None, None, None, true)
+        }
+        _ => return Err(shape("cut payload counting has no exact source")),
+    };
+    if summary {
+        c.model.items = r::add(c.model.items, 6)?;
+        c.gate()?;
+        for _ in 0..6 {
+            c.id(w)?;
+        }
+    }
+    count_extra(c, change, result, rawchange, rawresult, w)
+}
 fn count_extra(
     c: &mut Count,
     change: Option<&p::ChangeStreamWriterCut>,
@@ -758,14 +859,7 @@ fn count(
                 c.ty(w)?;
             }
             count_partition(c, Some(&x.partitioning), None, w)?;
-            count_extra(
-                c,
-                x.change_stream_writer.as_ref(),
-                x.writer_result.as_ref(),
-                None,
-                None,
-                w,
-            )?;
+            count_payload(c, Some(&x.payload), None, w)?;
         }
 
         for x in &p.outbound {
@@ -785,14 +879,7 @@ fn count(
                 c.ty(w)?;
             }
             count_partition(c, Some(&x.partitioning), None, w)?;
-            count_extra(
-                c,
-                x.change_stream_writer.as_ref(),
-                x.writer_result.as_ref(),
-                None,
-                None,
-                w,
-            )?;
+            count_payload(c, Some(&x.payload), None, w)?;
         }
         count_filters(c, Some(&p.runtime_filters), None, w)?;
         count_bindings(c, Some(&p.runtime_filter_bindings), None, w)?;
@@ -803,6 +890,8 @@ fn count(
             req(x.source_fragment_id)?;
             req(x.destination_node_id)?;
             read_edge(x.kind)?;
+            read_source_port(x.source_port)?;
+            read_delivery(x.delivery)?;
             c.list::<p::CutImport, wire::CutImport>(x.imports.len(), x.imports.capacity(), w)?;
             for v in &x.imports {
                 let t = req(v.source.as_ref())?;
@@ -814,20 +903,15 @@ fn count(
                 c.ty(w)?;
             }
             count_partition(c, None, x.partitioning.as_ref(), w)?;
-            count_extra(
-                c,
-                None,
-                None,
-                x.change_stream_writer.as_ref(),
-                x.writer_result.as_ref(),
-                w,
-            )?;
+            count_payload(c, None, Some(raw_inbound_payload(x.payload.as_ref())?), w)?;
         }
 
         for x in &p.outbound {
             req(x.edge_id)?;
             req(x.destination_fragment_id)?;
             read_edge(x.kind)?;
+            read_source_port(x.source_port)?;
+            read_delivery(x.delivery)?;
             c.list::<p::CutValue, wire::CutValue>(x.projection.len(), x.projection.capacity(), w)?;
             for v in &x.projection {
                 req(v.value_id)?;
@@ -850,14 +934,7 @@ fn count(
                 c.ty(w)?;
             }
             count_partition(c, None, x.partitioning.as_ref(), w)?;
-            count_extra(
-                c,
-                None,
-                None,
-                x.change_stream_writer.as_ref(),
-                x.writer_result.as_ref(),
-                w,
-            )?;
+            count_payload(c, None, Some(raw_outbound_payload(x.payload.as_ref())?), w)?;
         }
         count_filters(c, None, Some(&p.runtime_filters), w)?;
         count_bindings(c, None, Some(&p.runtime_filter_bindings), w)?;
@@ -872,7 +949,7 @@ fn types_physical(
         for v in &x.imports {
             f(&v.source.ty)?;
         }
-        if let Some(r) = &x.writer_result {
+        if let p::ExchangePayloadContract::WriterResults(r) = &x.payload {
             for v in &r.fields {
                 f(&v.ty)?;
             }
@@ -885,7 +962,7 @@ fn types_physical(
         for v in &x.destination_imports {
             f(&v.source.ty)?;
         }
-        if let Some(r) = &x.writer_result {
+        if let p::ExchangePayloadContract::WriterResults(r) = &x.payload {
             for v in &r.fields {
                 f(&v.ty)?;
             }
@@ -904,7 +981,7 @@ fn types_wire(p: &wire::FragmentCuts, mut f: impl FnMut(u32) -> Result<(), E>) -
         for v in &x.imports {
             f(req(req(v.source.as_ref())?.value_type_id)?)?;
         }
-        if let Some(r) = &x.writer_result {
+        if let RawPayload::WriterResults(r) = raw_inbound_payload(x.payload.as_ref())? {
             for v in &r.fields {
                 f(req(v.value_type_id)?)?;
             }
@@ -917,7 +994,7 @@ fn types_wire(p: &wire::FragmentCuts, mut f: impl FnMut(u32) -> Result<(), E>) -
         for v in &x.destination_imports {
             f(req(req(v.source.as_ref())?.value_type_id)?)?;
         }
-        if let Some(r) = &x.writer_result {
+        if let RawPayload::WriterResults(r) = raw_outbound_payload(x.payload.as_ref())? {
             for v in &r.fields {
                 f(req(v.value_type_id)?)?;
             }
@@ -1232,6 +1309,44 @@ fn decode_result(
         })?,
     })
 }
+fn decode_payload(
+    value: RawPayload<'_>,
+    t: &DecodedTypeTable,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<p::ExchangePayloadContract, E> {
+    Ok(match value {
+        RawPayload::Relational => p::ExchangePayloadContract::Relational,
+        RawPayload::ProviderRoute(v) => {
+            p::ExchangePayloadContract::ProviderRoute(decode_change(v, w)?)
+        }
+        RawPayload::WriterResults(v) => {
+            p::ExchangePayloadContract::WriterResults(decode_result(v, t, w)?)
+        }
+        RawPayload::LogicalSummary(v) => {
+            p::ExchangePayloadContract::LogicalSummary(decode_summary(v)?)
+        }
+    })
+}
+macro_rules! encode_payload {
+    ($value:expr, $module:ident, $e:expr, $w:expr) => {{
+        use wire::$module::Payload as P;
+        match $value {
+            p::ExchangePayloadContract::Relational => P::Relational(Empty {}),
+            p::ExchangePayloadContract::ProviderRoute(v) => {
+                P::ChangeStreamWriter(encode_change(v, $w)?)
+            }
+            p::ExchangePayloadContract::WriterResults(v) => {
+                P::WriterResult(encode_result(v, $e, $w)?)
+            }
+            p::ExchangePayloadContract::LogicalSummary(v) => {
+                P::LogicalSummary(wire::LogicalSummaryCut {
+                    source: Some(encode_summary_columns(v.source)),
+                    destination: Some(encode_summary_columns(v.destination)),
+                })
+            }
+        }
+    }};
+}
 fn encode_inbound(
     p: &p::InboundFragmentCut,
     e: &mut Encode<'_>,
@@ -1244,16 +1359,9 @@ fn encode_inbound(
         destination_node_id: Some(p.destination_node.get()),
         imports: vec_map(&p.imports, w, |p, _| encode_import(p, e))?,
         partitioning: Some(encode_partition(&p.partitioning, w)?),
-        change_stream_writer: p
-            .change_stream_writer
-            .as_ref()
-            .map(|p| encode_change(p, w))
-            .transpose()?,
-        writer_result: p
-            .writer_result
-            .as_ref()
-            .map(|p| encode_result(p, e, w))
-            .transpose()?,
+        source_port: source_port(p.source_port),
+        delivery: delivery(p.delivery),
+        payload: Some(encode_payload!(&p.payload, inbound_fragment_cut, e, w)),
     })
 }
 fn decode_inbound(
@@ -1268,16 +1376,9 @@ fn decode_inbound(
         destination_node: p::NodeId::new(req(p.destination_node_id)?),
         imports: box_map(&p.imports, w, |p, w| decode_import(p, t, w))?,
         partitioning: decode_partition(req(p.partitioning.as_ref())?, w)?,
-        change_stream_writer: p
-            .change_stream_writer
-            .as_ref()
-            .map(|p| decode_change(p, w))
-            .transpose()?,
-        writer_result: p
-            .writer_result
-            .as_ref()
-            .map(|p| decode_result(p, t, w))
-            .transpose()?,
+        source_port: read_source_port(p.source_port)?,
+        delivery: read_delivery(p.delivery)?,
+        payload: decode_payload(raw_inbound_payload(p.payload.as_ref())?, t, w)?,
     })
 }
 fn encode_outbound(
@@ -1293,16 +1394,9 @@ fn encode_outbound(
         projection: vec_map(&p.projection, w, |p, _| encode_value(p, e))?,
         destination_imports: vec_map(&p.destination_imports, w, |p, _| encode_import(p, e))?,
         partitioning: Some(encode_partition(&p.partitioning, w)?),
-        change_stream_writer: p
-            .change_stream_writer
-            .as_ref()
-            .map(|p| encode_change(p, w))
-            .transpose()?,
-        writer_result: p
-            .writer_result
-            .as_ref()
-            .map(|p| encode_result(p, e, w))
-            .transpose()?,
+        source_port: source_port(p.source_port),
+        delivery: delivery(p.delivery),
+        payload: Some(encode_payload!(&p.payload, outbound_fragment_cut, e, w)),
     })
 }
 fn decode_outbound(
@@ -1318,16 +1412,9 @@ fn decode_outbound(
         projection: box_map(&p.projection, w, |p, w| decode_value(p, t, w))?,
         destination_imports: box_map(&p.destination_imports, w, |p, w| decode_import(p, t, w))?,
         partitioning: decode_partition(req(p.partitioning.as_ref())?, w)?,
-        change_stream_writer: p
-            .change_stream_writer
-            .as_ref()
-            .map(|p| decode_change(p, w))
-            .transpose()?,
-        writer_result: p
-            .writer_result
-            .as_ref()
-            .map(|p| decode_result(p, t, w))
-            .transpose()?,
+        source_port: read_source_port(p.source_port)?,
+        delivery: read_delivery(p.delivery)?,
+        payload: decode_payload(raw_outbound_payload(p.payload.as_ref())?, t, w)?,
     })
 }
 fn encode_coverage(
@@ -1874,3 +1961,44 @@ fn decode_filter(
 #[cfg(test)]
 #[path = "physical_cuts_v2/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod summary_contract_tests {
+    use super::*;
+    #[test]
+    fn exchange_payload_port_delivery_and_counter_presence_have_no_defaults() {
+        assert!(raw_inbound_payload(None).is_err());
+        assert!(raw_outbound_payload(None).is_err());
+        for value in [0, -1, i32::MAX] {
+            assert!(read_source_port(value).is_err());
+            assert!(read_delivery(value).is_err());
+        }
+        let columns = wire::LogicalSummaryColumns {
+            inserted_value_id: Some(0),
+            replaced_value_id: Some(u32::MAX),
+            deleted_value_id: Some(7),
+        };
+        assert_eq!(
+            summary_columns(&columns).unwrap().values(),
+            [
+                p::ValueId::new(0),
+                p::ValueId::new(u32::MAX),
+                p::ValueId::new(7)
+            ]
+        );
+        assert!(
+            summary_columns(&wire::LogicalSummaryColumns {
+                inserted_value_id: None,
+                ..columns
+            })
+            .is_err()
+        );
+        assert!(
+            decode_summary(&wire::LogicalSummaryCut {
+                source: None,
+                destination: None
+            })
+            .is_err()
+        );
+    }
+}

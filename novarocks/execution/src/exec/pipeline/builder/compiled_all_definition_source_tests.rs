@@ -192,6 +192,7 @@ fn source_fixture() -> SourceFixture {
                 max: 1,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let requests = vec![
@@ -615,6 +616,7 @@ fn all_definition_source_original_publication_rejects_unreachable_definition() {
                 max: 1,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap_err();
     assert!(

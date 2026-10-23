@@ -429,6 +429,12 @@ fn group() -> p::WriterGroupedUnpivotSpec {
 }
 fn finisher(grouped: bool) -> p::PhysicalNode {
     header(p::NodeKind::TableFinish(p::WriterFinishSpec {
+        count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
+        inputs: novarocks_physical_plan::FinishInputs {
+            writer_results: 0,
+            logical_summary: None,
+        },
+        logical_summary: None,
         expected_target_ordinals: Box::from([
             WriteTargetOrdinal::try_new(4095).unwrap(),
             WriteTargetOrdinal::try_new(0).unwrap(),
@@ -623,6 +629,10 @@ fn expected(writer: bool, grouped: bool) -> wire::PhysicalNode {
             })
         } else {
             wire::physical_node::Kind::TableFinish(wire::WriterFinish {
+                count_mode: wire::FinishCountMode::WriterReported as i32,
+                writer_results_input: Some(0),
+                logical_summary_input: None,
+                logical_summary: None,
                 expected_target_ordinals: vec![4095, 0, 4095],
                 input_schema: Some(expected_schema()),
                 output_schema: Some(expected_schema()),
@@ -1860,5 +1870,94 @@ fn table_write_parent_known_containers_refuse_before_pending_callback() {
                 assert_eq!(c.trace(), vec![(CompilePhase::Decode, 0)]);
             }
         }
+    });
+}
+
+#[test]
+fn finish_summary_is_three_original_references_with_strict_header_presence() {
+    let c = Control::default();
+    let f = Fixture::new();
+    // Existing namespace IDs 0,7,MAX are enough to test the representation's
+    // precise reference domain. Static non-null Int64/port laws stay with IR
+    // validation; this test does not certify a complete physical graph.
+    let baseline = finisher(false);
+    let mut logical = baseline.clone();
+    let spec = finish_spec(&mut logical);
+    spec.count_mode = p::FinishCountMode::LogicalChanges;
+    spec.inputs.logical_summary = Some(1);
+    spec.logical_summary = Some(p::LogicalSummaryColumns {
+        inserted: p::ValueId::new(0),
+        replaced: p::ValueId::new(7),
+        deleted: p::ValueId::new(u32::MAX),
+    });
+    // Each physical owner must use the original binding loans it authored.
+    let base_ids = Ids::new(&baseline);
+    let (base_raw, base) = f.with(&baseline, &c, |v, e, _, _| {
+        c.arm(None);
+        encode_table_write_node(&baseline, v, e, base_ids.view(), SOURCE, limits()).unwrap()
+    });
+    let ids = Ids::new(&logical);
+    f.with(&logical, &c, |v, e, r, a| {
+        c.arm(None);
+        let (raw, facts) =
+            encode_table_write_node(&logical, v, e, ids.view(), SOURCE, limits()).unwrap();
+        assert_eq!(facts.value_reference_count, base.value_reference_count + 3);
+        assert_eq!(facts.list_item_count, base.list_item_count + 3);
+        assert_eq!(
+            facts.allocation_requests_upper_bound,
+            base.allocation_requests_upper_bound
+        );
+        assert_eq!(
+            facts.allocation_request_bytes_upper_bound,
+            base.allocation_request_bytes_upper_bound
+        );
+        let mut under = limits();
+        under.node.max_value_references = base.value_reference_count;
+        c.arm(None);
+        assert!(encode_table_write_node(&logical, v, e, ids.view(), SOURCE, under).is_err());
+        c.arm(None);
+        let (_, received_base) =
+            decode_table_write_node(&base_raw, r, a, SOURCE, limits()).unwrap();
+        c.arm(None);
+        let (owned, received) = decode_table_write_node(&raw, r, a, SOURCE, limits()).unwrap();
+        assert_eq!(owned, logical);
+        assert_eq!(
+            received.value_reference_count,
+            received_base.value_reference_count + 3
+        );
+        assert_eq!(received.list_item_count, received_base.list_item_count + 3);
+        c.arm(None);
+        assert!(decode_table_write_node(&raw, r, a, SOURCE, under).is_err());
+        for fault in 0..9 {
+            let mut bad = raw.clone();
+            let finish = raw_finish(&mut bad);
+            match fault {
+                0 => finish.count_mode = 0,
+                1 => finish.count_mode = i32::MAX,
+                2 => finish.writer_results_input = None,
+                3 => finish.logical_summary_input = None,
+                4 => finish.logical_summary_input = finish.writer_results_input,
+                5 => finish.logical_summary = None,
+                6 => finish.logical_summary.as_mut().unwrap().inserted_value_id = None,
+                7 => finish.logical_summary.as_mut().unwrap().replaced_value_id = None,
+                _ => finish.logical_summary.as_mut().unwrap().deleted_value_id = None,
+            }
+            c.arm(None);
+            assert!(
+                matches!(
+                    decode_table_write_node(&bad, r, a, SOURCE, limits()),
+                    Err(Error::InvalidShape(_))
+                ),
+                "fault {fault}"
+            );
+        }
+        let mut unknown = raw;
+        raw_finish(&mut unknown)
+            .logical_summary
+            .as_mut()
+            .unwrap()
+            .inserted_value_id = Some(404);
+        c.arm(None);
+        assert!(decode_table_write_node(&unknown, r, a, SOURCE, limits()).is_err());
     });
 }

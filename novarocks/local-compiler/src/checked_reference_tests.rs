@@ -202,6 +202,7 @@ fn checked_package(pool: &ConstantPool, ordinals: &[u32]) -> FragmentPackage {
                 max: 1,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control::good()).unwrap();

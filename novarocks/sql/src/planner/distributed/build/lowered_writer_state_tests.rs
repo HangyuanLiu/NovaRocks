@@ -197,7 +197,12 @@ pub(crate) fn authored_with_catalog(
             probe_runtime_filters: Vec::new(),
         };
         let routes = (0..counts.len())
-            .map(|i| ChangeStreamWriteRouteSpec {
+            .map(|i| {
+                ChangeStreamWriteRouteSpec {
+            requirements: novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
+                layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
                 route_id: ConnectorWriteRouteId::from_bytes([u8::try_from(i + 1).unwrap(); 32]),
                 write_target_ordinal: WriteTargetOrdinal::try_new(u32::try_from(i).unwrap())
                     .unwrap(),
@@ -206,9 +211,10 @@ pub(crate) fn authored_with_catalog(
                     ConnectorWriteFieldToken::from_bytes([1; 32]),
                     0,
                 )],
-                partition_input_positions: Vec::new(),
-                output_partition_ordinals: Vec::new(),
+
+
                 sink: declared_inputs[i].clone(),
+            }
             })
             .collect();
         let handles = (0..counts.len()).map(|i| {
@@ -320,7 +326,17 @@ fn walk(
         let state = final_source.state_inputs_observed(&mut work)?;
         let root = state.root();
         assert_eq!(root.value, final_source.source().input);
-        assert_eq!(root.node, final_source.node().inputs[0]);
+        let NodeKind::TableFinish(finish) = &final_source.node().kind else {
+            panic!("actual Writer Final must belong to TableFinish")
+        };
+        assert_eq!(
+            root.node,
+            final_source.node().inputs[finish.inputs.writer_results as usize]
+        );
+        if let Some(summary) = finish.inputs.logical_summary {
+            assert_ne!(summary, finish.inputs.writer_results);
+            assert_ne!(root.node, final_source.node().inputs[summary as usize]);
+        }
         state.visit_observed(
             &mut work,
             |source, endpoint, work| {

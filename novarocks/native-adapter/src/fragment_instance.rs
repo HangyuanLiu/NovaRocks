@@ -251,6 +251,7 @@ mod tests {
                         )
                     })
                     .collect(),
+                novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
             )
             .expect("legal inbound")
         };

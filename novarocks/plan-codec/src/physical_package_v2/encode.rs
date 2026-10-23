@@ -617,6 +617,7 @@ fn encode_fragment_package_in<'s>(
             nodes,
             sink: Some(envelope.sink),
             dop_domain: Some(envelope.dop_domain),
+            stage_placement: Some(envelope.stage_placement),
             runtime_filter_ids: envelope.runtime_filter_ids,
             call_requests: Some(call_requests),
         }),

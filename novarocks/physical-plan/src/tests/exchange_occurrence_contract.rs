@@ -60,7 +60,12 @@ fn exchange_source_rejects_reordered_output_occurrences() {
         .unwrap();
 
     let errors = builder
-        .finish_definition(node, FragmentSink::Noop, dop())
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .expect_err("exchange output positions must preserve the import sequence");
     assert!(errors.errors().iter().any(|error| {
         error

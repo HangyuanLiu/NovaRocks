@@ -5,7 +5,7 @@ use novarocks_execution::runtime::fragment::io::{
     ExchangeFrame, ExchangeFrameTransmitter, ExchangeTransmitRejection, FragmentIoError,
     FragmentIoErrorKind, FragmentIoOperation,
 };
-use novarocks_execution::task_execution::status::CancelReason;
+
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks as proto;
 use tokio_util::sync::CancellationToken;
@@ -65,6 +65,23 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
                 "exchange destination has no frozen task identity",
             )
         })?;
+        let stream = frame.stream.ok_or_else(|| {
+            failed(
+                FragmentIoErrorKind::InvalidResponse,
+                "exchange source has no frozen stream identity",
+            )
+        })?;
+        if stream.destination() != target
+            || stream.destination_fragment_instance_id() != frame.destination_fragment_instance_id
+            || stream.destination_node().get() != frame.destination_node_id
+            || stream.source().fragment_instance_id() != frame.sender_fragment_instance_id
+            || stream.source().sender_ordinal() != frame.sender_ordinal
+        {
+            return Err(failed(
+                FragmentIoErrorKind::InvalidResponse,
+                "exchange frame does not match its exact stream identity",
+            ));
+        }
         let endpoint =
             novarocks_types::NativeEndpoint::from_host_port(frame.destination.host(), port)
                 .map_err(|error| failed(FragmentIoErrorKind::InvalidResponse, error.to_string()))?;
@@ -75,10 +92,7 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
         );
         let normal_closed = client
             .exchange_unary(
-                frame.destination_fragment_instance_id,
-                frame.destination_node_id,
-                frame.sender_fragment_instance_id,
-                frame.sender_ordinal,
+                stream,
                 frame.sender_count,
                 frame.sender_id,
                 frame.backend_number,
@@ -122,33 +136,25 @@ fn validate_normal_close(
             "exchange destination has no frozen task identity",
         )
     })?;
-    let actual_task = proof.destination_task.as_ref().ok_or_else(|| {
+    let stream = frame.stream.ok_or_else(|| {
         failed(
             FragmentIoErrorKind::InvalidResponse,
-            "normal-close response omits destination task",
+            "exchange frame omits exact stream identity",
         )
     })?;
-    let actual_task = novarocks_task_codec::identity::decode_task_identity(
-        actual_task,
-        FieldPath::root("exchange_response")
-            .field("normal_closed")
-            .field("destination_task"),
-    )
-    .map_err(|error| failed(FragmentIoErrorKind::InvalidResponse, error.to_string()))?;
-    if actual_task != expected_task
-        || proof.destination_finst_id_hi != frame.destination_fragment_instance_id.high()
-        || proof.destination_finst_id_lo != frame.destination_fragment_instance_id.low()
-        || proof.destination_node_id != frame.destination_node_id
-        || proof.source_finst_id_hi != frame.sender_fragment_instance_id.high()
-        || proof.source_finst_id_lo != frame.sender_fragment_instance_id.low()
-        || proof.sender_ordinal != frame.sender_ordinal
-        || proof.sender_count != frame.sender_count
-    {
+    if stream.destination() != expected_task {
         return Err(failed(
             FragmentIoErrorKind::InvalidResponse,
-            "normal-close response does not match frozen exchange destination and sender",
+            "exchange destination differs from stream",
         ));
     }
+    let close = novarocks_task_codec::exchange_flow_codec::decode_normal_close(
+        proof,
+        stream,
+        frame.sender_count,
+        FieldPath::root("exchange_response").field("normal_closed"),
+    )
+    .map_err(|error| failed(FragmentIoErrorKind::InvalidResponse, error.to_string()))?;
     #[cfg(novarocks_dev_controls)]
     if let Some(observer) = observer {
         observer.observe(&format!(
@@ -164,19 +170,17 @@ fn validate_normal_close(
             frame.eos,
         ));
     }
-    Err(ExchangeTransmitRejection::DestinationCanceled(
-        CancelReason::UpstreamNoLongerNeeded,
-    ))
+    Err(ExchangeTransmitRejection::NormallyClosed(close.disposition))
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_execution::runtime::fragment::io::{
         ExchangeFrame, ExchangeTransmitRejection, FragmentIoErrorKind,
     };
     use novarocks_execution::task_execution::identity::TaskIdentity;
-    use novarocks_execution::task_execution::status::CancelReason;
+
     use novarocks_proto_models::novarocks as proto;
     use novarocks_types::{
         UniqueId,
@@ -194,9 +198,24 @@ mod tests {
         )
     }
 
-    fn frame_and_proof() -> (ExchangeFrame, proto::ExchangeNormalClosed) {
+    pub(crate) fn frame_and_proof() -> (ExchangeFrame, proto::ExchangeNormalClosed) {
         let task = task();
+        let source = TaskIdentity::new(
+            task.query_execution_id(),
+            StageId::new(2).unwrap(),
+            TaskId::new(2).unwrap(),
+            task.backend_process_id(),
+        );
+        let stream = novarocks_execution_contract::ExchangeStreamIdentity::try_new(
+            novarocks_execution_contract::ExchangeSource::new(source, UniqueId::new(21, 22), 1),
+            task,
+            UniqueId::new(11, 12),
+            novarocks_execution_contract::FragmentNodeId::new(7),
+        )
+        .unwrap();
         let frame = ExchangeFrame {
+            stream: Some(stream),
+            delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
             destination: RuntimeEndpoint::new("127.0.0.1", 9090).unwrap(),
             destination_fragment_instance_id: UniqueId::new(11, 12),
             destination_task_identity: Some(task),
@@ -211,6 +230,11 @@ mod tests {
             payload: Vec::new(),
         };
         let proof = proto::ExchangeNormalClosed {
+            disposition: Some(
+                novarocks_proto_models::novarocks::exchange_normal_closed::Disposition::Withdrawn(
+                    novarocks_proto_models::novarocks::ExchangeWithdrawn {},
+                ),
+            ),
             destination_task: Some(novarocks_task_codec::identity::encode_task_identity(task)),
             destination_finst_id_hi: 11,
             destination_finst_id_lo: 12,
@@ -261,8 +285,8 @@ mod tests {
                 #[cfg(novarocks_dev_controls)]
                 None
             ),
-            Err(ExchangeTransmitRejection::DestinationCanceled(
-                CancelReason::UpstreamNoLongerNeeded
+            Err(ExchangeTransmitRejection::NormallyClosed(
+                novarocks_execution_contract::ExchangeCloseDisposition::Withdrawn
             ))
         );
     }
@@ -346,6 +370,55 @@ mod tests {
             .unwrap()
             .kind(),
             FragmentIoErrorKind::InvalidResponse
+        );
+    }
+    #[test]
+    fn normal_close_requires_disposition_and_preserves_consumed_final_sequence() {
+        let (frame, mut proof) = frame_and_proof();
+        proof.disposition = None;
+        assert_eq!(
+            validate_normal_close(
+                &frame,
+                &proof,
+                #[cfg(novarocks_dev_controls)]
+                None
+            )
+            .unwrap_err()
+            .failure()
+            .unwrap()
+            .kind(),
+            FragmentIoErrorKind::InvalidResponse
+        );
+        proof.disposition = Some(proto::exchange_normal_closed::Disposition::Consumed(
+            proto::ExchangeConsumed { final_sequence: 5 },
+        ));
+        assert_eq!(
+            validate_normal_close(
+                &frame,
+                &proof,
+                #[cfg(novarocks_dev_controls)]
+                None
+            ),
+            Err(ExchangeTransmitRejection::NormallyClosed(
+                novarocks_execution_contract::ExchangeCloseDisposition::Consumed {
+                    final_sequence: novarocks_execution_contract::ExchangeFrameSequence::try_new(5)
+                        .unwrap()
+                }
+            ))
+        );
+        proof.disposition = Some(proto::exchange_normal_closed::Disposition::Consumed(
+            proto::ExchangeConsumed { final_sequence: -1 },
+        ));
+        assert!(
+            validate_normal_close(
+                &frame,
+                &proof,
+                #[cfg(novarocks_dev_controls)]
+                None
+            )
+            .unwrap_err()
+            .failure()
+            .is_some()
         );
     }
 }

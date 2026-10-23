@@ -359,6 +359,7 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
     .collect();
     let fragment = p::Fragment::try_from_structure_observed(
         p::FragmentStructureInput {
+            stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
             id: p::FragmentId::new(u32::MAX),
             root: table,
             values,
@@ -657,6 +658,7 @@ pub(in crate::physical_package_v2) fn cv_package() -> p::FragmentPackage {
     let values = [p::ValueId::new(0), p::ValueId::new(u32::MAX)];
     let fragment = p::Fragment::try_from_structure_observed(
         p::FragmentStructureInput {
+            stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
             id: p::FragmentId::new(9),
             root: source,
             values: values
@@ -904,6 +906,7 @@ pub(in crate::physical_package_v2) fn values_package(
         .collect::<Box<[_]>>();
     let fragment = p::Fragment::try_from_structure_observed(
         p::FragmentStructureInput {
+            stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
             id: p::FragmentId::new(5),
             root: source,
             values: values
@@ -1065,6 +1068,38 @@ pub(in crate::physical_package_v2) fn writer_constant_package() -> p::FragmentPa
 pub(in crate::physical_package_v2) fn writer_finish_package() -> p::FragmentPackage {
     crate::physical_type_v2::sender_tests::checked_finish_package_with(writer_recipe(), true)
 }
+pub(in crate::physical_package_v2) fn change_stream_packages() -> Vec<p::FragmentPackage> {
+    crate::physical_type_v2::sender_tests::checked_change_stream_packages(writer_recipe())
+        .into_values()
+        .collect()
+}
+
+/// A complete graph whose Provider maps one source twice into distinct fields.
+pub(in crate::physical_package_v2) fn repeated_change_stream_packages() -> Vec<p::FragmentPackage> {
+    let original = writer_recipe();
+    let recipe = c::ConnectorWriteRecipeDraft::try_new(
+        original.binding().clone(),
+        original.payload().clone(),
+        c::ConnectorWriteInputShape::Data {
+            fields: [([1; 32], "first"), ([2; 32], "second")]
+                .into_iter()
+                .map(|(token, name)| {
+                    c::ConnectorWriteFieldBinding::new(
+                        c::ConnectorWriteFieldToken::from_bytes(token),
+                        Field::new(name, DataType::Int64, false),
+                    )
+                    .with_execution_type(FunctionValueType::new(DataType::Int64, false))
+                    .unwrap()
+                })
+                .collect(),
+        },
+    )
+    .unwrap();
+    crate::physical_type_v2::sender_tests::checked_change_stream_packages(recipe)
+        .into_values()
+        .collect()
+}
+
 fn writer_recipe() -> c::ConnectorWriteRecipeDraft {
     let provider = c::ConnectorProviderId::parse("iceberg").unwrap();
     let instance = c::ConnectorInstanceId::try_from_canonical("lake").unwrap();
@@ -1249,8 +1284,8 @@ fn cut_types(cuts: &p::FragmentCuts) -> Vec<&FunctionValueType> {
     for cut in cuts.inbound.iter() {
         out.extend(cut.imports.iter().map(|v| &v.source.ty));
         out.extend(
-            cut.writer_result
-                .iter()
+            cut.writer_result()
+                .into_iter()
                 .flat_map(|r| r.fields.iter().map(|f| &f.ty)),
         );
     }
@@ -1258,8 +1293,8 @@ fn cut_types(cuts: &p::FragmentCuts) -> Vec<&FunctionValueType> {
         out.extend(cut.projection.iter().map(|v| &v.ty));
         out.extend(cut.destination_imports.iter().map(|v| &v.source.ty));
         out.extend(
-            cut.writer_result
-                .iter()
+            cut.writer_result()
+                .into_iter()
                 .flat_map(|r| r.fields.iter().map(|f| &f.ty)),
         );
     }
@@ -1675,6 +1710,105 @@ fn actual_writer_target_output_schema_and_outbound_cut_types_reach_original_cut_
     assert!(n[10] > 1);
     assert!(n[7] > 0, "stream sink has an outbound cut projection");
     assert_eq!(out.cuts.outbound.len(), package.cuts().outbound.len());
+}
+
+#[test]
+fn complete_change_stream_graph_closes_original_definition_type_and_binding_sources() {
+    for package in change_stream_packages()
+        .into_iter()
+        .chain(repeated_change_stream_packages())
+    {
+        let out = project(&package, &Control::default(), view_limits(), wide()).unwrap();
+        // project verifies every stored type ID resolves to the original root;
+        // it also derives binding/type namespaces through their real authors.
+        assert_eq!(out.counts, expected_counts(&package));
+        assert!(out.requests.entries.is_empty());
+        assert_eq!(out.cuts.inbound.len(), package.cuts().inbound.len());
+        assert_eq!(out.cuts.outbound.len(), package.cuts().outbound.len());
+        let n = expected_counts(&package);
+        project(
+            &package,
+            &Control::default(),
+            view_limits(),
+            exact_limits(n),
+        )
+        .unwrap();
+        for (axis, count) in n.iter().enumerate() {
+            if *count != 0 {
+                assert!(
+                    matches!(
+                        project(
+                            &package,
+                            &Control::default(),
+                            view_limits(),
+                            one_under(exact_limits(n), axis),
+                        ),
+                        Err(Failure::Control(CompileControlError::ResourceExhausted))
+                    ),
+                    "fragment {:?}, definition axis {axis}",
+                    package.fragment().id()
+                );
+            }
+        }
+        let exact = exact_budget(out.facts);
+        project(&package, &Control::default(), exact, wide()).unwrap();
+        for axis in 0..4 {
+            let mut under = exact;
+            match axis {
+                0 => under.max_allocation_requests -= 1,
+                1 => under.max_allocation_request_bytes -= 1,
+                2 => under.max_coexisting_source_and_request_bytes -= 1,
+                _ => under.max_work -= 1,
+            }
+            assert!(
+                matches!(
+                    project(&package, &Control::default(), under, wide()),
+                    Err(Failure::Control(CompileControlError::ResourceExhausted))
+                ),
+                "fragment {:?}, resource axis {axis}",
+                package.fragment().id()
+            );
+        }
+    }
+}
+
+#[test]
+fn complete_change_stream_graph_preserves_repeated_projection_occurrences() {
+    let packages = repeated_change_stream_packages();
+    let router = packages
+        .iter()
+        .find(|p| p.fragment().id().get() == 3)
+        .unwrap();
+    let writer = packages
+        .iter()
+        .find(|p| p.fragment().id().get() == 1)
+        .unwrap();
+    let route = router
+        .cuts()
+        .outbound
+        .iter()
+        .find(|cut| matches!(cut.payload, p::ExchangePayloadContract::ProviderRoute(_)))
+        .unwrap();
+    assert_eq!(route.projection.len(), 2);
+    assert_eq!(route.projection[0].value, route.projection[1].value);
+    assert_ne!(
+        route.destination_imports[0].destination,
+        route.destination_imports[1].destination
+    );
+    let target = writer
+        .fragment()
+        .nodes()
+        .values()
+        .find_map(|node| match &node.kind {
+            p::NodeKind::TableWriter { target } => Some(target),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(target.target_fields.len(), 2);
+    assert_eq!(&*target.target_fields[0].provider_name, "first");
+    assert_eq!(&*target.target_fields[1].provider_name, "second");
+    assert_ne!(target.target_fields[0].token, target.target_fields[1].token);
+    assert_ne!(target.target_fields[0].input, target.target_fields[1].input);
 }
 
 #[test]

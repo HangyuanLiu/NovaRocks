@@ -283,7 +283,12 @@ fn empty_fixture() -> Fixture {
         },
     );
     let fragment = builder
-        .finish_definition(node, FragmentSink::Noop, dop())
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap()
         .with_call_requests_observed(vec![], &Control::default())
         .unwrap();
@@ -300,7 +305,12 @@ fn scalar_fixture(count: usize, fragment_id: u32) -> Fixture {
     let request = zero_argument_request();
     let (node, expression) = add_values(&mut builder, count, true);
     let fragment = builder
-        .finish_definition(node, FragmentSink::Noop, dop())
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap()
         .with_call_requests_observed(
             vec![(PhysicalCallDefinition::Expression(expression), request)],
@@ -527,7 +537,12 @@ fn case_fixture() -> Fixture {
         },
     );
     let fragment = builder
-        .finish_definition(node, FragmentSink::Noop, dop())
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let domains = vec![
         domain(0),
@@ -800,7 +815,12 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
         },
     );
     let fragment = builder
-        .finish_definition(table, FragmentSink::Noop, dop())
+        .finish_definition(
+            table,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     validate_fragment_definition(&fragment).unwrap();
     let uses = leaf_roots(&fragment);
@@ -1124,7 +1144,12 @@ fn type_only_parent_retains_static_child_binding_without_runtime_child_claim() {
         },
     );
     let fragment = builder
-        .finish_definition(node, FragmentSink::Noop, dop())
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let current = context(0, u32::MAX, EvaluationDemand::Value);
     let flow = ExpressionControlFlow::try_new(

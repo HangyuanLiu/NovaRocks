@@ -309,7 +309,10 @@ fn visit<'source>(
         }
     })?;
     for (ordinal, cut) in package.cuts().inbound.iter().enumerate() {
-        let fields = cut.writer_result.as_ref().map_or(0, |r| r.fields.len());
+        let fields = match &cut.payload {
+            p::ExchangePayloadContract::WriterResults(r) => r.fields.len(),
+            _ => 0,
+        };
         visitor.header(
             Counts {
                 cuts: add(cut.imports.len(), fields)?,
@@ -334,7 +337,7 @@ fn visit<'source>(
                 work,
             )?;
         }
-        if let Some(result) = &cut.writer_result {
+        if let p::ExchangePayloadContract::WriterResults(result) = &cut.payload {
             for (ordinal, field) in result.fields.iter().enumerate() {
                 visitor.ty(
                     owner,
@@ -348,7 +351,10 @@ fn visit<'source>(
         }
     }
     for (ordinal, cut) in package.cuts().outbound.iter().enumerate() {
-        let fields = cut.writer_result.as_ref().map_or(0, |r| r.fields.len());
+        let fields = match &cut.payload {
+            p::ExchangePayloadContract::WriterResults(r) => r.fields.len(),
+            _ => 0,
+        };
         let n = add(
             add(cut.projection.len(), cut.destination_imports.len())?,
             fields,
@@ -387,7 +393,7 @@ fn visit<'source>(
                 work,
             )?;
         }
-        if let Some(result) = &cut.writer_result {
+        if let p::ExchangePayloadContract::WriterResults(result) = &cut.payload {
             for (ordinal, field) in result.fields.iter().enumerate() {
                 visitor.ty(
                     owner,

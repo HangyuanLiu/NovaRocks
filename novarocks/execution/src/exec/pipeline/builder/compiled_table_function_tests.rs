@@ -456,6 +456,7 @@ fn finish(builder: FragmentBuilder, root: NodeId, sink: FragmentSink, max_dop: u
                 max: max_dop,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let mut entries = fragment

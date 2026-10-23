@@ -122,6 +122,10 @@ fn mor_merge_completion_reaches_the_original_compiled_router_refusal() {
             .map(|(field, input)| ConnectorMutationRouteInput::new(field.token, *input))
             .collect();
         routes.push(DmlChangeStreamRoute {
+            requirements: novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
+                layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             route_id: ConnectorWriteRouteId::from_bytes([ordinal as u8 + 1; 32]),
             write_target_ordinal: WriteTargetOrdinal::try_new(ordinal).unwrap(),
             accepted_effects: if ordinal == 0 {
@@ -133,7 +137,6 @@ fn mor_merge_completion_reaches_the_original_compiled_router_refusal() {
                 vec![ConnectorRowMutationEffect::Replace]
             },
             input_ordinals: inputs,
-            partition_input_tokens: Vec::new(),
             sink: DmlWritePlanInput::try_new(
                 if ordinal == 0 {
                     DmlWriteSinkMode::RowLineageData
@@ -171,6 +174,7 @@ fn mor_merge_completion_reaches_the_original_compiled_router_refusal() {
                 })
                 .collect(),
             pre_expand_keyed_assert: Some(DmlPreExpandKeyedAssert {
+                applicability_output_ordinal: None,
                 key_column_name: "__nr_merge_assert_key".into(),
                 key_label: "_row_id".into(),
                 message_prefix: "MOR MERGE matched target row".into(),

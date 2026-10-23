@@ -8,7 +8,6 @@ use crate::runtime::execution_runtime::ExecutionRuntime;
 use crate::runtime::mem_tracker::MemTracker;
 use novarocks_types::UniqueId;
 use std::sync::Arc;
-use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ExchangeReceiverKey {
@@ -18,6 +17,7 @@ pub struct ExchangeReceiverKey {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExchangeReceiverFrame {
+    pub stream: novarocks_execution_contract::ExchangeStreamIdentity,
     pub source_fragment_instance_id: UniqueId,
     pub sender_ordinal: u32,
     pub sender_count: u32,
@@ -149,21 +149,9 @@ impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
         key: ExchangeReceiverKey,
         frame: ExchangeReceiverFrame,
     ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
-        let exchange_key = Self::key(key);
-        let decode_start = Instant::now();
-        let registry = self.runtime.exchange_registry();
-        let sender =
-            ExchangeSenderIdentity::native(frame.source_fragment_instance_id, frame.sender_ordinal);
-        let chunks = registry.decode_chunks_for_sender(exchange_key, sender, &frame.payload)?;
-        registry.push_chunks_with_stats(
-            exchange_key,
-            sender,
-            chunks,
-            frame.eos,
-            frame.payload.len(),
-            decode_start.elapsed().as_nanos(),
-        );
-        Ok(())
+        self.runtime
+            .exchange_registry()
+            .admit_native_frame(Self::key(key), frame)
     }
 
     fn cancel(&self, key: ExchangeReceiverKey) {
@@ -327,6 +315,12 @@ mod tests {
         })
         .expect("actual native receiver installation");
         let frame = |source_fragment_instance_id, sender_ordinal| ExchangeReceiverFrame {
+            stream: crate::runtime::fragment::io::exchange::fixture_stream(
+                source_fragment_instance_id,
+                key.fragment_instance_id,
+                key.node_id,
+                sender_ordinal,
+            ),
             source_fragment_instance_id,
             sender_ordinal,
             sender_count: 2,

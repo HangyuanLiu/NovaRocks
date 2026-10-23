@@ -83,6 +83,21 @@ struct UnionAllSourceOperator {
 }
 
 impl OperatorLifecycle for UnionAllSourceOperator {
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        if self.active {
+            self.state.close_consumer();
+        }
+        Ok(())
+    }
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.begin_exit()
+    }
+    fn cancel(&mut self) {
+        if self.active {
+            self.state.close_consumer();
+        }
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -153,7 +168,7 @@ mod tests {
         use crate::exec::pipeline::step_context::{StepContext, TurnWork};
         use std::num::NonZeroU64;
         let state = RuntimeState::default();
-        let shared = UnionAllSharedState::new(2, 7);
+        let shared = UnionAllSharedState::new_with_limits(2, 7, 1024, 1024);
         let mut source = UnionAllSourceFactory::new(shared.clone(), 7).create(1, 0);
         let control = state.error_state();
         let mut work = TurnWork::new(NonZeroU64::new(1).unwrap(), 8);
@@ -173,7 +188,9 @@ mod tests {
         ));
         // Publication and last-producer close precede any wait registration.
         // The frozen generation must still force a poll of the retained row.
-        shared.push_chunk(shared.queue_mem_tracker(&state).as_ref(), one_row_chunk());
+        shared
+            .push_chunk(shared.queue_mem_tracker(&state).as_ref(), one_row_chunk())
+            .unwrap();
         shared.producer_finished();
         assert!(wait.is_ready());
         let data = source.drive(&mut context).unwrap();
@@ -188,8 +205,10 @@ mod tests {
     #[test]
     fn non_zero_source_driver_does_not_drain_shared_queue() {
         let state = RuntimeState::default();
-        let shared = UnionAllSharedState::new(1, 7);
-        shared.push_chunk(shared.queue_mem_tracker(&state).as_ref(), one_row_chunk());
+        let shared = UnionAllSharedState::new_with_limits(1, 7, 1024, 1024);
+        shared
+            .push_chunk(shared.queue_mem_tracker(&state).as_ref(), one_row_chunk())
+            .unwrap();
 
         let factory = UnionAllSourceFactory::new(shared.clone(), 7);
         let mut inactive = factory.create(2, 1);

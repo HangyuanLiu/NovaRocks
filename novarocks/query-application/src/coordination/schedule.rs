@@ -693,10 +693,12 @@ mod tests {
             fragments: vec![
                 FragmentSchedulingFacts {
                     fragment_id: 1,
+                    placement: novarocks_physical_plan::StagePlacementPolicy::ScanWork,
                     scans: vec![ScanSchedulingFacts { scan, work }],
                 },
                 FragmentSchedulingFacts {
                     fragment_id: 2,
+                    placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
                     scans: Vec::new(),
                 },
             ],

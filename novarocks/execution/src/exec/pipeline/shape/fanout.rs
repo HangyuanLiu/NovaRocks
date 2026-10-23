@@ -64,11 +64,18 @@ pub(crate) trait FanoutRouter: InputEncodingPolicy {
         ctx: &mut StepContext<'_>,
     ) -> ExecutionResult<RouteStep>;
     fn accepts_branch(&self, branch: usize) -> bool;
+    fn requires_branch_drain(&self, _branch: usize) -> bool {
+        false
+    }
+    fn input_exhausted(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<()> {
+        Ok(())
+    }
     fn visit_demand_events(&self, _visit: &mut dyn FnMut(Arc<Observable>)) {}
 }
 pub(crate) enum RouteStep {
     Input { branch: usize, chunk: Chunk },
     Finished,
+    Skip,
 }
 #[derive(Default)]
 struct FanoutPreparation(HydrateInput);
@@ -185,6 +192,7 @@ enum FanoutFailure {
     NotPrepared,
     InputClosed,
     BranchOutput,
+    RequiredBranchWithdrawn,
     InvalidRoute,
     CleanupPanic(&'static str),
     MissingFailurePort,
@@ -197,6 +205,9 @@ impl std::fmt::Display for FanoutFailure {
             Self::NotPrepared => f.write_str("fanout work started before preparation"),
             Self::InputClosed => f.write_str("fanout received input after its demand closed"),
             Self::BranchOutput => f.write_str("fanout sink branch produced an output payload"),
+            Self::RequiredBranchWithdrawn => {
+                f.write_str("required fanout branch withdrew before its input exhausted")
+            }
             Self::InvalidRoute => {
                 f.write_str("fanout router reused or exceeded its branch input slot")
             }
@@ -220,6 +231,10 @@ impl novarocks_failure_contract::FailureProjection for FanoutFailure {
             Self::InputClosed => (FailureClass::Invariant, ExecutionReason::FanoutInputClosed),
             Self::BranchOutput => (FailureClass::Invariant, ExecutionReason::FanoutBranchOutput),
             Self::InvalidRoute => (FailureClass::Invariant, ExecutionReason::FanoutInvalidRoute),
+            Self::RequiredBranchWithdrawn => (
+                FailureClass::Invariant,
+                ExecutionReason::FanoutRequiredBranchWithdrawn,
+            ),
             Self::MissingFailurePort => (
                 FailureClass::Invariant,
                 ExecutionReason::FanoutMissingFailurePort,
@@ -412,6 +427,12 @@ impl<R: FanoutRouter> Fanout<R> {
                 drop(branch.wait.take());
             }
         }
+        if matches!(result.next, NextStep::Finished)
+            && !branch.input_closed
+            && self.router.requires_branch_drain(index)
+        {
+            return Err(fault(FanoutFailure::RequiredBranchWithdrawn));
+        }
         branch.next = result.next;
         Ok(())
     }
@@ -441,6 +462,9 @@ impl<R: FanoutRouter> Fanout<R> {
             || self.branches.iter().any(|branch| branch.pending.is_some())
         {
             return Ok(false);
+        }
+        if self.finishing {
+            self.router.input_exhausted(ctx)?;
         }
         let mut changed = false;
         for (index, branch) in self.branches.iter_mut().enumerate() {
@@ -518,7 +542,7 @@ impl<R: FanoutRouter> Fanout<R> {
         ctx: &mut StepContext<'_>,
         generation: u64,
     ) -> ExecutionResult<StepResult> {
-        if !ctx.work().try_consume(1) {
+        if ctx.work().remaining() == 0 {
             self.next = NextStep::Yield;
             return Ok(StepResult::new(None, NextStep::Yield, 0));
         }
@@ -526,6 +550,7 @@ impl<R: FanoutRouter> Fanout<R> {
             return Ok(self.result(generation));
         }
         if let Some(index) = self.runnable_child() {
+            let before = ctx.work().remaining();
             self.round_robin = (index + 1) % self.branches.len();
             let branch = &mut self.branches[index];
             if matches!(branch.next, NextStep::NeedInput) {
@@ -593,7 +618,13 @@ impl<R: FanoutRouter> Fanout<R> {
                 let result = branch.operator.as_mut().drive(ctx)?;
                 self.record_branch(index, result, ctx)?;
             }
+            if ctx.work().remaining() == before {
+                ctx.work().try_consume(1);
+            }
             return Ok(self.result(generation));
+        }
+        if !ctx.work().try_consume(1) {
+            return Ok(StepResult::new(None, NextStep::Yield, 0));
         }
         if self.receiver.is_occupied() {
             let preparation = ctx.perform(
@@ -640,6 +671,11 @@ impl<R: FanoutRouter> Fanout<R> {
                         ctx.report_failure(error.clone());
                         return Err(error);
                     }
+                    if matches!(child.next, NextStep::Finished)
+                        && self.router.requires_branch_drain(branch)
+                    {
+                        return Err(fault(FanoutFailure::RequiredBranchWithdrawn));
+                    }
                     if !matches!(child.next, NextStep::Finished) {
                         child.pending = Some(super::super::input::derived_raw_input(chunk));
                     }
@@ -647,6 +683,7 @@ impl<R: FanoutRouter> Fanout<R> {
                 RouteStep::Finished => {
                     drop(self.cursor.take());
                 }
+                RouteStep::Skip => {}
             }
             return Ok(self.result(generation));
         }
@@ -669,7 +706,7 @@ impl<R: FanoutRouter> StepOperator for Fanout<R> {
         }
         let result = (|| {
             let mut changed = false;
-            for branch in &mut self.branches {
+            for (index, branch) in self.branches.iter_mut().enumerate() {
                 if matches!(branch.next, NextStep::Finished) {
                     continue;
                 }
@@ -680,6 +717,9 @@ impl<R: FanoutRouter> StepOperator for Fanout<R> {
                         changed = true;
                     }
                     ControlStep::Withdrawn => {
+                        if !branch.input_closed && self.router.requires_branch_drain(index) {
+                            return Err(fault(FanoutFailure::RequiredBranchWithdrawn));
+                        }
                         branch.next = NextStep::Finished;
                         drop(branch.pending.take());
                         changed = true;
@@ -827,8 +867,10 @@ impl<R: FanoutRouter> OperatorLifecycle for Fanout<R> {
         self.construction = Some(factory);
     }
     fn set_profiles(&mut self, profiles: OperatorProfiles) {
-        for branch in &mut self.branches {
-            branch.operator.set_profiles(profiles.clone());
+        for (index, branch) in self.branches.iter_mut().enumerate() {
+            branch.operator.set_profiles(OperatorProfiles::new(
+                profiles.operator.child(format!("Branch{index}")),
+            ));
         }
     }
     fn set_fragment_event_sink(&mut self, sink: Arc<dyn FragmentEventSink>) {
@@ -861,10 +903,14 @@ impl<R: FanoutRouter> OperatorLifecycle for Fanout<R> {
         self.construction
             .as_ref()
             .ok_or(ConstructionFailure::MissingOwner)?;
-        for branch in &mut self.branches {
+        for (index, branch) in self.branches.iter_mut().enumerate() {
             branch.operator.prepare()?;
             branch.operator.install_control();
             branch.next = branch.operator.initial_step();
+            if matches!(branch.next, NextStep::Finished) && self.router.requires_branch_drain(index)
+            {
+                return Err(fault(FanoutFailure::RequiredBranchWithdrawn));
+            }
             if let Some(event) = branch.operator.control_observable() {
                 if !self
                     .controls
@@ -1899,6 +1945,84 @@ pub(crate) mod test_support {
             } else {
                 assert!(parent_weak.upgrade().is_none());
                 assert_eq!(parent_tracker.current(), 0);
+            }
+        }
+    }
+    #[test]
+    fn strict_initial_finished_branch_fails_preparation_while_ordinary_withdrawal_remains_legal() {
+        struct Closed;
+        impl OperatorLifecycle for Closed {
+            fn name(&self) -> &str {
+                "initially closed branch"
+            }
+        }
+        impl InputEncodingPolicy for Closed {}
+        impl super::super::SinkKernel for Closed {
+            fn start(&self) -> super::super::TransformStart {
+                super::super::TransformStart::Finished
+            }
+            fn consume(
+                &mut self,
+                _: &mut StepContext<'_>,
+                _: PreparedInput,
+            ) -> ExecutionResult<super::super::SinkStep> {
+                unreachable!("closed fixture cannot receive input")
+            }
+        }
+        struct Router(bool);
+        impl InputEncodingPolicy for Router {}
+        impl FanoutRouter for Router {
+            type Cursor = ();
+            fn begin(
+                &mut self,
+                _: PreparedInput,
+                _: &dyn InputConstructionFactory,
+                _: &mut StepContext<'_>,
+            ) -> ExecutionResult<()> {
+                unreachable!("empty fixture has no input")
+            }
+            fn advance(
+                &mut self,
+                _: &mut (),
+                _: &dyn InputConstructionFactory,
+                _: &mut StepContext<'_>,
+            ) -> ExecutionResult<RouteStep> {
+                Ok(RouteStep::Finished)
+            }
+            fn accepts_branch(&self, _: usize) -> bool {
+                true
+            }
+            fn requires_branch_drain(&self, _: usize) -> bool {
+                self.0
+            }
+        }
+        for strict in [false, true] {
+            let state = RuntimeState::default();
+            let mut fanout = Fanout::new(
+                "closed branch admission".into(),
+                vec![Box::new(super::super::Transform::hydrating(Closed))],
+                Router(strict),
+                None,
+            );
+            fanout.set_mem_tracker(MemTracker::new_root("closed branch fixture"));
+            fanout.set_construction_factory(
+                crate::exec::operators::logical_change_summary::tests::creator(&state),
+            );
+            fanout.bind_runtime_state(&state).unwrap();
+            let result = fanout.prepare();
+            if strict {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .detail()
+                        .contains("required fanout branch withdrew")
+                );
+            } else {
+                result.unwrap();
+                assert!(matches!(
+                    fanout.drive_for_test(&state).unwrap().next,
+                    NextStep::Finished
+                ));
             }
         }
     }

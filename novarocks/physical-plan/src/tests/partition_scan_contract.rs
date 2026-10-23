@@ -122,7 +122,12 @@ fn finish_join(
             },
         })
         .unwrap();
-    builder.finish_definition(join, FragmentSink::Noop, dop())
+    builder.finish_definition(
+        join,
+        FragmentSink::Noop,
+        dop(),
+        crate::StagePlacementPolicy::Singleton,
+    )
 }
 
 fn finish_scan_with_budget(
@@ -161,7 +166,12 @@ fn finish_scan_with_budget(
             },
         })
         .unwrap();
-    builder.finish_definition(scan, FragmentSink::Noop, dop())
+    builder.finish_definition(
+        scan,
+        FragmentSink::Noop,
+        dop(),
+        crate::StagePlacementPolicy::Singleton,
+    )
 }
 
 fn contains_error(result: Result<Fragment, ValidationErrors>, expected: &str) -> bool {
@@ -233,7 +243,12 @@ fn finish_plan_with_partition_distributions(
             .unwrap();
         plan.add_fragment(
             builder
-                .finish_definition(scan, FragmentSink::Noop, dop())
+                .finish_definition(
+                    scan,
+                    FragmentSink::Noop,
+                    dop(),
+                    crate::StagePlacementPolicy::Singleton,
+                )
                 .unwrap(),
         )
         .unwrap();

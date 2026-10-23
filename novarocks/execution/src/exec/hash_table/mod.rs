@@ -24,3 +24,5 @@ pub mod key_table;
 
 pub(crate) mod allocation;
 pub mod array_views;
+
+pub(crate) mod partition_keys;

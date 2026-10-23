@@ -664,8 +664,9 @@ pub(super) fn compiled_fragment(
                 destination: value,
             }]),
             partitioning: partitioning(),
-            change_stream_writer: None,
-            writer_result: None,
+            source_port: novarocks_physical_plan::FragmentOutputPort::Root,
+            delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
+            payload: novarocks_physical_plan::ExchangePayloadContract::Relational,
         }]);
     } else {
         builder
@@ -736,8 +737,9 @@ pub(super) fn compiled_fragment(
                         destination: value,
                     }]),
                     partitioning: partitioning(),
-                    change_stream_writer: None,
-                    writer_result: None,
+                    source_port: novarocks_physical_plan::FragmentOutputPort::Root,
+                    delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
+                    payload: novarocks_physical_plan::ExchangePayloadContract::Relational,
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
@@ -761,6 +763,7 @@ pub(super) fn compiled_fragment(
                 max: dop,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .expect("checked fragment");
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).expect("expression roots");
@@ -931,6 +934,7 @@ impl RawCreate {
                     inbound: if self.exchange_input {
                         vec![proto::TaskExchangeInbound {
                             destination_node_id: 10,
+                            delivery: proto::ExchangeDeliveryRequirement::DemandDriven as i32,
                             sources: vec![proto::TaskExchangeSource {
                                 task: Some(proto::TaskIdentity {
                                     query_execution_id: Some(execution),
@@ -1803,11 +1807,52 @@ fn exchange_probe(
     eos: bool,
     exchange_authorization: &str,
 ) -> Result<proto::ExchangeResponse> {
+    use prost::Message;
+    let Some(proto::task_operation::Operation::CreateTask(request)) = create.operation().operation
+    else {
+        bail!("exchange probe requires its actual frozen Create");
+    };
+    let metadata = proto::CreationMetadata::decode(request.creation_metadata.as_ref())?;
+    let descriptor = metadata
+        .descriptor
+        .context("probe Create omits descriptor")?;
+    let inbound = descriptor
+        .topology
+        .as_ref()
+        .and_then(|topology| topology.inbound.first())
+        .context("probe Create omits frozen input")?;
+    let source = inbound
+        .sources
+        .first()
+        .context("probe input omits source")?;
+    let stream = proto::ExchangeStreamIdentity {
+        source_task: source.task.clone(),
+        destination_task: descriptor.identity.clone(),
+        source_finst_id_hi: source
+            .fragment_instance_id
+            .context("probe source omits kernel")?
+            .hi,
+        source_finst_id_lo: source
+            .fragment_instance_id
+            .context("probe source omits kernel")?
+            .lo,
+        sender_ordinal: source.sender_ordinal,
+        destination_finst_id_hi: descriptor
+            .fragment_instance_id
+            .context("probe destination omits kernel")?
+            .hi,
+        destination_finst_id_lo: descriptor
+            .fragment_instance_id
+            .context("probe destination omits kernel")?
+            .lo,
+        destination_node_id: inbound.destination_node_id,
+    };
     raw_unary(
         session.connector.clone(),
         "/novarocks.NovaRocksGrpc/ExchangeUnary",
         exchange_authorization,
         proto::ExchangeRequest {
+            stream: Some(stream),
             finst_id_hi: 0x5b,
             finst_id_lo: create.kernel_key_low,
             node_id: 10,

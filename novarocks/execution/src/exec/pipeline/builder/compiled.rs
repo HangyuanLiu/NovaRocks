@@ -1032,10 +1032,31 @@ fn build_node(
         }
         ProgramNodeKind::AssertNumRows { input, mode } => {
             let factory = AssertNumRowsProcessorFactory::new(node_id, assertion_mode(mode))?;
-            // Both modes judge the whole instance input: a global count, or
-            // at most one row per key, so the assertion runs on one driver.
-            // The keyed mode keeps the existing owner's key identity: a NULL
-            // key equals a NULL key, and values compare by type and display.
+            // Existing keyed assertions receive their exact frozen declarations.
+            // This is construction metadata, not a type inferred from an encoded
+            // first batch. New stage/applicability routing is installed separately.
+            let factory = if let AssertRowsMode::PerKeyAtMostOne { key_slots, .. } = mode {
+                let layout = program.graph().nodes()[input.index()].output_layout();
+                let types = key_slots
+                    .iter()
+                    .map(|slot| {
+                        let binding = layout.value_binding(*slot).ok_or_else(|| {
+                            program_failure(
+                                FragmentBindingErrorKind::InvalidAssignment,
+                                "compiled assertion key has no frozen type",
+                            )
+                        })?;
+                        novarocks_type_contract::FunctionValueType::try_from_typed_binding(
+                            binding.clone(),
+                        )
+                        .map_err(ExecutionFailure::from_domain)
+                    })
+                    .collect::<ExecutionResult<Vec<_>>>()?;
+                factory.with_key_types(types)?
+            } else {
+                factory
+            };
+            // Existing global and instance-wide assertions remain on one driver.
             let build = build_node(program, *input, ctx, error, ordered)?;
             let mut build = gather_to_one(build, ctx, node_id);
             build.pipeline.factories.push(Box::new(factory));
@@ -1329,6 +1350,7 @@ fn assertion_mode(mode: &AssertRowsMode) -> AssertNumRowsMode {
             key_slots,
             key_labels,
             message_prefix,
+            ..
         } => AssertNumRowsMode::PerKeyAtMostOne {
             key_slots: key_slots.clone(),
             key_labels: key_labels.iter().map(ToString::to_string).collect(),

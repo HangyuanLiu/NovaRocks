@@ -587,6 +587,9 @@ fn every_final_author_callback_propagates_original_control_without_rechecking() 
 #[test]
 fn exchange_input_addresses_cover_exactly_the_actual_exchange_sources() {
     let address = CompiledExchangeInput {
+        role: crate::ProgramOutputRole::Relational,
+        delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+        routing: crate::CompiledExchangeRouting::Unpartitioned,
         receiver_node: 3,
         edge: 5,
         source_fragment: 1,

@@ -313,9 +313,12 @@ fn add_edge_with_kind(
     kind: EdgeKind,
 ) {
     plan.add_edge(Edge {
+        role: crate::OutputRole::Relational,
+        delivery: crate::DeliveryRequirement::DemandDriven,
         id,
         kind,
         source: EdgeSource {
+            port: crate::FragmentOutputPort::Root,
             fragment: endpoints.source_fragment,
             projection: Box::from([endpoints.source_value]),
         },
@@ -365,6 +368,7 @@ fn blocking_runtime_filter_rejects_multicast_backpressure_cycle() {
                 edges: Box::from([build_branch, probe_branch]),
             },
             dop(),
+            crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
 
@@ -382,6 +386,7 @@ fn blocking_runtime_filter_rejects_multicast_backpressure_cycle() {
                 edge: join_build_edge,
             },
             dop(),
+            crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
 
@@ -401,7 +406,12 @@ fn blocking_runtime_filter_rejects_multicast_backpressure_cycle() {
     let join = append_broadcast_join(&mut probe_builder, probe, build);
     probe_builder.attach_runtime_filter(filter_id).unwrap();
     let probe_fragment = probe_builder
-        .finish_definition(join, FragmentSink::Noop, dop())
+        .finish_definition(
+            join,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut filter = filter(
@@ -489,7 +499,12 @@ fn blocking_runtime_filter_rejects_a_cycle_through_a_nested_producer_build() {
     let mut build_builder = FragmentBuilder::new(build_fragment_id);
     let (build_root, build_value) = append_single_copy_literal(&mut build_builder);
     let build_fragment = build_builder
-        .finish_definition(build_root, FragmentSink::Stream { edge: build_edge }, dop())
+        .finish_definition(
+            build_root,
+            FragmentSink::Stream { edge: build_edge },
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut inner_builder = FragmentBuilder::new(inner_fragment_id);
@@ -504,6 +519,7 @@ fn blocking_runtime_filter_rejects_a_cycle_through_a_nested_producer_build() {
                 edge: nested_build_edge,
             },
             dop(),
+            crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
 
@@ -518,7 +534,12 @@ fn blocking_runtime_filter_rejects_a_cycle_through_a_nested_producer_build() {
     let outer_join = append_broadcast_join(&mut outer_builder, outer_probe, outer_build);
     outer_builder.attach_runtime_filter(filter_id).unwrap();
     let outer_fragment = outer_builder
-        .finish_definition(outer_join, FragmentSink::Noop, dop())
+        .finish_definition(
+            outer_join,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let filter = filter(
@@ -613,6 +634,7 @@ pub(super) fn acyclic_cross_fragment_fixture() -> AcyclicFixture {
                 edge: recursive_build_edge,
             },
             dop(),
+            crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
 
@@ -630,6 +652,7 @@ pub(super) fn acyclic_cross_fragment_fixture() -> AcyclicFixture {
                 edge: direct_build_edge,
             },
             dop(),
+            crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
 
@@ -644,7 +667,12 @@ pub(super) fn acyclic_cross_fragment_fixture() -> AcyclicFixture {
     let join = append_broadcast_join(&mut target_builder, probe, build);
     target_builder.attach_runtime_filter(filter_id).unwrap();
     let target = target_builder
-        .finish_definition(join, FragmentSink::Noop, dop())
+        .finish_definition(
+            join,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let filter = filter(
@@ -706,6 +734,7 @@ fn replace_source_fragment(
 ) -> PhysicalPlan {
     let source = &plan.fragments()[&source_id];
     let mut parts = crate::plan::FragmentParts {
+        stage_placement: crate::StagePlacementPolicy::Singleton,
         id: source.id(),
         root: source.root(),
         values: source.values().clone(),

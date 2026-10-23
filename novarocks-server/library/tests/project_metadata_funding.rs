@@ -189,6 +189,7 @@ fn source(ty: FunctionValueType, label_bytes: usize) -> Vec<u8> {
                 max: 1,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();

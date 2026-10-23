@@ -24,7 +24,6 @@ use hyper_util::rt::TokioIo;
 use novarocks_native_trust::{NativeClientAuthInterceptor, NativeTrust};
 use novarocks_proto_codec::native_rpc::{NativeRpcMethod, NativeTrafficClass};
 use novarocks_proto_models::{filter, novarocks as proto};
-use novarocks_types::identity::UniqueId;
 use novarocks_types::{BackendProcessId, NativeEndpoint};
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
@@ -194,16 +193,9 @@ impl NativeRpcClient {
         })
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The frozen native boundary keeps independently validated inputs explicit."
-    )]
     pub fn exchange_unary(
         &self,
-        finst_id: UniqueId,
-        node_id: i32,
-        source_finst_id: UniqueId,
-        sender_ordinal: u32,
+        stream: novarocks_execution_contract::ExchangeStreamIdentity,
         sender_count: u32,
         sender_id: i32,
         be_number: i32,
@@ -214,12 +206,15 @@ impl NativeRpcClient {
         stop: CancellationToken,
     ) -> Result<Option<proto::ExchangeNormalClosed>, String> {
         let request = proto::ExchangeRequest {
-            finst_id_hi: finst_id.high(),
-            finst_id_lo: finst_id.low(),
-            node_id,
-            source_finst_id_hi: source_finst_id.high(),
-            source_finst_id_lo: source_finst_id.low(),
-            sender_ordinal,
+            stream: Some(novarocks_task_codec::exchange_flow_codec::encode_stream(
+                stream,
+            )),
+            finst_id_hi: stream.destination_fragment_instance_id().high(),
+            finst_id_lo: stream.destination_fragment_instance_id().low(),
+            node_id: stream.destination_node().get(),
+            source_finst_id_hi: stream.source().fragment_instance_id().high(),
+            source_finst_id_lo: stream.source().fragment_instance_id().low(),
+            sender_ordinal: stream.source().sender_ordinal(),
             sender_count,
             sender_id,
             be_number,
@@ -373,7 +368,6 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use novarocks_types::UniqueId;
     use tokio_util::sync::CancellationToken;
 
     use super::{NativeRpcClient, channel_endpoint};
@@ -390,11 +384,11 @@ mod tests {
         );
         client
             .exchange_unary(
-                UniqueId::new(1, 2),
-                3,
-                UniqueId::new(4, 5),
-                0,
-                1,
+                crate::exchange_transmitter::tests::frame_and_proof()
+                    .0
+                    .stream
+                    .unwrap(),
+                2,
                 0,
                 0,
                 false,

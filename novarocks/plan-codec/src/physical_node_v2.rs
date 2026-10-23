@@ -327,12 +327,8 @@ pub(crate) fn physical_property_refs(
     values: &impl Values,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
-    if let p::Distribution::Hash { keys, .. } | p::Distribution::BucketShuffle { keys, .. } =
-        &input.distribution
-    {
-        for id in keys {
-            reference(id.get(), values, w)?;
-        }
+    for id in input.distribution.value_references() {
+        reference(id.get(), values, w)?;
     }
     for key in &input.ordering {
         reference(key.value.get(), values, w)?;
@@ -347,6 +343,15 @@ pub(crate) fn wire_property_refs(
     if let Some(kind) = input.distribution.as_ref().and_then(|v| v.kind.as_ref()) {
         let keys = match kind {
             wire::distribution::Kind::Hash(v) => &v.key_value_ids[..],
+            wire::distribution::Kind::ConditionalKey(v) => {
+                reference(
+                    v.applies_value_id
+                        .ok_or_else(|| invalid("conditional partition applicability is absent"))?,
+                    values,
+                    w,
+                )?;
+                &v.key_value_ids[..]
+            }
             wire::distribution::Kind::BucketShuffle(v) => &v.key_value_ids[..],
             _ => &[],
         };

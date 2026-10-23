@@ -270,7 +270,12 @@ fn fixture(operator: Operator, ordered: bool) -> Fixture {
         }
     }
     let fragment = builder
-        .finish_definition(target, FragmentSink::Noop, dop())
+        .finish_definition(
+            target,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     validate_fragment_definition(&fragment).unwrap();
     let uses = roots_for_fixture(&fragment);

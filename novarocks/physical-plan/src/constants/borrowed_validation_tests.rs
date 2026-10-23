@@ -239,6 +239,7 @@ fn collection_fragment_with_scalar(
             },
             PlanLimits::FROZEN,
             &Control::good(),
+            crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     (fragment, literal)

@@ -1,6 +1,8 @@
 use std::fmt;
 
-use novarocks_execution_contract::TaskIdentity;
+use novarocks_execution_contract::{
+    ExchangeCloseDisposition, ExchangeDeliveryRequirement, ExchangeStreamIdentity, TaskIdentity,
+};
 use novarocks_types::UniqueId;
 
 use crate::runtime::endpoint::RuntimeEndpoint;
@@ -12,6 +14,10 @@ use super::FragmentIoError;
 /// transport adapter.
 #[derive(Clone, Debug)]
 pub struct ExchangeFrame {
+    /// Local operator fixtures have no Task. Native transport requires the
+    /// complete stream and checks every duplicated envelope field against it.
+    pub stream: Option<ExchangeStreamIdentity>,
+    pub delivery: ExchangeDeliveryRequirement,
     pub destination: RuntimeEndpoint,
     pub destination_fragment_instance_id: UniqueId,
     pub destination_task_identity: Option<TaskIdentity>,
@@ -34,6 +40,9 @@ pub struct ExchangeFrame {
 /// failure can never be reported as a success-compatible cancellation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExchangeTransmitRejection {
+    /// A receiver-authored close for this exact stream. This is separate from
+    /// an ordinary ACK, which proves admission rather than consumption.
+    NormallyClosed(ExchangeCloseDisposition),
     /// The destination withdrew its ingress capability because it no longer
     /// needs this producer's output. The producer closes that one edge,
     /// discards that edge's frames, and waits to be cancelled by its
@@ -50,6 +59,7 @@ impl ExchangeTransmitRejection {
     /// departure rather than a failure.
     pub const fn cancel_reason(&self) -> Option<CancelReason> {
         match self {
+            Self::NormallyClosed(_) => None,
             Self::DestinationCanceled(reason) => Some(*reason),
             Self::Failed(_) => None,
         }
@@ -58,6 +68,7 @@ impl ExchangeTransmitRejection {
     /// The producer's own failure cause, if this rejection is one.
     pub const fn failure(&self) -> Option<&FragmentIoError> {
         match self {
+            Self::NormallyClosed(_) => None,
             Self::DestinationCanceled(_) => None,
             Self::Failed(error) => Some(error),
         }
@@ -67,6 +78,9 @@ impl ExchangeTransmitRejection {
 impl fmt::Display for ExchangeTransmitRejection {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NormallyClosed(disposition) => {
+                write!(formatter, "exchange input closed: {disposition:?}")
+            }
             Self::DestinationCanceled(reason) => {
                 write!(formatter, "exchange destination cancelled: {reason}")
             }
@@ -158,16 +172,7 @@ impl super::ExchangeReceiverPort for TestExchangeReceiverPort {
         key: super::ExchangeReceiverKey,
         frame: super::ExchangeReceiverFrame,
     ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
-        let key = Self::key(key);
-        let sender = crate::runtime::exchange::ExchangeSenderIdentity::native(
-            frame.source_fragment_instance_id,
-            frame.sender_ordinal,
-        );
-        let chunks = self
-            .registry
-            .decode_chunks_for_sender(key, sender, &frame.payload)?;
-        self.registry.push_chunks(key, sender, chunks, frame.eos);
-        Ok(())
+        self.registry.admit_native_frame(Self::key(key), frame)
     }
 
     fn cancel(&self, key: super::ExchangeReceiverKey) {
@@ -226,6 +231,40 @@ impl super::ExchangeReceiverPort for TestExchangeReceiverPort {
 }
 
 #[cfg(test)]
+pub(crate) fn fixture_stream(
+    source_kernel: UniqueId,
+    destination_kernel: UniqueId,
+    node: i32,
+    ordinal: u32,
+) -> ExchangeStreamIdentity {
+    use novarocks_types::identity::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+    static PROCESS: std::sync::OnceLock<BackendProcessId> = std::sync::OnceLock::new();
+    let process = *PROCESS.get_or_init(BackendProcessId::new_v7);
+    let query = QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).unwrap()).unwrap();
+    let source = TaskIdentity::new(
+        query,
+        StageId::new(1).unwrap(),
+        TaskId::new(ordinal + 1).unwrap(),
+        process,
+    );
+    let target = TaskIdentity::new(
+        query,
+        StageId::new(2).unwrap(),
+        TaskId::new(1).unwrap(),
+        process,
+    );
+    ExchangeStreamIdentity::try_new(
+        novarocks_execution_contract::ExchangeSource::new(source, source_kernel, ordinal),
+        target,
+        destination_kernel,
+        novarocks_execution_contract::FragmentNodeId::new(node),
+    )
+    .unwrap()
+}
+
+#[cfg(test)]
 mod tests {
     use super::in_process_test_exchange_receiver_port;
     use crate::runtime::fragment::io::{ExchangeReceiverFrame, ExchangeReceiverKey};
@@ -258,6 +297,12 @@ mod tests {
         })
         .expect("actual native receiver installation");
         let frame = |source_fragment_instance_id, sender_ordinal| ExchangeReceiverFrame {
+            stream: super::fixture_stream(
+                source_fragment_instance_id,
+                key.fragment_instance_id,
+                key.node_id,
+                sender_ordinal,
+            ),
             source_fragment_instance_id,
             sender_ordinal,
             sender_count: 2,

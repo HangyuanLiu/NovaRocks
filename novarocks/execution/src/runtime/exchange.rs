@@ -51,6 +51,10 @@ use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::observable::Observable;
+use novarocks_execution_contract::{
+    ExchangeCloseDisposition, ExchangeFrameSequence, ExchangeSource, ExchangeStreamClose,
+    ExchangeStreamIdentity,
+};
 use novarocks_types::format_uuid;
 use novarocks_types::{SlotId, UniqueId};
 use tracing::debug;
@@ -282,6 +286,45 @@ struct DecodedExchangePayload<'a> {
     arrow_payload: &'a [u8],
 }
 
+/// Provenance is receiver-authored metadata, never a payload-selected Task.
+pub struct SourcedExchangeChunk {
+    source: Option<ExchangeSource>,
+    chunk: Chunk,
+}
+impl SourcedExchangeChunk {
+    pub const fn source(&self) -> Option<ExchangeSource> {
+        self.source
+    }
+    pub fn into_parts(self) -> (Option<ExchangeSource>, Chunk) {
+        (self.source, self.chunk)
+    }
+    fn local(chunk: Chunk) -> Self {
+        Self {
+            source: None,
+            chunk,
+        }
+    }
+}
+impl std::ops::Deref for SourcedExchangeChunk {
+    type Target = Chunk;
+    fn deref(&self) -> &Chunk {
+        &self.chunk
+    }
+}
+impl std::ops::DerefMut for SourcedExchangeChunk {
+    fn deref_mut(&mut self) -> &mut Chunk {
+        &mut self.chunk
+    }
+}
+struct ReceivedExchangeStream {
+    admission: Arc<Mutex<()>>,
+    _admission_storage: novarocks_type_contract::ValueTypeStorageLifetime,
+    identity: ExchangeStreamIdentity,
+    next: i64,
+    end: Option<ExchangeFrameSequence>,
+    consumed: bool,
+}
+
 #[derive(Default)]
 struct ReceiverState {
     expected_senders: usize,
@@ -291,7 +334,9 @@ struct ReceiverState {
     sender_wire_meta: HashMap<ExchangeSenderIdentity, Arc<GuardedExchangeWireMeta>>,
     sender_wire_table_storage: Option<novarocks_type_contract::ValueTypeStorageLifetime>,
     finished: HashSet<ExchangeSenderIdentity>,
-    chunks: VecDeque<Chunk>,
+    chunks: VecDeque<SourcedExchangeChunk>,
+    streams: HashMap<ExchangeSenderIdentity, ReceivedExchangeStream>,
+    stream_table_storage: Option<novarocks_type_contract::ValueTypeStorageLifetime>,
     recv_request_count: u128,
     recv_payload_bytes: u128,
     recv_deserialize_ns: u128,
@@ -663,7 +708,8 @@ impl ExecutionExchangeRegistry {
                     chunk.transfer_to(tracker);
                 }
             }
-            st.chunks.extend(chunks);
+            st.chunks
+                .extend(chunks.into_iter().map(SourcedExchangeChunk::local));
         }
         if eos {
             st.finished.insert(sender);
@@ -682,7 +728,7 @@ impl ExecutionExchangeRegistry {
                 .map(|observer| {
                     let mut finished = st.finished.iter().copied().collect::<Vec<_>>();
                     finished.sort_unstable();
-                    let queued_rows = st.chunks.iter().map(Chunk::len).sum::<usize>();
+                    let queued_rows = st.chunks.iter().map(|chunk| chunk.len()).sum::<usize>();
                     (
                         observer,
                         st.expected_senders,
@@ -853,7 +899,7 @@ impl ExecutionExchangeRegistry {
             }
         }
 
-        let chunks: Vec<Chunk> = st.chunks.drain(..).collect();
+        let chunks: Vec<Chunk> = st.chunks.drain(..).map(|item| item.chunk).collect();
         let stats = ExchangeRecvStats {
             request_received: st.recv_request_count,
             bytes_received: st.recv_payload_bytes,
@@ -867,6 +913,11 @@ impl ExecutionExchangeRegistry {
         // guard.remove(&key);
         Ok((chunks, stats))
     }
+}
+
+pub enum SourcedExchangePopResult {
+    Chunk(SourcedExchangeChunk),
+    Finished(ExchangeRecvStats),
 }
 
 pub enum ExchangePopResult {
@@ -884,6 +935,18 @@ impl ExchangeReceiverHandle {
         &self,
         expected_senders: usize,
     ) -> Result<Option<ExchangePopResult>, ExchangeFailure> {
+        Ok(self
+            .try_pop_sourced_with_stats(expected_senders)?
+            .map(|item| match item {
+                SourcedExchangePopResult::Chunk(item) => ExchangePopResult::Chunk(item.chunk),
+                SourcedExchangePopResult::Finished(stats) => ExchangePopResult::Finished(stats),
+            }))
+    }
+
+    pub fn try_pop_sourced_with_stats(
+        &self,
+        expected_senders: usize,
+    ) -> Result<Option<SourcedExchangePopResult>, ExchangeFailure> {
         use tracing::debug;
 
         let r = &self.receiver;
@@ -898,7 +961,7 @@ impl ExchangeReceiverHandle {
         }
 
         if let Some(chunk) = st.chunks.pop_front() {
-            return Ok(Some(ExchangePopResult::Chunk(chunk)));
+            return Ok(Some(SourcedExchangePopResult::Chunk(chunk)));
         }
 
         let expected = st.expected_senders.max(expected_senders);
@@ -916,10 +979,37 @@ impl ExchangeReceiverHandle {
             // If the first driver finishes and removes it, subsequent drivers may create a new empty receiver and hang.
             // Cleanup relies on explicit cancel_fragment() or TTL.
             // exchange().lock().expect("exchange lock").remove(&self.key);
-            return Ok(Some(ExchangePopResult::Finished(stats)));
+            return Ok(Some(SourcedExchangePopResult::Finished(stats)));
         }
 
         Ok(None)
+    }
+
+    /// Called by the input owner only after its real source has exhausted
+    /// data and End. ACK, Task outcome and readiness peeks do not call this.
+    pub fn complete_input_consumption(
+        &self,
+        expected_senders: usize,
+    ) -> Result<(), ExchangeFailure> {
+        let mut st = self.receiver.mu.lock().expect("exchange receiver lock");
+        if st.canceled {
+            return Err(exchange_stopped());
+        }
+        let expected = st.expected_senders.max(expected_senders);
+        if !st.chunks.is_empty() || st.finished.len() < expected {
+            return Err(exchange_contract(
+                "exchange input has not exhausted every sender's data and End",
+            ));
+        }
+        if st.streams.values().any(|stream| stream.end.is_none()) {
+            return Err(exchange_contract("exchange stream has no admitted End"));
+        }
+        for stream in st.streams.values_mut() {
+            stream.consumed = true;
+        }
+        drop(st);
+        self.receiver.observable.defer_notify().arm();
+        Ok(())
     }
 
     pub fn observable(&self) -> Arc<Observable> {
@@ -987,7 +1077,7 @@ impl ExchangeReceiverHandle {
             }
 
             if let Some(chunk) = st.chunks.pop_front() {
-                return Ok(ExchangePopResult::Chunk(chunk));
+                return Ok(ExchangePopResult::Chunk(chunk.chunk));
             }
 
             let expected = st.expected_senders.max(expected_senders);
@@ -2361,6 +2451,261 @@ pub(crate) fn decode_chunks(bytes: &[u8]) -> Result<Vec<Chunk>, ExchangeFailure>
 }
 
 impl ExecutionExchangeRegistry {
+    pub fn admit_native_frame(
+        &self,
+        key: ExchangeKey,
+        frame: crate::runtime::fragment::io::ExchangeReceiverFrame,
+    ) -> Result<(), ExchangeFailure> {
+        let stream = frame.stream;
+        if stream.destination_fragment_instance_id()
+            != UniqueId::new(key.finst_id_hi, key.finst_id_lo)
+            || stream.destination_node().get() != key.node_id
+            || stream.source().fragment_instance_id() != frame.source_fragment_instance_id
+            || stream.source().sender_ordinal() != frame.sender_ordinal
+            || frame.sender_count == 0
+            || frame.sender_ordinal >= frame.sender_count
+        {
+            return Err(exchange_contract(
+                "exchange frame differs from its exact admitted stream",
+            ));
+        }
+        let sequence = ExchangeFrameSequence::try_new(frame.sequence).map_err(exchange_contract)?;
+        let receiver = self
+            .receivers
+            .lock()
+            .expect("exchange lock")
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| exchange_contract("exchange receiver is not registered"))?;
+        let sender =
+            ExchangeSenderIdentity::native(frame.source_fragment_instance_id, frame.sender_ordinal);
+        let admission = {
+            let mut st = receiver.mu.lock().expect("exchange receiver lock");
+            if st.canceled {
+                return Err(exchange_stopped());
+            }
+            if st.expected_senders != frame.sender_count as usize {
+                return Err(exchange_contract(
+                    "exchange sender count differs from its frozen receiver",
+                ));
+            }
+            if let Some(prior) = st.streams.get(&sender) {
+                if prior.identity != stream {
+                    return Err(exchange_contract("exchange stream identity changed"));
+                }
+                prior.admission.clone()
+            } else {
+                if sequence != ExchangeFrameSequence::FIRST
+                    || st.streams.len() >= st.expected_senders
+                {
+                    return Err(exchange_contract(
+                        "exchange first frame is not the exact stream's first sequence",
+                    ));
+                }
+                let expected = st
+                    .expected
+                    .as_ref()
+                    .ok_or_else(|| {
+                        exchange_contract("exchange receiver has no frozen declaration")
+                    })?
+                    .clone();
+                let owner = expected
+                    .creation_factory
+                    .begin_typed_construction(&expected.chunk_schema)?;
+                let growth = novarocks_type_contract::owned_resources::hashmap::next_insert_allocation_upper_bound_observed::<ExchangeSenderIdentity, ReceivedExchangeStream, ExchangeFailure>(
+                    st.streams.len(), st.streams.capacity(), || {
+                        owner.observe(0, &[], crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork { units: 1 })?; Ok(())
+                    })?;
+                let table_owner = if growth != 0 {
+                    let owner = expected
+                        .creation_factory
+                        .begin_typed_construction(&expected.chunk_schema)?;
+                    owner.observe_opaque_upper_bound(growth)?;
+                    Some(owner)
+                } else {
+                    None
+                };
+                owner.request(
+                    novarocks_type_contract::owned_resources::layout::arc_layout(
+                        std::alloc::Layout::new::<Mutex<()>>(),
+                    )
+                    .map_err(crate::exec::pipeline::operator::ConstructionFailure::from)?,
+                )?;
+                let admission = Arc::new(Mutex::new(()));
+                st.streams.insert(
+                    sender,
+                    ReceivedExchangeStream {
+                        admission: admission.clone(),
+                        _admission_storage: owner.storage_lifetime(),
+                        identity: stream,
+                        next: 0,
+                        end: None,
+                        consumed: false,
+                    },
+                );
+                if let Some(owner) = table_owner {
+                    st.stream_table_storage = Some(owner.storage_lifetime());
+                }
+                admission
+            }
+        };
+        // Never wait for this stream's decoder while holding receiver.mu.
+        // Independent streams decode concurrently; each stream publishes in order.
+        let _admission = admission.lock().expect("exchange stream admission lock");
+        {
+            let st = receiver.mu.lock().expect("exchange receiver lock");
+            if st.canceled {
+                return Err(exchange_stopped());
+            }
+            let prior = st
+                .streams
+                .get(&sender)
+                .ok_or_else(|| exchange_contract("exchange stream admission disappeared"))?;
+            if prior.end.is_some() || prior.next != frame.sequence {
+                return Err(exchange_contract(
+                    "exchange sequence continuity or End invariant failed",
+                ));
+            }
+        }
+        let next = if frame.eos {
+            frame.sequence
+        } else {
+            sequence.checked_next().map_err(exchange_contract)?.get()
+        };
+        let start = Instant::now();
+        let mut chunks = self.decode_chunks_for_sender(key, sender, &frame.payload)?;
+        let notify = receiver.observable.defer_notify();
+        let mut st = receiver.mu.lock().expect("exchange receiver lock");
+        if st.canceled {
+            return Err(exchange_stopped());
+        }
+        let rows: usize = chunks.iter().map(Chunk::len).sum();
+        if let Some(tracker) = st.mem_tracker.as_ref() {
+            for chunk in &mut chunks {
+                chunk.transfer_to(tracker);
+            }
+        }
+        st.recv_request_count = st.recv_request_count.saturating_add(1);
+        st.recv_payload_bytes = st
+            .recv_payload_bytes
+            .saturating_add(frame.payload.len() as u128);
+        st.recv_deserialize_ns = st
+            .recv_deserialize_ns
+            .saturating_add(start.elapsed().as_nanos());
+        st.recv_chunks = st.recv_chunks.saturating_add(chunks.len() as u128);
+        st.recv_rows = st.recv_rows.saturating_add(rows as u128);
+        st.chunks
+            .extend(chunks.into_iter().map(|chunk| SourcedExchangeChunk {
+                source: Some(stream.source()),
+                chunk,
+            }));
+        let accepted = st
+            .streams
+            .get_mut(&sender)
+            .ok_or_else(|| exchange_contract("exchange stream admission disappeared"))?;
+        accepted.next = next;
+        accepted.end = frame.eos.then_some(sequence);
+        if frame.eos {
+            st.finished.insert(sender);
+        }
+        #[cfg(novarocks_dev_controls)]
+        let eos_snapshot = if frame.eos {
+            st.test_observer
+                .clone()
+                .filter(|o| o.is_active())
+                .map(|observer| {
+                    let mut finished = st.finished.iter().copied().collect::<Vec<_>>();
+                    finished.sort_unstable();
+                    (
+                        observer,
+                        st.expected_senders,
+                        finished,
+                        st.chunks.len(),
+                        st.chunks.iter().map(|c| c.len()).sum::<usize>(),
+                        receiver.observable.generation(),
+                    )
+                })
+        } else {
+            None
+        };
+        drop(st);
+        receiver.cv.notify_all();
+        #[cfg(novarocks_dev_controls)]
+        if let Some((observer, expected, finished, queued_chunks, queued_rows, generation)) =
+            eos_snapshot
+        {
+            emit_exchange_snapshot_marker(Some(observer.as_ref()), || {
+                format!(
+                    "event=push_eos finst={} node_id={} sender={} expected_senders={} finished_senders={:?} queued_chunks={} queued_rows={} receiver_generation_before_notify={}",
+                    key.finst_uuid(),
+                    key.node_id,
+                    sender,
+                    expected,
+                    finished,
+                    queued_chunks,
+                    queued_rows,
+                    generation
+                )
+            });
+        }
+        notify.arm();
+        Ok(())
+    }
+
+    /// Snapshot only existing source-authored facts; an absent stream is not
+    /// evidence of consumption. The binding owner supplies its frozen set.
+    pub fn stream_close_facts(
+        &self,
+        key: ExchangeKey,
+        expected: &[ExchangeStreamIdentity],
+    ) -> Result<Vec<ExchangeStreamClose>, ExchangeFailure> {
+        let receiver = self
+            .receivers
+            .lock()
+            .expect("exchange lock")
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| exchange_contract("exchange receiver is not registered"))?;
+        let st = receiver.mu.lock().expect("exchange receiver lock");
+        if st.canceled {
+            return Err(exchange_stopped());
+        }
+        expected
+            .iter()
+            .map(|stream| {
+                if stream.destination_fragment_instance_id()
+                    != UniqueId::new(key.finst_id_hi, key.finst_id_lo)
+                    || stream.destination_node().get() != key.node_id
+                {
+                    return Err(exchange_contract(
+                        "close snapshot names another exchange input",
+                    ));
+                }
+                let sender = ExchangeSenderIdentity::native(
+                    stream.source().fragment_instance_id(),
+                    stream.source().sender_ordinal(),
+                );
+                let disposition = match st.streams.get(&sender) {
+                    Some(actual) if actual.identity != *stream => {
+                        return Err(exchange_contract(
+                            "close snapshot source differs from admitted stream",
+                        ));
+                    }
+                    Some(actual) if actual.consumed => ExchangeCloseDisposition::Consumed {
+                        final_sequence: actual
+                            .end
+                            .ok_or_else(|| exchange_contract("consumed stream has no End"))?,
+                    },
+                    _ => ExchangeCloseDisposition::Withdrawn,
+                };
+                Ok(ExchangeStreamClose {
+                    stream: *stream,
+                    disposition,
+                })
+            })
+            .collect()
+    }
+
     pub fn decode_chunks_for_sender(
         &self,
         key: ExchangeKey,
@@ -4490,6 +4835,251 @@ mod tests {
                 .expect_err("binding conflict")
                 .to_string()
                 .contains("exchange column binding mismatch")
+        );
+    }
+
+    fn native_stream_fixture() -> (
+        ExecutionExchangeRegistry,
+        ExchangeKey,
+        crate::runtime::fragment::io::ExchangeReceiverFrame,
+        Chunk,
+    ) {
+        let registry = ExecutionExchangeRegistry::default();
+        let key = ExchangeKey {
+            finst_id_hi: 88001,
+            finst_id_lo: 88002,
+            node_id: 3,
+        };
+        let chunk = exchange_test_chunk("k2");
+        registry
+            .register_expected_chunk_schema(
+                key,
+                1,
+                plain_declaration(&chunk.chunk_schema_ref()),
+                crate::runtime::fragment::exchange::test_receiver_creation_factory(),
+            )
+            .unwrap();
+        let source_kernel = UniqueId::new(88003, 88004);
+        let stream = crate::runtime::fragment::io::exchange::fixture_stream(
+            source_kernel,
+            UniqueId::new(key.finst_id_hi, key.finst_id_lo),
+            key.node_id,
+            0,
+        );
+        let frame = crate::runtime::fragment::io::ExchangeReceiverFrame {
+            stream,
+            source_fragment_instance_id: source_kernel,
+            sender_ordinal: 0,
+            sender_count: 1,
+            sender_id: 0,
+            backend_number: 0,
+            sequence: 0,
+            eos: false,
+            payload: encode_chunks(std::slice::from_ref(&chunk), true).unwrap(),
+        };
+        (registry, key, frame, chunk)
+    }
+
+    #[test]
+    fn native_exchange_decode_failure_does_not_advance_and_gap_duplicate_after_end_fail() {
+        let (registry, key, frame, _) = native_stream_fixture();
+        let mut invalid = frame.clone();
+        invalid.payload = vec![0xff];
+        assert!(registry.admit_native_frame(key, invalid).is_err());
+        assert_eq!(
+            registry
+                .receivers
+                .lock()
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .mu
+                .lock()
+                .unwrap()
+                .recv_request_count,
+            0
+        );
+        let mut gap = frame.clone();
+        gap.sequence = 1;
+        assert!(registry.admit_native_frame(key, gap).is_err());
+        registry.admit_native_frame(key, frame.clone()).unwrap();
+        assert!(registry.admit_native_frame(key, frame.clone()).is_err());
+        let mut end = frame.clone();
+        end.sequence = 1;
+        end.eos = true;
+        end.payload.clear();
+        registry.admit_native_frame(key, end.clone()).unwrap();
+        assert!(registry.admit_native_frame(key, end).is_err());
+        let mut after = frame;
+        after.sequence = 2;
+        assert!(registry.admit_native_frame(key, after).is_err());
+        assert_eq!(
+            registry
+                .receivers
+                .lock()
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .mu
+                .lock()
+                .unwrap()
+                .recv_request_count,
+            2
+        );
+    }
+
+    #[test]
+    fn native_exchange_consumed_requires_source_exhaustion_and_retains_final_data_end_sequence() {
+        use super::{ExchangeCloseDisposition, ExchangeFrameSequence, SourcedExchangePopResult};
+        let (registry, key, mut frame, chunk) = native_stream_fixture();
+        frame.eos = true;
+        let stream = frame.stream;
+        registry.admit_native_frame(key, frame).unwrap();
+        let handle = registry.get_receiver_handle(key, 1).unwrap();
+        assert!(handle.has_output_or_finished(1));
+        assert_eq!(
+            registry.stream_close_facts(key, &[stream]).unwrap()[0].disposition,
+            ExchangeCloseDisposition::Withdrawn
+        );
+        assert!(handle.complete_input_consumption(1).is_err());
+        let Some(SourcedExchangePopResult::Chunk(data)) =
+            handle.try_pop_sourced_with_stats(1).unwrap()
+        else {
+            panic!("source data is retained");
+        };
+        assert_eq!(data.source(), Some(stream.source()));
+        assert_eq!(data.len(), chunk.len());
+        assert!(matches!(
+            handle.try_pop_sourced_with_stats(1).unwrap(),
+            Some(SourcedExchangePopResult::Finished(_))
+        ));
+        // Even a non-consuming EOF peek cannot author a close fact.
+        assert_eq!(
+            registry.stream_close_facts(key, &[stream]).unwrap()[0].disposition,
+            ExchangeCloseDisposition::Withdrawn
+        );
+        handle.complete_input_consumption(1).unwrap();
+        assert_eq!(
+            registry.stream_close_facts(key, &[stream]).unwrap()[0].disposition,
+            ExchangeCloseDisposition::Consumed {
+                final_sequence: ExchangeFrameSequence::FIRST
+            }
+        );
+    }
+
+    #[test]
+    fn native_exchange_empty_end_is_consumed_only_at_input_exhaustion() {
+        use super::{ExchangeCloseDisposition, ExchangeFrameSequence};
+        let (registry, key, mut frame, _) = native_stream_fixture();
+        frame.eos = true;
+        frame.payload.clear();
+        let stream = frame.stream;
+        registry.admit_native_frame(key, frame).unwrap();
+        assert_eq!(
+            registry.stream_close_facts(key, &[stream]).unwrap()[0].disposition,
+            ExchangeCloseDisposition::Withdrawn
+        );
+        registry
+            .get_receiver_handle(key, 1)
+            .unwrap()
+            .complete_input_consumption(1)
+            .unwrap();
+        assert_eq!(
+            registry.stream_close_facts(key, &[stream]).unwrap()[0].disposition,
+            ExchangeCloseDisposition::Consumed {
+                final_sequence: ExchangeFrameSequence::FIRST
+            }
+        );
+    }
+
+    #[test]
+    fn native_exchange_concurrent_same_sequence_has_one_admission() {
+        let (registry, key, frame, _) = native_stream_fixture();
+        let registry = Arc::new(registry);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles = (0..2)
+            .map(|_| {
+                let registry = registry.clone();
+                let barrier = barrier.clone();
+                let frame = frame.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry.admit_native_frame(key, frame).is_ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        assert_eq!(
+            handles
+                .into_iter()
+                .map(|h| usize::from(h.join().unwrap()))
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            registry
+                .receivers
+                .lock()
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .mu
+                .lock()
+                .unwrap()
+                .recv_request_count,
+            1
+        );
+    }
+    #[test]
+    fn native_exchange_one_stream_decoder_does_not_serialize_other_sources() {
+        let (registry, key, mut first, _) = native_stream_fixture();
+        // Re-register this explicit fixture with two actual frozen senders.
+        registry.set_expected_senders(key, 2);
+        first.sender_count = 2;
+        registry.admit_native_frame(key, first.clone()).unwrap();
+        let registry = Arc::new(registry);
+        let fence = registry
+            .receivers
+            .lock()
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .mu
+            .lock()
+            .unwrap()
+            .streams
+            .get(&ExchangeSenderIdentity::native(
+                first.source_fragment_instance_id,
+                0,
+            ))
+            .unwrap()
+            .admission
+            .clone();
+        let guard = fence.lock().unwrap();
+        let mut second = first;
+        second.sender_ordinal = 1;
+        second.source_fragment_instance_id = UniqueId::new(88005, 88006);
+        second.stream = crate::runtime::fragment::io::exchange::fixture_stream(
+            second.source_fragment_instance_id,
+            UniqueId::new(key.finst_id_hi, key.finst_id_lo),
+            key.node_id,
+            1,
+        );
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker_registry = registry.clone();
+        let worker = std::thread::spawn(move || {
+            sent.send(worker_registry.admit_native_frame(key, second))
+                .unwrap();
+        });
+        let result = received.recv_timeout(std::time::Duration::from_secs(2));
+        drop(guard);
+        worker.join().unwrap();
+        result
+            .expect("another source progresses while one decoder is occupied")
+            .unwrap();
+        assert_eq!(
+            registry.snapshot_receiver_state(key).unwrap().queued_chunks,
+            2
         );
     }
 }

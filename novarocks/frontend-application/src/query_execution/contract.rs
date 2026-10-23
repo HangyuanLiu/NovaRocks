@@ -1263,6 +1263,7 @@ mod tests {
                     max: 1,
                     requires_power_of_two: false,
                 },
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .unwrap();
         let mut builder = PlanBuilder::new(PlanVersionId::try_new([29; 16]).unwrap())

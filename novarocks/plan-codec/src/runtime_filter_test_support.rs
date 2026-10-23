@@ -196,6 +196,7 @@ pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
                 max: 1,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let mut right_builder = FragmentBuilder::new(right_fragment);
@@ -209,6 +210,7 @@ pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
                 max: 1,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
 
@@ -345,6 +347,7 @@ pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
                 max: 1,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
 
@@ -420,9 +423,12 @@ pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
     plan.add_fragment(right_source).unwrap();
     plan.add_fragment(join_stage).unwrap();
     plan.add_edge(Edge {
+        role: novarocks_physical_plan::OutputRole::Relational,
+        delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
         id: left_edge,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: novarocks_physical_plan::FragmentOutputPort::Root,
             fragment: left_fragment,
             projection: Box::from([left_source_value]),
         },
@@ -446,9 +452,12 @@ pub(crate) fn finish_ordered_join_build_filter_plan() -> PhysicalPlan {
     })
     .unwrap();
     plan.add_edge(Edge {
+        role: novarocks_physical_plan::OutputRole::Relational,
+        delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
         id: right_edge,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: novarocks_physical_plan::FragmentOutputPort::Root,
             fragment: right_fragment,
             projection: Box::from([right_source_value]),
         },

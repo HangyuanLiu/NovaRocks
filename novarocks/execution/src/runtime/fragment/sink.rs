@@ -83,6 +83,7 @@ pub(crate) fn materialize_compiled_sink(
             let input = DataStreamSinkFactoryInput::try_from_static_program(
                 branch.dest_node_id(),
                 branch.partition_type(),
+                branch.contract().delivery,
                 branch.output_columns().to_vec(),
                 destinations.clone(),
             )
@@ -110,7 +111,8 @@ pub(crate) fn materialize_compiled_sink(
         }
         (
             StaticSinkProgram::MultiCastDataStream { .. }
-            | StaticSinkProgram::SplitDataStream { .. },
+            | StaticSinkProgram::SplitDataStream { .. }
+            | StaticSinkProgram::ChangeStreamRouter { .. },
             _,
         ) => Err(materialization_contract(format!(
             "compiled {} sink not executable yet",
@@ -178,6 +180,7 @@ fn sink_program_name(program: &StaticSinkProgram) -> &'static str {
         StaticSinkProgram::DataStream { .. } => "data_stream",
         StaticSinkProgram::MultiCastDataStream { .. } => "multi_cast_data_stream",
         StaticSinkProgram::SplitDataStream { .. } => "split_data_stream",
+        StaticSinkProgram::ChangeStreamRouter { .. } => "change_stream_router",
     }
 }
 

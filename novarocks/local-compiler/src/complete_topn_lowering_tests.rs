@@ -183,7 +183,12 @@ fn complete_cross_fragment() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
         .unwrap();
     scan_builder.attach_runtime_filter(FILTER).unwrap();
     let scan_fragment = scan_builder
-        .finish_definition(PROJECT, FragmentSink::Stream { edge: EDGE }, dop())
+        .finish_definition(
+            PROJECT,
+            FragmentSink::Stream { edge: EDGE },
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut aggregate_builder = FragmentBuilder::new(GATHER);
@@ -236,7 +241,12 @@ fn complete_cross_fragment() -> (Arc<FragmentPackage>, Arc<FragmentPackage>) {
         .unwrap();
     aggregate_builder.attach_runtime_filter(FILTER).unwrap();
     let aggregate_fragment = aggregate_builder
-        .finish_definition(TOPN, FragmentSink::Result, dop())
+        .finish_definition(
+            TOPN,
+            FragmentSink::Result,
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let mut filter = ordered_filter(
         GATHER,
@@ -465,7 +475,12 @@ fn complete_multi_scan_union(local_groups: bool) -> Arc<FragmentPackage> {
         .unwrap();
     builder.attach_runtime_filter(FILTER).unwrap();
     let fragment = builder
-        .finish_definition(TOPN, FragmentSink::Result, dop())
+        .finish_definition(
+            TOPN,
+            FragmentSink::Result,
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let mut filter = ordered_filter(
         PROBE,

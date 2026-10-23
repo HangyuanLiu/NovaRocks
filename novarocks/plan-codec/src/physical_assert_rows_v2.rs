@@ -57,6 +57,16 @@ fn decode_comparison(value: i32) -> Result<p::RowCountAssertion, Error> {
         _ => Err(invalid("row-count comparison is absent or unknown")),
     }
 }
+fn physical_applicability_references(value: p::AssertionApplicability) -> usize {
+    usize::from(matches!(value, p::AssertionApplicability::WhenTrue(_)))
+}
+fn wire_applicability(value: &wire::PerKeyRowCountAssertion) -> Result<Option<u32>, Error> {
+    match value.applicability.as_ref().and_then(|a| a.kind.as_ref()) {
+        Some(wire::assertion_applicability::Kind::AllRows(_)) => Ok(None),
+        Some(wire::assertion_applicability::Kind::WhenTrueValueId(id)) => Ok(Some(*id)),
+        None => Err(invalid("keyed assertion applicability is absent")),
+    }
+}
 fn physical_outer(
     input: &p::PhysicalNode,
     assertion: &p::RowCountAssertionSpec,
@@ -64,9 +74,18 @@ fn physical_outer(
     let header = add(input.required_inputs.len(), input.output.columns.len())?;
     match assertion {
         p::RowCountAssertionSpec::Global { .. } => Ok(header),
-        p::RowCountAssertionSpec::PerKeyAtMostOne { keys, labels, .. } => {
-            add(header, add(keys.len(), labels.len())?)
-        }
+        p::RowCountAssertionSpec::PerKeyAtMostOne {
+            keys,
+            labels,
+            applicability,
+            ..
+        } => add(
+            header,
+            add(
+                add(keys.len(), labels.len())?,
+                physical_applicability_references(*applicability),
+            )?,
+        ),
     }
 }
 fn wire_outer(
@@ -77,9 +96,13 @@ fn wire_outer(
     let header = add(input.required_inputs.len(), port.value_ids.len())?;
     match assertion {
         wire::row_count_assertion_node::Kind::Global(_) => Ok(header),
-        wire::row_count_assertion_node::Kind::PerKeyAtMostOne(v) => {
-            add(header, add(v.key_value_ids.len(), v.labels.len())?)
-        }
+        wire::row_count_assertion_node::Kind::PerKeyAtMostOne(v) => add(
+            header,
+            add(
+                add(v.key_value_ids.len(), v.labels.len())?,
+                usize::from(wire_applicability(v)?.is_some()),
+            )?,
+        ),
     }
 }
 fn prepare_encode(
@@ -123,6 +146,7 @@ fn prepare_encode(
                 keys,
                 labels,
                 message,
+                ..
             } => add(
                 bytes::<p::ValueId>(keys.len())?,
                 add(bytes::<Box<str>>(labels.len())?, message.len())?,
@@ -148,8 +172,20 @@ fn prepare_encode(
             keys,
             labels,
             message,
+            ..
         } => {
-            model.refs = add(model.refs, keys.len())?;
+            model.refs = add(
+                model.refs,
+                add(
+                    keys.len(),
+                    match assertion {
+                        p::RowCountAssertionSpec::PerKeyAtMostOne { applicability, .. } => {
+                            physical_applicability_references(*applicability)
+                        }
+                        _ => 0,
+                    },
+                )?,
+            )?;
             model.request::<u32>(keys.len(), 1)?;
             model.request::<String>(labels.len(), 1)?;
             model.request::<u8>(message.len(), 1)?;
@@ -199,7 +235,15 @@ fn prepare_encode(
     for id in &input.output.columns {
         reference(id.get(), values, w)?;
     }
-    if let p::RowCountAssertionSpec::PerKeyAtMostOne { keys, .. } = assertion {
+    if let p::RowCountAssertionSpec::PerKeyAtMostOne {
+        keys,
+        applicability,
+        ..
+    } = assertion
+    {
+        if let p::AssertionApplicability::WhenTrue(value) = applicability {
+            reference(value.get(), values, w)?;
+        }
         for id in keys {
             reference(id.get(), values, w)?;
         }
@@ -286,7 +330,13 @@ fn prepare_decode(
             model.request::<u8>(v.subject.len(), 2)?;
         }
         wire::row_count_assertion_node::Kind::PerKeyAtMostOne(v) => {
-            model.refs = add(model.refs, v.key_value_ids.len())?;
+            model.refs = add(
+                model.refs,
+                add(
+                    v.key_value_ids.len(),
+                    usize::from(wire_applicability(v)?.is_some()),
+                )?,
+            )?;
             model.request::<p::ValueId>(v.key_value_ids.len(), 2)?;
             model.request::<Box<str>>(v.labels.len(), 2)?;
             model.request::<u8>(v.message.len(), 2)?;
@@ -342,6 +392,17 @@ fn prepare_decode(
         reference(*id, values, w)?;
     }
     if let wire::row_count_assertion_node::Kind::PerKeyAtMostOne(v) = assertion {
+        match v
+            .applicability
+            .as_ref()
+            .and_then(|value| value.kind.as_ref())
+        {
+            Some(wire::assertion_applicability::Kind::AllRows(_)) => {}
+            Some(wire::assertion_applicability::Kind::WhenTrueValueId(id)) => {
+                reference(*id, values, w)?
+            }
+            None => return Err(invalid("keyed assertion applicability is absent")),
+        }
         for id in &v.key_value_ids {
             reference(*id, values, w)?;
         }
@@ -416,6 +477,7 @@ fn emit_encode(
             keys,
             labels,
             message,
+            applicability,
         } => {
             let key_value_ids = encode_ids(keys, work)?;
             let mut copied = reserve(labels.len(), work)?;
@@ -424,6 +486,18 @@ fn emit_encode(
                 work.step()?;
             }
             wire::row_count_assertion_node::Kind::PerKeyAtMostOne(wire::PerKeyRowCountAssertion {
+                applicability: Some(wire::AssertionApplicability {
+                    kind: Some(match applicability {
+                        p::AssertionApplicability::AllRows => {
+                            wire::assertion_applicability::Kind::AllRows(
+                                novarocks_proto_models::physical_control_v2::Empty {},
+                            )
+                        }
+                        p::AssertionApplicability::WhenTrue(value) => {
+                            wire::assertion_applicability::Kind::WhenTrueValueId(value.get())
+                        }
+                    }),
+                }),
                 key_value_ids,
                 labels: copied,
                 message: copy_text(message, work)?,
@@ -474,6 +548,19 @@ fn emit_decode(
                 work.step()?;
             }
             p::RowCountAssertionSpec::PerKeyAtMostOne {
+                applicability: match v
+                    .applicability
+                    .as_ref()
+                    .and_then(|value| value.kind.as_ref())
+                {
+                    Some(wire::assertion_applicability::Kind::AllRows(_)) => {
+                        p::AssertionApplicability::AllRows
+                    }
+                    Some(wire::assertion_applicability::Kind::WhenTrueValueId(id)) => {
+                        p::AssertionApplicability::WhenTrue(p::ValueId::new(*id))
+                    }
+                    None => return Err(invalid("keyed assertion applicability is absent")),
+                },
                 keys,
                 labels: boxed(labels, work)?,
                 message: copy_boxed_text(&v.message, work)?,

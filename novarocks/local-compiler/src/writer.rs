@@ -74,7 +74,7 @@ pub(crate) fn extra_channels(package: &FragmentPackage, node: &PhysicalNode) -> 
         NodeKind::TableFinish(spec) => {
             let input = node
                 .inputs
-                .first()
+                .get(spec.inputs.writer_results as usize)
                 .and_then(|input| package.fragment().nodes().get(input))
                 .map_or(0, |input| input.output.columns.len());
             node.output
@@ -92,8 +92,9 @@ pub(crate) fn extra_channels(package: &FragmentPackage, node: &PhysicalNode) -> 
 /// A `TableWriter` is the one root of its fragment and streams exactly its
 /// writer relation; a partitioned input at multiple drivers requires an exact
 /// exchange receiver whose edge keys can be shuffled locally. A
-/// `TableFinish` is the root of a Result fragment over exactly one
-/// writer-result receiver. Statistics are admitted by their own owner.
+/// `TableFinish` is the root of a Result fragment over its writer multiplex
+/// relation and, for logical counts, an independent summary receiver.
+/// Statistics are admitted by their own owner.
 pub(crate) fn admit_writer_family(
     package: &FragmentPackage,
     node: &PhysicalNode,
@@ -175,30 +176,44 @@ pub(crate) fn admit_writer_family(
             ) {
                 return Err(unsupported("table finish without a Result sink"));
             }
-            let [input] = node.inputs.as_ref() else {
+            let input = node
+                .inputs
+                .get(spec.inputs.writer_results as usize)
+                .and_then(|id| fragment.nodes().get(id))
+                .ok_or(FragmentCompileError::Invalid(
+                    "missing table finish writer input",
+                ))?;
+            let logical =
+                spec.count_mode == novarocks_physical_plan::FinishCountMode::LogicalChanges;
+            if node.inputs.len() != if logical { 2 } else { 1 } {
                 return Err(FragmentCompileError::Invalid(
-                    "table finish requires exactly one input",
-                ));
-            };
-            let input = fragment
-                .nodes()
-                .get(input)
-                .ok_or(FragmentCompileError::Invalid("missing table finish input"))?;
-            if !matches!(input.kind, NodeKind::ExchangeSource { .. }) {
-                return Err(unsupported(
-                    "table finish over more than one writer fragment (multi-writer union)",
+                    "table finish input roles differ",
                 ));
             }
-            let mut carried = false;
-            for cut in package.cuts().inbound.iter() {
-                let addressed = cut.destination_node == input.id && cut.writer_result.is_some();
-                work.step()?;
-                carried |= addressed;
-            }
-            if !carried {
-                return Err(FragmentCompileError::Invalid(
-                    "table finish input is not a writer-result receiver",
-                ));
+            if logical {
+                let summary = spec
+                    .inputs
+                    .logical_summary
+                    .and_then(|port| node.inputs.get(port as usize))
+                    .and_then(|id| fragment.nodes().get(id))
+                    .ok_or(FragmentCompileError::Invalid(
+                        "missing logical finish summary input",
+                    ))?;
+                let mut carried = false;
+                for cut in package.cuts().inbound.iter() {
+                    carried |= cut.destination_node == summary.id
+                        && cut.delivery == novarocks_physical_plan::DeliveryRequirement::MustDrain
+                        && matches!(
+                            cut.payload,
+                            novarocks_physical_plan::ExchangePayloadContract::LogicalSummary(_)
+                        );
+                    work.step()?;
+                }
+                if !matches!(summary.kind, NodeKind::ExchangeSource { .. }) || !carried {
+                    return Err(FragmentCompileError::Invalid(
+                        "logical finish requires its exact summary receiver",
+                    ));
+                }
             }
             // The finish reads its input relation positionally: the receiver's
             // occurrences are exactly the frozen input schema.
@@ -238,12 +253,9 @@ pub(crate) fn admit_writer_result_cut(
             feature: "writer-result stream from a fragment not rooted at a table writer",
         });
     };
-    let writer_result = cut
-        .writer_result
-        .as_ref()
-        .ok_or(FragmentCompileError::Invalid(
-            "table writer stream carries no writer-result cut",
-        ))?;
+    let writer_result = cut.writer_result().ok_or(FragmentCompileError::Invalid(
+        "table writer stream carries no writer-result cut",
+    ))?;
     if cut.kind != EdgeKind::Stream
         || writer_result.write_target_ordinal != target.write_target_ordinal
         || writer_result.schema_revision != target.output_schema.revision
@@ -712,6 +724,7 @@ pub(crate) struct LoweredFinish {
 pub(crate) struct FinishLoweringInput<'a> {
     pub child: ProgramNodeId,
     pub child_layout: &'a StaticLayout,
+    pub summary: Option<(ProgramNodeId, &'a StaticLayout)>,
     /// Fresh slots of the Root relation, in field order.
     pub slots: &'a [SlotId],
     /// Fresh internal slots of the statistics: the grouped Unpivot's
@@ -723,7 +736,7 @@ pub(crate) struct FinishLoweringInput<'a> {
     pub expressions: &'a BTreeMap<ExprId, ProgramExprId>,
 }
 
-/// Lower one admitted finish over its one writer-result receiver. The finish
+/// Lower one admitted finish over its writer multiplex and optional summary. The finish
 /// reads the receiver's layout unchanged as its multiplex relation and
 /// publishes its root relation with the frozen relation names.
 pub(crate) fn lower_finish_with_creation<H>(
@@ -804,7 +817,21 @@ pub(crate) fn lower_finish_with_creation<H>(
         work.flush()?;
         Ok(LoweredFinish {
             kind: ProgramNodeKind::TableFinish {
-                inputs: vec![child],
+                count_mode: spec.count_mode,
+                input_roles: spec.inputs,
+                logical_summary_layout: input.summary.map(|(_, layout)| layout.clone()),
+                inputs: {
+                    let mut inputs = vec![child; node.inputs.len()];
+                    inputs[spec.inputs.writer_results as usize] = child;
+                    if let Some((summary, _)) = input.summary {
+                        inputs[spec
+                            .inputs
+                            .logical_summary
+                            .ok_or(FragmentCompileError::Invalid("summary input has no role"))?
+                            as usize] = summary;
+                    }
+                    inputs
+                },
                 expected_targets: spec.expected_target_ordinals.to_vec(),
                 writer_multiplex_layout: child_layout.clone(),
                 root_result_layout: root.clone(),

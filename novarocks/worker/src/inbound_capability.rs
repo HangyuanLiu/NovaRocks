@@ -22,7 +22,9 @@ use std::mem::size_of;
 use std::sync::{Arc, Mutex, RwLock};
 
 use novarocks_execution_contract::{
-    ExchangeInbound, ExchangeSource, FragmentNodeId, QueryContextRef, TaskDescriptor, TaskIdentity,
+    ExchangeCloseDisposition, ExchangeDeliveryRequirement, ExchangeInbound, ExchangeSource,
+    ExchangeStreamClose, ExchangeStreamIdentity, FragmentNodeId, QueryContextRef, TaskDescriptor,
+    TaskIdentity,
 };
 use novarocks_types::{QueryExecutionId, UniqueId};
 
@@ -34,6 +36,9 @@ const CAPABILITY_LOCK: &str = "task inbound capability lock";
 #[derive(Debug)]
 enum InboundCapabilityFailure {
     RecordSize,
+    InvalidCloseFacts {
+        task: TaskIdentity,
+    },
     ReservationConflict {
         task: TaskIdentity,
     },
@@ -64,6 +69,10 @@ impl std::fmt::Display for InboundCapabilityFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RecordSize => f.write_str("normal-close record size overflow"),
+            Self::InvalidCloseFacts { task } => write!(
+                f,
+                "task {task} normal-close facts do not cover its exact frozen streams and delivery obligations"
+            ),
             Self::ReservationConflict { task } => write!(
                 f,
                 "normal-close reservation conflicts with accepted task {task}"
@@ -101,6 +110,9 @@ impl novarocks_execution_contract::failure::FailureProjection for InboundCapabil
         use crate::failure_reason::WorkerFailureReason as R;
         use novarocks_execution_contract::failure::*;
         let (reason, dimension, requested, committed, limit) = match self {
+            Self::InvalidCloseFacts { .. } => {
+                return FailureFact::new(FailureClass::Invariant, R::InboundCloseContract.reason());
+            }
             Self::RecordSize => {
                 return FailureFact::new(FailureClass::Resource, R::InboundRecordSize.reason());
             }
@@ -243,30 +255,33 @@ pub struct TaskInboundCapabilities {
 struct NormalClosedInboundRecord {
     destination: TaskIdentity,
     inbound: Vec<ExchangeInbound>,
+    closes: Box<[ExchangeStreamClose]>,
 }
 
 /// An exact normal-close answer to a frozen sender of one input occurrence.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct NormalClosedInbound {
-    destination: TaskIdentity,
-    destination_kernel_key: UniqueId,
-    destination_node_id: FragmentNodeId,
-    source: ExchangeSource,
+    // The close fact is the sole author of the exact stream endpoints.
     sender_count: u32,
+    close: ExchangeStreamClose,
 }
 
 impl NormalClosedInbound {
+    pub const fn close(self) -> ExchangeStreamClose {
+        self.close
+    }
+
     pub const fn destination(self) -> TaskIdentity {
-        self.destination
+        self.close.stream.destination()
     }
     pub const fn destination_kernel_key(self) -> UniqueId {
-        self.destination_kernel_key
+        self.close.stream.destination_fragment_instance_id()
     }
     pub const fn destination_node_id(self) -> FragmentNodeId {
-        self.destination_node_id
+        self.close.stream.destination_node()
     }
     pub const fn source(self) -> ExchangeSource {
-        self.source
+        self.close.stream.source()
     }
     pub const fn sender_count(self) -> u32 {
         self.sender_count
@@ -278,9 +293,13 @@ impl NormalClosedInbound {
 pub struct InboundFrameAdmission {
     destination: TaskIdentity,
     source: ExchangeSource,
+    sender_count: u32,
 }
 
 impl InboundFrameAdmission {
+    pub const fn sender_count(self) -> u32 {
+        self.sender_count
+    }
     pub const fn destination(self) -> TaskIdentity {
         self.destination
     }
@@ -339,11 +358,9 @@ impl TaskInboundCapabilities {
             |bytes, node| {
                 bytes
                     .checked_add(size_of::<ExchangeInbound>() + 64)?
-                    .checked_add(
-                        node.sources()
-                            .len()
-                            .checked_mul(size_of::<ExchangeSource>() + 16)?,
-                    )
+                    .checked_add(node.sources().len().checked_mul(
+                        size_of::<ExchangeSource>() + size_of::<ExchangeStreamClose>() + 16,
+                    )?)
             },
         )
     }
@@ -419,7 +436,87 @@ impl TaskInboundCapabilities {
         Ok(InboundFrameAdmission {
             destination: descriptor.identity(),
             source,
+            sender_count,
         })
+    }
+
+    /// Resolve the complete source/destination identity from frozen facts.
+    /// The sender count is authored by the descriptor, never by a request.
+    pub fn claim_stream(
+        &self,
+        stream: ExchangeStreamIdentity,
+    ) -> Result<InboundFrameAdmission, InboundFrameClaim> {
+        Self::claim_stream_locked(&self.state.lock().expect(CAPABILITY_LOCK), stream)
+    }
+
+    /// Synchronously deliver only while the exact stream remains installed.
+    /// The existing receiver-local read fence orders this callback with normal
+    /// retirement; the process capability lock is released before the callback.
+    /// The callback must not perform network I/O or wait for external capacity.
+    pub fn with_claimed_stream<T, E>(
+        &self,
+        stream: ExchangeStreamIdentity,
+        claim: impl FnOnce(InboundFrameAdmission) -> Result<T, E>,
+    ) -> Result<Result<T, E>, InboundFrameClaim> {
+        let gate = self
+            .state
+            .lock()
+            .expect(CAPABILITY_LOCK)
+            .delivery_gates
+            .get(&stream.destination_fragment_instance_id())
+            .cloned();
+        let _delivery = gate
+            .as_ref()
+            .map(|gate| gate.read().expect("task inbound delivery gate"));
+        let admission =
+            Self::claim_stream_locked(&self.state.lock().expect(CAPABILITY_LOCK), stream)?;
+        Ok(claim(admission))
+    }
+
+    fn claim_stream_locked(
+        state: &TaskInboundCapabilityState,
+        stream: ExchangeStreamIdentity,
+    ) -> Result<InboundFrameAdmission, InboundFrameClaim> {
+        let key = stream.destination_fragment_instance_id();
+        let (destination, inbound) = if let Some(closed) = state.normally_closed.get(&key) {
+            (closed.destination, closed.inbound.as_slice())
+        } else if let Some(descriptor) = state.installed.get(&key) {
+            (descriptor.identity(), descriptor.topology().inbound())
+        } else {
+            return Err(InboundFrameClaim::NotHeld);
+        };
+        if destination != stream.destination() {
+            return Err(InboundFrameClaim::Refused(
+                "exchange stream names a different destination Task".into(),
+            ));
+        }
+        let node = inbound
+            .iter()
+            .find(|node| node.node_id() == stream.destination_node())
+            .ok_or_else(|| {
+                InboundFrameClaim::Refused("exchange stream destination node was not frozen".into())
+            })?;
+        if !node.sources().contains(&stream.source()) {
+            return Err(InboundFrameClaim::Refused(
+                "exchange stream source Task, kernel, or ordinal was not frozen".into(),
+            ));
+        }
+        let count = node.expected_sender_count().get();
+        match Self::claim_locked(
+            state,
+            key,
+            stream.destination_node(),
+            stream.source().fragment_instance_id(),
+            stream.source().sender_ordinal(),
+            count,
+        ) {
+            InboundFrameClaim::Authorized => Ok(InboundFrameAdmission {
+                destination,
+                source: stream.source(),
+                sender_count: count,
+            }),
+            claim => Err(claim),
+        }
     }
 
     /// States whether this worker owns a destination and, if it does, whether
@@ -543,11 +640,24 @@ impl TaskInboundCapabilities {
                     closed.destination
                 ));
             }
-            return InboundFrameClaim::NormallyClosed(NormalClosedInbound {
-                destination: closed.destination,
+            let stream = ExchangeStreamIdentity::try_new(
+                source,
+                closed.destination,
                 destination_kernel_key,
                 destination_node_id,
-                source,
+            )
+            .expect("frozen inbound stream identity");
+            let Ok(index) = closed
+                .closes
+                .binary_search_by_key(&stream, |close| close.stream)
+            else {
+                return InboundFrameClaim::Refused(
+                    "normally closed input omits its exact source close fact".into(),
+                );
+            };
+            let close = closed.closes[index];
+            return InboundFrameClaim::NormallyClosed(NormalClosedInbound {
+                close,
                 sender_count: expected,
             });
         }
@@ -726,9 +836,101 @@ impl TaskInboundCapabilities {
         }
     }
 
-    /// Atomically replaces one installed receiver capability with its frozen,
-    /// bounded normal-close record while the host retires the receiver route.
+    /// Existing DemandDriven retirement adapter. It records explicit withdrawal,
+    /// never consumption. This void adapter is transitional: the strict host
+    /// composition must replace it with receiver-authored facts and the checked
+    /// API below, with its pre-success validation, before MustDrain is enabled.
     pub fn close_normally(&self, descriptor: &TaskDescriptor, retire_receiver: impl FnOnce()) {
+        let mut closes = descriptor
+            .topology()
+            .inbound()
+            .iter()
+            .flat_map(|node| {
+                node.sources()
+                    .iter()
+                    .map(move |source| ExchangeStreamClose {
+                        stream: ExchangeStreamIdentity::try_new(
+                            *source,
+                            descriptor.identity(),
+                            descriptor.fragment_instance_id(),
+                            node.node_id(),
+                        )
+                        .expect("frozen inbound stream identity"),
+                        disposition: ExchangeCloseDisposition::Withdrawn,
+                    })
+            })
+            .collect::<Vec<_>>();
+        closes.sort_unstable_by_key(|close| close.stream);
+        self.close_normally_record(descriptor, closes.into_boxed_slice(), retire_receiver);
+    }
+
+    /// Retain actual receiver-authored facts, covering every frozen stream once.
+    /// Validation refuses strict withdrawal before invoking retirement. This is
+    /// not the pre-success Task hook: the host must install that separately and
+    /// propagate this Result rather than discarding a strict close violation.
+    pub fn close_normally_with_facts(
+        &self,
+        descriptor: &TaskDescriptor,
+        mut closes: Vec<ExchangeStreamClose>,
+        retire_receiver: impl FnOnce(),
+    ) -> Result<(), HostRejection> {
+        let invalid = || {
+            capability_rejection(InboundCapabilityFailure::InvalidCloseFacts {
+                task: descriptor.identity(),
+            })
+        };
+        let expected = descriptor
+            .topology()
+            .inbound()
+            .iter()
+            .try_fold(0usize, |count, node| {
+                count.checked_add(node.sources().len())
+            })
+            .ok_or_else(|| capability_rejection(InboundCapabilityFailure::RecordSize))?;
+        if closes.len() != expected {
+            return Err(invalid());
+        }
+        closes.sort_unstable_by_key(|close| close.stream);
+        if closes
+            .windows(2)
+            .any(|pair| pair[0].stream == pair[1].stream)
+        {
+            return Err(invalid());
+        }
+        for node in descriptor.topology().inbound() {
+            for source in node.sources() {
+                let stream = ExchangeStreamIdentity::try_new(
+                    *source,
+                    descriptor.identity(),
+                    descriptor.fragment_instance_id(),
+                    node.node_id(),
+                )
+                .map_err(|_| invalid())?;
+                let index = closes
+                    .binary_search_by_key(&stream, |close| close.stream)
+                    .map_err(|_| invalid())?;
+                if node.delivery() == ExchangeDeliveryRequirement::MustDrain
+                    && !matches!(
+                        closes[index].disposition,
+                        ExchangeCloseDisposition::Consumed { .. }
+                    )
+                {
+                    return Err(invalid());
+                }
+            }
+        }
+        self.close_normally_record(descriptor, closes.into_boxed_slice(), retire_receiver);
+        Ok(())
+    }
+
+    /// Atomically replaces the installed capability while holding the existing
+    /// delivery writer fence. A pending synchronous delivery rechecks its claim.
+    fn close_normally_record(
+        &self,
+        descriptor: &TaskDescriptor,
+        closes: Box<[ExchangeStreamClose]>,
+        retire_receiver: impl FnOnce(),
+    ) {
         let key = descriptor.fragment_instance_id();
         let gate = self
             .state
@@ -764,6 +966,7 @@ impl TaskInboundCapabilities {
                     NormalClosedInboundRecord {
                         destination: descriptor.identity(),
                         inbound: descriptor.topology().inbound().to_vec(),
+                        closes,
                     },
                 );
                 state
@@ -838,6 +1041,7 @@ mod tests {
                 ExchangeInbound::try_new(
                     FragmentNodeId::new(7),
                     vec![ExchangeSource::new(source, source_kernel, 0)],
+                    novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
                 )
                 .unwrap(),
             ],
@@ -1071,6 +1275,317 @@ mod tests {
         assert!(matches!(
             claim(&capabilities, second_key, second_source, 0, 1),
             InboundFrameClaim::Authorized
+        ));
+    }
+    #[test]
+    fn exact_stream_claim_uses_frozen_tasks_and_count() {
+        use novarocks_execution_contract::{ExchangeSource, ExchangeStreamIdentity};
+        let capabilities = TaskInboundCapabilities::with_limits(4, 16384);
+        let (descriptor, _) = descriptor(501, UniqueId::new(51, 52));
+        capabilities.install(Arc::new(descriptor.clone())).unwrap();
+        let node = &descriptor.topology().inbound()[0];
+        let source = node.sources()[0];
+        let stream = ExchangeStreamIdentity::try_new(
+            source,
+            descriptor.identity(),
+            descriptor.fragment_instance_id(),
+            node.node_id(),
+        )
+        .unwrap();
+        assert_eq!(capabilities.claim_stream(stream).unwrap().sender_count(), 1);
+        let forged = TaskIdentity::new(
+            source.task().query_execution_id(),
+            source.task().stage_id(),
+            source.task().task_id(),
+            BackendProcessId::new_v7(),
+        );
+        let forged_stream = ExchangeStreamIdentity::try_new(
+            ExchangeSource::new(
+                forged,
+                source.fragment_instance_id(),
+                source.sender_ordinal(),
+            ),
+            descriptor.identity(),
+            descriptor.fragment_instance_id(),
+            node.node_id(),
+        )
+        .unwrap();
+        assert!(matches!(
+            capabilities.claim_stream(forged_stream),
+            Err(InboundFrameClaim::Refused(_))
+        ));
+        let claimed = capabilities
+            .with_claimed_stream(stream, |admission| Ok::<_, ()>(admission.sender_count()));
+        assert_eq!(claimed, Ok(Ok(1)));
+    }
+
+    #[test]
+    fn strict_normal_retirement_requires_exact_receiver_consumption_facts() {
+        use novarocks_execution_contract::{
+            ExchangeCloseDisposition, ExchangeDeliveryRequirement, ExchangeFrameSequence,
+            ExchangeStreamClose, ExchangeStreamIdentity,
+        };
+        let (base, _) = descriptor(601, UniqueId::new(61, 62));
+        let node = &base.topology().inbound()[0];
+        let strict = TaskDescriptor::try_new(
+            base.identity(),
+            base.fragment_instance_id(),
+            NonZeroUsize::new(1).unwrap(),
+            Vec::new(),
+            ExchangeTopology::try_new(
+                Vec::new(),
+                vec![
+                    ExchangeInbound::try_new(
+                        node.node_id(),
+                        node.sources().to_vec(),
+                        ExchangeDeliveryRequirement::MustDrain,
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let capabilities = TaskInboundCapabilities::with_limits(4, 16384);
+        capabilities.install(Arc::new(strict.clone())).unwrap();
+        let retired = std::sync::atomic::AtomicBool::new(false);
+        let stream = ExchangeStreamIdentity::try_new(
+            node.sources()[0],
+            strict.identity(),
+            strict.fragment_instance_id(),
+            node.node_id(),
+        )
+        .unwrap();
+        assert!(
+            capabilities
+                .close_normally_with_facts(
+                    &strict,
+                    vec![ExchangeStreamClose {
+                        stream,
+                        disposition: ExchangeCloseDisposition::Withdrawn
+                    }],
+                    || retired.store(true, std::sync::atomic::Ordering::SeqCst)
+                )
+                .is_err()
+        );
+        assert!(!retired.load(std::sync::atomic::Ordering::SeqCst));
+        let close = ExchangeStreamClose {
+            stream,
+            disposition: ExchangeCloseDisposition::Consumed {
+                final_sequence: ExchangeFrameSequence::try_new(7).unwrap(),
+            },
+        };
+        capabilities
+            .close_normally_with_facts(&strict, vec![close], || {
+                retired.store(true, std::sync::atomic::Ordering::SeqCst)
+            })
+            .unwrap();
+        assert!(retired.load(std::sync::atomic::Ordering::SeqCst));
+        let Err(InboundFrameClaim::NormallyClosed(proof)) = capabilities.claim_stream(stream)
+        else {
+            panic!("expected frozen per-source close")
+        };
+        assert_eq!(proof.close(), close);
+        assert_eq!(proof.sender_count(), 1);
+    }
+    #[test]
+    fn checked_close_rejects_missing_duplicate_foreign_and_strict_withdrawn_facts() {
+        use novarocks_execution_contract::{
+            ExchangeCloseDisposition, ExchangeDeliveryRequirement, ExchangeFrameSequence,
+            ExchangeStreamClose, ExchangeStreamIdentity,
+        };
+        let (base, _) = descriptor(701, UniqueId::new(71, 72));
+        let source = base.topology().inbound()[0].sources()[0];
+        let topology = ExchangeTopology::try_new(
+            Vec::new(),
+            vec![
+                ExchangeInbound::try_new(
+                    FragmentNodeId::new(7),
+                    vec![source],
+                    ExchangeDeliveryRequirement::MustDrain,
+                )
+                .unwrap(),
+                ExchangeInbound::try_new(
+                    FragmentNodeId::new(8),
+                    vec![source],
+                    ExchangeDeliveryRequirement::DemandDriven,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let descriptor = TaskDescriptor::try_new(
+            base.identity(),
+            base.fragment_instance_id(),
+            NonZeroUsize::new(1).unwrap(),
+            Vec::new(),
+            topology,
+        )
+        .unwrap();
+        let capabilities = TaskInboundCapabilities::new();
+        capabilities.install(Arc::new(descriptor.clone())).unwrap();
+        let stream = |node| {
+            ExchangeStreamIdentity::try_new(
+                source,
+                descriptor.identity(),
+                descriptor.fragment_instance_id(),
+                FragmentNodeId::new(node),
+            )
+            .unwrap()
+        };
+        let first = ExchangeStreamClose {
+            stream: stream(7),
+            disposition: ExchangeCloseDisposition::Consumed {
+                final_sequence: ExchangeFrameSequence::try_new(17).unwrap(),
+            },
+        };
+        let second = ExchangeStreamClose {
+            stream: stream(8),
+            disposition: ExchangeCloseDisposition::Withdrawn,
+        };
+        let invalids = [
+            vec![],
+            vec![first],
+            vec![first, first],
+            vec![
+                first,
+                ExchangeStreamClose {
+                    stream: stream(99),
+                    ..second
+                },
+            ],
+            vec![
+                ExchangeStreamClose {
+                    disposition: ExchangeCloseDisposition::Withdrawn,
+                    ..first
+                },
+                second,
+            ],
+        ];
+        for closes in invalids {
+            let retired = std::sync::atomic::AtomicBool::new(false);
+            assert!(
+                capabilities
+                    .close_normally_with_facts(&descriptor, closes, || {
+                        retired.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })
+                    .is_err()
+            );
+            assert!(!retired.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(capabilities.claim_stream(first.stream).is_ok());
+        }
+        capabilities
+            .close_normally_with_facts(&descriptor, vec![second, first], || {})
+            .unwrap();
+        for expected in [first, second] {
+            let Err(InboundFrameClaim::NormallyClosed(proof)) =
+                capabilities.claim_stream(expected.stream)
+            else {
+                panic!("expected exact per-input close fact");
+            };
+            assert_eq!(proof.close(), expected);
+        }
+    }
+
+    #[test]
+    fn legacy_void_retirement_records_withdrawal_and_never_forges_consumption() {
+        use novarocks_execution_contract::{ExchangeCloseDisposition, ExchangeStreamIdentity};
+        let (descriptor, _) = descriptor(801, UniqueId::new(81, 82));
+        let input = &descriptor.topology().inbound()[0];
+        let stream = ExchangeStreamIdentity::try_new(
+            input.sources()[0],
+            descriptor.identity(),
+            descriptor.fragment_instance_id(),
+            input.node_id(),
+        )
+        .unwrap();
+        let capabilities = TaskInboundCapabilities::new();
+        capabilities.install(Arc::new(descriptor.clone())).unwrap();
+        capabilities.close_normally(&descriptor, || {});
+        let Err(InboundFrameClaim::NormallyClosed(proof)) = capabilities.claim_stream(stream)
+        else {
+            panic!("expected original DemandDriven normal close");
+        };
+        assert_eq!(
+            proof.close().disposition,
+            ExchangeCloseDisposition::Withdrawn
+        );
+        let forged = TaskIdentity::new(
+            stream.source().task().query_execution_id(),
+            stream.source().task().stage_id(),
+            stream.source().task().task_id(),
+            BackendProcessId::new_v7(),
+        );
+        let forged = ExchangeStreamIdentity::try_new(
+            ExchangeSource::new(
+                forged,
+                stream.source().fragment_instance_id(),
+                stream.source().sender_ordinal(),
+            ),
+            descriptor.identity(),
+            descriptor.fragment_instance_id(),
+            input.node_id(),
+        )
+        .unwrap();
+        assert!(matches!(
+            capabilities.claim_stream(forged),
+            Err(InboundFrameClaim::Refused(_))
+        ));
+        let mut delivered = false;
+        assert!(
+            capabilities
+                .with_claimed_stream(stream, |_| {
+                    delivered = true;
+                    Ok::<_, ()>(())
+                })
+                .is_err()
+        );
+        assert!(!delivered);
+    }
+
+    #[test]
+    fn exact_stream_delivery_releases_process_lock_and_retirement_waits_for_callback() {
+        use novarocks_execution_contract::ExchangeStreamIdentity;
+        let (descriptor, _) = descriptor(901, UniqueId::new(91, 92));
+        let node = &descriptor.topology().inbound()[0];
+        let stream = ExchangeStreamIdentity::try_new(
+            node.sources()[0],
+            descriptor.identity(),
+            descriptor.fragment_instance_id(),
+            node.node_id(),
+        )
+        .unwrap();
+        let capabilities = TaskInboundCapabilities::new();
+        capabilities.install(Arc::new(descriptor.clone())).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let delivery_owner = Arc::clone(&capabilities);
+        let delivery = std::thread::spawn(move || {
+            delivery_owner.with_claimed_stream(stream, |_| {
+                assert_eq!(
+                    delivery_owner.len(),
+                    1,
+                    "callback does not hold process lock"
+                );
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok::<_, ()>(())
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let close_owner = Arc::clone(&capabilities);
+        let close = std::thread::spawn(move || {
+            close_owner.close_normally(&descriptor, || closed_tx.send(()).unwrap())
+        });
+        assert!(closed_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        release_tx.send(()).unwrap();
+        assert_eq!(delivery.join().unwrap(), Ok(Ok(())));
+        close.join().unwrap();
+        closed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            capabilities.claim_stream(stream),
+            Err(InboundFrameClaim::NormallyClosed(_))
         ));
     }
 }

@@ -114,6 +114,7 @@ fn input(count: usize) -> FragmentStructureInput {
         },
     };
     FragmentStructureInput {
+        stage_placement: crate::StagePlacementPolicy::Singleton,
         id: FragmentId::new(u32::MAX),
         root: root.id,
         values,

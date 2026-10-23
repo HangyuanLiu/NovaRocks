@@ -465,9 +465,12 @@ pub(crate) fn edge(
     destination: Distribution,
 ) -> Edge {
     Edge {
+        role: novarocks_physical_plan::OutputRole::Relational,
+        delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
         id,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: novarocks_physical_plan::FragmentOutputPort::Root,
             fragment: from.0,
             projection: Box::from(from.1),
         },
@@ -499,7 +502,14 @@ pub(crate) fn finish(
     sink: FragmentSink,
     max_dop: u32,
 ) -> Fragment {
-    let fragment = builder.finish_definition(root, sink, dop(max_dop)).unwrap();
+    let fragment = builder
+        .finish_definition(
+            root,
+            sink,
+            dop(max_dop),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
     let mut entries = fragment
         .call_requests()
         .entries()
@@ -927,6 +937,14 @@ impl ExchangeFrameTransmitter for LoopbackTransmitter {
                     node_id: frame.destination_node_id,
                 },
                 ExchangeReceiverFrame {
+                    stream: frame.stream.unwrap_or_else(|| {
+                        crate::runtime::fragment::io::exchange::fixture_stream(
+                            frame.sender_fragment_instance_id,
+                            frame.destination_fragment_instance_id,
+                            frame.destination_node_id,
+                            frame.sender_ordinal,
+                        )
+                    }),
                     source_fragment_instance_id: frame.sender_fragment_instance_id,
                     sender_ordinal: frame.sender_ordinal,
                     sender_count: frame.sender_count,

@@ -98,6 +98,7 @@ fn fixture(id: u32) -> Fragment {
             max: 1,
             requires_power_of_two: false,
         },
+        crate::StagePlacementPolicy::Singleton,
     )
     .unwrap()
 }

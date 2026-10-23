@@ -1495,6 +1495,12 @@ pub(crate) fn writer_program(
         ProgramNode::new(
             30,
             ProgramNodeKind::TableFinish {
+                count_mode: novarocks_result_contract::FinishCountMode::WriterReported,
+                input_roles: novarocks_result_contract::FinishInputs {
+                    writer_results: 0,
+                    logical_summary: None,
+                },
+                logical_summary_layout: None,
                 inputs: vec![ProgramNodeId::new(1)],
                 expected_targets: vec![target],
                 writer_multiplex_layout: intermediate.clone(),

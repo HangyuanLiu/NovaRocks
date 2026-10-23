@@ -3136,7 +3136,14 @@ pub(crate) mod tests {
     fn inbound_topology(node: FragmentNodeId, sources: Vec<ExchangeSource>) -> ExchangeTopology {
         ExchangeTopology::try_new(
             Vec::new(),
-            vec![ExchangeInbound::try_new(node, sources).expect("a legal inbound")],
+            vec![
+                ExchangeInbound::try_new(
+                    node,
+                    sources,
+                    novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                )
+                .expect("a legal inbound"),
+            ],
         )
         .expect("a legal topology")
     }
@@ -3146,10 +3153,10 @@ pub(crate) mod tests {
         query: ExchangeRouteQuery,
     ) -> InboundFrameClaim {
         capabilities.claim_frame(
-            query.destination_fragment_instance_id,
-            FragmentNodeId::new(query.destination_node_id),
-            query.source_fragment_instance_id,
-            query.sender_ordinal,
+            query.stream.destination_fragment_instance_id(),
+            query.stream.destination_node(),
+            query.stream.source().fragment_instance_id(),
+            query.stream.source().sender_ordinal(),
             query.sender_count,
         )
     }
@@ -3575,10 +3582,13 @@ pub(crate) mod tests {
         let claim = claim_frame(
             &capabilities,
             ExchangeRouteQuery {
-                destination_fragment_instance_id: kernel_key,
-                destination_node_id: node.get(),
-                source_fragment_instance_id: producer_key,
-                sender_ordinal: 0,
+                stream: novarocks_execution_contract::ExchangeStreamIdentity::try_new(
+                    ExchangeSource::new(producer, producer_key, 0),
+                    consumer,
+                    kernel_key,
+                    node,
+                )
+                .unwrap(),
                 sender_count: 1,
             },
         );
@@ -3638,10 +3648,13 @@ pub(crate) mod tests {
                      sender_ordinal: u32,
                      sender_count: u32| {
             ExchangeRouteQuery {
-                destination_fragment_instance_id: destination,
-                destination_node_id,
-                source_fragment_instance_id: source,
-                sender_ordinal,
+                stream: novarocks_execution_contract::ExchangeStreamIdentity::try_new(
+                    ExchangeSource::new(producer, source, sender_ordinal),
+                    consumer,
+                    destination,
+                    FragmentNodeId::new(destination_node_id),
+                )
+                .unwrap(),
                 sender_count,
             }
         };
@@ -3772,6 +3785,15 @@ pub(crate) mod tests {
             ))],
         );
         let request = |destination: UniqueId, source: UniqueId| proto::ExchangeRequest {
+            stream: Some(novarocks_task_codec::exchange_flow_codec::encode_stream(
+                novarocks_execution_contract::ExchangeStreamIdentity::try_new(
+                    ExchangeSource::new(producer, source, 0),
+                    consumer,
+                    destination,
+                    node,
+                )
+                .unwrap(),
+            )),
             finst_id_hi: destination.high(),
             finst_id_lo: destination.low(),
             node_id: node.get(),
@@ -6383,6 +6405,13 @@ pub(crate) mod tests {
         }
         runnable.commit_creation();
         let frame = || ExchangeReceiverFrame {
+            stream: novarocks_execution_contract::ExchangeStreamIdentity::try_new(
+                source,
+                descriptor.identity(),
+                key.fragment_instance_id,
+                inbound.node_id(),
+            )
+            .unwrap(),
             source_fragment_instance_id: source.fragment_instance_id(),
             sender_ordinal: source.sender_ordinal(),
             sender_count: 1,
@@ -6415,7 +6444,9 @@ pub(crate) mod tests {
                     "the original DATA declaration is accepted before stop: {delivery:?}"
                 );
             }
-            port.push(key, frame()).expect("original exact sender EOS");
+            let mut eos = frame();
+            eos.sequence = i64::from(data_payload.is_some());
+            port.push(key, eos).expect("original exact sender EOS");
         } else if matches!(stop, ReceiverStop::Quiesce | ReceiverStop::QuiesceThenAbort) {
             runnable.quiesce();
         } else if matches!(stop, ReceiverStop::Abort) {
@@ -6527,7 +6558,10 @@ pub(crate) mod tests {
                 source.fragment_instance_id(),
                 source.sender_ordinal(),
                 1,
-                || port.push(key, frame()).map_err(|error| error.to_string())
+                // Probe ownership under the original inbound read gate. DATA
+                // and abort behavior were checked above; replaying EOS here
+                // would violate the stream's already consumed sequence.
+                || Ok(())
             ),
             InboundFrameClaim::Authorized
         );

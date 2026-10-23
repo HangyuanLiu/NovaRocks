@@ -86,7 +86,12 @@ fn structure_stage_keeps_actual_nested_loop_placement_before_effect_proof() {
         )
         .unwrap();
         make(mode, 0)
-            .finish_definition(NodeId::new(u32::MAX), FragmentSink::Noop, dop())
+            .finish_definition(
+                NodeId::new(u32::MAX),
+                FragmentSink::Noop,
+                dop(),
+                crate::StagePlacementPolicy::Singleton,
+            )
             .unwrap();
     }
     for (mode, fault) in [
@@ -157,6 +162,7 @@ fn finish(
         dop(),
         limits,
         control,
+        crate::StagePlacementPolicy::Singleton,
     )
 }
 fn function_builder() -> FragmentBuilder {
@@ -228,7 +234,12 @@ fn reject_both(make: impl Fn() -> FragmentBuilder, root: u32) {
     ));
     assert!(
         make()
-            .finish_definition(NodeId::new(root), FragmentSink::Noop, dop())
+            .finish_definition(
+                NodeId::new(root),
+                FragmentSink::Noop,
+                dop(),
+                crate::StagePlacementPolicy::Singleton
+            )
             .is_err()
     );
 }
@@ -302,7 +313,12 @@ fn structure_stage_defers_property_derivation_but_definition_and_package_still_r
     );
     assert!(
         make()
-            .finish_definition(NodeId::new(u32::MAX), FragmentSink::Noop, dop())
+            .finish_definition(
+                NodeId::new(u32::MAX),
+                FragmentSink::Noop,
+                dop(),
+                crate::StagePlacementPolicy::Singleton
+            )
             .is_err()
     );
     let setup = Control::default();
@@ -443,7 +459,12 @@ fn structure_stage_defers_legacy_intrinsic_bits_without_deferring_kind_or_signat
     finish(make(), 0, PlanLimits::FROZEN, &Control::default()).unwrap();
     assert!(
         make()
-            .finish_definition(NodeId::new(0), FragmentSink::Noop, dop())
+            .finish_definition(
+                NodeId::new(0),
+                FragmentSink::Noop,
+                dop(),
+                crate::StagePlacementPolicy::Singleton
+            )
             .is_err()
     );
     for kind_or_signature in 0..2 {
@@ -744,7 +765,12 @@ fn exact_signature_structure_keeps_types_but_requires_legacy_publication_provena
         Err(MissingLegacyBindingMetadata)
     );
     let errors = make(0)
-        .finish_definition(NodeId::new(0), FragmentSink::Noop, dop())
+        .finish_definition(
+            NodeId::new(0),
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap_err();
     assert!(
         errors

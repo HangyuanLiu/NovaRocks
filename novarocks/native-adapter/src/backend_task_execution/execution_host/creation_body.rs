@@ -130,6 +130,7 @@ fn finish(
                 max: dop,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
@@ -304,8 +305,9 @@ impl Body {
                         destination: ValueId::new(0),
                     }]),
                     partitioning: edge_partition(kind, value, ValueId::new(0)),
-                    change_stream_writer: None,
-                    writer_result: None,
+                    source_port: novarocks_physical_plan::FragmentOutputPort::Root,
+                    delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
+                    payload: novarocks_physical_plan::ExchangePayloadContract::Relational,
                 }]);
                 FragmentSink::Stream { edge }
             }
@@ -340,8 +342,9 @@ impl Body {
                     ValueId::new(0),
                     ValueId::new(0),
                 ),
-                change_stream_writer: None,
-                writer_result: None,
+                source_port: novarocks_physical_plan::FragmentOutputPort::Root,
+                delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
+                payload: novarocks_physical_plan::ExchangePayloadContract::Relational,
             }]),
             ..Default::default()
         };

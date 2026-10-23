@@ -175,11 +175,9 @@ fn physical_distribution_refs(
     values: &EncodedValues<'_, '_, '_>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Error> {
-    if let p::Distribution::Hash { keys, .. } | p::Distribution::BucketShuffle { keys, .. } = d {
-        for id in keys {
-            reference(id.get(), values, w)?;
-            w.step()?;
-        }
+    for id in d.value_references() {
+        reference(id.get(), values, w)?;
+        w.step()?;
     }
     Ok(())
 }
@@ -190,6 +188,15 @@ fn wire_distribution_refs(
 ) -> Result<(), Error> {
     let keys = match d.kind.as_ref() {
         Some(wire::distribution::Kind::Hash(v)) => &v.key_value_ids[..],
+        Some(wire::distribution::Kind::ConditionalKey(v)) => {
+            reference(
+                v.applies_value_id
+                    .ok_or_else(|| invalid("conditional partition applicability is absent"))?,
+                e.values(),
+                w,
+            )?;
+            &v.key_value_ids[..]
+        }
         Some(wire::distribution::Kind::BucketShuffle(v)) => &v.key_value_ids[..],
         _ => &[],
     };
@@ -229,6 +236,73 @@ fn base(
         ..Model::default()
     })
 }
+fn finish_mode(value: i32) -> Result<p::FinishCountMode, Error> {
+    match wire::FinishCountMode::try_from(value) {
+        Ok(wire::FinishCountMode::LogicalChanges) => Ok(p::FinishCountMode::LogicalChanges),
+        Ok(wire::FinishCountMode::WriterReported) => Ok(p::FinishCountMode::WriterReported),
+        Ok(wire::FinishCountMode::ExternalOwner) => Ok(p::FinishCountMode::ExternalOwner),
+        _ => Err(invalid("finish count mode is absent or unknown")),
+    }
+}
+fn finish_roles(
+    mode: p::FinishCountMode,
+    writer: u32,
+    summary: Option<u32>,
+    has_columns: bool,
+) -> Result<(), Error> {
+    let logical = matches!(mode, p::FinishCountMode::LogicalChanges);
+    if logical != summary.is_some() || logical != has_columns || summary == Some(writer) {
+        return Err(invalid("finish count mode and exact input roles disagree"));
+    }
+    Ok(())
+}
+fn physical_finish_references(value: &p::WriterFinishSpec) -> Result<usize, Error> {
+    finish_roles(
+        value.count_mode,
+        value.inputs.writer_results,
+        value.inputs.logical_summary,
+        value.logical_summary.is_some(),
+    )?;
+    Ok(if value.logical_summary.is_some() {
+        3
+    } else {
+        0
+    })
+}
+/// Validate mandatory scalar/presence facts before any output allocation.
+fn wire_finish_columns(
+    value: &wire::WriterFinish,
+) -> Result<Option<p::LogicalSummaryColumns>, Error> {
+    let writer = value
+        .writer_results_input
+        .ok_or_else(|| invalid("finish writer input role is absent"))?;
+    finish_roles(
+        finish_mode(value.count_mode)?,
+        writer,
+        value.logical_summary_input,
+        value.logical_summary.is_some(),
+    )?;
+    value
+        .logical_summary
+        .as_ref()
+        .map(|v| {
+            Ok(p::LogicalSummaryColumns {
+                inserted: p::ValueId::new(
+                    v.inserted_value_id
+                        .ok_or_else(|| invalid("inserted summary field is absent"))?,
+                ),
+                replaced: p::ValueId::new(
+                    v.replaced_value_id
+                        .ok_or_else(|| invalid("replaced summary field is absent"))?,
+                ),
+                deleted: p::ValueId::new(
+                    v.deleted_value_id
+                        .ok_or_else(|| invalid("deleted summary field is absent"))?,
+                ),
+            })
+        })
+        .transpose()
+}
 fn encode_model(n: &p::PhysicalNode, b: &Body<'_>) -> Result<(Model, usize), Error> {
     let c = calls(b).len();
     let (list, refs, backing) = match b {
@@ -250,10 +324,16 @@ fn encode_model(n: &p::PhysicalNode, b: &Body<'_>) -> Result<(Model, usize), Err
             )?,
         ),
         Body::Finish(t) => (
-            add(t.expected_target_ordinals.len(), c)?,
             add(
-                add(t.input_schema.fields.len(), t.output_schema.fields.len())?,
-                mul(2, c)?,
+                add(t.expected_target_ordinals.len(), c)?,
+                physical_finish_references(t)?,
+            )?,
+            add(
+                add(
+                    add(t.input_schema.fields.len(), t.output_schema.fields.len())?,
+                    mul(2, c)?,
+                )?,
+                physical_finish_references(t)?,
             )?,
             add(
                 bytes::<WriteTargetOrdinal>(t.expected_target_ordinals.len())?,
@@ -329,8 +409,22 @@ fn decode_model(
                 raw_schema(t.output_schema.as_ref(), w)?
             };
             (
-                add(t.expected_target_ordinals.len(), c)?,
-                add(add(i.fields.len(), o.fields.len())?, mul(2, c)?)?,
+                add(
+                    add(t.expected_target_ordinals.len(), c)?,
+                    if wire_finish_columns(t)?.is_some() {
+                        3
+                    } else {
+                        0
+                    },
+                )?,
+                add(
+                    add(add(i.fields.len(), o.fields.len())?, mul(2, c)?)?,
+                    if wire_finish_columns(t)?.is_some() {
+                        3
+                    } else {
+                        0
+                    },
+                )?,
                 add(
                     bytes::<u32>(t.expected_target_ordinals.capacity())?,
                     add(
@@ -649,6 +743,12 @@ fn prepare_encode_core(
             physical_distribution_refs(&t.required_distribution, values, w)?;
         }
         Body::Finish(t) => {
+            if let Some(columns) = t.logical_summary {
+                for id in columns.values() {
+                    reference(id.get(), values, w)?;
+                    w.step()?;
+                }
+            }
             for id in &t.expected_target_ordinals {
                 ordinal(id.get(), w)?;
                 w.step()?;
@@ -1091,6 +1191,12 @@ fn prepare_decode_core(
             wire_distribution_refs(t.required_distribution.as_ref().unwrap(), e, w)?;
         }
         Raw::Finish(t) => {
+            if let Some(columns) = completed(wire_finish_columns(t), w)? {
+                for id in columns.values() {
+                    reference(id.get(), e.values(), w)?;
+                    w.step()?;
+                }
+            }
             for id in &t.expected_target_ordinals {
                 ordinal(*id, w)?;
                 w.step()?;
@@ -1204,6 +1310,26 @@ fn emit_encode(
                 w.step()?;
             }
             wire::physical_node::Kind::TableFinish(wire::WriterFinish {
+                count_mode: match t.count_mode {
+                    p::FinishCountMode::LogicalChanges => {
+                        wire::FinishCountMode::LogicalChanges as i32
+                    }
+                    p::FinishCountMode::WriterReported => {
+                        wire::FinishCountMode::WriterReported as i32
+                    }
+                    p::FinishCountMode::ExternalOwner => {
+                        wire::FinishCountMode::ExternalOwner as i32
+                    }
+                },
+                writer_results_input: Some(t.inputs.writer_results),
+                logical_summary_input: t.inputs.logical_summary,
+                logical_summary: t
+                    .logical_summary
+                    .map(|columns| wire::LogicalSummaryColumns {
+                        inserted_value_id: Some(columns.inserted.get()),
+                        replaced_value_id: Some(columns.replaced.get()),
+                        deleted_value_id: Some(columns.deleted.get()),
+                    }),
                 expected_target_ordinals: ordinals,
                 input_schema: Some(schema::emit_schema(&t.input_schema, input_schema, w)?),
                 output_schema: Some(schema::emit_schema(&t.output_schema, output_schema, w)?),
@@ -1282,6 +1408,12 @@ fn emit_decode(
                 w.step()?;
             }
             p::NodeKind::TableFinish(p::WriterFinishSpec {
+                count_mode: completed(finish_mode(t.count_mode), w)?,
+                inputs: p::FinishInputs {
+                    writer_results: required(t.writer_results_input, w)?,
+                    logical_summary: t.logical_summary_input,
+                },
+                logical_summary: completed(wire_finish_columns(t), w)?,
                 expected_target_ordinals: boxed(ordinals, w)?,
                 input_schema: schema::read_schema(t.input_schema.as_ref().unwrap(), e.types(), w)?,
                 output_schema: schema::read_schema(

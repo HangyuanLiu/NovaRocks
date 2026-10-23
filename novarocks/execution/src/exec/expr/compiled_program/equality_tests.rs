@@ -241,6 +241,7 @@ fn equality_program(kind: EqualityCase) -> Arc<LocalProgram> {
                 max: 1,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let result = ResultPort {

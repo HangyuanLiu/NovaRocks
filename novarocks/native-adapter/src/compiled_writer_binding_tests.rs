@@ -426,7 +426,12 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
         })
         .unwrap();
     let producer = builder
-        .finish_definition(writer, FragmentSink::Stream { edge: EDGE }, dop)
+        .finish_definition(
+            writer,
+            FragmentSink::Stream { edge: EDGE },
+            dop,
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut builder = FragmentBuilder::new(FragmentId::new(2));
@@ -485,6 +490,12 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
                 columns: outputs.iter().map(|field| field.value).collect(),
             },
             kind: NodeKind::TableFinish(WriterFinishSpec {
+                count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
+                inputs: novarocks_physical_plan::FinishInputs {
+                    writer_results: 0,
+                    logical_summary: None,
+                },
+                logical_summary: None,
                 expected_target_ordinals: Box::from([ordinal]),
                 input_schema: WriterRelationSchema {
                     revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -500,7 +511,12 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
         })
         .unwrap();
     let consumer = builder
-        .finish_definition(finish, FragmentSink::Result, dop)
+        .finish_definition(
+            finish,
+            FragmentSink::Result,
+            dop,
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([6; 16]).unwrap());
@@ -533,9 +549,12 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(Edge {
+        role: novarocks_physical_plan::OutputRole::WriterResults,
+        delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
         id: EDGE,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: novarocks_physical_plan::FragmentOutputPort::Root,
             fragment: FragmentId::new(1),
             projection: fields.iter().map(|field| field.value).collect(),
         },

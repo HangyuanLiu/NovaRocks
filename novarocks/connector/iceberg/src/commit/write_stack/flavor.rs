@@ -984,22 +984,53 @@ fn route_facts<'a>(
     partition_source_fields: &[ConnectorWriteFieldBinding],
     selection_bindings: impl Into<Arc<[ConnectorWriteSelectionBinding]>>,
 ) -> Result<ConnectorWriteRouteFacts, ConnectorError> {
+    let consumed = consumed.collect::<Vec<_>>();
     let input_ordinals = consumed
+        .iter()
+        .copied()
         .map(|binding| {
             ordinals
                 .ordinal_of(binding.token())
                 .map(|ordinal| ConnectorMutationRouteInput::new(binding.token(), ordinal))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let partition_fields = partition_source_fields
+    use novarocks_spi::connector::write_stack::{
+        ConnectorWriteColocation, ConnectorWriteLayoutPreference, ConnectorWriteRouteRequirements,
+    };
+    // Only deletion vectors require one final author per old data file.
+    // Table partition values are a layout preference, not an ownership key.
+    let colocation = match key.branch {
+        IcebergWriteBranch::DeletionVector => {
+            let files = consumed
+                .iter()
+                .filter(|field| field.field().name().eq_ignore_ascii_case(ICEBERG_FILE_COL))
+                .map(|field| field.token())
+                .collect::<Vec<_>>();
+            if files.len() != 1 {
+                return Err(invalid(
+                    "Iceberg deletion-vector route requires exactly one `_file` input",
+                ));
+            }
+            ConnectorWriteColocation::ByKey(files)
+        }
+        IcebergWriteBranch::Data
+        | IcebergWriteBranch::PositionDelete
+        | IcebergWriteBranch::EqualityDelete => ConnectorWriteColocation::None,
+    };
+    let layout_keys = partition_source_fields
         .iter()
         .map(ConnectorWriteFieldBinding::token)
         .collect::<Vec<_>>();
+    let layout = if layout_keys.is_empty() {
+        ConnectorWriteLayoutPreference::None
+    } else {
+        ConnectorWriteLayoutPreference::ClusterBy(layout_keys)
+    };
     ConnectorWriteRouteFacts::try_new(
         key.route_id(table),
         accepted_effects,
         input_ordinals,
-        partition_fields,
+        ConnectorWriteRouteRequirements { colocation, layout },
         selection_bindings,
     )
 }

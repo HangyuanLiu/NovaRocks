@@ -72,17 +72,11 @@ pub(crate) enum ExecutionReason {
     FragmentIoInvalidResponse = 73,
     FragmentIoCancelled = 74,
     FragmentIoInternal = 75,
-    #[cfg(test)]
     FanoutNotPrepared = 91,
-    #[cfg(test)]
     FanoutInputClosed = 92,
-    #[cfg(test)]
     FanoutBranchOutput = 93,
-    #[cfg(test)]
     FanoutInvalidRoute = 94,
-    #[cfg(test)]
     FanoutCleanupPanicked = 95,
-    #[cfg(test)]
     FanoutEmptyBranches = 96,
     ChildInputSlotOccupied = 121,
     ChildUnexpectedInputRequest = 122,
@@ -277,7 +271,11 @@ pub(crate) enum ExecutionReason {
     AssertRowsMismatch = 316,
     AssertRowsDuplicateKey = 317,
     AssertRowsCounter = 318,
+    // Retired production formatting paths; keep their IDs in independent
+    // diagnostic regression fixtures without reassigning either number.
+    #[cfg(test)]
     AssertRowsDisplayMemory = 319,
+    #[cfg(test)]
     AssertRowsDisplay = 320,
     FinalIdentityInput = 321,
     HashJoinExecutionContract = 322,
@@ -431,9 +429,7 @@ pub(crate) enum ExecutionReason {
     RootInputSubmissionContract = 589,
     ChildMissingFailurePort = 590,
     ChildFailurePortChanged = 591,
-    #[cfg(test)]
     FanoutMissingFailurePort = 592,
-    #[cfg(test)]
     FanoutFailurePortChanged = 593,
     DriverDroppedWithPendingExit = 594,
     WriterExitUnresolved = 595,
@@ -454,6 +450,9 @@ pub(crate) enum ExecutionReason {
     PreparedDrainBeforeConclusion = 610,
     RootReadinessNotificationPanicked = 611,
     RootReadinessNotificationInvariant = 612,
+    LogicalChangeCount = 613,
+    LogicalSummaryContract = 614,
+    FanoutRequiredBranchWithdrawn = 615,
 }
 impl ExecutionReason {
     pub(crate) const fn code(self) -> NonZeroU16 {

@@ -132,7 +132,12 @@ fn checked_values(rows: usize) -> Fragment {
         )
         .unwrap();
     builder
-        .finish_definition(owner, FragmentSink::Noop, dop())
+        .finish_definition(
+            owner,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap()
 }
 
@@ -142,6 +147,7 @@ fn snapshot(
     nodes: BTreeMap<NodeId, PhysicalNode>,
 ) -> Fragment {
     Fragment::from(FragmentParts {
+        stage_placement: crate::StagePlacementPolicy::Singleton,
         id: source.id(),
         root: source.root(),
         values: source.values().clone(),

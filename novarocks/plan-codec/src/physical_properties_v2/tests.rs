@@ -574,6 +574,9 @@ fn distribution_pure_counts_keep_independent_layout_and_original_five_gate_trace
         bucket(),
     ] {
         let raw = match &original.distribution {
+            physical::Distribution::ConditionalKey { .. } => {
+                unreachable!("conditional distributions have a separate reference/resource fixture")
+            }
             physical::Distribution::Hash { .. } => expected_hash().distribution.unwrap(),
             physical::Distribution::BucketShuffle { .. } => expected_bucket().distribution.unwrap(),
             physical::Distribution::Unconstrained => wire::Distribution {

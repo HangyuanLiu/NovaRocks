@@ -269,6 +269,11 @@ pub fn compiled_sink_kind(
             Ok(FragmentSinkKind::MultiCastDataStream)
         }
         Some(StaticSinkProgram::SplitDataStream { .. }) => Ok(FragmentSinkKind::SplitDataStream),
+        Some(StaticSinkProgram::ChangeStreamRouter { .. }) => Err(FragmentBindingError::new(
+            FragmentBindingTarget::Sink,
+            FragmentBindingErrorKind::InvalidAssignment,
+            "compiled change-stream router runtime is not installed",
+        )),
         None => Err(FragmentBindingError::new(
             FragmentBindingTarget::Sink,
             FragmentBindingErrorKind::MissingAssignment,

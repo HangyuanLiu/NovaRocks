@@ -83,6 +83,12 @@ pub(super) fn retain_received_buffer(
     port.push(
         key,
         ExchangeReceiverFrame {
+            stream: crate::runtime::fragment::io::exchange::fixture_stream(
+                UniqueId::new(0xc28, 1),
+                key.fragment_instance_id,
+                key.node_id,
+                0,
+            ),
             source_fragment_instance_id: UniqueId::new(0xc28, 1),
             sender_ordinal: 0,
             sender_count: 1,

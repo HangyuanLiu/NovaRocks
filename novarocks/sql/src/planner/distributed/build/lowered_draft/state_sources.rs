@@ -653,6 +653,31 @@ pub(super) fn check_state_inputs_observed<'a>(
     })
 }
 
+/// A Final aggregate reads only its explicitly declared writer-results child.
+/// The independent summary child is not an aggregate-state contributor.
+fn writer_state_input_node(node: &novarocks_physical_plan::PhysicalNode) -> Option<NodeId> {
+    let NodeKind::TableFinish(spec) = &node.kind else {
+        return None;
+    };
+    let logical = matches!(
+        spec.count_mode,
+        novarocks_physical_plan::FinishCountMode::LogicalChanges
+    );
+    if node.inputs.len() != if logical { 2 } else { 1 }
+        || logical != spec.inputs.logical_summary.is_some()
+        || logical != spec.logical_summary.is_some()
+        || spec.inputs.logical_summary.is_some_and(|ordinal| {
+            ordinal == spec.inputs.writer_results
+                || usize::try_from(ordinal).map_or(true, |index| index >= node.inputs.len())
+        })
+    {
+        return None;
+    }
+    node.inputs
+        .get(usize::try_from(spec.inputs.writer_results).ok()?)
+        .copied()
+}
+
 /// Check the actual Writer ValueId demand without fabricating an expression.
 pub(super) fn check_writer_state_inputs_observed<'a>(
     entry: &CheckedWriterAggregateLogicalSourceEntry<'a>,
@@ -679,7 +704,7 @@ pub(super) fn check_writer_state_inputs_observed<'a>(
         "Writer merge has no original state input association",
     ))?;
     let same = endpoint.fragment == entry.fragment.id()
-        && entry.node.inputs.as_ref() == [endpoint.node]
+        && writer_state_input_node(entry.node) == Some(endpoint.node)
         && endpoint.value == demand
         && demand == entry.source.input;
     work.step()?;
@@ -1082,7 +1107,15 @@ fn construction_input_root<'a, G: StateGraph<'a>>(
     let root = root.ok_or(SqlSourceJournalError::InvalidSource(
         "merge lacks its original state input association",
     ))?;
-    if root.fragment != fragment || node.inputs.as_ref() != [root.node] {
+    let original_child = match (site, &node.kind) {
+        (PhysicalCallSite::WriterFinal { node: owner, .. }, NodeKind::TableFinish(_))
+            if owner == node.id =>
+        {
+            writer_state_input_node(node) == Some(root.node)
+        }
+        _ => node.inputs.as_ref() == [root.node],
+    };
+    if root.fragment != fragment || !original_child {
         return Err(SqlSourceJournalError::InvalidSource(
             "merge differs from its original child association",
         ));

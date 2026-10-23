@@ -358,8 +358,12 @@ fn fixture_with_types(
             },
         })
         .unwrap();
-    let producer =
-        builder.finish_definition(writer, FragmentSink::Stream { edge: EDGE }, dop_domain())?;
+    let producer = builder.finish_definition(
+        writer,
+        FragmentSink::Stream { edge: EDGE },
+        dop_domain(),
+        novarocks_physical_plan::StagePlacementPolicy::Singleton,
+    )?;
 
     let mut builder = FragmentBuilder::new(FINISH_FRAGMENT);
     let exchange = builder.reserve_node_id().unwrap();
@@ -416,6 +420,12 @@ fn fixture_with_types(
                 columns: outputs.iter().map(|field| field.value).collect(),
             },
             kind: NodeKind::TableFinish(WriterFinishSpec {
+                count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
+                inputs: novarocks_physical_plan::FinishInputs {
+                    writer_results: 0,
+                    logical_summary: None,
+                },
+                logical_summary: None,
                 expected_target_ordinals: Box::from([ordinal]),
                 input_schema: WriterRelationSchema {
                     revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -431,16 +441,24 @@ fn fixture_with_types(
         })
         .unwrap();
     let consumer = builder
-        .finish_definition(finish, FragmentSink::Result, dop_domain())
+        .finish_definition(
+            finish,
+            FragmentSink::Result,
+            dop_domain(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([1; 16]).unwrap());
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(Edge {
+        role: novarocks_physical_plan::OutputRole::WriterResults,
+        delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
         id: EDGE,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: novarocks_physical_plan::FragmentOutputPort::Root,
             fragment: WRITER_FRAGMENT,
             projection: fields.iter().map(|field| field.value).collect(),
         },
@@ -517,7 +535,7 @@ fn fixture_with_types(
     })
 }
 
-/// One complete eager use per literal root site in one root domain.
+/// One complete eager use per literal or materialized-value root site in one domain.
 fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
     let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
     let mut uses = Vec::new();
@@ -529,7 +547,7 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
             let id = ExpressionUseId::new(index as u32);
             assert!(matches!(
                 fragment.expressions().get(root.expr).unwrap().kind,
-                ExprKind::Literal(_)
+                ExprKind::Literal(_) | ExprKind::Value(_)
             ));
             // A literal has no argument, so its control shape is trivially eager.
             let _ = control_argument_semantics(ControlShape::Eager, 0, 0, root.demand);
@@ -844,6 +862,13 @@ fn finish_fragment_reads_the_writer_relation_and_publishes_the_root_relation() {
     let graph = program.graph();
     let root = graph.root();
     let ProgramNodeKind::TableFinish {
+        count_mode: novarocks_local_program::FinishCountMode::WriterReported,
+        input_roles:
+            novarocks_local_program::FinishInputs {
+                writer_results: 0,
+                logical_summary: None,
+            },
+        logical_summary_layout: None,
         inputs,
         expected_targets,
         writer_multiplex_layout,
@@ -1359,7 +1384,12 @@ fn statistics_fixture() -> StatisticsFixture {
         .unwrap();
     let producer = with_requests(
         builder
-            .finish_definition(writer, FragmentSink::Stream { edge: EDGE }, dop_domain())
+            .finish_definition(
+                writer,
+                FragmentSink::Stream { edge: EDGE },
+                dop_domain(),
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            )
             .unwrap(),
         partial_aggregates.iter().enumerate().map(|(call, item)| {
             (
@@ -1484,6 +1514,12 @@ fn statistics_fixture() -> StatisticsFixture {
                 columns: outputs.iter().map(|field| field.value).collect(),
             },
             kind: NodeKind::TableFinish(WriterFinishSpec {
+                count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
+                inputs: novarocks_physical_plan::FinishInputs {
+                    writer_results: 0,
+                    logical_summary: None,
+                },
+                logical_summary: None,
                 expected_target_ordinals: Box::from([ordinal]),
                 input_schema: WriterRelationSchema {
                     revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -1514,7 +1550,12 @@ fn statistics_fixture() -> StatisticsFixture {
         .unwrap();
     let consumer = with_requests(
         builder
-            .finish_definition(finish, FragmentSink::Result, dop_domain())
+            .finish_definition(
+                finish,
+                FragmentSink::Result,
+                dop_domain(),
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            )
             .unwrap(),
         final_aggregates.iter().enumerate().map(|(call, item)| {
             (
@@ -1534,9 +1575,12 @@ fn statistics_fixture() -> StatisticsFixture {
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(Edge {
+        role: novarocks_physical_plan::OutputRole::WriterResults,
+        delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
         id: EDGE,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: novarocks_physical_plan::FragmentOutputPort::Root,
             fragment: WRITER_FRAGMENT,
             projection: fields.iter().map(|field| field.value).collect(),
         },
@@ -2216,3 +2260,6 @@ fn actual_writer_compilation_accepts_root_null_obligation_and_refuses_nested_bin
         }
     }
 }
+
+#[path = "writer_lowering_tests/change_stream.rs"]
+mod change_stream;

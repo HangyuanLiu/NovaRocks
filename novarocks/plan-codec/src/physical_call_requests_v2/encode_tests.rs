@@ -276,6 +276,7 @@ fn fixture_with_parameters(reference: p::ConstantReference, parameter_count: usi
                 max: 1,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap()
         .with_call_requests_observed(
@@ -619,6 +620,7 @@ fn empty_explicit_table_emits_empty_and_wide_actual_value_channels_observe_real_
                 max: 1,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap()
         .with_call_requests_observed(vec![], &c)

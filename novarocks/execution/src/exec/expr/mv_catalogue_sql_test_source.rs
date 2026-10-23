@@ -608,6 +608,10 @@ pub(super) fn run_with_denied_loan(
             join_mode: SqlMvJoinIncrementalRefreshMode::AppendOnly,
             write_mode: SqlMvIncrementalWriteMode::FastAppend,
             routes: vec![DmlChangeStreamRoute {
+            requirements: novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
+                layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
                 route_id: ConnectorWriteRouteId::from_bytes([2; 32]),
                 write_target_ordinal:
                     novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(0).unwrap(),
@@ -616,7 +620,6 @@ pub(super) fn run_with_denied_loan(
                     ConnectorWriteFieldToken::from_bytes([1; 32]),
                     0,
                 )],
-                partition_input_tokens: vec![],
                 sink,
             }],
             current_catalog: Some("ice".into()),
