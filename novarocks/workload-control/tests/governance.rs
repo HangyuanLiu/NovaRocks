@@ -159,6 +159,60 @@ async fn compute_background_roots_share_the_warehouse_query_queue() {
     assert_eq!(control.snapshot().admitted_queries, 0);
 }
 
+#[test]
+fn unpolled_warehouse_roots_and_children_share_the_finite_scope_inventory() {
+    for class in [
+        WorkClass::Query,
+        WorkClass::MaterializedView,
+        WorkClass::Statistics,
+        WorkClass::TableMaintenance,
+    ] {
+        let control = WorkloadControl::try_new_counted(WorkloadConfig {
+            root_limit: 1,
+            business_limit: 1,
+            query_concurrency_limit: 1,
+            scope_records_limit: 2,
+            ..config()
+        })
+        .unwrap()
+        .owner;
+        control.mark_ready().unwrap();
+        // Neither request has polled the one warehouse concurrency queue.
+        let first = control
+            .begin_warehouse_root(WorkRequest::new(class))
+            .unwrap();
+        let second = control
+            .begin_warehouse_root(WorkRequest::new(class))
+            .unwrap();
+        let mut refused = None;
+        assert_eq!(
+            control
+                .root_admission()
+                .begin_warehouse_root_in(WorkRequest::new(class), &mut refused),
+            Err(WorkError::Capacity("scope records"))
+        );
+        assert!(refused.is_none());
+        let full = control.snapshot();
+        assert_eq!(full.scopes.len(), 2);
+        assert_eq!(full.admission_records, 0);
+        assert_eq!(full.admitted_queries, 0);
+        first.owner.complete();
+        let child = second.owner.scope().child_inherited().unwrap();
+        assert!(matches!(
+            control.begin_warehouse_root(WorkRequest::new(class)),
+            Err(WorkError::Capacity("scope records"))
+        ));
+        child.complete();
+        let next = control
+            .begin_warehouse_root(WorkRequest::new(class))
+            .unwrap();
+        next.owner.complete();
+        second.owner.complete();
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
+    }
+}
+
 #[tokio::test]
 async fn cancelled_queued_query_never_consumes_concurrency_or_leaks_its_root() {
     let mut limits = config();

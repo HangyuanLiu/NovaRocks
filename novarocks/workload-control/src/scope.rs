@@ -852,9 +852,12 @@ fn install_warehouse_root(
             if !state.ready {
                 return Err(WorkError::NotReady);
             }
-            // A warehouse query enters the one fair query queue below. Root
-            // and scope-record accounting must not become a second Frontend
-            // admission decision before that queue can observe the request.
+            // Registering an unpolled request already retains a real scope.
+            // Bound that responsibility before minting its identity, while
+            // leaving computation concurrency to the original warehouse queue.
+            if state.nodes.len() >= inner.config.scope_records_limit {
+                return Err(WorkError::Capacity("scope records"));
+            }
             let id = WorkId(state.next_id()?);
             let cancellation = state.take_root_cancellation(class, id, request.deadline)?;
             state
