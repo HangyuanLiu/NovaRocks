@@ -1497,6 +1497,7 @@ impl FrontendDormantAttemptFactory for ProductionDormantAttemptFactory {
             RegisteredManifestAttemptProjection {
                 base: self.pending_projection.take().unwrap(),
                 handoff: self.pending_handoff.take(),
+                pending_projected: None,
             },
             ManifestAttemptCompletion::AcceptedRootSuccessSeal,
             Arc::clone(&self.runtime.lifecycle_diagnostics),
@@ -1517,6 +1518,8 @@ impl FrontendDormantAttemptFactory for ProductionDormantAttemptFactory {
 struct RegisteredManifestAttemptProjection {
     base: ProductionManifestAttemptProjection,
     handoff: Option<AttemptHandoffProducer>,
+    // This complete original result survives a handoff notification unwind.
+    pending_projected: Option<ProjectedManifestAttempt>,
 }
 impl std::fmt::Debug for RegisteredManifestAttemptProjection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1540,11 +1543,20 @@ impl FrontendManifestAttemptProjection for RegisteredManifestAttemptProjection {
                 + 'a,
         >,
     > {
+        if self.pending_projected.is_some() {
+            return Box::pin(async {
+                Err(projection_message(
+                    "the original projected attempt still awaits source disposition",
+                ))
+            });
+        }
         Box::pin(async move {
-            let mut projected = self
-                .base
-                .project(prepared, manifest, replacement_admissions, cancellation)
-                .await?;
+            self.pending_projected = Some(
+                self.base
+                    .project(prepared, manifest, replacement_admissions, cancellation)
+                    .await?,
+            );
+            let projected = self.pending_projected.as_mut().unwrap();
             if let Some(handoff) = self.handoff.as_mut() {
                 let protocol = projected.round.take_protocol_facts().ok_or_else(|| {
                     projection_message(
@@ -1565,13 +1577,19 @@ impl FrontendManifestAttemptProjection for RegisteredManifestAttemptProjection {
                     .map_err(|error| NativeAttemptActivationFailure::new(handoff_failure(error)))?;
                 projected.handoff = self.handoff.take();
             }
-            Ok(projected)
+            Ok(self.pending_projected.take().unwrap())
         })
     }
     fn converge<'a>(
         &'a mut self,
         cancellation: CancellationView,
     ) -> NativeAttemptConvergenceFuture<'a> {
+        if self.pending_projected.is_some() {
+            // The completed round/rows are no longer covered by the base's
+            // empty convergence. Keep this same finite owner unproven until
+            // the original round's actual close/return author is connected.
+            return Box::pin(std::future::pending());
+        }
         if let Some(handoff) = self.handoff.as_mut() {
             handoff.retire_unclaimed();
         }
@@ -2007,6 +2025,8 @@ pub(crate) struct FrontendTaskProtocolActiveBehavior {
     split_assignment: Option<SplitAssignmentRoundGuard>,
     abort_route: Option<LogicalAbortRoute>,
     handoff: Option<AttemptHandoffProducer>,
+    _profile_observer:
+        Option<crate::task_execution::profile_diagnostics::ProfileDiagnosticObserver>,
     lifecycle_diagnostics:
         Arc<crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics>,
 }
@@ -2036,7 +2056,7 @@ impl FrontendTaskProtocolActiveBehavior {
             _split_assignment: split_assignment,
             _abort_route: abort_route,
             handoff,
-            profile_observer: _,
+            profile_observer,
         } = attempt;
         Self {
             attempt: round,
@@ -2047,6 +2067,7 @@ impl FrontendTaskProtocolActiveBehavior {
             split_assignment,
             abort_route,
             handoff,
+            _profile_observer: profile_observer,
             lifecycle_diagnostics,
         }
     }
@@ -2167,6 +2188,7 @@ impl RetainedAttemptInputs for SnapshotBoundDormantAttemptInputs {
 struct SnapshotBoundDormantAttemptOwner<B, I = SnapshotBoundDormantAttemptInputs>
 where
     I: RetainedAttemptInputs,
+    B: FrontendDormantAttemptBehavior<I::Manifest>,
 {
     #[cfg(novarocks_dev_controls)]
     test_placement: Option<(
@@ -2175,12 +2197,14 @@ where
     )>,
     dormant_inputs: Option<I>,
     manifest_inputs: Option<I::Manifest>,
+    pending_active_behavior:
+        Option<<B as FrontendDormantAttemptBehavior<I::Manifest>>::ActiveBehavior>,
     behavior: B,
 }
 
 impl<B, I> std::fmt::Debug for SnapshotBoundDormantAttemptOwner<B, I>
 where
-    B: std::fmt::Debug,
+    B: FrontendDormantAttemptBehavior<I::Manifest>,
     I: RetainedAttemptInputs,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2211,6 +2235,7 @@ type NativeActiveAttemptActivationFuture<'a, Manifest, Behavior> = std::pin::Pin
 impl<B, I> SnapshotBoundDormantAttemptOwner<B, I>
 where
     I: RetainedAttemptInputs,
+    B: FrontendDormantAttemptBehavior<I::Manifest>,
 {
     fn new(inputs: I, behavior: B) -> Self {
         Self {
@@ -2218,6 +2243,7 @@ where
             test_placement: None,
             dormant_inputs: Some(inputs),
             manifest_inputs: None,
+            pending_active_behavior: None,
             behavior,
         }
     }
@@ -2229,6 +2255,7 @@ where
             test_placement: None,
             dormant_inputs: None,
             manifest_inputs: Some(inputs),
+            pending_active_behavior: None,
             behavior,
         }
     }
@@ -2269,22 +2296,35 @@ where
     where
         B: FrontendDormantAttemptBehavior<I::Manifest>,
     {
+        if self.pending_active_behavior.is_some() {
+            return Box::pin(async {
+                Err(projection_message(
+                    "the original active behavior still awaits source disposition",
+                ))
+            });
+        }
         let behavior = &mut self.behavior;
         let manifest_inputs = &mut self.manifest_inputs;
+        let pending_active = &mut self.pending_active_behavior;
         Box::pin(async move {
-            let mut active_behavior = behavior
-                .activate(
-                    manifest_inputs
-                        .as_mut()
-                        .expect("activation retains its manifest inputs"),
-                    replacement_admissions,
-                    cancellation,
-                )
-                .await?;
+            *pending_active = Some(
+                behavior
+                    .activate(
+                        manifest_inputs
+                            .as_mut()
+                            .expect("activation retains its manifest inputs"),
+                        replacement_admissions,
+                        cancellation,
+                    )
+                    .await?,
+            );
+            // This trait extraction may unwind. Both the original manifest
+            // and the returned active behavior remain in their owner fields.
+            let rows = pending_active.as_mut().unwrap().take_rows_runtime();
             let inputs = manifest_inputs
                 .take()
                 .expect("successful activation transfers the retained manifest once");
-            let rows = active_behavior.take_rows_runtime();
+            let active_behavior = pending_active.take().unwrap();
             Ok((
                 SnapshotBoundActiveAttemptOwner {
                     inputs,
@@ -2324,6 +2364,12 @@ where
     where
         B: FrontendDormantAttemptBehavior<I::Manifest>,
     {
+        if self.pending_active_behavior.is_some() {
+            // A completed active source is not covered by dormant projection
+            // cleanup. Keep this SAME finite owner until its real close/return
+            // author is supplied; never report an empty convergence as exit.
+            return Box::pin(std::future::pending());
+        }
         match self.manifest_inputs.as_mut() {
             Some(inputs) => self.behavior.converge(inputs, cancellation),
             None => Box::pin(async {}),
@@ -2730,7 +2776,7 @@ fn attempt_runtime_failure(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use futures::FutureExt;
@@ -3214,10 +3260,10 @@ mod tests {
     #[derive(Debug)]
     struct NeverActiveBehavior;
 
-    impl FrontendActiveAttemptBehavior for NeverActiveBehavior {
+    impl<M: std::fmt::Debug + Send + 'static> FrontendActiveAttemptBehavior<M> for NeverActiveBehavior {
         fn run<'a>(
             &'a mut self,
-            _inputs: &'a mut ManifestBoundNativeAttemptInputs,
+            _inputs: &'a mut M,
             _drive: &'a NativeAttemptDrive,
             _cancellation: CancellationView,
         ) -> NativeAttemptRunFuture<'a> {
@@ -3226,7 +3272,7 @@ mod tests {
 
         fn converge<'a>(
             &'a mut self,
-            _inputs: &'a mut ManifestBoundNativeAttemptInputs,
+            _inputs: &'a mut M,
             _request: NativeActiveConvergenceRequest,
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
             Box::pin(async {
@@ -3237,12 +3283,14 @@ mod tests {
         }
     }
 
-    impl FrontendDormantAttemptBehavior for AdversarialBehavior {
+    impl<M: std::fmt::Debug + Send + 'static> FrontendDormantAttemptBehavior<M>
+        for AdversarialBehavior
+    {
         type ActiveBehavior = NeverActiveBehavior;
 
         fn activate<'a>(
             &'a mut self,
-            _inputs: &'a mut ManifestBoundNativeAttemptInputs,
+            _inputs: &'a mut M,
             _replacement_admissions: Option<Box<[novarocks_query_application::coordination::ReplacementWorkerAdmissionEvidence]>>,
             _cancellation: CancellationView,
         ) -> std::pin::Pin<
@@ -3258,7 +3306,7 @@ mod tests {
 
         fn converge<'a>(
             &'a mut self,
-            _inputs: &'a mut ManifestBoundNativeAttemptInputs,
+            _inputs: &'a mut M,
             _cancellation: CancellationView,
         ) -> NativeAttemptConvergenceFuture<'a> {
             Box::pin(async {})
@@ -3613,6 +3661,154 @@ mod tests {
         .expect("the original active fixture joins successfully");
         assert!(convergence_observed.load(Ordering::SeqCst));
     }
+
+    struct OriginalRowsExtractionPanic {
+        drops: Arc<AtomicU64>,
+    }
+    impl Drop for OriginalRowsExtractionPanic {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[derive(Debug)]
+    struct ExtractionPanicDormant {
+        active_drops: Arc<AtomicU64>,
+        cause_drops: Arc<AtomicU64>,
+        extractions: Arc<AtomicU64>,
+        dormant_closes: Arc<AtomicU64>,
+    }
+    #[derive(Debug)]
+    struct ExtractionPanicActive {
+        active_drops: Arc<AtomicU64>,
+        cause_drops: Arc<AtomicU64>,
+        extractions: Arc<AtomicU64>,
+    }
+    impl Drop for ExtractionPanicActive {
+        fn drop(&mut self) {
+            self.active_drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl FrontendActiveAttemptBehavior<TestManifest> for ExtractionPanicActive {
+        fn take_rows_runtime(
+            &mut self,
+        ) -> Option<(
+            super::FrontendRootRowsRuntime,
+            super::AcceptedRootStatusSource,
+        )> {
+            self.extractions.fetch_add(1, Ordering::SeqCst);
+            std::panic::panic_any(OriginalRowsExtractionPanic {
+                drops: Arc::clone(&self.cause_drops),
+            });
+        }
+        fn run<'a>(
+            &'a mut self,
+            _inputs: &'a mut TestManifest,
+            _drive: &'a NativeAttemptDrive,
+            _cancellation: CancellationView,
+        ) -> NativeAttemptRunFuture<'a> {
+            Box::pin(async { panic!("the extraction-failure fixture must not dispatch") })
+        }
+        fn converge<'a>(
+            &'a mut self,
+            _inputs: &'a mut TestManifest,
+            _request: NativeActiveConvergenceRequest,
+        ) -> NativeActiveAttemptConvergenceFuture<'a> {
+            Box::pin(async { panic!("no active close receipt is invented by this fixture") })
+        }
+    }
+    impl FrontendDormantAttemptBehavior<TestManifest> for ExtractionPanicDormant {
+        type ActiveBehavior = ExtractionPanicActive;
+        fn activate<'a>(
+            &'a mut self,
+            inputs: &'a mut TestManifest,
+            _admissions: Option<Box<[novarocks_query_application::coordination::ReplacementWorkerAdmissionEvidence]>>,
+            _cancellation: CancellationView,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Self::ActiveBehavior, NativeAttemptActivationFailure>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                assert_eq!(inputs.marker, 73);
+                Ok(ExtractionPanicActive {
+                    active_drops: Arc::clone(&self.active_drops),
+                    cause_drops: Arc::clone(&self.cause_drops),
+                    extractions: Arc::clone(&self.extractions),
+                })
+            })
+        }
+        fn converge<'a>(
+            &'a mut self,
+            _inputs: &'a mut TestManifest,
+            _cancellation: CancellationView,
+        ) -> NativeAttemptConvergenceFuture<'a> {
+            self.dormant_closes.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+    }
+    #[tokio::test]
+    async fn real_rows_extraction_panic_keeps_returned_active_and_manifest_in_original_owner() {
+        let (_control, root, cancellation) = governed_cancellation();
+        let active_drops = Arc::new(AtomicU64::new(0));
+        let cause_drops = Arc::new(AtomicU64::new(0));
+        let extractions = Arc::new(AtomicU64::new(0));
+        let dormant_closes = Arc::new(AtomicU64::new(0));
+        let mut owner = SnapshotBoundDormantAttemptOwner::<_, CapturedInputs>::from_manifest(
+            TestManifest {
+                eligible_backends: vec![],
+                marker: 73,
+                identity: Box::new(91),
+            },
+            ExtractionPanicDormant {
+                active_drops: Arc::clone(&active_drops),
+                cause_drops: Arc::clone(&cause_drops),
+                extractions: Arc::clone(&extractions),
+                dormant_closes: Arc::clone(&dormant_closes),
+            },
+        );
+        let original_identity =
+            owner.manifest_inputs.as_ref().unwrap().identity.as_ref() as *const u8 as usize;
+        let outcome =
+            std::panic::AssertUnwindSafe(owner.activate_fixed_retained(None, cancellation.clone()))
+                .catch_unwind()
+                .await;
+        let original_cause = match outcome {
+            Err(original) => Some(original),
+            Ok(result) => {
+                drop(result);
+                None
+            }
+        };
+        let exact_cause = original_cause
+            .as_ref()
+            .is_some_and(|cause| cause.is::<OriginalRowsExtractionPanic>());
+        let manifest_retained = owner.manifest_inputs.as_ref().is_some_and(|manifest| {
+            manifest.identity.as_ref() as *const u8 as usize == original_identity
+        });
+        let active_retained = owner.pending_active_behavior.is_some();
+        let mut close = owner.converge_retained(cancellation);
+        let close_pending = futures::poll!(&mut close).is_pending();
+        drop(close);
+        let before = (
+            active_drops.load(Ordering::SeqCst),
+            cause_drops.load(Ordering::SeqCst),
+        );
+        // This explicit fixture-owner disposition is not a normal Native close
+        // receipt, WorkerStopped evidence or a profile qualification.
+        drop(owner);
+        drop(original_cause);
+        root.owner.complete();
+        root.business.release();
+        assert!(exact_cause && manifest_retained && active_retained && close_pending);
+        assert_eq!(before, (0, 0));
+        assert_eq!(extractions.load(Ordering::SeqCst), 1);
+        assert_eq!(dormant_closes.load(Ordering::SeqCst), 0);
+        assert_eq!(active_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(cause_drops.load(Ordering::SeqCst), 1);
+    }
 }
 
 /// Pure pointee layout of the actual first-party preparation author. Shared
@@ -3620,4 +3816,25 @@ mod tests {
 pub(crate) fn native_preparation_owner_layout() -> std::alloc::Layout {
     std::alloc::Layout::new::<FrontendNativeAttemptPreparationPort<ProductionDormantAttemptFactory>>(
     )
+}
+
+/// Pure layout of the actual dormant owner pointee, including its one stable
+/// activation result. Dynamic backing and original service owners are separate.
+pub(crate) fn native_dormant_owner_layout() -> std::alloc::Layout {
+    std::alloc::Layout::new::<
+        SnapshotBoundDormantAttemptOwner<
+            FrontendTaskProtocolDormantBehavior<RegisteredManifestAttemptProjection>,
+        >,
+    >()
+}
+
+/// Pure layout of the concrete active owner transferred to the original QA
+/// custody slot. It is a storage fact, not an execution or capacity grant.
+pub(crate) fn native_active_owner_layout() -> std::alloc::Layout {
+    std::alloc::Layout::new::<
+        SnapshotBoundActiveAttemptOwner<
+            ManifestBoundNativeAttemptInputs,
+            FrontendTaskProtocolActiveBehavior,
+        >,
+    >()
 }
