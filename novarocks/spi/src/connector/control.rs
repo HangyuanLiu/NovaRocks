@@ -702,14 +702,7 @@ impl ConnectorControlBinding {
 
     /// Attach provider-owned, FE-local work which can only be installed after
     /// desired state has frozen the immutable catalog identity.
-    #[expect(
-        clippy::type_complexity,
-        reason = "The callback is the exact borrowed installation contract; extracting a new public SPI callback type would expand the API"
-    )]
-    pub fn with_catalog_handle_installer(
-        mut self,
-        installer: Arc<dyn Fn(&CatalogHandle) -> Result<(), ConnectorError> + Send + Sync>,
-    ) -> Self {
+    pub fn with_catalog_handle_installer(mut self, installer: Arc<CatalogHandleInstaller>) -> Self {
         self.catalog_handle_installer = Some(installer);
         self
     }
