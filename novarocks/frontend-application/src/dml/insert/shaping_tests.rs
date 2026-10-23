@@ -628,7 +628,14 @@ fn literal_target_casts_keep_original_bitmap_and_hll_declarations() {
         .map(|_| ())
     }
     for (domain, source, target_name) in [
-        (ValueLogicalType::Bitmap, "to_bitmap(10)", "BITMAP"),
+        // The test owns opaque cast preservation, independently of the
+        // unavailable legacy to_bitmap overload. This real aggregate-backed
+        // scalar subquery preserves a concrete Bitmap producer and its domain.
+        (
+            ValueLogicalType::Bitmap,
+            "(SELECT bitmap_agg(10))",
+            "BITMAP",
+        ),
         (ValueLogicalType::Hll, "hll_hash(10)", "HLL"),
     ] {
         let declared =
