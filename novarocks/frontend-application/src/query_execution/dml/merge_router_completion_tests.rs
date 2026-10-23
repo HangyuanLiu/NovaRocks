@@ -137,7 +137,6 @@ fn mor_merge_completion_reaches_the_original_compiled_router_refusal() {
                 vec![ConnectorRowMutationEffect::Replace]
             },
             input_ordinals: inputs,
-            partition_input_tokens: Vec::new(),
             sink: DmlWritePlanInput::try_new(
                 if ordinal == 0 {
                     DmlWriteSinkMode::RowLineageData

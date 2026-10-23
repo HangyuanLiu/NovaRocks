@@ -471,8 +471,8 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
     plan.add_fragment(producer).expect("add writer fragment");
     plan.add_fragment(consumer).expect("add finish fragment");
     plan.add_edge(p::Edge {
-        role: novarocks_physical_plan::OutputRole::Relational,
-        delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
+        role: p::OutputRole::WriterResults,
+        delivery: p::DeliveryRequirement::MustDrain,
         id: edge,
         kind: p::EdgeKind::Stream,
         source: p::EdgeSource {

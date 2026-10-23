@@ -1449,17 +1449,16 @@ impl LocalProgramGraph {
                 inputs,
                 ..
             } = &node.kind
+                && let Some(port) = input_roles.logical_summary
             {
-                if let Some(port) = input_roles.logical_summary {
-                    let source = inputs
-                        .get(port as usize)
-                        .ok_or(LocalProgramError::InvalidRequirement)?;
-                    let used = summary_consumers
-                        .get_mut(source)
-                        .ok_or(LocalProgramError::InvalidRequirement)?;
-                    if std::mem::replace(used, true) {
-                        return Err(LocalProgramError::InvalidRequirement.into());
-                    }
+                let source = inputs
+                    .get(port as usize)
+                    .ok_or(LocalProgramError::InvalidRequirement)?;
+                let used = summary_consumers
+                    .get_mut(source)
+                    .ok_or(LocalProgramError::InvalidRequirement)?;
+                if std::mem::replace(used, true) {
+                    return Err(LocalProgramError::InvalidRequirement.into());
                 }
             }
             let required = match &node.kind {

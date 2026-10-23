@@ -143,6 +143,7 @@ fn router_graph(projection: RouteProjection) -> Result<LocalProgramGraph, LocalP
         expressions(),
         SlotId::new(1),
         vec![StaticRouterRoute {
+            layout: crate::ProgramWriteLayoutPreference::None,
             branch: 0,
             accepted_effects: Arc::from([ConnectorRowMutationEffect::Insert]),
         }],

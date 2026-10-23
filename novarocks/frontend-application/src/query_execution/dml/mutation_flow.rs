@@ -439,7 +439,6 @@ fn compile_dml_change_stream_write(
             accepted_effects: route.accepted_effects().to_vec(),
             input_ordinals: route.input_ordinals().to_vec(),
             requirements: route.requirements().clone(),
-            partition_input_tokens: route.partition_fields().to_vec(),
             sink,
         });
         statistics_targets.push(
@@ -5797,7 +5796,10 @@ mod tests {
             route.route_id(),
             route.accepted_effects().to_vec(),
             route.input_ordinals().to_vec(),
-            { let keys = route.partition_fields().to_vec(); novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements { colocation: if keys.is_empty() { novarocks_spi::connector::write_stack::ConnectorWriteColocation::None } else { novarocks_spi::connector::write_stack::ConnectorWriteColocation::ByKey(keys) }, layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None } },
+            novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
+                layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             vec![
                 novarocks_spi::connector::write_stack::ConnectorWriteSelectionBinding::new(
                     id_token,
@@ -6036,18 +6038,7 @@ mod tests {
                     )
                 })
                 .collect(),
-            {
-                let keys = fixture.route_facts.partition_fields().to_vec();
-                novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
-                    colocation: if keys.is_empty() {
-                        novarocks_spi::connector::write_stack::ConnectorWriteColocation::None
-                    } else {
-                        novarocks_spi::connector::write_stack::ConnectorWriteColocation::ByKey(keys)
-                    },
-                    layout:
-                        novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
-                }
-            },
+            fixture.route_facts.requirements().clone(),
             fixture.route_facts.selection_bindings().to_vec(),
         )
         .expect("route");

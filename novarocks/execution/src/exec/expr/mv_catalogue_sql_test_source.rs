@@ -620,7 +620,6 @@ pub(super) fn run_with_denied_loan(
                     ConnectorWriteFieldToken::from_bytes([1; 32]),
                     0,
                 )],
-                partition_input_tokens: vec![],
                 sink,
             }],
             current_catalog: Some("ice".into()),

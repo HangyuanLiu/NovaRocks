@@ -39,6 +39,10 @@ pub(crate) struct PlannedChannels {
     pub inputs: BTreeMap<ExprId, ResolvedInput>,
     pub unpivot_sources: BTreeMap<NodeId, BTreeMap<ValueId, SlotId>>,
     pub assertion_keys: BTreeMap<NodeId, Vec<SlotId>>,
+    pub sink_projection: Option<SinkProjectionChannels>,
+    pub summary_slots: Option<Arc<[SlotId]>>,
+    pub assertion_applicability:
+        BTreeMap<NodeId, novarocks_local_program::ProgramAssertionApplicability>,
     pub unions: BTreeMap<NodeId, Vec<UnionChannelBranch>>,
     /// Fresh slots of each TableWriter's projected provider input, in target
     /// field order. Its output slots are its multiplex relation's.
@@ -56,6 +60,12 @@ pub(crate) struct PlannedChannels {
     /// pass-through reads are its one branch in `unions`.
     pub table_functions: BTreeMap<NodeId, crate::table_function::PlannedTableFunction>,
     pub series: BTreeMap<NodeId, crate::generate_series::PlannedGenerateSeries>,
+}
+
+pub(crate) struct SinkProjectionChannels {
+    pub node: ProgramNodeId,
+    pub slots: Arc<[SlotId]>,
+    pub route_slots: BTreeMap<novarocks_physical_plan::EdgeId, Arc<[SlotId]>>,
 }
 
 pub(crate) struct NodeChannels {
@@ -184,6 +194,7 @@ fn resolve_core_with_creation<H>(
     let mut next_slot = 0_u64;
     let mut unpivot_sources = BTreeMap::new();
     let mut assertion_keys = BTreeMap::new();
+    let mut assertion_applicability = BTreeMap::new();
     let mut next_node = 0usize;
     let mut unions = BTreeMap::new();
     let mut writer_projections = BTreeMap::new();
@@ -585,6 +596,33 @@ fn resolve_core_with_creation<H>(
                         work.step()?;
                     }
                 }
+                let applicability = match spec {
+                    novarocks_physical_plan::RowCountAssertionSpec::PerKeyAtMostOne {
+                        applicability:
+                            novarocks_physical_plan::AssertionApplicability::WhenTrue(value),
+                        ..
+                    } => {
+                        let resolved = resolve_input(*value, &nodes[&child], &ports[&child])?;
+                        let ty = &fragment
+                            .values()
+                            .get(value)
+                            .ok_or(ChannelLoweringError::Invalid(
+                                "missing assertion applicability",
+                            ))?
+                            .ty;
+                        if ty.data_type() != &arrow_schema::DataType::Boolean {
+                            return Err(ChannelLoweringError::Invalid(
+                                "assertion applicability is not Boolean",
+                            )
+                            .into());
+                        }
+                        novarocks_local_program::ProgramAssertionApplicability::WhenTrue(
+                            resolved.slot,
+                        )
+                    }
+                    _ => novarocks_local_program::ProgramAssertionApplicability::AllRows,
+                };
+                assertion_applicability.insert(source, applicability);
                 assertion_keys.insert(source, keys);
                 work.step()?;
                 planned
@@ -693,7 +731,18 @@ fn resolve_core_with_creation<H>(
             // A finish produces its root relation itself, and its statistics
             // their internal grouping and final channels.
             NodeKind::TableFinish(spec) => {
-                single_child(&node.inputs)?;
+                let expected = if spec.count_mode
+                    == novarocks_physical_plan::FinishCountMode::LogicalChanges
+                {
+                    2
+                } else {
+                    1
+                };
+                if node.inputs.len() != expected {
+                    return Err(
+                        ChannelLoweringError::Invalid("finish input role arity differs").into(),
+                    );
+                }
                 let relation = fresh_relation(fragment, node, &mut next_slot, work)?;
                 let statistics = fresh_slots(
                     crate::writer_statistics::finish_statistics_slots(spec),
@@ -836,11 +885,90 @@ fn resolve_core_with_creation<H>(
         }
         work.step()?;
     }
+    let (sink_projection, summary_slots) =
+        if let novarocks_physical_plan::FragmentSink::Router { routes, .. } = fragment.sink() {
+            let root = fragment
+                .nodes()
+                .get(&fragment.root())
+                .ok_or(ChannelLoweringError::Invalid("missing router root"))?;
+            let root_channels = &nodes[&fragment.root()];
+            let width = routes
+                .iter()
+                .try_fold(root.output.columns.len(), |count, route| {
+                    count.checked_add(route.input_mapping.len())
+                })
+                .ok_or(CompileControlError::ResourceExhausted)?;
+            if next_node >= novarocks_local_program::MAX_PROGRAM_NODES
+                || width > novarocks_type_contract::MAX_CONTROL_DEFINITIONS
+            {
+                return Err(CompileControlError::ResourceExhausted.into());
+            }
+            let local = ProgramNodeId::new(next_node);
+            let mut sources = Vec::new();
+            reserve_vec(&mut sources, width, work)?;
+            let mut output_slots = Vec::new();
+            reserve_vec(&mut output_slots, width, work)?;
+            // Every output gets a fresh identity. Reusing a child's slot here
+            // would shadow later reads of that same child inside the Project.
+            // The original ordered control occurrences remain in the prefix.
+            let prefix_slots = fresh_slots(root.output.columns.len(), &mut next_slot, work)?;
+            for (ordinal, value) in root.output.columns.iter().enumerate() {
+                sources.push(UnionChannelSource {
+                    input: ResolvedInput {
+                        slot: root_channels.slots[ordinal],
+                        source: ProgramChannelSite::Layout {
+                            node: root_channels.local,
+                            role: ProgramChannelLayoutRole::NodeOutput,
+                            ordinal: u32::try_from(ordinal)
+                                .map_err(|_| CompileControlError::ResourceExhausted)?,
+                        },
+                    },
+                    ty: fragment.values()[value].ty.clone_observed(|| work.step())?,
+                });
+                output_slots.push(prefix_slots[ordinal]);
+                work.step()?;
+            }
+            let mut route_slots = BTreeMap::new();
+            for route in routes {
+                let aliases = fresh_slots(route.input_mapping.len(), &mut next_slot, work)?;
+                for ((_, value), slot) in route.input_mapping.iter().zip(aliases.iter()) {
+                    sources.push(UnionChannelSource {
+                        input: resolve_input(*value, root_channels, &ports[&fragment.root()])?,
+                        ty: fragment.values()[value].ty.clone_observed(|| work.step())?,
+                    });
+                    output_slots.push(*slot);
+                    work.step()?;
+                }
+                route_slots.insert(route.edge, aliases);
+            }
+            let slots: Arc<[SlotId]> = Arc::from(output_slots);
+            unions
+                .entry(fragment.root())
+                .or_default()
+                .push(UnionChannelBranch {
+                    normalizer: local,
+                    input: root_channels.local,
+                    sources,
+                });
+            (
+                Some(SinkProjectionChannels {
+                    node: local,
+                    slots,
+                    route_slots,
+                }),
+                Some(fresh_slots(3, &mut next_slot, work)?),
+            )
+        } else {
+            (None, None)
+        };
     Ok(PlannedChannels {
         nodes,
         inputs,
         unpivot_sources,
         assertion_keys,
+        sink_projection,
+        summary_slots,
+        assertion_applicability,
         unions,
         writer_projections,
         finish_statistics,

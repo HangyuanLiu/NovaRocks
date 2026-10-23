@@ -90,6 +90,47 @@ impl fmt::Display for Hex<'_> {
 
 struct OptionalQuoted<'a>(Option<&'a str>);
 
+pub(super) struct StagePlacementDisplay<'a>(
+    pub(super) &'a novarocks_physical_plan::StagePlacementPolicy,
+);
+
+impl fmt::Display for StagePlacementDisplay<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use novarocks_physical_plan::StagePlacementPolicy;
+        match self.0 {
+            StagePlacementPolicy::Singleton => formatter.write_str("singleton"),
+            StagePlacementPolicy::ScanWork => formatter.write_str("scan-work"),
+            StagePlacementPolicy::Spread {
+                max_instances: None,
+            } => formatter.write_str("spread(max-instances=eligible-backends)"),
+            StagePlacementPolicy::Spread {
+                max_instances: Some(cap),
+            } => {
+                write!(formatter, "spread(max-instances={cap})")
+            }
+            StagePlacementPolicy::FollowSources { sources } => write!(
+                formatter,
+                "follow-sources([{}])",
+                joined(
+                    sources,
+                    ",",
+                    |source: &FragmentId, output: &mut fmt::Formatter<'_>| source.get().fmt(output)
+                )
+            ),
+        }
+    }
+}
+
+pub(super) fn finish_count_mode_name(
+    mode: novarocks_physical_plan::FinishCountMode,
+) -> &'static str {
+    match mode {
+        novarocks_physical_plan::FinishCountMode::LogicalChanges => "logical-changes",
+        novarocks_physical_plan::FinishCountMode::WriterReported => "writer-reported",
+        novarocks_physical_plan::FinishCountMode::ExternalOwner => "external-owner",
+    }
+}
+
 impl fmt::Display for OptionalQuoted<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
@@ -782,6 +823,10 @@ pub fn render_completed_plan(
         lines.push(format_args!(
             "  DOP DOMAIN min={}, max={}, power-of-two={}",
             dop.min, dop.max, dop.requires_power_of_two
+        ))?;
+        lines.push(format_args!(
+            "  STAGE PLACEMENT {}",
+            StagePlacementDisplay(fragment.stage_placement())
         ))?;
         lines.push(format_args!(
             "  RUNTIME FILTER ATTACHMENTS [{}]",
@@ -3182,8 +3227,11 @@ fn render_node_contract(
             format_writer_aggregates(&target.partial_aggregates)
         )),
         NodeKind::TableFinish(spec) => lines.push(format_args!(
-            "{pad}  targets=[{}], input-schema={}, output-schema={}, final-aggregates=[{}], grouped-unpivot={}",
+            "{pad}  targets=[{}], count-mode={}, writer-results-input={}, logical-summary-input={:?}, input-schema={}, output-schema={}, final-aggregates=[{}], grouped-unpivot={}",
             joined(&spec.expected_target_ordinals, ", ", |ordinal: &WriteTargetOrdinal, formatter: &mut fmt::Formatter<'_>| ordinal.get().fmt(formatter)),
+            finish_count_mode_name(spec.count_mode),
+            spec.inputs.writer_results,
+            spec.inputs.logical_summary,
             format_writer_schema(&spec.input_schema),
             format_writer_schema(&spec.output_schema),
             format_writer_aggregates(&spec.final_aggregates),

@@ -947,7 +947,7 @@ mod tests {
                 .iter()
                 .any(
                     |column| column.name.eq_ignore_ascii_case(ImvActionColumn::NAME)
-                        && column.data_type == DataType::Int8
+                        && column.data_type == DataType::Int32
                         && !column.nullable
                 ),
             "delta scan table metadata must expose the action pseudo-column for codegen"

@@ -78,6 +78,15 @@ fn render_tree_with_budget_observed(
             if context.detailed() {
                 out.push(format_args!("PLAN FRAGMENT {display_id}"))?;
                 out.push(format_args!("  OUTPUT EXPRS: *"))?;
+                out.push(format_args!(
+                    "  STAGE PLACEMENT: {}",
+                    super::completed::StagePlacementDisplay(fragment.stage_placement())
+                ))?;
+                let dop = fragment.dop_domain();
+                out.push(format_args!(
+                    "  DRIVER DOMAIN: min={}, max={}, power-of-two={}",
+                    dop.min, dop.max, dop.requires_power_of_two
+                ))?;
                 let distribution = fragment
                     .nodes()
                     .get(&fragment.root())
@@ -607,10 +616,13 @@ impl<'a> TreeContext<'a> {
                     self.render_edge_sink(*edge, out)?;
                 }
             }
-            FragmentSink::Router { routes, .. } => {
+            FragmentSink::Router {
+                routes, summary, ..
+            } => {
                 for route in routes.iter() {
                     self.render_edge_sink(route.edge, out)?;
                 }
+                self.render_edge_sink(summary.edge, out)?;
             }
             FragmentSink::Result | FragmentSink::RootResult(_) | FragmentSink::Noop => {}
         }
@@ -626,6 +638,25 @@ impl<'a> TreeContext<'a> {
             return Ok(());
         };
         out.push(format_args!("  STREAM DATA SINK"))?;
+        match edge.role {
+            novarocks_physical_plan::OutputRole::Relational => {}
+            novarocks_physical_plan::OutputRole::ProviderRoute { target } => {
+                out.push(format_args!(
+                    "    ROLE: provider-route(target={})",
+                    target.get()
+                ))?;
+            }
+            novarocks_physical_plan::OutputRole::LogicalSummary => {
+                out.push(format_args!(
+                    "    ROLE: logical-summary(inserted, replaced, deleted)"
+                ))?;
+            }
+            novarocks_physical_plan::OutputRole::WriterResults => {
+                out.push(format_args!(
+                    "    ROLE: writer-results(physical-received-rows, commit-fragments)"
+                ))?;
+            }
+        }
         out.push(format_args!(
             "    EXCHANGE ID: {}",
             self.display_id(edge.destination.fragment, edge.destination.node)
@@ -1507,8 +1538,12 @@ impl TreeContext<'_> {
             NodeKind::TableWriter { .. } => {
                 out.push(format_args!("{prefix}TABLE WRITER{stats}"))?;
             }
-            NodeKind::TableFinish(_) => {
+            NodeKind::TableFinish(spec) => {
                 out.push(format_args!("{prefix}TABLE FINISH{stats}"))?;
+                out.push(format_args!(
+                    "{pad}  count mode: {}",
+                    super::completed::finish_count_mode_name(spec.count_mode)
+                ))?;
             }
         }
         Ok(())

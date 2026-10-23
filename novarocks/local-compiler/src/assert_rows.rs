@@ -34,10 +34,11 @@ pub(crate) fn lower_assert_rows(
     child: ProgramNodeId,
     layout: &StaticLayout,
     key_slots: &[SlotId],
+    applicability: novarocks_local_program::ProgramAssertionApplicability,
     control: &dyn PureCompileControl,
 ) -> Result<(ProgramNodeKind, StaticLayout), FragmentCompileError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core(node, child, layout, key_slots, &mut work);
+    let result = lower_core(node, child, layout, key_slots, applicability, &mut work);
     if matches!(&result, Err(FragmentCompileError::Control(_))) {
         return result;
     }
@@ -50,6 +51,7 @@ fn lower_core(
     child: ProgramNodeId,
     layout: &StaticLayout,
     key_slots: &[SlotId],
+    applicability: novarocks_local_program::ProgramAssertionApplicability,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(ProgramNodeKind, StaticLayout), FragmentCompileError> {
     let NodeKind::AssertOneRow(spec) = &node.kind else {
@@ -57,25 +59,15 @@ fn lower_core(
             "row assertion source kind differs",
         ));
     };
-    if matches!(
-        spec,
-        RowCountAssertionSpec::PerKeyAtMostOne {
-            applicability: novarocks_physical_plan::AssertionApplicability::WhenTrue(_),
-            ..
-        }
-    ) {
-        return Err(FragmentCompileError::Unsupported {
-            node: Some(node.id),
-            feature: "conditional keyed assertion",
-        });
-    }
     let mode = match spec {
         RowCountAssertionSpec::Global {
             subject,
             desired_rows,
             comparison,
         } => {
-            let valid = !subject.is_empty() && key_slots.is_empty();
+            let valid = !subject.is_empty()
+                && key_slots.is_empty()
+                && applicability == novarocks_local_program::ProgramAssertionApplicability::AllRows;
             let desired = usize::try_from(*desired_rows);
             let assertion = match comparison {
                 RowCountAssertion::Eq => RowAssertion::Eq,
@@ -104,9 +96,20 @@ fn lower_core(
             keys,
             labels,
             message,
-            ..
+            applicability: source_applicability,
         } => {
-            let valid = !keys.is_empty()
+            let same_applicability = matches!(
+                (source_applicability, applicability),
+                (
+                    novarocks_physical_plan::AssertionApplicability::AllRows,
+                    novarocks_local_program::ProgramAssertionApplicability::AllRows
+                ) | (
+                    novarocks_physical_plan::AssertionApplicability::WhenTrue(_),
+                    novarocks_local_program::ProgramAssertionApplicability::WhenTrue(_)
+                )
+            );
+            let valid = same_applicability
+                && !keys.is_empty()
                 && keys.len() == key_slots.len()
                 && keys.len() == labels.len()
                 && !message.is_empty();
@@ -134,7 +137,7 @@ fn lower_core(
                 work.step()?;
             }
             AssertRowsMode::PerKeyAtMostOne {
-                applicability: novarocks_local_program::ProgramAssertionApplicability::AllRows,
+                applicability,
                 key_slots: copied_slots,
                 key_labels: copied_labels,
                 message_prefix: copy_text(message, work)?,

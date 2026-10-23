@@ -410,7 +410,7 @@ mod tests {
                 .iter()
                 .any(
                     |column| column.name.eq_ignore_ascii_case(ImvActionColumn::NAME)
-                        && column.data_type == DataType::Int8
+                        && column.data_type == DataType::Int32
                         && !column.nullable
                 ),
             "bound delta scan table metadata must expose the action pseudo-column for codegen"
@@ -483,7 +483,7 @@ mod tests {
             .filter(|column| column.name.eq_ignore_ascii_case(ImvActionColumn::NAME))
             .collect::<Vec<_>>();
         assert_eq!(metadata_actions.len(), 1);
-        assert_eq!(metadata_actions[0].data_type, DataType::Int8);
+        assert_eq!(metadata_actions[0].data_type, DataType::Int32);
         assert!(!metadata_actions[0].nullable);
     }
 

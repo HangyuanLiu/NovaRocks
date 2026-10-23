@@ -134,6 +134,9 @@ fn options() -> LocalCompileOptions {
 enum Shape {
     Global(RowCountAssertion, u64),
     Keyed(usize),
+    Conditional,
+    ForeignMask,
+    WrongMaskType,
     EmptySubject,
     EmptyKeys,
     EmptyLabel,
@@ -217,7 +220,14 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
         ordinal: 1,
     };
     let integer = FunctionValueType::new(DataType::Int64, false);
-    let text = FunctionValueType::new(DataType::Utf8, true);
+    let text = FunctionValueType::new(
+        if matches!(shape, Shape::Conditional | Shape::ForeignMask) {
+            DataType::Boolean
+        } else {
+            DataType::Utf8
+        },
+        true,
+    );
     let initial_values = project(
         &mut builder,
         initial,
@@ -302,7 +312,15 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
                 labels.pop();
             }
             RowCountAssertionSpec::PerKeyAtMostOne {
-                applicability: novarocks_physical_plan::AssertionApplicability::AllRows,
+                applicability: match shape {
+                    Shape::Conditional | Shape::WrongMaskType => {
+                        novarocks_physical_plan::AssertionApplicability::WhenTrue(child[3])
+                    }
+                    Shape::ForeignMask => {
+                        novarocks_physical_plan::AssertionApplicability::WhenTrue(initial_values[2])
+                    }
+                    _ => novarocks_physical_plan::AssertionApplicability::AllRows,
+                },
                 keys: keys.into_boxed_slice(),
                 labels: labels.into_boxed_slice(),
                 message: if matches!(shape, Shape::EmptyMessage) {
@@ -336,7 +354,11 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
         FragmentSink::Result,
         PipelineDopDomain {
             min: 1,
-            max: 1,
+            max: if matches!(shape, Shape::Conditional) {
+                4
+            } else {
+                1
+            },
             requires_power_of_two: false,
         },
         PlanLimits::FROZEN,
@@ -802,6 +824,7 @@ fn assert_rows_leaf_ordinary_shape_tail_and_unrepresentable_reservation_keep_ori
             ProgramNodeId::new(2),
             layout,
             &[SlotId::new(0)],
+            novarocks_local_program::ProgramAssertionApplicability::AllRows,
             control,
         )
     };
@@ -866,4 +889,53 @@ fn assert_rows_leaf_ordinary_shape_tail_and_unrepresentable_reservation_keep_ori
             (CompilePhase::LowerProgram, 1)
         ]
     );
+}
+
+#[test]
+fn conditional_assertion_keeps_the_exact_nullable_child_mask_at_parallel_width() {
+    let source = fixture(Shape::Conditional, false).unwrap();
+    let providers =
+        PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &Control).unwrap();
+    let checked =
+        validate_fragment_providers(source.package.clone(), &providers, &Control).unwrap();
+    let mut selected = options();
+    selected.pipeline_dop = NonZeroUsize::new(4).unwrap();
+    let program = compile_fragment(checked, &functions(), selected, &Control)
+        .expect("keyed assertion admits the exact parallel mask");
+    assert_eq!(program.graph().profile().pipeline_dop().get(), 4);
+    let assertion = &program.graph().nodes()[program.graph().root().index()];
+    let ProgramNodeKind::AssertNumRows {
+        input,
+        mode:
+            AssertRowsMode::PerKeyAtMostOne {
+                applicability,
+                key_slots,
+                ..
+            },
+    } = assertion.kind()
+    else {
+        panic!("keyed assertion")
+    };
+    let child = program.graph().nodes()[input.index()].output_layout();
+    assert_eq!(
+        *applicability,
+        novarocks_local_program::ProgramAssertionApplicability::WhenTrue(child.slots()[3])
+    );
+    assert_eq!(child.schema().field(3).data_type(), &DataType::Boolean);
+    assert!(child.schema().field(3).is_nullable());
+    assert_eq!(
+        key_slots,
+        &vec![
+            child.slots()[2],
+            child.slots()[0],
+            child.slots()[3],
+            child.slots()[0]
+        ]
+    );
+    for shape in [Shape::ForeignMask, Shape::WrongMaskType] {
+        assert!(
+            fixture(shape, false).is_err(),
+            "same-shaped foreign or non-Boolean masks never become a local program"
+        );
+    }
 }

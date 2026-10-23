@@ -163,7 +163,6 @@ fn incremental_change_stream_routes(
             accepted_effects: route.accepted_effects().to_vec(),
             input_ordinals: route.input_ordinals().to_vec(),
             requirements: route.requirements().clone(),
-            partition_input_tokens: route.partition_fields().to_vec(),
             sink,
         });
     }

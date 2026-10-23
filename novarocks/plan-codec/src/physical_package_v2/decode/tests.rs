@@ -17,7 +17,8 @@
 
 use super::*;
 use crate::physical_package_v2::definition_sources::tests::{
-    cv_package, rich_package, values_package, writer_constant_package, writer_finish_package,
+    change_stream_packages, cv_package, repeated_change_stream_packages, rich_package,
+    values_package, writer_constant_package, writer_finish_package,
 };
 use crate::physical_package_v2::encode::{PackageEncodeError, encode_fragment_package};
 use crate::physical_package_v2::provider_sources::tests::checked_read;
@@ -53,14 +54,33 @@ fn encode(package: &p::FragmentPackage) -> Result<Vec<u8>, PackageEncodeError> {
     Ok(encode_fragment_package(package, &encode_limits(), &Control::default())?.encode_to_vec())
 }
 fn fixtures() -> Vec<(&'static str, p::FragmentPackage)> {
-    vec![
+    let mut fixtures = vec![
         ("rich", rich_package()),
         ("cv", cv_package()),
         ("writer", writer_constant_package()),
         ("finish", writer_finish_package()),
         ("data-read", checked_read(false)),
         ("metadata-read", checked_read(true)),
-    ]
+    ];
+    for package in change_stream_packages() {
+        let name = match package.fragment().id().get() {
+            1 => "change-stream-writer",
+            2 => "logical-change-finish",
+            3 => "independent-router-summary",
+            _ => panic!("the fixture must have exactly its three declared fragments"),
+        };
+        fixtures.push((name, package));
+    }
+    for package in repeated_change_stream_packages() {
+        let name = match package.fragment().id().get() {
+            1 => "repeated-change-stream-writer",
+            2 => "repeated-logical-change-finish",
+            3 => "repeated-independent-router-summary",
+            _ => unreachable!(),
+        };
+        fixtures.push((name, package));
+    }
+    fixtures
 }
 
 // Lossless and canonical: sender bytes decode through the generated preflight
@@ -74,7 +94,8 @@ fn whole_package_roundtrip_is_byte_identical_through_original_constructors() {
         let decoded =
             decode_fragment_package(&bytes, &model, &decode_limits(), &Control::default())
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert_eq!(decoded.fragment().id(), package.fragment().id(), "{name}");
+        assert_eq!(decoded.fragment(), package.fragment(), "{name}");
+        assert_eq!(decoded.cuts(), package.cuts(), "{name}");
         assert_eq!(
             decoded.fragment().nodes().len(),
             package.fragment().nodes().len(),
@@ -215,6 +236,213 @@ fn mutated(
 fn refused(bytes: &[u8]) -> PackageDecodeError {
     decode_fragment_package(bytes, &model(), &decode_limits(), &Control::default())
         .expect_err("receiver must refuse")
+}
+
+#[test]
+fn change_stream_package_refuses_role_and_cut_downgrades() {
+    let package = change_stream_packages()
+        .into_iter()
+        .find(|package| package.fragment().id().get() == 3)
+        .unwrap();
+    type PackageMutation = fn(&mut wire::FragmentPackage);
+    let cases: [(&str, PackageMutation); 11] = [
+        ("summary uses relational root", |dto| {
+            dto.cuts
+                .as_mut()
+                .unwrap()
+                .outbound
+                .iter_mut()
+                .find(|cut| cut.edge_id == Some(9))
+                .unwrap()
+                .source_port = wire::FragmentOutputPort::Root as i32;
+        }),
+        ("summary permits withdrawal", |dto| {
+            dto.cuts
+                .as_mut()
+                .unwrap()
+                .outbound
+                .iter_mut()
+                .find(|cut| cut.edge_id == Some(9))
+                .unwrap()
+                .delivery = wire::DeliveryRequirement::DemandDriven as i32;
+        }),
+        ("summary payload becomes ordinary relation", |dto| {
+            let cut = dto
+                .cuts
+                .as_mut()
+                .unwrap()
+                .outbound
+                .iter_mut()
+                .find(|cut| cut.edge_id == Some(9))
+                .unwrap();
+            cut.payload = Some(wire::outbound_fragment_cut::Payload::Relational(
+                novarocks_proto_models::physical_control_v2::Empty {},
+            ));
+            cut.source_port = wire::FragmentOutputPort::Root as i32;
+            cut.delivery = wire::DeliveryRequirement::DemandDriven as i32;
+        }),
+        ("summary field type is absent", |dto| {
+            dto.cuts
+                .as_mut()
+                .unwrap()
+                .outbound
+                .iter_mut()
+                .find(|cut| cut.edge_id == Some(9))
+                .unwrap()
+                .projection[0]
+                .value_type_id = None;
+        }),
+        ("summary field uses the Int8 effect type", |dto| {
+            let fragment = dto.fragment.as_ref().unwrap();
+            let Some(wire::fragment_sink::Kind::Router(router)) =
+                &fragment.sink.as_ref().unwrap().kind
+            else {
+                panic!()
+            };
+            let effect_type = fragment
+                .values
+                .iter()
+                .find(|value| Some(value.id) == router.effect_value_id)
+                .unwrap()
+                .value_type_id;
+            dto.cuts
+                .as_mut()
+                .unwrap()
+                .outbound
+                .iter_mut()
+                .find(|cut| cut.edge_id == Some(9))
+                .unwrap()
+                .projection[0]
+                .value_type_id = effect_type;
+        }),
+        ("summary aliases two destination declarations", |dto| {
+            let cut = dto
+                .cuts
+                .as_mut()
+                .unwrap()
+                .outbound
+                .iter_mut()
+                .find(|cut| cut.edge_id == Some(9))
+                .unwrap();
+            cut.destination_imports[1].destination_value_id =
+                cut.destination_imports[0].destination_value_id;
+        }),
+        ("missing mandatory stage policy", |dto| {
+            dto.fragment.as_mut().unwrap().stage_placement = None;
+        }),
+        ("zero explicit stage cap", |dto| {
+            dto.fragment
+                .as_mut()
+                .unwrap()
+                .stage_placement
+                .as_mut()
+                .unwrap()
+                .kind = Some(wire::stage_placement_policy::Kind::Spread(
+                wire::SpreadStagePlacement {
+                    max_instances: Some(0),
+                },
+            ));
+        }),
+        ("missing independent summary", |dto| {
+            let Some(wire::fragment_sink::Kind::Router(router)) =
+                &mut dto.fragment.as_mut().unwrap().sink.as_mut().unwrap().kind
+            else {
+                panic!()
+            };
+            router.summary = None;
+        }),
+        ("missing colocation declaration", |dto| {
+            let Some(wire::fragment_sink::Kind::Router(router)) =
+                &mut dto.fragment.as_mut().unwrap().sink.as_mut().unwrap().kind
+            else {
+                panic!()
+            };
+            router.routes[0].requirements.as_mut().unwrap().colocation = None;
+        }),
+        ("missing layout declaration", |dto| {
+            let Some(wire::fragment_sink::Kind::Router(router)) =
+                &mut dto.fragment.as_mut().unwrap().sink.as_mut().unwrap().kind
+            else {
+                panic!()
+            };
+            router.routes[0].requirements.as_mut().unwrap().layout = None;
+        }),
+    ];
+    for (name, change) in cases {
+        let error = refused(&mutated(&package, change));
+        assert!(
+            !matches!(error, PackageDecodeError::Control(_)),
+            "{name}: malformed contracts must not become control/capacity failures: {error}"
+        );
+    }
+}
+
+#[test]
+fn logical_finish_package_requires_both_distinct_role_inputs() {
+    let package = change_stream_packages()
+        .into_iter()
+        .find(|package| package.fragment().id().get() == 2)
+        .unwrap();
+    for case in 0..5 {
+        let bytes = mutated(&package, |dto| {
+            let finish = dto
+                .fragment
+                .as_mut()
+                .unwrap()
+                .nodes
+                .iter_mut()
+                .find_map(|node| match &mut node.kind {
+                    Some(wire::physical_node::Kind::TableFinish(finish)) => Some(finish),
+                    _ => None,
+                })
+                .unwrap();
+            match case {
+                0 => finish.logical_summary_input = None,
+                1 => finish.logical_summary_input = finish.writer_results_input,
+                2 => finish.logical_summary = None,
+                3 => finish.count_mode = wire::FinishCountMode::WriterReported as i32,
+                4 => {
+                    finish.logical_summary.as_mut().unwrap().deleted_value_id =
+                        finish.logical_summary.as_ref().unwrap().inserted_value_id
+                }
+                _ => unreachable!(),
+            }
+        });
+        let error = refused(&bytes);
+        assert!(
+            !matches!(error, PackageDecodeError::Control(_)),
+            "case {case}: {error}"
+        );
+    }
+}
+
+#[test]
+fn change_stream_receiver_preserves_each_interrupted_control_prefix() {
+    let model = model();
+    for package in change_stream_packages() {
+        let bytes = encode(&package).unwrap();
+        let control = Control::default();
+        decode_fragment_package(&bytes, &model, &decode_limits(), &control).unwrap();
+        let trace = control.trace.lock().unwrap().clone();
+        assert!(trace.len() > 2);
+        for at in [0, trace.len() / 2, trace.len() - 1] {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let stop = Control {
+                    stop: Some((at, cause.clone())),
+                    ..Default::default()
+                };
+                assert!(
+                    matches!(decode_fragment_package(&bytes, &model, &decode_limits(), &stop),
+                    Err(PackageDecodeError::Control(actual)) if actual == cause)
+                );
+                assert_eq!(*stop.trace.lock().unwrap(), trace[..=at]);
+            }
+        }
+    }
 }
 
 #[test]

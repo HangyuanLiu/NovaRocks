@@ -1357,6 +1357,15 @@ fn a_row_mutation_yields_one_routed_target_per_branch() {
     };
     assert_eq!(positions(&sealed.targets()[0]), vec![0, 1]);
     assert_eq!(positions(&sealed.targets()[1]), vec![2, 3]);
+    assert_eq!(
+        sealed.targets()[0]
+            .route()
+            .unwrap()
+            .requirements()
+            .colocation,
+        novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
+        "an after-image route has no old-file ownership requirement"
+    );
 }
 
 #[test]
@@ -1385,13 +1394,28 @@ fn a_delete_only_row_mutation_seals_one_routed_delete_branch() {
         effects(&sealed.targets()[0]),
         vec![ConnectorRowMutationEffect::Delete]
     );
+    let route = sealed.targets()[0].route().expect("routed");
+    let file_token = route.input_ordinals()[0].token();
     assert_eq!(
-        sealed.targets()[0]
-            .route()
-            .expect("routed")
-            .partition_fields()
-            .len(),
-        1
+        route.requirements().colocation,
+        novarocks_spi::connector::write_stack::ConnectorWriteColocation::ByKey(vec![file_token])
+    );
+    let ConnectorWriteInputShape::DeletionVector {
+        partition_source_fields,
+        ..
+    } = &material.input
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        route.requirements().layout,
+        novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::ClusterBy(
+            partition_source_fields
+                .iter()
+                .map(|field| field.token())
+                .collect()
+        ),
+        "new partition values are a layout preference independent of old-file ownership"
     );
 }
 
@@ -2643,7 +2667,10 @@ fn a_merge_on_read_delete_branch_partitions_by_the_data_file_it_supersedes() {
         .expect("the row identity carries `_file`")
         .token();
     let delete_route = sealed.targets()[1].route().expect("routed");
-    assert_eq!(delete_route.partition_fields(), &[file_token]);
+    assert_eq!(
+        delete_route.requirements().colocation,
+        novarocks_spi::connector::write_stack::ConnectorWriteColocation::ByKey(vec![file_token])
+    );
     // SQL resolves a partition token through the route's own input ordinals, so
     // a token the branch does not consume would fail to bind.
     assert!(
