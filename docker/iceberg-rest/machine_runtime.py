@@ -23,6 +23,7 @@ import argparse
 from contextlib import contextmanager
 import copy
 import fcntl
+import hashlib
 import importlib.util
 import json
 import math
@@ -31,6 +32,7 @@ from pathlib import Path
 import re
 import secrets
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -524,7 +526,7 @@ class MachineDocker(runtime.Docker):
             raise runtime.RuntimeFailure(code, str(journal))
         return result
 
-    def command(self, args, *, absent_ok=False):
+    def command(self, args, *, absent_ok=False, catalog_removal=None):
         readonly = args[0] in {"ps", "info", "inspect", "version"} or "inspect" in args[:2] or args[:2] == ["context", "show"]
         deadline = min(time.monotonic() + self.timeout,
                        getattr(self, "operation_deadline", None) or float("inf"))
@@ -547,6 +549,10 @@ class MachineDocker(runtime.Docker):
             state = runtime.read_json(state_path)
             if state.get("phase") == "maintenance":
                 fact.update(maintenance_generation=state["generation"], maintenance_version=state["version"])
+        if catalog_removal is not None:
+            if readonly or not fact.get("maintenance_generation"):
+                raise runtime.RuntimeFailure("MaintenanceLockRequired", "catalog removal requires a saved maintenance intent")
+            fact["catalog_removal"] = copy.deepcopy(catalog_removal)
         runtime.atomic_json(journal, fact)
         result = self._supervise(journal, dict(operation="control", environment=self.environment,
             args=args, deadline_monotonic=deadline), timeout)
@@ -658,6 +664,114 @@ class MachineDocker(runtime.Docker):
         runtime.atomic_json(path, fact)
         return True
 
+    @staticmethod
+    def _terminal_material(path):
+        """Read a bounded, owned regular file without following a replacement."""
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            before = os.fstat(descriptor)
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                    or before.st_mode & 0o022 or before.st_size > 1024 * 1024):
+                raise ValueError("untrusted terminal material")
+            content = bytearray()
+            while len(content) <= 1024 * 1024:
+                block = os.read(descriptor, min(65536, 1024 * 1024 + 1 - len(content)))
+                if not block:
+                    break
+                content.extend(block)
+            after, named = os.fstat(descriptor), os.stat(path, follow_symlinks=False)
+            identity = lambda value: (value.st_dev, value.st_ino, value.st_size,
+                                      value.st_mtime_ns, value.st_ctime_ns)
+            if (len(content) != before.st_size or identity(before) != identity(after)
+                    or identity(before) != identity(named)):
+                raise ValueError("terminal material changed")
+            return bytes(content), identity(before)
+        finally:
+            os.close(descriptor)
+
+    def reconcile_terminal_catalog_refusal(self, path, fact, base):
+        # A complete refusal settles this one request as FAIL. It grants no
+        # catalog barrier, deletion, replay of an unknown call, or ready state.
+        base, path = Path(base), Path(path)
+        if (getattr(self, "maintenance_fd", None) is None
+                or Path(getattr(self, "maintenance_base", "")) != base
+                or base.is_symlink() or (base / "operations").is_symlink()
+                or path.parent != base / "operations"
+                or type(fact.get("schema")) is not int or fact["schema"] != 1
+                or fact.get("kind") != "control" or fact.get("phase") != "command-unknown"
+                or fact.get("mutating") is not True
+                or type(fact.get("command_exit")) is not int or fact["command_exit"] != 1
+                or fact.get("timed_out") is not False or fact.get("interrupted") is not False
+                or fact.get("command_succeeded") is not False
+                or not all(isinstance(fact.get(key), str) and fact[key] for key in
+                           ("maintenance_generation", "maintenance_version"))
+                or type(fact.get("cli_pid")) is not int or fact["cli_pid"] <= 0
+                or not all(fact.get(key) is True for key in ("command_dispatched", "leader_waited",
+                    "group_exit_confirmed", "group_exit_observed"))
+                or any(key in fact for key in ("error", "cleanup_error", "cleanup_failed",
+                    "leader_observation_error", "group_observation_error"))
+                or fact.get("control_root") != str(base.parent) or fact.get("machine") != base.name):
+            return False
+        files = {"fact": path, "request": path.with_suffix(".request"), "state": base / "state.json",
+                 "stdout": path.with_suffix(".stdout"),
+                 "stderr": Path(str(path.with_suffix(".stdout")) + ".stderr")}
+        try:
+            materials = {key: self._terminal_material(value) for key, value in files.items()}
+            original = json.loads(materials["fact"][0])
+            request, state = (json.loads(materials[key][0]) for key in ("request", "state"))
+            purpose = fact.get("catalog_removal", {})
+            old = state.get("fenced_store", {})
+            steps = state.get("steps", {})
+            name = purpose.get("volume", {}).get("Name")
+            if (original != fact or request.get("operation") != "control"
+                    or request.get("environment") != self.environment
+                    or request.get("args") != ["volume", "rm", name]
+                    or name not in {PROJECT + "_rest-catalog", PROJECT + "_rest-mv-catalog"}
+                    or state.get("phase") != "maintenance"
+                    or state.get("generation") != fact.get("maintenance_generation")
+                    or state.get("version") != fact.get("maintenance_version")
+                    or type(state.get("schema")) is not int or state["schema"] != PROTOCOL
+                    or not state.get("previous") or not old
+                    or not all(steps.get(key) is True for key in ("writers_stopped", "root_rotated", "root_fenced"))
+                    or any(steps.get(key) for key in ("rest_removed", "purged", "activation_started"))
+                    or purpose.get("source_generation") != old.get("generation")
+                    or purpose.get("source_version") != old.get("version")
+                    or old.get("kind") != "machine" or old.get("namespace") != base.name
+                    or old.get("control_root") != str(base.parent)
+                    or state.get("daemon_id") != old.get("daemon_id")
+                    or not old.get("daemon_id") or materials["stdout"][0] != b""):
+                return False
+            refusal = re.fullmatch(r"Error response from daemon: remove " + re.escape(name)
+                + r": volume is in use - \[([0-9a-f]{64}(?:, [0-9a-f]{64})*)\](?:\r?\n)?",
+                materials["stderr"][0].decode("utf-8"))
+            if refusal is None:
+                return False
+            # Recheck the exact partially completed source activation. Absence
+            # alone never settles the original request, and replacement fails.
+            if self.daemon_id() != old["daemon_id"]:
+                raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "catalog refusal belongs to another daemon")
+            self.validate_resources(old)
+            volume = self.inspect("volume", name, absent_ok=True)
+            if not volume or self._catalog_volume_identity(volume) != purpose["volume"]:
+                return False
+            if any(volume.get("Labels", {}).get(key) != value for key, value in self.labels(old).items()):
+                return False
+            if any(self._terminal_material(files[key]) != value for key, value in materials.items()):
+                return False
+        except (OSError, ValueError, UnicodeError, KeyError, TypeError, AttributeError):
+            return False
+        fact.update(phase="settled", command_succeeded=False,
+                    terminal_failure="daemon-catalog-volume-in-use",
+                    reconciled_same_maintenance_intent=True,
+                    terminal_evidence={key: hashlib.sha256(value[0]).hexdigest()
+                                       for key, value in materials.items()})
+        runtime.atomic_json(path, fact)
+        return True
+
+    @staticmethod
+    def _catalog_volume_identity(volume):
+        return {key: volume[key] for key in ("Name", "Driver", "Scope", "Options", "Labels", "CreatedAt")}
+
     def settle_operations(self, base):
         for path, fact in self.unsettled_operations(base):
             if fact.get("kind") == "control":
@@ -668,6 +782,8 @@ class MachineDocker(runtime.Docker):
                     runtime.atomic_json(path, fact)
                     continue
                 if self.reconcile_terminal_port_failure(path, fact, base):
+                    continue
+                if self.reconcile_terminal_catalog_refusal(path, fact, base):
                     continue
                 # No CLI completion fact survives a killed supervisor. A
                 # timeout is equally insufficient to authorize a later ready.
@@ -718,7 +834,9 @@ class MachineDocker(runtime.Docker):
             if volume:
                 if any(volume.get("Labels", {}).get(k) != v for k, v in self.labels(record).items()):
                     raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "foreign REST state volume")
-                self.command(["volume", "rm", name])
+                self.command(["volume", "rm", name], catalog_removal=dict(
+                    source_generation=record["generation"], source_version=record["version"],
+                    volume=self._catalog_volume_identity(volume)))
         for service in ("rest", "rest-mv"):
             record.get("containers", {}).pop(service, None)
         return self.rest_state_barrier(record)
