@@ -632,7 +632,7 @@ mod tests {
             assert_eq!(
                 input.site(),
                 novarocks_query_application::execution_error::ExecutionFailureSite::Task {
-                    identity: identity,
+                    identity,
                     phase: novarocks_execution_contract::TaskFailurePhase::Preparation
                 }
             );

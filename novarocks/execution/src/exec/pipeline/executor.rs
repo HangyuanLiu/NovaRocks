@@ -409,7 +409,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler_and_sche
         })?;
     let execution_runtime = runtime_state
         .execution_runtime()
-        .ok_or({ crate::runtime::runtime_state::RuntimeBindingFailure::MissingExecutionRuntime })?;
+        .ok_or(crate::runtime::runtime_state::RuntimeBindingFailure::MissingExecutionRuntime)?;
     let ordered = CompiledOrderedFilterContext::for_program(&program, &runtime_state)?;
     let graph = build_compiled_pipeline_graph_typed(
         &program,
