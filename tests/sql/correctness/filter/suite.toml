@@ -19,6 +19,7 @@ explicit_only = false
 
 [impact]
 paths = [
+    "novarocks/value-arrays/**",
     "novarocks/functions/src/comparison.rs",
     "novarocks/functions/src/logical_null.rs",
     "novarocks/functions/src/native_between.rs",
