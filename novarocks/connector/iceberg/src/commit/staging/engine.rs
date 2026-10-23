@@ -30,6 +30,10 @@ use crate::iceberg::{Error, ErrorKind, Result, TableIdent, TableRequirement, Tab
 use async_trait::async_trait;
 use novarocks_spi::connector::{ConnectorOperationControl, ConnectorRequestContext};
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The metadata snapshot is moved directly into staging; boxing it would add an allocation without avoiding a copy"
+)]
 #[derive(Clone)]
 pub enum StagingBase {
     Existing {
@@ -236,7 +240,7 @@ impl StagingState {
             base: self.identity,
             requirements: self.requirements,
             updates: self.updates,
-            artifacts: artifacts,
+            artifacts,
         })?
         .with_base_facts(&self.base)
     }
@@ -296,7 +300,6 @@ impl<'a> StagingEngine<'a> {
 
 /// Freeze an existing-table metadata/ref change through canonical staging.
 /// This capability owns no FileIO and cannot allocate or adopt any artifact.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn freeze_existing_change(
     target: TableIdent,
     target_ref: &str,

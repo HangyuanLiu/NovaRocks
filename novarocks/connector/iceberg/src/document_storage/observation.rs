@@ -25,8 +25,16 @@ use novarocks_spi::connector::{
 #[serde(deny_unknown_fields)]
 struct CommittedVersionV1 {
     version: u16,
+    #[expect(
+        dead_code,
+        reason = "The versioned observation payload keeps the table UUID as an identity fact for downstream decoders."
+    )]
     table_uuid: String,
     metadata_location: Option<String>,
+    #[expect(
+        dead_code,
+        reason = "The versioned observation payload keeps the metadata update time as a committed-version fact."
+    )]
     last_updated_ms: i64,
     current_snapshot_id: Option<i64>,
 }

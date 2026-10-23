@@ -85,12 +85,12 @@ impl crate::commit::staging::Preparer for RowDeltaPreparer {
                             .into(),
                     )),
                 };
-            if let Some(path) = file.referenced_data_file() {
-                if !live.contains_key(&EntryIdentity::DataFile { path: path.clone() }) {
-                    return Err(to_iceberg_unexpected(format!(
-                        "Position delete references absent data file {path}"
-                    )));
-                }
+            if let Some(path) = file.referenced_data_file()
+                && !live.contains_key(&EntryIdentity::DataFile { path: path.clone() })
+            {
+                return Err(to_iceberg_unexpected(format!(
+                    "Position delete references absent data file {path}"
+                )));
             }
             counts[idx] += 1;
             records[idx] = records[idx]

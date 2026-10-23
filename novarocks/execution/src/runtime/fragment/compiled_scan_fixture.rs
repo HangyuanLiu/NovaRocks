@@ -50,10 +50,10 @@ use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, DecimalOverflowPolicy,
     EvaluationDemand, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
     ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, PureCompileControl,
-    ValueLogicalType, control_argument_semantics,
+    control_argument_semantics,
 };
 
-use crate::exec::chunk::{Chunk, ChunkSchema};
+use crate::exec::chunk::Chunk;
 use crate::exec::node::scan::{
     BoundScanRanges, ScanChunkStream, ScanOp, ScanOutputStream, ScanSource, ScanStreamSource,
 };
@@ -107,11 +107,6 @@ fn payload(
     )
 }
 
-/// The provider's own projected fields: names, field ids and schema metadata
-/// are provider facts the compiled scan layout keeps exactly.
-fn public_schema() -> Schema {
-    public_schema_with_types(&[int64(), int64()])
-}
 fn public_schema_with_types(types: &[ValueType]) -> Schema {
     Schema::new_with_metadata(
         ["v0", "v1"]

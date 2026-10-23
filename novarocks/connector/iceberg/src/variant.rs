@@ -145,7 +145,6 @@ mod tests {
     /// Build the canonical 5-row test column from JSON, optionally shredded
     /// on path `a` as Int64. Rows: shredded int, shredded int, missing `a`,
     /// wrong-typed `a`, SQL NULL.
-
     fn test_variant_struct(shredded: bool) -> ArrayRef {
         variant_struct_from_json(
             shredded,
@@ -168,7 +167,6 @@ mod tests {
 
     /// Extract the string content of `$.a` when the sub-value is a variant string.
     /// Returns `None` when `$.a` is absent or is not a string (e.g. an int).
-
     fn get_a_str(serialized: &[u8]) -> Option<String> {
         let v = VariantValue::from_serialized(serialized).ok()?;
         let path = parse_variant_path("$.a").ok()?;

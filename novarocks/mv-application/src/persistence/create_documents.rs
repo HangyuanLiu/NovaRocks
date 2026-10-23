@@ -192,9 +192,9 @@ fn target_observations(
         .collect()
 }
 
-fn target_by_name<'a>(
-    fields: &'a [MvCreateTargetFieldObservation],
-) -> Result<BTreeMap<&'a str, &'a MvCreateTargetFieldObservation>, String> {
+fn target_by_name(
+    fields: &[MvCreateTargetFieldObservation],
+) -> Result<BTreeMap<&str, &MvCreateTargetFieldObservation>, String> {
     let mut result = BTreeMap::new();
     for field in fields {
         if result.insert(field.physical_name.as_str(), field).is_some() {

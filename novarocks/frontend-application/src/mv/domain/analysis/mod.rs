@@ -17,7 +17,6 @@
 
 //! Materialized-view query-analysis vocabulary and pure staged contract.
 
-pub mod rebind;
 pub mod refresh_property;
 use std::collections::HashSet;
 

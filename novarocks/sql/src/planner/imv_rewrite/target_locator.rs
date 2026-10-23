@@ -314,10 +314,6 @@ fn build_target_locator_join(
     ))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Locator scan output binds several independently validated target and sequence identities."
-)]
 fn build_target_locator_scan(
     ext: &ImvExtension,
     input: &LocatorJoinInput,
@@ -417,7 +413,7 @@ fn build_target_locator_scan(
     ));
 
     Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Scan(PlanScanNode {
+        LogicalPlanKind::scan(PlanScanNode {
             database: target.namespace.clone(),
             table: TableDef {
                 name: target.table.clone(),

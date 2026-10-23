@@ -626,22 +626,12 @@ struct NativeTrustConfigWire {
 
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 struct NativeTrustTransportConfigWire {
     mode: Option<String>,
     certificate_chain_path: Option<PathBuf>,
     private_key_path: Option<PathBuf>,
     trust_roots_path: Option<PathBuf>,
-}
-
-impl Default for NativeTrustTransportConfigWire {
-    fn default() -> Self {
-        Self {
-            mode: None,
-            certificate_chain_path: None,
-            private_key_path: None,
-            trust_roots_path: None,
-        }
-    }
 }
 
 fn deserialize_native_trust_config<'de, D>(
@@ -3148,8 +3138,10 @@ mod tests {
 
     #[test]
     fn query_blocking_config_derives_workers_and_rejects_zero_queue() {
-        let mut runtime = RuntimeConfig::default();
-        runtime.pipeline_exec_thread_pool_thread_num = 3;
+        let mut runtime = RuntimeConfig {
+            pipeline_exec_thread_pool_thread_num: 3,
+            ..RuntimeConfig::default()
+        };
         assert_eq!(runtime.actual_query_blocking_workers(), 3);
         validate_query_blocking_config(&runtime).expect("derived workers and queue are valid");
 
@@ -3898,19 +3890,25 @@ access_key_secret = ""
 
     #[test]
     fn catalog_materialization_config_rejects_invalid_bounds() {
-        let mut runtime = RuntimeConfig::default();
-        runtime.catalog_materialization_retry_initial_backoff_ms = 5_001;
+        let runtime = RuntimeConfig {
+            catalog_materialization_retry_initial_backoff_ms: 5_001,
+            ..RuntimeConfig::default()
+        };
         assert!(validate_query_control_config(&runtime).is_err());
 
-        let mut runtime = RuntimeConfig::default();
-        runtime.catalog_bind_provider_max_concurrent = 0;
+        let runtime = RuntimeConfig {
+            catalog_bind_provider_max_concurrent: 0,
+            ..RuntimeConfig::default()
+        };
         assert!(validate_query_control_config(&runtime).is_err());
     }
 
     #[test]
     fn query_control_config_rejects_invalid_task_update_retry_relationships() {
-        let mut runtime = RuntimeConfig::default();
-        runtime.query_control_task_update_retry_initial_backoff_ms = 1_001;
+        let runtime = RuntimeConfig {
+            query_control_task_update_retry_initial_backoff_ms: 1_001,
+            ..RuntimeConfig::default()
+        };
         let error = validate_query_control_config(&runtime)
             .expect_err("initial backoff above max must fail");
         assert!(
@@ -3919,8 +3917,10 @@ access_key_secret = ""
                 .contains("query_control_task_update_retry_initial_backoff_ms")
         );
 
-        let mut runtime = RuntimeConfig::default();
-        runtime.query_control_task_update_rpc_timeout_ms = 30_001;
+        let runtime = RuntimeConfig {
+            query_control_task_update_rpc_timeout_ms: 30_001,
+            ..RuntimeConfig::default()
+        };
         let error = validate_query_control_config(&runtime)
             .expect_err("rpc timeout above retry duration must fail");
         assert!(
@@ -3929,8 +3929,10 @@ access_key_secret = ""
                 .contains("query_control_task_update_rpc_timeout_ms")
         );
 
-        let mut runtime = RuntimeConfig::default();
-        runtime.query_control_task_update_retry_max_backoff_ms = 30_001;
+        let runtime = RuntimeConfig {
+            query_control_task_update_retry_max_backoff_ms: 30_001,
+            ..RuntimeConfig::default()
+        };
         let error = validate_query_control_config(&runtime)
             .expect_err("max backoff above retry duration must fail");
         assert!(
@@ -4321,8 +4323,10 @@ prefetch_progress_bucket_ms = 100
 
     #[test]
     fn scan_io_configuration_rejects_zero_capacity_and_coalesce_size() {
-        let mut runtime = RuntimeConfig::default();
-        runtime.scan_io_max_blocking_threads = 0;
+        let mut runtime = RuntimeConfig {
+            scan_io_max_blocking_threads: 0,
+            ..RuntimeConfig::default()
+        };
         assert!(super::validate_scan_io_config(&runtime).is_err());
         runtime.scan_io_max_blocking_threads = 16;
         runtime.scan_range_process_window = 0;
@@ -4438,8 +4442,10 @@ control_request_max_bytes = 524288
                 .contains("control_running")
         );
 
-        let mut cfg = NativeIngressRuntimeConfig::default();
-        cfg.worker_threads = 0;
+        let cfg = NativeIngressRuntimeConfig {
+            worker_threads: 0,
+            ..NativeIngressRuntimeConfig::default()
+        };
         assert!(
             cfg.validate()
                 .unwrap_err()
@@ -4447,8 +4453,10 @@ control_request_max_bytes = 524288
                 .contains("worker_threads")
         );
 
-        let mut cfg = NativeIngressRuntimeConfig::default();
-        cfg.ordinary_waiting = usize::MAX;
+        let cfg = NativeIngressRuntimeConfig {
+            ordinary_waiting: usize::MAX,
+            ..NativeIngressRuntimeConfig::default()
+        };
         assert!(
             cfg.validate()
                 .unwrap_err()
@@ -4456,9 +4464,11 @@ control_request_max_bytes = 524288
                 .contains("holder count overflows")
         );
 
-        let mut cfg = NativeIngressRuntimeConfig::default();
-        cfg.control_response_max_bytes = usize::MAX;
-        cfg.ordinary_response_max_bytes = usize::MAX;
+        let cfg = NativeIngressRuntimeConfig {
+            control_response_max_bytes: usize::MAX,
+            ordinary_response_max_bytes: usize::MAX,
+            ..NativeIngressRuntimeConfig::default()
+        };
         assert!(
             cfg.validate()
                 .unwrap_err()
@@ -4473,8 +4483,10 @@ control_request_max_bytes = 524288
                 .contains("message caps overflow")
         );
 
-        let mut cfg = NativeIngressRuntimeConfig::default();
-        cfg.ordinary_waiting = usize::MAX / (128 * 1024 * 1024);
+        let cfg = NativeIngressRuntimeConfig {
+            ordinary_waiting: usize::MAX / (128 * 1024 * 1024),
+            ..NativeIngressRuntimeConfig::default()
+        };
         assert!(
             cfg.frame_envelope()
                 .unwrap_err()

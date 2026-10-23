@@ -17,10 +17,8 @@
 
 //! The same exact Task failure before schema and after one visible row.
 
-use super::query_lifecycle::{
-    self,
-    native_sql_controls::{SqlIntentOwner, StatementSpec},
-};
+use super::native_sql_controls::{SqlIntentOwner, StatementSpec};
+use super::query_lifecycle;
 use crate::{
     actors::{
         mysql as mysql_actor,

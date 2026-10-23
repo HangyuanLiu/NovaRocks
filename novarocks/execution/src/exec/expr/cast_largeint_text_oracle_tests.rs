@@ -82,8 +82,8 @@ fn largeint_text_original_v1_all_policy_nullability_min_max_slice_and_empty() {
                         &Control,
                     )
                     .unwrap();
-                    for row in 0..source.len() {
-                        let expected = expected_rows[row]
+                    for (row, expected) in expected_rows.iter().enumerate() {
+                        let expected = expected
                             .map_or(CastRowResult::Null, |text| CastRowResult::Text(text.into()));
                         assert_eq!(
                             r.evaluate_row(EvaluatedArgument::Column(&source), row, row, &Control)

@@ -50,7 +50,6 @@ pub(crate) struct PreparedAddFilesAttempt {
 
 impl DmlService {
     /// Plans an admitted ADD FILES statement without beginning dispatch.
-    #[allow(clippy::result_large_err)]
     pub(crate) fn prepare_add_files(
         &self,
         engine: &dyn AddFilesEngine,
@@ -81,7 +80,6 @@ impl DmlService {
     }
 
     /// Crosses the one-shot provider dispatch boundary for planned ADD FILES.
-    #[allow(clippy::result_large_err)]
     pub(crate) fn execute_prepared_add_files(
         &self,
         engine: &dyn AddFilesEngine,

@@ -18,7 +18,7 @@
 //! A List offset refuses one finite input before any repeated output copy.
 
 use super::execution_failure::{INDEPENDENT_SQL, NEXT_SQL, run_rejection_policy};
-use super::query_lifecycle::native_sql_controls::{SqlIntentOwner, StatementSpec};
+use super::native_sql_controls::{SqlIntentOwner, StatementSpec};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::QueryLifecycleStructuredSnapshot;

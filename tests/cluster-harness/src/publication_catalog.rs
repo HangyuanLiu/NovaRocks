@@ -314,15 +314,15 @@ impl FixtureHandle {
                 status.release.notify_one();
             }
         }
-        if let Some(shutdown) = self.shutdown.take() {
-            if shutdown.send(()).is_err() {
-                failures.push("publication fixture exited before its shutdown request");
-            }
+        if let Some(shutdown) = self.shutdown.take()
+            && shutdown.send(()).is_err()
+        {
+            failures.push("publication fixture exited before its shutdown request");
         }
-        if let Some(thread) = self.thread.take() {
-            if thread.join().is_err() {
-                failures.push("publication fixture owner panicked during actual join");
-            }
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            failures.push("publication fixture owner panicked during actual join");
         }
         if failures.is_empty() {
             Ok(())
@@ -1205,10 +1205,10 @@ mod tests {
             if line == "\r\n" {
                 break;
             }
-            if let Some((name, value)) = line.split_once(':') {
-                if name.eq_ignore_ascii_case("content-length") {
-                    content_length = value.trim().parse::<usize>().unwrap();
-                }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                content_length = value.trim().parse::<usize>().unwrap();
             }
         }
         assert!(

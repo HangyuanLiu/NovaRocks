@@ -360,8 +360,8 @@ fn timestamp_nullability_and_effects_follow_exact_five_null_pairs_and_one_error_
                         );
                         assert_eq!(
                             carrier_cast_can_produce_null(
-                                &ty(from, false).data_type(),
-                                &ty(to, false).data_type(),
+                                ty(from, false).data_type(),
+                                ty(to, false).data_type(),
                                 allow
                             ),
                             null_pair
@@ -613,7 +613,7 @@ fn timestamp_class_source_domain_addresses_and_required_journal_are_checked_befo
     ));
     let required = SelectedValues::try_new(
         Selection::all(2),
-        &ty(TimeUnit::Microsecond, true).data_type(),
+        ty(TimeUnit::Microsecond, true).data_type(),
         array(TimeUnit::Microsecond, vec![None, None]),
         vec![RowDataError::new(1, "required child failed")].into_boxed_slice(),
     )

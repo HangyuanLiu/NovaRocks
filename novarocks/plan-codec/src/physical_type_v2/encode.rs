@@ -43,6 +43,7 @@ use wire::carrier_type_definition::Kind;
 
 type Error = TypeCodecError;
 type HostError<H> = crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>;
+type BorrowedRootBindings<'source> = (Vec<(u32, &'source FunctionValueType)>, Vec<(u32, u32)>);
 use crate::host_projection_v2::{AdmissionRefusal, ProjectionFailure};
 
 /// The only non-strict selector carries an actual checked recipe source.
@@ -554,7 +555,7 @@ fn borrowed_roots<'source, H>(
     writers: &[WriterTypeSource<'source>],
     resources: &mut Option<Admission<'_, H>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(Vec<(u32, &'source FunctionValueType)>, Vec<(u32, u32)>), HostError<H>> {
+) -> Result<BorrowedRootBindings<'source>, HostError<H>> {
     let mut writer_count = 0usize;
     for source in writers {
         work.step()?;
@@ -740,7 +741,7 @@ fn emit_field(
         Some(id) => id,
         None => ids.next(work)?,
     };
-    if table.source_facts.is_some() {
+    if let Some(source_facts) = table.source_facts.as_mut() {
         if projection.id().is_some() {
             return Err(Error::InvalidShape(
                 "source field cannot reference execution identity",
@@ -754,11 +755,7 @@ fn emit_field(
             dictionary_id,
             dictionary_is_ordered: field.dict_is_ordered(),
         };
-        table
-            .source_facts
-            .as_mut()
-            .expect("source emitter has its facts target")
-            .push(facts);
+        source_facts.push(facts);
     }
     table.fields.push(wire::FieldDefinition {
         id,
@@ -1092,8 +1089,6 @@ fn encode_roots<'a, H>(
             context.work,
         )
         .map_err(semantic::failure)?;
-    drop(context);
-    drop(callback);
     work.flush()?;
     let mut ids = FieldIds {
         reserved,

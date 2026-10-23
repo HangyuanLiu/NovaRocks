@@ -23,7 +23,7 @@ use crate::kernel_control::{KernelControlObservation, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::*;
 use allocator_api2::vec::Vec as HostVec;
-use arrow_array::{Array, ArrayRef, BinaryArray, builder::BinaryBuilder};
+use arrow_array::{Array, ArrayRef, BinaryArray};
 use arrow_schema::DataType;
 use std::sync::Arc;
 #[derive(Debug)]
@@ -82,16 +82,18 @@ impl ByKernel {
             .map_err(|_| KernelFailure::ResourceExhausted)?;
         for state in states {
             if values.len() == expected {
-                return Err(internal("max_by/min_by state iterator exceeded its extent").into());
+                return Err(internal("max_by/min_by state iterator exceeded its extent"));
             }
             if state.failed {
-                return Err(KernelFailure::InstanceFailed.into());
+                return Err(KernelFailure::InstanceFailed);
             }
             work.step()?;
             values.push(state.output(work)?);
         }
         if values.len() != expected {
-            return Err(internal("max_by/min_by state iterator shortened its extent").into());
+            return Err(internal(
+                "max_by/min_by state iterator shortened its extent",
+            ));
         }
         scalar::build_scalar_array(self.output_type(), values, work)
     }
@@ -113,7 +115,7 @@ impl ByKernel {
         let value_row = values.value_row(ordinal, row);
         let key_row = keys.value_row(ordinal, row);
         if value_row >= values.array().len() || key_row >= keys.array().len() {
-            return Err(internal("max_by/min_by selected address is out of bounds").into());
+            return Err(internal("max_by/min_by selected address is out of bounds"));
         }
         state.update_from_arrays(
             self.direction,

@@ -129,7 +129,7 @@ pub(super) fn output_capacity(rows: usize) -> Result<(), crate::KernelFailure> {
     array::<Option<i32>>(rows)?;
     array::<i32>(rows)?;
     // The checked Option<i32> extent proves this ceil operation fits usize.
-    array::<u8>((rows / 64 + usize::from(rows % 64 != 0)) * 8)
+    array::<u8>((rows / 64 + usize::from(!rows.is_multiple_of(64))) * 8)
 }
 
 #[cfg(test)]

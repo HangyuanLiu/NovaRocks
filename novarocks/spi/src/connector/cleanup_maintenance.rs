@@ -562,7 +562,6 @@ impl ConnectorCleanupPlan {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn try_restore(
         owner: ConnectorProviderBindingKey,
         operation_id: ConnectorCleanupOperationId,
@@ -692,7 +691,6 @@ pub struct PreparedBatch {
 }
 
 impl PreparedBatch {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         owner: ConnectorProviderBindingKey,
         operation_id: ConnectorCleanupOperationId,
@@ -974,7 +972,6 @@ pub struct BatchReceipt {
 }
 
 impl BatchReceipt {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         descriptor: ConnectorInstanceDescriptor,
         owner: ConnectorProviderBindingKey,
@@ -1608,7 +1605,6 @@ fn prepared_digest(
     digest_bytes(&mut hash, payload);
     hash.finalize().into()
 }
-#[allow(clippy::too_many_arguments)]
 fn receipt_digest(
     descriptor: &ConnectorInstanceDescriptor,
     owner: &ConnectorProviderBindingKey,

@@ -57,10 +57,6 @@ impl TurnWork {
         Ok(())
     }
 
-    pub(crate) fn yield_count(&self) -> u64 {
-        self.budget.exhaustions()
-    }
-
     pub fn generation(&self) -> NonZeroU64 {
         self.generation
     }
@@ -150,18 +146,6 @@ impl<'a> StepContext<'a> {
     pub fn report_failure(&self, failure: ExecutionFailure) {
         self.control.set_error(self.locate(failure));
     }
-    pub(crate) fn report_cleanup(&self, failure: &ExecutionFailure) {
-        self.control.report_cleanup(failure);
-    }
-    pub(crate) fn report_unresolved_exit(&self, failure: &ExecutionFailure) {
-        self.control.report_unresolved_exit(failure);
-    }
-    pub(crate) fn observe_exit(
-        &self,
-        observation: super::operator::ExitObservation,
-    ) -> super::operator::ExitProgress {
-        observation.report_to(self.control)
-    }
     pub(crate) fn failure_port(&self) -> &RuntimeErrorState {
         self.control
     }
@@ -180,6 +164,18 @@ impl<'a> StepContext<'a> {
             None => Ok(()),
         }
     }
+}
+
+/// Test callers get a real turn and the complete native step result. Quota and
+/// cross-step custody tests retain their own explicit TurnWork instead.
+#[cfg(test)]
+pub(super) fn with_test_step<T>(
+    state: &crate::runtime::runtime_state::RuntimeState,
+    action: impl FnOnce(&mut StepContext<'_>) -> T,
+) -> T {
+    let control = state.error_state();
+    let mut turn = TurnWork::new(std::num::NonZeroU64::MIN, DEFAULT_TURN_WORK_UNITS);
+    action(&mut StepContext::new(&control, &mut turn))
 }
 
 #[cfg(test)]
@@ -228,16 +224,4 @@ mod tests {
         assert!(!work.try_consume(1));
         assert_eq!(work.generation().get(), 9);
     }
-}
-
-/// Test callers get a real turn and the complete native step result. Quota and
-/// cross-step custody tests retain their own explicit TurnWork instead.
-#[cfg(test)]
-pub(super) fn with_test_step<T>(
-    state: &crate::runtime::runtime_state::RuntimeState,
-    action: impl FnOnce(&mut StepContext<'_>) -> T,
-) -> T {
-    let control = state.error_state();
-    let mut turn = TurnWork::new(std::num::NonZeroU64::MIN, DEFAULT_TURN_WORK_UNITS);
-    action(&mut StepContext::new(&control, &mut turn))
 }

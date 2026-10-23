@@ -29,6 +29,8 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use novarocks_spi::connector::ExternalMutationEffect;
 use novarocks_spi::connector::{
     ConnectorDataMutation, ConnectorDataMutationExecuteRequest, ConnectorDataMutationOperation,
     ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary,
@@ -36,8 +38,8 @@ use novarocks_spi::connector::{
     ConnectorDataMutationReconcileRequest, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorMutationOperationId, ConnectorOperationControl, ConnectorProviderBindingKey,
-    ConnectorRequestContext, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome,
+    ConnectorRequestContext, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome,
 };
 
 use super::add_files::{
@@ -120,7 +122,7 @@ struct IcebergDataMutationEvidenceV2 {
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
 enum RecoveryPublication {
     MarkerOnly {},
-    Dispatched { facts: FrozenPublicationFacts },
+    Dispatched { facts: Box<FrozenPublicationFacts> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -364,7 +366,6 @@ trait IcebergDataMutationBackend: Send + Sync {
         ConnectorError,
     >;
 
-    #[allow(clippy::result_large_err)]
     fn execute(
         &self,
         planned: &PlannedIcebergMutation,
@@ -824,15 +825,14 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
             .cloned()
         {
             if record.plan_digest == request.plan.plan_digest() {
-                if let ExternalMutationOutcome::CommitUnknown { evidence, .. } = &record.outcome {
-                    if let Some((journal, entry)) =
+                if let ExternalMutationOutcome::CommitUnknown { evidence, .. } = &record.outcome
+                    && let Some((journal, entry)) =
                         crate::commit::attempt::observation::PublicationJournal::<DataPublication>::from_evidence(evidence)?
                     {
                         return Ok(publication::project_external(
                             journal.catalog_entry_outcome(entry),
                         ));
                     }
-                }
                 return Ok(record.outcome);
             }
             return Err(invalid(
@@ -1334,11 +1334,11 @@ mod tests {
 
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
+    use crate::iceberg::TableCreation;
     use crate::iceberg::spec::{
         FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
         TableMetadataBuilder, Type,
     };
-    use crate::iceberg::{NamespaceIdent, TableCreation};
     use crate::resources::IcebergMetadataResources;
 
     struct FakeBackend {

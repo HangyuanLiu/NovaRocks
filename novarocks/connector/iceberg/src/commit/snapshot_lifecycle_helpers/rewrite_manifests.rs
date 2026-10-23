@@ -242,7 +242,7 @@ async fn merge_manifest_group(
 
     // Collect all live entries from all manifests in the group.
     for manifest_file in group {
-        let manifest = crate::manifest::load_manifest(&manifest_file, file_io).await?;
+        let manifest = crate::manifest::load_manifest(manifest_file, file_io).await?;
         if manifest.metadata().partition_spec().spec_id() != spec_id
             || *manifest.metadata().content() != content
         {
@@ -679,7 +679,7 @@ mod keyed_record_tests {
             target_ref: "main".into(),
             start: None,
             changes: FileChanges::default(),
-            dependencies: vec![Dependency::NoReadDependency],
+            dependencies: vec![Dependency::NoRead],
             isolation: IsolationLevel::Snapshot,
             shape: RequestShape::SnapshotProducing,
             summary: BTreeMap::new(),

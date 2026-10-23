@@ -96,7 +96,10 @@ impl IcebergWritePreparationOptions {
 
 /// Prepare an Iceberg write with an application-preallocated operation
 /// identity. This still performs no writer execution or catalog mutation.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The write preparation boundary validates the frozen target, options, and owner ports independently; a wrapper would duplicate the write contract."
+)]
 pub(crate) fn prepare_iceberg_write_with_options(
     state: &DmlExecutionKernel,
     target: &TargetBackend,
@@ -151,7 +154,10 @@ pub(crate) fn prepare_iceberg_write_with_options(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The distributed write builder receives separate frozen plan facts and connector capabilities; bundling would duplicate their owner-specific contracts."
+)]
 fn prepare_iceberg_distributed_write(
     state: &DmlExecutionKernel,
     target: &TargetBackend,
@@ -271,7 +277,6 @@ fn prepare_iceberg_distributed_write(
 /// The table is named the way the provider parses it -- namespace-qualified,
 /// last dot separating the table -- so a multi-level namespace round-trips
 /// instead of losing its trailing level.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn connector_write_begin_request(
     target: &TargetBackend,
     target_ref: &str,
@@ -291,7 +296,6 @@ pub(crate) fn connector_write_begin_request(
 /// An application-document publication must name the base its declaration was
 /// built against, so the provider can refuse a session that would publish onto
 /// a different one.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn connector_write_begin_request_on_base(
     target: &TargetBackend,
     target_ref: &str,
@@ -472,7 +476,6 @@ struct FrozenIcebergWriteSemanticBinding {
 
 /// Admit the complete provider-declared input before shaping INSERT source
 /// expressions. This opens no write session and performs no external effect.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_iceberg_write_plan(
     write_lease: &novarocks_spi::connector::ConnectorWriteLease,
     target_ref: &str,
@@ -943,6 +946,7 @@ fn single_quoted_sql(value: &str) -> String {
     format!("'{escaped}'")
 }
 
+#[cfg(test)]
 fn arrow_data_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Result<SqlType, String> {
     use arrow::datatypes::{DataType, TimeUnit};
     Ok(match dt {
@@ -1001,12 +1005,6 @@ fn arrow_data_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Result<SqlTyp
             ));
         }
     })
-}
-
-pub(crate) fn arrow_data_type_to_sql_type_name(
-    dt: &arrow::datatypes::DataType,
-) -> Result<String, String> {
-    sql_type_name(&arrow_data_type_to_sql_type(dt)?)
 }
 
 fn sql_type_name(sql_type: &SqlType) -> Result<String, String> {
@@ -1858,19 +1856,7 @@ mod provider_admission_before_shaping_tests {
                 .unwrap_err()
                 .contains("UUID has no SQL DDL type spelling")
         );
-        let target = TargetBackend {
-            provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap(),
-            catalog: "writer_domain_test".into(),
-            namespace: "db".into(),
-            table: "target".into(),
-        };
-        let resolved = ResolvedTable {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-            columns,
-            statistics_pin: None,
-        };
+        let resolved = ResolvedTable { columns };
         let control = Arc::new(Control {
             key: ConnectorProviderBindingKey {
                 instance_id: metadata.table.owner().clone(),

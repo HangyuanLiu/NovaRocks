@@ -20,8 +20,8 @@
 //! An async transport owns only a cloneable [`ContextConvergenceIntakeHandle`].
 //! It can retain a complete receipt and learn whether that exact observation
 //! may advance its subscription cursor. It cannot apply the observation to a
-//! logical execution. The move-only [`ContextConvergenceIntake`] is the single
-//! serial owner that drains retained observations.
+//! logical execution. The move-only intake owner used by tests drains retained
+//! observations.
 //!
 //! Capacity is counted in distinct contexts waiting to be drained. A newer
 //! complete receipt replaces the older receipt in the context's existing slot,
@@ -64,6 +64,7 @@ struct ContextConvergenceIntakeState {
     open: bool,
     pending: BTreeMap<QueryContextRef, QueryContextConvergenceReceipt>,
     order: VecDeque<QueryContextRef>,
+    #[cfg(test)]
     leased: Option<(QueryContextRef, QueryContextConvergenceReceipt)>,
 }
 
@@ -76,6 +77,7 @@ struct ContextConvergenceIntakeInner {
 }
 
 impl ContextConvergenceIntakeInner {
+    #[cfg(test)]
     fn release_capacity(&self) {
         self.capacity_state.send_modify(|state| {
             state.epoch = state
@@ -85,6 +87,7 @@ impl ContextConvergenceIntakeInner {
         });
     }
 
+    #[cfg(test)]
     fn close_capacity(&self) {
         self.capacity_state.send_modify(|state| state.closed = true);
     }
@@ -241,11 +244,13 @@ impl ContextConvergenceIntakeHandle {
 }
 
 /// The move-only, single serial owner of retained convergence observations.
+#[cfg(test)]
 #[derive(Debug)]
 pub struct ContextConvergenceIntake {
     inner: Arc<ContextConvergenceIntakeInner>,
 }
 
+#[cfg(test)]
 impl ContextConvergenceIntake {
     pub fn bounded(capacity: NonZeroUsize) -> Self {
         let (capacity_state, _) = watch::channel(ContextConvergenceCapacityState {
@@ -259,6 +264,7 @@ impl ContextConvergenceIntake {
                     open: true,
                     pending: BTreeMap::new(),
                     order: VecDeque::new(),
+                    #[cfg(test)]
                     leased: None,
                 }),
                 wake: tokio::sync::Notify::new(),
@@ -271,10 +277,6 @@ impl ContextConvergenceIntake {
         ContextConvergenceIntakeHandle {
             inner: Arc::clone(&self.inner),
         }
-    }
-
-    pub fn capacity(&self) -> NonZeroUsize {
-        self.inner.capacity
     }
 
     pub fn pending(&self) -> usize {
@@ -360,6 +362,7 @@ impl ContextConvergenceIntake {
 }
 
 /// The result of acknowledging a successfully applied retained receipt.
+#[cfg(test)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ContextConvergenceRetainedAck {
     /// The leased receipt was still current and its context slot was released.
@@ -375,6 +378,7 @@ pub enum ContextConvergenceRetainedAck {
 /// The lease owns no lock and is safe to hold across an asynchronous registry
 /// application. Only [`Self::ack`] may remove its receipt. Dropping it leaves
 /// the receipt and its capacity slot intact.
+#[cfg(test)]
 #[derive(Debug)]
 #[must_use = "dropping a convergence lease keeps its receipt retained"]
 pub struct ContextConvergenceRetainedLease {
@@ -384,6 +388,7 @@ pub struct ContextConvergenceRetainedLease {
     settled: bool,
 }
 
+#[cfg(test)]
 impl ContextConvergenceRetainedLease {
     pub const fn receipt(&self) -> QueryContextConvergenceReceipt {
         self.receipt
@@ -431,6 +436,7 @@ impl ContextConvergenceRetainedLease {
     }
 }
 
+#[cfg(test)]
 impl Drop for ContextConvergenceRetainedLease {
     fn drop(&mut self) {
         if self.settled {
@@ -443,6 +449,7 @@ impl Drop for ContextConvergenceRetainedLease {
     }
 }
 
+#[cfg(test)]
 impl Drop for ContextConvergenceIntake {
     fn drop(&mut self) {
         {

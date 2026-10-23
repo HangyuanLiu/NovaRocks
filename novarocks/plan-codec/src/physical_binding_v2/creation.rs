@@ -30,19 +30,19 @@ pub(crate) struct Construction<'a, H> {
     pub(crate) creator: Option<&'a mut dyn ValueSchemaCreationScope<H>>,
 }
 enum IdentityFailure<H> {
-    Grammar(FunctionIdentityError),
-    Resource(LayoutResourceError),
+    Grammar,
+    Resource,
     Host(H),
     Control(CompileControlError),
 }
 impl<H> From<FunctionIdentityError> for IdentityFailure<H> {
-    fn from(error: FunctionIdentityError) -> Self {
-        Self::Grammar(error)
+    fn from(_: FunctionIdentityError) -> Self {
+        Self::Grammar
     }
 }
 impl<H> From<LayoutResourceError> for IdentityFailure<H> {
-    fn from(error: LayoutResourceError) -> Self {
-        Self::Resource(error)
+    fn from(_: LayoutResourceError) -> Self {
+        Self::Resource
     }
 }
 impl<H> Construction<'_, H> {
@@ -142,14 +142,14 @@ impl<H> Construction<'_, H> {
         match result {
             Err(IdentityFailure::Host(cause)) => Err(ProjectionFailure::Host(cause)),
             Err(IdentityFailure::Control(cause)) => Err(cause.into()),
-            Err(IdentityFailure::Resource(_)) => Err(CompileControlError::ResourceExhausted.into()),
+            Err(IdentityFailure::Resource) => Err(CompileControlError::ResourceExhausted.into()),
             result => {
                 work.flush()?;
                 result.map_err(|cause| match cause {
-                    IdentityFailure::Grammar(_) => ProjectionFailure::Codec(Error::InvalidShape(
+                    IdentityFailure::Grammar => ProjectionFailure::Codec(Error::InvalidShape(
                         "materialized identity is invalid",
                     )),
-                    IdentityFailure::Resource(_) => unreachable!("handled resource refusal"),
+                    IdentityFailure::Resource => unreachable!("handled resource refusal"),
                     IdentityFailure::Host(_) | IdentityFailure::Control(_) => {
                         unreachable!("handled original refusal")
                     }

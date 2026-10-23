@@ -153,7 +153,7 @@ impl FailureSink<'_, '_> {
             EvaluationFailure::Kernel(diagnostic) => KernelFailure::from_domain(
                 super::aggregate_map_source_failure::MapDiagnosticFailure {
                     origin,
-                    diagnostic,
+                    _diagnostic: diagnostic,
                     phase,
                 },
             )

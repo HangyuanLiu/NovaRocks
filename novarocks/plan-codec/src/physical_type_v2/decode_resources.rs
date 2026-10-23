@@ -185,9 +185,6 @@ impl TypeDecodeModel {
             _ => None,
         })
     }
-    pub(super) fn dictionary_entity_upper(boxes: usize) -> Result<usize, E> {
-        Self::dictionary_bytes(boxes)
-    }
     pub(super) fn carrier_entity_upper(kind: &Kind, boxes: usize) -> Result<usize, E> {
         add(
             Self::carrier_backing(kind)?.map_or(0, |layout| layout.size()),

@@ -52,7 +52,6 @@ pub(crate) struct PreparedTruncateAttempt {
 
 impl DmlService {
     /// Plans an admitted TRUNCATE without beginning provider dispatch.
-    #[allow(clippy::result_large_err)]
     pub(crate) fn prepare_truncate(
         &self,
         engine: &dyn TruncateEngine,
@@ -78,7 +77,6 @@ impl DmlService {
     }
 
     /// Crosses the one-shot provider dispatch boundary for a planned TRUNCATE.
-    #[allow(clippy::result_large_err)]
     pub(crate) fn execute_prepared_truncate(
         &self,
         engine: &dyn TruncateEngine,

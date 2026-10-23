@@ -279,13 +279,7 @@ fn scan_ordered_required_all_seven_actual_callback_causes_stop_and_latch() {
     }
     let values = Int32Array::from(
         (0..513)
-            .map(|row| {
-                if row % 7 == 0 {
-                    None
-                } else {
-                    Some((row % 25) as i32)
-                }
-            })
+            .map(|row| if row % 7 == 0 { None } else { Some(row % 25) })
             .collect::<Vec<_>>(),
     );
     let batch = RecordBatch::try_new(

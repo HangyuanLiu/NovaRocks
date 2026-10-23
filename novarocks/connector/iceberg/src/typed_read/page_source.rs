@@ -67,6 +67,9 @@ use super::column_handle::{IcebergColumnHandle, corrupt, invalid, parse_type, un
 use super::delete_manager::{DeleteEvaluationMode, DeleteManager, SplitDeleteFilter};
 use super::preparation::{PlannedInput, PreparedRangeCandidate, SuccessorPreparationGroup};
 
+type FooterCache = HashMap<(StorageAccessDomainId, FileIdentity), ParquetMetadataInspection>;
+type FooterCacheGuard<'a> = std::sync::MutexGuard<'a, FooterCache>;
+
 mod stream;
 pub use stream::{
     IcebergParquetPageStream, IcebergPartitionOnlyPageStream, create_iceberg_page_stream,
@@ -648,7 +651,7 @@ impl ReaderPageSourceWithRowPositions {
 /// nothing survives the provider.
 #[derive(Debug, Default)]
 pub struct ParquetFooterCache {
-    entries: Mutex<HashMap<(StorageAccessDomainId, FileIdentity), ParquetMetadataInspection>>,
+    entries: Mutex<FooterCache>,
 }
 
 impl ParquetFooterCache {
@@ -719,15 +722,7 @@ impl ParquetFooterCache {
         Ok(self.lock()?.is_empty())
     }
 
-    fn lock(
-        &self,
-    ) -> Result<
-        std::sync::MutexGuard<
-            '_,
-            HashMap<(StorageAccessDomainId, FileIdentity), ParquetMetadataInspection>,
-        >,
-        ConnectorError,
-    > {
+    fn lock(&self) -> Result<FooterCacheGuard<'_>, ConnectorError> {
         self.entries.lock().map_err(|error| {
             ConnectorError::new(
                 ConnectorErrorKind::Internal,
@@ -1049,23 +1044,40 @@ impl ParquetSplitRequest {
     }
 }
 
+pub(super) struct PreparedInputRequest<'a> {
+    pub(super) relation: &'a IcebergReadRelation,
+    pub(super) split: &'a IcebergSplit,
+    pub(super) columns: &'a [IcebergColumnHandle],
+    pub(super) delete_mode: &'a DeleteEvaluationMode,
+    pub(super) footer: &'a ParquetMetadataInspection,
+    pub(super) access_binding: &'a IcebergReadBinding,
+    pub(super) context: FileReadContext,
+    pub(super) cache: Option<novarocks_fs::DataCacheContext>,
+    pub(super) budget: FileReadBudget,
+    pub(super) reader_options: FileReaderOptions,
+    pub(super) row_group_ordinal: Option<u32>,
+}
+
 /// Plan one conservative physical input range from an already prepared footer
 /// on the scan CPU. This path performs no metadata network request.
 /// Delete closure classification determines projection only; it does not load
 /// delete artifacts. The live filter is intentionally rechecked at promotion.
 pub(super) fn plan_iceberg_prepared_input(
-    relation: &IcebergReadRelation,
-    split: &IcebergSplit,
-    columns: &[IcebergColumnHandle],
-    delete_mode: &DeleteEvaluationMode,
-    footer: &ParquetMetadataInspection,
-    access_binding: &IcebergReadBinding,
-    context: FileReadContext,
-    cache: Option<novarocks_fs::DataCacheContext>,
-    budget: FileReadBudget,
-    mut reader_options: FileReaderOptions,
-    row_group_ordinal: Option<u32>,
+    request: PreparedInputRequest<'_>,
 ) -> Result<Option<PlannedInput>, ConnectorError> {
+    let PreparedInputRequest {
+        relation,
+        split,
+        columns,
+        delete_mode,
+        footer,
+        access_binding,
+        context,
+        cache,
+        budget,
+        mut reader_options,
+        row_group_ordinal,
+    } = request;
     admit_file_format(split.file_format())?;
     reject_encryption_material(
         split.decryption_data(),
@@ -1958,19 +1970,19 @@ impl IcebergParquetPageSource {
             let budget = self.budget;
             let options = self.reader_options;
             let planner = Arc::new(move |context: FileReadContext| {
-                plan_iceberg_prepared_input(
-                    &relation,
-                    &split,
-                    &columns,
-                    &delete_mode,
-                    &footer,
-                    &binding,
+                plan_iceberg_prepared_input(PreparedInputRequest {
+                    relation: &relation,
+                    split: &split,
+                    columns: &columns,
+                    delete_mode: &delete_mode,
+                    footer: &footer,
+                    access_binding: &binding,
                     context,
-                    cache.clone(),
+                    cache: cache.clone(),
                     budget,
-                    options,
-                    Some(next_ordinal),
-                )
+                    reader_options: options,
+                    row_group_ordinal: Some(next_ordinal),
+                })
             });
             let Some(candidate) = PreparedRangeCandidate::new(self.context.clone(), planner) else {
                 return Ok(ConnectorPreparationProgress::Deferred);
@@ -2771,7 +2783,7 @@ mod tests {
             snapshot_id: Some(11),
             read_domain: Some(crate::delete_semantics::test_read_domain(
                 schema,
-                &[spec.clone()],
+                std::slice::from_ref(&spec),
                 11,
             )),
             table_schema_json: serde_json::to_string(schema).expect("serialize schema"),

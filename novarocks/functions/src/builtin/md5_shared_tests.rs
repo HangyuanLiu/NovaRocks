@@ -38,10 +38,10 @@ impl KernelEvaluationControl for Control {
             assert!(at <= *stop, "callback after first refusal");
         }
         trace.push(units);
-        if let Some((stop, cause)) = &self.reject {
-            if at == *stop {
-                return Err(cause.clone());
-            }
+        if let Some((stop, cause)) = &self.reject
+            && at == *stop
+        {
+            return Err(cause.clone());
         }
         Ok(())
     }
@@ -203,7 +203,13 @@ fn required_digest_failure_preserves_full_sdk_source_and_bounded_original_prefix
         ))]
         .into(),
     );
-    let raw = evaluate_required(Operation::Md5sumNumeric, &[input.clone()], 1, None).unwrap();
+    let raw = evaluate_required(
+        Operation::Md5sumNumeric,
+        std::slice::from_ref(&input),
+        1,
+        None,
+    )
+    .unwrap();
     let expected = arrow_cast::cast(&raw, &target)
         .map_err(|error| format!("md5sum_numeric: failed to cast output: {}", error))
         .unwrap_err();

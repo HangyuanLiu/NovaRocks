@@ -30,8 +30,8 @@ use axum::{Json, Router, routing::get};
 use crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceReader;
 use crate::topology::{BackendIslandSnapshot, BackendIslandSnapshotReader};
 use crate::workload_lifecycle::{
-    FrontendCatalogServingSnapshot, FrontendDrainServingSnapshot, FrontendServingLifecycle,
-    FrontendServingSnapshot, FrontendServingSnapshotReader, FrontendWorkloadServingSnapshot,
+    FrontendCatalogServingSnapshot, FrontendDrainServingSnapshot, FrontendServingSnapshot,
+    FrontendServingSnapshotReader, FrontendWorkloadServingSnapshot,
 };
 #[cfg(novarocks_dev_controls)]
 use axum::routing::post;
@@ -342,23 +342,24 @@ pub(crate) fn frontend_management_router_with_readers(
         .route("/v1/memory/authority", get(memory_authority_snapshot))
         .route("/v1/catalogs/activity", get(catalog_activity_snapshot));
     #[cfg(novarocks_dev_controls)]
-    let router = if debug_enabled && statement_observation.is_some() && convergence_reader.is_some()
-    {
-        let convergence_reader = convergence_reader.expect("checked above");
-        let owner = statement_observation
-            .as_ref()
-            .expect("checked above")
-            .clone();
-        router.route(
-            crate::native::report_server::LIFECYCLE_CONVERGENCE_DEBUG_PATH,
-            get(move |headers: HeaderMap| {
-                latest_lifecycle_convergence_snapshot(
-                    Arc::clone(&convergence_reader),
-                    Arc::clone(&owner),
-                    headers,
-                )
-            }),
-        )
+    let router = if debug_enabled {
+        if let (Some(convergence_reader), Some(owner)) =
+            (convergence_reader, statement_observation.as_ref())
+        {
+            let owner = Arc::clone(owner);
+            router.route(
+                crate::native::report_server::LIFECYCLE_CONVERGENCE_DEBUG_PATH,
+                get(move |headers: HeaderMap| {
+                    latest_lifecycle_convergence_snapshot(
+                        Arc::clone(&convergence_reader),
+                        Arc::clone(&owner),
+                        headers,
+                    )
+                }),
+            )
+        } else {
+            router
+        }
     } else {
         router
     };

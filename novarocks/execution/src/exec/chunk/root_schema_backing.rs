@@ -248,6 +248,7 @@ impl<'a> RootSchemaInspection<'a> {
     /// The actual schema tree is independently checked for bounded semantic
     /// depth and carrier node count. Exact field receipts come from the supplied index;
     /// structural equality with a compiled schema is never sufficient.
+    #[cfg(test)]
     pub(crate) fn inspect_schema(
         &mut self,
         schema: &SchemaRef,
@@ -319,6 +320,7 @@ impl<'a> RootSchemaInspection<'a> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn inspect_field(
         &mut self,
         field: &FieldRef,
@@ -332,6 +334,7 @@ impl<'a> RootSchemaInspection<'a> {
     /// Every child Field/name/map/type heap is already covered by the complete
     /// immutable index inspection. Rewalking child trees for each array would
     /// turn a valid deeply nested carrier into quadratic work.
+    #[cfg(test)]
     pub(crate) fn inspect_data_type(
         &mut self,
         data_type: &DataType,
@@ -807,7 +810,9 @@ mod tests {
         );
         assert_eq!(state.bytes(), 0);
         let oversized: Fields =
-            vec![Arc::new(Field::new("x", DataType::Int32, true)); RootProfileV1::MAX_COLUMNS + 1]
+            std::iter::repeat_with(|| Arc::new(Field::new("x", DataType::Int32, true)))
+                .take(RootProfileV1::MAX_COLUMNS + 1)
+                .collect::<Vec<_>>()
                 .into();
         let schema = metadata(vec![]).into_schema(oversized);
         assert_eq!(

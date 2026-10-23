@@ -80,13 +80,13 @@ impl ScanOutputFilter {
     /// The filter one driver applies: the consumer states stay shared with
     /// every other driver, while compiled key instances are the driver's own.
     pub(super) fn for_driver(&self) -> ScanDriverFilter {
-        let compiled_keys = match &self.blocking {
-            Some(consumers) => Some(match &self.compiled_ordered {
+        let compiled_keys = self
+            .blocking
+            .as_ref()
+            .map(|consumers| match &self.compiled_ordered {
                 Some(ordered) => consumers.driver_keys_controlled(ordered.host.scalar_allocator()),
                 None => consumers.driver_keys(),
-            }),
-            None => None,
-        };
+            });
         ScanDriverFilter {
             filter: self.clone(),
             compiled_keys,

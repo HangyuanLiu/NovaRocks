@@ -339,12 +339,6 @@ impl PrivateControlOwner {
         self.identity = Some((metadata.dev(), metadata.ino()));
         Ok(())
     }
-    #[cfg(test)]
-    fn create() -> Result<Self> {
-        let mut owner = Self::reserve()?;
-        owner.initialize()?;
-        Ok(owner)
-    }
     fn environment(&self) -> CrossProcessChildEnvironment {
         let mut environment = CrossProcessChildEnvironment::default();
         environment.fe.insert(
@@ -505,10 +499,10 @@ impl Scenario for ExactNativeCase {
             .map_err(|_| anyhow::anyhow!("private launch owner poisoned"))?;
         let mut failure = None;
         if let Some(value) = owner.as_ref() {
-            if let Some(prepared) = &value.prepared {
-                if let Err(error) = prepared.verify_original_file() {
-                    retain_secondary(&mut failure, error);
-                }
+            if let Some(prepared) = &value.prepared
+                && let Err(error) = prepared.verify_original_file()
+            {
+                retain_secondary(&mut failure, error);
             }
             if let Err(error) = value.remove_empty_parent() {
                 retain_secondary(&mut failure, error);
@@ -823,15 +817,14 @@ async fn run_case(
     errors[0] = primary.err();
     // A failed held probe still asks original query control to cancel this actual handshake.
     // No external Resume command exists; original cancellation records and locally resumes.
-    if submitted && !kill_attempted {
-        if let Some(reader) = reader.as_ref() {
-            if let Err(error) = context
-                .handle()
-                .kill_query_until(reader.connection_id(), deadline)
-            {
-                errors[1] = Some(error);
-            }
-        }
+    if submitted
+        && !kill_attempted
+        && let Some(reader) = reader.as_ref()
+        && let Err(error) = context
+            .handle()
+            .kill_query_until(reader.connection_id(), deadline)
+    {
+        errors[1] = Some(error);
     }
     if let Some(reader) = reader.as_mut() {
         receipt.reader = Some(reader.snapshot());
@@ -1256,6 +1249,13 @@ async fn health(reader: &mut ExactResultReader) -> Result<()> {
 /// Retain both actual errors without formatting either source into a new string.
 struct SecondaryFailure {
     primary: anyhow::Error,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retain the original secondary cleanup failure without formatting it."
+        )
+    )]
     secondary: anyhow::Error,
 }
 impl std::fmt::Debug for SecondaryFailure {

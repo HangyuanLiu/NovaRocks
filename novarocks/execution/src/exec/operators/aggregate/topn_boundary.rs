@@ -26,12 +26,12 @@
 use std::cmp::Ordering;
 use std::fmt;
 use std::num::NonZeroU32;
+#[cfg(test)]
 use std::sync::Arc;
 
 use crate::exec::hash_table::allocation::AggregateVec;
 use crate::runtime_filter::contribution::{
-    ControlledOrderedTupleError, OrderedScalarRef, OrderedTuple, OrderedTupleError,
-    RuntimeOrderContract,
+    ControlledOrderedTupleError, OrderedScalarRef, OrderedTupleError, RuntimeOrderContract,
 };
 use crate::runtime_filter::{OrderedTopNAllocationHost, OwnedOrderKey};
 use arrow::array::{
@@ -43,15 +43,17 @@ use arrow::datatypes::{DataType, Int32Type, TimeUnit};
 use novarocks_functions::{KernelEvaluationControl, KernelFailure};
 
 #[cfg(test)]
-use crate::runtime_filter::contribution::OrderedScalar;
+use crate::runtime_filter::contribution::{OrderedScalar, OrderedTuple};
 
+#[cfg(test)]
 use crate::exec::hash_table::key_table::KeyLookup;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AggregateTopNCandidate<K = OrderedTuple> {
+pub(crate) struct AggregateTopNCandidate<K> {
     tuple: K,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AggregateTopNBoundarySnapshot {
     NotReady,
@@ -212,16 +214,19 @@ pub(crate) trait TopNBoundaryStorage: std::fmt::Debug {
 }
 
 #[derive(Clone, Eq, PartialEq)]
-pub(crate) struct LegacyTopNBoundaryStorage(Vec<AggregateTopNCandidate>);
+#[cfg(test)]
+pub(crate) struct LegacyTopNBoundaryStorage(Vec<AggregateTopNCandidate<OrderedTuple>>);
+#[cfg(test)]
 impl std::fmt::Debug for LegacyTopNBoundaryStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }
 }
+#[cfg(test)]
 impl TopNBoundaryStorage for LegacyTopNBoundaryStorage {
     type Key = OrderedTuple;
     type Error = AggregateTopNBoundaryError;
-    fn candidates(&self) -> &[AggregateTopNCandidate] {
+    fn candidates(&self) -> &[AggregateTopNCandidate<OrderedTuple>] {
         &self.0
     }
     fn push(
@@ -313,7 +318,9 @@ impl TopNBoundaryStorage for OwnedTopNBoundaryStorage {
     }
 }
 
+#[cfg(test)]
 struct LegacyBoundaryControl;
+#[cfg(test)]
 impl KernelEvaluationControl for LegacyBoundaryControl {
     fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
         Ok(())
@@ -344,6 +351,7 @@ impl<S: TopNBoundaryStorage> std::fmt::Debug for AggregateTopNBoundaryCore<S> {
             .finish()
     }
 }
+#[cfg(test)]
 pub(crate) type AggregateTopNBoundaryState = AggregateTopNBoundaryCore<LegacyTopNBoundaryStorage>;
 pub(crate) type OwnedAggregateTopNBoundaryState =
     AggregateTopNBoundaryCore<OwnedTopNBoundaryStorage>;
@@ -460,6 +468,7 @@ impl<S: TopNBoundaryStorage> AggregateTopNBoundaryCore<S> {
     }
 }
 
+#[cfg(test)]
 impl AggregateTopNBoundaryState {
     pub(crate) fn try_new(
         limit: NonZeroU32,
@@ -533,6 +542,7 @@ impl OwnedAggregateTopNBoundaryState {
     ) -> Result<(), OwnedTopNBoundaryError> {
         self.observe_controlled(group_id, tuple, control)
     }
+    #[cfg(test)]
     pub(crate) fn snapshot_owned(
         &self,
         control: &dyn KernelEvaluationControl,
@@ -541,16 +551,14 @@ impl OwnedAggregateTopNBoundaryState {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AggregateTopNBoundaryBinding {
     group_key_ordinal: usize,
     state: AggregateTopNBoundaryState,
 }
 
-#[allow(
-    dead_code,
-    reason = "The boundary accessor is retained for native aggregate runtime-filter wiring."
-)]
+#[cfg(test)]
 impl AggregateTopNBoundaryBinding {
     pub(crate) fn try_new(
         group_key_ordinal: usize,
@@ -603,6 +611,7 @@ fn validate_topn_boundary_contract(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn observe_key_table_group(
     bindings: &mut [AggregateTopNBoundaryBinding],
     lookup: &KeyLookup,
@@ -625,6 +634,7 @@ pub(crate) fn observe_key_table_group(
     Ok(())
 }
 
+#[cfg(test)]
 fn tuple_from_group_array(
     contract: &RuntimeOrderContract,
     array: &ArrayRef,

@@ -228,16 +228,16 @@ impl ByEncodeBuffer for Writer {
         self.appends += 1;
         // Header writes precede the decimal call; both length and text appends
         // happen with the distinct OWN and library reservations still live.
-        if at >= 2 {
-            if let Some(host) = &self.host {
-                assert_eq!(host.ledger.lock().unwrap().loans.len(), 2);
-                self.protected += 1;
-            }
+        if at >= 2
+            && let Some(host) = &self.host
+        {
+            assert_eq!(host.ledger.lock().unwrap().loans.len(), 2);
+            self.protected += 1;
         }
         if let Some((stop, cause)) = &self.refusal {
             assert!(at <= *stop, "append after primary refusal");
             if at == *stop {
-                return Err(cause.clone().into());
+                return Err(cause.clone());
             }
         }
         self.bytes.extend_from_slice(bytes);
@@ -561,8 +561,8 @@ fn control_refusals_at_both_call_boundaries_keep_first_cause_without_footer() {
                 &mut ScalarWork::new(Some(&mut checkpoints)),
             )
             .unwrap();
-            let trace = control.checks.lock().unwrap().clone();
-            trace
+
+            control.checks.lock().unwrap().clone()
         };
         clean(&baseline_host);
         let after = successful_trace

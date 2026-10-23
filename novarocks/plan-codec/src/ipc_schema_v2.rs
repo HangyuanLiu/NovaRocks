@@ -52,11 +52,13 @@ pub struct IpcSchemaProjectionLimits {
 
 pub(crate) mod owner_admission;
 mod writer_resources;
+#[cfg(test)]
+pub(crate) use owner_admission::SchemaAdmit;
 use owner_admission::{Admission, Policy};
-pub(crate) use owner_admission::{HostSchemaAdmit, SchemaAdmit, SchemaWriterRequestFacts};
+pub(crate) use owner_admission::{HostSchemaAdmit, SchemaWriterRequestFacts};
 pub(crate) use writer_resources::{
     preflight_schema_writer_resources, schema_writer_prefix_resources,
-    schema_writer_prefix_resources_in, schema_writer_prefix_resources_with_host_in,
+    schema_writer_prefix_resources_with_host_in,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -648,6 +650,7 @@ impl PreparedSchemaWriter<'_> {
             work_upper_bound: self.resources.work_upper_bound,
         }
     }
+    #[cfg(test)]
     pub(crate) fn emit_in(
         &self,
         admit: &mut SchemaAdmit<'_>,
@@ -681,6 +684,7 @@ impl PreparedSchemaWriter<'_> {
         )
     }
 }
+#[cfg(test)]
 pub(crate) fn prepare_schema_writer_in<'field>(
     field: &'field Field,
     source: usize,
@@ -712,27 +716,6 @@ pub(crate) fn prepare_schema_writer_with_host_in<'field, H>(
         field, source, limits, max_work, admit, work,
     )?;
     prepare_schema_writer_with_prefix_host_in(field, source, limits, max_work, prefix, admit, work)
-}
-
-pub(crate) fn prepare_schema_writer_with_prefix_in<'field>(
-    field: &'field Field,
-    source: usize,
-    limits: IpcSchemaProjectionLimits,
-    max_work: usize,
-    prefix: writer_resources::SchemaWriterPrefixFacts,
-    admit: &mut SchemaAdmit<'_>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<PreparedSchemaWriter<'field>, TypeCodecError> {
-    prepare_schema_writer_with_prefix_host_in(
-        field,
-        source,
-        limits,
-        max_work,
-        prefix,
-        &mut |facts| admit(facts).map_err(HostError::<std::convert::Infallible>::from),
-        work,
-    )
-    .map_err(ProjectionFailure::without_host)
 }
 
 pub(crate) fn prepare_schema_writer_with_prefix_host_in<'field, H>(
@@ -805,6 +788,7 @@ pub fn verify_single_field_schema_message(
 /// Same borrowed schema law and verifier, with a parent-owned numerical gate.
 /// Reader facts contain source-walker requests and fixed-scratch work only;
 /// no FlatBuffer builder or writer output allocation is charged here.
+#[cfg(test)]
 pub(crate) fn verify_single_field_schema_in(
     metadata: &[u8],
     expected: &Field,

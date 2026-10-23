@@ -802,12 +802,9 @@ async fn public_queue_recipe(ready_only: bool) -> Result<QueueRun, StdError> {
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .take()
+                        && entered.send(()).is_err()
                     {
-                        if entered.send(()).is_err() {
-                            return Poll::Ready(Err(
-                                "queue connector original observer exited".into()
-                            ));
-                        }
+                        return Poll::Ready(Err("queue connector original observer exited".into()));
                     }
                     Poll::Pending
                 }

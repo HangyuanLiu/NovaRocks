@@ -22,7 +22,7 @@ const UNIX_EPOCH_DAY_OFFSET: i32 = 719163;
 
 pub fn date_literal_to_date32(value: i64) -> Result<i32, FloatDateFailure> {
     let standardized = standardize_date_literal(value)
-        .ok_or_else(|| FloatDateFailure(RejectedDateValue::Literal(value)))?;
+        .ok_or(FloatDateFailure(RejectedDateValue::Literal(value)))?;
     let date_part = standardized / 1_000_000;
     let time_part = standardized % 1_000_000;
     let year = (date_part / 10000) as i32;
@@ -35,7 +35,7 @@ pub fn date_literal_to_date32(value: i64) -> Result<i32, FloatDateFailure> {
         return Err(FloatDateFailure(RejectedDateValue::Literal(value)));
     }
     let date = NaiveDate::from_ymd_opt(year, month, day)
-        .ok_or_else(|| FloatDateFailure(RejectedDateValue::Literal(value)))?;
+        .ok_or(FloatDateFailure(RejectedDateValue::Literal(value)))?;
     Ok(date.num_days_from_ce() - UNIX_EPOCH_DAY_OFFSET)
 }
 

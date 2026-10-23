@@ -405,8 +405,8 @@ pub fn realize_legacy_hour_public_result<H>(
     )))
 }
 
-fn exact_format<'a>(
-    actual: Option<&'a str>,
+fn exact_format(
+    actual: Option<&str>,
     constant: &crate::ConstantValue,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<(), KernelFailure> {

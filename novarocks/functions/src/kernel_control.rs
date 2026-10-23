@@ -171,6 +171,7 @@ impl KernelFailure {
     /// These are already unmaskable originating failures. An optional completion
     /// observation must neither replace them nor start another fallible tail.
     /// RowDataError remains in its own journal; Task acceptance is separate.
+    #[cfg(test)]
     pub(crate) fn is_atomic_failure(&self) -> bool {
         use novarocks_failure_contract::{FailureClass, FailureProjection};
         matches!(self, Self::CompileControl(_) | Self::Capacity(_))

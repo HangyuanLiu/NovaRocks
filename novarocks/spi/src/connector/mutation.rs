@@ -563,6 +563,10 @@ pub enum ConnectorDropTableDataDisposition {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The public mutation union keeps each DDL request as its exact owned value; boxing the table-creation payload would change the shared SPI contract"
+)]
 pub enum ConnectorCatalogMutationOperation {
     CreateNamespace {
         namespace: ConnectorNamespaceIdentity,

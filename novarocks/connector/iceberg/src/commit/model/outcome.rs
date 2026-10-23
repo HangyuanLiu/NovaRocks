@@ -77,8 +77,26 @@ pub enum PublicationOutcome<Proof, Evidence> {
     KnownUncommitted(ConnectorMutationFailure),
     Unknown {
         failure: ConnectorMutationFailure,
+        #[expect(
+            dead_code,
+            reason = "Retains exact provider evidence for later adjudication of an unknown publication."
+        )]
         evidence: Evidence,
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "Retains the original operation identity in the unknown publication report."
+            )
+        )]
         operation: OperationToken,
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "Retains the complete owned-object ledger while publication remains unknown."
+            )
+        )]
         artifacts: Vec<ArtifactRecord>,
     },
 }

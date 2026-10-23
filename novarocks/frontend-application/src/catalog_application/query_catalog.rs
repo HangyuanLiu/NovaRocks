@@ -103,7 +103,6 @@ pub type CatalogResolutionResult<T> = Result<T, CatalogResolutionError>;
 pub struct ConnectorQueryTableMaterialization {
     /// Frozen desired-state identity shared by every execution artifact this
     /// query derives from the admitted control lease.
-    pub catalog_handle: novarocks_spi::connector::CatalogHandle,
     pub schema_version: Option<Vec<u8>>,
     /// The exact sealed metadata used to materialize this SQL relation. It
     /// remains request-local so CREATE can ask the provider for opaque source
@@ -149,22 +148,6 @@ pub fn load_connector_table_materialization_with_lease_typed(
         table,
         novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
     )
-}
-
-/// Load one provider-defined read alias through the same opaque metadata
-/// contract used for base tables. The alias syntax is application-owned, but
-/// Core neither decodes the returned table handle nor names a provider type.
-pub fn load_connector_table_alias_materialization_with_lease(
-    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    catalog: &str,
-    namespace: &str,
-    alias: &str,
-) -> Result<ConnectorQueryTableMaterialization, String> {
-    load_connector_table_alias_materialization_with_lease_typed(
-        controls, context, catalog, namespace, alias,
-    )
-    .map_err(CatalogResolutionError::into_message)
 }
 
 /// Resolve a provider-defined alias while retaining typed absence semantics.
@@ -302,7 +285,6 @@ pub fn connector_table_materialization_from_metadata(
         );
     }
     Ok(ConnectorQueryTableMaterialization {
-        catalog_handle,
         schema_version: metadata.version.as_ref().map(|version| version.to_vec()),
         source_metadata: metadata.clone(),
         columns,

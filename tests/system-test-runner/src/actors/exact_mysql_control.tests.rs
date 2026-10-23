@@ -33,7 +33,9 @@ fn literal(value: &str) -> Vec<u8> {
     assert_eq!(value.len() % 2, 0);
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let hex = std::str::from_utf8(pair).unwrap();
             u8::from_str_radix(hex, 16).unwrap()
@@ -66,15 +68,15 @@ async fn concurrently<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output
     let mut a_done = None;
     let mut b_done = None;
     poll_fn(|cx| {
-        if a_done.is_none() {
-            if let Poll::Ready(value) = a.as_mut().poll(cx) {
-                a_done = Some(value);
-            }
+        if a_done.is_none()
+            && let Poll::Ready(value) = a.as_mut().poll(cx)
+        {
+            a_done = Some(value);
         }
-        if b_done.is_none() {
-            if let Poll::Ready(value) = b.as_mut().poll(cx) {
-                b_done = Some(value);
-            }
+        if b_done.is_none()
+            && let Poll::Ready(value) = b.as_mut().poll(cx)
+        {
+            b_done = Some(value);
         }
         if a_done.is_some() && b_done.is_some() {
             Poll::Ready((a_done.take().unwrap(), b_done.take().unwrap()))

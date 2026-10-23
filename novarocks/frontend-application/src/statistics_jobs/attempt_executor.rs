@@ -209,8 +209,6 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
                 compile_control: None,
                 message: Arc::from(error.to_string()),
             })
-        } else if error.publication_terminal().is_some() {
-            Self::failure(error.to_string())
         } else {
             Self::failure(error.to_string())
         }
@@ -434,23 +432,22 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
                 context: context.clone(),
             })
             .map_err(|error| Self::failure(error.to_string()))?;
-        let (table, data_version, read_version_ordinal, required, session) = start.into_parts();
+        let (table, _data_version, read_version_ordinal, required, session) = start.into_parts();
         let pending = if required.is_empty() {
             empty_collection_pending(session, capacity.clone())
         } else {
             let request = (|| {
-                let program = crate::query_execution::statistics::StatisticsCollectionProgram::try_new(
-                    table,
-                    data_version,
-                    read_version_ordinal,
-                    required,
-                    crate::query_execution::statistics::StatisticsExecutionPolicy::try_new(
-                        crate::query_execution::statistics::StatisticsExecutionMode::BackgroundCollectionAttempt,
-                        self.ports.attempt_timeout,
+                let program =
+                    crate::query_execution::statistics::StatisticsCollectionProgram::try_new(
+                        table,
+                        read_version_ordinal,
+                        required,
+                        crate::query_execution::statistics::StatisticsExecutionPolicy::try_new(
+                            self.ports.attempt_timeout,
+                        )
+                        .map_err(|error| Self::failure(error.to_string()))?,
                     )
-                    .map_err(|error| Self::failure(error.to_string()))?,
-                )
-                .map_err(|error| Self::failure(error.to_string()))?;
+                    .map_err(|error| Self::failure(error.to_string()))?;
                 let topology = self
                     .ports
                     .backend_topology

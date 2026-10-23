@@ -22,8 +22,11 @@
 //! wall clock or sleeps, and every reading arrives through this trait so a
 //! test can advance time without waiting for it.
 
+#[cfg(test)]
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 use novarocks_query_application::coordination::MonotonicInstant;
 
@@ -64,10 +67,12 @@ impl TaskProtocolClock for ProcessMonotonicClock {
 /// request horizon can be driven to an exact reading instead of being waited
 /// out.
 #[derive(Debug, Default)]
+#[cfg(test)]
 pub struct ManualClock {
     elapsed: Mutex<Duration>,
 }
 
+#[cfg(test)]
 impl ManualClock {
     pub fn new() -> Self {
         Self::default()
@@ -77,12 +82,9 @@ impl ManualClock {
         let mut elapsed = self.elapsed.lock().expect("manual clock");
         *elapsed = elapsed.saturating_add(delta);
     }
-
-    pub fn set(&self, elapsed: Duration) {
-        *self.elapsed.lock().expect("manual clock") = elapsed;
-    }
 }
 
+#[cfg(test)]
 impl TaskProtocolClock for ManualClock {
     fn now(&self) -> MonotonicInstant {
         MonotonicInstant::from_origin(*self.elapsed.lock().expect("manual clock"))

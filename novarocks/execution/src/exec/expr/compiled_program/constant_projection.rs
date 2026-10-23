@@ -136,7 +136,6 @@ pub(super) fn project(
             },
         )
     })?;
-    drop(meter);
     if Arc::ptr_eq(&values, original.pool().array()) {
         // Root source Field metadata is not part of the array's type. Do not
         // create a new runtime custody scope when the real author rebuilt none.

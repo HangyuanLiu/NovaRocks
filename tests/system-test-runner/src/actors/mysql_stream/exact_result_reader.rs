@@ -139,9 +139,6 @@ pub(crate) type ExactReadResult<T> = std::result::Result<T, ExactReadFailure>;
 pub(crate) struct ExactMetadata {
     pub columns: u8,
     pub actual_next_sequence: u8,
-    pub wire_bytes: u64,
-    pub wire_sha256: [u8; 32],
-    pub payload_sha256: [u8; 32],
 }
 /// Fixed-size packet for the original one-column health oracle, not target row assembly.
 pub(crate) struct ExactSmallPacket {
@@ -552,8 +549,7 @@ impl ExactResultReader {
             );
             // Header+body are constructed only in a fixed stack buffer below.
             ensure!(
-                user.len() <= SMALL
-                    && user.len() + 32 + 2 + b"mysql_native_password".len() + 1 <= SMALL,
+                user.len() <= SMALL && user.len() + 32 + 2 + b"mysql_native_password".len() < SMALL,
                 "original auth user exceeds fixed preallocation bound"
             );
             let socket = TcpSocket::new_v4()?;
@@ -584,7 +580,6 @@ impl ExactResultReader {
             .await?;
             let cid = handshake_connection_id(handshake.payload())?;
             recorder.state.connection_id = cid;
-            drop(handshake);
             recorder.state.phase = ExactPhase::Authenticate;
             const FLAGS: u32 =
                 0x0000_0001 | 0x0000_0004 | 0x0000_0200 | 0x0000_2000 | 0x0000_8000 | 0x0008_0000;
@@ -661,6 +656,7 @@ impl ExactResultReader {
     pub fn connection_id(&self) -> u32 {
         self.client.connection_id
     }
+    #[cfg(test)]
     pub fn receive_buffer_bytes(&self) -> Option<u32> {
         self.client.receive_buffer_bytes
     }
@@ -754,13 +750,9 @@ impl ExactResultReader {
             self.recorder.state.metadata_complete = true;
             self.phase = ExactPhase::CutPrefix;
             self.recorder.state.phase = self.phase;
-            let state = self.snapshot();
             Ok(ExactMetadata {
                 columns: self.input.columns,
                 actual_next_sequence,
-                wire_bytes: state.metadata_wire_bytes,
-                wire_sha256: state.metadata_wire_sha256,
-                payload_sha256: state.metadata_payload_sha256,
             })
         }
         .await;

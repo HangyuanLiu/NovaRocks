@@ -271,7 +271,7 @@ impl KeyTable {
                     Some(value) => {
                         let additional = 5usize
                             .checked_add(value.len())
-                            .ok_or_else(|| super::key_builder::group_key_request_arithmetic())?;
+                            .ok_or_else(super::key_builder::group_key_request_arithmetic)?;
                         encoded.try_reserve(additional).map_err(|source| {
                             allocator.allocation_error("grow fallback group-key row", source)
                         })?;

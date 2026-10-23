@@ -1401,67 +1401,6 @@ fn package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {
 #[path = "temporal_tests.rs"]
 mod temporal_tests;
 
-/// A real executed InvocationData phase, captured before bounded row projection.
-/// The journal is thread local and enabled only by an independent differential.
-#[derive(Clone, Debug)]
-pub(crate) struct TemporalInvocationDataProbe {
-    pub shape: novarocks_type_contract::TemporalSourceShape,
-    pub stage: usize,
-    pub message: String,
-    pub fact: novarocks_failure_contract::FailureFact,
-    pub invocation_rows: Vec<usize>,
-    pub affected_rows: Vec<usize>,
-    pub prior_errors: Vec<(usize, String)>,
-}
-thread_local! {
-    static TEMPORAL_DATA_PROBES: std::cell::RefCell<Option<Vec<TemporalInvocationDataProbe>>> =
-        const { std::cell::RefCell::new(None) };
-}
-pub(crate) struct TemporalProbeScope(Option<Vec<TemporalInvocationDataProbe>>);
-impl TemporalProbeScope {
-    pub(crate) fn enter() -> Self {
-        Self(TEMPORAL_DATA_PROBES.with(|slot| slot.replace(Some(Vec::new()))))
-    }
-    pub(crate) fn take(&self) -> Vec<TemporalInvocationDataProbe> {
-        TEMPORAL_DATA_PROBES.with(|slot| std::mem::take(slot.borrow_mut().as_mut().unwrap()))
-    }
-}
-impl Drop for TemporalProbeScope {
-    fn drop(&mut self) {
-        TEMPORAL_DATA_PROBES.with(|slot| {
-            slot.replace(self.0.take());
-        });
-    }
-}
-pub(crate) fn record_temporal_invocation_data(
-    shape: novarocks_type_contract::TemporalSourceShape,
-    stage: usize,
-    message: &str,
-    fact: novarocks_failure_contract::FailureFact,
-    invocation_rows: &[usize],
-    affected_ordinals: &[usize],
-    prior_errors: &BTreeMap<usize, novarocks_functions::RowDataError>,
-) {
-    TEMPORAL_DATA_PROBES.with(|slot| {
-        if let Some(journal) = slot.borrow_mut().as_mut() {
-            journal.push(TemporalInvocationDataProbe {
-                shape,
-                stage,
-                message: message.to_owned(),
-                fact,
-                invocation_rows: invocation_rows.to_vec(),
-                affected_rows: affected_ordinals
-                    .iter()
-                    .map(|i| invocation_rows[*i])
-                    .collect(),
-                prior_errors: prior_errors
-                    .iter()
-                    .map(|(i, e)| (invocation_rows[*i], e.message().to_owned()))
-                    .collect(),
-            });
-        }
-    });
-}
 #[path = "regexp_count_tests.rs"]
 mod regexp_count_tests;
 

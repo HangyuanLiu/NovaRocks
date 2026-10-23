@@ -193,7 +193,7 @@ struct FrontendRoleProducts {
     /// Retained because the catalog publication set observes it weakly: this
     /// is the reference that decides how long MV rediscovery reacts to newly
     /// admitted catalogs, and it ends with the role graph.
-    mv_catalog_admission: Arc<dyn crate::catalog_application::CatalogAdmissionObserver>,
+    _mv_catalog_admission: Arc<dyn crate::catalog_application::CatalogAdmissionObserver>,
     exchange_port: u16,
 }
 
@@ -387,7 +387,7 @@ async fn build_frontend_role_products(
             )
             .map_err(FrontendApplicationError::server)?,
             novarocks_mv_application::management::ProcessIncarnation::parse(
-                &uuid::Uuid::now_v7().to_string(),
+                uuid::Uuid::now_v7().to_string(),
             )
             .expect("UUIDv7 process incarnation is a valid management identity"),
         ),
@@ -573,7 +573,7 @@ async fn build_frontend_role_products(
         mv_service,
         maintenance_ports,
         mv_storage_observation,
-        mv_catalog_admission,
+        _mv_catalog_admission: mv_catalog_admission,
         exchange_port,
     })
 }
@@ -2331,7 +2331,8 @@ mod tests {
             }];
             // These bind grants freeze statement ownership without inventing a BE
             // receipt or a QueryExecutionId. This test fails before placement.
-            for token in ["first-entry"] {
+            {
+                let token = "first-entry";
                 grants.push(DomainGrant {
                     domain: "native".into(),
                     grant_id: format!("bind-{token}"),

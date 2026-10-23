@@ -20,8 +20,4 @@ pub(crate) mod change_stream;
 pub(crate) mod contract;
 pub(crate) mod sink;
 
-pub use auxiliary::{
-    WriteUnpivotMapping, WriterFinalAggregateCall, WriterFinalAggregatePlan,
-    WriterPartialAggregateCall, WriterPartialAggregatePlan, WriterUnpivotPlan,
-};
 pub use contract::ConnectorWriteInputBinding;

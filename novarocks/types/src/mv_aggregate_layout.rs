@@ -77,7 +77,7 @@ impl MvAggregateVisibleColumn {
     }
 
     pub fn data_type(&self) -> &DataType {
-        &self.value_type.data_type()
+        self.value_type.data_type()
     }
 
     pub fn nullable(&self) -> bool {
@@ -102,7 +102,6 @@ pub struct MvAggregateStateColumn {
 }
 
 impl MvAggregateStateColumn {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
         value_type: FunctionValueType,
@@ -132,7 +131,7 @@ impl MvAggregateStateColumn {
     }
 
     pub fn data_type(&self) -> &DataType {
-        &self.value_type.data_type()
+        self.value_type.data_type()
     }
 
     pub fn nullable(&self) -> bool {
@@ -236,7 +235,7 @@ impl MvAggregateRuntimeLayout {
                             state_column.aggregate_index
                         ));
                     }
-                    if !is_varbinary_data_type(&state_column.value_type.data_type()) {
+                    if !is_varbinary_data_type(state_column.value_type.data_type()) {
                         return Err(format!(
                             "aggregate MV Single state column must be Binary or LargeBinary: column={} data_type={:?}",
                             state_column.name,
@@ -290,7 +289,7 @@ impl MvAggregateRuntimeLayout {
                 MvAggregateStateRole::AvgSum | MvAggregateStateRole::AvgCount => {
                     if state_column.aggregate_index >= aggregate_count
                         || state_column.aggregate_kind != MvAggregateRuntimeKind::Avg
-                        || !is_varbinary_data_type(&state_column.value_type.data_type())
+                        || !is_varbinary_data_type(state_column.value_type.data_type())
                         || state_column.value_type.nullable()
                     {
                         return Err(format!(

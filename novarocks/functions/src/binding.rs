@@ -687,17 +687,6 @@ impl FunctionBindingDefinition {
     pub(crate) fn retain_resolver_from(&mut self, original: &Self) {
         self.resolver = original.resolver.clone();
     }
-
-    pub(crate) fn new(
-        declaration: FunctionBindingDeclaration,
-        resolver: Arc<dyn FunctionBindingResolver>,
-    ) -> Self {
-        Self {
-            declaration: Arc::new(declaration),
-            resolver: FunctionBindingResolverOwner::original(resolver),
-            pure: None,
-        }
-    }
 }
 
 /// Derive an aggregate's binding contract from the overloads it already

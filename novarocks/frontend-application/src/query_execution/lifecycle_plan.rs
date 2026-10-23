@@ -164,7 +164,7 @@ impl AttemptCredentialLeaseCollector {
             .is_empty()
     }
 
-    pub(crate) fn into_credential_leases(
+    pub(crate) fn drain_credential_leases(
         &self,
     ) -> Result<QueryCredentialLeases, DistributedQueryError> {
         let mut state = self
@@ -437,22 +437,6 @@ impl QueryCredentialLeases {
         &self.leases
     }
 
-    fn storage_route(&self) -> Option<Arc<AttemptCredentialLeaseStorageRoute>> {
-        self.storage_route.clone()
-    }
-
-    pub(crate) fn adopt_storage_resolver(&self, owner: Arc<dyn ConnectorStorageResolver>) {
-        if let Some(storage_route) = &self.storage_route {
-            storage_route.adopt(owner);
-        }
-    }
-
-    pub(crate) fn revoke_storage_resolver(&self) {
-        if let Some(storage_route) = &self.storage_route {
-            storage_route.revoke();
-        }
-    }
-
     /// Turns this attempt's frozen table into the storage capability its own
     /// commit reads through.
     ///
@@ -588,8 +572,6 @@ fn vended_storage_access_denied() -> ConnectorError {
 
 pub struct QueryInitOptions {
     execution_id: QueryExecutionId,
-    native_compatibility_id: NativeCompatibilityId,
-    live_backends: Vec<LiveBackendTarget>,
     /// Execution-owned options retained solely for sealed native fragment
     /// submission. They are not the lifecycle wire carrier.
     native_submission_options: QueryOptions,
@@ -642,8 +624,6 @@ impl QueryInitOptions {
         }
         Ok(Self {
             execution_id,
-            native_compatibility_id,
-            live_backends,
             native_submission_options: native_submission_options.runtime_options().clone(),
             query_options,
             catalog_set: CatalogSet::new([]).expect("the empty catalog set is valid"),
@@ -653,14 +633,6 @@ impl QueryInitOptions {
 
     pub const fn execution_id(&self) -> QueryExecutionId {
         self.execution_id
-    }
-
-    pub const fn native_compatibility_id(&self) -> NativeCompatibilityId {
-        self.native_compatibility_id
-    }
-
-    pub fn live_backends(&self) -> &[LiveBackendTarget] {
-        &self.live_backends
     }
 
     /// Frozen runtime options carried from Init through the sealed native
@@ -886,13 +858,13 @@ mod tests {
             .offer_vended_s3_credential_lease(&properties, vended_contribution("second-canary"))
             .expect("duplicate scope is dropped without retaining its value");
 
-        let leases = collector.into_credential_leases().expect("one-time drain");
+        let leases = collector.drain_credential_leases().expect("one-time drain");
         assert_eq!(leases.leases().len(), 1);
         assert!(
             !leases.leases()[0].descriptor().refresh_capable(),
             "an endpoint-free contribution without a provider source is not refreshable"
         );
-        assert!(collector.into_credential_leases().is_err());
+        assert!(collector.drain_credential_leases().is_err());
     }
 
     #[test]
@@ -938,7 +910,7 @@ mod tests {
             .offer_vended_s3_credential_lease(&properties, contribution)
             .expect("provider-local contribution");
 
-        let leases = collector.into_credential_leases().expect("one-time drain");
+        let leases = collector.drain_credential_leases().expect("one-time drain");
         assert!(leases.leases()[0].descriptor().refresh_capable());
         assert!(leases.leases()[0].provider().is_some());
     }
@@ -962,7 +934,7 @@ mod tests {
         assert_eq!(resolved.matched_prefix().as_str(), "s3://warehouse/data");
 
         collector
-            .into_credential_leases()
+            .drain_credential_leases()
             .expect("one-way lifecycle handoff");
         assert!(resolver.resolve_vended_s3(&request).is_err());
     }

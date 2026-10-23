@@ -17,14 +17,14 @@
 //! Sort operations retain actual Arrow causes independently of their call stage.
 use crate::runtime::fragment::{ExecutionFailure, ExecutionReason};
 use arrow::error::ArrowError;
+use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
+#[cfg(test)]
 use novarocks_failure_contract::{
-    BoundedDetail, FailureClass, FailureFact, FailureProjection, RepresentationBoundary,
-    RepresentationFacts, RepresentationLayout, domain,
+    RepresentationBoundary, RepresentationFacts, RepresentationLayout, domain,
 };
-use std::{
-    fmt,
-    num::{NonZeroU16, TryFromIntError},
-};
+use std::fmt;
+#[cfg(test)]
+use std::num::{NonZeroU16, TryFromIntError};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Operation {
@@ -34,7 +34,6 @@ pub(super) enum Operation {
     Batch,
     Concat,
     ConcatBatches,
-    EncodeRows,
 }
 #[derive(Debug)]
 enum SortOperationFailure {
@@ -42,7 +41,7 @@ enum SortOperationFailure {
         operation: Operation,
         source: ArrowError,
     },
-    Contract(BoundedDetail),
+    #[cfg(test)]
     RowIndex {
         required: usize,
         source: TryFromIntError,
@@ -52,7 +51,7 @@ impl fmt::Display for SortOperationFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Arrow { operation, source } => write!(f, "sort {operation:?} failed: {source}"),
-            Self::Contract(detail) => detail.fmt(f),
+            #[cfg(test)]
             Self::RowIndex { required, .. } => {
                 write!(f, "row index {required} exceeds UInt32Array range")
             }
@@ -63,8 +62,8 @@ impl std::error::Error for SortOperationFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Arrow { source, .. } => Some(source),
+            #[cfg(test)]
             Self::RowIndex { source, .. } => Some(source),
-            Self::Contract(_) => None,
         }
     }
 }
@@ -84,10 +83,7 @@ impl FailureProjection for SortOperationFailure {
                 FailureClass::Invariant,
                 ExecutionReason::SortOperationArrow.reason(),
             ),
-            Self::Contract(_) => FailureFact::new(
-                FailureClass::Invariant,
-                ExecutionReason::SortOperationContract.reason(),
-            ),
+            #[cfg(test)]
             Self::RowIndex { required, .. } => FailureFact::new(
                 FailureClass::Representation,
                 ExecutionReason::SortRowIndexExtent.reason(),
@@ -108,12 +104,9 @@ impl FailureProjection for SortOperationFailure {
 pub(super) fn arrow(operation: Operation, source: ArrowError) -> ExecutionFailure {
     ExecutionFailure::from_domain(SortOperationFailure::Arrow { operation, source })
 }
-pub(super) fn contract(detail: impl fmt::Display) -> ExecutionFailure {
-    ExecutionFailure::from_domain(SortOperationFailure::Contract(
-        BoundedDetail::truncating_display(detail),
-    ))
-}
-pub(super) fn row_index(required: usize) -> Result<u32, ExecutionFailure> {
+
+#[cfg(test)]
+fn row_index(required: usize) -> Result<u32, ExecutionFailure> {
     u32::try_from(required).map_err(|source| {
         ExecutionFailure::from_domain(SortOperationFailure::RowIndex { required, source })
     })
@@ -141,8 +134,7 @@ mod tests {
         let weak = Arc::downgrade(&field);
         let unsupported = DataType::Map(field.clone(), false);
         let source = arrow::row::RowConverter::new(vec![arrow::row::SortField::new(unsupported)])
-            .err()
-            .expect("Map is not a sort-row carrier");
+            .expect_err("Map is not a sort-row carrier");
         let failure = arrow(Operation::RowConverter, source);
         assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
         assert_eq!(failure.failure_fact().resource(), None);

@@ -16,7 +16,6 @@
 // under the License.
 
 use super::*;
-use crate::builtin::aggregate_mann_whitney_core::MannFailure;
 use novarocks_type_contract::{
     CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
     ExpressionEffectContext, ExpressionUseId, SemanticParameters,
@@ -431,8 +430,7 @@ fn mann_whitney_checked_creator_preserves_four_phases_and_original_control() {
                 &mut creation,
                 &stop,
             )
-            .err()
-            .expect("the original control must refuse checked preparation");
+            .expect_err("the original control must refuse checked preparation");
         assert!(matches!(
             error,
             CheckedCallPreparationFailure::Preparation(CheckedOwnerFailure::Original(

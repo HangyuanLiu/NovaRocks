@@ -42,7 +42,7 @@ pub(super) trait SchemaEmission<H> {
     ) -> Result<ValueTypeStorageLifetime, Failure<H>>;
     fn boxed(
         &mut self,
-        values: &Vec<(u32, MaterializedSchema)>,
+        values: &[(u32, MaterializedSchema)],
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Failure<H>>;
 }
@@ -80,7 +80,7 @@ impl SchemaEmission<std::convert::Infallible> for UnscopedEmission {
     }
     fn boxed(
         &mut self,
-        _: &Vec<(u32, MaterializedSchema)>,
+        _: &[(u32, MaterializedSchema)],
         _: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Failure<std::convert::Infallible>> {
         Ok(())
@@ -220,7 +220,7 @@ impl<H, F: ValueSchemaCreationFactory<H>> SchemaEmission<H> for ScopedEmission<'
     }
     fn boxed(
         &mut self,
-        values: &Vec<(u32, MaterializedSchema)>,
+        values: &[(u32, MaterializedSchema)],
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), Failure<H>> {
         // The original model already covers the complete possible trim. Its

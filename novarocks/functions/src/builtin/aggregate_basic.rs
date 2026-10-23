@@ -634,9 +634,9 @@ impl BasicComputation<'_> {
                         let diff = i32::from(target) - i32::from(input_scale);
                         let factor = 10i128
                             .checked_pow(diff.unsigned_abs())
-                            .ok_or_else(|| numeric_overflow())?;
+                            .ok_or_else(numeric_overflow)?;
                         if diff > 0 {
-                            v = v.checked_mul(factor).ok_or_else(|| numeric_overflow())?;
+                            v = v.checked_mul(factor).ok_or_else(numeric_overflow)?;
                         } else if diff < 0 {
                             v /= factor;
                         }
@@ -649,13 +649,13 @@ impl BasicComputation<'_> {
                         for _ in 0..diff.unsigned_abs() {
                             factor = factor
                                 .checked_mul(i256::from_i128(10))
-                                .ok_or_else(|| numeric_overflow())?;
+                                .ok_or_else(numeric_overflow)?;
                             w.step()?;
                         }
                         if diff > 0 {
                             v = v.wrapping_mul(factor);
                         } else if diff < 0 {
-                            v = v.checked_div(factor).ok_or_else(|| numeric_overflow())?;
+                            v = v.checked_div(factor).ok_or_else(numeric_overflow)?;
                         }
                         next.wide = next.wide.wrapping_add(v);
                     }
@@ -1094,13 +1094,13 @@ impl BasicComputation<'_> {
                 return Err(internal("basic aggregate emission changed its exact extent").into());
             }
             w.flush()?;
-            let output: ArrayRef;
-            if self.operation.boolean() {
+
+            let output: ArrayRef = if self.operation.boolean() {
                 let values = collect(&snapshot, w, |s| Ok(s.seen.then_some(s.boolean)))?;
-                output = Arc::new(BooleanArray::from(values));
+                Arc::new(BooleanArray::from(values))
             } else if self.operation == BasicOperation::CountIf {
                 let values = collect(&snapshot, w, |s| Ok(s.count))?;
-                output = Arc::new(Int64Array::from(values));
+                Arc::new(Int64Array::from(values))
             } else if intermediate && matches!(self.intermediate_type, DataType::Utf8) {
                 let values = collect(&snapshot, w, |s| {
                     Ok(if s.count == 0 {
@@ -1123,7 +1123,7 @@ impl BasicComputation<'_> {
                         })
                     })
                 })?;
-                output = Arc::new(StringArray::from(values));
+                Arc::new(StringArray::from(values))
             } else if intermediate && matches!(self.intermediate_type, DataType::Binary) {
                 let mut builder = arrow_array::builder::BinaryBuilder::new();
                 for s in &snapshot {
@@ -1173,7 +1173,7 @@ impl BasicComputation<'_> {
                     }
                     w.flush()?;
                 }
-                output = Arc::new(builder.finish());
+                Arc::new(builder.finish())
             } else if intermediate && self.operation == BasicOperation::Avg {
                 let sum: ArrayRef = match self.domain {
                     BasicStateDomain::Decimal128 => {
@@ -1208,10 +1208,10 @@ impl BasicComputation<'_> {
                     arrow_schema::Field::new("count", DataType::Int64, true),
                 ]
                 .into();
-                output = Arc::new(
+                Arc::new(
                     StructArray::try_new(fields, vec![sum, count], None)
                         .map_err(BasicStateError::StateArrow)?,
-                );
+                )
             } else if intermediate {
                 return Err(state_error(if self.operation.variance() {
                     "variance/stddev intermediate type mismatch"
@@ -1228,15 +1228,13 @@ impl BasicComputation<'_> {
                     i32::from(scale) - i32::from(self.state_scale()?.expect("decimal state scale"));
                 let factor = 10i128
                     .checked_pow(diff.unsigned_abs())
-                    .ok_or_else(|| numeric_overflow())?;
+                    .ok_or_else(numeric_overflow)?;
                 let values = collect(&snapshot, w, |s| {
                     if s.count == 0 {
                         return Ok(None);
                     }
                     let sum = if diff > 0 {
-                        s.decimal
-                            .checked_mul(factor)
-                            .ok_or_else(|| numeric_overflow())?
+                        s.decimal.checked_mul(factor).ok_or_else(numeric_overflow)?
                     } else if diff < 0 {
                         s.decimal / factor
                     } else {
@@ -1244,11 +1242,11 @@ impl BasicComputation<'_> {
                     };
                     Ok(Some(round_i128(sum, s.count)))
                 })?;
-                output = Arc::new(
+                Arc::new(
                     Decimal128Array::from(values)
                         .with_precision_and_scale(precision, scale)
                         .map_err(BasicStateError::StateArrow)?,
-                );
+                )
             } else if self.operation == BasicOperation::Avg
                 && self.domain == BasicStateDomain::Decimal256
             {
@@ -1261,7 +1259,7 @@ impl BasicComputation<'_> {
                 for _ in 0..diff.unsigned_abs() {
                     factor = factor
                         .checked_mul(i256::from_i128(10))
-                        .ok_or_else(|| numeric_overflow())?;
+                        .ok_or_else(numeric_overflow)?;
                     w.step()?;
                 }
                 let values = collect(&snapshot, w, |s| {
@@ -1271,24 +1269,22 @@ impl BasicComputation<'_> {
                         let value = if diff > 0 {
                             s.wide.wrapping_mul(factor)
                         } else if diff < 0 {
-                            s.wide
-                                .checked_div(factor)
-                                .ok_or_else(|| numeric_overflow())?
+                            s.wide.checked_div(factor).ok_or_else(numeric_overflow)?
                         } else {
                             s.wide
                         };
                         round_i256(value, s.count).map(Some).map_err(Into::into)
                     }
                 })?;
-                output = Arc::new(
+                Arc::new(
                     Decimal256Array::from(values)
                         .with_precision_and_scale(*precision, *scale)
                         .map_err(BasicStateError::StateArrow)?,
-                );
+                )
             } else {
                 let values = collect(&snapshot, w, |s| Ok(self.float_result(s)))?;
-                output = Arc::new(Float64Array::from(values));
-            }
+                Arc::new(Float64Array::from(values))
+            };
             w.flush()?;
             Ok(output)
         })

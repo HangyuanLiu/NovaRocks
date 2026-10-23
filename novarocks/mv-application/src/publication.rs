@@ -83,10 +83,6 @@ impl MvRefreshPublicationBase {
         &self.table_object_id
     }
 
-    #[expect(
-        clippy::wrong_self_convention,
-        reason = "The persisted refresh-publication accessor retains the established from-snapshot terminology."
-    )]
     pub const fn from_snapshot(&self) -> Option<i64> {
         self.from_snapshot
     }
@@ -119,7 +115,6 @@ pub struct MvRefreshPublicationIntent {
 }
 
 impl MvRefreshPublicationIntent {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         publication_id: LakePublicationId,
         target_object_id: ConnectorTableObjectId,

@@ -109,7 +109,7 @@ fn append_count_chain(
                 .collect();
             intermediate = Some(output);
             NodeKind::TopN {
-                order_by: Box::from(order),
+                order_by: order,
                 limit: 2,
                 offset: 0,
                 phase: TopNPhase::Partial {
@@ -168,7 +168,7 @@ fn append_count_chain(
         .add_top_n(
             final_topn,
             final_aggregate,
-            Box::from(order),
+            order,
             2,
             0,
             TopNPhase::Final {
@@ -264,7 +264,11 @@ fn ordered_scan_plan(
     let count = CountStar::bind(&catalog);
     let ty = ValueType::new(DataType::Utf8, nullable);
     let mut builder = FragmentBuilder::new(PROBE);
-    let keys = add_scan_typed(&mut builder, Distribution::Singleton, &[ty.clone()]);
+    let keys = add_scan_typed(
+        &mut builder,
+        Distribution::Singleton,
+        std::slice::from_ref(&ty),
+    );
     let root = append_count_chain(
         &mut builder,
         SCAN,

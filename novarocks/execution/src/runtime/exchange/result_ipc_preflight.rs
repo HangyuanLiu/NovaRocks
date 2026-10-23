@@ -234,7 +234,7 @@ pub fn preflight_typed_root_result_decode(
             return Err(extent(
                 DecodeExtent::PayloadBytes,
                 body_len as u128,
-                payload_limit as u64,
+                payload_limit,
             ));
         }
         if body_len % ARROW_IPC_ALIGNMENT != 0 {

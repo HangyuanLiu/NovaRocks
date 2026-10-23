@@ -32,6 +32,7 @@ mod extract_binding_tests;
 mod full_value_type_tests;
 pub(crate) mod functions;
 mod helpers;
+#[cfg(test)]
 pub(crate) use helpers::sql_logical_projection;
 mod literal_coercion;
 #[cfg(test)]
@@ -148,6 +149,7 @@ pub(crate) fn analyze_with_function_catalog(
 }
 
 /// Analyze using the semantic setting frozen by the SQL compiler.
+#[cfg(test)]
 pub(crate) fn analyze_with_function_catalog_and_sql_semantics(
     query: &ast::Query,
     catalog: &dyn PlannerTableProvider,
@@ -1674,16 +1676,21 @@ impl<'a> AnalyzerContext<'a> {
         // non-nullable declared output and be refused while adapting it.
         let nulled_keys: std::collections::HashSet<crate::column_id::ColumnId> = grouping_ids
             .iter()
-            .enumerate()
-            .flat_map(|(_, bitmap)| {
-                (0..total_grouping_columns).filter_map(move |idx| {
-                    let bit = total_grouping_columns - 1 - idx;
-                    (bitmap & (1u64 << bit) != 0).then_some(idx)
+            .flat_map(|bitmap| {
+                (0..total_grouping_columns).filter(move |idx| {
+                    let bit = total_grouping_columns - 1 - *idx;
+                    bitmap & (1u64 << bit) != 0
                 })
             })
-            .filter_map(|idx| match sel.group_by.get(idx).map(|key| &key.kind) {
-                Some(ExprKind::ColumnRef { column_id, .. }) => Some(*column_id),
-                _ => None,
+            .filter(|idx| {
+                matches!(
+                    sel.group_by.get(*idx).map(|key| &key.kind),
+                    Some(ExprKind::ColumnRef { .. })
+                )
+            })
+            .map(|idx| match &sel.group_by[idx].kind {
+                ExprKind::ColumnRef { column_id, .. } => *column_id,
+                _ => unreachable!("filtered grouping key is a column reference"),
             })
             .collect();
         if !nulled_keys.is_empty() {
@@ -2646,10 +2653,7 @@ impl<'a> AnalyzerContext<'a> {
             // as-is. This mirrors substitute_select_aliases_inner's coverage.
             other => other,
         };
-        TypedExpr {
-            kind,
-            value_type: value_type,
-        }
+        TypedExpr { kind, value_type }
     }
 }
 

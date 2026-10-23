@@ -132,27 +132,6 @@ fn signed_type<'a>(
     ))
 }
 
-pub(super) fn build_cow_append_query_closed(
-    selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
-    rows: &[novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal],
-    input: &novarocks_spi::connector::ConnectorWriteInputShape,
-    route: &novarocks_spi::connector::write_stack::ConnectorWriteRouteFacts,
-    contract: &novarocks_spi::connector::ConnectorMutationMatchContract,
-    preflight: Gate<'_>,
-    check: Check<'_>,
-) -> closed::Result<Query> {
-    build_cow_append_query_core(
-        selection,
-        rows,
-        input,
-        route,
-        contract,
-        Some(preflight),
-        check,
-        false,
-    )
-}
-
 pub(super) fn build_cow_append_query_materialized(
     selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
     rows: &[novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal],
@@ -246,7 +225,7 @@ fn build_cow_append_query_core(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) fn build_cow_rewrite_query_closed(
     selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
     rows: &[novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal],
@@ -657,37 +636,6 @@ fn add_bytes(a: u64, b: u64) -> closed::Result<u64> {
 // Caller first validates the sealed target/proof/base/single-file facts and
 // produces actual new target metadata layout. This scalar is NOT a public
 // authority: the private all-target caller must derive it before any clone.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn preflight_target(
-    selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
-    rows: &[novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal],
-    input: &Input,
-    route: &novarocks_spi::connector::write_stack::ConnectorWriteRouteFacts,
-    contract: &novarocks_spi::connector::ConnectorMutationMatchContract,
-    rewrite: Option<(
-        &novarocks_spi::connector::write_stack::ConnectorWriteRewriteSource,
-        &FrozenConnectorScanIdentity,
-    )>,
-    owned_target_metadata_upper: u64,
-    compiler_handoff_upper: u64,
-    recipe: &mut Recipe,
-    check: Check<'_>,
-) -> closed::Result<()> {
-    preflight_target_core(
-        selection,
-        rows,
-        input,
-        route,
-        contract,
-        rewrite,
-        owned_target_metadata_upper,
-        compiler_handoff_upper,
-        recipe,
-        check,
-        false,
-    )
-}
-
 pub(super) fn preflight_materialized_target(
     selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
     rows: &[novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal],
@@ -718,6 +666,10 @@ pub(super) fn preflight_materialized_target(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The COW preflight validates separately owned selection, schema, and connector facts; a wrapper would duplicate the route-specific contract."
+)]
 fn preflight_target_core(
     selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
     rows: &[novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal],
@@ -979,7 +931,6 @@ fn preflight_target_core(
     recipe.finish_target(target).map_err(map_footprint)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn preflight_signed_cell(
     selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
     row: novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal,

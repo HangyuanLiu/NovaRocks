@@ -531,10 +531,14 @@ mod tests {
             to_snapshot_id_inclusive: 12,
             from_read_domain: crate::delete_semantics::test_read_domain(
                 schema,
-                &[spec.clone()],
+                std::slice::from_ref(&spec),
                 11,
             ),
-            to_read_domain: crate::delete_semantics::test_read_domain(schema, &[spec.clone()], 12),
+            to_read_domain: crate::delete_semantics::test_read_domain(
+                schema,
+                std::slice::from_ref(&spec),
+                12,
+            ),
             partition_spec_jsons: BTreeMap::from([(
                 0,
                 serde_json::to_string(&spec).expect("spec json"),

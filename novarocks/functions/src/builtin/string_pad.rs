@@ -322,8 +322,8 @@ pub(super) fn evaluate_string_pad<'a>(
         output_capacity(selection.len(), 0)?;
         let mut total = 0usize;
         for (ordinal, batch_row) in selection.iter().enumerate() {
-            if let Some((text, count, pad_row)) = selected_plan(ordinal, batch_row, &mut work)? {
-                if let Some(extent) = string_repeat_pad_core::pad_into(
+            if let Some((text, count, pad_row)) = selected_plan(ordinal, batch_row, &mut work)?
+                && let Some(extent) = string_repeat_pad_core::pad_into(
                     text,
                     count,
                     || pads.value(pad_row),
@@ -334,11 +334,11 @@ pub(super) fn evaluate_string_pad<'a>(
                         extent: 0,
                         work: &mut work,
                     },
-                )? {
-                    total = total
-                        .checked_add(extent)
-                        .ok_or(KernelFailure::ResourceExhausted)?;
-                }
+                )?
+            {
+                total = total
+                    .checked_add(extent)
+                    .ok_or(KernelFailure::ResourceExhausted)?;
             }
         }
         output_capacity(selection.len(), total)?;

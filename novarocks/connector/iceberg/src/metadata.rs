@@ -30,6 +30,7 @@ use std::time::Instant;
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use bytes::Bytes;
+use novarocks_spi::connector::ConnectorProviderBindingKey;
 use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
 use novarocks_spi::connector::{
     ConnectorBeginScanRequest, ConnectorCanonicalReadPoint, ConnectorChangeWindow, ConnectorError,
@@ -37,11 +38,11 @@ use novarocks_spi::connector::{
     ConnectorInstanceId, ConnectorListNamespacesRequest, ConnectorListTablesRequest,
     ConnectorMetadata, ConnectorMutationOperationId, ConnectorNamespaceIdentity,
     ConnectorNamespaceRequest, ConnectorOperationControl, ConnectorPredicateDisposition,
-    ConnectorPredicateDispositionKind, ConnectorProviderBindingKey, ConnectorReadNamedReference,
-    ConnectorReadPurpose, ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest,
-    ConnectorReadReferenceKind, ConnectorReadSelector, ConnectorReadSnapshotLogEntry,
-    ConnectorScalarType, ConnectorScalarValue, ConnectorScan, ConnectorScanHandle,
-    ConnectorScanPlanning, ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorPredicateDispositionKind, ConnectorReadNamedReference, ConnectorReadPurpose,
+    ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind,
+    ConnectorReadSelector, ConnectorReadSnapshotLogEntry, ConnectorScalarType,
+    ConnectorScalarValue, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+    ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
     ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
     ConnectorStaticPredicate, ConnectorStaticPredicateKind, ConnectorTableDefinitionFacts,
     ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
@@ -103,7 +104,6 @@ impl GenerationOwner {
 pub struct IcebergMetadata {
     descriptor: ConnectorInstanceDescriptor,
     incarnation: ProviderBindingEpoch,
-    binding_key: ConnectorProviderBindingKey,
     runtime: Arc<IcebergMetadataContext>,
     generation_owner: Arc<GenerationOwner>,
 }
@@ -121,14 +121,9 @@ impl IcebergMetadata {
         if let Some(activity) = runtime.resources().catalog_runtime().activity() {
             activity.bind_epoch(incarnation);
         }
-        let binding_key = ConnectorProviderBindingKey {
-            instance_id: descriptor.instance_id.clone(),
-            incarnation,
-        };
         Self {
             descriptor,
             incarnation,
-            binding_key,
             runtime,
             generation_owner: Arc::new(GenerationOwner {
                 registration_lease: OnceLock::new(),
@@ -1854,7 +1849,6 @@ fn split_name_mapping(table: &IcebergTablePayload) -> Result<Option<String>, Con
         .transpose()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_data_split(
     provider: &IcebergMetadata,
     scan: &IcebergScanPayload,

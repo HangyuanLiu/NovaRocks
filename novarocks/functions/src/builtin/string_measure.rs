@@ -66,9 +66,7 @@ impl std::error::Error for MeasureFailure {
 }
 impl novarocks_failure_contract::FailureProjection for MeasureFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use novarocks_failure_contract::{
-            FailureClass, FailureFact, FailureProjection, FailureReason, domain,
-        };
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
         match self {
             Self::Int32 { .. } => crate::DataFailureReason::NumericOutOfRange.failure_fact(),
             _ => FailureFact::new(
@@ -121,16 +119,15 @@ fn compute_rows(
         }
         let row = address(ordinal, batch);
         if nullable.is_some() && row >= values.len() {
-            return Err(
-                internal("string measurement selected row is outside its checked carrier").into(),
-            );
+            return Err(internal(
+                "string measurement selected row is outside its checked carrier",
+            ));
         }
         if values.is_null(row) {
             if nullable == Some(false) {
                 return Err(internal(
                     "string measurement non-null input contains selected SQL NULL",
-                )
-                .into());
+                ));
             }
             output(None)?;
             continue;

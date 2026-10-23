@@ -180,10 +180,6 @@ pub(super) fn prepare_definition(
     Ok((definition, properties))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The control-plane view operation preserves its established explicit input contract."
-)]
 #[cfg(test)]
 pub(crate) fn create_view(
     runtime: &IcebergMetadataContext,

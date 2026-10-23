@@ -999,8 +999,10 @@ fn array_sortby_public_constant_view_broadcasts_original_ordinal_through_actual_
     let key = ScalarInvocationSource::ConstantView(
         crate::CanonicalConstantView::from_authored_projection(&key_original, &key_canonical),
     );
-    let OwnedArraySource::ConstantView(owned_original, owned_values) =
-        OwnedArraySource::from_source(&source)
+    let OwnedArraySource::ConstantView {
+        _value: owned_original,
+        _array: owned_values,
+    } = OwnedArraySource::from_source(&source)
     else {
         panic!("the installed source must retain the explicit ConstantView");
     };

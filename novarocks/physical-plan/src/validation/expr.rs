@@ -453,7 +453,7 @@ pub(crate) fn validate_expression(
             }
             if let Some(input) = fragment.expressions().get(*expr)
                 && !novarocks_type_contract::decimal_error_policy_cast_supported(
-                    &input.ty.data_type(),
+                    input.ty.data_type(),
                     target,
                     *decimal_overflow_policy,
                 )
@@ -468,8 +468,7 @@ pub(crate) fn validate_expression(
             // statement may stand this value where null is admitted. It may
             // not claim the reverse: a null-admitting input does not stop
             // admitting null by being converted.
-            if !novarocks_type_contract::arrow_data_types_exact(&expression.ty.data_type(), target)
-            {
+            if !novarocks_type_contract::arrow_data_types_exact(expression.ty.data_type(), target) {
                 // Both types, because which half drifted is the diagnosis.
                 errors.push(ValidationError::new(
                     &path,
@@ -571,7 +570,7 @@ pub(crate) fn validate_expression(
                 fragment
                     .expressions()
                     .get(id)
-                    .is_some_and(|value| !is_utf8(&value.ty.data_type()))
+                    .is_some_and(|value| !is_utf8(value.ty.data_type()))
             }) {
                 errors.push(ValidationError::new(
                     &path,
@@ -609,7 +608,7 @@ pub(crate) fn validate_literal_type(
         crate::LiteralValue::UInt64(_) => *ty.data_type() == DataType::UInt64,
         crate::LiteralValue::Float64Bits(_) => *ty.data_type() == DataType::Float64,
         crate::LiteralValue::LargeInt(_) => {
-            novarocks_type_contract::is_largeint_data_type(&ty.data_type())
+            novarocks_type_contract::is_largeint_data_type(ty.data_type())
                 && is_numeric_value_type(ty)
         }
         crate::LiteralValue::Decimal128(_) => {
@@ -618,7 +617,7 @@ pub(crate) fn validate_literal_type(
         crate::LiteralValue::Decimal256(_) => {
             matches!(ty.data_type(), DataType::Decimal256(_, _))
         }
-        crate::LiteralValue::Utf8(_) => is_utf8(&ty.data_type()),
+        crate::LiteralValue::Utf8(_) => is_utf8(ty.data_type()),
         crate::LiteralValue::Binary(_) => {
             matches!(
                 ty.data_type(),
@@ -1679,7 +1678,8 @@ mod value_arithmetic_tests {
             DataType::Float64,
             DataType::Decimal128(18, 4),
         ] {
-            for nullable in [true] {
+            {
+                let nullable = true;
                 assert!(
                     unary_fragment(
                         ValueType::new(carrier.clone(), nullable),

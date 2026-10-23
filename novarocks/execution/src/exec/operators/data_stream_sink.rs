@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+#[cfg(test)]
+use crate::exec::pipeline::operator::ExitProgress;
 use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 
@@ -216,7 +218,7 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::pipeline::{
     input::{PreparedInput, RawInput},
-    operator::{ExitObservation, ExitProgress, FinishWatch, InputEncodingPolicy, Operator},
+    operator::{ExitObservation, FinishWatch, InputEncodingPolicy, Operator},
     shape::{ControlStep, SinkKernel, SinkStep, Transform},
     step::{AdmissionNext, NextStep, WaitFact, WaitReason},
     step_context::StepContext,
@@ -2119,7 +2121,7 @@ impl DataStreamSinkOperator {
             &mut state.instances,
             &state.keys.program,
             &state.keys.sites,
-            &control,
+            control,
         )?;
         let instances = state
             .instances
@@ -2127,7 +2129,7 @@ impl DataStreamSinkOperator {
             .ok_or_else(|| stream_contract("compiled partition key instances are absent"))?;
         let mut arrays = Vec::with_capacity(instances.len());
         for (instance, site) in instances.iter_mut().zip(&state.keys.sites) {
-            let array = evaluate_all(instance, *site, &chunk.record_batch(), &control)?;
+            let array = evaluate_all(instance, *site, chunk.record_batch(), control)?;
             // Same refusal as the legacy sink's partition-key type check.
             if matches!(array.data_type(), DataType::LargeBinary) {
                 return Err(stream_contract(

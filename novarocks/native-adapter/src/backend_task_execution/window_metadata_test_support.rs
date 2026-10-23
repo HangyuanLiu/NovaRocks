@@ -169,10 +169,6 @@ pub fn prepare_window_metadata_for_test(
 }
 /// A closed, single-fragment fixture passes explicit empty capability sets.
 /// The original builder still validates that they cover the actual program.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The test inputs preserve the actual program and preparation owners"
-)]
 pub fn prepare_window_metadata_graph_for_test(
     compiled: CompiledTaskProgram,
     functions: Arc<SealedExecutionFunctionSet>,

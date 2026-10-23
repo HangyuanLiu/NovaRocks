@@ -190,11 +190,9 @@ impl ProgramTypedChannels {
             }
         }
         let mut entries = BTreeMap::new();
-        let mut entry_insertions = 0usize;
-        for (site, ty) in channels {
+        for (entry_insertions, (site, ty)) in channels.into_iter().enumerate() {
             work.step()?;
             creation.before_tree_insert::<ProgramChannelTypeError, ProgramChannelSite, FunctionValueType>(entry_insertions, &mut work)?;
-            entry_insertions += 1;
             if entries.insert(site, ty).is_some() {
                 return Err(ProgramChannelTypeError::DuplicateSite.into());
             }
@@ -1138,7 +1136,7 @@ fn same_value(
     {
         return Err(ProgramChannelTypeError::TypeMismatch);
     };
-    same_carrier(&actual.data_type(), &expected.data_type(), work)
+    same_carrier(actual.data_type(), expected.data_type(), work)
 }
 
 #[cfg(test)]

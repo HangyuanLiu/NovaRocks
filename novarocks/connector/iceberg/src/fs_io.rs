@@ -480,10 +480,11 @@ impl Storage for IcebergFsStorage {
             let listed = entry.path().trim_start_matches('/');
             if let Some(relative) = listed.strip_prefix(prefix) {
                 let relative = relative.trim_start_matches('/');
-                if let Some(directory) = relative.strip_suffix('/') {
-                    if !directory.is_empty() && !directory.contains('/') {
-                        directories.push(directory)?;
-                    }
+                if let Some(directory) = relative.strip_suffix('/')
+                    && !directory.is_empty()
+                    && !directory.contains('/')
+                {
+                    directories.push(directory)?;
                 }
             }
         }

@@ -247,15 +247,15 @@ impl EdgeRetirement {
 }
 
 pub(crate) struct RetainedDriverOwners {
-    pub process_panic: ProcessPanicCustody,
-    pub operators: Vec<OperatorInstance>,
-    pub edges: Vec<EdgeRetirement>,
-    pub edge_inputs: Vec<Option<RawInput>>,
-    pub upstream_grant: Option<(usize, RootInputPermit)>,
-    pub runtime: Arc<RuntimeState>,
-    pub query_memory: Option<QueryMemoryBinding>,
-    pub edge_trackers: Vec<Option<Arc<MemTracker>>>,
-    pub event_sink: Arc<dyn FragmentEventSink>,
+    pub _process_panic: ProcessPanicCustody,
+    pub _operators: Vec<OperatorInstance>,
+    pub _edges: Vec<EdgeRetirement>,
+    pub _edge_inputs: Vec<Option<RawInput>>,
+    pub _upstream_grant: Option<(usize, RootInputPermit)>,
+    pub _runtime: Arc<RuntimeState>,
+    pub _query_memory: Option<QueryMemoryBinding>,
+    pub _edge_trackers: Vec<Option<Arc<MemTracker>>>,
+    pub _event_sink: Arc<dyn FragmentEventSink>,
 }
 /// One original driver has exactly one slot. Only an unresolved Drop retains
 /// its own slot; there is no process-global list or unbounded parking service.
@@ -401,23 +401,13 @@ impl Drop for TaskExitLoan<'_> {
 /// `process` enters ordinary work only until its first unwind. Exit hooks and
 /// observers then have their own once scopes. This original driver slot keeps
 /// raw payloads outside the accepted Task error/source graph.
+#[derive(Default)]
 pub(crate) struct ProcessPanicCustody {
     primary: [Option<ManuallyDrop<Box<dyn std::any::Any + Send>>>; 2],
     secondary: [Option<ManuallyDrop<Box<dyn std::any::Any + Send>>>; 2],
     failure: Option<ExecutionFailure>,
     unresolved: bool,
     watch: Option<Arc<crate::runtime::observable::Observable>>,
-}
-impl Default for ProcessPanicCustody {
-    fn default() -> Self {
-        Self {
-            primary: [None, None],
-            secondary: [None, None],
-            failure: None,
-            unresolved: false,
-            watch: None,
-        }
-    }
 }
 impl ProcessPanicCustody {
     pub(crate) fn new() -> Self {
@@ -456,18 +446,17 @@ impl ProcessPanicCustody {
             failures.report_cleanup(&cause);
         }
         for index in [1, 0] {
-            if let Some(mut payload) = self.primary[index].take() {
-                if let Err(secondary) =
+            if let Some(mut payload) = self.primary[index].take()
+                && let Err(secondary) =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
                         ManuallyDrop::drop(&mut payload);
                     }))
-                {
-                    // Save before any subsequent reporting or foreign action.
-                    self.secondary[index] = Some(ManuallyDrop::new(secondary));
-                    self.unresolved = true;
-                    failures.report_unresolved_exit(&cause);
-                    failures.report_cleanup(&cause);
-                }
+            {
+                // Save before any subsequent reporting or foreign action.
+                self.secondary[index] = Some(ManuallyDrop::new(secondary));
+                self.unresolved = true;
+                failures.report_unresolved_exit(&cause);
+                failures.report_cleanup(&cause);
             }
         }
         cause

@@ -54,19 +54,11 @@ impl CopyBufferPeak {
     /// The pinned take_bytes author sums actual selected offsets first, then
     /// creates offsets Vec(rows+1) and values Vec(payload) with exact capacity.
     /// Exact Vec capacity comes from that author, not a UTF8-per-row estimate.
-    pub(super) fn exact(bytes: usize) -> Result<Self, CopyError> {
-        buffer_extent(bytes, 1)?;
-        Ok(Self {
-            initial: bytes,
-            maximum_required: bytes,
-            retained_upper: bytes,
-            transient_upper: bytes,
-        })
-    }
     /// Rust 1.92 RawVec::grow_amortized uses
     /// max(2*capacity, required, min_non_zero_cap). The initial reservation
     /// comes from the original builder; this describes its request layouts,
     /// not a caller budget or the eventual allocator usable-size statistic.
+    #[cfg(test)]
     pub(super) fn vec<T>(
         initial_elements: usize,
         maximum_elements: usize,
@@ -102,11 +94,21 @@ impl CopyBufferPeak {
     }
     /// Original String::new + fmt/write uses the SAME u8 RawVec growth.
     /// An original format! capacity hint must be passed as its initial fact.
+    #[cfg(test)]
     pub(super) fn string(
         original_hint: usize,
         maximum_rendered_bytes: usize,
     ) -> Result<Self, CopyError> {
         Self::vec::<u8>(original_hint, maximum_rendered_bytes)
+    }
+    pub(super) fn exact(bytes: usize) -> Result<Self, CopyError> {
+        buffer_extent(bytes, 1)?;
+        Ok(Self {
+            initial: bytes,
+            maximum_required: bytes,
+            retained_upper: bytes,
+            transient_upper: bytes,
+        })
     }
     pub(super) fn retained_upper(self) -> usize {
         self.retained_upper

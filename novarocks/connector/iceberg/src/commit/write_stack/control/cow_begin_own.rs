@@ -93,9 +93,6 @@ pub(super) struct LoadedFacts {
     _original: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
 }
 impl LoadedFacts {
-    pub(super) fn facts(&self) -> &IcebergWriteTableFacts {
-        &self.facts
-    }
     pub(super) fn retained_upper(&self) -> u64 {
         self.retained_upper
     }
@@ -103,20 +100,35 @@ impl LoadedFacts {
         self.facts
     }
 }
-pub(super) fn loaded_facts<E>(
-    metadata: &TableMetadata,
-    namespace: &str,
-    table: &str,
-    target_ref: &str,
-    base_snapshot_id: Option<i64>,
-    base_sequence_number: i64,
-    schema_id: i32,
-    spec_id: i32,
-    format_version: u8,
-    original_caller_existing: u64,
-    validation: &LocationValidationUpper,
-    scope: &dyn OriginalScope<E>,
-) -> Result<LoadedFacts, Failure<E>> {
+pub(super) struct LoadedFactsInput<'a, E> {
+    pub(super) metadata: &'a TableMetadata,
+    pub(super) namespace: &'a str,
+    pub(super) table: &'a str,
+    pub(super) target_ref: &'a str,
+    pub(super) base_snapshot_id: Option<i64>,
+    pub(super) base_sequence_number: i64,
+    pub(super) schema_id: i32,
+    pub(super) spec_id: i32,
+    pub(super) format_version: u8,
+    pub(super) original_caller_existing: u64,
+    pub(super) validation: &'a LocationValidationUpper,
+    pub(super) scope: &'a dyn OriginalScope<E>,
+}
+pub(super) fn loaded_facts<E>(input: LoadedFactsInput<'_, E>) -> Result<LoadedFacts, Failure<E>> {
+    let LoadedFactsInput {
+        metadata,
+        namespace,
+        table,
+        target_ref,
+        base_snapshot_id,
+        base_sequence_number,
+        schema_id,
+        spec_id,
+        format_version,
+        original_caller_existing,
+        validation,
+        scope,
+    } = input;
     let mut uuid_buf = [0u8; 36];
     let uuid = metadata.uuid().hyphenated().encode_lower(&mut uuid_buf);
     let explicit_data = metadata.properties().get("write.data.path");
@@ -400,6 +412,7 @@ pub(super) struct SignedInput {
     _original: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
 }
 impl SignedInput {
+    #[cfg(test)]
     pub(super) fn shape(&self) -> &novarocks_spi::connector::ConnectorWriteInputShape {
         &self.shape
     }

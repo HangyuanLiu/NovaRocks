@@ -636,15 +636,14 @@ impl ViewSink for TableResponseSink {
                 if id.is_some() && id == self.request.snapshot {
                     self.snapshot_present = true;
                 }
-                if let Some(id) = id {
-                    if let Some(index) = self
+                if let Some(id) = id
+                    && let Some(index) = self
                         .request
                         .removed_snapshots
                         .iter()
                         .position(|candidate| *candidate == id)
-                    {
-                        self.retention_snapshots_present[index] = true;
-                    }
+                {
+                    self.retention_snapshots_present[index] = true;
                 }
             }
             TableNode::TargetRefSnapshotId => {

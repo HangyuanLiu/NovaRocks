@@ -174,9 +174,7 @@ pub fn merge_source(
 ) -> Result<(), TimeTextError> {
     for (idx, value) in out.iter_mut().enumerate() {
         work.step()?;
-        if idx < source.len() && matches!(mode, MergeMode::Override) {
-            *value = source[idx];
-        } else if value.is_none() && idx < source.len() {
+        if idx < source.len() && (matches!(mode, MergeMode::Override) || value.is_none()) {
             *value = source[idx];
         }
     }

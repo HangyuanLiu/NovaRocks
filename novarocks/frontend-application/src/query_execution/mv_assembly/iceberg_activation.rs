@@ -30,8 +30,7 @@ use novarocks_spi::connector::{
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::mv_assembly::refresh_artifact::{
-    MvIncrementalWriteRequest, MvStagedRefreshWriteMode, PreparedMvFirstRefreshWrite,
-    PreparedMvMetadataOnlyWrite,
+    MvIncrementalWriteRequest, PreparedMvFirstRefreshWrite, PreparedMvMetadataOnlyWrite,
 };
 use crate::query_execution::mv_assembly::refresh_handoff::{
     PreparedMvRefreshWrite, PreparedMvRefreshWriteArtifact,
@@ -455,10 +454,6 @@ fn incremental_publication_write_input(
 /// The publication id travels inside the managed intent and nowhere else. It
 /// reaches the snapshot the commit writes -- that is what the publication fence
 /// reads back -- but no writer recipe, commit fragment, or backend sees it.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Opening an incremental publication session needs each independently frozen request, publication, schema, and lease fact."
-)]
 pub(crate) fn begin_incremental_connector_write_session(
     request: &MvIncrementalWriteRequest,
     target_table: &novarocks_spi::connector::ConnectorTableHandle,

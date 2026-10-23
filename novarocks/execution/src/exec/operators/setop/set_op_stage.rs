@@ -46,28 +46,35 @@ struct SetOpStageControllerInner {
 }
 
 impl SetOpStageController {
+    #[cfg(test)]
     pub(crate) fn new(
         op_name: &'static str,
         stage_producer_counts: Vec<usize>,
     ) -> crate::runtime::fragment::ExecutionResult<Self> {
+        let node_failure = |detail: std::fmt::Arguments<'_>| {
+            let detail = novarocks_failure_contract::BoundedDetail::truncating_display(detail);
+            crate::exec::fragment::error::ExecPlanBuildError::new(
+                crate::exec::fragment::error::ExecPlanInvariant::Node,
+                detail.as_str(),
+            )
+            .into()
+        };
         if stage_producer_counts.len() < 2 {
-            return Err(crate::exec::fragment::error::node_construction_failure(
-                format_args!(
-                    "{} expects at least 2 inputs, got {}",
-                    op_name,
-                    stage_producer_counts.len()
-                ),
-            ));
+            return Err(node_failure(format_args!(
+                "{} expects at least 2 inputs, got {}",
+                op_name,
+                stage_producer_counts.len()
+            )));
         }
         if let Some(stage) = stage_producer_counts.iter().position(|count| *count == 0) {
-            return Err(crate::exec::fragment::error::node_construction_failure(
-                format_args!("{op_name} stage {stage} has no declared producer"),
-            ));
+            return Err(node_failure(format_args!(
+                "{op_name} stage {stage} has no declared producer"
+            )));
         }
         let stage_total = stage_producer_counts.len();
         let remaining_producers = stage_producer_counts
             .into_iter()
-            .map(|n| AtomicUsize::new(n))
+            .map(AtomicUsize::new)
             .collect::<Vec<_>>();
         Ok(Self {
             inner: Arc::new(SetOpStageControllerInner {

@@ -261,6 +261,11 @@ pub struct ReadScanProjectionLimits {
     pub max_coexisting_source_and_request_bytes: usize,
     pub max_work: usize,
 }
+pub type DecodedReadScans = (
+    Vec<(NodeId, c::FrozenConnectorRead)>,
+    ReadScanProjectionFacts,
+);
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReadScanProjectionFacts {
     pub scan_count: usize,
@@ -1774,13 +1779,7 @@ pub fn decode_read_scans_observed(
     limits: ReadScanProjectionLimits,
     admit: &mut impl FnMut(&ReadScanProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<
-    (
-        Vec<(NodeId, c::FrozenConnectorRead)>,
-        ReadScanProjectionFacts,
-    ),
-    E,
-> {
+) -> Result<DecodedReadScans, E> {
     decode_read_scans_core::<Infallible>(
         scans,
         expressions,
@@ -1803,13 +1802,7 @@ pub fn decode_read_scans_with_creator<H>(
     admit: &mut impl FnMut(&ReadScanProjectionFacts) -> Result<(), CompileControlError>,
     creation: &mut ValueSchemaCreation<'_, H>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<
-    (
-        Vec<(NodeId, c::FrozenConnectorRead)>,
-        ReadScanProjectionFacts,
-    ),
-    ProjectionFailure<E, H>,
-> {
+) -> Result<DecodedReadScans, ProjectionFailure<E, H>> {
     decode_read_scans_core(
         scans,
         expressions,
@@ -1831,13 +1824,7 @@ fn decode_read_scans_core<H>(
     admit: &mut impl FnMut(&ReadScanProjectionFacts) -> Result<(), CompileControlError>,
     mut creation: Option<&mut ValueSchemaCreation<'_, H>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<
-    (
-        Vec<(NodeId, c::FrozenConnectorRead)>,
-        ReadScanProjectionFacts,
-    ),
-    ProjectionFailure<E, H>,
-> {
+) -> Result<DecodedReadScans, ProjectionFailure<E, H>> {
     let mut m = Model::new::<(NodeId, c::FrozenConnectorRead)>(scans.len(), source_retained_bytes)?;
     m.items(add(
         expressions.len(),
@@ -2178,12 +2165,12 @@ fn decode_read_scans_core<H>(
                 bindings.push(binding.clone());
                 work.step()?;
             }
-            if bindings_layout.size() != 0 {
-                if let Some(creation) = creation.as_deref_mut() {
-                    creation
-                        .observe_opaque_upper_bound(bindings_layout.size())
-                        .map_err(ProjectionFailure::Host)?;
-                }
+            if bindings_layout.size() != 0
+                && let Some(creation) = creation.as_deref_mut()
+            {
+                creation
+                    .observe_opaque_upper_bound(bindings_layout.size())
+                    .map_err(ProjectionFailure::Host)?;
             }
             request_read_layout(
                 &mut creation,

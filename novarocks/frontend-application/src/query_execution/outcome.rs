@@ -46,6 +46,7 @@ impl std::fmt::Debug for QueryExecutionResult {
 }
 
 pub enum DistributedQueryOutcome {
+    #[cfg(test)]
     Result(ResultExecutionOutcome),
     CowMatch(novarocks_spi::connector::ConnectorRowMutationSelection),
     Write(WriteExecutionOutcome),
@@ -53,10 +54,12 @@ pub enum DistributedQueryOutcome {
     Statistics(StatisticsExecutionOutcome),
 }
 
+#[cfg(test)]
 pub struct ResultExecutionOutcome {
     result: QueryResult,
 }
 
+#[cfg(test)]
 impl ResultExecutionOutcome {
     pub(crate) fn into_query_result(self) -> QueryResult {
         self.result
@@ -139,10 +142,6 @@ impl WriteExecutionOutcome {
         self.write_session
     }
 
-    pub(crate) const fn write_session(&self) -> Option<&ConnectorWriteSessionCompletion> {
-        self.write_session.as_ref()
-    }
-
     /// Carry the write terminal this outcome holds into the role-neutral
     /// execution result.
     pub(crate) fn into_execution_result(self) -> QueryExecutionResult {
@@ -198,6 +197,7 @@ impl ProfileExecutionOutcome {
 impl DistributedQueryOutcome {
     pub fn intent(&self) -> DistributedQueryIntent {
         match self {
+            #[cfg(test)]
             Self::Result(_) => DistributedQueryIntent::Result,
             Self::CowMatch(_) => DistributedQueryIntent::CowMatch,
             Self::Write(_) => DistributedQueryIntent::Write,
@@ -221,6 +221,7 @@ impl DistributedQueryOutcome {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn into_result(self) -> Result<ResultExecutionOutcome, DistributedQueryError> {
         match self {
             Self::Result(outcome) => Ok(outcome),
@@ -299,6 +300,7 @@ impl QueryOutcomeFactory {
         clippy::wrong_self_convention,
         reason = "The established outcome translator name describes its execution-result input."
     )]
+    #[cfg(test)]
     pub(crate) fn from_execution_result(
         self,
         result: QueryExecutionResult,
@@ -365,6 +367,7 @@ impl QueryOutcomeFactory {
         Ok(DistributedQueryOutcome::CowMatch(selection))
     }
 
+    #[cfg(test)]
     pub fn result(
         self,
         result: QueryResult,

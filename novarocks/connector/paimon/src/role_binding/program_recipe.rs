@@ -17,10 +17,9 @@
 
 //! Full frozen-input validation, independent of Paimon runtime capabilities.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use bytes::Bytes;
 use novarocks_connector_contract::{
     ConnectorReadArtifactCoverage, ConnectorReadBinding, ConnectorReadDistribution,
@@ -43,7 +42,7 @@ use super::{
     PaimonReadRecipeCompiler, decode_column, decode_read_view, decode_table, encode_column,
     encode_read_view, encode_table,
 };
-use crate::{PROVIDER_ID, domain::PaimonColumn, schema::PaimonDataType};
+use crate::{PROVIDER_ID, domain::PaimonColumn};
 
 type Failure = PureProviderCompileError<ConnectorCodecError>;
 const FIELD_ID_KEY: &str = "PARQUET:field_id";
@@ -415,10 +414,8 @@ fn digest_bytes(
 
 /// The public schema of a frozen Paimon read of `columns`.
 ///
-/// Each field comes from `column_field`, the same author the pure compiler
-/// requires every public field to equal exactly, with the PAI-1 physical
-/// logical domain and no schema metadata. A column must be one of the frozen
-/// table's own catalog-visible columns; its alias never names its field.
+/// A column must be one of the frozen table's catalog-visible columns; its
+/// alias never replaces its source field identity.
 pub(super) fn public_read_schema(
     table_columns: &[PaimonColumn],
     columns: &[&PaimonColumn],
@@ -428,33 +425,6 @@ pub(super) fn public_read_schema(
 }
 
 mod typed_source;
-
-/// The admitted PAI-1 projection of the SDK build_target_arrow_schema author.
-/// Field ID metadata is source identity; scan variables are separate aliases.
-#[cfg(test)]
-fn column_field(column: &PaimonColumn) -> Field {
-    let data_type = match column.data_type() {
-        PaimonDataType::Boolean => DataType::Boolean,
-        PaimonDataType::Int8 => DataType::Int8,
-        PaimonDataType::Int16 => DataType::Int16,
-        PaimonDataType::Int32 => DataType::Int32,
-        PaimonDataType::Int64 => DataType::Int64,
-        PaimonDataType::Float32 => DataType::Float32,
-        PaimonDataType::Float64 => DataType::Float64,
-        PaimonDataType::Decimal128 { precision, scale } => {
-            DataType::Decimal128(precision, scale as i8)
-        }
-        PaimonDataType::Utf8 => DataType::Utf8,
-        PaimonDataType::Binary => DataType::Binary,
-        PaimonDataType::Date32 => DataType::Date32,
-        PaimonDataType::TimestampMillis { .. } => DataType::Timestamp(TimeUnit::Millisecond, None),
-        PaimonDataType::TimestampMicros { .. } => DataType::Timestamp(TimeUnit::Microsecond, None),
-    };
-    Field::new(column.name(), data_type, column.nullable()).with_metadata(HashMap::from([(
-        FIELD_ID_KEY.to_owned(),
-        column.field_id().to_string(),
-    )]))
-}
 
 // Retained while Paimon-specific tests are suspended.
 #[cfg(all(test, any()))]

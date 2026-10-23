@@ -139,35 +139,36 @@ impl SqlConstantEvaluator for Recorder {
         let mut capture_guard = CAPTURE_STATE.lock().unwrap();
         let state = capture_guard.as_mut().expect("active fixture capture");
         state.observed.push(request.clone());
-        let shape = match (&state.node, &request.kind) {
-            (FixtureNode::Function { .. }, FrozenFoldNode::Call(_)) => true,
-            (FixtureNode::Cast(_), FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Cast { .. })) => {
-                true
-            }
-            (
-                FixtureNode::UnaryOp(UnOp::Not),
-                FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Not),
-            ) => true,
-            (
-                FixtureNode::UnaryOp(UnOp::Negate),
-                FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Negate),
-            ) => true,
-            (
-                FixtureNode::UnaryOp(UnOp::BitwiseNot),
-                FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::BitNot),
-            ) => true,
-            (
-                FixtureNode::BinaryOp(_, _),
-                FrozenFoldNode::Intrinsic(
-                    FrozenFoldIntrinsic::Arithmetic { .. }
-                    | FrozenFoldIntrinsic::Comparison { .. }
-                    | FrozenFoldIntrinsic::NullSafeEq { .. }
-                    | FrozenFoldIntrinsic::Conjunction
-                    | FrozenFoldIntrinsic::Disjunction,
-                ),
-            ) => true,
-            _ => false,
-        };
+        let shape = matches!(
+            (&state.node, &request.kind),
+            (FixtureNode::Function { .. }, FrozenFoldNode::Call(_))
+                | (
+                    FixtureNode::Cast(_),
+                    FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Cast { .. })
+                )
+                | (
+                    FixtureNode::UnaryOp(UnOp::Not),
+                    FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Not)
+                )
+                | (
+                    FixtureNode::UnaryOp(UnOp::Negate),
+                    FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Negate)
+                )
+                | (
+                    FixtureNode::UnaryOp(UnOp::BitwiseNot),
+                    FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::BitNot)
+                )
+                | (
+                    FixtureNode::BinaryOp(_, _),
+                    FrozenFoldNode::Intrinsic(
+                        FrozenFoldIntrinsic::Arithmetic { .. }
+                            | FrozenFoldIntrinsic::Comparison { .. }
+                            | FrozenFoldIntrinsic::NullSafeEq { .. }
+                            | FrozenFoldIntrinsic::Conjunction
+                            | FrozenFoldIntrinsic::Disjunction
+                    )
+                )
+        );
         let sources_match = state.sources.as_ref().is_none_or(|sources| {
             sources.len() == request.args.len()
                 && sources.iter().zip(&request.args).all(|(expected, actual)| {
@@ -1122,7 +1123,7 @@ fn ordinary_row_error_and_invalid_arithmetic_observe_exact_original_completion()
     });
     let mut request = binary(BinOp::Div, vec![i32(1), i32(0)], DataType::Float64);
     request.result_type = request.result_type.with_nullable(false).unwrap();
-    assert_all_callbacks(&request, |result| assert_invalid_arithmetic(result));
+    assert_all_callbacks(&request, assert_invalid_arithmetic);
 }
 #[test]
 fn source_annotations_do_not_mint_a_type_resource_refusal() {

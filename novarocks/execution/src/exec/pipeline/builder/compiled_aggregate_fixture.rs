@@ -55,15 +55,14 @@ use novarocks_physical_plan::{
     HashDefinition, HashPartitionScheme, LiteralValue, NodeId, NodeKind, OutputPort,
     PartitionCountDomain, PartitionCountParameter, PartitionCountParameterId, PartitionSpaceId,
     PhysicalCallBinding, PhysicalCallDefinition, PhysicalCallRequest, PhysicalCallSite,
-    PhysicalExpressionRoots, PhysicalNode, PhysicalPlan, PhysicalProperties, PhysicalRootUses,
-    PipelineDopDomain, PlanLimits, PropertyProofProjectionLimits, RowMultiplicity,
-    StaticFunctionArgument, ValueId, ValueOrigin, extract_fragment_packages,
+    PhysicalNode, PhysicalPlan, PhysicalProperties, PhysicalRootUses, PipelineDopDomain,
+    PlanLimits, PropertyProofProjectionLimits, RowMultiplicity, StaticFunctionArgument, ValueId,
+    ValueOrigin, extract_fragment_packages,
 };
 use novarocks_type_contract::{
-    CallProofScope, CompileCheckpoints, CompilePhase, ControlShape, DecimalOverflowPolicy,
-    EvaluationDemand, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
-    ExpressionEffects, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
-    FunctionValueType, SemanticParameters,
+    CallProofScope, CompileCheckpoints, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
+    EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEffects,
+    ExpressionEvaluationDomain, ExpressionUseId, FunctionValueType, SemanticParameters,
 };
 use novarocks_types::UniqueId;
 
@@ -91,13 +90,13 @@ use crate::runtime::fragment::sink::materialize_compiled_sink;
 use crate::runtime::runtime_state::RuntimeState;
 
 /// The frozen decimal policy every fixture call authors explicitly.
-pub(super) const POLICY: DecimalOverflowPolicy = DecimalOverflowPolicy::ReportError;
+pub(crate) const POLICY: DecimalOverflowPolicy = DecimalOverflowPolicy::ReportError;
 /// Relational use IDs start far above every expression use of a fixture.
 const RELATIONAL_USE_BASE: u32 = 1_000_000;
 
 /// Direct operator fixtures install the same original tracker/control host as
 /// pipeline preparation; the representation profile has one production owner.
-pub(super) fn runtime_construction_factory(
+pub(crate) fn runtime_construction_factory(
     tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
     error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
 ) -> Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory> {
@@ -111,7 +110,7 @@ pub(super) fn runtime_construction_factory(
 
 /// A sealed subset of the real builtin catalogue holding exactly the named
 /// aggregate owners with their installed ABIs.
-pub(super) fn aggregate_catalog(owners: &[(&str, PureKernelAbi)]) -> PureEngineFunctionCatalog {
+pub(crate) fn aggregate_catalog(owners: &[(&str, PureKernelAbi)]) -> PureEngineFunctionCatalog {
     let actual =
         novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
     let mut builder = EngineFunctionCatalogBuilder::new();
@@ -157,7 +156,7 @@ pub(super) fn aggregate_catalog(owners: &[(&str, PureKernelAbi)]) -> PureEngineF
 }
 
 /// COUNT, MIN and MAX: the owners Stage 1 runs.
-pub(super) fn extrema_catalog() -> PureEngineFunctionCatalog {
+pub(crate) fn extrema_catalog() -> PureEngineFunctionCatalog {
     aggregate_catalog(&[
         ("count", PureKernelAbi::AggregateWindowV1),
         ("min", PureKernelAbi::AggregateWindowV1),
@@ -167,7 +166,7 @@ pub(super) fn extrema_catalog() -> PureEngineFunctionCatalog {
 
 /// One resolved aggregate selection, from the real resolver.
 #[derive(Clone, Debug)]
-pub(super) struct Bound {
+pub(crate) struct Bound {
     pub function_id: FunctionId,
     pub selected: FunctionBindingSelection,
     pub semantics: novarocks_functions::FunctionSemantics,
@@ -176,13 +175,13 @@ pub(super) struct Bound {
 }
 
 impl Bound {
-    pub(super) fn result_type(&self) -> FunctionValueType {
+    pub(crate) fn result_type(&self) -> FunctionValueType {
         match &self.selected.result_type {
             FunctionResultType::Scalar(value) => value.clone(),
             other => panic!("aggregate result is scalar, got {other:?}"),
         }
     }
-    pub(super) fn intermediate_type(&self) -> FunctionValueType {
+    pub(crate) fn intermediate_type(&self) -> FunctionValueType {
         self.selected
             .aggregate
             .as_ref()
@@ -191,14 +190,14 @@ impl Bound {
             .clone()
     }
     /// The value type a call in `phase` emits.
-    pub(super) fn output_type(&self, phase: AggregatePhase) -> FunctionValueType {
+    pub(crate) fn output_type(&self, phase: AggregatePhase) -> FunctionValueType {
         if phase.produces_final_result() {
             self.result_type()
         } else {
             self.intermediate_type()
         }
     }
-    pub(super) fn binding(&self, phase: AggregatePhase) -> AggregateBinding {
+    pub(crate) fn binding(&self, phase: AggregatePhase) -> AggregateBinding {
         let aggregate = self
             .selected
             .aggregate
@@ -234,7 +233,7 @@ impl Bound {
     }
 }
 
-pub(super) fn bind(
+pub(crate) fn bind(
     catalog: &PureEngineFunctionCatalog,
     name: &str,
     arguments: &[FunctionValueType],
@@ -268,7 +267,7 @@ pub(super) fn bind(
     }
 }
 
-pub(super) fn kernel_phase(phase: AggregatePhase) -> AggregateKernelPhase {
+pub(crate) fn kernel_phase(phase: AggregatePhase) -> AggregateKernelPhase {
     match phase {
         AggregatePhase::Single => AggregateKernelPhase::Single,
         AggregatePhase::Partial { .. } => AggregateKernelPhase::Partial,
@@ -279,7 +278,7 @@ pub(super) fn kernel_phase(phase: AggregatePhase) -> AggregateKernelPhase {
 
 /// One aggregate call of a fixture node. An update phase reads its logical
 /// argument values; a merge phase reads exactly one state value.
-pub(super) struct CallSpec<'a> {
+pub(crate) struct CallSpec<'a> {
     pub bound: &'a Bound,
     pub phase: AggregatePhase,
     pub id: AggregateCallId,
@@ -302,7 +301,7 @@ fn aggregate_distribution(input: &Distribution, output: &[ValueId]) -> Distribut
 
 /// Add an Aggregate over `input`: the group values pass through as outputs,
 /// followed by one output per call.
-pub(super) fn add_aggregate(
+pub(crate) fn add_aggregate(
     builder: &mut FragmentBuilder,
     input: NodeId,
     groups: &[ValueId],
@@ -382,7 +381,7 @@ pub(super) fn add_aggregate(
 
 /// A Values leaf whose columns have the given complete types and whose rows
 /// are literal cells of exactly those types.
-pub(super) fn values(
+pub(crate) fn values(
     builder: &mut FragmentBuilder,
     node: NodeId,
     types: &[FunctionValueType],
@@ -391,7 +390,7 @@ pub(super) fn values(
     super::family_fixture::values(builder, node, types, rows)
 }
 
-pub(super) fn dop(max: u32) -> PipelineDopDomain {
+pub(crate) fn dop(max: u32) -> PipelineDopDomain {
     PipelineDopDomain {
         min: 1,
         max,
@@ -400,7 +399,7 @@ pub(super) fn dop(max: u32) -> PipelineDopDomain {
 }
 
 /// A native-exchange hash scheme over `keys`.
-pub(super) fn hash(keys: &[ValueId]) -> Distribution {
+pub(crate) fn hash(keys: &[ValueId]) -> Distribution {
     Distribution::Hash {
         keys: Box::from(keys),
         scheme: HashPartitionScheme {
@@ -419,7 +418,7 @@ pub(super) fn hash(keys: &[ValueId]) -> Distribution {
 }
 
 /// Imports `sources` of `edge` as an ExchangeSource at `node`.
-pub(super) fn receive(
+pub(crate) fn receive(
     builder: &mut FragmentBuilder,
     node: NodeId,
     edge: EdgeId,
@@ -458,7 +457,7 @@ pub(super) fn receive(
     imports
 }
 
-pub(super) fn edge(
+pub(crate) fn edge(
     id: EdgeId,
     from: (FragmentId, &[ValueId]),
     to: (FragmentId, NodeId, &[ValueId]),
@@ -494,7 +493,7 @@ pub(super) fn edge(
 
 /// Finish a fragment and attach one original request per relational call:
 /// its logical argument types, in every phase.
-pub(super) fn finish(
+pub(crate) fn finish(
     builder: FragmentBuilder,
     root: NodeId,
     sink: FragmentSink,
@@ -555,7 +554,7 @@ fn freeze(
 ) -> (PhysicalRootUses, FrozenFragmentCalls) {
     let expression_roots = crate::runtime::fragment::scan::compiled_fixture::root_uses(fragment);
     let expression_domain = EvaluationDomainId::new(0);
-    let mut uses = expression_roots
+    let uses = expression_roots
         .flow()
         .uses()
         .values()
@@ -722,7 +721,7 @@ fn freeze(
                         expected_result_type: None,
                     },
                     environment: &[],
-                    parameters: &parameters,
+                    parameters,
                     decimal_overflow_policy: POLICY,
                     proof_scope: CallProofScope::Domain(context.domain),
                 },
@@ -767,7 +766,7 @@ fn admission() -> FragmentPackageAdmission {
 }
 
 /// Every fragment of `plan` as a checked package with its frozen calls.
-pub(super) fn packages(
+pub(crate) fn packages(
     plan: &PhysicalPlan,
     catalog: &PureEngineFunctionCatalog,
 ) -> BTreeMap<FragmentId, FragmentPackage> {
@@ -775,7 +774,7 @@ pub(super) fn packages(
 }
 
 /// The same aggregate root/call author with explicitly frozen provider reads.
-pub(super) fn packages_with_reads(
+pub(crate) fn packages_with_reads(
     plan: &PhysicalPlan,
     catalog: &PureEngineFunctionCatalog,
     reads: &BTreeMap<
@@ -818,7 +817,7 @@ pub(super) fn packages_with_reads(
     .unwrap_or_else(|error| panic!("aggregate packages extract: {error:?}"))
 }
 
-pub(super) fn try_compile(
+pub(crate) fn try_compile(
     package: FragmentPackage,
     catalog: &PureEngineFunctionCatalog,
     pipeline_dop: usize,
@@ -852,7 +851,7 @@ fn try_compile_with_providers<E: std::error::Error + 'static>(
         .map_err(|error| error.to_string())
 }
 
-pub(super) fn compile(
+pub(crate) fn compile(
     package: FragmentPackage,
     catalog: &PureEngineFunctionCatalog,
     pipeline_dop: usize,
@@ -864,7 +863,7 @@ pub(super) fn compile(
 
 /// Preserve the original compile/options author while admitting the fixture's
 /// actual frozen Scan through its existing pure provider catalogue.
-pub(super) fn compile_with_providers<E: std::error::Error + 'static>(
+pub(crate) fn compile_with_providers<E: std::error::Error + 'static>(
     package: FragmentPackage,
     catalog: &PureEngineFunctionCatalog,
     pipeline_dop: usize,
@@ -877,20 +876,20 @@ pub(super) fn compile_with_providers<E: std::error::Error + 'static>(
 
 /// Delivers every encoded frame to the receiver port, as the native data
 /// plane does after its wire hop, and counts the rows each sender sent.
-pub(super) struct LoopbackTransmitter {
+pub(crate) struct LoopbackTransmitter {
     port: Arc<dyn ExchangeReceiverPort>,
     rows: Mutex<BTreeMap<(UniqueId, UniqueId), usize>>,
 }
 
 impl LoopbackTransmitter {
-    pub(super) fn new(port: Arc<dyn ExchangeReceiverPort>) -> Arc<Self> {
+    pub(crate) fn new(port: Arc<dyn ExchangeReceiverPort>) -> Arc<Self> {
         Arc::new(Self {
             port,
             rows: Mutex::default(),
         })
     }
     /// Rows `sender` sent to `destination`.
-    pub(super) fn rows(&self, sender: UniqueId, destination: UniqueId) -> usize {
+    pub(crate) fn rows(&self, sender: UniqueId, destination: UniqueId) -> usize {
         self.rows
             .lock()
             .unwrap()
@@ -963,7 +962,7 @@ fn runtime_state() -> Arc<RuntimeState> {
 }
 
 /// Prepare and run one instance of `program`; a failure is returned as text.
-pub(super) fn try_run(
+pub(crate) fn try_run(
     program: &Arc<LocalProgram>,
     sink: Box<dyn OperatorFactory>,
     bindings: ExchangeBindings,
@@ -982,7 +981,7 @@ pub(super) fn try_run(
 
 /// The same original local execution lane with an explicit declared query
 /// tracker. This is test input wiring, not a new source, control or executor.
-pub(super) fn try_run_with_tracker(
+pub(crate) fn try_run_with_tracker(
     program: &Arc<LocalProgram>,
     sink: Box<dyn OperatorFactory>,
     bindings: ExchangeBindings,
@@ -1009,7 +1008,7 @@ pub(super) fn try_run_with_tracker(
     )
 }
 /// Run the original compiled pipeline with this instance's exact scan operations.
-pub(super) fn try_run_with_scans(
+pub(crate) fn try_run_with_scans(
     program: &Arc<LocalProgram>,
     sink: Box<dyn OperatorFactory>,
     bindings: ExchangeBindings,
@@ -1064,7 +1063,7 @@ fn try_run_in(
 
 /// The single receiver of `program`, registered for `instance` with
 /// `senders` expected senders.
-pub(super) fn register(
+pub(crate) fn register(
     program: &LocalProgram,
     instance: UniqueId,
     senders: usize,
@@ -1096,7 +1095,7 @@ pub(super) fn register(
     bindings
 }
 
-pub(super) fn destination(
+pub(crate) fn destination(
     instance: UniqueId,
     sender: UniqueId,
     ordinal: u32,
@@ -1112,7 +1111,7 @@ pub(super) fn destination(
     .expect("destination")
 }
 
-pub(super) fn stream_sink(
+pub(crate) fn stream_sink(
     program: &Arc<LocalProgram>,
     instance: UniqueId,
     destinations: Vec<FragmentDestination>,
@@ -1132,7 +1131,7 @@ pub(super) fn stream_sink(
     .expect("compiled stream sink")
 }
 
-pub(super) fn result_sink(
+pub(crate) fn result_sink(
     program: &Arc<LocalProgram>,
     instance: UniqueId,
     output: &ResultSinkHandle,

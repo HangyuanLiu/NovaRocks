@@ -929,7 +929,6 @@ pub fn begin_final_mv_incremental_refresh_change_stream(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn canonical_incremental_change_stream_request<'a>(
     query: ast::Query,
     imv_rewrite: &'a crate::compiler::SqlImvPlanningInput,
@@ -1989,7 +1988,7 @@ fn base_field_name(
         .bases
         .iter()
         .find(|base| base.occurrence_id == occurrence)
-        .and_then(|base| base.fields.iter().find(|field| &field.field_id == field_id))
+        .and_then(|base| base.fields.iter().find(|field| field.field_id == field_id))
         .map(|field| field.name_at_create.clone())
         .ok_or_else(|| {
             format!(
@@ -1999,10 +1998,6 @@ fn base_field_name(
         })
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "These are distinct frozen SQL planning facts and grouping them would obscure the compiler boundary."
-)]
 fn build_join_descriptor(
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
     left: &novarocks_types::naming::TableIdentity,
@@ -2296,7 +2291,6 @@ pub struct SqlMvFirstRefreshArtifactBuilder {
 }
 
 impl SqlMvFirstRefreshArtifactBuilder {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         select_query: ast::Query,
         pin: SqlMvSnapshotPin,

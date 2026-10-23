@@ -336,9 +336,7 @@ mod analysis_tests {
                     panic!("Files scan")
                 };
                 assert_eq!(scan.metadata_table_type, SqlMetadataTableKind::Files);
-                let ScanSource::Sql(source) = &scan.table.source else {
-                    panic!("SQL binding")
-                };
+                let ScanSource::Sql(source) = &scan.table.source;
                 assert_eq!(
                     source.binding,
                     crate::binding::SqlTableBindingId::new_for_test(61)

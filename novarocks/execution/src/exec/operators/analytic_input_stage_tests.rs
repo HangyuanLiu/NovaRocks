@@ -196,7 +196,7 @@ fn run(
             let result = stages::split(
                 output,
                 source.record_batch().columns(),
-                &[source.clone()],
+                std::slice::from_ref(&source),
                 work,
             )?;
             assert_eq!(result.stage, stage);
@@ -257,8 +257,7 @@ fn original_error(stage: AnalyticInputStage) -> String {
             source,
             chunk(Arc::new(Int64Array::from(vec![5, 6]))),
         ])
-        .err()
-        .expect("original concat Data"),
+        .expect_err("original concat Data"),
         AnalyticInputStage::Regroup => super::reorder_chunk_by_partition_keys(
             &source,
             &[Arc::new(BinaryArray::from(vec![
@@ -268,15 +267,13 @@ fn original_error(stage: AnalyticInputStage) -> String {
                 b"c".as_slice(),
             ]))],
         )
-        .err()
-        .expect("original unsupported key Data"),
+        .expect_err("original unsupported key Data"),
         AnalyticInputStage::OutputSplit => super::split_analytic_output_chunks(
             schema(DataType::Int64),
             source.record_batch().columns(),
-            &[source.clone()],
+            std::slice::from_ref(&source),
         )
-        .err()
-        .expect("original split Data"),
+        .expect_err("original split Data"),
     }
     .to_string()
 }
@@ -292,9 +289,7 @@ fn analytic_input_stage_original_data_full_text_and_scope_no_failure_footer() {
         let observed = KernelControlObservation::new(&control);
         let drops = Arc::new(AtomicUsize::new(0));
         let mut work = Work::new(&observed, Arc::clone(&drops));
-        let failure = run(stage, true, &mut work)
-            .err()
-            .expect("original stage Data");
+        let failure = run(stage, true, &mut work).expect_err("original stage Data");
         match &failure {
             AnalyticStageFailure::Operation {
                 stage: actual,
@@ -403,9 +398,7 @@ fn analytic_input_stage_result_scope_lasts_until_real_result_drop() {
     let drops = Arc::new(AtomicUsize::new(0));
     let mut work = Work::new(&observed, Arc::clone(&drops));
     let source = ints(vec![Some(1)]);
-    let result = stages::gather(std::slice::from_ref(&source), &mut work)
-        .ok()
-        .expect("stage success");
+    let result = stages::gather(std::slice::from_ref(&source), &mut work).expect("stage success");
     assert_eq!(result.stage, AnalyticInputStage::Gather);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     drop(result);

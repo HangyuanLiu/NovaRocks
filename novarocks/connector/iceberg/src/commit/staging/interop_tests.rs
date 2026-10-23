@@ -165,16 +165,15 @@ fn interop_storage_belongs(storage: &Value, context: &Value, location: &str) -> 
         }
         if let Some(relative) = location.strip_prefix(warehouse) {
             let namespace = relative.split('/').next().unwrap_or_default();
-            if let Some(purpose) = namespace.strip_prefix(&format!("{run}_")) {
-                if namespace.len() <= 63
-                    && !purpose.is_empty()
-                    && purpose.as_bytes()[0].is_ascii_lowercase()
-                    && purpose
-                        .bytes()
-                        .all(|v| v.is_ascii_lowercase() || v.is_ascii_digit())
-                {
-                    return true;
-                }
+            if let Some(purpose) = namespace.strip_prefix(&format!("{run}_"))
+                && namespace.len() <= 63
+                && !purpose.is_empty()
+                && purpose.as_bytes()[0].is_ascii_lowercase()
+                && purpose
+                    .bytes()
+                    .all(|v| v.is_ascii_lowercase() || v.is_ascii_digit())
+            {
+                return true;
             }
         }
     }
@@ -792,7 +791,7 @@ async fn physical(
     attempt: &IcebergCommitAttempt,
 ) -> Vec<(ManifestFile, ManifestEntry)> {
     let snapshot = metadata.snapshot_by_id(snapshot_id).unwrap();
-    let list = crate::manifest::load_manifest_list(&snapshot, attempt.file_io(), metadata)
+    let list = crate::manifest::load_manifest_list(snapshot, attempt.file_io(), metadata)
         .await
         .unwrap();
     let mut raw = Vec::new();
@@ -871,7 +870,7 @@ async fn iru5_java_rest_three_shapes_historic_spec_and_composition() {
                 .unwrap(),
         ],
         vec![],
-        Dependency::NoReadDependency,
+        Dependency::NoRead,
     );
     let attempt = operation.begin_attempt().unwrap();
     let mut engine = StagingEngine::begin(
@@ -910,7 +909,7 @@ async fn iru5_java_rest_three_shapes_historic_spec_and_composition() {
                 .unwrap(),
         ],
         vec![],
-        Dependency::NoReadDependency,
+        Dependency::NoRead,
     );
     let attempt = operation.begin_attempt().unwrap();
     let mut engine = StagingEngine::begin(base(&created), &append, &attempt).unwrap();
@@ -1065,7 +1064,7 @@ async fn iru5_java_rest_d12_inheritance_and_physical_rewrite() {
                 .unwrap(),
         ],
         vec![],
-        Dependency::NoReadDependency,
+        Dependency::NoRead,
     );
     let attempt = operation.begin_attempt().unwrap();
     let (expected, request) = freeze_append(&loaded, &append, &attempt).await;
@@ -1192,7 +1191,7 @@ async fn iru5_java_rest_two_canonical_clients_real_cas() {
                 .unwrap(),
         ],
         vec![],
-        Dependency::NoReadDependency,
+        Dependency::NoRead,
     );
     let right_intent = intent(
         &other,
@@ -1205,7 +1204,7 @@ async fn iru5_java_rest_two_canonical_clients_real_cas() {
                 .unwrap(),
         ],
         vec![],
-        Dependency::NoReadDependency,
+        Dependency::NoRead,
     );
     let left_attempt = left.begin_attempt().unwrap();
     let right_attempt = right.begin_attempt().unwrap();
@@ -1348,7 +1347,7 @@ async fn iru5_java_rest_attempt_runner_reloads_and_reprepares_after_real_cas() {
                 .unwrap(),
         ],
         vec![],
-        Dependency::NoReadDependency,
+        Dependency::NoRead,
     );
     let other_intent = intent(
         &other,
@@ -1361,7 +1360,7 @@ async fn iru5_java_rest_attempt_runner_reloads_and_reprepares_after_real_cas() {
                 .unwrap(),
         ],
         vec![],
-        Dependency::NoReadDependency,
+        Dependency::NoRead,
     );
     let other_attempt = competitor.begin_attempt().unwrap();
     let (other_expected, other_request) =
@@ -2163,7 +2162,7 @@ async fn iru13a_java_rest_table_commit_shapes() {
                 .unwrap(),
         ],
         vec![],
-        Dependency::NoReadDependency,
+        Dependency::NoRead,
     );
     let attempt = operation.begin_attempt().unwrap();
     let (expected, request) = freeze_append(&created, &append, &attempt).await;
@@ -2464,7 +2463,7 @@ async fn iru13a_java_rest_stage_create_and_ctas_final_commit() {
                 .unwrap(),
         ],
         vec![],
-        Dependency::NoReadDependency,
+        Dependency::NoRead,
     );
     let attempt = operation.begin_attempt().unwrap();
     let mut engine = StagingEngine::begin(
@@ -2944,7 +2943,7 @@ async fn iru13b_java_rest_ctas_publishes_staged_metadata_for_every_format_versio
             RequestShape::Create,
             vec![AddedContent::new_logical_data(file, staged.default_partition_spec_id()).unwrap()],
             vec![],
-            Dependency::NoReadDependency,
+            Dependency::NoRead,
         );
         let attempt = operation.begin_attempt().unwrap();
         let mut engine = StagingEngine::begin(

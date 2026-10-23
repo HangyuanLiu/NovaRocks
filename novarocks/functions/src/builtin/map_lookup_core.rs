@@ -456,7 +456,7 @@ impl std::fmt::Display for LookupRowFailure {
 impl std::error::Error for LookupRowFailure {}
 #[derive(Debug)]
 struct RequiredLookupRow {
-    ordinal: Option<usize>,
+    _ordinal: Option<usize>,
     cause: LookupRowFailure,
 }
 impl std::fmt::Display for RequiredLookupRow {
@@ -488,7 +488,7 @@ impl FailureProjection for RequiredLookupRow {
 impl novarocks_failure_contract::OuterFailureProjection for RequiredLookupRow {}
 pub fn required_row_error(ordinal: usize, cause: LookupRowFailure) -> KernelFailure {
     KernelFailure::from_domain(RequiredLookupRow {
-        ordinal: Some(ordinal),
+        _ordinal: Some(ordinal),
         cause,
     })
 }
@@ -538,46 +538,46 @@ mod source_properties {
     use std::{error::Error, sync::Arc};
     #[test]
     fn only_explicit_strict_missing_key_becomes_a_required_row_failure() {
-        let mut builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
-        builder.keys().append_value("present");
-        builder.values().append_value(7);
-        builder.append(true).unwrap();
-        let map: ArrayRef = Arc::new(builder.finish());
-        let key: ArrayRef = Arc::new(StringArray::from(vec!["missing"]));
-        let flags: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
-        let weak_map = Arc::downgrade(&map);
-        let weak_key = Arc::downgrade(&key);
-        let inputs = MapLookupInputs::new(&map, &key, Some(&flags)).unwrap();
-        let error = lookup_observed(
-            &inputs,
-            crate::Selection::all(1),
-            |_, row| Ok::<_, KernelFailure>(inputs.direct_rows(row)),
-            None,
-            |_, _| Ok(()),
-            |ordinal, cause| Err(required_row_error(ordinal, cause)),
-            &mut |_| Ok(()),
-        )
-        .unwrap_err();
-        let MapLookupFailure::Operation(failure) = error else {
-            panic!("originating missing-key failure");
+        let (weak_map, weak_key, failure) = {
+            let mut builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+            builder.keys().append_value("present");
+            builder.values().append_value(7);
+            builder.append(true).unwrap();
+            let map: ArrayRef = Arc::new(builder.finish());
+            let key: ArrayRef = Arc::new(StringArray::from(vec!["missing"]));
+            let flags: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
+            let weak_map = Arc::downgrade(&map);
+            let weak_key = Arc::downgrade(&key);
+            let inputs = MapLookupInputs::new(&map, &key, Some(&flags)).unwrap();
+            let error = lookup_observed(
+                &inputs,
+                crate::Selection::all(1),
+                |_, row| Ok::<_, KernelFailure>(inputs.direct_rows(row)),
+                None,
+                |_, _| Ok(()),
+                |ordinal, cause| Err(required_row_error(ordinal, cause)),
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+            let MapLookupFailure::Operation(failure) = error else {
+                panic!("originating missing-key failure");
+            };
+            let original = failure
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .downcast_ref::<RequiredLookupRow>()
+                .unwrap();
+            assert_eq!(failure.failure_fact().class(), FailureClass::Data);
+            assert_eq!(failure.failure_fact().reason().code(), 377);
+            assert_eq!(failure.to_string(), "Key not present in map");
+            assert_eq!(original._ordinal, Some(0));
+            (weak_map, weak_key, failure)
         };
-        assert_eq!(failure.failure_fact().class(), FailureClass::Data);
-        assert_eq!(failure.failure_fact().reason().code(), 377);
-        assert_eq!(failure.to_string(), "Key not present in map");
-        let original = failure
-            .source()
-            .unwrap()
-            .source()
-            .unwrap()
-            .downcast_ref::<RequiredLookupRow>()
-            .unwrap();
-        assert_eq!(original.ordinal, Some(0));
-        drop(inputs);
-        drop(map);
-        drop(key);
-        drop(flags);
         assert!(weak_map.upgrade().is_none());
         assert!(weak_key.upgrade().is_none());
+        assert_eq!(failure.failure_fact().class(), FailureClass::Data);
     }
     #[test]
     fn actual_empty_value_sdk_cast_refusal_is_not_a_row_error_and_has_no_later_observer() {
@@ -650,7 +650,7 @@ pub fn compare_keys_required(
     compare_keys_at(keys, key_idx, targets, target_idx).map_err(|cause| match cause {
         KeyComparisonFailure::Operation(cause) => cause,
         KeyComparisonFailure::Row(cause) => KernelFailure::from_domain(RequiredLookupRow {
-            ordinal: None,
+            _ordinal: None,
             cause,
         }),
     })

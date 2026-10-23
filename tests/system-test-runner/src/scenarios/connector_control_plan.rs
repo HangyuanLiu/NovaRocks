@@ -19,7 +19,7 @@
 use super::{ConnectorRead, IdleMysqlConnection};
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::ScenarioContext;
-use crate::scenarios::query_lifecycle::native_sql_controls::SelectedStatement;
+use crate::scenarios::native_sql_controls::SelectedStatement;
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::{FromRow, Queryable};
 use novarocks_cluster_harness::{
@@ -28,6 +28,8 @@ use novarocks_cluster_harness::{
 };
 use novarocks_failpoint::session::DomainGrant;
 use serde_json::json;
+#[cfg(test)]
+use std::time::Duration;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -39,7 +41,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 pub(super) const READER: &str = "reader-marker";

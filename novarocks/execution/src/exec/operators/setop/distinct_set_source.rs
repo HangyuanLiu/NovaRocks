@@ -55,6 +55,7 @@ pub struct DistinctSetSourceFactory<S: DistinctSetSemantics> {
 }
 
 impl<S: DistinctSetSemantics> DistinctSetSourceFactory<S> {
+    #[cfg(test)]
     pub(crate) fn new(state: DistinctSetSharedState<S>, node_id: i32) -> Self {
         let name = if node_id >= 0 {
             format!("{} (id={node_id})", S::SOURCE_OPERATOR_NAME)

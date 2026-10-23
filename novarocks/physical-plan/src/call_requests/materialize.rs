@@ -342,14 +342,14 @@ fn boxed<T, H>(
         return Ok(Box::default());
     }
     work.flush()?;
-    if values.capacity() > values.len() {
-        if let Some(scope) = creation {
-            let layout = Layout::array::<T>(values.len())
-                .map_err(|_| CompileControlError::ResourceExhausted)?;
-            scope
-                .request_layout(layout)
-                .map_err(CallRequestMaterializationFailure::Creator)?;
-        }
+    if values.capacity() > values.len()
+        && let Some(scope) = creation
+    {
+        let layout =
+            Layout::array::<T>(values.len()).map_err(|_| CompileControlError::ResourceExhausted)?;
+        scope
+            .request_layout(layout)
+            .map_err(CallRequestMaterializationFailure::Creator)?;
     }
     let values = values.into_boxed_slice();
     work.step()?;

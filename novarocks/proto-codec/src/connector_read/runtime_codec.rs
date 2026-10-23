@@ -677,6 +677,12 @@ impl DecodedConnectorReadScan {
     }
 }
 
+impl novarocks_execution_contract::failure::FailureProjection for ConnectorReadCodecError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        self.protocol.failure_fact()
+    }
+}
+
 #[cfg(test)]
 mod compile_control_tests {
     use super::*;
@@ -830,11 +836,5 @@ mod compile_control_tests {
             source.downcast_ref::<ConnectorCodecError>(),
             Some(&original)
         );
-    }
-}
-
-impl novarocks_execution_contract::failure::FailureProjection for ConnectorReadCodecError {
-    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
-        self.protocol.failure_fact()
     }
 }

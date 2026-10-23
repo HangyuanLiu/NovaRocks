@@ -520,16 +520,14 @@ fn collect_extra_sort_items(
             qualifier,
             column,
         } = &item.expr.kind
-        {
-            if output_ids.contains(column_id)
+            && (output_ids.contains(column_id)
                 || (*column_id == ColumnId::UNSET
                     && qualifier.is_none()
                     && output
                         .iter()
-                        .any(|output| output.name.eq_ignore_ascii_case(column)))
-            {
-                continue;
-            }
+                        .any(|output| output.name.eq_ignore_ascii_case(column))))
+        {
+            continue;
         }
         let mut matched = false;
         for projected in source_projection.iter().chain(&extra) {
@@ -725,7 +723,7 @@ fn plan_body_scoped(
 mod constant_identity_tests {
     use super::*;
     use arrow::array::{Array, ArrayRef, Float64Array, Int64Array};
-    use arrow::datatypes::{DataType, Field};
+    use arrow::datatypes::Field;
     use novarocks_type_contract::{CompileControlError, CompilePhase, FunctionValueType};
     use std::sync::{Arc, Mutex};
 

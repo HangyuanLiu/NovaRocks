@@ -535,7 +535,7 @@ fn values_dynamic_list_cells_keep_complete_type_and_cross_pool_constant_backing(
     let ty = pools[0].1.value_type().clone();
     let package = cast_package_with_cells(
         pools,
-        &[ty.clone()],
+        std::slice::from_ref(&ty),
         vec![
             vec![Cell::Constant(0, 0)],
             vec![Cell::Cast(1, 0)],

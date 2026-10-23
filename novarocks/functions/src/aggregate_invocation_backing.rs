@@ -210,9 +210,6 @@ impl HostDiagnostic {
     pub(crate) fn retained_bytes(&self) -> usize {
         self.0.block_bytes() + self.0.capacity()
     }
-    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
-        self.0.ptr_eq(&other.0)
-    }
 }
 struct ObservedHostWriter<'a, 'b> {
     bytes: HostVec<u8, HostAggregateAllocator>,

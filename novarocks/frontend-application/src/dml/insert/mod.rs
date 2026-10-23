@@ -63,10 +63,6 @@ impl DmlService {
     /// exists solely for diagnostic locations derived from AST spans; it must
     /// not be reparsed or sliced to classify an INSERT form. Its query source
     /// is already the parser-owned typed AST.
-    #[allow(
-        clippy::result_large_err,
-        reason = "Preserves the frozen DML error contract without a broad ABI migration."
-    )]
     pub(crate) fn prepare_insert(
         &self,
         engine: &dyn InsertEngine,
@@ -106,11 +102,6 @@ impl DmlService {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[allow(
-        clippy::result_large_err,
-        reason = "Preserves the frozen DML error contract without a broad ABI migration."
-    )]
     fn prepare_iceberg_source(
         &self,
         engine: &dyn InsertEngine,
@@ -145,10 +136,6 @@ impl DmlService {
     }
 
     /// Crosses the statement's one-shot native execution and publication edge.
-    #[allow(
-        clippy::result_large_err,
-        reason = "Preserves the frozen DML error contract without a broad ABI migration."
-    )]
     pub(crate) fn execute_prepared_insert(
         &self,
         engine: &dyn InsertEngine,

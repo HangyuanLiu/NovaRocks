@@ -343,7 +343,9 @@ fn assert_actual_schema_body_error_keeps_owned_bytes(
         operator.prepared_schema_for_test().is_none(),
         "failed preparation published no schema"
     );
-    drop(host);
+    {
+        let _host = host;
+    }
     assert_eq!(journal.phase, Some(ProjectMetadataPhase::Prepare(node)));
     assert!(journal.facts.is_some());
     assert_eq!(journal.body.settlement.as_ref().unwrap().next_step, Ok(()));
@@ -405,7 +407,9 @@ fn project_metadata_original_worker_stop_refuses_compile_body_with_exact_cause()
             matches!(failure, novarocks_local_compiler::ProjectMetadataFailure::Host(PreparationMemoryRefusal::Interrupted(cause)) if std::ptr::eq(cause.cause(), expected.cause()))
         );
         assert_eq!(calls.get(), 0);
-        drop(host);
+        {
+            let _host = host;
+        }
         assert!(journal.body.settlement.is_none());
     }
 }
@@ -449,7 +453,9 @@ fn project_metadata_real_capacity_and_arithmetic_refuse_before_compile_body() {
             )
         ));
         assert_eq!(calls.get(), 0);
-        drop(host);
+        {
+            let _host = host;
+        }
         assert!(journal.capacity.is_some());
         assert!(journal.body.settlement.is_none());
     }
@@ -577,7 +583,9 @@ fn project_metadata_real_pending_requalifies_one_original_compiler_body() {
     assert!(projects > 0);
     assert_eq!(calls.get(), projects);
     assert_eq!(host.admissions, projects + 1);
-    drop(host);
+    {
+        let _host = host;
+    }
     assert!(!journal.pending.unwrap().complete);
     assert!(journal.capacity.is_none() && journal.shortage.is_none());
     assert_eq!(journal.body.settlement.as_ref().unwrap().next_step, Ok(()));
@@ -729,7 +737,9 @@ fn analytic_schema_private_native_loan_rejects_wrong_program_kind_site_and_layou
         );
     }
     assert_eq!(calls.get(), 0);
-    drop(host);
+    {
+        let _host = host;
+    }
     // Source refusal precedes journal.start, so the last compiler receipt
     // remains intact and must not be mistaken for this declined occurrence.
     assert_eq!(journal.phase, prior_phase);
@@ -783,7 +793,9 @@ fn analytic_schema_actual_worker_stop_keeps_nominal_cause_and_runs_no_original_b
         };
         assert!(std::ptr::eq(actual.cause(), expected.cause()));
         assert_eq!(calls.get(), 0);
-        drop(host);
+        {
+            let _host = host;
+        }
         assert!(journal.body.settlement.is_none());
         assert!(journal.body.stopped.is_none());
     }
@@ -847,7 +859,9 @@ fn analytic_schema_actual_policy_refuses_before_original_body() {
         ))
     ));
     assert_eq!(calls.get(), 0);
-    drop(host);
+    {
+        let _host = host;
+    }
     assert!(journal.capacity.is_some());
     assert!(journal.body.settlement.is_none());
 }
@@ -1080,7 +1094,9 @@ fn accepted_original_task_source_crosses_both_compile_views_and_metadata_before_
         assert!(std::ptr::eq(actual.cause(), raw.cause()));
         assert_eq!(actual.failure_fact(), expected);
         assert_eq!(calls.get(), 0);
-        drop(host);
+        {
+            let _host = host;
+        }
         assert!(journal.body.settlement.is_none());
         assert_eq!(binding.account().snapshot().granted_bytes, 0);
     }

@@ -87,7 +87,8 @@ impl MvLocalProjectionInventory {
 
 fn local_inventory_bound() -> novarocks_mv_application::repository::MvProjectionInventoryBound {
     use novarocks_mv_application::repository::MvProjectionInventoryBound;
-    let bound = MvProjectionInventoryBound {
+
+    MvProjectionInventoryBound {
         entries: novarocks_query_application::api::LocalResultBound::V1.rows,
         snapshot_bytes: 16 * 1024 * 1024,
         raw_page_bytes: 1024 * 1024,
@@ -98,8 +99,7 @@ fn local_inventory_bound() -> novarocks_mv_application::repository::MvProjection
             max_working_set_bytes: 4 * 1024 * 1024,
             ..Default::default()
         },
-    };
-    bound
+    }
 }
 
 /// Read-only inventory for query-local MV candidate discovery.
@@ -159,11 +159,6 @@ impl MvReadinessPort {
     /// Construct the separate query inventory from the same product-owned
     /// repository. The reader intentionally does not inherit this port's
     /// process-local readiness or refresh authority.
-    /// The runtime this port defers blocking work to.
-    pub(crate) fn runtime(&self) -> &tokio::runtime::Handle {
-        &self.handle
-    }
-
     pub(crate) fn candidate_reader(&self) -> MvCandidateReader {
         MvCandidateReader {
             reader: self.service.candidate_reader(),
@@ -323,17 +318,6 @@ impl MvReadinessPort {
         self.block_on(
             self.service
                 .ensure_no_ready_downstream_dependencies(upstream),
-        )
-    }
-
-    /// Reserve the exact repository expectation before any provider delete.
-    pub(crate) fn reserve_projection_delete(
-        &self,
-        target: &MvTarget,
-    ) -> Result<MvKeyedProjectionDeleteGuard, MvProjectionError> {
-        self.block_on(
-            self.service
-                .reserve_projection_delete(canonical_mv_target(target)),
         )
     }
 
@@ -501,9 +485,8 @@ mod controlled_wipe_tests {
     use novarocks_failpoint::session::SessionRole;
     use novarocks_mv_application::{
         activity::{MvActivityGateError, MvActivityOwner},
-        process_runtime::{MvBackgroundRuntime, ProcessRuntime},
+        process_runtime::MvBackgroundRuntime,
         product::MvTarget,
-        scheduler::MvSchedulerConfig,
         service::MvKeyedProductService,
     };
     use std::sync::atomic::{AtomicBool, Ordering};

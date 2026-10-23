@@ -117,12 +117,12 @@ impl StatementNativeAttempt {
         self.profile_waits_for_terminals = profile && mode == NativeAttemptConvergenceMode::Normal;
         self.feedback_state.close();
         self.round.begin_input_close();
-        if let Some(reader) = self.relayed_reader.as_ref() {
-            if mode == NativeAttemptConvergenceMode::Cleanup {
-                let mut root = RootReadConvergence::new(self.round.root_task());
-                if let Err(error) = reader.seal(root.seal_terminated()) {
-                    tracing::warn!(%error, "Terminal root close diagnostic");
-                }
+        if let Some(reader) = self.relayed_reader.as_ref()
+            && mode == NativeAttemptConvergenceMode::Cleanup
+        {
+            let mut root = RootReadConvergence::new(self.round.root_task());
+            if let Err(error) = reader.seal(root.seal_terminated()) {
+                tracing::warn!(%error, "Terminal root close diagnostic");
             }
         }
         if let Some(polls) = self.root_result_polls.as_mut() {
@@ -151,11 +151,10 @@ impl StatementNativeAttempt {
             if let Err(error) = self.round.execution_mut().abort_context(
                 context,
                 novarocks_execution_contract::AbortCause::QueryFailed,
-            ) {
-                if !self.close_turn_error_reported {
-                    tracing::warn!(%error, "Native terminal context stop diagnostic");
-                    self.close_turn_error_reported = true;
-                }
+            ) && !self.close_turn_error_reported
+            {
+                tracing::warn!(%error, "Native terminal context stop diagnostic");
+                self.close_turn_error_reported = true;
             }
         }
     }

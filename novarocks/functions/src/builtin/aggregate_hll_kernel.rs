@@ -24,7 +24,6 @@ use crate::*;
 use arrow_array::builder::BinaryBuilder;
 use arrow_array::{Array, ArrayRef, BinaryArray, Int64Array};
 use arrow_schema::DataType;
-use std::fmt::Write;
 use std::sync::Arc;
 #[derive(Debug)]
 pub(super) struct NdvKernel {
@@ -191,7 +190,7 @@ impl PreparedAggregateKernel for NdvKernel {
                 address,
                 &mut work,
                 |failure| EvaluationFailure::Kernel(failure.into_kernel()),
-                |cause| EvaluationFailure::Kernel(cause),
+                EvaluationFailure::Kernel,
             )?;
             if let Some(hash) = hash {
                 state.core.has_value = true;
@@ -339,7 +338,7 @@ impl PreparedAggregateKernel for NdvKernel {
                         )
                         .into(),
                     },
-                    |cause| EvaluationFailure::Kernel(cause),
+                    EvaluationFailure::Kernel,
                 )?;
             }
             Ok(())

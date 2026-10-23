@@ -152,8 +152,7 @@ fn to_date_int64_declared_overload_is_explicitly_refused_during_prepare() {
         &FunctionValueType::new(DataType::Int64, true),
         DecimalOverflowPolicy::OutputNull,
     )
-    .err()
-    .expect("the admitted Int64 signature has no legacy reader");
+    .expect_err("the admitted Int64 signature has no legacy reader");
     assert!(
         refusal
             .to_string()

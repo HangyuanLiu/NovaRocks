@@ -96,18 +96,11 @@ impl Arithmetic {
             )),
         }
     }
-    fn mul(self, left: usize, right: usize) -> Result<usize, TypeCodecError> {
-        match self {
-            Self::Plain => mul(left, right),
-            Self::Parent => left.checked_mul(right).ok_or(TypeCodecError::Control(
-                CompileControlError::ResourceExhausted,
-            )),
-        }
-    }
 }
 
 /// The sole closed-root prefix bound, without observations or scratch setup.
 /// This does not prove datatype equality or authorize a logical/carrier domain.
+#[cfg(test)]
 pub(crate) fn type_binding_prefix_work_upper_bound(
     left: &FunctionValueType,
     right: &FunctionValueType,

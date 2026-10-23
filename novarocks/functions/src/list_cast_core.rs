@@ -33,6 +33,10 @@ pub enum ListCastError<E> {
     Host(E),
 }
 
+/// Child-cast callback used by the shared List CAST implementation.
+pub type ListChildCaster<'call, E> =
+    dyn FnMut(&ArrayRef, &DataType) -> Result<ArrayRef, ListCastError<E>> + 'call;
+
 /// Original Null-source lifting; this does not infer a child logical identity.
 pub fn null_source_observed<E>(
     len: usize,
@@ -58,7 +62,7 @@ pub fn null_source(len: usize, target: &DataType) -> ArrayRef {
 pub fn cast_observed<E>(
     array: &ArrayRef,
     target_field: &FieldRef,
-    cast_child: &mut dyn FnMut(&ArrayRef, &DataType) -> Result<ArrayRef, ListCastError<E>>,
+    cast_child: &mut ListChildCaster<'_, E>,
     observe: &mut dyn FnMut(ListCastObservation) -> Result<(), E>,
 ) -> Result<ArrayRef, ListCastError<E>> {
     observe(ListCastObservation::Step).map_err(ListCastError::Host)?;

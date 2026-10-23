@@ -70,10 +70,10 @@ impl<H> Context<'_, '_, H> {
         self.work.step().map_err(Into::into)
     }
     pub(crate) fn allocate(&mut self, allocation: Layout) -> Result<(), Failure<H>> {
-        if allocation.size() != 0 {
-            if let Some(observe) = self.observe_scope.as_deref_mut() {
-                observe(allocation)?;
-            }
+        if allocation.size() != 0
+            && let Some(observe) = self.observe_scope.as_deref_mut()
+        {
+            observe(allocation)?;
         }
         admit(self.request, allocation)
     }
@@ -131,10 +131,6 @@ impl<H> Context<'_, '_, H> {
         let retained = array::<u8, H>(value.capacity())?.size();
         Ok((value, retained))
     }
-    pub(crate) fn boxed_name(&mut self, source: &str) -> Result<Box<str>, Failure<H>> {
-        self.boxed_name_with_source_facts(source)
-            .map(|(value, _)| value)
-    }
     pub(crate) fn boxed_name_with_source_facts(
         &mut self,
         source: &str,
@@ -151,10 +147,6 @@ impl<H> Context<'_, '_, H> {
         self.step()?;
         self.work.flush()?;
         Ok((output, retained))
-    }
-    pub(crate) fn timezone(&mut self, source: &str) -> Result<Arc<str>, Failure<H>> {
-        self.timezone_with_source_facts(source)
-            .map(|(value, _)| value)
     }
     pub(crate) fn timezone_with_source_facts(
         &mut self,

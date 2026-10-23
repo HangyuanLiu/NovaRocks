@@ -47,7 +47,6 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Int32Array, ListArray, MapArray, StringArray, StructArray};
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, FieldRef};
-use arrow::record_batch::RecordBatch;
 use novarocks_local_program::{
     LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
     ProgramNodeKind, StaticLayout, UnpivotConstant,
@@ -56,8 +55,8 @@ use novarocks_types::SlotId;
 
 use super::compiled_expression::{RuntimeKernelControl, evaluate_all, instances, root_value_type};
 use super::unpivot_processor::{
-    concat_owned_with_construction, flattened_segments, next_bounded_output_with_construction,
-    unpivot_copy_failure, unpivot_vec,
+    concat_owned_with_construction, next_bounded_output_with_construction, unpivot_copy_failure,
+    unpivot_vec,
 };
 use super::unpivot_processor::{unpivot_arrow, unpivot_contract};
 use crate::exec::chunk::{Chunk, ChunkBatchProjection, ChunkSchemaRef};
@@ -986,8 +985,7 @@ fn build_output_typed(
         },
         |literal, field, rows| {
             observe_literal(literal, rows, temporary.as_ref(), control)?;
-            let result =
-                materialize_literal(literal, field, rows).map_err(ExecutionFailure::from)?;
+            let result = materialize_literal(literal, field, rows)?;
             control.checkpoint(0)?;
             Ok(result)
         },

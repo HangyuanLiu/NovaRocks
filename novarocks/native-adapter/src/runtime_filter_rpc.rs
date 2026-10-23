@@ -392,7 +392,6 @@ pub struct BackendNativeRuntimeFilterEnvelope {
     reason = "Retained for target-specific native integration and regression coverage."
 )]
 impl BackendNativeRuntimeFilterEnvelope {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         kind: novarocks_worker::runtime_filter::domain::BackendEnvelopeKind,
         participant: BackendParticipantIdentity,
@@ -509,7 +508,7 @@ fn validate_native_route(
     };
     valid
         .then_some(())
-        .ok_or_else(|| NativeFilterEnvelopeError::Route(kind))
+        .ok_or(NativeFilterEnvelopeError::Route(kind))
 }
 
 fn validate_native_presence(

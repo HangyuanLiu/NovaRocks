@@ -28,7 +28,7 @@ pub(crate) mod retention;
 pub(crate) mod view;
 pub(crate) mod write;
 
-pub(crate) use view::{project_full_view, project_view, reference_closure};
+pub(crate) use view::{project_full_view, project_view};
 
 #[cfg(test)]
 mod tests;

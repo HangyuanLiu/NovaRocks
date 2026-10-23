@@ -438,7 +438,7 @@ impl CompiledTableFunctionProcessor {
         let mut columns = Vec::with_capacity(contract.result_types().len());
         for (index, result) in contract.result_types().iter().enumerate() {
             let column = if pages.is_empty() {
-                new_empty_array(&result.data_type())
+                new_empty_array(result.data_type())
             } else {
                 let parts = pages
                     .iter()

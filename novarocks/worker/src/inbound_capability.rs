@@ -651,10 +651,10 @@ impl TaskInboundCapabilities {
             .map(|(key, _)| *key)
             .collect();
         for key in keys {
-            if let Some(record) = state.normally_closed.remove(&key) {
-                if let Some(bytes) = state.reserved.remove(&record.destination) {
-                    state.reserved_bytes -= bytes;
-                }
+            if let Some(record) = state.normally_closed.remove(&key)
+                && let Some(bytes) = state.reserved.remove(&record.destination)
+            {
+                state.reserved_bytes -= bytes;
             }
         }
     }

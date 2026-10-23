@@ -120,8 +120,14 @@ fn claim_batch_hold(
     )
     .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
     for operation in operations {
-        if let novarocks_task_codec::operation::DecodedOperation::AcquireQueryContextAdmissionTicket(request)=operation {
-            if let Some(claim)=controls.claim_context_hold(action,request.context(),token).map_err(tonic::Status::failed_precondition)? {return Ok(Some(claim));}
+        if let novarocks_task_codec::operation::DecodedOperation::AcquireQueryContextAdmissionTicket(
+            request,
+        ) = operation
+            && let Some(claim) = controls
+                .claim_context_hold(action, request.context(), token)
+                .map_err(tonic::Status::failed_precondition)?
+        {
+            return Ok(Some(claim));
         }
     }
     Ok(None)

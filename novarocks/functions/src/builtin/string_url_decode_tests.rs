@@ -946,7 +946,7 @@ fn required_decode_uses_original_oracles_and_retains_small_utf8_source_with_glob
         .unwrap()
         .downcast_ref::<RequiredDecodeFailure>()
         .unwrap();
-    assert_eq!(required.ordinal, 2);
+    assert_eq!(required._ordinal, 2);
     let actual = required
         .source()
         .unwrap()

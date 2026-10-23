@@ -111,11 +111,11 @@ impl Evidence {
         };
         let deadline = Instant::now() + WATCHDOG;
         loop {
-            if let Ok(bytes) = fs::read(helper.directory.join("ready.json")) {
-                if let Ok(value) = serde_json::from_slice(&bytes) {
-                    helper.ready = value;
-                    return helper;
-                }
+            if let Ok(bytes) = fs::read(helper.directory.join("ready.json"))
+                && let Ok(value) = serde_json::from_slice(&bytes)
+            {
+                helper.ready = value;
+                return helper;
             }
             if let Some(status) = helper.child.try_wait().unwrap() {
                 helper.reaped = true;

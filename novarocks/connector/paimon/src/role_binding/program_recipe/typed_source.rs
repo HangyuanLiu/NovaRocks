@@ -17,7 +17,11 @@
 
 //! Complete PAI-1 declarations from the actual frozen SDK column author.
 
+use std::collections::HashMap;
+
 use super::*;
+use crate::schema::PaimonDataType;
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use novarocks_connector_contract::{
     ConnectorReadExecutionSchema, ConnectorSourceFieldFacts, ConnectorSourceSchemaFacts,
     ConnectorSourceSchemaShape,

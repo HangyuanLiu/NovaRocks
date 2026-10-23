@@ -703,7 +703,6 @@ pub struct ConnectorDataMutationReceipt {
 }
 
 impl ConnectorDataMutationReceipt {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -1183,7 +1182,6 @@ impl ConnectorDataMutationLease {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn validate_receipt(
         &self,
         operation_id: ConnectorMutationOperationId,
@@ -1495,7 +1493,6 @@ fn validate_operation_kind(kind: &str) -> Result<(), ConnectorError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;

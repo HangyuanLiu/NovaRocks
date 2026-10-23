@@ -187,6 +187,10 @@ pub struct RoleConfig {
     process: ProcessCompatibilityProjection,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "ResolvedServerLaunch is constructed once during startup and immediately moved into its role runner; boxing the 6 KiB AllInOne pair adds an allocation and changes this public launch type without reducing repeated or hot-path storage."
+)]
 #[derive(Clone)]
 pub enum ResolvedServerLaunch {
     Fe(RoleConfig),
@@ -519,9 +523,11 @@ mod tests {
         let mysql = mysql
             .map(|port| format!("\n[standalone_server]\nmysql_port = {port}\n"))
             .unwrap_or_default();
-        let frontend_endpoint = (role == "be")
-            .then_some("frontend_endpoint = \"127.0.0.1:19080\"\n")
-            .unwrap_or_default();
+        let frontend_endpoint = if role == "be" {
+            "frontend_endpoint = \"127.0.0.1:19080\"\n"
+        } else {
+            Default::default()
+        };
         let control_port = if role == "be" {
             "control_grpc_port = 19082\n"
         } else {

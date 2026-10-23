@@ -132,7 +132,7 @@ fn xx_hash3_128_owner_exact_byte_carriers_and_original_logical_domains() {
         );
     }
     for source in profiles {
-        let prepared = prepared_for_test("xx_hash3_128", &[source.clone()]).unwrap();
+        let prepared = prepared_for_test("xx_hash3_128", std::slice::from_ref(&source)).unwrap();
         let result = prepared.contract().result_type();
         assert_eq!(result.logical_type(), ValueLogicalType::LargeInt);
         assert_eq!(result.data_type().clone(), DataType::FixedSizeBinary(16));

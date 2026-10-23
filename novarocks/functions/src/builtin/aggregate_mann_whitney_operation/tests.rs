@@ -17,7 +17,6 @@
 
 use super::super::aggregate_mann_whitney_core::MannWhitneyState;
 use super::*;
-use crate::builtin::aggregate_mann_whitney_core::MannFailure;
 use crate::opaque_memory::OpaqueAllocationHost;
 use crate::source_custody_resources_tests::{measured, measured_live_bytes, without_recording};
 use crate::*;

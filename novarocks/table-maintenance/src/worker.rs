@@ -546,30 +546,28 @@ pub(crate) mod tests {
         }
     }
 
-    fn submit_job(jobs: &OptimizeProcessRuntime) -> impl std::future::Future<Output = i64> + '_ {
-        async move {
-            let target = MaintenanceTarget {
-                catalog: "catalog".to_string(),
-                namespace: "namespace".to_string(),
-                table: "table".to_string(),
-            };
-            let permit = TableMaintenanceActivity::default()
-                .acquire(&target, MaintenanceActivityFamily::Optimize)
-                .expect("permit");
-            jobs.submit(
-                JobCreate {
-                    target,
-                    object_id: vec![1],
-                    base_snapshot_id: 1,
-                    created_at_ms: 1,
-                    effect_id: None,
-                },
-                permit,
-            )
-            .await
-            .expect("submit")
-            .job_id
-        }
+    async fn submit_job(jobs: &OptimizeProcessRuntime) -> i64 {
+        let target = MaintenanceTarget {
+            catalog: "catalog".to_string(),
+            namespace: "namespace".to_string(),
+            table: "table".to_string(),
+        };
+        let permit = TableMaintenanceActivity::default()
+            .acquire(&target, MaintenanceActivityFamily::Optimize)
+            .expect("permit");
+        jobs.submit(
+            JobCreate {
+                target,
+                object_id: vec![1],
+                base_snapshot_id: 1,
+                created_at_ms: 1,
+                effect_id: None,
+            },
+            permit,
+        )
+        .await
+        .expect("submit")
+        .job_id
     }
 
     #[tokio::test]

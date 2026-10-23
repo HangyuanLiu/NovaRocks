@@ -29,7 +29,7 @@ use crate::kernel_control::{compile_failure, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::*;
 use allocator_api2::vec::Vec as HostVec;
-use arrow_array::{ArrayRef, builder::BinaryBuilder};
+use arrow_array::ArrayRef;
 use arrow_schema::DataType;
 use novarocks_type_contract::CompileCheckpoints;
 use std::sync::Arc;
@@ -568,7 +568,7 @@ impl PreparedAggregateKernel for ApproxPercentileKernel {
                 }
                 work.step()?;
             }
-            let mut sink = FailureSink {
+            let sink = FailureSink {
                 allocator: &prepared.allocator,
                 domain: FailureDomain::Mutation {
                     contract: &self.contract,
@@ -654,7 +654,7 @@ impl PreparedAggregateKernel for ApproxPercentileKernel {
                 .into());
             }
             work.step()?;
-            let mut sink = FailureSink {
+            let sink = FailureSink {
                 allocator: &prepared.allocator,
                 domain: FailureDomain::Mutation {
                     contract: &self.contract,
@@ -766,11 +766,6 @@ impl PreparedAggregateKernel for ApproxPercentileKernel {
                 HostAggregateAllocator::try_new(Arc::clone(context.allocator().ok_or_else(
                     || invalid("approximate percentile final requires actual host allocator"),
                 )?))?;
-            let mut sink = FailureSink {
-                allocator: &host,
-                domain: FailureDomain::Emission(context),
-                control,
-            };
             let output_kind = match self.output_type() {
                 DataType::Float64 => core::ScalarOutput::Float64,
                 DataType::List(_) => core::ScalarOutput::List,

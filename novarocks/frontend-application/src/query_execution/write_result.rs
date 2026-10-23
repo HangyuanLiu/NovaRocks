@@ -43,26 +43,38 @@ use crate::query_execution::internal_result_cpu::InternalResultRetention;
 use novarocks_native_adapter::root_record_assembly::{RootRecordAssembly, RootRecordDomain};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
 use arrow::array::{
     Array, BinaryArray, Int8Array, Int32Array, Int64Array, ListArray, MapArray, StringArray,
     StructArray,
 };
+#[cfg(test)]
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_native_adapter::root_write_commit_codec::WriteCommitRecordView;
 use novarocks_spi::connector::write_stack::{
-    PreparedWriteSetLedger, ROOT_WRITE_RESULT_BLOB_TYPE_INDEX, ROOT_WRITE_RESULT_BODY_INDEX,
+    PreparedWriteSetLedger, RootRowKind, RootWriteResultMembershipValidator,
+    RootWriteResultRowShape, WriteRowCountAccumulator, WriteStatisticsArtifact, WriteTargetOrdinal,
+    row_count_from_wire, target_ordinal_from_wire, validate_artifact_draft_nested_values,
+};
+#[cfg(test)]
+use novarocks_spi::connector::write_stack::{
+    ROOT_WRITE_RESULT_BLOB_TYPE_INDEX, ROOT_WRITE_RESULT_BODY_INDEX,
     ROOT_WRITE_RESULT_FRAGMENT_INDEX, ROOT_WRITE_RESULT_INPUT_FIELDS_INDEX,
     ROOT_WRITE_RESULT_KIND_INDEX, ROOT_WRITE_RESULT_PROPERTIES_INDEX,
-    ROOT_WRITE_RESULT_ROW_COUNT_INDEX, ROOT_WRITE_RESULT_TARGET_INDEX, RootRowKind,
-    RootWriteResultMembershipValidator, RootWriteResultRowShape, RootWriteResultSchema,
-    WriteRowCountAccumulator, WriteStatisticsArtifact, WriteTargetOrdinal, row_count_from_wire,
-    target_ordinal_from_wire, validate_artifact_draft_nested_values,
+    ROOT_WRITE_RESULT_ROW_COUNT_INDEX, ROOT_WRITE_RESULT_TARGET_INDEX, RootWriteResultSchema,
 };
 use novarocks_spi::connector::{
     MAX_CONNECTOR_STATISTICS_ARTIFACTS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
     MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES, StatisticsArtifactDraft,
     StatisticsArtifactIdentity,
 };
+
+pub(crate) type RootWriteResultParts = (
+    u64,
+    Vec<(WriteTargetOrdinal, Vec<u8>)>,
+    Vec<WriteStatisticsArtifact>,
+    Option<InternalResultRetention>,
+);
 
 /// A complete prepared write set, still in canonical carrier form.
 ///
@@ -125,14 +137,7 @@ impl DecodedPreparedWriteSet {
         &self.fragments
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        u64,
-        Vec<(WriteTargetOrdinal, Vec<u8>)>,
-        Vec<WriteStatisticsArtifact>,
-        Option<InternalResultRetention>,
-    ) {
+    pub(crate) fn into_parts(self) -> RootWriteResultParts {
         (
             self.row_count,
             self.fragments,
@@ -148,6 +153,7 @@ impl DecodedPreparedWriteSet {
 pub(crate) struct RootWriteDecodeContract {
     expected_targets: BTreeSet<WriteTargetOrdinal>,
     expected_artifacts: BTreeSet<(WriteTargetOrdinal, StatisticsArtifactIdentity)>,
+    #[cfg(test)]
     schema: RootWriteResultSchema,
 }
 
@@ -189,6 +195,7 @@ impl RootWriteDecodeContract {
         Ok(Self {
             expected_targets,
             expected_artifacts,
+            #[cfg(test)]
             schema: RootWriteResultSchema::new(),
         })
     }
@@ -266,6 +273,7 @@ impl RootWriteResultDecoder {
         Ok(decoder)
     }
 
+    #[cfg(test)]
     pub(crate) fn apply_chunk(&mut self, chunk: &Chunk) -> Result<(), String> {
         if self.root_eof {
             return Err("write Root emitted a trailing batch after EOF".into());
@@ -610,6 +618,7 @@ fn charge_total(
     Ok(total)
 }
 
+#[cfg(test)]
 fn downcast<'a, T: 'static>(
     column: &'a arrow::array::ArrayRef,
     label: &str,

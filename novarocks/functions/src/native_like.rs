@@ -261,7 +261,7 @@ impl PreparedNativeLikeRecipe {
         truth_only: bool,
         control: &dyn crate::KernelEvaluationControl,
     ) -> Result<crate::SelectedValues<'a>, crate::KernelFailure> {
-        use crate::kernel_control::{internal, invalid};
+        use crate::kernel_control::invalid;
         use crate::{EvaluatedArgument, KernelEvaluationControl, KernelFailure};
         let observed = crate::KernelControlObservation::new(control);
         observed.checkpoint(0)?;
@@ -297,7 +297,7 @@ impl PreparedNativeLikeRecipe {
                     arg.validate_shape_observed::<KernelFailure>(selection, || work.step())?;
                 }
             }
-            if selection.len() == 0 {
+            if selection.is_empty() {
                 crate::kernel_input::validate_argument_observed(
                     text, selection, &self.text, &observed,
                 )?;

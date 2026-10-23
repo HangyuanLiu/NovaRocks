@@ -17,6 +17,8 @@
 //! Receiver-owned asynchronous sink with pre-acceptance queue credit. Data
 //! completion and the actor's actual join are separate observations.
 
+#[cfg(test)]
+use crate::exec::pipeline::operator::ExitProgress;
 use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::{
     exec::{
@@ -24,8 +26,7 @@ use crate::{
         pipeline::{
             input::{AcceptedInput, InputPreparationFailure, RawInput},
             operator::{
-                ExitObservation, ExitProgress, FinishWatch, InputConstructionFactory,
-                InputEncodingPolicy, Operator,
+                ExitObservation, FinishWatch, InputConstructionFactory, InputEncodingPolicy,
             },
             schedule::observer::Observable,
             shape::{
@@ -1011,7 +1012,6 @@ async fn drain_loop<B: AsyncSinkBackend>(
         // Its original backend and receiver remain in this protected frame.
         park_actor(&shared).await;
     }
-    let mut current: Option<ManuallyDrop<SinkBatch>> = None;
     while shared.failure().is_none() && !shared.stop.load(Ordering::Acquire) {
         shared.phase(SinkPhase::Input);
         // There is exactly one actor input waiter. notify_one retains a wake
@@ -1034,14 +1034,10 @@ async fn drain_loop<B: AsyncSinkBackend>(
         let Some(batch) = next else {
             break;
         };
-        current = Some(ManuallyDrop::new(batch));
+        let mut current = ManuallyDrop::new(batch);
         if !shared.stop.load(Ordering::Acquire) {
             let result = backend_call(SinkPhase::Write, &shared, &control, || {
-                start
-                    .backend
-                    .as_mut()
-                    .unwrap()
-                    .write_chunk(current.as_ref().unwrap().chunk())
+                start.backend.as_mut().unwrap().write_chunk(current.chunk())
             })
             .await;
             let _ = result; // The original call already consumed its failure event.
@@ -1049,10 +1045,9 @@ async fn drain_loop<B: AsyncSinkBackend>(
         if shared.unresolved.load(Ordering::Acquire) {
             break;
         }
-        if !current.as_mut().unwrap().retire(&shared, &control, false) {
+        if !current.retire(&shared, &control, false) {
             break;
         }
-        current = None;
         shared.queued.fetch_sub(1, Ordering::AcqRel);
         shared.notify(SinkNotice::Ready, &control, &mut || shared.wake());
     }
@@ -1060,11 +1055,10 @@ async fn drain_loop<B: AsyncSinkBackend>(
     start.rx.as_mut().unwrap().close();
     if !shared.unresolved.load(Ordering::Acquire) {
         while let Ok(batch) = start.rx.as_mut().unwrap().try_recv() {
-            current = Some(ManuallyDrop::new(batch));
-            if !current.as_mut().unwrap().retire(&shared, &control, false) {
+            let mut current = ManuallyDrop::new(batch);
+            if !current.retire(&shared, &control, false) {
                 break;
             }
-            current = None;
             shared.queued.fetch_sub(1, Ordering::AcqRel);
         }
     }
@@ -1072,27 +1066,24 @@ async fn drain_loop<B: AsyncSinkBackend>(
     if shared.failure().is_none()
         && !shared.stop.load(Ordering::Acquire)
         && !shared.unresolved.load(Ordering::Acquire)
-    {
-        match backend_call(SinkPhase::Finish, &shared, &control, || {
+        && let Ok(value) = backend_call(SinkPhase::Finish, &shared, &control, || {
             start.backend.as_mut().unwrap().finish()
         })
         .await
-        {
-            Ok(value) => *output = Some(value),
-            Err(_) => {} // The original finish author already consumed its event.
-        }
+    {
+        *output = Some(value);
     }
+    // The original finish author already consumed any finish failure event.
     let aborted = shared.failure().is_some()
         || shared.stop.load(Ordering::Acquire)
         || shared.unresolved.load(Ordering::Acquire);
-    if aborted {
-        if let Err(_error) = backend_call(SinkPhase::Abort, &shared, &control, || {
+    if aborted
+        && let Err(_error) = backend_call(SinkPhase::Abort, &shared, &control, || {
             start.backend.as_mut().unwrap().abort()
         })
         .await
-        {
-            // The same backend operation already reported this cleanup event.
-        }
+    {
+        // The same backend operation already reported this cleanup event.
     }
     if let Err(_error) = backend_call(SinkPhase::Close, &shared, &control, || {
         start.backend.as_mut().unwrap().close()
@@ -2343,8 +2334,6 @@ mod tests {
         assert_eq!(rows.load(Ordering::Acquire), 6);
         assert_eq!(chunks.load(Ordering::Acquire), 6);
     }
-    use crate::runtime::task_control::TaskExecutionPort;
-    use novarocks_execution_contract::TaskConclusionPort;
     // The existing Task author owns acceptance. This adapter records only the
     // real event calls and exposes the same process Health to the oracle.
     struct SinkPort {

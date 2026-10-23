@@ -224,6 +224,7 @@ fn truncate_input(source: &DataType) -> bool {
     )
 }
 
+#[cfg(test)]
 pub(super) fn bind_result(
     name: &str,
     request: FunctionBindingRequest<'_>,

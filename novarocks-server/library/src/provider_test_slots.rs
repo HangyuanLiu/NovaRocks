@@ -125,9 +125,8 @@ impl ProviderTestSlots {
         let storage = novarocks_fs::StorageAuthorityCloseControls::from_grants(
             scope.grants_for("storage-authority"),
         )
-        .map_err(|error| {
+        .inspect_err(|_error| {
             self.iceberg.close();
-            error
         })?;
         let install = (|| -> Result<(), String> {
             let registries = self

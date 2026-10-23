@@ -22,10 +22,9 @@ use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate
 use crate::runtime::{
     fragment::ExecutionFailureCause,
     query_memory::QueryMemoryBinding,
-    runtime_state::{RuntimeErrorState, RuntimeState},
+    runtime_state::RuntimeState,
     scalar_memory::{
-        RuntimeScalarEvaluationFailure, RuntimeScalarMemoryJournal, RuntimeScalarMemoryRefusal,
-        RuntimeScalarMemoryScope,
+        RuntimeScalarMemoryJournal, RuntimeScalarMemoryRefusal, RuntimeScalarMemoryScope,
     },
 };
 use arrow::{

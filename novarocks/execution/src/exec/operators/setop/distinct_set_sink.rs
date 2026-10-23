@@ -52,17 +52,6 @@ pub struct DistinctSetSinkFactory<S: DistinctSetSemantics> {
     state: DistinctSetSharedState<S>,
 }
 
-impl<S: DistinctSetSemantics> DistinctSetSinkFactory<S> {
-    pub(crate) fn new(stage: usize, state: DistinctSetSharedState<S>, node_id: i32) -> Self {
-        let name = if node_id >= 0 {
-            format!("{} (id={node_id})", S::SINK_OPERATOR_NAME)
-        } else {
-            S::SINK_OPERATOR_NAME.to_string()
-        };
-        Self { name, stage, state }
-    }
-}
-
 impl<S: DistinctSetSemantics> OperatorFactory for DistinctSetSinkFactory<S> {
     fn name(&self) -> &str {
         &self.name

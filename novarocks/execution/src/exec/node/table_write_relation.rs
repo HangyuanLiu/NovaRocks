@@ -159,6 +159,7 @@ impl WriterMultiplexRelationSchema {
     /// exact SPI relation by Arrow schema, and every column, the fixed prefix
     /// included, is carried by its compiler-allocated layout slot. An
     /// auxiliary channel is identified by its layout slot.
+    #[cfg(test)]
     pub(crate) fn try_from_compiled_layout(
         layout: &novarocks_local_program::StaticLayout,
     ) -> ExecutionResult<Self> {
@@ -346,10 +347,10 @@ impl WriterMultiplexRelationSchema {
 
 fn plain_relation_value(value: &novarocks_type_contract::ValueTypeRef) -> bool {
     novarocks_type_contract::visit_value_type_observed(value, |visit| {
-        if let novarocks_type_contract::ValueSemanticVisit::Node(value) = visit {
-            if value.domain().is_some() {
-                return Err(());
-            }
+        if let novarocks_type_contract::ValueSemanticVisit::Node(value) = visit
+            && value.domain().is_some()
+        {
+            return Err(());
         }
         Ok(())
     })
@@ -409,24 +410,6 @@ impl WriterMultiplexRelationTemplate {
         Ok(Self {
             layout: layout.clone(),
         })
-    }
-    /// The local plan route retains the original reserved prefix slot law.
-    pub(crate) fn try_new_reserved(
-        layout: &novarocks_local_program::StaticLayout,
-    ) -> ExecutionResult<Self> {
-        let template = Self::try_new(layout)?;
-        if layout.slots()[..WRITE_RELATION_COLUMN_COUNT]
-            .iter()
-            .copied()
-            .ne((0..WRITE_RELATION_COLUMN_COUNT)
-                .map(|ordinal| SlotId::new(write_relation_column_id(ordinal))))
-        {
-            return Err(relation_failure(
-                WriteRelationViolation::SlotBinding,
-                "writer multiplex slot order differs from static layout",
-            ));
-        }
-        Ok(template)
     }
     pub(crate) fn slots(&self) -> &[SlotId] {
         self.layout.slots()
@@ -546,8 +529,6 @@ impl WriterMultiplexRelationTemplate {
 }
 #[derive(Clone, Debug)]
 pub(crate) enum WriterRelationPreparation {
-    #[cfg(test)]
-    Existing(WriterMultiplexRelationSchema),
     Compiled {
         template: WriterMultiplexRelationTemplate,
         prepared: Option<WriterMultiplexRelationSchema>,
@@ -565,15 +546,11 @@ impl WriterRelationPreparation {
     }
     pub(crate) fn slots(&self) -> &[SlotId] {
         match self {
-            #[cfg(test)]
-            Self::Existing(schema) => schema.chunk_schema().slot_ids(),
             Self::Compiled { template, .. } => template.slots(),
         }
     }
     pub(crate) fn schema(&self) -> ExecutionResult<&WriterMultiplexRelationSchema> {
         match self {
-            #[cfg(test)]
-            Self::Existing(schema) => Ok(schema),
             Self::Compiled {
                 prepared: Some(schema),
                 ..
@@ -590,13 +567,13 @@ impl WriterRelationPreparation {
             &std::sync::Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
         >,
     ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
-        if let Self::Compiled { template, prepared } = self {
-            if prepared.is_none() {
-                let factory = factory
-                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
-                let schema = template.prepare(factory.as_ref())?;
-                *prepared = Some(schema);
-            }
+        if let Self::Compiled { template, prepared } = self
+            && prepared.is_none()
+        {
+            let factory = factory
+                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+            let schema = template.prepare(factory.as_ref())?;
+            *prepared = Some(schema);
         }
         Ok(())
     }
@@ -640,24 +617,6 @@ impl RootWriteResultRelationTemplate {
         })
     }
 
-    /// The local plan route retains the original reserved root slot law.
-    pub(crate) fn try_new_reserved(
-        layout: &novarocks_local_program::StaticLayout,
-    ) -> ExecutionResult<Self> {
-        let template = Self::try_new(layout)?;
-        if RootWriteResultSchema::new()
-            .slot_ids()
-            .into_iter()
-            .map(SlotId::new)
-            .ne(layout.slots().iter().copied())
-        {
-            return Err(relation_failure(
-                WriteRelationViolation::SlotBinding,
-                "root write result slot order differs from static layout",
-            ));
-        }
-        Ok(template)
-    }
     pub(crate) fn layout(&self) -> &novarocks_local_program::StaticLayout {
         &self.layout
     }

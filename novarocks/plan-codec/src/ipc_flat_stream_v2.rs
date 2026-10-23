@@ -154,6 +154,7 @@ pub(crate) fn metadata<'a>(
 ) -> Result<(&'a [u8], usize), TypeCodecError> {
     metadata_in(input, offset, limit, None, None, work)
 }
+#[cfg(test)]
 pub(crate) fn metadata_in<'a, E: ReaderGeometryFailure>(
     input: &'a [u8],
     offset: usize,
@@ -239,6 +240,7 @@ pub fn preflight_flat_constant_stream<'a, 'f>(
     result
 }
 
+#[cfg(test)]
 pub(crate) fn preflight_flat_constant_stream_in<'a, 'f>(
     input: &'a [u8],
     expected: &'f Field,

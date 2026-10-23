@@ -1328,13 +1328,13 @@ fn nested_value_encoded_len(array: &ArrayRef, row: usize) -> ExecutionResult<usi
     } else {
         encoded_group_key_non_null_len(array, row)?
             .checked_add(5)
-            .ok_or_else(|| group_key_request_arithmetic())
+            .ok_or_else(group_key_request_arithmetic)
     }
 }
 
 fn checked_encoded_len_add(left: usize, right: usize) -> ExecutionResult<usize> {
     left.checked_add(right)
-        .ok_or_else(|| group_key_request_arithmetic())
+        .ok_or_else(group_key_request_arithmetic)
 }
 
 pub(crate) fn decode_group_key_rows(

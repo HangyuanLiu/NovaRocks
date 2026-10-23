@@ -47,14 +47,14 @@ use novarocks_type_contract::{
     FunctionValueType, PureCompileControl, SemanticParameters,
 };
 
-use crate::exec::chunk::{Chunk, ChunkSchema, OutputColumnMetadata};
+use crate::exec::chunk::{Chunk, OutputColumnMetadata};
 use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
 use crate::exec::pipeline::binding::ExchangeBindings;
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution;
 use crate::runtime::fragment::io::NoopFragmentEventSink;
 use crate::runtime::runtime_state::RuntimeState;
 
-pub(super) struct FixtureControl;
+pub(crate) struct FixtureControl;
 impl PureCompileControl for FixtureControl {
     fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
         Ok(())
@@ -72,7 +72,7 @@ impl novarocks_functions::KernelEvaluationControl for FixtureControl {
 
 /// A declared constant input with an admitted original columns Vec. Only
 /// container metadata is paid here; this does not grant payload authority.
-pub(super) fn paid_input(
+pub(crate) fn paid_input(
     program: &LocalProgram,
     tracker: &Arc<crate::runtime::mem_tracker::MemTracker>,
 ) -> Chunk {
@@ -109,16 +109,16 @@ pub(super) fn paid_input(
     Chunk::try_new_with_output_column_metadata(batch, schema, metadata, owner.as_ref()).unwrap()
 }
 
-pub(super) fn int64(nullable: bool) -> FunctionValueType {
+pub(crate) fn int64(nullable: bool) -> FunctionValueType {
     FunctionValueType::new(DataType::Int64, nullable)
 }
 
-pub(super) fn boolean(nullable: bool) -> FunctionValueType {
+pub(crate) fn boolean(nullable: bool) -> FunctionValueType {
     FunctionValueType::new(DataType::Boolean, nullable)
 }
 
 /// One nullable or non-null Int64 literal cell.
-pub(super) fn cell(value: Option<i64>) -> LiteralValue {
+pub(crate) fn cell(value: Option<i64>) -> LiteralValue {
     value.map_or(LiteralValue::Null, LiteralValue::Int64)
 }
 
@@ -185,7 +185,7 @@ fn admission() -> FragmentPackageAdmission {
 
 /// Publish the fragment rooted at `root` with a Result sink. Every root is a
 /// leaf and gets one eager use; there is no function call to freeze.
-pub(super) fn package(
+pub(crate) fn package(
     builder: FragmentBuilder,
     root: NodeId,
     constants: ConstantPools,
@@ -309,7 +309,7 @@ pub(crate) fn package_with_sink_and_names(
 
 /// Explicit fixture constant admission; these values are not production
 /// defaults. Constant pools authored by a test use the same policy.
-pub(super) fn constant_policy() -> ConstantPolicy {
+pub(crate) fn constant_policy() -> ConstantPolicy {
     ConstantPolicy {
         max_rows: 16,
         max_array_nodes: 128,
@@ -336,7 +336,7 @@ fn options(dop: usize) -> LocalCompileOptions {
 
 /// Compile with the real local compiler. The catalog is the sealed RAND
 /// subset because an empty catalog is refused; these fixtures bind no call.
-pub(super) fn try_compile(
+pub(crate) fn try_compile(
     package: Arc<FragmentPackage>,
     dop: usize,
 ) -> Result<Arc<LocalProgram>, String> {
@@ -356,13 +356,13 @@ pub(crate) fn compile(package: Arc<FragmentPackage>, dop: usize) -> Arc<LocalPro
 
 /// Prepare and run the program with its frozen driver count; a preparation
 /// or execution failure is returned as text.
-pub(super) fn try_run(program: &Arc<LocalProgram>) -> Result<Vec<Chunk>, String> {
+pub(crate) fn try_run(program: &Arc<LocalProgram>) -> Result<Vec<Chunk>, String> {
     try_run_in(program, None)
 }
 
 /// A declared original query tracker for resource-owning component fixtures.
 /// Other family fixtures keep their original untracked inputs unchanged.
-pub(super) fn run_with_tracker(
+pub(crate) fn run_with_tracker(
     program: &Arc<LocalProgram>,
     tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
 ) -> Vec<Chunk> {
@@ -409,12 +409,12 @@ fn try_run_in(
     Ok(output.take_chunks())
 }
 
-pub(super) fn run(program: &Arc<LocalProgram>) -> Vec<Chunk> {
+pub(crate) fn run(program: &Arc<LocalProgram>) -> Vec<Chunk> {
     try_run(program).unwrap_or_else(|error| panic!("compiled program runs: {error}"))
 }
 
 /// Every output row as nullable Int64 cells, in emission order.
-pub(super) fn int64_rows(chunks: &[Chunk]) -> Vec<Vec<Option<i64>>> {
+pub(crate) fn int64_rows(chunks: &[Chunk]) -> Vec<Vec<Option<i64>>> {
     let mut rows = Vec::new();
     for chunk in chunks {
         let columns = chunk

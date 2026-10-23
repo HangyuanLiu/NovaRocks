@@ -343,7 +343,7 @@ fn original_flat_recursive_resource_authors_keep_plain_laws_and_parent_results()
         let actual = preflight_recursive_pool_resources_in(
             &field,
             &value,
-            lengths.into_iter(),
+            lengths,
             input,
             policy(),
             &mut |_| Ok(()),

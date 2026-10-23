@@ -31,13 +31,12 @@ use novarocks_local_compiler::{
 };
 use novarocks_local_program::{
     KernelAbiVersion, LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole,
-    ProgramNodeKind, ProgramUseRef, StaticExprKind,
+    ProgramNodeKind,
 };
 use novarocks_physical_plan::*;
 use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, author_fragment_package_semantics};
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
-    ValueTypeStorageLifetime,
+    CompileControlError, CompilePhase, PureCompileControl, ValueTypeStorageLifetime,
 };
 use std::{
     collections::BTreeMap,

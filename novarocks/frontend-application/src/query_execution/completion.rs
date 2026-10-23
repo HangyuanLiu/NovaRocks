@@ -73,13 +73,6 @@ pub struct QueryAttemptReservation {
 }
 
 impl QueryAttemptReservation {
-    #[cfg(novarocks_dev_controls)]
-    pub(crate) fn test_statement_nomination(
-        &self,
-    ) -> Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>> {
-        self.test_nomination.get().cloned()
-    }
-
     pub(crate) fn first(
         query_id: QueryId,
     ) -> Result<Self, crate::query_execution::contract::DistributedQueryError> {
@@ -159,10 +152,10 @@ impl QueryAttemptReservation {
         #[cfg(novarocks_dev_controls)]
         if let Some(nomination) = nomination {
             nomination.validate().map_err(|error| error.to_string())?;
-            if let Err(candidate) = self.test_nomination.set(nomination.clone()) {
-                if self.test_nomination.get() != Some(&candidate) {
-                    return Err("attempt reservation already names another statement".into());
-                }
+            if let Err(candidate) = self.test_nomination.set(nomination.clone())
+                && self.test_nomination.get() != Some(&candidate)
+            {
+                return Err("attempt reservation already names another statement".into());
             }
             let installed =
                 context.request_scope_extension_or_insert_with(|| nomination.as_ref().clone());
@@ -181,7 +174,7 @@ impl QueryAttemptReservation {
         self,
     ) -> Result<QueryCredentialLeases, crate::query_execution::contract::DistributedQueryError>
     {
-        self.credential_collector.into_credential_leases()
+        self.credential_collector.drain_credential_leases()
     }
 }
 
@@ -425,12 +418,7 @@ pub struct PreparedQueryCompletion {
     formatter: PreparedQueryFormatter,
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Completion formatting retains the exact profile payload paired with the distributed request."
-)]
 enum PreparedQueryFormatter {
-    Result,
     Profile(PreparedProfileFormatter),
 }
 
@@ -449,12 +437,6 @@ enum ProfilePlan {
 }
 
 impl PreparedQueryCompletion {
-    pub(crate) fn result() -> Self {
-        Self {
-            formatter: PreparedQueryFormatter::Result,
-        }
-    }
-
     pub(crate) fn completed_profile(
         plan: std::sync::Arc<novarocks_physical_plan::PhysicalPlan>,
         annotations: std::sync::Arc<[novarocks_sql::compiler::SqlDisplayAnnotation]>,
@@ -477,11 +459,6 @@ impl PreparedQueryCompletion {
         outcome: crate::query_execution::outcome::DistributedQueryOutcome,
     ) -> Result<StatementResult, String> {
         match self.formatter {
-            PreparedQueryFormatter::Result => outcome
-                .into_result()
-                .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
-                .map(StatementResult::Query)
-                .map_err(|error| error.to_string()),
             PreparedQueryFormatter::Profile(formatter) => complete_profile(formatter, outcome),
         }
     }

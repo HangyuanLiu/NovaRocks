@@ -237,7 +237,7 @@ impl DeploymentInput {
             .collect();
         let join_progress = facts
             .join_progress()
-            .filter_map(|progress| match progress {
+            .map(|progress| match progress {
                 crate::query_execution::preparation::runtime_filter_view::RuntimeFilterJoinProgressFacts::Proven {
                     channel_id,
                     producer_binding_id,
@@ -245,7 +245,7 @@ impl DeploymentInput {
                     join_node_id,
                     build_frontier,
                     non_build_inputs,
-                } => Some(JoinProgressProof {
+                } => JoinProgressProof {
                     channel_id,
                     producer_binding_id,
                     producer_fragment_id,
@@ -258,8 +258,7 @@ impl DeploymentInput {
                         .into_iter()
                         .map(|edge| (edge.source_fragment_id, edge.target_exchange_node_id))
                         .collect(),
-                }),
-                crate::query_execution::preparation::runtime_filter_view::RuntimeFilterJoinProgressFacts::Skipped { .. } => None,
+                },
             })
             .map(|proof| {
                 (
@@ -847,7 +846,6 @@ fn compile_feedback_declaration(
                     plan_node_id: binding.node_id,
                     binding_id: binding.binding_id,
                     data_type: value_type.data_type().clone(),
-                    nullable: value_type.nullable(),
                 }),
                 BindingRole::Consumer {
                     feedback_scan_type: None,
@@ -1590,6 +1588,7 @@ fn build_wait_edges(
     Ok(edges)
 }
 
+#[cfg(test)]
 fn build_wait_graph(
     bindings: &BTreeMap<u32, BindingSpec>,
     fragment_edges: &[FragmentEdgeSpec],

@@ -17,7 +17,6 @@
 
 //! Actual host-ledger and all checkpoint refusal probes for the NDV lifecycle.
 use super::*;
-use arrow_array::StringArray;
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
     EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
@@ -74,10 +73,10 @@ impl AggregateStateAllocator for Host {
         let mut ledger = self.ledger.lock().unwrap();
         let at = ledger.attempts;
         ledger.attempts += 1;
-        if let Some((stop, cause)) = &*self.refusal.lock().unwrap() {
-            if *stop == at {
-                return Err(cause.clone());
-            }
+        if let Some((stop, cause)) = &*self.refusal.lock().unwrap()
+            && *stop == at
+        {
+            return Err(cause.clone());
         }
         let pointer = NonNull::new(unsafe { std::alloc::alloc(layout) })
             .ok_or(KernelFailure::ResourceExhausted)?;
@@ -110,14 +109,6 @@ impl AggregateStateAllocator for Host {
 fn arm_refusal(host: &Host, offset: usize, cause: KernelFailure) {
     let next = host.ledger.lock().unwrap().attempts;
     *host.refusal.lock().unwrap() = Some((next + offset, cause));
-}
-fn assert_metadata_only(host: &Host) {
-    let ledger = host.ledger.lock().unwrap();
-    let metadata = ledger
-        .metadata
-        .expect("successful constructor allocated metadata");
-    assert_eq!(ledger.live.as_slice(), &[metadata]);
-    assert_eq!(ledger.bytes, metadata.1.size());
 }
 fn causes() -> [KernelFailure; 7] {
     [

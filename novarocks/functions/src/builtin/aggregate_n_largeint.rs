@@ -115,7 +115,7 @@ impl NEmissionAccess for NLargeIntState {
         operation: impl FnOnce(&CoreNState<HostAggregateAllocator>) -> Result<(), KernelFailure>,
     ) -> Result<(), KernelFailure> {
         if self.failed.get() {
-            return Err(KernelFailure::InstanceFailed.into());
+            return Err(KernelFailure::InstanceFailed);
         }
         let core = self
             .core
@@ -214,7 +214,9 @@ fn mapping_copy(
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<usize, KernelFailure> {
     if mapping.len() != selection.len() {
-        return Err(invalid("min_n/max_n mapping differs from its selected domain").into());
+        return Err(invalid(
+            "min_n/max_n mapping differs from its selected domain",
+        ));
     }
     work.flush()?;
     target
@@ -228,7 +230,7 @@ fn mapping_copy(
         .capacity()
         .checked_mul(size_of::<usize>())
         .ok_or(KernelFailure::ResourceExhausted)?;
-    Ok(add(allocator_retained(allocator)?, bytes)?)
+    add(allocator_retained(allocator)?, bytes)
 }
 impl PreparedAggregateKernel for NLargeIntKernel {
     type State = NLargeIntState;
@@ -400,8 +402,7 @@ impl PreparedAggregateKernel for NLargeIntKernel {
                 {
                     return Err(invalid(
                         "min_n/max_n update differs from its exact phase or channels",
-                    )
-                    .into());
+                    ));
                 }
                 retained = mapping_copy(mapping, input.selection(), &mut owned, &allocator, work)?;
                 Ok(())
@@ -426,56 +427,55 @@ impl PreparedAggregateKernel for NLargeIntKernel {
         if state.failed.get() {
             return Err(KernelFailure::InstanceFailed.into());
         }
-        let result = call_unit(
-            &batch.charge,
-            &batch.allocator,
-            NDataDomain::Mutation {
-                contract: &self.contract,
-                phase: AggregateInvocationPhase::Update,
-                selection: batch.input.selection(),
-                mapping: &batch.mapping,
-            },
-            control,
-            |work| {
-                state.validate(&self.contract, &batch.host)?;
-                if !std::ptr::eq(batch.input.contract(), self.contract.as_ref()) {
-                    return Err(invalid("min_n/max_n update frame uses another exact call").into());
-                }
-                let mut core = state
-                    .core
-                    .try_borrow_mut()
-                    .map_err(|_| internal("min_n/max_n state has a conflicting update borrow"))?;
-                let row = batch
-                    .input
-                    .selection()
-                    .row(ordinal)
-                    .ok_or_else(|| invalid("min_n/max_n selected ordinal is out of bounds"))?;
-                let values = batch.input.logical_arguments()[0];
-                let limits = batch.input.logical_arguments()[1];
-                let value_row = values.value_row(ordinal, row);
-                let limit_row = limits.value_row(ordinal, row);
-                if value_row >= values.array().len() || limit_row >= limits.array().len() {
-                    return Err(
-                        internal("min_n/max_n selected channel address is out of bounds").into(),
-                    );
-                }
-                work.step()?;
-                let mut sort = BoundNSortResources {
-                    charge: &batch.charge,
-                    allocator: &core.allocator.clone(),
-                };
-                core.update_from_arrays_with_sort_resources(
-                    values.array(),
-                    value_row,
-                    limits.array(),
-                    limit_row,
-                    self.keep_smallest,
-                    &mut sort,
-                    work,
-                )?;
-                state.account(&core, work)
-            },
-        );
+        let result =
+            call_unit(
+                &batch.charge,
+                &batch.allocator,
+                NDataDomain::Mutation {
+                    contract: &self.contract,
+                    phase: AggregateInvocationPhase::Update,
+                    selection: batch.input.selection(),
+                    mapping: &batch.mapping,
+                },
+                control,
+                |work| {
+                    state.validate(&self.contract, &batch.host)?;
+                    if !std::ptr::eq(batch.input.contract(), self.contract.as_ref()) {
+                        return Err(invalid("min_n/max_n update frame uses another exact call"));
+                    }
+                    let mut core = state.core.try_borrow_mut().map_err(|_| {
+                        internal("min_n/max_n state has a conflicting update borrow")
+                    })?;
+                    let row =
+                        batch.input.selection().row(ordinal).ok_or_else(|| {
+                            invalid("min_n/max_n selected ordinal is out of bounds")
+                        })?;
+                    let values = batch.input.logical_arguments()[0];
+                    let limits = batch.input.logical_arguments()[1];
+                    let value_row = values.value_row(ordinal, row);
+                    let limit_row = limits.value_row(ordinal, row);
+                    if value_row >= values.array().len() || limit_row >= limits.array().len() {
+                        return Err(internal(
+                            "min_n/max_n selected channel address is out of bounds",
+                        ));
+                    }
+                    work.step()?;
+                    let mut sort = BoundNSortResources {
+                        charge: &batch.charge,
+                        allocator: &core.allocator.clone(),
+                    };
+                    core.update_from_arrays_with_sort_resources(
+                        values.array(),
+                        value_row,
+                        limits.array(),
+                        limit_row,
+                        self.keep_smallest,
+                        &mut sort,
+                        work,
+                    )?;
+                    state.account(&core, work)
+                },
+            );
         if result.is_err() {
             state.latch();
         }
@@ -511,8 +511,7 @@ impl PreparedAggregateKernel for NLargeIntKernel {
                 {
                     return Err(invalid(
                         "min_n/max_n merge differs from its exact phase or Binary state",
-                    )
-                    .into());
+                    ));
                 }
                 retained = mapping_copy(mapping, input.selection(), &mut owned, &allocator, work)?;
                 Ok(())
@@ -550,7 +549,7 @@ impl PreparedAggregateKernel for NLargeIntKernel {
             |work| {
                 state.validate(&self.contract, &batch.host)?;
                 if !std::ptr::eq(batch.input.contract(), self.contract.as_ref()) {
-                    return Err(invalid("min_n/max_n merge frame uses another exact call").into());
+                    return Err(invalid("min_n/max_n merge frame uses another exact call"));
                 }
                 let mut core = state
                     .core
@@ -569,9 +568,9 @@ impl PreparedAggregateKernel for NLargeIntKernel {
                         invalid("min_n/max_n merge requires its exact Binary carrier")
                     })?;
                 if address >= array.len() {
-                    return Err(
-                        internal("min_n/max_n selected merge address is out of bounds").into(),
-                    );
+                    return Err(internal(
+                        "min_n/max_n selected merge address is out of bounds",
+                    ));
                 }
                 work.step()?;
                 if array.is_null(address) {

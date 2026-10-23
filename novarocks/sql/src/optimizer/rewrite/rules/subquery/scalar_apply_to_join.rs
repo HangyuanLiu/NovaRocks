@@ -665,7 +665,7 @@ mod tests {
 
     fn make_t2_scan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: "t2".to_string(),
@@ -773,7 +773,7 @@ mod tests {
         let mut ctx = ctx_with_factory();
 
         let apply = LogicalPlanNode::new(
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
                 output_column: OutputColumn {
@@ -872,7 +872,7 @@ mod tests {
         );
 
         let apply = LogicalPlanNode::new(
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
                 output_column: OutputColumn {
@@ -1004,7 +1004,7 @@ mod tests {
         );
 
         let apply = LogicalPlanNode::new(
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
                 output_column: OutputColumn {
@@ -1101,7 +1101,7 @@ mod tests {
         );
 
         let apply = LogicalPlanNode::new(
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 // simple scan, no agg
                 kind: ApplyKind::Scalar,
                 subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
@@ -1329,7 +1329,7 @@ mod tests {
         let mut ctx = ctx_with_factory();
 
         let apply = LogicalPlanNode::new(
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
                 output_column: OutputColumn {

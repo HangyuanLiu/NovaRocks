@@ -802,16 +802,14 @@ mod tests {
     fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
         matches!(
             &plan.kind,
-            LogicalPlanKind::Scan(PlanScanNode {
-                table: TableDef {
-                    source: ScanSource::Sql(SqlScanSource {
+            LogicalPlanKind::Scan(scan)
+                if matches!(
+                    &scan.table.source,
+                    ScanSource::Sql(SqlScanSource {
                         kind: SqlScanKind::MvTargetState { .. },
                         ..
-                    }),
-                    ..
-                },
-                ..
-            })
+                    })
+                )
         ) || plan.children.iter().any(contains_target_state_scan)
     }
 
@@ -911,7 +909,7 @@ mod tests {
     fn scan(name: &str, first_id: u32) -> LogicalPlanNode {
         let columns = vec![column_def("region"), column_def("amount")];
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: name.to_string(),

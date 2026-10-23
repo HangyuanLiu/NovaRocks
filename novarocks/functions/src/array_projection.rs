@@ -504,9 +504,7 @@ where
     Ok(Arc::new(field))
 }
 
-fn physical<'a, T: 'static, E: From<ArrayProjectionFailure>>(
-    array: &'a ArrayRef,
-) -> Result<&'a T, E> {
+fn physical<T: 'static, E: From<ArrayProjectionFailure>>(array: &ArrayRef) -> Result<&T, E> {
     array.as_any().downcast_ref::<T>().ok_or_else(|| {
         E::from(ArrayProjectionFailure::Contract(
             ArrayProjectionViolation::PhysicalWrapper,

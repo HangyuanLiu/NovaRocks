@@ -180,7 +180,7 @@ impl ReadyKernelMemory {
             .domain
             .activate(self.stock_bytes, self.threshold_bytes)?;
         *journal = KernelMemoryJournal::default();
-        let mut guard = SettleReady {
+        let guard = SettleReady {
             lease: Some(lease),
             domain: &self.domain,
             journal,

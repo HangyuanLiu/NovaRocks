@@ -90,7 +90,7 @@ pub(crate) fn validate_current() -> Result<()> {
 
 fn exact_milliseconds(duration: Duration, name: &'static str) -> Result<u64> {
     ensure!(
-        duration.subsec_nanos() % 1_000_000 == 0,
+        duration.subsec_nanos().is_multiple_of(1_000_000),
         "external listing {name} is not an exact millisecond duration"
     );
     let milliseconds = u64::try_from(duration.as_millis())

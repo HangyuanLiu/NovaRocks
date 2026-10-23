@@ -248,8 +248,7 @@ fn constructor_and_all_turns_fit_original_scratch_without_extra_allocation() {
         true,
     );
     let refusal = ChunkSlotSchema::try_new_with_field(SlotId::new(7), oversized, None, None)
-        .err()
-        .expect("execution timezone keeps its original type bound");
+        .expect_err("execution timezone keeps its original type bound");
     use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
     let expected = novarocks_type_contract::ExecutionValueTypeError::Invalid(
         "value layout timezone exceeds the byte limit",

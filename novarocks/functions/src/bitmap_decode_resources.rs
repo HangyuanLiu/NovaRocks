@@ -35,9 +35,8 @@ impl BitmapDecodeResources {
         self.refused
     }
     fn boundary(&mut self, work: &mut EvaluationCheckpoints<'_>) -> Result<(), KernelFailure> {
-        work.flush().map_err(|cause| {
+        work.flush().inspect_err(|_cause| {
             self.refused = true;
-            cause
         })
     }
     fn reserve(&mut self, bytes: usize) -> Result<(), KernelFailure> {
@@ -50,15 +49,13 @@ impl BitmapDecodeResources {
             .checked_add(bytes)
             .ok_or(KernelFailure::ResourceExhausted)?;
         Layout::from_size_align(bytes, 1).map_err(|_| KernelFailure::ResourceExhausted)?;
-        let mut reservation = self.copies.reserve_operation(bytes).map_err(|cause| {
+        let mut reservation = self.copies.reserve_operation(bytes).inspect_err(|_cause| {
             self.refused = true;
-            cause
         })?;
         self.copies
             .reconcile_under_reservation(retained, &mut reservation)
-            .map_err(|cause| {
+            .inspect_err(|_cause| {
                 self.refused = true;
-                cause
             })
     }
     fn resource() -> KernelFailure {

@@ -274,22 +274,39 @@ pub struct ScenarioPhaseObservation {
     counters: BTreeMap<&'static str, u64>,
 }
 
+pub(crate) struct ScenarioContextParams {
+    pub name: &'static str,
+    pub handle: CrossProcessServerHandle,
+    pub scenario_root: PathBuf,
+    pub timeout: Duration,
+    pub original_deadline: Instant,
+    pub binary: PathBuf,
+    pub compatible_binary: Option<PathBuf>,
+    pub other_island_binary: Option<PathBuf>,
+    pub base_config_path: PathBuf,
+    pub cluster_size: usize,
+    pub launch_profile: LaunchProfile,
+    pub build: crate::build_information::BuildInformation,
+    pub exact_mysql_clock: Option<ExactMysqlPrelaunchClock>,
+}
+
 impl ScenarioContext {
-    pub(crate) fn new(
-        name: &'static str,
-        handle: CrossProcessServerHandle,
-        scenario_root: PathBuf,
-        timeout: Duration,
-        original_deadline: Instant,
-        binary: PathBuf,
-        compatible_binary: Option<PathBuf>,
-        other_island_binary: Option<PathBuf>,
-        base_config_path: PathBuf,
-        cluster_size: usize,
-        launch_profile: LaunchProfile,
-        build: crate::build_information::BuildInformation,
-        exact_mysql_clock: Option<ExactMysqlPrelaunchClock>,
-    ) -> Self {
+    pub(crate) fn new(params: ScenarioContextParams) -> Self {
+        let ScenarioContextParams {
+            name,
+            handle,
+            scenario_root,
+            timeout,
+            original_deadline,
+            binary,
+            compatible_binary,
+            other_island_binary,
+            base_config_path,
+            cluster_size,
+            launch_profile,
+            build,
+            exact_mysql_clock,
+        } = params;
         Self {
             build,
             name,
@@ -743,25 +760,6 @@ fn scenario_platform_identity() -> Result<ScenarioPlatformIdentity> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::source_tree_sha256;
-
-    #[test]
-    fn source_tree_identity_changes_with_each_git_input() {
-        let baseline = source_tree_sha256("revision", "", b"tracked", b"diff", b"staged");
-        for changed in [
-            source_tree_sha256("other-revision", "", b"tracked", b"diff", b"staged"),
-            source_tree_sha256("revision", " M file", b"tracked", b"diff", b"staged"),
-            source_tree_sha256("revision", "", b"other-tracked", b"diff", b"staged"),
-            source_tree_sha256("revision", "", b"tracked", b"other-diff", b"staged"),
-            source_tree_sha256("revision", "", b"tracked", b"diff", b"other-staged"),
-        ] {
-            assert_ne!(baseline, changed);
-        }
-    }
-}
-
 fn unix_millis(time: SystemTime) -> Result<u128> {
     Ok(time
         .duration_since(UNIX_EPOCH)
@@ -812,4 +810,23 @@ pub(crate) fn resolve_backend_binaries(
                 .map(|binary| binary.unwrap_or_else(|| primary.to_path_buf()))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_tree_sha256;
+
+    #[test]
+    fn source_tree_identity_changes_with_each_git_input() {
+        let baseline = source_tree_sha256("revision", "", b"tracked", b"diff", b"staged");
+        for changed in [
+            source_tree_sha256("other-revision", "", b"tracked", b"diff", b"staged"),
+            source_tree_sha256("revision", " M file", b"tracked", b"diff", b"staged"),
+            source_tree_sha256("revision", "", b"other-tracked", b"diff", b"staged"),
+            source_tree_sha256("revision", "", b"tracked", b"other-diff", b"staged"),
+            source_tree_sha256("revision", "", b"tracked", b"diff", b"other-staged"),
+        ] {
+            assert_ne!(baseline, changed);
+        }
+    }
 }

@@ -323,6 +323,10 @@ impl<T: StatementNativeAttemptOwner + ?Sized> StatementNativeForegroundLease<T> 
             }
         }
     }
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "Changing this public foreground-owner accessor to BorrowMut requires cross-crate API review."
+    )]
     pub fn borrow_mut(&mut self) -> &mut T {
         self.owner.as_deref_mut().expect("live original owner")
     }
@@ -634,10 +638,10 @@ impl StatementNativeResidualRegistry {
                 _panic: None,
                 _cause: Some(cause),
             });
-        } else if let Some(first) = state.health.as_mut() {
-            if first._cause.is_none() {
-                first._cause = Some(cause);
-            }
+        } else if let Some(first) = state.health.as_mut()
+            && first._cause.is_none()
+        {
+            first._cause = Some(cause);
         }
         drop(state);
         self.0.changed.notify_one();

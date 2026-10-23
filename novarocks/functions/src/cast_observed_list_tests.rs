@@ -484,11 +484,11 @@ fn list_cast_core_keeps_the_exact_child_failure_and_has_no_observation_footer() 
     #[derive(Debug)]
     enum CallerFailure {
         Original(Arc<String>),
-        Domain(crate::list_cast_core::ListCastFailure),
+        Domain,
     }
     impl From<crate::list_cast_core::ListCastFailure> for CallerFailure {
-        fn from(cause: crate::list_cast_core::ListCastFailure) -> Self {
-            Self::Domain(cause)
+        fn from(_: crate::list_cast_core::ListCastFailure) -> Self {
+            Self::Domain
         }
     }
     let a = input(true, 3);

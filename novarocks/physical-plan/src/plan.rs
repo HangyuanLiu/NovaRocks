@@ -421,12 +421,12 @@ impl JoinKind {
     /// exactly the unmatched ones, so pushing into those sides would delete
     /// rows the statement asked for.
     pub const fn key_filter_reaches_side(self, side: JoinSide) -> bool {
-        match (self, side) {
+        matches!(
+            (self, side),
             (Self::Inner | Self::LeftSemi | Self::RightSemi, _)
-            | (Self::LeftOuter, JoinSide::Right)
-            | (Self::RightOuter, JoinSide::Left) => true,
-            _ => false,
-        }
+                | (Self::LeftOuter, JoinSide::Right)
+                | (Self::RightOuter, JoinSide::Left)
+        )
     }
 
     /// Whether removing rows from this side of the join can only remove rows
@@ -436,11 +436,11 @@ impl JoinKind {
     /// removing a row makes more of the preserved side qualify, so the output
     /// grows rather than shrinks.
     pub const fn side_only_loses_rows(self, side: JoinSide) -> bool {
-        match (self, side) {
+        !matches!(
+            (self, side),
             (Self::LeftAnti | Self::NullAwareLeftAnti, JoinSide::Right)
-            | (Self::RightAnti, JoinSide::Left) => false,
-            _ => true,
-        }
+                | (Self::RightAnti, JoinSide::Left)
+        )
     }
 }
 

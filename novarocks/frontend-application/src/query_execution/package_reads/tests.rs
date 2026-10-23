@@ -27,29 +27,32 @@
 //! because the Frontend host that composes them needs a StateStore.
 
 use std::collections::BTreeMap;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use novarocks_catalog_application::ConnectorControlHost;
+#[cfg(any())]
 use novarocks_connector_contract::{
     PureProviderManifestEntry, PureProviderProgramCatalog, PureProviderProgramDefinition,
 };
 use novarocks_connector_paimon::io::{PaimonFsAuthorizedListing, PaimonHostFileIo};
+#[cfg(any())]
+use novarocks_connector_paimon::role_binding::PaimonReadRecipeCompiler;
 use novarocks_connector_paimon::role_binding::{
-    PaimonControlRoleBindingFactory, PaimonReadRecipeCompiler, PaimonRoleFileIoFactory,
+    PaimonControlRoleBindingFactory, PaimonRoleFileIoFactory,
 };
 use novarocks_physical_plan::{
-    MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, NodeKind, PipelineDopDomain, PlanVersionId,
-    PredicateGuaranteeKind, ScanReadBudget,
+    MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId, ScanReadBudget,
 };
 use novarocks_query_application::preparation::{
     CatalogFactPort, CompletedPlanWithAccess, FinalPlanCompletionDriver, MaterializedViewFactPort,
     QueryCompletionFactSource, StatisticsFactPort,
 };
+#[cfg(any())]
+use novarocks_spi::connector::ConnectorCodecError;
 use novarocks_spi::connector::{
-    CatalogHandle, CatalogProperties, CatalogProperty, CatalogVersion, ConnectorCodecError,
+    CatalogHandle, CatalogProperties, CatalogProperty, CatalogVersion,
     ConnectorControlRoleBindingFactory, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorProviderId, ConnectorRequestContext, ConnectorStopOwner, MaterializationContext,
     StorageAccessDomainId,
@@ -72,6 +75,7 @@ use crate::catalog_application::query_materializer::{
     CatalogServiceMaterializer, iceberg_table_binding_loader,
 };
 use crate::query_execution::package_freeze::{CompiledPackageCarrier, PackageFreezeError};
+#[cfg(any())]
 use crate::query_execution::physical_encoding::{EncodedCompletedPlan, encode_completed_plan};
 use crate::query_execution::provider_read_facts::{
     FrontendProviderReadFacts, FrozenProviderRead, FrozenReadEncoding,
@@ -429,6 +433,7 @@ fn compiled_carrier() -> CompiledPackageCarrier {
     )
 }
 
+#[cfg(any())]
 fn encode(
     completed: CompletedPlanWithAccess<FrozenProviderRead>,
     carrier: &CompiledPackageCarrier,
@@ -444,6 +449,7 @@ fn encode(
 
 /// The installed pure Paimon read program, as a read-only manifest entry.
 /// This is a fixture catalogue, not the Server's sealed manifest.
+#[cfg(any())]
 fn paimon_programs() -> PureProviderProgramCatalog<ConnectorCodecError> {
     let provider = ConnectorProviderId::parse("paimon").expect("provider id");
     PureProviderProgramCatalog::try_new(
@@ -465,6 +471,7 @@ fn paimon_programs() -> PureProviderProgramCatalog<ConnectorCodecError> {
 /// A real sealed RAND-only subset; the scan and its residual bind no
 /// function, but the compiler refuses an empty pure catalog. This is not the
 /// Server catalogue.
+#[cfg(any())]
 fn sealed_rand_subset() -> novarocks_functions::PureEngineFunctionCatalog {
     use novarocks_functions::{
         EngineFunctionCatalogBuilder, FunctionId, FunctionKind, FunctionOverloadId,

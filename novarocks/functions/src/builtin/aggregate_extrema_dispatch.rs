@@ -102,6 +102,12 @@ impl PreparedAggregateKernel for PreparedExtrema {
         contract: Arc<AggregateCallContract>,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Arc<Self>, KernelFailure> {
+        control
+            .checkpoint(
+                novarocks_type_contract::CompilePhase::FunctionSpecialization,
+                0,
+            )
+            .map_err(crate::kernel_control::compile_failure)?;
         Ok(Arc::new(match self {
             Self::Fixed(kernel) => Self::Fixed(ExtremaKernel {
                 contract,

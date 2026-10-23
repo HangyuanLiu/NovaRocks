@@ -55,6 +55,7 @@ use crate::exec::pipeline::{
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult, RequiredExpressionRowError};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
+#[cfg(test)]
 pub(super) use crate::runtime::kernel_memory as runtime_kernel_memory;
 #[cfg(test)]
 #[path = "runtime_kernel_memory_tests.rs"]
@@ -83,9 +84,6 @@ impl RuntimeKernelControl {
             allocator: None,
             construction: None,
         }
-    }
-    pub(crate) fn failure_port(&self) -> Arc<RuntimeErrorState> {
-        Arc::clone(&self.error)
     }
     /// Bind a nested receiver to the same fragment services. Its allocator is
     /// installed separately on that receiver; this creates no memory authority.
@@ -123,6 +121,7 @@ impl RuntimeKernelControl {
     pub(crate) fn query_memory(&self) -> Option<&crate::runtime::query_memory::QueryMemoryBinding> {
         self.query_memory.as_ref()
     }
+    #[cfg(test)]
     pub(super) fn request_kernel_memory(
         &self,
         request: runtime_kernel_memory::KernelMemoryRequest,
@@ -172,20 +171,19 @@ impl RuntimeKernelControl {
     // originating fact only when that port actually observes its owner stop;
     // an unrelated kernel failure must not adopt a later fragment failure.
     fn observe_stop_cause(&self) {
-        if self.observed_stop.get().is_none() {
-            if let Some(error) = self.error.error() {
-                let _ = self.observed_stop.set(error);
-            }
+        if self.observed_stop.get().is_none()
+            && let Some(error) = self.error.error()
+        {
+            let _ = self.observed_stop.set(error);
         }
     }
     fn project_required_failure(&self, failure: ExecutionFailure) -> ExecutionFailure {
         if matches!(
             failure.cause(),
             crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
-        ) {
-            if let Some(original) = self.observed_stop.get() {
-                return original.clone();
-            }
+        ) && let Some(original) = self.observed_stop.get()
+        {
+            return original.clone();
         }
         failure
     }
@@ -194,9 +192,6 @@ impl RuntimeKernelControl {
             Some(error) => Err(error),
             None => Ok(()),
         }
-    }
-    pub(crate) fn wait_execution(&self, duration: Duration) -> ExecutionResult<()> {
-        self.error.wait_interruptibly(duration)
     }
 }
 
@@ -312,7 +307,7 @@ fn evaluate_selection(
         crate::runtime::scalar_memory::RuntimeScalarMemoryScope::new(control, &mut journal);
     let result = instance
         .evaluate_input_runtime(input, selection, activation, control, &mut scope)
-        .map_err(|cause| control.project_required_failure(cause.into()))?;
+        .map_err(|cause| control.project_required_failure(cause))?;
     let (selection, values, errors) = result.into_parts();
     if let Some(error) = errors.into_vec().into_iter().next() {
         return Err(RequiredExpressionRowError::try_new(site, selection, error)?.into());
@@ -640,9 +635,7 @@ pub(crate) fn project_chunk_with_source_observer(
         .output
         .ok_or_else(|| {
             novarocks_functions::KernelFailure::Internal(
-                novarocks_functions::KernelDiagnostic::new(
-                    &("source fixture Project has no output"),
-                ),
+                novarocks_functions::KernelDiagnostic::new("source fixture Project has no output"),
             )
             .into()
         })

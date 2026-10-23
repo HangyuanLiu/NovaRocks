@@ -160,10 +160,10 @@ impl PureCompileControl for Trace {
             assert!(index <= refuse, "no callback after first refusal")
         }
         events.push((phase, steps));
-        if let Some((refuse, cause)) = self.refuse.clone() {
-            if index == refuse {
-                return Err(cause);
-            }
+        if let Some((refuse, cause)) = self.refuse.clone()
+            && index == refuse
+        {
+            return Err(cause);
         }
         Ok(())
     }

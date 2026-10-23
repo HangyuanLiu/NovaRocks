@@ -27,8 +27,7 @@ use arrow::{
 };
 use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
 use novarocks_local_program::{
-    LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeKind,
-    StaticExprKind,
+    LocalProgram, ProgramExpressionRootSite, ProgramNodeKind, StaticExprKind,
 };
 use novarocks_physical_plan::{ExprKind, PhysicalCallDefinition};
 

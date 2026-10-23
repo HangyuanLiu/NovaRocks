@@ -1087,7 +1087,6 @@ pub struct ConnectorCommittedPartitionField {
 }
 
 impl ConnectorCommittedPartitionField {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         partition_field_id: i32,
         partition_field_name: impl Into<Arc<str>>,
@@ -2424,8 +2423,6 @@ fn sha256(payload: &Bytes) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use arrow::datatypes::{DataType, Field};
 
     use super::*;

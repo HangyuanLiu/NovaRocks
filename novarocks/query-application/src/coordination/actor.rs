@@ -115,6 +115,7 @@ impl LogicalExecutionClock for ProcessLogicalExecutionClock {
 }
 
 impl AttemptActivationIdentity {
+    #[cfg(test)]
     pub(crate) const fn from_parts(
         actor_instance_id: u64,
         execution: QueryExecutionId,
@@ -155,10 +156,12 @@ pub(crate) struct RootResultObserver {
 }
 
 impl RootResultObserver {
+    #[cfg(test)]
     pub(crate) const fn activation(&self) -> AttemptActivationIdentity {
         self.activation
     }
 
+    #[cfg(test)]
     pub(crate) async fn observe_status(
         &self,
         status: TaskStatus,
@@ -932,7 +935,6 @@ impl LogicalExecutionActorConfig {
     ///     );
     /// }
     /// ```
-    #[allow(clippy::too_many_arguments)]
     pub fn single_attempt_read_rows(
         initial_execution: QueryExecutionId,
         mailbox_capacity: NonZeroUsize,
@@ -1016,7 +1018,10 @@ impl LogicalExecutionActorConfig {
 
     /// Constructs an effect-free read whose whole attempt may restart only
     /// before any result packet becomes visible.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "this public constructor freezes each independent admission, replacement, work-owner, and row-carrier fact"
+    )]
     pub fn read_only_pre_visibility_recovery_rows(
         initial_execution: QueryExecutionId,
         mailbox_capacity: NonZeroUsize,
@@ -1422,7 +1427,7 @@ struct RootTerminalObservation {
 pub(crate) enum RootTerminalFailure {
     Unspecified,
     Pending,
-    Authoritative(QueryExecutionError),
+    Authoritative(Box<QueryExecutionError>),
 }
 
 enum PendingResult {
@@ -2298,6 +2303,10 @@ pub(crate) fn spawn_logical_execution_actor(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the actor loop receives independently owned mailboxes, permits, effect ports, and ledger state from one spawn boundary"
+)]
 async fn run_actor(
     state: &mut LogicalExecutionState,
     mut receiver: mpsc::Receiver<ActorCommand>,
@@ -2808,12 +2817,12 @@ fn synchronize_all_stand_down(
     abort_effect_port: Option<&dyn AbortQueryContextEffectPort>,
 ) {
     for attempt in attempts.values_mut() {
-        if !attempt.stand_down.started() && state.conclusion() == Some(LogicalConclusion::Succeeded)
+        if !attempt.stand_down.started()
+            && state.conclusion() == Some(LogicalConclusion::Succeeded)
+            && let Err(error) = begin_or_refresh_successful_cleanup(attempt)
         {
-            if let Err(error) = begin_or_refresh_successful_cleanup(attempt) {
-                stand_down_error.get_or_insert(error);
-                attempt.stand_down_error.get_or_insert(error);
-            }
+            stand_down_error.get_or_insert(error);
+            attempt.stand_down_error.get_or_insert(error);
         }
         let replacement_failed = matches!(
             state.phase(),
@@ -2832,11 +2841,11 @@ fn synchronize_all_stand_down(
                 LogicalConclusion::Succeeded => None,
             })
         };
-        if let Some(cause) = cause {
-            if let Err(error) = begin_or_refresh_stand_down(attempt, cause) {
-                stand_down_error.get_or_insert(error);
-                attempt.stand_down_error.get_or_insert(error);
-            }
+        if let Some(cause) = cause
+            && let Err(error) = begin_or_refresh_stand_down(attempt, cause)
+        {
+            stand_down_error.get_or_insert(error);
+            attempt.stand_down_error.get_or_insert(error);
         }
         if attempt.stand_down.started() && attempt.stand_down.responsibility_settled() {
             if let Err(error) = cancel_pending_abort_issues(
@@ -3374,7 +3383,7 @@ fn result_receipt_failure(
 ) -> Option<QueryExecutionError> {
     match disposition {
         Ok(ResultDeliveryDisposition::Completed) => None,
-        Ok(ResultDeliveryDisposition::Failed(error)) => Some(error),
+        Ok(ResultDeliveryDisposition::Failed(error)) => Some(*error),
         Ok(ResultDeliveryDisposition::Dropped) | Err(()) => Some(logical_owner_failure(
             crate::execution_error::QueryFailureReason::LogicalOwnerStopped,
             "result delivery receipt ended without a consumer completion",
@@ -3892,7 +3901,7 @@ fn fail_result_runtime(state: &mut LogicalExecutionState, runtime: Option<&mut R
 fn conclude_for_work_cancellation(
     state: &mut LogicalExecutionState,
     replacement: Option<&ReplacementRuntime>,
-    mut runtime: Option<&mut ResultRuntime>,
+    runtime: Option<&mut ResultRuntime>,
     reason: &CancellationReason,
 ) {
     let was_unconcluded = state.conclusion().is_none();
@@ -3904,7 +3913,7 @@ fn conclude_for_work_cancellation(
     conclude_or_interrupt_success(state, replacement, None, conclusion);
     if was_unconcluded
         && state.conclusion() == Some(conclusion)
-        && let Some(runtime) = runtime.as_deref_mut()
+        && let Some(runtime) = runtime
     {
         let (kind, message) = match reason {
             CancellationReason::DeadlineExceeded
@@ -3960,6 +3969,10 @@ fn conclude_with(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each mutable reference is a distinct actor ledger and must stay separately borrowed while one command is applied"
+)]
 fn handle_command(
     state: &mut LogicalExecutionState,
     attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
@@ -4511,10 +4524,9 @@ fn handle_command(
                         if state
                             .conclude(&capability, LogicalConclusion::Failed)
                             .is_ok()
+                            && let (Some(runtime), Some(error)) = (result_runtime, terminal_error)
                         {
-                            if let (Some(runtime), Some(error)) = (result_runtime, terminal_error) {
-                                runtime.accepted_error = Some(error);
-                            }
+                            runtime.accepted_error = Some(error);
                         }
                         lifetime.settle();
                         let _ = reply.send(Err(error.into()));
@@ -5074,7 +5086,10 @@ fn apply_root_status_observation(
             return;
         }
         if let RootTerminalFailure::Authoritative(error) = terminal_failure {
-            runtime.attempt_error = Some(AttemptResultFailure { activation, error });
+            runtime.attempt_error = Some(AttemptResultFailure {
+                activation,
+                error: *error,
+            });
         }
         if state.output_visible() {
             fail_result_observation(state, runtime);
@@ -5130,7 +5145,10 @@ fn apply_root_status_observation(
     if terminal_state {
         let cause_pending = matches!(&terminal_failure, RootTerminalFailure::Pending);
         if let RootTerminalFailure::Authoritative(error) = terminal_failure {
-            runtime.attempt_error = Some(AttemptResultFailure { activation, error });
+            runtime.attempt_error = Some(AttemptResultFailure {
+                activation,
+                error: *error,
+            });
         }
         if cause_pending {
             runtime.attempt_decision_pending = Some(activation);

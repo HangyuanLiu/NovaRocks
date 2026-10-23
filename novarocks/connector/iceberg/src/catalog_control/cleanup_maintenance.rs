@@ -1102,7 +1102,9 @@ fn hex_decode(value: &str) -> Option<Vec<u8>> {
     }
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|digits| {
             let high = (digits[0] as char).to_digit(16)? as u8;
             let low = (digits[1] as char).to_digit(16)? as u8;
@@ -1230,8 +1232,8 @@ mod tests {
     use super::*;
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
+    use crate::iceberg::TableCreation;
     use crate::iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
-    use crate::iceberg::{TableCreation, TableUpdate};
     use crate::metadata::IcebergMetadata;
     use crate::resources::IcebergMetadataResources;
 

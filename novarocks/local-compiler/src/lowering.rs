@@ -2020,11 +2020,10 @@ fn lower_with_creation<
             definition,
             control: invocation.control,
             arguments: {
-                if arguments.capacity()!=arguments.len() && !arguments.is_empty() {
-                    if let Some(scope)=main_flow_scope.as_mut() {
+                if arguments.capacity()!=arguments.len() && !arguments.is_empty()
+                    && let Some(scope)=main_flow_scope.as_mut() {
                         crate::creation::request(std::alloc::Layout::array::<novarocks_type_contract::ExpressionUseId>(arguments.len()).map_err(|_| novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic)?,scope,work)?;
                     }
-                }
                 arguments.into_boxed_slice()
             },
         });

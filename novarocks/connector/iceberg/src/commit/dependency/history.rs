@@ -26,7 +26,6 @@ pub enum HistoryGap {
     StartExpired(i64),
     SnapshotMissing(i64),
     StartNotAncestor { start: i64, parent: Option<i64> },
-    Cycle(i64),
 }
 
 #[derive(Debug)]
@@ -54,10 +53,10 @@ pub fn history_window(
     start: Option<i64>,
     parent: Option<i64>,
 ) -> Result<HistoryWindow, HistoryGap> {
-    if let Some(start) = start {
-        if metadata.snapshot_by_id(start).is_none() {
-            return Err(HistoryGap::StartExpired(start));
-        }
+    if let Some(start) = start
+        && metadata.snapshot_by_id(start).is_none()
+    {
+        return Err(HistoryGap::StartExpired(start));
     }
     let mut next = parent;
     let mut visited = BTreeSet::new();
@@ -69,9 +68,7 @@ pub fn history_window(
                 parent,
             });
         };
-        if !visited.insert(id) {
-            return Err(HistoryGap::Cycle(id));
-        }
+        assert!(visited.insert(id), "Iceberg history contains a cycle");
         let snapshot = metadata
             .snapshot_by_id(id)
             .ok_or(HistoryGap::SnapshotMissing(id))?;

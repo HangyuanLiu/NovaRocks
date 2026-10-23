@@ -103,12 +103,11 @@ impl Drop for BackedPair {
     fn drop(&mut self) {
         let mut failures: [Option<RawValue>; 2] = [None, None];
         for (index, value) in self.values.iter_mut().enumerate() {
-            if let Some(value) = value.take() {
-                if let Err(payload) =
+            if let Some(value) = value.take()
+                && let Err(payload) =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value)))
-                {
-                    failures[index] = Some(payload);
-                }
+            {
+                failures[index] = Some(payload);
             }
         }
         if failures.iter().all(Option::is_none) {
@@ -125,7 +124,7 @@ impl Drop for BackedPair {
                         .zip(self.backing.as_ref())
                         .is_some_and(|(a, b)| Arc::ptr_eq(a, b)) =>
                 {
-                    failures = std::mem::replace(&mut previous.values, [None, None]);
+                    failures = std::mem::take(&mut previous.values);
                     previous.backing.take();
                 }
                 Ok(previous) => failures[index] = Some(previous),

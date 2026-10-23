@@ -43,7 +43,6 @@ pub struct RequestAdmission {
 }
 
 impl RequestAdmission {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         current_catalog: Option<String>,
         current_database: String,

@@ -31,19 +31,33 @@ use std::sync::Arc;
 /// their original Chunk/provider custody on the backing buffers.
 #[derive(Clone)]
 pub(super) enum OwnedArraySource {
-    Array(ArrayRef),
-    Constant(ConstantValue),
-    ConstantView(ConstantValue, ArrayRef),
+    Array {
+        _array: ArrayRef,
+    },
+    Constant {
+        _value: ConstantValue,
+    },
+    ConstantView {
+        _value: ConstantValue,
+        _array: ArrayRef,
+    },
 }
 impl OwnedArraySource {
     pub(super) fn from_source(source: &ScalarInvocationSource<'_>) -> Self {
         match source {
-            ScalarInvocationSource::Constant(value) => Self::Constant((*value).clone()),
-            ScalarInvocationSource::ConstantView(value) => {
-                Self::ConstantView(value.original().clone(), value.values().clone())
-            }
-            ScalarInvocationSource::Scalar(array) => Self::Array(Arc::clone(array)),
-            ScalarInvocationSource::Array(loan) => Self::Array(Arc::clone(loan.array())),
+            ScalarInvocationSource::Constant(value) => Self::Constant {
+                _value: (*value).clone(),
+            },
+            ScalarInvocationSource::ConstantView(value) => Self::ConstantView {
+                _value: value.original().clone(),
+                _array: value.values().clone(),
+            },
+            ScalarInvocationSource::Scalar(array) => Self::Array {
+                _array: Arc::clone(array),
+            },
+            ScalarInvocationSource::Array(loan) => Self::Array {
+                _array: Arc::clone(loan.array()),
+            },
         }
     }
 }

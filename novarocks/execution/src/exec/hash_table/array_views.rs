@@ -22,7 +22,6 @@ use arrow::datatypes::DataType;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AggregateViewFailure {
-    InputContract(novarocks_failure_contract::BoundedDetail),
     PhysicalWrapper {
         expected: &'static str,
     },
@@ -34,7 +33,6 @@ pub enum AggregateViewFailure {
 impl std::fmt::Display for AggregateViewFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InputContract(detail) => detail.fmt(f),
             Self::PhysicalWrapper { expected } => write!(f, "failed to downcast to {expected}"),
             Self::Unsupported { view, actual } => {
                 write!(f, "unsupported {view} input type: {actual}")
@@ -46,9 +44,6 @@ impl std::error::Error for AggregateViewFailure {}
 impl novarocks_failure_contract::FailureProjection for AggregateViewFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         let reason = match self {
-            Self::InputContract(_) => {
-                crate::runtime::fragment::ExecutionReason::AggregateInputContract
-            }
             Self::PhysicalWrapper { .. } => {
                 crate::runtime::fragment::ExecutionReason::AggregateViewWrapper
             }
@@ -68,14 +63,6 @@ impl From<AggregateViewFailure> for crate::runtime::fragment::ExecutionFailure {
     }
 }
 
-pub(crate) fn aggregate_input_contract(
-    detail: impl std::fmt::Display,
-) -> crate::runtime::fragment::ExecutionFailure {
-    crate::runtime::fragment::ExecutionFailure::from_domain(AggregateViewFailure::InputContract(
-        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
-    ))
-}
-
 #[derive(Clone, Debug)]
 pub enum IntArrayView<'a> {
     Int64(&'a Int64Array),
@@ -91,28 +78,28 @@ impl<'a> IntArrayView<'a> {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .map(Self::Int64)
-                .ok_or_else(|| AggregateViewFailure::PhysicalWrapper {
+                .ok_or(AggregateViewFailure::PhysicalWrapper {
                     expected: "Int64Array",
                 }),
             DataType::Int32 => array
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .map(Self::Int32)
-                .ok_or_else(|| AggregateViewFailure::PhysicalWrapper {
+                .ok_or(AggregateViewFailure::PhysicalWrapper {
                     expected: "Int32Array",
                 }),
             DataType::Int16 => array
                 .as_any()
                 .downcast_ref::<Int16Array>()
                 .map(Self::Int16)
-                .ok_or_else(|| AggregateViewFailure::PhysicalWrapper {
+                .ok_or(AggregateViewFailure::PhysicalWrapper {
                     expected: "Int16Array",
                 }),
             DataType::Int8 => array
                 .as_any()
                 .downcast_ref::<Int8Array>()
                 .map(Self::Int8)
-                .ok_or_else(|| AggregateViewFailure::PhysicalWrapper {
+                .ok_or(AggregateViewFailure::PhysicalWrapper {
                     expected: "Int8Array",
                 }),
             other => Err(AggregateViewFailure::Unsupported {
@@ -147,14 +134,14 @@ impl<'a> FloatArrayView<'a> {
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .map(Self::Float64)
-                .ok_or_else(|| AggregateViewFailure::PhysicalWrapper {
+                .ok_or(AggregateViewFailure::PhysicalWrapper {
                     expected: "Float64Array",
                 }),
             DataType::Float32 => array
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .map(Self::Float32)
-                .ok_or_else(|| AggregateViewFailure::PhysicalWrapper {
+                .ok_or(AggregateViewFailure::PhysicalWrapper {
                     expected: "Float32Array",
                 }),
             other => Err(AggregateViewFailure::Unsupported {

@@ -31,6 +31,7 @@ use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
 
 pub(crate) type Payload = ManuallyDrop<Box<dyn Any + Send>>;
 pub(crate) type Callback<F> = Box<dyn FnMut(&F) -> bool + Send + 'static>;
+pub(crate) type Notification<F> = Box<dyn FnMut(&F) + Send + 'static>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Role {
@@ -178,7 +179,7 @@ impl<F: Send + 'static> OnceRole<F> {
 
     pub(crate) fn bind_notification(
         self: &Arc<Self>,
-        slot: &mut Option<Box<dyn FnMut(&F) + Send + 'static>>,
+        slot: &mut Option<Notification<F>>,
     ) -> ExecutionResult<()> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.bound {

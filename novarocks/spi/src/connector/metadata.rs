@@ -720,7 +720,7 @@ fn validate_foreign_key_constraints(
             .copied()
             .zip(constraint.referenced_column_names.iter().cloned())
             .collect::<Vec<_>>();
-        pairs.sort_by(|left, right| left.0.cmp(&right.0));
+        pairs.sort_by_key(|left| left.0);
         if pairs.iter().any(|(_, column)| column.trim().is_empty())
             || pairs.windows(2).any(|pair| pair[0].0 == pair[1].0)
         {

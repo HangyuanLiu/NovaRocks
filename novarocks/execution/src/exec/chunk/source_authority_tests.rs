@@ -188,7 +188,7 @@ fn source_authority_direct_provider_capture_is_held_by_last_cross_thread_buffer(
 fn source_authority_direct_constructor_refusal_preserves_the_paid_raw_source_alias() {
     use crate::exec::operators::compiled_expression::RuntimeKernelControl;
     use crate::runtime::runtime_state::RuntimeErrorState;
-    use novarocks_functions::{EvaluationCheckpoints, KernelFailure, SourceBackingOwner};
+    use novarocks_functions::{EvaluationCheckpoints, SourceBackingOwner};
     for provider in [false, true] {
         let tracker = MemTracker::new_root("failed capture original input");
         let chunk = if provider {

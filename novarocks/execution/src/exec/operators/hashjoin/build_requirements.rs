@@ -57,10 +57,6 @@ impl BuildComponentRequirements {
         self.row_payload == RowPayloadRequirement::Required
     }
 
-    pub(crate) fn requires_match_flags(self) -> bool {
-        self.match_flags == MatchFlagRequirement::Needed
-    }
-
     pub(crate) fn requires_lookup_table(self) -> bool {
         matches!(
             self.lookup,

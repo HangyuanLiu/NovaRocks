@@ -24,6 +24,13 @@ use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 
 use crate::iceberg::spec::TableMetadata;
 
+type MetadataOutputError = novarocks_connector_contract::PureProviderCompileError<
+    novarocks_spi::connector::ConnectorError,
+>;
+type MetadataOutputResult<T> = Result<T, MetadataOutputError>;
+type MetadataColumnCreator<'a> =
+    dyn FnMut(&str, DataType, bool) -> MetadataOutputResult<MetadataOutputColumn> + 'a;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum MetadataTableType {
     Files,
@@ -72,12 +79,7 @@ pub fn metadata_table_output_columns(
     let mut column = |name: &str, data_type: DataType, nullable: bool| {
         let name = creation.text(name)?;
         let binding = typed::value(&data_type, nullable, creation)?;
-        Ok::<
-            _,
-            novarocks_connector_contract::PureProviderCompileError<
-                novarocks_spi::connector::ConnectorError,
-            >,
-        >(MetadataOutputColumn { name, binding })
+        Ok::<_, MetadataOutputError>(MetadataOutputColumn { name, binding })
     };
     let map_int_to = |value: DataType| {
         let entries = DataType::Struct(
@@ -104,21 +106,8 @@ pub fn metadata_table_output_columns(
         );
         DataType::Map(Arc::new(Field::new("entries", entries, false)), false)
     };
-    let files = |column: &mut dyn FnMut(
-        &str,
-        DataType,
-        bool,
-    ) -> Result<
-        MetadataOutputColumn,
-        novarocks_connector_contract::PureProviderCompileError<
-            novarocks_spi::connector::ConnectorError,
-        >,
-    >|
-     -> Result<
+    let files = |column: &mut MetadataColumnCreator<'_>| -> MetadataOutputResult<
         Vec<MetadataOutputColumn>,
-        novarocks_connector_contract::PureProviderCompileError<
-            novarocks_spi::connector::ConnectorError,
-        >,
     > {
         let mut columns = vec![
             column("content", DataType::Int32, false)?,
@@ -295,6 +284,7 @@ pub fn metadata_output_schema(
     Ok(Arc::new(Schema::new(fields)))
 }
 
+#[cfg(test)]
 fn normalize_metadata_output_type(data_type: &DataType) -> DataType {
     match data_type {
         DataType::List(item) => DataType::List(Arc::new(normalize_metadata_output_field(item))),
@@ -345,6 +335,7 @@ fn normalize_metadata_output_type(data_type: &DataType) -> DataType {
     }
 }
 
+#[cfg(test)]
 fn normalize_metadata_output_field(field: &Field) -> Field {
     field
         .clone()

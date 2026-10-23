@@ -16,7 +16,7 @@
 // under the License.
 //! Real catalogue -> frozen Physical call -> LocalCompiler -> runtime Frame fixture.
 use super::*;
-use arrow::array::{ArrayRef, BinaryArray, StringArray};
+use arrow::array::StringArray;
 fn functions() -> PureEngineFunctionCatalog {
     let actual =
         novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();

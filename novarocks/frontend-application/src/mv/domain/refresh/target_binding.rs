@@ -108,7 +108,7 @@ impl MvTargetBinding {
     /// keys and aggregate state are declared physical target fields.
     pub fn physical_write_schema(&self) -> Result<SchemaRef, String> {
         mv_target_physical_write_schema(
-            &self.metadata.schema(),
+            self.metadata.schema(),
             &self.metadata.planning_facts,
             self.observation.field_ids(),
         )
@@ -158,20 +158,12 @@ impl MvTargetBinding {
         self.observation.table_uuid()
     }
 
-    pub const fn schema_id(&self) -> i32 {
-        self.observation.schema_id()
-    }
-
     pub const fn partition(&self) -> &MvPartitionContract {
         self.observation.partition()
     }
 
     pub const fn current_snapshot_id(&self) -> Option<i64> {
         self.observation.current_snapshot_id()
-    }
-
-    pub fn snapshot_id_for_ref(&self, ref_name: &str) -> Option<i64> {
-        self.observation.snapshot_id_for_ref(ref_name)
     }
 }
 

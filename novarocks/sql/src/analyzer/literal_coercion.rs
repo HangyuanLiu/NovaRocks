@@ -75,7 +75,7 @@ pub(crate) fn coerce_literal_for_comparison(left: &TypedExpr, right: TypedExpr) 
     if !is_column_ref(left) {
         return right;
     }
-    if !is_coercible_target(&left.value_type.data_type()) {
+    if !is_coercible_target(left.value_type.data_type()) {
         return right;
     }
     if !matches!(
@@ -85,7 +85,7 @@ pub(crate) fn coerce_literal_for_comparison(left: &TypedExpr, right: TypedExpr) 
         return right;
     }
     // Reuse the existing coercion that already handles STRING → DATE / TIMESTAMP.
-    super::resolve_expr::coerce_to_target_type(right, &left.value_type.data_type())
+    super::resolve_expr::coerce_to_target_type(right, left.value_type.data_type())
 }
 
 #[cfg(test)]

@@ -122,6 +122,7 @@ pub(super) enum PreparedNodeEncode<'node, 'namespace, 'loan, 'source, 'control> 
     TableWrite(PreparedTableWriteNodeEncode<'node, 'namespace, 'loan, 'source, 'control>),
 }
 impl PreparedNodeEncode<'_, '_, '_, '_, '_> {
+    #[cfg(test)]
     pub(super) fn facts(&self) -> &NodeProjectionFacts {
         match self {
             Self::Simple(token) => token.facts(),
@@ -169,10 +170,11 @@ pub(super) enum PreparedNodeDecode<'node, 'namespace, 'loan, 'wire, 'control> {
     Aggregate(PreparedAggregateNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>),
     TopN(PreparedTopNNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>),
     TableFunction(PreparedTableFunctionNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>),
-    Scan(PreparedScanNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>),
+    Scan(Box<PreparedScanNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>>),
     TableWrite(PreparedTableWriteNodeDecode<'node, 'namespace, 'loan, 'wire, 'control>),
 }
 impl PreparedNodeDecode<'_, '_, '_, '_, '_> {
+    #[cfg(test)]
     pub(super) fn facts(&self) -> &NodeProjectionFacts {
         match self {
             Self::Simple(token) => token.facts(),
@@ -203,7 +205,7 @@ impl PreparedNodeDecode<'_, '_, '_, '_, '_> {
             Self::Aggregate(token) => token.emit_in(admit, work),
             Self::TopN(token) => token.emit_in(admit, work),
             Self::TableFunction(token) => token.emit_in(admit, work),
-            Self::Scan(token) => token.emit_in(admit, work),
+            Self::Scan(token) => (*token).emit_in(admit, work),
             Self::TableWrite(token) => token.emit_in(admit, work),
         }
     }
@@ -499,7 +501,7 @@ pub(super) fn prepare_node_decode_in<'node, 'namespace, 'loan, 'wire, 'control>(
             )?)
         }
         Some(wire::physical_node::Kind::Scan(_)) => {
-            PreparedNodeDecode::Scan(prepare_scan_node_decode_in(
+            PreparedNodeDecode::Scan(Box::new(prepare_scan_node_decode_in(
                 input,
                 context.relations,
                 context.expressions,
@@ -510,7 +512,7 @@ pub(super) fn prepare_node_decode_in<'node, 'namespace, 'loan, 'wire, 'control>(
                 },
                 admit,
                 work,
-            )?)
+            )?))
         }
         Some(wire::physical_node::Kind::TableWriter(_))
         | Some(wire::physical_node::Kind::TableFinish(_)) => {

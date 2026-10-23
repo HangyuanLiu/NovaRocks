@@ -95,10 +95,7 @@ impl ReadCompletionTracker {
         self.root
     }
 
-    pub const fn stream(&self) -> RootResultStream {
-        self.stream
-    }
-
+    #[cfg(test)]
     pub const fn end_of_stream_observed(&self) -> bool {
         self.stream.end_of_stream_observed()
     }
@@ -244,10 +241,6 @@ impl WriteCompletionTracker {
         })
     }
 
-    pub const fn root_finish_task(&self) -> TaskIdentity {
-        self.root_finish
-    }
-
     pub fn writers(&self) -> impl ExactSizeIterator<Item = &TaskIdentity> + '_ {
         self.writers.iter()
     }
@@ -293,10 +286,8 @@ impl WriteCompletionTracker {
             if status.state() == TaskState::Finished {
                 continue;
             }
-            if status.state() == TaskState::Canceled {
-                if status.is_success_compatible_terminal() {
-                    continue;
-                }
+            if status.state() == TaskState::Canceled && status.is_success_compatible_terminal() {
+                continue;
             }
             return WriteVerdict::TaskNotFinished {
                 task,

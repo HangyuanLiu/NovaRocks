@@ -765,50 +765,51 @@ fn topk_known_codec_origin_survives_real_diagnostic_refusal_and_host_exit() {
     let host = Arc::new(Host::default());
     let host_owner = Arc::downgrade(&host);
     let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
-    let input: ArrayRef = Arc::new(BinaryArray::from(vec![b"bad".as_slice()]));
-    let input_owner = Arc::downgrade(&input);
-    let bytes = input
-        .as_any()
-        .downcast_ref::<BinaryArray>()
-        .unwrap()
-        .value(0);
-    let origin =
-        core::deserialize_state_tracked_observed(bytes, &allocator, &mut ScalarWork::new(None))
-            .err()
-            .expect("actual bad payload must fail");
-    let expected = origin.clone();
     let control = Control {
         refusal: Some((0, KernelFailure::DeadlineExceeded)),
         ..Default::default()
     };
-    let mut sink = FailureSink {
-        allocator: &allocator,
-        domain: FailureDomain::Mutation {
-            contract: &kernel.contract,
-            phase: AggregateInvocationPhase::Merge,
-            selection: Selection::all(1),
-            mapping: &[0],
-        },
-        control: &control,
+    let (input_owner, expected, error) = {
+        let input: ArrayRef = Arc::new(BinaryArray::from(vec![b"bad".as_slice()]));
+        let input_owner = Arc::downgrade(&input);
+        let bytes = input
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap()
+            .value(0);
+        let origin =
+            core::deserialize_state_tracked_observed(bytes, &allocator, &mut ScalarWork::new(None))
+                .err()
+                .expect("actual bad payload must fail");
+        let expected = origin.clone();
+        let mut sink = FailureSink {
+            allocator: &allocator,
+            domain: FailureDomain::Mutation {
+                contract: &kernel.contract,
+                phase: AggregateInvocationPhase::Merge,
+                selection: Selection::all(1),
+                mapping: &[0],
+            },
+            control: &control,
+        };
+        let EvaluationFailure::Kernel(error) = topk_error(origin, &mut sink) else {
+            panic!("diagnostic cannot complete")
+        };
+        assert_eq!(error.failure_fact(), expected.failure_fact());
+        let KernelFailure::Source(source) = &error else {
+            panic!("actual diagnostic refusal required")
+        };
+        let source = source
+            .source()
+            .unwrap()
+            .downcast_ref::<TopKDiagnosticFailure>()
+            .unwrap();
+        assert_eq!(source.origin, expected);
+        assert_eq!(source._diagnostic, KernelFailure::DeadlineExceeded);
+        assert_eq!(source.phase, AggregateInvocationPhase::Merge);
+        assert_eq!(control.trace.lock().unwrap().len(), 1);
+        (input_owner, expected, error)
     };
-    let EvaluationFailure::Kernel(error) = topk_error(origin, &mut sink) else {
-        panic!("diagnostic cannot complete")
-    };
-    assert_eq!(error.failure_fact(), expected.failure_fact());
-    let KernelFailure::Source(source) = &error else {
-        panic!("actual diagnostic refusal required")
-    };
-    let source = source
-        .source()
-        .unwrap()
-        .downcast_ref::<TopKDiagnosticFailure>()
-        .unwrap();
-    assert_eq!(source.origin, expected);
-    assert_eq!(source.diagnostic, KernelFailure::DeadlineExceeded);
-    assert_eq!(source.phase, AggregateInvocationPhase::Merge);
-    assert_eq!(control.trace.lock().unwrap().len(), 1);
-    drop(sink);
-    drop(input);
     assert!(input_owner.upgrade().is_none());
     drop(allocator);
     empty(&host);

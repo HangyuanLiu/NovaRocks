@@ -64,10 +64,11 @@ fn allocation<E>(
     layout: Layout,
     occurrences: usize,
 ) -> Result<(), E> {
-    if layout.size() != 0 && occurrences != 0 {
-        if let Some(loan) = loan.as_deref_mut() {
-            loan(layout, occurrences)?;
-        }
+    if layout.size() != 0
+        && occurrences != 0
+        && let Some(loan) = loan.as_deref_mut()
+    {
+        loan(layout, occurrences)?;
     }
     Ok(())
 }
@@ -132,7 +133,6 @@ impl ChunkSchema {
                 .ok_or_else(|| {
                     E::from(MetadataMaterializationError::MissingOriginalFieldOrigin)
                 })??;
-            drop(repeated);
             allocation(allocations, arc_request::<Field, E>()?, 3)?;
             result.field_clone_requests_bytes = add::<E>(
                 result.field_clone_requests_bytes,
@@ -173,7 +173,6 @@ impl ChunkSchema {
                                         MetadataMaterializationError::MissingOriginalFieldOrigin,
                                     )
                                 })?;
-                            drop(repeated);
                             allocation(allocations, arc_request::<Field, E>()?, 3)?;
                             result.nested_field_occurrences =
                                 add::<E>(result.nested_field_occurrences, 1)?;
@@ -233,7 +232,6 @@ impl ChunkSchema {
             roots,
             &mut Some(&mut repeated),
         )?;
-        drop(repeated);
         result.sidecar_requests_bytes = times::<E>(sidecar.coexistence_request_bytes, 2)?;
         result.sidecar_requests_bytes = add::<E>(
             result.sidecar_requests_bytes,

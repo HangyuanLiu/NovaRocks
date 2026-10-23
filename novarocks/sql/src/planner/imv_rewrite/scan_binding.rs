@@ -96,7 +96,7 @@ impl LogicalRewriteRule for BindIcebergScanRule {
                     let LogicalPlanKind::Scan(scan) = scan_kind else {
                         return Ok(PlanRewriteResult::Unchanged);
                     };
-                    let mut bound = bind_delta_scan(scan, &ext.snapshot)?;
+                    let mut bound = bind_delta_scan(*scan, &ext.snapshot)?;
                     if let Some(column_id) = node.action_column {
                         bound
                             .columns
@@ -109,7 +109,7 @@ impl LogicalRewriteRule for BindIcebergScanRule {
                         );
                     }
                     Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
-                        LogicalPlanKind::Scan(bound),
+                        LogicalPlanKind::scan(bound),
                         vec![],
                         required_output_columns,
                     )))
@@ -118,9 +118,9 @@ impl LogicalRewriteRule for BindIcebergScanRule {
                     let LogicalPlanKind::Scan(scan) = scan_kind else {
                         return Ok(PlanRewriteResult::Unchanged);
                     };
-                    let bound = bind_version_scan(scan, &ext.snapshot, node.version_ref.role)?;
+                    let bound = bind_version_scan(*scan, &ext.snapshot, node.version_ref.role)?;
                     Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
-                        LogicalPlanKind::Scan(bound),
+                        LogicalPlanKind::scan(bound),
                         vec![],
                         required_output_columns,
                     )))
@@ -376,7 +376,7 @@ mod tests {
                 branch_scope: None,
             }),
             vec![LogicalPlanNode::new(
-                LogicalPlanKind::Scan(iceberg_scan()),
+                LogicalPlanKind::scan(iceberg_scan()),
                 vec![],
                 None,
             )],
@@ -447,7 +447,7 @@ mod tests {
                 branch_scope: None,
             }),
             vec![LogicalPlanNode::new(
-                LogicalPlanKind::Scan(scan),
+                LogicalPlanKind::scan(scan),
                 vec![],
                 None,
             )],

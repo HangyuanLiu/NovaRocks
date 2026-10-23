@@ -43,6 +43,9 @@ use crate::coordination::{
     spawn_logical_execution_actor,
 };
 
+pub(crate) type StatementNativeResidualTask =
+    Pin<Box<dyn Future<Output = Result<(), crate::api::QueryExecutionError>> + Send>>;
+
 static NEXT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct LogicalExecutionRuntimeRegistry {
@@ -340,10 +343,6 @@ impl LogicalExecutionRegistration {
     pub const fn initial_execution(&self) -> QueryExecutionId {
         self.initial_execution
     }
-
-    pub const fn generation(&self) -> u64 {
-        self.generation
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -370,6 +369,7 @@ pub enum LogicalExecutionJoinOutcome {
 }
 
 impl LogicalExecutionJoinReceipt {
+    #[cfg(test)]
     pub const fn outcome(&self) -> LogicalExecutionJoinOutcome {
         self.outcome
     }
@@ -522,10 +522,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
         self.inner.statement_native.port(budget)
     }
 
-    pub(crate) fn statement_native_ready_tasks(
-        &self,
-    ) -> Vec<Pin<Box<dyn Future<Output = Result<(), crate::api::QueryExecutionError>> + Send>>>
-    {
+    pub(crate) fn statement_native_ready_tasks(&self) -> Vec<StatementNativeResidualTask> {
         self.inner.statement_native.ready_tasks()
     }
 
@@ -1755,7 +1752,6 @@ mod tests {
         let actor = registry.actor(&registration).unwrap();
         let running = actor.activate(initial.ready()).await.unwrap();
         actor.complete_attempt(running).await.unwrap();
-        drop(registration);
 
         registry
             .shutdown_until(Instant::now() + Duration::from_secs(1))
@@ -1818,7 +1814,6 @@ mod tests {
             .expect("shutdown cancels running work");
         assert_eq!(reason, CancellationReason::ServerShutdown);
         drop(running);
-        drop(registration);
         if shutdown.is_err() {
             registry
                 .shutdown_until(Instant::now() + Duration::from_secs(1))
@@ -1878,7 +1873,6 @@ mod tests {
             ingress_closed.changed().await.unwrap();
         }
         drop(running);
-        drop(registration);
         if shutdown.is_err() {
             registry
                 .shutdown_until(Instant::now() + Duration::from_secs(1))
@@ -1931,7 +1925,6 @@ mod tests {
             ingress_closed.changed().await.unwrap();
         }
         drop(running);
-        drop(registration);
         registry
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await
@@ -1992,8 +1985,6 @@ mod tests {
         }
         drop(first_running);
         drop(second_running);
-        drop(first_registration);
-        drop(second_registration);
         registry
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await
@@ -2148,7 +2139,7 @@ mod tests {
         // Poll the real Registry shutdown to actual healthy retirement. The
         // one-second test cap is not a receipt; only removal after join is.
         let healthy_retired = std::future::poll_fn(|cx| {
-            if let Poll::Ready(_) = shutdown.as_mut().poll(cx) {
+            if shutdown.as_mut().poll(cx).is_ready() {
                 return Poll::Ready(false);
             }
             if !handle.lock().entries.contains_key(&healthy.query_id()) {

@@ -21,7 +21,9 @@
 //! the caller. Repeated stored occurrences remain repeated callbacks.
 
 use crate::physical_type_v2::WriterTypeRootRole;
-use arrow::datatypes::{DataType, Field};
+#[cfg(test)]
+use arrow::datatypes::DataType;
+use arrow::datatypes::Field;
 use novarocks_connector_contract::{
     ConnectorWriteFieldBinding, ConnectorWriteInputShape, ConnectorWriteRecipeDraft,
 };
@@ -121,8 +123,8 @@ pub(crate) struct PackageTypeOccurrence {
 pub(crate) enum PackageTypeSource<'source> {
     Value(&'source p::ValueType),
     MissingReadSchema,
-    /// Cast stores a carrier only; this loan does not invent logical flags.
-    Carrier(&'source DataType),
+    /// Cast contributes a carrier-only occurrence without inventing logical flags.
+    Carrier,
     StrictField(&'source Arc<Field>),
     SourceField(&'source Arc<Field>),
     ExecutionField {
@@ -138,6 +140,7 @@ pub(crate) enum PackageTypeSource<'source> {
     },
 }
 
+#[cfg(test)]
 type Visitor<'a, 'b, E> = dyn FnMut(
         PackageTypeOccurrence,
         PackageTypeSource<'a>,
@@ -156,9 +159,11 @@ pub(crate) trait PackageTypeSourceSink<'source, E> {
     ) -> Result<(), E>;
     fn before_completed(&mut self) -> Result<(), E>;
 }
+#[cfg(test)]
 struct CallbackSink<'a, 'b, E> {
     visitor: &'b mut Visitor<'a, 'b, E>,
 }
+#[cfg(test)]
 impl<'a, E> PackageTypeSourceSink<'a, E> for CallbackSink<'a, '_, E> {
     fn capture(
         &mut self,
@@ -300,6 +305,7 @@ impl<'a, E: From<CompileControlError>> Walk<'a, '_, '_, '_, E> {
 /// Walk the checked owner in map/slice order. No root is structurally interned.
 /// All callback errors return directly, with no enumerator entry or footer.
 /// Work inside a callback is additional caller work, not this visitor's bill.
+#[cfg(test)]
 pub(crate) fn visit_package_type_sources<'source, E: From<CompileControlError>>(
     package: &'source p::FragmentPackage,
     visitor: &mut Visitor<'source, '_, E>,
@@ -354,10 +360,10 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
                     )?;
                 }
             }
-            p::ExprKind::Cast { target, .. } => walk.emit(
+            p::ExprKind::Cast { .. } => walk.emit(
                 O::Expression(*id),
                 C::CastTarget,
-                PackageTypeSource::Carrier(target),
+                PackageTypeSource::Carrier,
             )?,
             p::ExprKind::Value(_)
             | p::ExprKind::LambdaParameter { .. }

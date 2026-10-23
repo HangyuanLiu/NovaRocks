@@ -236,7 +236,7 @@ fn scalar_invocation_lifecycle_actual_empty_activation_is_distinct_from_validati
             );
             assert_eq!(enters.load(Ordering::SeqCst), 1);
         } else {
-            assert!(matches!(&result, Ok(out) if out.values().len()==0));
+            assert!(matches!(&result, Ok(out) if out.values().is_empty()));
             assert_eq!(enters.load(Ordering::SeqCst), 0);
         }
         drop(result);

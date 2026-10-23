@@ -15,7 +15,6 @@ pub mod insert;
 pub mod mutation;
 pub(crate) mod mutation_flow;
 pub mod truncate;
-pub(crate) mod write;
 
 pub(crate) mod cow_closed_ast;
 pub(crate) mod cow_closed_route;

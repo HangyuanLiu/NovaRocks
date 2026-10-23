@@ -27,21 +27,6 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use std::sync::Arc;
-
-use super::build_artifact::JoinBuildArtifact;
-
-/// Contract for join build-state implementations that ingest chunks and publish probe-ready artifacts.
-pub(crate) trait JoinBuildSinkState: Send + Sync {
-    fn partition_for_driver(&self, driver_id: i32) -> usize;
-    fn dep_name(&self, partition: usize) -> &str;
-    fn set_build(
-        &self,
-        partition: usize,
-        artifact: Arc<JoinBuildArtifact>,
-    ) -> crate::runtime::fragment::ExecutionResult<()>;
-}
-
 #[derive(Debug)]
 struct JoinBuildStateContract(novarocks_failure_contract::BoundedDetail);
 impl std::fmt::Display for JoinBuildStateContract {

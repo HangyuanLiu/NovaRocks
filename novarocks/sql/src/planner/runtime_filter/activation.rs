@@ -20,7 +20,6 @@
 use std::collections::BTreeMap;
 
 use super::contract::{BindingId, ChannelId, ConsumerActivation, LateApplyGranularity};
-use super::wait_graph::CycleStep;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ActivationConstraint {
@@ -28,20 +27,11 @@ pub(crate) enum ActivationConstraint {
         late_apply: LateApplyGranularity,
         reason: RequiredLiveReason,
     },
-    BlockingOrBatchLive {
-        fallback: ActivationFallback,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ActivationFallback {
-    BlockingSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequiredLiveReason {
     OrderedBoundContract,
-    FencedFinalDomainContract,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,22 +40,9 @@ pub(crate) struct ActivationDecision {
     pub(crate) consumer_binding: BindingId,
     pub(crate) consumer_fragment: u32,
     pub(crate) activation: ConsumerActivation,
-    pub(crate) reason: ActivationDecisionReason,
 }
 
 pub(crate) type ActivationDecisionCatalog = BTreeMap<BindingId, ActivationDecision>;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ActivationDecisionReason {
-    RequiredByContract {
-        reason: RequiredLiveReason,
-    },
-    CycleForced {
-        producer_bindings: Vec<BindingId>,
-        witness: Vec<CycleStep>,
-    },
-    ConservativeFallback,
-}
 
 #[cfg(test)]
 mod tests {

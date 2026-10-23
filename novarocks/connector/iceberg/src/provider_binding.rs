@@ -36,11 +36,14 @@ const DEFAULT_ACCESS_BINDING: &str = "default";
 /// This is deliberately resource-free. Installation performs this preparation
 /// before it reaches any BE-local credential, object-store, or runtime state.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct PreparedIcebergExecutionBinding {
     access_binding: String,
 }
 
+#[cfg(test)]
 impl PreparedIcebergExecutionBinding {
+    #[cfg(test)]
     pub(crate) fn access_binding(&self) -> &str {
         &self.access_binding
     }
@@ -94,6 +97,7 @@ impl ConnectorExecutionDistribution for IcebergInstanceDistribution {
 }
 
 /// Extracts Iceberg's typed provider-binding facts without touching local resources.
+#[cfg(test)]
 pub(crate) fn prepare_iceberg_execution_binding(
     binding: &ConnectorProviderBinding,
 ) -> Result<PreparedIcebergExecutionBinding, ConnectorError> {

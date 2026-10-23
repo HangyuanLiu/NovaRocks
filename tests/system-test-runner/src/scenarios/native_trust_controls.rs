@@ -18,7 +18,7 @@
 //! Exact SQL observations consumed only by the Native trust scenarios.
 
 use crate::scenario::ScenarioContext;
-use crate::scenarios::query_lifecycle::native_sql_controls::{SelectedStatement, StatementSpec};
+use crate::scenarios::native_sql_controls::{SelectedStatement, StatementSpec};
 use anyhow::{Context, Result};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::{QueryLifecycleStructuredSnapshot, ServerHandle};
@@ -102,7 +102,7 @@ pub(super) async fn join_probe_driver(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scenarios::query_lifecycle::native_sql_controls::SqlIntentOwner;
+    use crate::scenarios::native_sql_controls::SqlIntentOwner;
     use std::time::{Duration, Instant};
 
     #[test]

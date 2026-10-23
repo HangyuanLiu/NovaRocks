@@ -60,10 +60,6 @@ impl DmlService {
     /// frontend record cannot safely replay, abort, clean up, or adjudicate a
     /// provider-owned staged-create publication after the originating process
     /// has gone away.
-    #[allow(
-        clippy::result_large_err,
-        reason = "Preserves the frozen DML error contract without a broad ABI migration."
-    )]
     pub(crate) fn prepare_ctas(
         &self,
         engine: &dyn CtasEngine,
@@ -132,10 +128,6 @@ impl DmlService {
         })
     }
 
-    #[allow(
-        clippy::result_large_err,
-        reason = "Preserves the frozen DML error contract without a broad ABI migration."
-    )]
     pub(crate) fn execute_prepared_ctas(
         &self,
         engine: &dyn CtasEngine,
@@ -154,14 +146,6 @@ impl DmlService {
     }
 }
 
-#[allow(
-    clippy::result_large_err,
-    reason = "Preserves the frozen DML error contract without a broad ABI migration."
-)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The statement boundary keeps its source and session inputs explicit."
-)]
 fn execute_standard_ctas_operation(
     engine: &dyn CtasEngine,
     source_text: String,
@@ -225,8 +209,7 @@ fn execute_standard_ctas_operation(
             }
             write
         }
-        StandardCtasWriteOutcome::KnownUncommitted { failure }
-        | StandardCtasWriteOutcome::CommitUnknown { failure, .. } => {
+        StandardCtasWriteOutcome::KnownUncommitted { failure } => {
             return Err(pre_dispatch_failure(&mut attempt, &source_text, failure));
         }
     };
@@ -239,10 +222,6 @@ fn execute_standard_ctas_operation(
     finish_standard_publication(engine, &mut attempt, target, publish)
 }
 
-#[allow(
-    clippy::result_large_err,
-    reason = "Preserves the frozen DML error contract without a broad ABI migration."
-)]
 fn finish_standard_publication(
     engine: &dyn CtasEngine,
     attempt: &mut DmlPublicationAttempt,
@@ -250,10 +229,8 @@ fn finish_standard_publication(
     publish: crate::query_execution::dml::ctas::PreparedStandardCtasCatalogAction,
 ) -> Result<(), DmlError> {
     match engine.publish_standard_ctas(publish.handle.as_ref()) {
-        Ok(StandardCtasPublishOutcome::KnownUncommitted {
-            mut failure,
-            cleanup,
-        }) => {
+        Ok(StandardCtasPublishOutcome::KnownUncommitted { failure, cleanup }) => {
+            let mut failure = *failure;
             if let ExternalMutationFinalization::Failed(cleanup_failure) = cleanup {
                 failure
                     .message
@@ -266,10 +243,7 @@ fn finish_standard_publication(
             mark_dispatch_possible(attempt)?;
             finish_known_committed(attempt, finalization)
         }
-        Ok(StandardCtasPublishOutcome::CommitUnknown {
-            failure: _,
-            evidence,
-        }) => {
+        Ok(StandardCtasPublishOutcome::CommitUnknown { evidence }) => {
             mark_dispatch_possible(attempt)?;
             let adjudication = attempt.begin_adjudication().map_err(attempt_error)?;
             match engine.adjudicate_standard_ctas_publication(target.handle.as_ref(), evidence) {
@@ -298,7 +272,7 @@ fn finish_standard_publication(
                     Err(unknown_failure(
                         terminal,
                         "CTAS publication adjudication",
-                        failure,
+                        *failure,
                     ))
                 }
                 Err(error) => {
@@ -721,7 +695,6 @@ mod tests {
         ) -> Result<PreparedStandardCtasCatalogAction, CtasFailure> {
             assert_eq!(publication_id.to_bytes(), self.operation_id.to_bytes());
             Ok(PreparedStandardCtasCatalogAction {
-                input_digest: [8; 32],
                 handle: Arc::new(TestAction),
             })
         }
@@ -860,7 +833,6 @@ mod tests {
         ) -> Result<StandardCtasPublishOutcome, CtasFailure> {
             self.publishes.fetch_add(1, Ordering::SeqCst);
             Ok(StandardCtasPublishOutcome::CommitUnknown {
-                failure: internal_failure("publish response lost"),
                 evidence: Self::evidence(),
             })
         }
@@ -872,7 +844,7 @@ mod tests {
         ) -> Result<StandardCtasPublicationAdjudicationOutcome, CtasFailure> {
             self.adjudications.fetch_add(1, Ordering::SeqCst);
             Ok(StandardCtasPublicationAdjudicationOutcome::CommitUnknown {
-                failure: internal_failure("exact publication remains unproven"),
+                failure: Box::new(internal_failure("exact publication remains unproven")),
             })
         }
     }
@@ -910,7 +882,6 @@ mod tests {
             handle: Arc::new(TestTarget),
         };
         let publish = crate::query_execution::dml::ctas::PreparedStandardCtasCatalogAction {
-            input_digest: [3; 32],
             handle: Arc::new(TestAction),
         };
 

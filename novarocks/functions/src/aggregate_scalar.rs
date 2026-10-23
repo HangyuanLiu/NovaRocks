@@ -17,9 +17,11 @@
 
 //! The original recursive aggregate scalar reader and output builder, shared
 //! by legacy shells and pure owners through their exact state allocator.
+#[cfg(test)]
+use crate::KernelDiagnostic;
+use crate::KernelFailure;
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::largeint;
-use crate::{KernelDiagnostic, KernelFailure};
 use allocator_api2::{alloc::Allocator, vec::Vec as ScalarVec};
 use arrow_array::builder::*;
 use arrow_array::*;
@@ -100,6 +102,16 @@ impl std::fmt::Debug for AggScalarValue {
     }
 }
 
+/// One recursively tracked key/value pair in a map aggregate value.
+#[expect(
+    type_alias_bounds,
+    reason = "The allocator bound is required to form the tracked value types in the alias"
+)]
+pub type TrackedAggScalarMapEntry<A: ScalarStateAllocator> = (
+    Option<TrackedAggScalarValue<A>>,
+    Option<TrackedAggScalarValue<A>>,
+);
+
 /// Aggregate-state-owned scalar whose complete recursive heap graph uses the
 /// query's exact aggregate allocator. Arrow output materialization converts
 /// this value back to `AggScalarValue`; the tracked form never escapes the
@@ -116,15 +128,7 @@ pub enum TrackedAggScalarValue<A: ScalarStateAllocator> {
     Decimal256(i256),
     Binary(ScalarVec<u8, A>),
     Struct(ScalarVec<Option<TrackedAggScalarValue<A>>, A>),
-    Map(
-        ScalarVec<
-            (
-                Option<TrackedAggScalarValue<A>>,
-                Option<TrackedAggScalarValue<A>>,
-            ),
-            A,
-        >,
-    ),
+    Map(ScalarVec<TrackedAggScalarMapEntry<A>, A>),
     List(ScalarVec<Option<TrackedAggScalarValue<A>>, A>),
 }
 
@@ -445,8 +449,7 @@ pub fn tracked_scalar_from_array<A: ScalarStateAllocator>(
             return Err(source_failure::contract(
                 ContractKind::TrackedType,
                 format_args!("unsupported tracked scalar type: {other:?}"),
-            )
-            .into());
+            ));
         }
     };
     Ok(Some(value))
@@ -566,8 +569,7 @@ pub fn build_scalar_array_with_largeint_observation(
     if work.work.is_none() {
         return Err(crate::kernel_control::invalid(
             "observed LARGEINT scalar builder requires evaluation control",
-        )
-        .into());
+        ));
     }
     build_scalar_array_impl(output_type, values, work, true)
 }
@@ -591,8 +593,7 @@ fn build_scalar_array_impl(
                         return Err(source_failure::contract(
                             ContractKind::ValueType,
                             "scalar output type mismatch for Boolean",
-                        )
-                        .into());
+                        ));
                     }
                 }
             }
@@ -613,8 +614,7 @@ fn build_scalar_array_impl(
                         return Err(source_failure::contract(
                             ContractKind::ValueType,
                             "scalar output type mismatch for Int8",
-                        )
-                        .into());
+                        ));
                     }
                 }
             }
@@ -635,8 +635,7 @@ fn build_scalar_array_impl(
                         return Err(source_failure::contract(
                             ContractKind::ValueType,
                             "scalar output type mismatch for Int16",
-                        )
-                        .into());
+                        ));
                     }
                 }
             }
@@ -657,8 +656,7 @@ fn build_scalar_array_impl(
                         return Err(source_failure::contract(
                             ContractKind::ValueType,
                             "scalar output type mismatch for Int32",
-                        )
-                        .into());
+                        ));
                     }
                 }
             }
@@ -675,8 +673,7 @@ fn build_scalar_array_impl(
                         return Err(source_failure::contract(
                             ContractKind::ValueType,
                             "scalar output type mismatch for Int64",
-                        )
-                        .into());
+                        ));
                     }
                 }
             }
@@ -693,8 +690,7 @@ fn build_scalar_array_impl(
                         return Err(source_failure::contract(
                             ContractKind::ValueType,
                             "scalar output type mismatch for Float32",
-                        )
-                        .into());
+                        ));
                     }
                 }
             }
@@ -711,8 +707,7 @@ fn build_scalar_array_impl(
                         return Err(source_failure::contract(
                             ContractKind::ValueType,
                             "scalar output type mismatch for Float64",
-                        )
-                        .into());
+                        ));
                     }
                 }
             }
@@ -733,8 +728,7 @@ fn build_scalar_array_impl(
                         return Err(source_failure::contract(
                             ContractKind::ValueType,
                             "scalar output type mismatch for Utf8",
-                        )
-                        .into());
+                        ));
                     }
                 }
             }
@@ -755,8 +749,7 @@ fn build_scalar_array_impl(
                         return Err(source_failure::contract(
                             ContractKind::ValueType,
                             "scalar output type mismatch for Binary",
-                        )
-                        .into());
+                        ));
                     }
                 }
             }
@@ -777,8 +770,7 @@ fn build_scalar_array_impl(
                         return Err(source_failure::contract(
                             ContractKind::ValueType,
                             "scalar output type mismatch for LargeBinary",
-                        )
-                        .into());
+                        ));
                     }
                 }
             }
@@ -795,8 +787,7 @@ fn build_scalar_array_impl(
                         return Err(source_failure::contract(
                             ContractKind::ValueType,
                             "scalar output type mismatch for Date32",
-                        )
-                        .into());
+                        ));
                     }
                 }
             }
@@ -813,8 +804,7 @@ fn build_scalar_array_impl(
                         return Err(source_failure::contract(
                             ContractKind::ValueType,
                             "scalar output type mismatch for Timestamp",
-                        )
-                        .into());
+                        ));
                     }
                 }
             }
@@ -866,8 +856,7 @@ fn build_scalar_array_impl(
                         return Err(source_failure::contract(
                             ContractKind::ValueType,
                             "scalar output type mismatch for Decimal128",
-                        )
-                        .into());
+                        ));
                     }
                 }
             }
@@ -887,8 +876,7 @@ fn build_scalar_array_impl(
                         return Err(source_failure::contract(
                             ContractKind::ValueType,
                             "scalar output type mismatch for Decimal256",
-                        )
-                        .into());
+                        ));
                     }
                 }
             }
@@ -908,8 +896,7 @@ fn build_scalar_array_impl(
                         return Err(source_failure::contract(
                             ContractKind::ValueType,
                             "scalar output type mismatch for LargeInt",
-                        )
-                        .into());
+                        ));
                     }
                 }
             }
@@ -951,8 +938,7 @@ fn build_scalar_array_impl(
                         return Err(source_failure::contract(
                             ContractKind::ValueType,
                             "scalar output type mismatch for List",
-                        )
-                        .into());
+                        ));
                     }
                 }
             }
@@ -984,8 +970,7 @@ fn build_scalar_array_impl(
                                     fields.len(),
                                     items.len(),
                                 ),
-                            )
-                            .into());
+                            ));
                         }
                         nulls.append_non_null();
                         for (idx, item) in items.into_iter().enumerate() {
@@ -1004,13 +989,12 @@ fn build_scalar_array_impl(
                         return Err(source_failure::contract(
                             ContractKind::ValueType,
                             "scalar output type mismatch for Struct",
-                        )
-                        .into());
+                        ));
                     }
                 }
             }
             let mut columns = Vec::with_capacity(fields.len());
-            for (field, values) in fields.iter().zip(field_values.into_iter()) {
+            for (field, values) in fields.iter().zip(field_values) {
                 work.step()?;
                 columns.push(build_scalar_array_impl(
                     field.data_type(),
@@ -1034,15 +1018,13 @@ fn build_scalar_array_impl(
                 return Err(source_failure::contract(
                     ContractKind::MapEntries,
                     "scalar output MAP entries type must be STRUCT",
-                )
-                .into());
+                ));
             };
             if entry_fields.len() != 2 {
                 return Err(source_failure::contract(
                     ContractKind::MapEntries,
                     "scalar output MAP entries must have 2 fields",
-                )
-                .into());
+                ));
             }
             let mut key_values = Vec::<Option<AggScalarValue>>::new();
             let mut value_values = Vec::<Option<AggScalarValue>>::new();
@@ -1072,8 +1054,7 @@ fn build_scalar_array_impl(
                         return Err(source_failure::contract(
                             ContractKind::ValueType,
                             "scalar output type mismatch for Map",
-                        )
-                        .into());
+                        ));
                     }
                 }
             }
@@ -1105,8 +1086,7 @@ fn build_scalar_array_impl(
         other => Err(source_failure::contract(
             ContractKind::OutputType,
             format_args!("unsupported scalar output type: {:?}", other),
-        )
-        .into()),
+        )),
     }
 }
 

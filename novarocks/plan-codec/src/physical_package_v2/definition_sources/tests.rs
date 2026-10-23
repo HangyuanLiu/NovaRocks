@@ -1069,7 +1069,8 @@ fn writer_recipe() -> c::ConnectorWriteRecipeDraft {
     let provider = c::ConnectorProviderId::parse("iceberg").unwrap();
     let instance = c::ConnectorInstanceId::try_from_canonical("lake").unwrap();
     let catalog = c::CatalogHandle::new(instance.clone(), c::CatalogVersion::from_bytes([7; 32]));
-    let recipe = c::ConnectorWriteRecipeDraft::try_new(
+
+    c::ConnectorWriteRecipeDraft::try_new(
         c::ConnectorWriteBinding::new(
             c::ConnectorInstanceDescriptor {
                 provider_id: provider.clone(),
@@ -1097,8 +1098,7 @@ fn writer_recipe() -> c::ConnectorWriteRecipeDraft {
             ],
         },
     )
-    .unwrap();
-    recipe
+    .unwrap()
 }
 
 fn view_limits() -> TypeViewLimits {
@@ -1324,7 +1324,7 @@ fn one_under(limits: DefinitionSourceLimits, axis: usize) -> DefinitionSourceLim
 enum Failure {
     Control(CompileControlError),
     Source(TypeViewError),
-    Ordinary(String),
+    Ordinary,
 }
 impl From<CompileControlError> for Failure {
     fn from(e: CompileControlError) -> Self {
@@ -1339,7 +1339,7 @@ impl From<TypeViewError> for Failure {
         }
     }
 }
-macro_rules! ordinary_from {($($t:ident),+)=>{$(impl From<$t> for Failure {fn from(e:$t)->Self {match e {$t::Control(c)=>Self::Control(c),other=>Self::Ordinary(format!("{other:?}"))}}})+};}
+macro_rules! ordinary_from {($($t:ident),+)=>{$(impl From<$t> for Failure {fn from(e:$t)->Self {match e {$t::Control(c)=>Self::Control(c),_=>Self::Ordinary}}})+};}
 ordinary_from!(TypeCodecError, CallRequestCodecError, NodeCodecError);
 fn finish<T>(result: Result<T, Failure>, work: CompileCheckpoints<'_>) -> Result<T, Failure> {
     if matches!(result, Err(Failure::Control(_))) {
@@ -1378,7 +1378,6 @@ fn same(
 
 // Every stored ID resolves through the original encoded type table to the
 // exact original occurrence; bindings resolve to the original owner rows.
-#[allow(clippy::too_many_arguments)]
 fn verify_roots(
     package: &p::FragmentPackage,
     bindings: &BindingSources<'_>,

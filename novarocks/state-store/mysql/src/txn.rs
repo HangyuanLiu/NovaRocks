@@ -285,7 +285,6 @@ pub(super) async fn begin_write(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn write_actor(
     pool: Arc<dyn PoolLifecycle>,
     operation: MysqlRuntimeGuard,

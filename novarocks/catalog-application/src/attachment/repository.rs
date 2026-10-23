@@ -948,10 +948,9 @@ mod tests {
     #[tokio::test]
     async fn sqlite_create_is_absent_cas_and_drop_requires_the_frozen_version() {
         let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
-        let registry =
-            builtin_state_store_provider_registry().expect("builtin StateStore registry");
+        builtin_state_store_provider_registry().expect("builtin StateStore registry");
         let mut host = StateStoreHost::open(
-            &registry,
+            &(),
             StateStoreHostConfig {
                 state_store: StateStoreAppConfig {
                     store: StateStoreConfig {
@@ -1017,10 +1016,9 @@ mod tests {
     #[tokio::test]
     async fn restart_reconstructs_the_exact_canonical_binding() {
         let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
-        let registry =
-            builtin_state_store_provider_registry().expect("builtin StateStore registry");
+        builtin_state_store_provider_registry().expect("builtin StateStore registry");
         let mut host = StateStoreHost::open(
-            &registry,
+            &(),
             StateStoreHostConfig {
                 state_store: StateStoreAppConfig {
                     store: StateStoreConfig {
@@ -1073,17 +1071,15 @@ mod tests {
     #[tokio::test]
     async fn create_rejects_an_over_budget_attachment_without_writing_a_record() {
         let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
-        let registry =
-            builtin_state_store_provider_registry().expect("builtin StateStore registry");
+        builtin_state_store_provider_registry().expect("builtin StateStore registry");
         let mut host = StateStoreHost::open(
-            &registry,
+            &(),
             StateStoreHostConfig {
                 state_store: StateStoreAppConfig {
                     store: StateStoreConfig {
                         cluster_id: "catalog-attachment-budget-test".to_string(),
                         limits: StateStoreLimitOverrides {
                             max_value_bytes: Some(256),
-                            ..StateStoreLimitOverrides::default()
                         },
                         provider: StateStoreProviderConfig::Sqlite {
                             path: directory.path().join("state-store.sqlite"),
@@ -1150,10 +1146,9 @@ mod tests {
     #[tokio::test]
     async fn a_lost_commit_response_is_resolved_and_keeps_one_stable_attachment_identity() {
         let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
-        let registry =
-            builtin_state_store_provider_registry().expect("builtin StateStore registry");
+        builtin_state_store_provider_registry().expect("builtin StateStore registry");
         let mut host = StateStoreHost::open(
-            &registry,
+            &(),
             StateStoreHostConfig {
                 state_store: StateStoreAppConfig {
                     store: StateStoreConfig {
@@ -1251,10 +1246,9 @@ mod tests {
     #[tokio::test]
     async fn an_observed_product_reference_refuses_the_drop_and_keeps_attachment() {
         let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
-        let registry =
-            builtin_state_store_provider_registry().expect("builtin StateStore registry");
+        builtin_state_store_provider_registry().expect("builtin StateStore registry");
         let mut host = StateStoreHost::open(
-            &registry,
+            &(),
             StateStoreHostConfig {
                 state_store: StateStoreAppConfig {
                     store: StateStoreConfig {
@@ -1321,10 +1315,9 @@ mod tests {
     #[tokio::test]
     async fn mv_attachment_assertion_rejects_a_dropped_or_recreated_attachment() {
         let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
-        let registry =
-            builtin_state_store_provider_registry().expect("builtin StateStore registry");
+        builtin_state_store_provider_registry().expect("builtin StateStore registry");
         let mut host = StateStoreHost::open(
-            &registry,
+            &(),
             StateStoreHostConfig {
                 state_store: StateStoreAppConfig {
                     store: StateStoreConfig {

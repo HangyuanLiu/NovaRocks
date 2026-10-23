@@ -18,37 +18,10 @@ use crate::runtime::fragment::{ExecutionFailure, ExecutionReason};
 use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
 use std::{error::Error, fmt};
 
-#[derive(Debug)]
-struct JsonEncodingFailure(serde_json::Error);
-impl fmt::Display for JsonEncodingFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Variant JSON rendering contract failed: {}", self.0)
-    }
-}
-impl Error for JsonEncodingFailure {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.0)
-    }
-}
-impl FailureProjection for JsonEncodingFailure {
-    fn failure_fact(&self) -> FailureFact {
-        FailureFact::new(
-            FailureClass::Invariant,
-            ExecutionReason::VariantJsonEncoding.reason(),
-        )
-    }
-}
-pub(crate) fn json_encoding(source: serde_json::Error) -> ExecutionFailure {
-    ExecutionFailure::from_domain(JsonEncodingFailure(source))
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum SdkStage {
-    ParseJson,
     AssembleInput,
     Extract,
-    Unshred,
-    InspectResult,
 }
 #[derive(Debug)]
 struct VariantSdkFailure {
@@ -74,9 +47,8 @@ impl FailureProjection for VariantSdkFailure {
                 FailureClass::Resource,
                 ExecutionReason::VariantKernelAllocation,
             ),
-            (SdkStage::ParseJson, _) => (FailureClass::Data, ExecutionReason::VariantKernelValue),
             (
-                SdkStage::Extract | SdkStage::Unshred,
+                SdkStage::Extract,
                 ArrowError::ParseError(_)
                 | ArrowError::CastError(_)
                 | ArrowError::JsonError(_)
@@ -93,9 +65,6 @@ impl FailureProjection for VariantSdkFailure {
         };
         FailureFact::new(class, reason.reason())
     }
-}
-pub(crate) fn sdk(stage: SdkStage, source: arrow::error::ArrowError) -> ExecutionFailure {
-    sdk_at("Variant", stage, source)
 }
 pub(crate) fn sdk_at(
     operation: &'static str,

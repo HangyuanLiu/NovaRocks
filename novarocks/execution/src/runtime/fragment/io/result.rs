@@ -1713,7 +1713,7 @@ mod root_input_tests {
     }
 
     struct HeldOriginal {
-        data: std::mem::ManuallyDrop<Arc<Vec<u8>>>,
+        _data: std::mem::ManuallyDrop<Arc<Vec<u8>>>,
     }
     struct OpaqueDrop {
         data: std::mem::ManuallyDrop<Arc<Vec<u8>>>,
@@ -1724,7 +1724,7 @@ mod root_input_tests {
             self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let data = unsafe { std::mem::ManuallyDrop::take(&mut self.data) };
             std::panic::panic_any(HeldOriginal {
-                data: std::mem::ManuallyDrop::new(data),
+                _data: std::mem::ManuallyDrop::new(data),
             });
         }
     }
@@ -2230,10 +2230,15 @@ mod root_input_tests {
         data: std::mem::ManuallyDrop<Arc<Vec<u8>>>,
         drops: Arc<std::sync::atomic::AtomicUsize>,
         payload_drops: Arc<std::sync::atomic::AtomicUsize>,
+        wakes: Arc<std::sync::atomic::AtomicUsize>,
     }
     impl std::task::Wake for ReceiptDrop {
-        fn wake(self: Arc<Self>) {}
-        fn wake_by_ref(self: &Arc<Self>) {}
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
     impl Drop for ReceiptDrop {
         fn drop(&mut self) {
@@ -2258,10 +2263,12 @@ mod root_input_tests {
         let weak = Arc::downgrade(&data);
         let drops = Arc::new(AtomicUsize::new(0));
         let payload_drops = Arc::new(AtomicUsize::new(0));
+        let wakes = Arc::new(AtomicUsize::new(0));
         let waker = std::task::Waker::from(Arc::new(ReceiptDrop {
             data: std::mem::ManuallyDrop::new(data),
             drops: Arc::clone(&drops),
             payload_drops: Arc::clone(&payload_drops),
+            wakes: Arc::clone(&wakes),
         }));
         assert_eq!(
             authority.poll_input_exit(&waker),
@@ -2680,7 +2687,7 @@ mod root_input_tests {
                 owner.request_notify(); // Actual reentry while the original owner is active.
                 let data = unsafe { std::mem::ManuallyDrop::take(&mut self.data) };
                 std::panic::panic_any(HeldOriginal {
-                    data: std::mem::ManuallyDrop::new(data),
+                    _data: std::mem::ManuallyDrop::new(data),
                 });
             }
         }

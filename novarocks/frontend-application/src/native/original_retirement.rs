@@ -37,12 +37,11 @@ struct BackedValue<B: Send + Sync + 'static> {
 }
 impl<B: Send + Sync + 'static> Drop for BackedValue<B> {
     fn drop(&mut self) {
-        if let Some(value) = self.value.take() {
-            if let Err(payload) =
+        if let Some(value) = self.value.take()
+            && let Err(payload) =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value)))
-            {
-                resume_backed_panic(payload, self.backing.take());
-            }
+        {
+            resume_backed_panic(payload, self.backing.take());
         }
     }
 }

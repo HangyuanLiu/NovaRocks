@@ -1415,13 +1415,13 @@ pub fn decode_receipt_header(
                 &verdict.safe_detail,
                 p.clone().field("safe_detail"),
             )?;
-            if let Some(field) = &verdict.safe_field_path {
-                if field.len() > novarocks_execution_contract::status::SAFE_FIELD_PATH_MAX_BYTES {
-                    return Err(out_of_range(
-                        p.field("safe_field_path"),
-                        "safe field path exceeds the redacted text limit",
-                    ));
-                }
+            if let Some(field) = &verdict.safe_field_path
+                && field.len() > novarocks_execution_contract::status::SAFE_FIELD_PATH_MAX_BYTES
+            {
+                return Err(out_of_range(
+                    p.field("safe_field_path"),
+                    "safe field path exceeds the redacted text limit",
+                ));
             }
             OperationResult::Verdict {
                 outcome,
@@ -2772,6 +2772,10 @@ pub fn decode_status_event(
 }
 
 /// One observed status event.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Status events carry frozen TaskStatus snapshots by value; boxing would change the consumer contract and allocate per event."
+)]
 #[derive(Clone, Debug)]
 pub enum StatusStreamEvent {
     Status(novarocks_execution_contract::task_execution::status::TaskStatus),
@@ -2779,6 +2783,10 @@ pub enum StatusStreamEvent {
 }
 
 /// One event from a convergence-aware task-status subscription.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Status events carry frozen TaskStatus snapshots by value; boxing would change the consumer contract and allocate per event."
+)]
 #[derive(Clone, Debug)]
 pub enum ContextAwareStatusStreamEvent {
     Status(novarocks_execution_contract::task_execution::status::TaskStatus),
@@ -3178,6 +3186,10 @@ pub struct CoveredObservationBookmark {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Status events carry frozen TaskStatus snapshots by value; boxing would change the consumer contract and allocate per event."
+)]
 pub enum CoveredStatusStreamFact {
     Status(TaskStatus),
     Gone(TaskIdentity),

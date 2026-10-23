@@ -82,6 +82,10 @@ struct Entry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "Each public error variant names the exact exhausted resource; the shared suffix keeps the variants parallel without obscuring their distinct causes."
+)]
 pub enum ConnectionRegistrationError {
     ConnectionIdExhausted,
     GenerationExhausted,

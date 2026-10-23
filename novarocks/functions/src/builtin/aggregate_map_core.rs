@@ -190,25 +190,23 @@ pub fn merge_row_observed<A: ScalarStateAllocator>(
     }
     Ok(())
 }
-pub fn build_array<'state, A: ScalarStateAllocator, I>(
+pub fn build_array<'state, A: ScalarStateAllocator + 'state, I>(
     target_type: &DataType,
     group_states: I,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<ArrayRef, KernelFailure>
 where
     I: ExactSizeIterator<Item = &'state MapAggState<A>>,
-    A: 'state,
 {
     build_array_checked_states(target_type, group_states.map(Ok), work)
 }
-pub fn build_array_checked_states<'state, A: ScalarStateAllocator, I>(
+pub fn build_array_checked_states<'state, A: ScalarStateAllocator + 'state, I>(
     target_type: &DataType,
     group_states: I,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<ArrayRef, KernelFailure>
 where
     I: ExactSizeIterator<Item = Result<&'state MapAggState<A>, KernelFailure>>,
-    A: 'state,
 {
     let (map_field, field_defs, ordered) = parse_map_type(target_type)?;
     let key_type = field_defs[0].data_type();

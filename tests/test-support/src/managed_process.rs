@@ -825,14 +825,14 @@ impl ManagedProcess {
 
 impl Drop for ManagedProcess {
     fn drop(&mut self) {
-        if !self.settled {
-            if let Err(error) = self.stop() {
-                self.owner.close_control();
-                let _ = fs::write(
-                    self.diagnostic_root().join("caller-drop-error.txt"),
-                    format!("managed process drop cleanup failed: {error:#}\n"),
-                );
-            }
+        if !self.settled
+            && let Err(error) = self.stop()
+        {
+            self.owner.close_control();
+            let _ = fs::write(
+                self.diagnostic_root().join("caller-drop-error.txt"),
+                format!("managed process drop cleanup failed: {error:#}\n"),
+            );
         }
     }
 }

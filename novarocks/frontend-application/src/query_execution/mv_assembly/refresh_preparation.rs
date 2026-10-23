@@ -84,8 +84,7 @@ use novarocks_mv_application::publication::{
     MvRefreshPublicationBase, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
 };
 use novarocks_spi::connector::{
-    ConnectorCommittedPartitioning, ConnectorInstanceId,
-    ConnectorManagedPartitionSpecPreviewRequest, ConnectorProviderBindingKey,
+    ConnectorInstanceId, ConnectorManagedPartitionSpecPreviewRequest, ConnectorProviderBindingKey,
     ConnectorTableIdentity, ConnectorTableObjectId,
 };
 use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
@@ -197,7 +196,7 @@ pub(crate) fn freeze_statement_refresh_rewrite_context(
     let lease = target_binding.lease().clone();
     let rewrite = freeze_refresh_rewrite_context(RefreshRewriteInputs {
         connector_control: source.connector_control(),
-        connector_context: &connector_context,
+        connector_context,
         projection: Arc::new(projection),
         pin: &pin,
         state_baseline: &state_baseline,
@@ -357,19 +356,13 @@ impl MvRefreshPreparationService for FrontendMvRefreshPreparationService<'_> {
             RefreshStateBaseline::SnapshotBacked {
                 target_snapshot_id, ..
             } => *target_snapshot_id,
-            RefreshStateBaseline::Pinless => None,
         };
         let target_table_uuid = match &plan.contract.state_baseline {
             RefreshStateBaseline::SnapshotBacked {
                 target_table_uuid, ..
             } => target_table_uuid.clone(),
-            RefreshStateBaseline::Pinless => String::new(),
         };
-        let full_overwrite = self.statement.full
-            && matches!(
-                &plan.contract.state_baseline,
-                RefreshStateBaseline::SnapshotBacked { .. }
-            );
+        let full_overwrite = self.statement.full;
         let work = match plan.contract.decision {
             ExecutableRefreshDecision::SkipEmpty => PreparedMvRefreshWork::NoOp,
             ExecutableRefreshDecision::MetadataOnly => {
@@ -440,7 +433,6 @@ impl MvRefreshPreparationService for FrontendMvRefreshPreparationService<'_> {
             },
         };
         Ok(PreparedMvRefresh {
-            statement: request.statement,
             attempt: request.attempt,
             observed_binding,
             finalize: MvRefreshFinalizeFacts {
@@ -537,10 +529,6 @@ fn execution_binding_key_for_target(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Managed repartition preparation keeps the frozen lease, partition contract, and operation identity explicit."
-)]
 fn prepare_managed_repartition_transition(
     source: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
@@ -796,7 +784,6 @@ fn definition_has_join(query: &novarocks_parser::ast::Query) -> bool {
 /// Join first refresh remains behind its typed logical binder and therefore
 /// fails closed here rather than using the old frontend row-materialization
 /// implementation.
-#[allow(clippy::too_many_arguments)]
 fn prepare_frontend_first_refresh_write(
     source: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
@@ -850,10 +837,7 @@ fn prepare_frontend_first_refresh_write(
         &connector_context,
     )?;
     let mut admitted_publication = crate::mv::domain::staged_create::admit_mv_publication(
-        source
-            .management_entrance()
-            .map_err(|error| error)?
-            .as_ref(),
+        source.management_entrance()?.as_ref(),
         &planning_lease,
         &projection,
         attempt.publication_id,
@@ -966,17 +950,8 @@ fn prepare_frontend_first_refresh_write(
         RefreshStateBaseline::SnapshotBacked {
             target_snapshot_id, ..
         } => *target_snapshot_id,
-        RefreshStateBaseline::Pinless => None,
     };
     if definition_has_join(&query) && !capabilities.has_agg_state {
-        if !matches!(
-            contract.state_baseline,
-            RefreshStateBaseline::SnapshotBacked { .. }
-        ) {
-            return Err("MV first-refresh join requires a snapshot-backed baseline"
-                .to_string()
-                .into());
-        }
         let rewrite = freeze_refresh_rewrite_context(RefreshRewriteInputs {
             connector_control: source.connector_control(),
             connector_context: &connector_context,
@@ -1310,12 +1285,7 @@ fn prepare_metadata_only_publication(
         previous_sources,
         definition_fingerprint,
         ..
-    } = &contract.state_baseline
-    else {
-        return Err(
-            "MV metadata-only refresh requires a snapshot-backed target baseline".to_string(),
-        );
-    };
+    } = &contract.state_baseline;
     let target = IcebergMvTarget {
         catalog: contract
             .target
@@ -1339,7 +1309,7 @@ fn prepare_metadata_only_publication(
     )?;
     let intent = mv_refresh_publication_intent(
         source.connector_control(),
-        &connector_context,
+        connector_context,
         attempt.publication_id,
         projection.facts.source_revision().target_object_id.clone(),
         expected_target_snapshot(contract),
@@ -1387,7 +1357,10 @@ fn prepare_metadata_only_publication(
     Ok((write, admitted))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The publication intent validates a complete set of independently owned MV and connector facts; a bundle would merely duplicate the frozen intent shape."
+)]
 fn mv_refresh_publication_intent(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -1453,7 +1426,6 @@ fn expected_target_snapshot(contract: &RefreshPlanContract) -> Option<i64> {
         RefreshStateBaseline::SnapshotBacked {
             target_snapshot_id, ..
         } => *target_snapshot_id,
-        RefreshStateBaseline::Pinless => None,
     }
 }
 
@@ -1502,7 +1474,6 @@ fn baseline_previous_sources(baseline: &RefreshStateBaseline) -> &[RefreshStateB
         RefreshStateBaseline::SnapshotBacked {
             previous_sources, ..
         } => previous_sources,
-        RefreshStateBaseline::Pinless => &[],
     }
 }
 
@@ -1511,7 +1482,6 @@ fn baseline_previous_sources(baseline: &RefreshStateBaseline) -> &[RefreshStateB
 /// writer contract.  Join branches and policy-driven full rebuilds retain
 /// their explicit preparation boundary until their distinct physical artifacts
 /// are extracted; treating either as an append would be incorrect.
-#[allow(clippy::too_many_arguments)]
 enum PreparedIncrementalRefreshWork {
     MetadataOnly,
     ChangeStream(PreparedMvIncrementalWrite, AdmittedMvDataPublication),
@@ -1551,14 +1521,7 @@ fn prepare_frontend_incremental_write(
         target_snapshot_id,
         definition_fingerprint,
         ..
-    } = &contract.state_baseline
-    else {
-        return Err(
-            "MV incremental refresh requires a snapshot-backed target baseline"
-                .to_string()
-                .into(),
-        );
-    };
+    } = &contract.state_baseline;
     let definition_occurrences = &projection.facts.definition().relation_occurrences;
     if definition_occurrences.len() != contract.base_refs.len() {
         return Err(
@@ -1763,7 +1726,6 @@ fn prepare_frontend_incremental_write(
             target.namespace.clone(),
             target.table.clone(),
             attempt.staging_branch(),
-            current_catalog.map(str::to_string),
             current_database.to_string(),
             *target_snapshot_id,
             observed_binding,
@@ -1873,7 +1835,6 @@ fn prepare_frontend_incremental_write(
             )?;
             Ok::<_, String>((
                 base,
-                previous_snapshot_id,
                 current_snapshot_id,
                 current_table_object_id.clone(),
                 admission,
@@ -1883,17 +1844,10 @@ fn prepare_frontend_incremental_write(
     let changes = loaded_bases
         .iter()
         .map(
-            |(
-                base_ref,
-                previous_snapshot_id,
-                current_snapshot_id,
-                current_table_object_id,
-                admission,
-            )| {
+            |(base_ref, current_snapshot_id, current_table_object_id, admission)| {
                 NonJoinBaseChange {
                     occurrence_id: base_ref.occurrence_id,
                     base_ref: &base_ref.table,
-                    previous_snapshot_id: *previous_snapshot_id,
                     current_snapshot_id: *current_snapshot_id,
                     current_table_object_id,
                     admission: admission.clone(),
@@ -1948,7 +1902,6 @@ fn prepare_frontend_incremental_write(
         target.namespace.clone(),
         target.table.clone(),
         attempt.staging_branch(),
-        current_catalog.map(str::to_string),
         current_database.to_string(),
         *target_snapshot_id,
         observed_binding,

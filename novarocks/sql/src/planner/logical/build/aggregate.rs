@@ -369,6 +369,13 @@ fn collect_repeat_input_refs(
     }
 }
 
+type AggregateProjectionSplit = (
+    Vec<ProjectItem>,
+    Vec<AggregateCall>,
+    Vec<OutputColumn>,
+    Option<TypedExpr>,
+);
+
 /// Split the SELECT list into post-aggregate projection items and aggregate calls.
 ///
 /// For a query like `SELECT a, count(*), sum(b) + 1 FROM t GROUP BY a`:
@@ -381,15 +388,7 @@ pub(super) fn split_projection_for_aggregate(
     having: Option<&TypedExpr>,
     factory: &mut ColumnRefFactory,
     control: &dyn PureCompileControl,
-) -> Result<
-    (
-        Vec<ProjectItem>,
-        Vec<AggregateCall>,
-        Vec<OutputColumn>,
-        Option<TypedExpr>,
-    ),
-    SqlCompileError,
-> {
+) -> Result<AggregateProjectionSplit, SqlCompileError> {
     let mut agg_calls = Vec::new();
 
     for item in projection {

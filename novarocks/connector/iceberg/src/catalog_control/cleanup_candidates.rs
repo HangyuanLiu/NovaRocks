@@ -312,6 +312,54 @@ fn unavailable(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Unavailable, message)
 }
 
+async fn build_dv_index(
+    metadata: &TableMetadata,
+    file_io: &FileIO,
+    snapshot_ids: &HashSet<i64>,
+) -> Result<HashMap<String, HashSet<String>>, String> {
+    let mut index = HashMap::<String, HashSet<String>>::new();
+    for snapshot_id in snapshot_ids {
+        let Some(snapshot) = metadata.snapshot_by_id(*snapshot_id) else {
+            continue;
+        };
+        let manifest_list = crate::manifest::load_manifest_list(snapshot, file_io, metadata)
+            .await
+            .map_err(|error| format!("load orphan cleanup manifest list: {error}"))?;
+        for manifest_file in manifest_list.entries() {
+            let manifest = crate::manifest::load_manifest(manifest_file, file_io)
+                .await
+                .map_err(|error| format!("load orphan cleanup manifest: {error}"))?;
+            for entry in manifest.entries() {
+                let file = entry.data_file();
+                if let Some(referenced) = file.referenced_data_file() {
+                    index
+                        .entry(file.file_path().to_string())
+                        .or_default()
+                        .insert(referenced);
+                }
+            }
+        }
+    }
+    Ok(index)
+}
+
+pub(super) fn canonical_object_mtime_ms(value: i64) -> i64 {
+    value.div_euclid(1_000) * 1_000
+}
+
+fn normalize_scanned_path(path: &str) -> String {
+    if path.contains("://") || !path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("file://{path}")
+    }
+}
+
+fn canonical_containment(location: &str) -> String {
+    let stripped = location.strip_prefix("file://").unwrap_or(location);
+    format!("{}/", stripped.trim_end_matches('/'))
+}
+
 #[cfg(test)]
 mod tests {
     use futures::TryStreamExt;
@@ -412,52 +460,4 @@ mod tests {
         );
         assert_eq!(selected.len(), 1);
     }
-}
-
-async fn build_dv_index(
-    metadata: &TableMetadata,
-    file_io: &FileIO,
-    snapshot_ids: &HashSet<i64>,
-) -> Result<HashMap<String, HashSet<String>>, String> {
-    let mut index = HashMap::<String, HashSet<String>>::new();
-    for snapshot_id in snapshot_ids {
-        let Some(snapshot) = metadata.snapshot_by_id(*snapshot_id) else {
-            continue;
-        };
-        let manifest_list = crate::manifest::load_manifest_list(&snapshot, file_io, metadata)
-            .await
-            .map_err(|error| format!("load orphan cleanup manifest list: {error}"))?;
-        for manifest_file in manifest_list.entries() {
-            let manifest = crate::manifest::load_manifest(&manifest_file, file_io)
-                .await
-                .map_err(|error| format!("load orphan cleanup manifest: {error}"))?;
-            for entry in manifest.entries() {
-                let file = entry.data_file();
-                if let Some(referenced) = file.referenced_data_file() {
-                    index
-                        .entry(file.file_path().to_string())
-                        .or_default()
-                        .insert(referenced);
-                }
-            }
-        }
-    }
-    Ok(index)
-}
-
-pub(super) fn canonical_object_mtime_ms(value: i64) -> i64 {
-    value.div_euclid(1_000) * 1_000
-}
-
-fn normalize_scanned_path(path: &str) -> String {
-    if path.contains("://") || !path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("file://{path}")
-    }
-}
-
-fn canonical_containment(location: &str) -> String {
-    let stripped = location.strip_prefix("file://").unwrap_or(location);
-    format!("{}/", stripped.trim_end_matches('/'))
 }

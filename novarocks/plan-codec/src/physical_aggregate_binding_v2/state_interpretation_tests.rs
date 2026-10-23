@@ -116,14 +116,7 @@ fn receipt_codec_keeps_control_cause_and_bounded_observation_on_long_keys() {
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
     encode_state_interpretation(&source, &mut work).unwrap();
     work.finish().unwrap();
-    assert!(
-        control
-            .units
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|units| *units == 256)
-    );
+    assert!(control.units.lock().unwrap().contains(&256));
     for cause in [
         CompileControlError::Cancelled,
         CompileControlError::DeadlineExceeded,

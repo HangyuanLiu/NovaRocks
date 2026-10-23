@@ -78,10 +78,6 @@ impl CatalogDelegate {
         }
     }
 
-    pub(super) fn client(&self) -> &Arc<dyn Catalog> {
-        &self.client
-    }
-
     // ---- Reads ----------------------------------------------------------
 
     /// The vendored clients expose namespace enumeration only as one complete

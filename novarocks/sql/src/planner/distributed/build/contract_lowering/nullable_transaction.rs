@@ -399,7 +399,7 @@ impl ContractLoweringVisitor<'_> {
                         let mut revised = old.ty.clone();
                         revised = revised.with_nullable(revised.nullable() || (input.nullable()
                             || novarocks_functions::carrier_cast_can_produce_null_with_policy(
-                                &input.data_type(),
+                                input.data_type(),
                                 target,
                                 *decimal_overflow_policy,
                                 self.root_allow_throw_exception,
@@ -861,8 +861,8 @@ impl ContractLoweringVisitor<'_> {
                         super::super::physical_aggregate_requests::checked_aggregate_state_semantics_observed(
                             consumer, old_binding, captured, producer.binding, work)?;
                     }
-                    if producer.writer {
-                        if let Err(error) = super::super::physical_writer_requests::checked_captured_writer_sources_observed(consumer, captured, work) {
+                    if producer.writer
+                        && let Err(error) = super::super::physical_writer_requests::checked_captured_writer_sources_observed(consumer, captured, work) {
                             let exit = match &error {
                                 super::super::physical_writer_requests::PhysicalWriterRequestError::Control(cause) => super::super::lowered_draft::SqlSourceJournalError::Control(cause.clone()),
                                 super::super::physical_writer_requests::PhysicalWriterRequestError::InvalidSource(detail) => super::super::lowered_draft::SqlSourceJournalError::InvalidSource(detail),
@@ -871,7 +871,6 @@ impl ContractLoweringVisitor<'_> {
                             writer_callback_failure = Some(error);
                             return Err(exit);
                         }
-                    }
                     work.flush()?;
                     contributors.try_reserve(1).map_err(|_| CompileControlError::ResourceExhausted)?;
                     contributors.push((Arc::clone(canonical), producer.binding.clone()));
@@ -1378,22 +1377,19 @@ impl ContractLoweringVisitor<'_> {
                             for event in events.iter() {
                                 for (output, expr) in event.assignments.iter() {
                                     self.work.step()?;
-                                    if *output == value.id {
-                                        if let Some(expr) = expr {
-                                            if dirty_expressions.contains(&(fragment, *expr)) {
-                                                revised = revised
-                                                    .with_nullable(
-                                                        revised.nullable()
-                                                            || (self
-                                                                .construction_expression(
-                                                                    fragment, *expr,
-                                                                )?
-                                                                .ty
-                                                                .nullable()),
-                                                    )
-                                                    .expect("validated root NULL contract");
-                                            }
-                                        }
+                                    if *output == value.id
+                                        && let Some(expr) = expr
+                                        && dirty_expressions.contains(&(fragment, *expr))
+                                    {
+                                        revised = revised
+                                            .with_nullable(
+                                                revised.nullable()
+                                                    || (self
+                                                        .construction_expression(fragment, *expr)?
+                                                        .ty
+                                                        .nullable()),
+                                            )
+                                            .expect("validated root NULL contract");
                                     }
                                 }
                             }

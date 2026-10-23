@@ -161,7 +161,7 @@ enum Contribution {
     Float(f64),
 }
 
-fn downcast<'a, T: 'static>(array: &'a dyn Array) -> Result<&'a T, KernelFailure> {
+fn downcast<T: 'static>(array: &dyn Array) -> Result<&T, KernelFailure> {
     array
         .as_any()
         .downcast_ref::<T>()

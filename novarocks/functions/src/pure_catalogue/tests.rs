@@ -1898,7 +1898,10 @@ fn actual_builtin_sleep_seals_only_with_its_exact_controlled_wait_record() {
         abi: PureKernelAbi::ScalarV1,
     };
     assert_eq!(declared.identity, expected.overload);
-    assert_eq!(attachment.implementations.as_ref(), &[expected.clone()]);
+    assert_eq!(
+        attachment.implementations.as_ref(),
+        std::slice::from_ref(&expected)
+    );
     let effects = declared.effects.as_ref().unwrap();
     assert_eq!(effects.value_stability, FunctionVolatility::Volatile);
     assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);

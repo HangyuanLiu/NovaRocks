@@ -213,6 +213,7 @@ impl PreparedFlatReader<'_, '_, '_, '_> {
         0
     }
 
+    #[cfg(test)]
     pub(crate) fn materialize_in(
         self,
         admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<'_>,
@@ -737,6 +738,7 @@ impl<'a, 'f> FlatConstantStream<'a, 'f> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_pool_borrowed_in<'v, 'c>(
         self,
         field: Arc<Field>,

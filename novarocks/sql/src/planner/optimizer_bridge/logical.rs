@@ -58,7 +58,7 @@ pub(crate) fn try_to_optimizer_expr(
     Ok(expression)
 }
 
-#[cfg(any(test, novarocks_dev_controls))]
+#[cfg(test)]
 pub(crate) fn to_optimizer_expr(plan: &LogicalPlanNode, scalars: &mut ScalarArena) -> OptExpr {
     try_to_optimizer_expr(plan, scalars, crate::optimizer::test_optimizer_control())
         .expect("invalid logical plan stage")
@@ -591,7 +591,7 @@ pub(crate) fn to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> LogicalPlan
         .map(|c| to_logical_plan(c, arena))
         .collect();
     let kind = match expr.op {
-        Operator::LogicalScan(op) => LogicalPlanKind::Scan(PlanScanNode {
+        Operator::LogicalScan(op) => LogicalPlanKind::scan(PlanScanNode {
             database: op.database,
             table: op.table,
             alias: op.alias,
@@ -724,7 +724,7 @@ pub(crate) fn to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> LogicalPlan
             // before to_logical_plan is called. If it survives, we
             // still need to materialize it correctly for callers that inspect
             // the plan before memo conversion.
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 kind: op.kind,
                 subquery_expr: materialize(arena, op.subquery_expr),
                 output_column: op.output_column,
@@ -831,7 +831,7 @@ mod tests {
     #[test]
     fn to_optimizer_expr_normalizes_scan_mv_rewrite_source() {
         let scan = LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "db".to_string(),
                 table: dummy_table_def(),
                 alias: None,
@@ -989,7 +989,7 @@ mod tests {
     #[test]
     fn test_scan_to_memo() {
         let scan = LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "db".to_string(),
                 table: dummy_table_def(),
                 alias: None,
@@ -1036,7 +1036,7 @@ mod tests {
         );
 
         let scan = LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "db".to_string(),
                 table: dummy_table_def(),
                 alias: None,
@@ -1127,7 +1127,7 @@ mod tests {
         let mut table = dummy_table_def();
         table.source = crate::planner::table::test_sql_scan_source(SqlScanKind::ConnectorRead);
         let scan = LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "db".to_string(),
                 table,
                 alias: None,
@@ -1177,7 +1177,7 @@ mod tests {
     #[test]
     fn test_filter_scan_to_memo() {
         let scan = LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "db".to_string(),
                 table: dummy_table_def(),
                 alias: None,
@@ -1229,7 +1229,7 @@ mod tests {
     #[test]
     fn test_cte_anchor_to_memo() {
         let scan = LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "db".to_string(),
                 table: dummy_table_def(),
                 alias: None,

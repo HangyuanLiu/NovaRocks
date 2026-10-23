@@ -78,6 +78,10 @@ use crate::observation::TaskStatusSource;
 pub const METRIC_PUBLISH_MIN_INTERVAL: Duration = Duration::from_millis(250);
 
 /// How one proposed status change was answered.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "This Worker transition result carries the exact typed TaskStatusError; boxing would change the public contract and allocate on rejection."
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatusAdvance {
     /// A lifecycle change published a new version.
@@ -257,10 +261,6 @@ pub(crate) struct PendingTaskConclusion<'a> {
     publication: PendingStatusPublication<'a>,
 }
 impl PendingTaskConclusion<'_> {
-    pub(crate) fn acceptance(&self) -> &ConclusionAcceptance<ExecutionFailure> {
-        &self.accepted
-    }
-
     pub(crate) fn publish(self) -> ConclusionAcceptance<ExecutionFailure> {
         let Self {
             accepted,
@@ -686,13 +686,12 @@ impl TaskStatusOwner {
         }
         if terminal_state_of(from) == Some(to) {
             termination = state.current.termination().cloned();
-        } else if let Some(proposed) = termination.as_ref() {
-            if state.conclusions.current() != Some(&TaskConclusion::Terminated(proposed.clone()))
-                && termination_decision(state, proposed)
-                    == novarocks_execution_contract::ConclusionDecision::Keep
-            {
-                return StatusAdvance::KeptConclusion(from);
-            }
+        } else if let Some(proposed) = termination.as_ref()
+            && state.conclusions.current() != Some(&TaskConclusion::Terminated(proposed.clone()))
+            && termination_decision(state, proposed)
+                == novarocks_execution_contract::ConclusionDecision::Keep
+        {
+            return StatusAdvance::KeptConclusion(from);
         }
         match classify_task_transition(from, to) {
             TaskTransition::AlreadyTerminal => StatusAdvance::AlreadyTerminal(from),
@@ -921,19 +920,18 @@ impl TaskStatusOwner {
         if !self.preparation.allows_runtime_exit_publication() {
             return false;
         }
-        if state.runtime_actual_stopped_received {
-            if let TaskConvergenceAdvance::Advanced(snapshot) = state
+        if state.runtime_actual_stopped_received
+            && let TaskConvergenceAdvance::Advanced(snapshot) = state
                 .convergence
                 .note_actual_stopped()
                 .expect("a live task accepts original actual-stop evidence")
-            {
-                let version = TaskConvergenceVersion::new(snapshot.version())
-                    .expect("advanced convergence has a nonzero version");
-                state.buffered_convergence = Some(TaskConvergenceReceipt::actual_stopped(
-                    self.identity,
-                    version,
-                ));
-            }
+        {
+            let version = TaskConvergenceVersion::new(snapshot.version())
+                .expect("advanced convergence has a nonzero version");
+            state.buffered_convergence = Some(TaskConvergenceReceipt::actual_stopped(
+                self.identity,
+                version,
+            ));
         }
         state.runtime_resources_converged_received
             && matches!(
@@ -1044,32 +1042,32 @@ impl TaskStatusOwner {
             .cloned()
             .map(TaskConclusion::Terminated)
             .or_else(|| (next.state() == TaskState::Finished).then_some(TaskConclusion::Succeeded));
-        if let Some(projected) = projected {
-            if state.conclusions.current() != Some(&projected) {
-                let proposal = match projected {
-                    TaskConclusion::Succeeded => TaskConclusionProposal::Succeeded,
-                    TaskConclusion::Terminated(TerminationDetail::Canceled(reason)) => {
-                        TaskConclusionProposal::Canceled(reason)
-                    }
-                    TaskConclusion::Terminated(TerminationDetail::Aborted(cause)) => {
-                        TaskConclusionProposal::Aborted(cause)
-                    }
-                    TaskConclusion::Terminated(TerminationDetail::Failed(_)) => {
-                        panic!("Task failure projection requires its accepted original source")
-                    }
-                };
-                let (accepted, discarded) = state.conclusions.accept(
-                    self.identity,
-                    PreparedTaskConclusion::new(proposal),
-                    false,
-                );
-                assert_ne!(
-                    accepted.decision,
-                    ConclusionDecision::Keep,
-                    "status cannot overwrite an accepted Task conclusion"
-                );
-                assert!(discarded.is_none());
-            }
+        if let Some(projected) = projected
+            && state.conclusions.current() != Some(&projected)
+        {
+            let proposal = match projected {
+                TaskConclusion::Succeeded => TaskConclusionProposal::Succeeded,
+                TaskConclusion::Terminated(TerminationDetail::Canceled(reason)) => {
+                    TaskConclusionProposal::Canceled(reason)
+                }
+                TaskConclusion::Terminated(TerminationDetail::Aborted(cause)) => {
+                    TaskConclusionProposal::Aborted(cause)
+                }
+                TaskConclusion::Terminated(TerminationDetail::Failed(_)) => {
+                    panic!("Task failure projection requires its accepted original source")
+                }
+            };
+            let (accepted, discarded) = state.conclusions.accept(
+                self.identity,
+                PreparedTaskConclusion::new(proposal),
+                false,
+            );
+            assert_ne!(
+                accepted.decision,
+                ConclusionDecision::Keep,
+                "status cannot overwrite an accepted Task conclusion"
+            );
+            assert!(discarded.is_none());
         }
         state.current = next.clone();
         state.metrics_pending = false;
@@ -2583,7 +2581,7 @@ mod conclusion_tests {
         /// Accepted but not installed: the shape a rolled-back creation has.
         Planned,
         Running,
-        Terminating(TerminationFixture),
+        Terminating(Box<TerminationFixture>),
     }
 
     fn start(start: &Start) -> TaskStatusOwner {
@@ -2652,47 +2650,47 @@ mod conclusion_tests {
             (Start::Running, late_abort.clone(), late_abort.clone()),
             (Start::Running, late_failure.clone(), late_failure.clone()),
             (
-                Start::Terminating(first_cancel.clone()),
+                Start::Terminating(Box::new(first_cancel.clone())),
                 late_cancel.clone(),
                 first_cancel.clone(),
             ),
             (
-                Start::Terminating(first_cancel.clone()),
+                Start::Terminating(Box::new(first_cancel.clone())),
                 late_abort.clone(),
                 first_cancel.clone(),
             ),
             (
-                Start::Terminating(first_cancel.clone()),
+                Start::Terminating(Box::new(first_cancel.clone())),
                 late_failure.clone(),
                 first_cancel.clone(),
             ),
             (
-                Start::Terminating(first_abort.clone()),
+                Start::Terminating(Box::new(first_abort.clone())),
                 late_cancel.clone(),
                 first_abort.clone(),
             ),
             (
-                Start::Terminating(first_abort.clone()),
+                Start::Terminating(Box::new(first_abort.clone())),
                 late_abort.clone(),
                 first_abort.clone(),
             ),
             (
-                Start::Terminating(first_abort.clone()),
+                Start::Terminating(Box::new(first_abort.clone())),
                 late_failure.clone(),
                 first_abort.clone(),
             ),
             (
-                Start::Terminating(first_failure.clone()),
+                Start::Terminating(Box::new(first_failure.clone())),
                 late_cancel,
                 first_failure.clone(),
             ),
             (
-                Start::Terminating(first_failure.clone()),
+                Start::Terminating(Box::new(first_failure.clone())),
                 late_abort,
                 first_failure.clone(),
             ),
             (
-                Start::Terminating(first_failure.clone()),
+                Start::Terminating(Box::new(first_failure.clone())),
                 late_failure,
                 first_failure,
             ),
@@ -2743,7 +2741,7 @@ mod conclusion_tests {
             TerminationFixture::command(aborted(AbortCause::PeerTaskFailed)),
             resource_fixture(),
         ] {
-            let owner = start(&Start::Terminating(winner.clone()));
+            let owner = start(&Start::Terminating(Box::new(winner.clone())));
             assert!(owner.force_conclusion(AbortCause::LeaseExpired));
             assert_concluded(
                 &owner,
@@ -2761,9 +2759,9 @@ mod conclusion_tests {
     #[test]
     fn only_an_originating_failure_refines_a_live_derived_placeholder() {
         let derived = aborted(AbortCause::PeerTaskFailed);
-        let owner = start(&Start::Terminating(TerminationFixture::command(
+        let owner = start(&Start::Terminating(Box::new(TerminationFixture::command(
             derived.clone(),
-        )));
+        ))));
         for proposal in [
             canceled(CancelReason::UpstreamNoLongerNeeded),
             aborted(AbortCause::LeaseExpired),
@@ -3249,10 +3247,13 @@ mod preparation_runtime_receipt_tests {
         secondary: bool,
         secondary_drops: Arc<AtomicUsize>,
     }
-    struct SecondaryDrop(Arc<Vec<u8>>, Arc<AtomicUsize>);
+    struct SecondaryDrop {
+        _data: Arc<Vec<u8>>,
+        drops: Arc<AtomicUsize>,
+    }
     impl Drop for SecondaryDrop {
         fn drop(&mut self) {
-            self.1.fetch_add(1, Ordering::AcqRel);
+            self.drops.fetch_add(1, Ordering::AcqRel);
         }
     }
     impl Drop for PrimaryDrop {
@@ -3260,10 +3261,10 @@ mod preparation_runtime_receipt_tests {
             self.entered.send(()).unwrap();
             self.release.recv().unwrap();
             if self.secondary {
-                std::panic::panic_any(SecondaryDrop(
-                    self.data.clone(),
-                    self.secondary_drops.clone(),
-                ));
+                std::panic::panic_any(SecondaryDrop {
+                    _data: self.data.clone(),
+                    drops: self.secondary_drops.clone(),
+                });
             }
         }
     }

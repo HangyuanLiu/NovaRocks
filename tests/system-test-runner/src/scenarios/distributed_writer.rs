@@ -65,9 +65,7 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::query_lifecycle::native_sql_controls::{
-    SelectedStatement, SqlIntentOwner, StatementSpec,
-};
+use super::native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpec};
 #[path = "writer_statement_actor.rs"]
 mod writer_statement_actor;
 use writer_statement_actor::{WriterActor, retain_write_result};
@@ -1465,7 +1463,7 @@ fn assert_every_backend_accepted_task(
         }
         delta.push(after - before);
     }
-    if delta.iter().any(|count| *count == 0.0) {
+    if delta.contains(&0.0) {
         bail!(
             "{label} accepted-task deltas are {delta:?}; every backend in native 1FE+3BE \
              must accept at least one EES task from this statement"
@@ -2512,7 +2510,6 @@ fn run_faulted_write(
     Option<QueryLifecycleStructuredSnapshot>,
     OriginalWriteWindow,
 )> {
-    let case = fault.case();
     let insert = fault.statement(statements);
     match fault {
         WriteFault::FetchAbort => {

@@ -390,16 +390,16 @@ impl<S> NativeIngressService<S> {
     /// Hold each request's lane stream position from `admission` until its
     /// response body exits.
     pub fn with_lane_streams(mut self, admission: Option<NativeTransportAdmission>) -> Self {
-        if self.domain == NativeEndpointDomain::BackendData {
-            if let Some(admission) = &admission {
-                self.root_result = Gate::new(
-                    admission.root_result_ingress_owner_limit(),
-                    0,
-                    "root_result",
-                    self.backend_metrics,
-                    novarocks_result_contract::RootProfileV1::ENVELOPE_BYTES,
-                );
-            }
+        if self.domain == NativeEndpointDomain::BackendData
+            && let Some(admission) = &admission
+        {
+            self.root_result = Gate::new(
+                admission.root_result_ingress_owner_limit(),
+                0,
+                "root_result",
+                self.backend_metrics,
+                novarocks_result_contract::RootProfileV1::ENVELOPE_BYTES,
+            );
         }
         self.lane_streams = admission;
         self
@@ -922,7 +922,7 @@ mod tests {
             ..Default::default()
         };
         let data = NativeIngressService::new(
-            service.clone(),
+            service,
             config,
             "test",
             false,

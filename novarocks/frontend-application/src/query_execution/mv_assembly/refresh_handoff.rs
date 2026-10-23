@@ -106,13 +106,6 @@ impl PreparedMvRefreshWrite {
         }
     }
 
-    pub fn primary_cohort(&self) -> novarocks_spi::connector::ConnectorWriteCohortId {
-        match &self.artifact {
-            PreparedMvRefreshWriteArtifact::FirstRefresh(write) => write.primary_cohort(),
-            PreparedMvRefreshWriteArtifact::Incremental(write) => write.primary_cohort(),
-        }
-    }
-
     pub fn publication_intent(&self) -> &MvRefreshPublicationIntent {
         match &self.artifact {
             PreparedMvRefreshWriteArtifact::FirstRefresh(write) => write.publication_intent(),
@@ -127,7 +120,6 @@ impl PreparedMvRefreshWrite {
 
 /// Frontend lifecycle artifact assembled from SQL facts and a reserved attempt.
 pub struct PreparedMvRefresh {
-    pub statement: MvRefreshStatement,
     pub attempt: MvRefreshAttemptIdentity,
     pub observed_binding: ConnectorProviderBindingKey,
     pub finalize: MvRefreshFinalizeFacts,

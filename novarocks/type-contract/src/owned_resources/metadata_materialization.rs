@@ -51,10 +51,11 @@ fn allocation<E>(
     layout: std::alloc::Layout,
     occurrences: usize,
 ) -> Result<(), E> {
-    if layout.size() != 0 && occurrences != 0 {
-        if let Some(loan) = loan.as_deref_mut() {
-            loan(layout, occurrences)?;
-        }
+    if layout.size() != 0
+        && occurrences != 0
+        && let Some(loan) = loan.as_deref_mut()
+    {
+        loan(layout, occurrences)?;
     }
     Ok(())
 }
@@ -755,7 +756,7 @@ impl MetadataFieldLoan {
             .then(|| original_map_backing_observed(self.metadata, actual.metadata(), observe))
     }
     pub fn lends_borrowed_field(&self, actual: &Field) -> bool {
-        self.field.as_ptr() == actual as *const Field
+        std::ptr::eq(self.field.as_ptr(), actual)
     }
     pub fn original_borrowed_field_clone_request<
         'a,

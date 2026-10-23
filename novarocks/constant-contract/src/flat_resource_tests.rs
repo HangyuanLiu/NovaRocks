@@ -575,7 +575,7 @@ fn allocation_dedup_inline_and_spill_keep_duplicates_and_real_view_owners_exact(
     }
     assert!(set.insert((100, 128)));
     assert!(!set.insert((100, 128)));
-    let payloads: Vec<_> = [b'a', b'b', b'c', b'd']
+    let payloads: Vec<_> = (*b"abcd")
         .into_iter()
         .map(|byte| Buffer::from(vec![byte; 13]))
         .collect();

@@ -52,22 +52,16 @@ pub(crate) struct NlJoinSharedState {
     build_dep: DependencyHandle,
     build_rows: AtomicUsize,
     build: Mutex<Option<Arc<NlJoinBuildArtifact>>>,
-    probe_total: usize,
-    probe_finished: AtomicUsize,
-    shared_build_matched: Mutex<Option<Vec<Vec<bool>>>>,
 }
 
 impl NlJoinSharedState {
-    pub(crate) fn new(node_id: i32, probe_count: usize, dep_manager: DependencyManager) -> Self {
+    pub(crate) fn new(node_id: i32, dep_manager: DependencyManager) -> Self {
         let build_dep = dep_manager.get_or_create(format!("nljoin_build:{}", node_id));
         Self {
             node_id,
             build_dep,
             build_rows: AtomicUsize::new(0),
             build: Mutex::new(None),
-            probe_total: probe_count.max(1),
-            probe_finished: AtomicUsize::new(0),
-            shared_build_matched: Mutex::new(None),
         }
     }
 
@@ -106,59 +100,5 @@ impl NlJoinSharedState {
     pub(crate) fn has_build(&self) -> bool {
         let guard = self.build.lock().expect("nljoin build lock");
         guard.is_some()
-    }
-
-    pub(crate) fn is_build_empty(&self) -> bool {
-        self.has_build() && self.build_rows.load(Ordering::Acquire) == 0
-    }
-
-    pub(crate) fn finish_probe(&self, local_flags: Option<Vec<Vec<bool>>>) -> bool {
-        if let Some(local) = local_flags {
-            let mut shared = self
-                .shared_build_matched
-                .lock()
-                .expect("nljoin build match flags lock");
-            match shared.as_mut() {
-                Some(shared_flags) => {
-                    if shared_flags.len() != local.len() {
-                        panic!(
-                            "nljoin build match flags batch mismatch: shared={} local={}",
-                            shared_flags.len(),
-                            local.len()
-                        );
-                    }
-                    for (shared_batch, local_batch) in
-                        shared_flags.iter_mut().zip(local.into_iter())
-                    {
-                        if shared_batch.len() != local_batch.len() {
-                            panic!(
-                                "nljoin build match flags row mismatch: shared={} local={}",
-                                shared_batch.len(),
-                                local_batch.len()
-                            );
-                        }
-                        for (shared_flag, local_flag) in
-                            shared_batch.iter_mut().zip(local_batch.into_iter())
-                        {
-                            *shared_flag |= local_flag;
-                        }
-                    }
-                }
-                None => {
-                    *shared = Some(local);
-                }
-            }
-        }
-
-        let finished = self.probe_finished.fetch_add(1, Ordering::AcqRel) + 1;
-        finished >= self.probe_total
-    }
-
-    pub(crate) fn shared_build_matched(&self) -> Option<Vec<Vec<bool>>> {
-        let guard = self
-            .shared_build_matched
-            .lock()
-            .expect("nljoin build match flags lock");
-        guard.clone()
     }
 }

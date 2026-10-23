@@ -538,7 +538,6 @@ pub fn aggregate_topn_grouped_parent_matches_observed(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn trace_aggregate_sequence_inputs(
     plan: &PhysicalPlan,
     sequence: crate::AggregateSequenceId,
@@ -833,7 +832,6 @@ struct Traced {
     comparator: Option<crate::OrderedComparisonAlgorithm>,
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn trace_topn_reduction_inputs(
     plan: &PhysicalPlan,
     sequence: crate::TopNSequenceId,

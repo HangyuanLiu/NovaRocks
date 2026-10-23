@@ -193,14 +193,6 @@ impl OperationDispatcher {
         }
     }
 
-    pub const fn budget(&self) -> DispatchBudget {
-        self.budget
-    }
-
-    pub const fn transport_budget(&self) -> TransportBudget {
-        self.transport
-    }
-
     /// Counts one task this attempt places on a backend.
     pub fn register_task(&mut self, backend: BackendProcessId) -> Result<(), TaskExecutionError> {
         let limit = self.transport.max_active_tasks_per_backend();
@@ -836,30 +828,36 @@ impl OperationDispatcher {
         Ok(())
     }
 
+    #[cfg(test)]
     pub const fn queued_items(&self) -> usize {
         self.queued_items
     }
 
+    #[cfg(test)]
     pub const fn queued_bytes(&self) -> usize {
         self.queued_bytes
     }
 
+    #[cfg(test)]
     pub fn in_flight_operations(&self) -> usize {
         self.in_flight.len()
     }
 
+    #[cfg(test)]
     pub fn lane_in_flight(&self, backend: BackendProcessId, lane: DispatchLane) -> usize {
         self.backends
             .get(&backend)
             .map_or(0, |queues| queues.in_flight[lane_index(lane)])
     }
 
+    #[cfg(test)]
     pub fn lane_queued(&self, backend: BackendProcessId, lane: DispatchLane) -> usize {
         self.backends
             .get(&backend)
             .map_or(0, |queues| queues.lanes[lane_index(lane)].len())
     }
 
+    #[cfg(test)]
     pub fn backends(&self) -> impl ExactSizeIterator<Item = BackendProcessId> + '_ {
         self.rotation.iter().copied()
     }

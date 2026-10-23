@@ -507,7 +507,7 @@ mod tests {
             ])) as ArrayRef,
         ] {
             let unit = match array.data_type() {
-                DataType::Timestamp(unit, _) => unit.clone(),
+                DataType::Timestamp(unit, _) => *unit,
                 _ => unreachable!(),
             };
             let input = array.slice(1, 2);

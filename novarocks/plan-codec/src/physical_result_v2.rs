@@ -30,8 +30,10 @@ use crate::{
 };
 use novarocks_physical_plan as p;
 use novarocks_proto_models::physical_package_v2 as wire;
+#[cfg(test)]
+use novarocks_type_contract::CompilePhase;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
+    CompileCheckpoints, CompileControlError, FunctionValueType, PureCompileControl,
 };
 use std::mem::size_of;
 type Error = NodeCodecError;
@@ -805,9 +807,11 @@ pub(crate) struct PreparedResultEncode<'input, 'values, 'loan, 'source, 'control
     facts: NodeProjectionFacts,
 }
 impl PreparedResultEncode<'_, '_, '_, '_, '_> {
+    #[cfg(test)]
     pub(crate) fn facts(&self) -> &NodeProjectionFacts {
         &self.facts
     }
+    #[cfg(test)]
     pub(crate) fn emit(self) -> Result<(Option<wire::ResultPort>, NodeProjectionFacts), Error> {
         let mut w = CompileCheckpoints::try_new(self.control, CompilePhase::Encode)?;
         // Retain the exact original namespace until the component is published.
@@ -826,6 +830,7 @@ impl PreparedResultEncode<'_, '_, '_, '_, '_> {
             ));
         }
         admit(&self.facts)?;
+        let _values = self.values;
         emit_encode(self.input, self.ids, work).map(|output| (output, self.facts))
     }
 }
@@ -853,6 +858,7 @@ pub(crate) fn prepare_result_encode_in<'input, 'values, 'loan, 'source, 'control
         facts,
     })
 }
+#[cfg(test)]
 pub(crate) fn prepare_result_encode<'input, 'values, 'loan, 'source, 'control>(
     input: Option<&'input p::ResultPort>,
     ids: &'input [u32],
@@ -888,9 +894,11 @@ pub(crate) struct PreparedResultDecode<'input, 'values, 'loan, 'wire, 'control> 
     facts: NodeProjectionFacts,
 }
 impl PreparedResultDecode<'_, '_, '_, '_, '_> {
+    #[cfg(test)]
     pub(crate) fn facts(&self) -> &NodeProjectionFacts {
         &self.facts
     }
+    #[cfg(test)]
     pub(crate) fn emit(self) -> Result<(Option<p::ResultPort>, NodeProjectionFacts), Error> {
         let mut w = CompileCheckpoints::try_new(self.control, CompilePhase::Decode)?;
         let result = emit_decode(self.input, self.values.types(), &mut w).map(|v| (v, self.facts));
@@ -932,6 +940,7 @@ pub(crate) fn prepare_result_decode_in<'input, 'values, 'loan, 'wire, 'control>(
         facts,
     })
 }
+#[cfg(test)]
 pub(crate) fn prepare_result_decode<'input, 'values, 'loan, 'wire, 'control>(
     input: Option<&'input wire::ResultPort>,
     values: &'values DecodedValues<'loan, 'wire, 'control>,

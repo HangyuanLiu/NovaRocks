@@ -16,7 +16,7 @@
 // under the License.
 
 //! Existing scan SQL actors with an explicit idle-connection submission gate.
-use super::super::query_lifecycle::native_sql_controls::SelectedStatement;
+use super::super::native_sql_controls::SelectedStatement;
 use crate::{actors::mysql as mysql_actor, scenario::ScenarioContext};
 use anyhow::{Context, Result};
 use mysql::prelude::Queryable;

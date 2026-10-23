@@ -214,7 +214,9 @@ fn selected_schema_after_exit(
     drop(schemas);
     drop(types);
     drop(creator);
-    drop(factory);
+    {
+        let _factory = factory;
+    }
     drop(package);
     work.finish().unwrap();
     drop(scratch);
@@ -396,7 +398,9 @@ fn candidate_schema_original_namespace_gate_precedes_first_real_scope_refusal() 
     assert_eq!(tracker.current(), before);
     drop(types);
     drop(creator);
-    drop(factory);
+    {
+        let _factory = factory;
+    }
     drop(actual);
     assert_eq!(tracker.current(), 0);
 }

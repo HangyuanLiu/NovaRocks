@@ -244,7 +244,7 @@ fn establish_declared(
     let session = RawBackendSession::establish_declared(
         context,
         backend_index,
-        query.query_id.clone(),
+        query.query_id,
         query.frontend,
     )?;
     intent.verify_backend(backend_index, session.backend)?;
@@ -363,7 +363,7 @@ fn same_batch(
             "same ApplyBatch did not promptly accept the exact ordered item: {receipt:?}"
         );
         let Some(proto::task_operation_verdict::Ack::CreateTask(ack)) =
-            &receipt_verdict(&receipt)?.ack
+            &receipt_verdict(receipt)?.ack
         else {
             bail!("same ApplyBatch omitted the Create acknowledgement");
         };
@@ -656,7 +656,7 @@ fn parse_snapshot(body: &str) -> Result<Option<Snapshot>> {
         let value = body
             .lines()
             .find_map(|line| {
-                line.strip_prefix(&name)
+                line.strip_prefix(name)
                     .and_then(|tail| tail.strip_prefix(' '))
             })
             .with_context(|| format!("missing owner sample {name}"))?;
@@ -710,25 +710,24 @@ pub(super) fn await_snapshot_at(
     workers: usize,
 ) -> Result<Snapshot> {
     loop {
-        if let Some(snapshot) = scrape(context, index)? {
-            if (snapshot.positions, snapshot.queued, snapshot.workers)
+        if let Some(snapshot) = scrape(context, index)?
+            && (snapshot.positions, snapshot.queued, snapshot.workers)
                 == (positions, queued, workers)
-            {
+        {
+            ensure!(
+                snapshot.bytes <= snapshot.byte_limit
+                    && snapshot.positions <= snapshot.position_limit
+                    && snapshot.context_positions <= snapshot.context_limit
+                    && snapshot.workers <= snapshot.worker_limit,
+                "owner exceeded configured preparation charge limits: {snapshot:?}"
+            );
+            if positions == 0 {
                 ensure!(
-                    snapshot.bytes <= snapshot.byte_limit
-                        && snapshot.positions <= snapshot.position_limit
-                        && snapshot.context_positions <= snapshot.context_limit
-                        && snapshot.workers <= snapshot.worker_limit,
-                    "owner exceeded configured preparation charge limits: {snapshot:?}"
+                    snapshot.bytes == 0 && snapshot.context_positions == 0,
+                    "exited jobs leaked temporary byte/Context charges: {snapshot:?}"
                 );
-                if positions == 0 {
-                    ensure!(
-                        snapshot.bytes == 0 && snapshot.context_positions == 0,
-                        "exited jobs leaked temporary byte/Context charges: {snapshot:?}"
-                    );
-                }
-                return Ok(snapshot);
             }
+            return Ok(snapshot);
         }
         thread::sleep(
             context

@@ -19,13 +19,13 @@
 
 use super::dround_core::{DroundComputation, compute_dround};
 use crate::math_numeric::NumericArrayView;
-use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array,
+    Array, ArrayRef, Int32Array,
     types::{Decimal128Type, validate_decimal_precision_and_scale},
 };
+#[cfg(test)]
+use arrow_array::{Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
 
@@ -34,6 +34,8 @@ use crate::{
     KernelFailure, ScalarCallInput, SelectedValues,
     kernel_control::{internal, invalid},
 };
+#[cfg(test)]
+use std::sync::Arc;
 
 /// Frozen by the exact owner; binary DROUND deliberately truncates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

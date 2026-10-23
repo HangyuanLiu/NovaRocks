@@ -120,13 +120,11 @@ pub fn preflight_catalog_source(config: &mut NovaRocksConfig, config_path: &Path
         ClusterRole::Fe => {
             validate_frontend_timeouts(config, true)?;
             let has_state_store = config.state_store.is_some();
-            let source = config
-                .catalog_source
-                .get_or_insert_with(|| CatalogSourceConfig {
-                    mode: CatalogDesiredStateSourceMode::StaticFile,
-                    static_file_path: None,
-                    static_snapshot: None,
-                });
+            let source = config.catalog_source.get_or_insert(CatalogSourceConfig {
+                mode: CatalogDesiredStateSourceMode::StaticFile,
+                static_file_path: None,
+                static_snapshot: None,
+            });
             match source.mode {
                 CatalogDesiredStateSourceMode::StaticFile => {
                     let configured = source.static_file_path.as_ref().ok_or_else(|| {

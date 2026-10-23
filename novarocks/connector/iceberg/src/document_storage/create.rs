@@ -173,10 +173,6 @@ fn internal(message: impl Into<String>) -> ConnectorError {
 }
 
 #[cfg(test)]
-#[path = "tests/admission_support.rs"]
-mod admission_support;
-
-#[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
@@ -188,7 +184,7 @@ mod tests {
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
 
-    use super::admission_support::{AdmissionCatalogSpy, AdmissionFileIoSpy};
+    use super::super::admission_support::{AdmissionCatalogSpy, AdmissionFileIoSpy};
     use super::*;
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog::CatalogCreateIntent;

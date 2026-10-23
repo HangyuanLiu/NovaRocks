@@ -927,73 +927,73 @@ impl ProgramRootControlBindings {
             ProgramCreationFailure::Capacity(error) => ProgramCreationFailure::Capacity(error),
         })?;
         let mut creation = ProgramCreation { creator };
-        let mut temporary = ProgramCreation { creator: temporary };
-        if flows.len() != roots.arenas.len() || bindings.len() != roots.sites.len() {
-            return Err(ProgramRootBindingError::IncompleteCoverage.into());
-        }
-        let mut all_roots = BTreeSet::new();
-        let mut root_insertions = 0usize;
-        let mut reference_count = 0usize;
-        for (scope, flow) in &flows {
-            work.step().map_err(ProgramRootBindingError::Control)?;
-            let arena = roots
-                .arenas
-                .get(scope)
-                .ok_or(ProgramRootBindingError::InvalidArena)?;
-            reference_count = reference_count
-                .checked_add(flow.use_reference_count())
-                .filter(|value| *value <= MAX_CONTROL_USE_REFERENCES)
-                .ok_or(ProgramRootBindingError::TooManyItems)?;
-            for value in flow.uses().values() {
+        let (all_roots, sites) = {
+            let mut temporary = ProgramCreation { creator: temporary };
+            if flows.len() != roots.arenas.len() || bindings.len() != roots.sites.len() {
+                return Err(ProgramRootBindingError::IncompleteCoverage.into());
+            }
+            let mut all_roots = BTreeSet::new();
+            let mut root_insertions = 0usize;
+            let mut reference_count = 0usize;
+            for (scope, flow) in &flows {
                 work.step().map_err(ProgramRootBindingError::Control)?;
-                if arena.node(value.definition).is_none() {
-                    return Err(ProgramRootBindingError::InvalidDefinition.into());
+                let arena = roots
+                    .arenas
+                    .get(scope)
+                    .ok_or(ProgramRootBindingError::InvalidArena)?;
+                reference_count = reference_count
+                    .checked_add(flow.use_reference_count())
+                    .filter(|value| *value <= MAX_CONTROL_USE_REFERENCES)
+                    .ok_or(ProgramRootBindingError::TooManyItems)?;
+                for value in flow.uses().values() {
+                    work.step().map_err(ProgramRootBindingError::Control)?;
+                    if arena.node(value.definition).is_none() {
+                        return Err(ProgramRootBindingError::InvalidDefinition.into());
+                    }
+                }
+                validate_intrinsic_correspondence(arena, flow, &mut work)?;
+                for use_id in flow.root_use_ids() {
+                    work.step().map_err(ProgramRootBindingError::Control)?;
+                    temporary.before_tree_insert::<ProgramRootBindingError, (ProgramExpressionArena, ExpressionUseId), ()>(root_insertions, &mut work)?;
+                    root_insertions += 1;
+                    all_roots.insert((*scope, *use_id));
                 }
             }
-            validate_intrinsic_correspondence(arena, flow, &mut work)?;
-            for use_id in flow.root_use_ids() {
+            let mut sites = BTreeMap::new();
+            for (site_insertions, binding) in bindings.into_iter().enumerate() {
                 work.step().map_err(ProgramRootBindingError::Control)?;
-                temporary.before_tree_insert::<ProgramRootBindingError, (ProgramExpressionArena, ExpressionUseId), ()>(root_insertions, &mut work)?;
-                root_insertions += 1;
-                all_roots.insert((*scope, *use_id));
+                let expected = roots
+                    .sites
+                    .get(&binding.site)
+                    .ok_or(ProgramRootBindingError::InvalidRoot)?;
+                let scope = binding.site.arena();
+                let flow = flows
+                    .get(&scope)
+                    .ok_or(ProgramRootBindingError::InvalidArena)?;
+                let invocation = flow
+                    .uses()
+                    .get(&binding.use_id)
+                    .ok_or(ProgramRootBindingError::InvalidRoot)?;
+                if invocation.definition != expected.definition
+                    || invocation.context.demand != expected.demand
+                {
+                    return Err(ProgramRootBindingError::InvalidRoot.into());
+                }
+                creation.before_tree_insert::<ProgramRootBindingError, ProgramExpressionRootSite, ExpressionUseId>(site_insertions, &mut work)?;
+                if sites.insert(binding.site, binding.use_id).is_some() {
+                    return Err(ProgramRootBindingError::DuplicateSite.into());
+                }
+                if !all_roots.remove(&(scope, binding.use_id)) {
+                    return Err(ProgramRootBindingError::SharedRootUse.into());
+                }
             }
-        }
-        let mut sites = BTreeMap::new();
-        let mut site_insertions = 0usize;
-        for binding in bindings {
-            work.step().map_err(ProgramRootBindingError::Control)?;
-            let expected = roots
-                .sites
-                .get(&binding.site)
-                .ok_or(ProgramRootBindingError::InvalidRoot)?;
-            let scope = binding.site.arena();
-            let flow = flows
-                .get(&scope)
-                .ok_or(ProgramRootBindingError::InvalidArena)?;
-            let invocation = flow
-                .uses()
-                .get(&binding.use_id)
-                .ok_or(ProgramRootBindingError::InvalidRoot)?;
-            if invocation.definition != expected.definition
-                || invocation.context.demand != expected.demand
-            {
-                return Err(ProgramRootBindingError::InvalidRoot.into());
+            if sites.len() != roots.sites.len() || !all_roots.is_empty() {
+                return Err(ProgramRootBindingError::IncompleteCoverage.into());
             }
-            creation.before_tree_insert::<ProgramRootBindingError, ProgramExpressionRootSite, ExpressionUseId>(site_insertions, &mut work)?;
-            site_insertions += 1;
-            if sites.insert(binding.site, binding.use_id).is_some() {
-                return Err(ProgramRootBindingError::DuplicateSite.into());
-            }
-            if !all_roots.remove(&(scope, binding.use_id)) {
-                return Err(ProgramRootBindingError::SharedRootUse.into());
-            }
-        }
-        if sites.len() != roots.sites.len() || !all_roots.is_empty() {
-            return Err(ProgramRootBindingError::IncompleteCoverage.into());
-        }
+            (all_roots, sites)
+        };
         // Scratch is released independently of the published maps.
         drop(all_roots);
-        drop(temporary);
         work.flush()?;
         let storage = creation.storage();
         let flows = creation.arc::<ProgramRootBindingError, _>(

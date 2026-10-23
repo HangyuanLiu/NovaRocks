@@ -281,7 +281,7 @@ pub(crate) async fn current_equality_delete_column_names_with_control(
         .map(|field| (field.id, field.name.clone()))
         .collect();
     let file_io = table.file_io();
-    let manifest_list = crate::manifest::load_manifest_list(&snapshot, file_io, metadata)
+    let manifest_list = crate::manifest::load_manifest_list(snapshot, file_io, metadata)
         .await
         .map_err(|error| format!("load manifest list: {error}"))?;
     check_active()?;
@@ -291,7 +291,7 @@ pub(crate) async fn current_equality_delete_column_names_with_control(
         if manifest_file.content != ManifestContentType::Deletes {
             continue;
         }
-        let manifest = crate::manifest::load_manifest(&manifest_file, file_io)
+        let manifest = crate::manifest::load_manifest(manifest_file, file_io)
             .await
             .map_err(|error| {
                 with_variant_statistics_hint(format!("load manifest: {error}"), metadata)
@@ -549,6 +549,7 @@ pub(crate) async fn extract_data_files_with_stats_at_projected<O>(
 
 /// COW extracts the same complete live-file facts without constructing scan-only
 /// DataFile clones or the unused IcebergDataFileMetadata graph.
+#[cfg(test)]
 pub(crate) async fn extract_cow_data_files_with_stats_at(
     table: &Table,
     snapshot_id: i64,
@@ -556,6 +557,7 @@ pub(crate) async fn extract_cow_data_files_with_stats_at(
     extract_cow_data_files_with_stats_at_with_control(table, snapshot_id, None).await
 }
 
+#[cfg(test)]
 pub(crate) async fn extract_cow_data_files_with_stats_at_with_control(
     table: &Table,
     snapshot_id: i64,
@@ -613,7 +615,7 @@ pub(crate) async fn extract_cow_data_files_with_stats_at_with_control(
 pub(crate) struct CheckedCowDataFiles {
     pub files: Vec<FrozenReadFileWithStats>,
     pub simultaneous_upper: u64,
-    pub retention_guard: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
+    pub _retention_guard: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
 }
 
 pub(crate) async fn extract_cow_data_files_with_stats_at_with_original_scope(
@@ -734,7 +736,7 @@ pub(crate) async fn extract_cow_data_files_with_stats_at_with_original_scope(
         Ok::<_, ReadFailure>(CheckedCowDataFiles {
             files,
             simultaneous_upper: budget.upper(),
-            retention_guard: scope.retention_guard(),
+            _retention_guard: scope.retention_guard(),
         })
     };
     build.await.map_err(ReadFailure::into_cause)

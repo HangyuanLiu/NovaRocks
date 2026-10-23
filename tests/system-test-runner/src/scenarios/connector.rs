@@ -560,7 +560,7 @@ impl Scenario for DistributedReaderCancel {
                     "connector_cancel_catalog",
                     "wait for every BE to open a distributed connector reader",
                     &baseline_logs,
-                    AwaitedRead::new(&target, "the connector read"),
+                    AwaitedRead::new(target, "the connector read"),
                 )?;
                 // Kept alongside the barrier's own liveness check rather than folded
                 // into it: the barrier covers the wait, this covers the instant
@@ -580,11 +580,11 @@ impl Scenario for DistributedReaderCancel {
                     context.remaining("await connector read cancellation")?,
                 )?;
                 assert_target_connection_remains_usable(
-                    &target,
+                    target,
                     context.remaining("verify KILL QUERY target connection remains usable")?,
                 )?;
                 assert_idle_query(&mut control, connection_id)?;
-                release_connector_read(&target)?;
+                release_connector_read(target)?;
                 Ok(())
             })();
             owned.finish_after(context, &mut control, phase)?;
@@ -692,7 +692,7 @@ impl Scenario for DistributedReaderKillConnection {
                     "connector_kill_connection_catalog",
                     "wait for every BE to open a KILL CONNECTION target reader",
                     &baseline_logs,
-                    AwaitedRead::new(&target, "the KILL CONNECTION target read"),
+                    AwaitedRead::new(target, "the KILL CONNECTION target read"),
                 )?;
 
                 context.action(format!(
@@ -706,10 +706,10 @@ impl Scenario for DistributedReaderKillConnection {
                     context.remaining("await KILL CONNECTION target query termination")?,
                 )?;
                 assert_target_connection_is_closed(
-                    &target,
+                    target,
                     context.remaining("verify KILL CONNECTION closes the target socket")?,
                 )?;
-                release_connector_read(&target)?;
+                release_connector_read(target)?;
                 Ok(())
             })();
             owned.finish_after(context, &mut control, phase)?;
@@ -733,7 +733,7 @@ impl Scenario for DistributedReaderKillConnection {
                     .query_drop(format!("KILL {idle_connection_id}"))
                     .context("issue bare public MySQL KILL for idle target")?;
                 assert_idle_target_connection_is_closed(
-                    &idle_target,
+                    idle_target,
                     context.remaining("verify bare KILL closes the idle target socket")?,
                 )?;
                 Ok(())
@@ -915,11 +915,11 @@ impl Scenario for CatalogReadyLifecycle {
                         .min(context.remaining("await held catalog query cancellation")?),
                 )?;
                 assert_target_connection_remains_usable(
-                    &cancelled,
+                    cancelled,
                     context.remaining("verify KILL QUERY preserves held client connection")?,
                 )?;
                 held_selection.release(connector_control_plan::HOLD)?;
-                release_connector_read(&cancelled)?;
+                release_connector_read(cancelled)?;
                 Ok(())
             })();
             cancelled_owner.finish_after(context, &mut control, phase)?;
@@ -1072,10 +1072,10 @@ impl Scenario for CatalogReadyLifecycle {
                     context.remaining("await cold catalog reader cancellation")?,
                 )?;
                 assert_target_connection_remains_usable(
-                    &cold,
+                    cold,
                     context.remaining("verify cold catalog KILL QUERY connection")?,
                 )?;
-                release_connector_read(&cold)?;
+                release_connector_read(cold)?;
                 Ok(())
             })();
             cold_owner.finish_after(context, &mut control, phase)?;
@@ -3228,154 +3228,12 @@ impl Scenario for VendedCredentialFaultPem {
     }
 }
 
-struct DebugAuthorityIdentity {
-    key: String,
-    version: String,
-}
-
-fn wait_for_debug_authority_identity(
-    context: &ScenarioContext,
-    backend_index: usize,
-    catalog: &str,
-    scope: &str,
-) -> Result<DebugAuthorityIdentity> {
-    let root = context.runtime_dir().join("query-lifecycle-faults");
-    let prefix = format!("be-{backend_index}.storage-authority-");
-    loop {
-        let matches = std::fs::read_dir(&root)
-            .with_context(|| format!("read runner fault directory {}", root.display()))?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                name.starts_with(&prefix) && name.ends_with(".identity")
-            })
-            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
-            .filter_map(|contents| {
-                let fields = contents
-                    .lines()
-                    .filter_map(|line| line.split_once('='))
-                    .collect::<BTreeMap<_, _>>();
-                (fields.get("catalog") == Some(&catalog)
-                    && fields.get("scope") == Some(&scope)
-                    && fields.get("principal") == Some(&"vended-rest-execution:v1")
-                    && fields.get("path") == Some(&"credentials-endpoint"))
-                .then(|| {
-                    Some(DebugAuthorityIdentity {
-                        key: fields.get("key")?.to_string(),
-                        version: fields.get("version")?.to_string(),
-                    })
-                })
-                .flatten()
-            })
-            .collect::<Vec<_>>();
-        ensure!(
-            matches.len() <= 1,
-            "ambiguous BE authority identities for {catalog}"
-        );
-        if let Some(identity) = matches.into_iter().next() {
-            ensure!(
-                identity.key.len() == 64 && identity.version.len() == 64,
-                "invalid debug authority identity"
-            );
-            return Ok(identity);
-        }
-        thread::sleep(
-            context
-                .remaining("wait for BE authority identity")?
-                .min(Duration::from_millis(20)),
-        );
-    }
-}
-
-fn start_simple_vended_read(
-    user: String,
-    port: u16,
-    sql: String,
-) -> (
-    mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
-    thread::JoinHandle<Result<()>>,
-) {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let thread = thread::spawn(move || {
-        let mut connection =
-            mysql_actor::connect_for_cancellation(&user, port, Duration::from_secs(10))?;
-        sender
-            .send(connection.query(sql))
-            .context("publish credential fault read result")?;
-        Ok(())
-    });
-    (receiver, thread)
-}
-
-fn trigger_debug_authority_close(
-    context: &ScenarioContext,
-    backend_index: usize,
-    key: &str,
-) -> Result<BTreeMap<String, String>> {
-    let root = context.runtime_dir().join("query-lifecycle-faults");
-    let trigger = root.join(format!(
-        "be-{backend_index}.storage-authority-close.trigger"
-    ));
-    let temporary = trigger.with_extension("trigger.tmp");
-    std::fs::write(&temporary, format!("{key}\n")).context("arm exact debug authority close")?;
-    std::fs::rename(&temporary, &trigger).context("publish exact debug authority close")?;
-    let confirmed = root.join(format!(
-        "be-{backend_index}.storage-authority-close.confirmed"
-    ));
-    wait_for_debug_close_record(context, &confirmed, key, "closed")
-}
-
-fn wait_for_debug_authority_late_discard(
-    context: &ScenarioContext,
-    backend_index: usize,
-    key: &str,
-) -> Result<BTreeMap<String, String>> {
-    let record = context
-        .runtime_dir()
-        .join("query-lifecycle-faults")
-        .join(format!(
-            "be-{backend_index}.storage-authority-close.late-confirmed"
-        ));
-    wait_for_debug_close_record(context, &record, key, "discarded")
-}
-
 fn debug_close_counter(record: &BTreeMap<String, String>, field: &str) -> Result<u64> {
     record
         .get(field)
         .ok_or_else(|| anyhow::anyhow!("debug close record omitted {field}"))?
         .parse::<u64>()
         .with_context(|| format!("parse debug close {field}"))
-}
-
-fn wait_for_debug_close_record(
-    context: &ScenarioContext,
-    path: &Path,
-    key: &str,
-    expected_status: &str,
-) -> Result<BTreeMap<String, String>> {
-    loop {
-        if let Ok(contents) = std::fs::read_to_string(path) {
-            let fields = contents
-                .lines()
-                .filter_map(|line| line.split_once('='))
-                .map(|(key, value)| (key.to_string(), value.to_string()))
-                .collect::<BTreeMap<_, _>>();
-            ensure!(
-                fields.get("key").is_some_and(|value| value == key)
-                    && fields
-                        .get("status")
-                        .is_some_and(|value| value == expected_status),
-                "debug close record disagrees with the exact target: {fields:?}"
-            );
-            return Ok(fields);
-        }
-        thread::sleep(
-            context
-                .remaining("wait for exact debug authority close record")?
-                .min(Duration::from_millis(20)),
-        );
-    }
 }
 
 /// Proves a Frontend restart reconstructs its durable catalog projection
@@ -3499,10 +3357,10 @@ impl Scenario for CatalogFeRestartCache {
                     context.remaining("await in-flight query failure after FE restart")?,
                 )?;
                 assert_target_connection_is_closed(
-                    &target,
+                    target,
                     context.remaining("verify FE restart closed in-flight client connection")?,
                 )?;
-                release_connector_read(&target)?;
+                release_connector_read(target)?;
                 Ok(())
             })();
             if fe_exited {
@@ -4350,7 +4208,7 @@ impl Scenario for CatalogVersionDrain {
                     "connector_generation_catalog",
                     "wait for every BE to open an old-version connector reader",
                     &baseline_logs,
-                    AwaitedRead::new(&target, "the old-version connector read"),
+                    AwaitedRead::new(target, "the old-version connector read"),
                 )?;
                 let old_versions =
                     reader_catalog_versions(&old_logs, "connector_generation_catalog")?;
@@ -4397,11 +4255,11 @@ impl Scenario for CatalogVersionDrain {
                     context.remaining("await old-version reader cancellation")?,
                 )?;
                 assert_target_connection_remains_usable(
-                    &target,
+                    target,
                     context.remaining("verify old-generation KILL QUERY target remains usable")?,
                 )?;
                 assert_idle_query(&mut control, connection_id)?;
-                release_connector_read(&target)?;
+                release_connector_read(target)?;
                 Ok(old_versions)
             })();
             let old_versions = owned.finish_after(context, &mut control, phase)?;
@@ -4815,24 +4673,6 @@ fn static_catalog_profile(
     }
 }
 
-fn assert_static_catalog_sum(
-    control: &mut mysql::Conn,
-    catalog: &str,
-    database: &str,
-    table: &str,
-    expected: i64,
-) -> Result<()> {
-    let rows: Vec<i64> = control
-        .query(format!("SELECT sum(v) FROM {catalog}.{database}.{table}"))
-        .with_context(|| format!("sum {catalog}.{database}.{table} through typed connector"))?;
-    if rows != [expected] {
-        bail!(
-            "static credential catalog {catalog}.{database}.{table} returned sum {rows:?}, expected [{expected}]"
-        );
-    }
-    Ok(())
-}
-
 fn assert_static_reader_opened_on_every_backend(logs: &[String], catalog: &str) -> Result<()> {
     for (index, log) in logs.iter().enumerate() {
         if reader_open_lines(log, catalog).next().is_none() {
@@ -4909,27 +4749,6 @@ pub(super) fn create_catalog(
         .with_context(|| format!("create Hadoop Iceberg catalog {catalog}"))
 }
 
-fn assert_catalog_read_summary(
-    control: &mut mysql::Conn,
-    catalog: &str,
-    database: &str,
-    table: &str,
-    expected_count: i64,
-    expected_sum: i64,
-) -> Result<()> {
-    let rows: Vec<(i64, i64)> = control
-        .query(format!(
-            "SELECT count(*), sum(v) FROM {catalog}.{database}.{table}"
-        ))
-        .context("read catalog table after distributed write")?;
-    if rows != [(expected_count, expected_sum)] {
-        bail!(
-            "catalog read-write summary returned {rows:?}, expected [({expected_count}, {expected_sum})]"
-        );
-    }
-    Ok(())
-}
-
 fn assert_positive_profile_counter(profile: &str, name: &str) -> Result<()> {
     let marker = format!("{name}=");
     let value = profile
@@ -4949,174 +4768,6 @@ fn assert_positive_profile_counter(profile: &str, name: &str) -> Result<()> {
         bail!("page-index EXPLAIN ANALYZE counter {name} must be positive; profile={profile}");
     }
     Ok(())
-}
-
-/// Which connection form a connector reader runs on.
-///
-/// The distinction is not cosmetic, and it is about what the *first* byte of
-/// the response is. `SocketBounded` carries a ten-second socket read timeout,
-/// which is harmless — and useful — for a reader that is already streaming
-/// rows when it is cancelled: every packet resets the window, so the timeout
-/// can only fire on a genuine stall.
-///
-/// A statement that is parked before it produces anything has no such
-/// packets. Its first byte *is* the cancellation response, so the whole wait
-/// sits inside one read and the socket timeout converts any server latency
-/// past ten seconds into `EAGAIN` — on macOS, `Resource temporarily
-/// unavailable (os error 35)`, which says nothing about whether the server
-/// answered wrongly, late, or not at all. `ScenarioBounded` drops the read
-/// timeout so the wait is bounded by an explicit assertion instead, and the
-/// answer that arrives can be judged on its merits.
-#[derive(Copy, Clone, Eq, PartialEq)]
-enum ReaderConnection {
-    SocketBounded,
-    ScenarioBounded,
-}
-
-fn start_connector_read(
-    user: &str,
-    port: u16,
-    catalog: &str,
-    database: &str,
-    table: &str,
-) -> Result<ConnectorRead> {
-    start_connector_read_on(
-        user,
-        port,
-        catalog,
-        database,
-        table,
-        ReaderConnection::SocketBounded,
-        None,
-    )
-}
-
-/// A connector reader whose statement is expected to be parked, producing
-/// nothing, until another session cancels it.
-fn start_held_connector_read(
-    user: &str,
-    port: u16,
-    catalog: &str,
-    database: &str,
-    table: &str,
-) -> Result<ConnectorRead> {
-    start_connector_read_on(
-        user,
-        port,
-        catalog,
-        database,
-        table,
-        ReaderConnection::ScenarioBounded,
-        None,
-    )
-}
-
-fn start_connector_read_on(
-    user: &str,
-    port: u16,
-    catalog: &str,
-    database: &str,
-    table: &str,
-    connection_form: ReaderConnection,
-    pipeline_dop: Option<NonZeroU32>,
-) -> Result<ConnectorRead> {
-    let (ready_tx, ready) = mpsc::sync_channel(1);
-    let (done_tx, done) = mpsc::sync_channel(1);
-    let (probe, probe_rx) = mpsc::sync_channel(1);
-    let (probe_result_tx, probe_result) = mpsc::sync_channel(1);
-    let (release, release_rx) = mpsc::channel();
-    let user = user.to_string();
-    // Keep every file reader in flight long enough to observe and cancel it.
-    // The sleep belongs in the scan-side filter: a projection can be moved to
-    // the root after exchange, which leaves remote page sources free to close
-    // before the scenario reaches its reader-ready barrier.
-    //
-    // The compiled Boolean region owns row demand and invocation order
-    // (`novarocks/execution/src/exec/expr/compiled_program/guarded.rs` and
-    // `boolean_region.rs`). Its frozen effects and demand decide which rows
-    // reach an operand; legacy eager `eval_and` timings are not a contract
-    // for this path. Keep the scan predicate and the reader-ready barrier as
-    // the actual cancellation stimulus, rather than deriving readiness from
-    // an assumed chunk-wide sleep duration.
-    //
-    // The cross join is deliberately small. It used to fan out to 1e9, which
-    // made the scan's downstream unable to drain: the first split's reader
-    // closed, the output buffer stayed full, and no later split ever opened.
-    // Any barrier that waits for a *new* reader was then unsatisfiable by
-    // construction, and the join side grew to many gigabytes on the way there.
-    // A small fan-out keeps rows flowing so the scan keeps pulling splits,
-    // which is what "the read is still going" is supposed to mean.
-    let query = format!(
-        "SELECT t.v FROM (SELECT v FROM {catalog}.{database}.{table} WHERE v % 4096 = 0 AND sleep(1) = 0) AS t CROSS JOIN TABLE(generate_series(1, 64)) AS gs(x)"
-    );
-    let thread = thread::spawn(move || -> Result<()> {
-        let mut connection = match connection_form {
-            ReaderConnection::SocketBounded => {
-                mysql_actor::connect(&user, port, Duration::from_secs(10))
-            }
-            ReaderConnection::ScenarioBounded => {
-                mysql_actor::connect_for_cancellation(&user, port, Duration::from_secs(10))
-            }
-        }
-        .context("connect connector reader MySQL client")?;
-        if let Some(dop) = pipeline_dop {
-            connection
-                .query_drop(format!("SET pipeline_dop = {}", dop.get()))
-                .context("set explicit connector reader driver parallelism")?;
-        }
-        ready_tx
-            .send(connection.connection_id())
-            .context("publish connector reader MySQL connection id")?;
-        let result = connection.query::<i64, _>(query);
-        done_tx
-            .send(result)
-            .context("publish connector reader MySQL result")?;
-        probe_rx
-            .recv()
-            .context("receive connector reader connection probe")?;
-        probe_result_tx
-            .send(connection.query_first::<i64, _>("SELECT 1"))
-            .context("publish connector reader connection probe result")?;
-        release_rx
-            .recv()
-            .context("release connector reader MySQL session")?;
-        Ok(())
-    });
-    Ok(ConnectorRead {
-        ready,
-        done,
-        probe,
-        probe_result,
-        release,
-        thread,
-    })
-}
-
-fn start_idle_mysql_connection(user: &str, port: u16) -> Result<IdleMysqlConnection> {
-    let (ready_tx, ready) = mpsc::sync_channel(1);
-    let (probe, probe_rx) = mpsc::sync_channel(1);
-    let (probe_result_tx, probe_result) = mpsc::sync_channel(1);
-    let user = user.to_string();
-    let thread = thread::spawn(move || -> Result<()> {
-        let mut connection = mysql_actor::connect(&user, port, Duration::from_secs(10))
-            .context("connect idle MySQL target")?;
-        ready_tx
-            .send(connection.connection_id())
-            .context("publish idle MySQL target connection id")?;
-        probe_rx
-            .recv()
-            .context("receive idle MySQL target connection probe")?;
-        probe_result_tx
-            .send(connection.query_first::<i64, _>("SELECT 1"))
-            .context("publish idle MySQL target connection probe result")?;
-        Ok(())
-    });
-    Ok(IdleMysqlConnection {
-        ready,
-        probe,
-        probe_result,
-        thread,
-    })
 }
 
 fn assert_idle_query(control: &mut mysql::Conn, connection_id: u32) -> Result<()> {
@@ -5852,11 +5503,6 @@ fn assert_catalog_runtime_built_at_most_once(
          install to be idempotent about"
     );
     Ok(())
-}
-
-fn release_catalog_install_hold(hold_file: &std::path::Path) -> Result<()> {
-    std::fs::remove_file(hold_file)
-        .with_context(|| format!("release catalog-install hold file {}", hold_file.display()))
 }
 
 /// No connector reader may open after this query's abort reached a backend.

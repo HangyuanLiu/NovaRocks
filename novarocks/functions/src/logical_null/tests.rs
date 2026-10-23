@@ -193,9 +193,7 @@ fn invalid_row_address_keeps_the_native_source_without_input_ownership() {
             &mut || Ok::<_, std::convert::Infallible>(()),
         )
         .unwrap_err();
-    let super::NullVisitError::Invalid(source) = error else {
-        panic!("unexpected control refusal")
-    };
+    let super::NullVisitError::Invalid(source) = error;
     assert_eq!(source, super::NullAddressViolation::NestedAddress);
     let fact = source.failure_fact();
     assert_eq!(fact.class(), FailureClass::Invariant);

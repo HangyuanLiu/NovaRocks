@@ -697,9 +697,7 @@ impl ResponseHoldSequence {
             .lock()
             .expect("vended REST fixture table-load hold lock poisoned")
             .holds
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
+            .to_vec();
         for hold in holds {
             hold.release();
         }
@@ -985,14 +983,13 @@ impl TargetedRefreshHold {
             .lock()
             .expect("vended REST targeted refresh lock poisoned")
             .as_mut()
+            && (entry.audit.request_sequence == Some(request_sequence) || entry.allow_retries)
         {
-            if entry.audit.request_sequence == Some(request_sequence) || entry.allow_retries {
-                if entry.poisoned {
-                    return false;
-                }
-                entry.audit.response_issued |= issued;
-                return true;
+            if entry.poisoned {
+                return false;
             }
+            entry.audit.response_issued |= issued;
+            return true;
         }
         false
     }

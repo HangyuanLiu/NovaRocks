@@ -24,12 +24,13 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+#[cfg(test)]
+use novarocks_spi::connector::MvCreatedTargetObservation as SpiCreatedTargetObservation;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
     ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableObjectId,
-    MvCreatedTargetObservation as SpiCreatedTargetObservation,
     MvMaintenanceMetadataObservation as SpiMaintenanceMetadataObservation,
-    MvObservedField as SpiObservedField, MvObservedPartitionSpec as SpiObservedPartitionSpec,
+    MvObservedPartitionSpec as SpiObservedPartitionSpec,
     MvObservedPartitionTransform as SpiObservedPartitionTransform,
     MvRefreshBaseObservation as SpiRefreshBaseObservation,
     MvRefreshTargetObservation as SpiRefreshTargetObservation,
@@ -39,6 +40,7 @@ use novarocks_spi::connector::{
 use novarocks_mv_application::persistence::schema::MvPartitionContract;
 
 /// Exact target-schema facts observed immediately after CREATE.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MvTargetCreationObservation {
     pub table: ConnectorTableIdentity,
@@ -48,6 +50,7 @@ pub(crate) struct MvTargetCreationObservation {
     pub partition: MvPartitionContract,
 }
 
+#[cfg(test)]
 impl MvTargetCreationObservation {
     pub fn try_new(
         table: ConnectorTableIdentity,
@@ -132,6 +135,7 @@ impl MvSchemaValidationObservation {
 }
 
 /// One field in an observed target schema.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MvObservedTargetField {
     pub field_id: i32,
@@ -230,10 +234,6 @@ pub(crate) struct MvObservedRefreshMarker {
 }
 
 impl MvRefreshTargetObservation {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Target observation preserves each pinned provider fact as a separate validated boundary input."
-    )]
     pub fn try_new(
         table: ConnectorTableIdentity,
         table_uuid: String,
@@ -333,10 +333,6 @@ impl MvRefreshTargetObservation {
         &self.table_uuid
     }
 
-    pub const fn schema_id(&self) -> i32 {
-        self.schema_id
-    }
-
     pub const fn partition(&self) -> &MvPartitionContract {
         &self.partition
     }
@@ -351,6 +347,7 @@ impl MvRefreshTargetObservation {
     /// `main` ref has not been materialized still has a current snapshot, and
     /// the MV apply path treats those as the same fact. Any other missing ref
     /// is reported as absent rather than silently resolved to `main`.
+    #[cfg(test)]
     pub fn snapshot_id_for_ref(&self, ref_name: &str) -> Option<i64> {
         self.ref_snapshot_ids.get(ref_name).copied().or_else(|| {
             (ref_name == "main")
@@ -417,7 +414,6 @@ pub(crate) struct MvObservedMaintenancePolicy {
 }
 
 impl MvMaintenanceMetadataObservation {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         current_snapshot_id: Option<i64>,
         snapshots: Vec<MvObservedSnapshot>,
@@ -558,6 +554,7 @@ pub(crate) fn observe_maintenance_metadata(
     )
 }
 
+#[cfg(test)]
 fn created_target_from_spi(
     observation: SpiCreatedTargetObservation,
 ) -> Result<MvTargetCreationObservation, ConnectorError> {
@@ -710,7 +707,10 @@ fn maintenance_metadata_from_spi(
     )
 }
 
-fn observed_fields_from_spi(fields: &[SpiObservedField]) -> Vec<MvObservedTargetField> {
+#[cfg(test)]
+fn observed_fields_from_spi(
+    fields: &[novarocks_spi::connector::MvObservedField],
+) -> Vec<MvObservedTargetField> {
     fields
         .iter()
         .map(|field| MvObservedTargetField {
@@ -795,6 +795,7 @@ fn validate_table_identity(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_partition_contract(
     partition: &MvPartitionContract,
     fields: &[MvObservedTargetField],

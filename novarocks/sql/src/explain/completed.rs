@@ -265,7 +265,6 @@ impl SqlExplainOperatorMetrics {
         self
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub const fn with_dictionary_counts(
         mut self,
         input_rows: i64,
@@ -596,6 +595,11 @@ impl<'control> ExplainRenderOutput<'control> {
         Ok(self.lines)
     }
 
+    #[cfg(test)]
+    pub(super) fn finish(self) -> Vec<String> {
+        self.lines
+    }
+
     pub(super) fn push(&mut self, arguments: fmt::Arguments<'_>) -> Result<(), SqlCompileError> {
         if self.lines.len() >= self.budget.max_lines {
             return Err(explain_budget_exceeded(self.budget));
@@ -653,10 +657,6 @@ impl<'control> ExplainRenderOutput<'control> {
         Ok(())
     }
 
-    pub(super) fn finish(self) -> Vec<String> {
-        self.lines
-    }
-
     pub(super) fn ensure_prefix_fits(&self, bytes: usize) -> Result<(), SqlCompileError> {
         let separator = usize::from(!self.lines.is_empty());
         let used = self
@@ -711,11 +711,11 @@ impl Write for BoundedStringWriter<'_, '_> {
                 end -= 1;
             }
             self.output.push_str(&value[start..end]);
-            if let Some(work) = &mut self.work {
-                if let Err(error) = work.step() {
-                    *self.control_error = Some(error.into());
-                    return Err(fmt::Error);
-                }
+            if let Some(work) = &mut self.work
+                && let Err(error) = work.step()
+            {
+                *self.control_error = Some(error.into());
+                return Err(fmt::Error);
             }
             start = end;
         }

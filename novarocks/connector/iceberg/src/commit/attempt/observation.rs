@@ -53,6 +53,10 @@ pub(crate) enum DispatchEvidence {
     },
     Rejected {
         failure: ConnectorMutationFailure,
+        #[expect(
+            dead_code,
+            reason = "Retain the exact protocol observation alongside the typed rejection for dispatch diagnostics."
+        )]
         observation: ProtocolObservation,
     },
     Applied {
@@ -60,14 +64,40 @@ pub(crate) enum DispatchEvidence {
     },
     Unknown {
         failure: ConnectorMutationFailure,
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "Retain the exact protocol observation alongside an indeterminate dispatch for diagnostics."
+            )
+        )]
         observation: ProtocolObservation,
     },
 }
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProtocolObservation {
+    #[expect(
+        dead_code,
+        reason = "The adapter identity is retained as protocol diagnostic evidence."
+    )]
     pub adapter: &'static str,
+    #[expect(
+        dead_code,
+        reason = "The dispatch stage is retained as protocol diagnostic evidence."
+    )]
     pub stage: &'static str,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "The response status is retained as protocol diagnostic evidence."
+        )
+    )]
     pub status_code: Option<u16>,
+    #[expect(
+        dead_code,
+        reason = "Response header names are retained as protocol diagnostic evidence."
+    )]
     pub header_names: Vec<String>,
 }
 /// A narrow capability minted only from one exact Applied journal entry.
@@ -698,6 +728,7 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
             self.record_finalization(finalization.clone());
         }
     }
+    #[cfg(test)]
     pub(crate) fn record_finalization(&self, finalization: ExternalMutationFinalization) {
         self.record_entry_finalization(
             self.current_entry()
@@ -818,6 +849,7 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
             },
         }
     }
+    #[cfg(test)]
     pub(crate) fn catalog_outcome(&self) -> ExternalMutationOutcome<R> {
         let entry_ref = self
             .current_entry()
@@ -940,30 +972,6 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                 },
                 _ => panic!("Unknown publication follows its checked dispatch"),
             },
-        }
-    }
-    pub(crate) fn project_entry(
-        &self,
-        entry_ref: JournalEntryRef,
-        report: Report,
-    ) -> ExternalMutationOutcome<R> {
-        match self.catalog_entry_outcome(entry_ref) {
-            ExternalMutationOutcome::KnownCommitted {
-                effect,
-                receipt,
-                finalization,
-            } => ExternalMutationOutcome::KnownCommitted {
-                effect,
-                receipt,
-                finalization: merge_finalization(finalization, report.cleanup.finalization()),
-            },
-            ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
-                ExternalMutationOutcome::KnownUncommitted {
-                    failure,
-                    cleanup: merge_finalization(cleanup, report.cleanup.finalization()),
-                }
-            }
-            unknown @ ExternalMutationOutcome::CommitUnknown { .. } => unknown,
         }
     }
     pub(crate) async fn recover_bridge(
@@ -1142,15 +1150,15 @@ impl<R> Drop for DispatchClaim<R> {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(entry) = state.entries.get_mut(&self.key) {
-                if matches!(entry.phase, EntryPhase::Claimed) {
-                    entry.phase = EntryPhase::Concluded(DispatchEvidence::NotDispatched {
-                        failure: ConnectorMutationFailure::new(
-                            ConnectorMutationFailureKind::Unavailable,
-                            "Publication barrier did not grant external dispatch",
-                        ),
-                    });
-                }
+            if let Some(entry) = state.entries.get_mut(&self.key)
+                && matches!(entry.phase, EntryPhase::Claimed)
+            {
+                entry.phase = EntryPhase::Concluded(DispatchEvidence::NotDispatched {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Unavailable,
+                        "Publication barrier did not grant external dispatch",
+                    ),
+                });
             }
         }
     }
@@ -1503,7 +1511,7 @@ mod tests {
                     target_ref: "main".into(),
                     start: None,
                     changes: FileChanges::default(),
-                    dependencies: vec![Dependency::NoReadDependency],
+                    dependencies: vec![Dependency::NoRead],
                     isolation: IsolationLevel::Snapshot,
                     shape: RequestShape::DocumentExpiry,
                     summary: Default::default(),

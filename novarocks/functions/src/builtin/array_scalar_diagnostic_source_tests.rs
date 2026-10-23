@@ -18,7 +18,7 @@
 use super::super::array_struct_subfield_core::{project, project_with_port};
 use super::super::scalar_invocation_data::{ScalarInvocationData, ScalarInvocationLatch};
 use super::*;
-use crate::opaque_memory::{OpaqueAllocationHost, OpaqueRetainedCharge};
+use crate::opaque_memory::OpaqueAllocationHost;
 use crate::{
     AggregateStateAllocator, FunctionValueType, KernelDiagnostic, KernelEvaluationControl,
 };
@@ -75,10 +75,10 @@ impl AggregateStateAllocator for Host {
         let mut l = self.ledger.lock().unwrap();
         let at = l.attempts;
         l.attempts += 1;
-        if let Some((stop, cause)) = &*self.refusal.lock().unwrap() {
-            if at == *stop {
-                return Err(cause.clone());
-            }
+        if let Some((stop, cause)) = &*self.refusal.lock().unwrap()
+            && at == *stop
+        {
+            return Err(cause.clone());
         }
         if l.opaque + l.blocks.iter().map(|(_, v)| v.size()).sum::<usize>() + layout.size()
             > self.actual_limit
@@ -106,10 +106,10 @@ impl OpaqueAllocationHost for Host {
         let mut l = self.ledger.lock().unwrap();
         let at = l.opaque_attempts;
         l.opaque_attempts += 1;
-        if let Some((stop, cause)) = &*self.opaque_refusal.lock().unwrap() {
-            if at == *stop {
-                return Err(cause.clone());
-            }
+        if let Some((stop, cause)) = &*self.opaque_refusal.lock().unwrap()
+            && at == *stop
+        {
+            return Err(cause.clone());
         }
         if l.opaque + l.blocks.iter().map(|(_, v)| v.size()).sum::<usize>() + bytes
             > self.actual_limit

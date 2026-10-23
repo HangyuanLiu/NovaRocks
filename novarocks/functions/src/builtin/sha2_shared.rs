@@ -60,7 +60,7 @@ impl DigestKind {
         emit: &mut impl FnMut(u8),
     ) -> Result<(), E> {
         let rendered = self.render(text, observe)?;
-        for pair in rendered.as_bytes().chunks_exact(2) {
+        for pair in rendered.as_bytes().as_chunks::<2>().0 {
             emit(pair[0]);
             emit(pair[1]);
             observe(Observation::Step)?;

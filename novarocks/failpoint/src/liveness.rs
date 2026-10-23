@@ -367,10 +367,10 @@ impl RunnerSession {
                     }
                 };
                 let result = run();
-                if let Err(error) = &result {
-                    if let Ok(mut state) = worker_state.lock() {
-                        state.failure = Some(error.to_string());
-                    }
+                if let Err(error) = &result
+                    && let Ok(mut state) = worker_state.lock()
+                {
+                    state.failure = Some(error.to_string());
                 }
                 result
             });

@@ -341,12 +341,11 @@ impl CompiledChangeEventProcessor {
             Some(root) => {
                 let truth =
                     evaluate_all(&mut instances[root], self.sites[root], input, &self.control)?;
-                let truth = truth
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| ChangeEventFailure::PredicateType {
+                let truth = truth.as_any().downcast_ref::<BooleanArray>().ok_or(
+                    ChangeEventFailure::PredicateType {
                         event: event_ordinal,
-                    })?;
+                    },
+                )?;
                 // TruthOnly: FALSE and NULL both leave the row unselected.
                 (0..truth.len())
                     .filter(|&row| truth.is_valid(row) && truth.value(row))

@@ -39,13 +39,10 @@ pub(crate) mod union_all_shared;
 mod union_all_sink;
 mod union_all_source;
 
-pub(crate) use except_shared::ExceptSharedState;
 pub use except_sink::ExceptSinkFactory;
 pub use except_source::ExceptSourceFactory;
-pub(crate) use intersect_shared::IntersectSharedState;
 pub use intersect_sink::IntersectSinkFactory;
 pub use intersect_source::IntersectSourceFactory;
-pub(crate) use set_op_stage::SetOpStageController;
 pub(crate) use union_all_shared::UnionAllSharedState;
 pub use union_all_sink::UnionAllSinkFactory;
 pub use union_all_source::UnionAllSourceFactory;

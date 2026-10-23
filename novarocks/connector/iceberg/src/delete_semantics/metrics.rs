@@ -69,10 +69,10 @@ impl FieldMetrics {
             {
                 return false;
             }
-            if let (Some(null), Some(nan)) = (self.null_count, self.nan_count) {
-                if null.checked_add(nan).is_none_or(|sum| sum > value_count) {
-                    return false;
-                }
+            if let (Some(null), Some(nan)) = (self.null_count, self.nan_count)
+                && null.checked_add(nan).is_none_or(|sum| sum > value_count)
+            {
+                return false;
             }
         }
         true

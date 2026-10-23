@@ -49,10 +49,6 @@ use super::observation::RuntimeFilterObservationEmitter;
 /// Backend adapter alone turns the frozen values into a Native envelope and
 /// chooses the transport implementation.
 pub trait RuntimeFilterParticipantOutbound: Send + Sync {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The worker preserves the frozen producer coordinates at its narrow outbound port."
-    )]
     fn forward_producer_contribution(
         &self,
         channel_id: RuntimeFilterChannelId,
@@ -64,10 +60,6 @@ pub trait RuntimeFilterParticipantOutbound: Send + Sync {
         contribution: RuntimeFilterContribution,
     ) -> Result<(), RuntimeFilterContractViolation>;
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The worker preserves the frozen producer coordinates at its narrow outbound port."
-    )]
     fn forward_producer_close(
         &self,
         channel_id: RuntimeFilterChannelId,
@@ -99,7 +91,6 @@ pub struct WorkerRuntimeFilterExecutionSession {
 }
 
 impl WorkerRuntimeFilterExecutionSession {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         fragment_instance_id: UniqueId,
         participant: BackendParticipantIdentity,

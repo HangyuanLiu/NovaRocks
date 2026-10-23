@@ -124,10 +124,7 @@ impl VerifiedSignature {
         self.work
     }
 }
-pub(crate) use encode::{
-    BindingEmission, emit_binding_definition, verify_scalar_signature,
-    verify_scalar_signature_admitted,
-};
+pub(crate) use encode::{verify_scalar_signature, verify_scalar_signature_admitted};
 
 #[derive(Clone, Copy)]
 pub enum BindingSource<'a> {

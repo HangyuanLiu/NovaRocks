@@ -34,6 +34,8 @@ use super::{
     ConnectorWriteLease, ProviderBindingEpoch,
 };
 
+type CatalogHandleInstaller = dyn Fn(&CatalogHandle) -> Result<(), ConnectorError> + Send + Sync;
+
 /// FE-only capability for planning a read after metadata has resolved a table.
 /// It intentionally has no reader-opening method.
 pub trait ConnectorScanPlanning: Send + Sync {
@@ -259,8 +261,7 @@ pub struct ConnectorControlBinding {
     /// query assembly carry one exact `CatalogSet` in Init without re-reading
     /// desired state or reconstructing provider configuration.
     catalog_properties: Option<CatalogProperties>,
-    catalog_handle_installer:
-        Option<Arc<dyn Fn(&CatalogHandle) -> Result<(), ConnectorError> + Send + Sync>>,
+    catalog_handle_installer: Option<Arc<CatalogHandleInstaller>>,
     metadata: Arc<dyn ConnectorMetadata>,
     planning: Arc<dyn ConnectorScanPlanning>,
     distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -298,7 +299,6 @@ impl ConnectorControlBinding {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_write(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -341,7 +341,6 @@ impl ConnectorControlBinding {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_data_mutation(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -364,7 +363,6 @@ impl ConnectorControlBinding {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_capabilities(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -388,7 +386,6 @@ impl ConnectorControlBinding {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_capabilities(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -466,7 +463,6 @@ impl ConnectorControlBinding {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_capabilities_and_metadata_maintenance(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -494,7 +490,10 @@ impl ConnectorControlBinding {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The constructor exposes independently optional capabilities validated against one generation; grouping them would add a shared SPI input type"
+    )]
     pub fn try_new_with_all_capabilities_and_staged_create(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -539,7 +538,10 @@ impl ConnectorControlBinding {
         Ok(binding)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The constructor exposes independently optional capabilities validated against one generation; grouping them would add a shared SPI input type"
+    )]
     pub fn try_new_with_all_maintenance_capabilities(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -569,7 +571,10 @@ impl ConnectorControlBinding {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The constructor exposes independently optional capabilities validated against one generation; grouping them would add a shared SPI input type"
+    )]
     pub fn try_new_with_all_maintenance_capabilities_and_staged_create(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -603,7 +608,10 @@ impl ConnectorControlBinding {
 
     /// Constructs a control binding with all FE-only maintenance facets.
     /// Cleanup deliberately remains absent from BE execution bindings.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The constructor exposes independently optional capabilities validated against one generation; grouping them would add a shared SPI input type"
+    )]
     pub fn try_new_with_all_maintenance_capabilities_cleanup_and_staged_create(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -694,10 +702,7 @@ impl ConnectorControlBinding {
 
     /// Attach provider-owned, FE-local work which can only be installed after
     /// desired state has frozen the immutable catalog identity.
-    pub fn with_catalog_handle_installer(
-        mut self,
-        installer: Arc<dyn Fn(&CatalogHandle) -> Result<(), ConnectorError> + Send + Sync>,
-    ) -> Self {
+    pub fn with_catalog_handle_installer(mut self, installer: Arc<CatalogHandleInstaller>) -> Self {
         self.catalog_handle_installer = Some(installer);
         self
     }

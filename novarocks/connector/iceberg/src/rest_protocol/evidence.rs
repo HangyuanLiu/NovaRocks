@@ -853,8 +853,8 @@ fn attribute_table(
             relation,
         ));
     }
-    if let Some(retention) = &expect.retention {
-        if view
+    if let Some(retention) = &expect.retention
+        && (view
             .retention_snapshots
             .iter()
             .any(|snapshot| snapshot.present)
@@ -863,13 +863,12 @@ fn attribute_table(
                     Some(snapshot) => !*present || observed != &Some(*snapshot),
                     None => *present,
                 },
-            )
-        {
-            return Err(Failed::Unattributable(
-                UnattributableCause::RetentionPostconditionMismatch,
-                relation,
-            ));
-        }
+            ))
+    {
+        return Err(Failed::Unattributable(
+            UnattributableCause::RetentionPostconditionMismatch,
+            relation,
+        ));
     }
     // Item 6: CTAS supplementary expectations.
     for ((key, expected), (_, observed)) in expect.properties.iter().zip(&view.properties) {

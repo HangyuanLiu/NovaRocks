@@ -52,7 +52,6 @@ use std::sync::Arc;
 pub struct MvCommandExecutor {
     ports: IcebergMvCorePorts,
     refresh_service: Arc<FrontendMvProductAdapter>,
-    storage_observation: Arc<dyn MvStorageObservationPort>,
     mv_backend: Arc<IcebergMvBackend>,
     /// The one process-local owner of management continuation. Absent only on
     /// a composition with no management authority at all, where the management
@@ -67,7 +66,7 @@ impl MvCommandExecutor {
     pub fn new(
         ports: IcebergMvCorePorts,
         refresh_service: Arc<FrontendMvProductAdapter>,
-        storage_observation: Arc<dyn MvStorageObservationPort>,
+        _storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_backend: Arc<IcebergMvBackend>,
         continuation: Option<
             Arc<novarocks_mv_application::management::ManagementContinuationService>,
@@ -79,7 +78,6 @@ impl MvCommandExecutor {
         Self {
             ports,
             refresh_service,
-            storage_observation,
             mv_backend,
             continuation,
             management_audit,

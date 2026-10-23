@@ -38,10 +38,10 @@ impl AggregateStateAllocator for Host {
         let mut ledger = self.ledger.lock().unwrap();
         let at = ledger.attempts;
         ledger.attempts += 1;
-        if let Some((stop, cause)) = &self.refusal {
-            if at == *stop {
-                return Err(cause.clone());
-            }
+        if let Some((stop, cause)) = &self.refusal
+            && at == *stop
+        {
+            return Err(cause.clone());
         }
         let ptr = NonNull::new(unsafe { std::alloc::alloc(layout) })
             .ok_or(KernelFailure::ResourceExhausted)?;
@@ -145,7 +145,7 @@ fn update(
     for row in 0..input.keys.len() {
         update_row(state, input, row, &mut work)?;
     }
-    work.flush().map_err(Into::into)
+    work.flush()
 }
 #[test]
 fn map_agg_core_actual_host_first_wins_partial_roundtrip_and_last_drop() {

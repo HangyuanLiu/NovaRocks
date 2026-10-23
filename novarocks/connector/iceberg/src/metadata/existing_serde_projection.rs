@@ -27,7 +27,7 @@ mod raw_defaults;
 
 pub(crate) enum Error<E = ConnectorError> {
     Control(E),
-    Json(serde_json::Error),
+    Json,
     Overflow,
     ShapeChanged,
 }
@@ -35,7 +35,7 @@ impl<E> std::fmt::Debug for Error<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Control(_) => "Control",
-            Self::Json(_) => "Json",
+            Self::Json => "Json",
             Self::Overflow => "Overflow",
             Self::ShapeChanged => "ShapeChanged",
         })
@@ -121,7 +121,7 @@ fn serialize<T: Serialize + ?Sized, E>(
     if writer.changed {
         return Err(Error::ShapeChanged);
     }
-    result.map_err(Error::Json)?;
+    result.map_err(|_| Error::Json)?;
     scope.check_active().map_err(Error::Control)?;
     Ok(writer.length)
 }
@@ -302,9 +302,11 @@ pub(crate) struct OwnedProjection {
     _guard: ConnectorPayloadRetentionGuard,
 }
 impl OwnedProjection {
+    #[cfg(test)]
     pub fn metadata_json(&self) -> &str {
         &self.metadata_json
     }
+    #[cfg(test)]
     pub fn schema(&self) -> &IcebergSchemaDef {
         &self.schema
     }
@@ -357,8 +359,9 @@ fn build_field<E>(
     let length = count(field, scope)?;
     let (initial_default_json, write_default_json) = {
         let text = exact_json(field, length, scope)?;
-        let raw: &serde_json::value::RawValue = serde_json::from_str(&text).map_err(Error::Json)?;
-        let defaults = raw_defaults::defaults(raw).map_err(Error::Json)?;
+        let raw: &serde_json::value::RawValue =
+            serde_json::from_str(&text).map_err(|_| Error::Json)?;
+        let defaults = raw_defaults::defaults(raw).map_err(|_| Error::Json)?;
         let initial = defaults
             .initial
             .map(|value| exact_string(value.get()))

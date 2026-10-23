@@ -16,20 +16,19 @@
 // under the License.
 
 use super::super::string_to_base64_owner::{
-    effects, operation, owner_for_test, prepared_for_test_with_control,
-    prepared_for_test_with_policy,
+    operation, owner_for_test, prepared_for_test_with_control, prepared_for_test_with_policy,
 };
 use super::*;
 use crate::{
     ConstantPolicy, ConstantPool, EvaluatedArgument, FunctionArgument, FunctionBindingRequest,
-    FunctionBindingResolver, FunctionResultType, FunctionSpecializationFailure, FunctionValueType,
+    FunctionBindingResolver, FunctionSpecializationFailure, FunctionValueType,
     PureFunctionMetadataOwner, PureScalarImplementation, ScalarEvaluationInstance,
-    ScopedExpressionEffects, Selection, specialize_frozen_scalar, specialize_scalar,
+    ScopedExpressionEffects, Selection, specialize_scalar,
 };
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
-    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
-    FunctionNullBehavior, FunctionVolatility, PureCompileControl, SemanticParameters,
+    EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, FunctionNullBehavior,
+    PureCompileControl, SemanticParameters,
 };
 use std::{sync::Mutex, time::Duration};
 

@@ -256,7 +256,7 @@ enum Schema {
     Domain,
     ColumnDomain,
     TupleDomain,
-    SchemaName,
+    Name,
     Identity,
     Column,
     Transaction,
@@ -382,7 +382,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             2 => repeated(Message(ColumnDomain)),
             _ => return None,
         },
-        SchemaName => match field {
+        Name => match field {
             1 | 2 => singular(Scalar),
             _ => return None,
         },
@@ -425,7 +425,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             _ => return None,
         },
         Table => match field {
-            1 => singular(Message(SchemaName)),
+            1 => singular(Message(Name)),
             2 | 4 | 6 | 9 => singular(Varint),
             3 | 11 | 12 => singular(Scalar),
             5 | 16 | 18 => repeated(MapI32String),
@@ -438,7 +438,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             _ => return None,
         },
         TableFunction => match field {
-            1 => singular(Message(SchemaName)),
+            1 => singular(Message(Name)),
             2 | 4 => singular(Scalar),
             3 => repeated(Message(Column)),
             5 | 6 => singular(Varint),
@@ -446,7 +446,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
         },
         ChangeWindowHandle => match field {
             8 | 9 => singular(Message(ReadDomain)),
-            1 => singular(Message(SchemaName)),
+            1 => singular(Message(Name)),
             2 | 4 => singular(Scalar),
             3 => repeated(Message(Column)),
             5 | 6 => singular(Varint),
@@ -454,7 +454,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             _ => return None,
         },
         SystemTable => match field {
-            1 => singular(Message(SchemaName)),
+            1 => singular(Message(Name)),
             2 | 5 => singular(Varint),
             3 | 4 => singular(Scalar),
             _ => return None,
@@ -475,7 +475,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             _ => return None,
         },
         TableExecute => match field {
-            1 => singular(Message(SchemaName)),
+            1 => singular(Message(Name)),
             2 => singular(Varint),
             3 => singular(Scalar),
             10 => oneof(Message(Optimize)),
@@ -483,7 +483,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             _ => return None,
         },
         Insert => match field {
-            1 => singular(Message(SchemaName)),
+            1 => singular(Message(Name)),
             2 | 3 => singular(Scalar),
             4 | 5 => singular(Varint),
             _ => return None,
@@ -3428,8 +3428,11 @@ mod tests {
             "spec-id":0,"fields":[{"field-id":1000,"source-id":1,"name":"p","transform":"identity"}]
         }))
         .unwrap();
-        let partition =
-            crate::partition_row::UnifiedPartitionRow::of(&table_schema, &[spec.clone()]).unwrap();
+        let partition = crate::partition_row::UnifiedPartitionRow::of(
+            &table_schema,
+            std::slice::from_ref(&spec),
+        )
+        .unwrap();
         let manifest = TrinoManifestFile::try_new(TrinoManifestFileParams {
             path: "s3://warehouse/db/t/metadata/m0.avro".into(),
             length: 1024,
@@ -3551,7 +3554,7 @@ mod tests {
                 "s3://warehouse/metadata/identifiers.json",
                 11,
                 &schema,
-                &[spec.clone()],
+                std::slice::from_ref(&spec),
             )
             .unwrap(),
         ));

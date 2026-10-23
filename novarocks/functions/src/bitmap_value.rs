@@ -625,7 +625,7 @@ pub fn encode_external_bitmap(values: &BTreeSet<u64>) -> Result<Vec<u8>, BitmapV
         let value = values
             .first()
             .copied()
-            .ok_or_else(|| BitmapValueFailure::MissingSingleton)?;
+            .ok_or(BitmapValueFailure::MissingSingleton)?;
         if let Ok(v32) = u32::try_from(value) {
             let mut out = Vec::with_capacity(5);
             out.push(BITMAP_TYPE_SINGLE32);
@@ -655,11 +655,8 @@ pub fn encode_external_bitmap(values: &BTreeSet<u64>) -> Result<Vec<u8>, BitmapV
         buckets.entry(high).or_default().push(low);
     }
     if buckets.len() == 1 && buckets.contains_key(&0) {
-        let payload = encode_roaring32_payload(
-            buckets
-                .get(&0)
-                .ok_or_else(|| BitmapValueFailure::MissingBucket)?,
-        )?;
+        let payload =
+            encode_roaring32_payload(buckets.get(&0).ok_or(BitmapValueFailure::MissingBucket)?)?;
         let mut out = Vec::with_capacity(1 + payload.len());
         out.push(BITMAP_TYPE_BITMAP32);
         out.extend_from_slice(&payload);

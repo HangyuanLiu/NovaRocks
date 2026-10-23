@@ -304,6 +304,21 @@ impl fmt::Display for RootResultError {
 }
 impl std::error::Error for RootResultError {}
 
+impl novarocks_failure_contract::FailureProjection for RootResultError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        let code = match self {
+            Self::Wait => 230,
+            Self::Payload => 231,
+            Self::EndSequence => 232,
+        };
+        FailureFact::new(
+            FailureClass::Data,
+            FailureReason::new(domain::RESULT, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,20 +361,5 @@ mod tests {
             )
             .is_err()
         );
-    }
-}
-
-impl novarocks_failure_contract::FailureProjection for RootResultError {
-    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use novarocks_failure_contract::*;
-        let code = match self {
-            Self::Wait => 230,
-            Self::Payload => 231,
-            Self::EndSequence => 232,
-        };
-        FailureFact::new(
-            FailureClass::Data,
-            FailureReason::new(domain::RESULT, std::num::NonZeroU16::new(code).unwrap()),
-        )
     }
 }

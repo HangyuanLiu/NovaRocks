@@ -176,10 +176,11 @@ fn common_domain(
     if matches!(right.kind(), ValueKind::Scalar(DataType::Null)) {
         return left.domain().unwrap_or(V::Physical);
     }
-    if let Some(domain) = left.domain() {
-        if Some(domain) == right.domain() && domain.validate_carrier(target).is_ok() {
-            return domain;
-        }
+    if let Some(domain) = left.domain()
+        && Some(domain) == right.domain()
+        && domain.validate_carrier(target).is_ok()
+    {
+        return domain;
     }
     let integer = |value: &novarocks_type_contract::ValueTypeRef| {
         matches!(

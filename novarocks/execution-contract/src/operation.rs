@@ -1002,10 +1002,6 @@ pub struct EstablishQueryContext {
 }
 
 impl EstablishQueryContext {
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the establish contract names each independently validated immutable fact"
-    )]
     pub fn new(
         operation_id: TaskOperationId,
         context: QueryContextRef,

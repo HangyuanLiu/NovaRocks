@@ -187,7 +187,7 @@ pub(crate) fn lower_with_creation<H>(
             creation,
         )?;
         work.flush()?;
-        backing.push(new_empty_array(&source.ty.data_type()));
+        backing.push(new_empty_array(source.ty.data_type()));
         work.flush()?;
         cells.push(StaticValuesCell {
             row: 0,

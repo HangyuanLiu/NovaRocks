@@ -572,7 +572,7 @@ mod tests {
             logical_type: None,
         }];
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: "mv_target".to_string(),

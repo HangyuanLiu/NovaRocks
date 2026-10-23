@@ -314,7 +314,7 @@ impl IcebergMetadataMaintenanceAdapter {
                     .load_complete_metadata_for_read(read_target, binding, None)
                     .await
             }) {
-            Ok(Ok(crate::catalog::CatalogMetadataLoad::Complete { base, .. })) => base,
+            Ok(Ok(crate::catalog::CatalogMetadataLoad::Complete { base, .. })) => *base,
             _ => return Ok(original),
         };
         let Some(observation) = descriptor
@@ -467,7 +467,7 @@ impl IcebergMetadataMaintenanceAdapter {
             target_ref: "main".into(),
             start: None,
             changes: FileChanges::default(),
-            dependencies: vec![Dependency::NoReadDependency],
+            dependencies: vec![Dependency::NoRead],
             isolation: IsolationLevel::Serializable,
             shape: RequestShape::SnapshotProducing,
             summary: BTreeMap::from([(MARKER_PROPERTY.into(), marker)]),
@@ -548,7 +548,6 @@ impl IcebergMetadataMaintenanceAdapter {
         Ok(outcome)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn execute_expire(
         &self,
         plan: &ConnectorMetadataMaintenancePlan,
@@ -678,27 +677,26 @@ impl IcebergMetadataMaintenanceAdapter {
                 Ok(Err(error)) => public_outcome(journal.catalog_bridge_failure(error.to_string())),
                 Err(message) => public_outcome(journal.catalog_bridge_failure(message.to_string())),
             };
-            if let ExternalMutationOutcome::KnownUncommitted { ref failure, .. } = outcome {
-                if failure.kind() == ConnectorMutationFailureKind::Conflict
-                    && ordinal < policy.retries()
-                {
-                    let wait = policy.backoff(ordinal);
-                    if wait >= policy.total_timeout().saturating_sub(started.elapsed()) {
-                        return Ok(outcome);
-                    }
-                    if let Err(error) = runtime
-                        .block_on({
-                            let waiting = operation.clone();
-                            async move { waiting.pause(wait).await }
-                        })
-                        .map_err(unavailable)
-                        .and_then(|r| r.map_err(iceberg_error))
-                    {
-                        return Ok(rejected(error));
-                    }
-                    ordinal += 1;
-                    continue;
+            if let ExternalMutationOutcome::KnownUncommitted { ref failure, .. } = outcome
+                && failure.kind() == ConnectorMutationFailureKind::Conflict
+                && ordinal < policy.retries()
+            {
+                let wait = policy.backoff(ordinal);
+                if wait >= policy.total_timeout().saturating_sub(started.elapsed()) {
+                    return Ok(outcome);
                 }
+                if let Err(error) = runtime
+                    .block_on({
+                        let waiting = operation.clone();
+                        async move { waiting.pause(wait).await }
+                    })
+                    .map_err(unavailable)
+                    .and_then(|r| r.map_err(iceberg_error))
+                {
+                    return Ok(rejected(error));
+                }
+                ordinal += 1;
+                continue;
             }
             self.runtime
                 .control_state()
@@ -1226,13 +1224,6 @@ where
     Ok(decoded)
 }
 
-fn decode_digest(value: &str) -> Result<[u8; 32], ConnectorError> {
-    let bytes = hex_decode(value).ok_or_else(|| invalid("maintenance digest is not hex"))?;
-    bytes
-        .try_into()
-        .map_err(|_| invalid("maintenance digest has invalid length"))
-}
-
 fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
     const ALPHABET: &[u8; 16] = b"0123456789abcdef";
     let bytes = bytes.as_ref();
@@ -1244,31 +1235,9 @@ fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
     encoded
 }
 
-fn hex_decode(value: &str) -> Option<Vec<u8>> {
-    if !value.len().is_multiple_of(2) {
-        return None;
-    }
-    value
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|digits| {
-            let high = (digits[0] as char).to_digit(16)? as u8;
-            let low = (digits[1] as char).to_digit(16)? as u8;
-            Some((high << 4) | low)
-        })
-        .collect()
-}
-
 fn digest_bytes(hasher: &mut Sha256, value: &[u8]) {
     hasher.update((value.len() as u64).to_be_bytes());
     hasher.update(value);
-}
-
-fn failure(
-    kind: ConnectorMutationFailureKind,
-    message: impl Into<String>,
-) -> ConnectorMutationFailure {
-    ConnectorMutationFailure::new(kind, message.into())
 }
 
 fn invalid(message: impl Into<String>) -> ConnectorError {
@@ -1281,6 +1250,25 @@ fn unavailable(message: impl Into<String>) -> ConnectorError {
 
 fn internal(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Internal, message.into())
+}
+
+#[cfg(test)]
+fn hex_decode(value: &str) -> Option<Vec<u8>> {
+    if value.len() & 1 != 0 {
+        return None;
+    }
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        }
+    }
+    let mut decoded = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks(2) {
+        decoded.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
+    }
+    Some(decoded)
 }
 
 #[cfg(test)]
@@ -1942,13 +1930,13 @@ mod tests {
         );
     }
 
+    type TableMaintenanceRecorder = Arc<
+        dyn Fn(&[crate::iceberg::TableRequirement], &[crate::iceberg::TableUpdate]) + Send + Sync,
+    >;
+
     fn recorded_adapter(
         adapter: &IcebergMetadataMaintenanceAdapter,
-        recorder: Arc<
-            dyn Fn(&[crate::iceberg::TableRequirement], &[crate::iceberg::TableUpdate])
-                + Send
-                + Sync,
-        >,
+        recorder: TableMaintenanceRecorder,
     ) -> IcebergMetadataMaintenanceAdapter {
         let owner = crate::catalog::admission_test_support::all_admitted_recording(
             Arc::clone(adapter.runtime.novarocks_catalog()),
@@ -2262,7 +2250,7 @@ mod tests {
             // objects are now absent from its live head, but serve source.
             let bytes = source
                 .file_io()
-                .new_input(&format!(
+                .new_input(format!(
                     "{}/data/real-11.parquet",
                     source.metadata().location()
                 ))
@@ -2316,7 +2304,7 @@ mod tests {
                     ],
                     removed: Vec::new(),
                 },
-                dependencies: vec![Dependency::NoReadDependency],
+                dependencies: vec![Dependency::NoRead],
                 isolation: IsolationLevel::Serializable,
                 shape: RequestShape::SnapshotProducing,
                 summary: BTreeMap::new(),

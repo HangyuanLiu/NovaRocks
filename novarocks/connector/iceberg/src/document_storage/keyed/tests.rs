@@ -625,7 +625,7 @@ fn publication_rewrites_closure_but_ordinary_refresh_does_not_gate_on_history_gr
     for index in 0..8 {
         let historical = ConnectorDocumentVersion::try_new(
             "novarocks.mv",
-            &format!("history-{index}"),
+            format!("history-{index}"),
             format(),
             vec![],
             Bytes::from(vec![b'x'; 30_000]),

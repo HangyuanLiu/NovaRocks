@@ -96,6 +96,8 @@ impl PreparedRecursiveReader<'_, '_, '_, '_> {
     pub(crate) fn geometry_scratch_request_count(&self) -> usize {
         self.stream.checked.scratch_request_count
     }
+    #[cfg(test)]
+    #[cfg(test)]
     pub(crate) fn materialize_in(
         self,
         admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<'_>,
@@ -290,6 +292,7 @@ pub fn preflight_recursive_constant_stream<'a, 'f>(
     result
 }
 
+#[cfg(test)]
 pub(crate) fn preflight_recursive_constant_stream_in<'a, 'f>(
     input: &'a [u8],
     expected: &'f Field,
@@ -708,6 +711,7 @@ impl<'a, 'f> RecursiveConstantStream<'a, 'f> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_pool_borrowed_in<'v, 'c>(
         self,
         field: Arc<Field>,

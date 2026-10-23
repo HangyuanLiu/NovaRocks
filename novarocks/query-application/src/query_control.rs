@@ -1282,8 +1282,10 @@ mod tests {
     async fn queued_governed_query_registers_kill_before_its_concurrency_grant() {
         let control = Arc::new(QueryApplicationControl::default());
         let service = QueryControlService::new(control.clone());
-        let mut config = WorkloadConfig::default();
-        config.query_concurrency_limit = 1;
+        let config = WorkloadConfig {
+            query_concurrency_limit: 1,
+            ..WorkloadConfig::default()
+        };
         let workload = WorkloadControl::try_new(
             config,
             ResourceConfig {

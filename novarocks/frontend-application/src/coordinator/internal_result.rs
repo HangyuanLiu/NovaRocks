@@ -71,7 +71,7 @@ impl InternalDomainFailure {
 pub(super) enum InternalDomainState {
     Statistics(StatisticsRootResultDecoder),
     Write(RootWriteResultDecoder),
-    Cow(CowMatchRootConsumer),
+    Cow(Box<CowMatchRootConsumer>),
 }
 
 pub(super) enum InternalDomainCompletion {
@@ -82,7 +82,7 @@ pub(super) enum InternalDomainCompletion {
 
 pub(super) enum InternalDomainSlot {
     Collecting {
-        state: InternalDomainState,
+        state: Box<InternalDomainState>,
         receipt: Option<u64>,
     },
     Eof {
@@ -117,7 +117,7 @@ impl InternalDomainSlot {
         let RootReplyView::Data { sequence, body, .. } = reply.outcome() else {
             return Err("internal domain data owner has no data".into());
         };
-        let result = match &mut state {
+        let result = match &mut *state {
             InternalDomainState::Statistics(decoder) => decoder
                 .apply_relay_body(body)
                 .map_err(InternalDomainFailure::from),
@@ -141,7 +141,7 @@ impl InternalDomainSlot {
         let Self::Collecting { state, .. } = self else {
             return Err("internal domain received duplicate EOF".into());
         };
-        let completion = match state {
+        let completion = match *state {
             InternalDomainState::Statistics(mut decoder) => {
                 decoder.check_relay_end(end.output_rows)?;
                 decoder.observe_root_eof()?;
@@ -154,7 +154,7 @@ impl InternalDomainSlot {
             }
             InternalDomainState::Cow(consumer) => {
                 consumer.check_end(end.output_rows)?;
-                InternalDomainCompletion::Cow(consumer.finish()?)
+                InternalDomainCompletion::Cow((*consumer).finish()?)
             }
         };
         Ok(Self::Eof { completion, end })
@@ -336,9 +336,9 @@ mod tests {
         let input =
             InternalResultValue::try_produce(binding.scope(), binding.window_alias(), |_| {
                 Ok(InternalDomainSlot::Collecting {
-                    state: InternalDomainState::Statistics(
+                    state: Box::new(InternalDomainState::Statistics(
                         StatisticsRootResultDecoder::for_test_with_capacity([], &binding),
-                    ),
+                    )),
                     receipt: None,
                 })
             })
@@ -425,9 +425,9 @@ mod tests {
         let input =
             InternalResultValue::try_produce(binding.scope(), binding.window_alias(), |_| {
                 Ok(InternalDomainSlot::Collecting {
-                    state: InternalDomainState::Statistics(
+                    state: Box::new(InternalDomainState::Statistics(
                         StatisticsRootResultDecoder::for_test_with_capacity([], &binding),
-                    ),
+                    )),
                     receipt: None,
                 })
             })

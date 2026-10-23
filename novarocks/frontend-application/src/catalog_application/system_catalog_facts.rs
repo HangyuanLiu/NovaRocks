@@ -73,12 +73,14 @@ where
 /// names are charged against the whole snapshot before they are retained, so
 /// many namespaces with many tables cannot together exceed `bound`. A table
 /// entry retains its schema name as well and is charged for both.
+type BoundedExternalNames = (Vec<String>, Vec<(String, String)>);
+
 fn bounded_external_names(
     bound: ConnectorListingBound,
     include_table_names: bool,
     list_namespaces: impl FnOnce(ConnectorListingBound) -> Result<Vec<String>, String>,
     mut list_tables: impl FnMut(&str, ConnectorListingBound) -> Result<Vec<String>, String>,
-) -> Result<(Vec<String>, Vec<(String, String)>), String> {
+) -> Result<BoundedExternalNames, String> {
     let mut budget = ConnectorListingBudget::new(bound).map_err(|error| error.to_string())?;
     let mut schema_names = list_namespaces(budget.remaining_bound())?;
     schema_names.sort();

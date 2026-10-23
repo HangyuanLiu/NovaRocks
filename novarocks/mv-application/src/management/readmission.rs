@@ -272,7 +272,6 @@ pub struct ManualReadmissionDeclaration {
 }
 
 impl ManualReadmissionDeclaration {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         challenge: ReadmissionChallenge,
         effect: EffectIdentity,

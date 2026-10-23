@@ -863,7 +863,7 @@ fn try_fold_node_with_services(
             let Some(call) = selected::freeze_fold_call(
                 evaluator.functions,
                 binding,
-                &mut args,
+                &args,
                 arena.constant_policy(),
                 true,
                 work.control(),

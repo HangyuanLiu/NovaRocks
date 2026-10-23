@@ -25,6 +25,11 @@ use novarocks_type_contract::{CompileControlError, ValueLogicalType, ValueTypeSt
 
 use crate::connector::{ConnectorError, ConnectorErrorKind};
 
+type SchemaCreationObservers<'a> = (
+    &'a mut (dyn FnMut(std::alloc::Layout) -> Result<(), CompileControlError> + 'a),
+    &'a mut (dyn FnMut(usize) -> Result<(), CompileControlError> + 'a),
+);
+
 /// Borrowed caller-owned creation observations. The result keeps only the
 /// actual storage lifetime; it never retains these callbacks or their owner.
 pub struct ConnectorReadSchemaCreation<'a> {
@@ -62,12 +67,7 @@ impl<'a> ConnectorReadSchemaCreation<'a> {
     }
     /// Split the independent observers for constructors accepting two borrowed
     /// callbacks. Both remain borrowed from this creation call.
-    pub fn observers(
-        &mut self,
-    ) -> (
-        &mut dyn FnMut(std::alloc::Layout) -> Result<(), CompileControlError>,
-        &mut dyn FnMut(usize) -> Result<(), CompileControlError>,
-    ) {
+    pub fn observers(&mut self) -> SchemaCreationObservers<'_> {
         (&mut *self.request, &mut *self.work)
     }
     pub fn reserve<T>(

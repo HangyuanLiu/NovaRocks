@@ -35,7 +35,7 @@ use novarocks_plan_codec::{
 };
 use novarocks_proto_codec::{FieldPath, ProtocolError};
 use novarocks_proto_models::{common, plan};
-use novarocks_type_contract::{CompileCheckpoints, CompilePhase, ValueTypeStorageLifetime};
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
 use std::{alloc::Layout, error::Error, fmt};
 
 /// Exact protocol, creator, or field-scoped domain cause, independent of any fragment-tree decoder.
@@ -49,6 +49,7 @@ pub(crate) enum NativeTypeDecodeError {
     },
 }
 impl NativeTypeDecodeError {
+    #[cfg(test)]
     pub(crate) fn construction_cause(&self) -> Option<&NativeTypeConstructionError> {
         match self {
             Self::Construction(cause) => Some(cause),
@@ -137,9 +138,6 @@ impl<'a> NativeTypeDecodeResources<'a> {
                 .map_err(NativeTypeConstructionError::Control)?,
         })
     }
-    pub(crate) fn storage(&self) -> ValueTypeStorageLifetime {
-        self.creation.storage_lifetime()
-    }
     pub(crate) fn request(&mut self, layout: Layout) -> Result<(), NativeTypeDecodeError> {
         self.work
             .flush()
@@ -168,12 +166,8 @@ pub(crate) fn table_failure(
     }
 }
 
-/// The retained source namespace and the successful decoder's actual request
-/// provenance. This upper includes temporary construction requests; it is not
-/// a precise retained size, a capacity grant, or a second memory authority.
 pub(crate) struct NativeSourceTypes {
     pub(crate) execution: DecodedExecutionTypeTable,
-    pub(crate) construction_request_bytes_upper_bound: usize,
 }
 
 /// Decode one complete namespace with the actual host factory. Finite grammar
@@ -189,10 +183,7 @@ pub(crate) fn decode_type_owner(
     let execution =
         decode_execution_type_table_with_factory_in(table, limits, &factory, &mut resources.work)
             .map_err(|error| table_failure(error, path))?;
-    Ok(NativeSourceTypes {
-        execution,
-        construction_request_bytes_upper_bound: factory.construction_request_bytes_upper_bound(),
-    })
+    Ok(NativeSourceTypes { execution })
 }
 
 /// Resolve only within this exact owner. The returned binding is borrowed;

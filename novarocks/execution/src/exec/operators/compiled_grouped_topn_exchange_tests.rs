@@ -27,6 +27,7 @@ use super::super::aggregate_fixture::{
     stream_sink, try_run_with_tracker,
 };
 use super::*;
+use crate::exec::chunk::ChunkSchema;
 use crate::exec::operators::{ResultSinkHandle, partition_chunk_by_hash_arrays};
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::builder::build_compiled_pipeline_graph;

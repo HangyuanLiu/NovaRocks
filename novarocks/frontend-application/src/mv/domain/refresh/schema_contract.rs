@@ -195,7 +195,6 @@ mod tests {
         ConnectorTableObjectId, MvObservedSourceField,
         MvSchemaValidationObservation as SpiObservation,
     };
-    use std::sync::Arc;
 
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(

@@ -28,7 +28,6 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use crate::exec::fragment::error::{FragmentBindingErrorKind, program_binding_failure};
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 
 fn program_failure(
@@ -38,20 +37,6 @@ fn program_failure(
     crate::exec::fragment::error::FragmentBindingError::new(
         crate::exec::fragment::error::FragmentBindingTarget::Program,
         kind,
-        detail,
-    )
-    .into()
-}
-
-fn builder_binding_failure(
-    kind: FragmentBindingErrorKind,
-    detail: impl std::fmt::Display,
-) -> ExecutionFailure {
-    program_binding_failure(kind, detail)
-}
-fn builder_filter_contract_failure(detail: impl Into<Arc<str>>) -> ExecutionFailure {
-    crate::runtime_filter::RuntimeFilterContractViolation::new(
-        crate::runtime_filter::RuntimeFilterContractViolationKind::ContractMismatch,
         detail,
     )
     .into()

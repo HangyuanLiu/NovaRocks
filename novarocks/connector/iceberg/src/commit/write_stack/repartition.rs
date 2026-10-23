@@ -48,10 +48,12 @@ pub(crate) struct IcebergPreparedRepartition {
 }
 
 impl IcebergPreparedRepartition {
+    #[cfg(test)]
     pub(crate) fn metadata_updates(&self) -> &[crate::iceberg::TableUpdate] {
         &self.metadata_updates
     }
 
+    #[cfg(test)]
     pub(crate) fn metadata_requirements(&self) -> &[crate::iceberg::TableRequirement] {
         &self.metadata_requirements
     }

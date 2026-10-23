@@ -40,7 +40,6 @@ use std::num::NonZeroU64;
 use novarocks_execution_contract::TaskIdentity;
 use novarocks_execution_contract::root_result::{
     RootReadDeferral, RootReadOutcome, RootReadRefusal, RootReadResponse, RootResultEnd,
-    RootResultReply,
 };
 use novarocks_result_contract::{
     ClientBodyError, ClientRowProfile, ClientRowStreamCursor, RootOutputKind, RootProfileId,
@@ -109,7 +108,6 @@ impl RootRelayError {
 
 impl novarocks_execution_contract::failure::FailureProjection for RootRelayError {
     fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
-        use novarocks_execution_contract::failure::FailureProjection;
         match self {
             Self::Body(error) => error.failure_fact(),
             Self::Identity
@@ -404,7 +402,7 @@ impl RootRelayFrontier {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use novarocks_execution_contract::root_result::RootResultData;
+    use novarocks_execution_contract::root_result::{RootResultData, RootResultReply};
     use novarocks_result_contract::RootProfileId;
     use novarocks_types::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,

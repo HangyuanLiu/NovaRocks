@@ -30,6 +30,8 @@ use novarocks_execution_contract::{
 };
 use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
 use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
+#[cfg(test)]
+use novarocks_query_application::api::QueryExecutionErrorKind;
 use novarocks_query_application::api::{
     ActivatedNativeAttempt, ActiveNativeAttemptOwner, CancellationView, DormantNativeAttemptOwner,
     LogicalExecutionNativePort, LogicalNativeOpenFuture, LogicalNativeOpenRequest,
@@ -37,19 +39,20 @@ use novarocks_query_application::api::{
     NativeActiveConvergenceRequest, NativeAttemptActivationFailure, NativeAttemptActivationFuture,
     NativeAttemptConvergenceFuture, NativeAttemptPreparationError, NativeAttemptPreparationFailure,
     NativeAttemptPreparationFuture, NativeAttemptPreparationPort, NativeAttemptPreparationRequest,
-    NativeAttemptRunFuture, QueryExecutionClient, QueryExecutionError, QueryExecutionErrorKind,
-    QueryExecutionFuture, QueryExecutionRequest,
+    NativeAttemptRunFuture, QueryExecutionClient, QueryExecutionError, QueryExecutionFuture,
+    QueryExecutionRequest,
 };
+#[cfg(test)]
+use novarocks_query_application::coordination::AttemptFailureClass;
 use novarocks_query_application::coordination::{
     AbortQueryContextEffectAdmission, AbortQueryContextEffectPort, AbortQueryContextIssueIdentity,
-    AcceptedRootStatusSource, ActiveAttemptIsolationOwner, AttemptFailureClass,
-    AttemptIsolationActivationFailure, AttemptIsolationReservation, AttemptSchedule,
-    CoordinationBudgets, NativeAttemptDrive, QualifiedReplacementReservation,
-    QualifiedWorkerAdmission, RecoveryMode, ReplacementQualificationEffectAdmission,
-    ReplacementQualificationEffectPort, ReplacementQualificationEffectReservation,
-    ReplacementQualificationEffectSubmission, ReplacementQualificationFailure,
-    ReplacementQualificationIdentity, ReplacementQualificationRequest, RootRelayBinding,
-    RootRelayFrontier,
+    AcceptedRootStatusSource, ActiveAttemptIsolationOwner, AttemptIsolationActivationFailure,
+    AttemptIsolationReservation, AttemptSchedule, CoordinationBudgets, NativeAttemptDrive,
+    QualifiedReplacementReservation, QualifiedWorkerAdmission, RecoveryMode,
+    ReplacementQualificationEffectAdmission, ReplacementQualificationEffectPort,
+    ReplacementQualificationEffectReservation, ReplacementQualificationEffectSubmission,
+    ReplacementQualificationFailure, ReplacementQualificationIdentity,
+    ReplacementQualificationRequest, RootRelayBinding, RootRelayFrontier,
 };
 use novarocks_query_application::execution_error::{
     ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
@@ -384,10 +387,6 @@ impl LogicalReplacementQualificationPort {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the wait consumes every independent identity, evidence, and bound"
-)]
 async fn wait_for_failed_context_isolation(
     process_observation: &BackendProcessObservationService,
     context: QueryContextRef,
@@ -704,7 +703,7 @@ async fn acquire_replacement_admissions(
                         .drain_events()
                         .into_iter()
                         .filter_map(|event| match event {
-                            TaskOperationIntakeEvent::Acknowledgement(ack) => Some(ack),
+                            TaskOperationIntakeEvent::Acknowledgement(ack) => Some(*ack),
                             TaskOperationIntakeEvent::EstablishSendStarted { .. } => None,
                         })
                         .find(|ack| ack.operation_id() == request.envelope().operation_id())
@@ -1640,9 +1639,9 @@ pub(crate) struct FrontendTaskProtocolActiveBehavior {
     attempt: ManifestAssembledRound,
     completion: ManifestAttemptCompletion,
     rows: Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)>,
-    prepared: Option<TaskExecutionPreparedQuery>,
-    split_assignment: Option<SplitAssignmentRoundGuard>,
-    abort_route: Option<LogicalAbortRoute>,
+    _prepared: Option<TaskExecutionPreparedQuery>,
+    _split_assignment: Option<SplitAssignmentRoundGuard>,
+    _abort_route: Option<LogicalAbortRoute>,
     lifecycle_diagnostics:
         Arc<crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics>,
 }
@@ -1675,9 +1674,9 @@ impl FrontendTaskProtocolActiveBehavior {
             attempt: round,
             completion,
             rows,
-            prepared,
-            split_assignment,
-            abort_route,
+            _prepared: prepared,
+            _split_assignment: split_assignment,
+            _abort_route: abort_route,
             lifecycle_diagnostics,
         }
     }
@@ -1801,6 +1800,21 @@ where
     }
 }
 
+type NativeActiveAttemptActivationFuture<'a, Manifest, Behavior> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<
+                    (
+                        SnapshotBoundActiveAttemptOwner<Manifest, Behavior>,
+                        Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)>,
+                    ),
+                    NativeAttemptActivationFailure,
+                >,
+            > + Send
+            + 'a,
+    >,
+>;
+
 impl<B, I> SnapshotBoundDormantAttemptOwner<B, I>
 where
     I: RetainedAttemptInputs,
@@ -1854,20 +1868,7 @@ where
             Box<[novarocks_query_application::coordination::ReplacementWorkerAdmissionEvidence]>,
         >,
         cancellation: CancellationView,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        (
-                            SnapshotBoundActiveAttemptOwner<I::Manifest, B::ActiveBehavior>,
-                            Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)>,
-                        ),
-                        NativeAttemptActivationFailure,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    >
+    ) -> NativeActiveAttemptActivationFuture<'a, I::Manifest, B::ActiveBehavior>
     where
         B: FrontendDormantAttemptBehavior<I::Manifest>,
     {
@@ -2396,48 +2397,49 @@ mod tests {
         });
         let topology: BackendTopologyService = mutable.clone();
         let (_control, root, cancellation) = governed_cancellation();
-        let wait = super::wait_for_attempt_topology(
-            &topology,
-            NativeAttemptTopologyRequirement::ExcludeProcess(failed),
-            &cancellation,
-        );
-        tokio::pin!(wait);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut wait)
+        {
+            let wait = super::wait_for_attempt_topology(
+                &topology,
+                NativeAttemptTopologyRequirement::ExcludeProcess(failed),
+                &cancellation,
+            );
+            tokio::pin!(wait);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut wait)
+                    .await
+                    .is_err()
+            );
+            // Losing all eligible targets cannot produce a schedulable replacement.
+            *mutable.snapshot.lock().unwrap() = BackendTopologySnapshot::empty(8);
+            mutable.changes.send_replace(8);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut wait)
+                    .await
+                    .is_err()
+            );
+            // No restart is required: remaining live capacity can admit the successor.
+            *mutable.snapshot.lock().unwrap() =
+                BackendTopologySnapshot::try_new(9, vec![target(0, failed), target(1, remaining)])
+                    .unwrap();
+            mutable.changes.send_replace(9);
+            let snapshot = tokio::time::timeout(Duration::from_secs(1), &mut wait)
                 .await
-                .is_err()
-        );
-        // Losing all eligible targets cannot produce a schedulable replacement.
-        *mutable.snapshot.lock().unwrap() = BackendTopologySnapshot::empty(8);
-        mutable.changes.send_replace(8);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut wait)
-                .await
-                .is_err()
-        );
-        // No restart is required: remaining live capacity can admit the successor.
-        *mutable.snapshot.lock().unwrap() =
-            BackendTopologySnapshot::try_new(9, vec![target(0, failed), target(1, remaining)])
+                .unwrap()
                 .unwrap();
-        mutable.changes.send_replace(9);
-        let snapshot = tokio::time::timeout(Duration::from_secs(1), &mut wait)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            snapshot
-                .targets()
-                .iter()
-                .any(|target| target.process_id() == Ok(failed)),
-            "membership remains the owner's complete snapshot"
-        );
-        assert!(
-            snapshot
-                .targets()
-                .iter()
-                .any(|target| target.process_id() == Ok(remaining))
-        );
-        drop(wait);
+            assert!(
+                snapshot
+                    .targets()
+                    .iter()
+                    .any(|target| target.process_id() == Ok(failed)),
+                "membership remains the owner's complete snapshot"
+            );
+            assert!(
+                snapshot
+                    .targets()
+                    .iter()
+                    .any(|target| target.process_id() == Ok(remaining))
+            );
+        }
         *mutable.snapshot.lock().unwrap() =
             BackendTopologySnapshot::try_new(10, vec![target(1, remaining)]).unwrap();
         mutable.changes.send_replace(10);

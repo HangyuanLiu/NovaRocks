@@ -18,28 +18,26 @@
 //! Private original ARRAY diagnostic transport factory for cross-crate probes.
 //! It is not a public ARRAY capability and cannot fund successful computation.
 
-use arrow_schema::DataType;
 use std::sync::Arc;
 
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompileCheckpoints, CompilePhase,
     FunctionEffectDeclaration, FunctionInstanceState, FunctionNullBehavior, ObservableEffects,
-    PureCompileControl, ValueLogicalType,
+    PureCompileControl,
 };
 
 use super::catalogue::BuiltinDynamicScalarResolver;
 use crate::kernel_control::{compile_failure, invalid};
 use crate::{
     AggregateStateAllocator, CallEffectInput, EvaluatedArgument, EvaluationCheckpoints,
-    FunctionArgument, FunctionArgumentType, FunctionBindingDeclaration, FunctionBindingError,
-    FunctionBindingRequest, FunctionBindingResolver, FunctionBindingSelection,
-    FunctionCatalogError, FunctionDefinition, FunctionEffectOwner, FunctionEffectOwnerError,
-    FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError, FunctionKind,
-    FunctionResultType, FunctionVisibility, FunctionVolatility, InvocationScalarKernelInstance,
-    KernelEvaluationControl, KernelFailure, PreparedInvocationScalarKernel,
-    PureFunctionMetadataOwner, PureImplementationDeclaration, PureImplementationId,
-    PureInvocationScalarImplementation, PureKernelAbi, ScalarCallContract, ScalarCallInput,
-    ScalarInvocationFailure, SelectedValues,
+    FunctionBindingDeclaration, FunctionBindingError, FunctionBindingRequest,
+    FunctionBindingResolver, FunctionBindingSelection, FunctionCatalogError, FunctionDefinition,
+    FunctionEffectOwner, FunctionEffectOwnerError, FunctionFailureBehavior, FunctionId,
+    FunctionIntrinsicRowError, FunctionKind, FunctionVisibility, FunctionVolatility,
+    InvocationScalarKernelInstance, KernelEvaluationControl, KernelFailure,
+    PreparedInvocationScalarKernel, PureFunctionMetadataOwner, PureImplementationDeclaration,
+    PureImplementationId, PureInvocationScalarImplementation, PureKernelAbi, ScalarCallContract,
+    ScalarCallInput, ScalarInvocationFailure, SelectedValues,
 };
 
 /// Original normalization precedes root NULL masking; full raw diagnostics are retained.

@@ -214,8 +214,8 @@ fn real_context_clone_two_vectors_are_counted_before_request_and_strings_shared(
         .unwrap()
         .catalog_properties();
     // Derive the expected new clone layout BEFORE the request Context clone.
-    let expected = props.execution_properties().len() * std::mem::size_of::<spi::CatalogProperty>()
-        + props.credential_bindings().len() * std::mem::size_of::<spi::CatalogCredentialBinding>();
+    let expected = std::mem::size_of_val(props.execution_properties())
+        + std::mem::size_of_val(props.credential_bindings());
     let held = capacity.snapshot().held_positions;
     let receipt = cow_fe_begin_receipt::before_request(
         &fixture.preparation,

@@ -173,7 +173,7 @@ fn caller_scope_package_admission_charges_nested_field_lookups_linearly() {
         .fragment()
         .values()
         .values()
-        .map(|value| nested_fields(&value.ty.data_type()))
+        .map(|value| nested_fields(value.ty.data_type()))
         .sum();
     assert!(nested >= 2, "the fixture carries {nested} nested fields");
     let admission = decode_limits().admission;
@@ -220,7 +220,8 @@ fn refused(bytes: &[u8]) -> PackageDecodeError {
 #[test]
 fn absent_required_components_are_refused_without_defaults() {
     let package = rich_package();
-    let cases: [(&str, fn(&mut wire::FragmentPackage)); 7] = [
+    type PackageMutation = fn(&mut wire::FragmentPackage);
+    let cases: [(&str, PackageMutation); 7] = [
         ("fragment", |d| d.fragment = None),
         ("expression_control", |d| d.expression_control = None),
         ("calls", |d| d.calls = None),

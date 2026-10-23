@@ -51,15 +51,6 @@ pub(crate) fn expression_allocation_host(tracker: Arc<MemTracker>) -> Arc<Tracke
     Arc::new(TrackedStateAllocator::new(tracker))
 }
 
-/// Differential probes borrow the actual production allocator and explicit
-/// tracker authority. The unaccounted allocator's default remains unchanged.
-#[cfg(test)]
-pub(crate) fn differential_aggregate_state_allocator(
-    tracker: Arc<MemTracker>,
-) -> Arc<dyn AggregateStateAllocator> {
-    Arc::new(TrackedStateAllocator::new(tracker))
-}
-
 impl novarocks_functions::opaque_memory::OpaqueAllocationHost for TrackedStateAllocator {
     fn reserve_opaque(&self, bytes: usize) -> Result<(), KernelFailure> {
         if bytes == 0 {

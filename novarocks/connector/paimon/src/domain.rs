@@ -452,7 +452,10 @@ pub struct PaimonSplit {
 }
 
 impl PaimonSplit {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The public constructor validates the frozen PAI-1 split facts individually; a wrapper would add a public request type without changing that contract"
+    )]
     pub fn try_new(
         snapshot_id: i64,
         schema_id: i64,

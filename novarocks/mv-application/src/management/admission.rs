@@ -459,19 +459,18 @@ impl ManagementEntrance {
             .ok_or_else(|| MvDocumentError::Contract("missing MV management slot".into()))?;
         let (owner, incarnation) = decode_management_slot(&slot.value)?;
         let mut states = lock(&self.inner.state);
-        if let Some(current) = states.get_mut(&view.table) {
-            if current.target.catalog() == catalog
-                && current.target.object_id() == &view.object_id
-                && (owner != self.inner.owner || incarnation != self.inner.incarnation)
-            {
-                current.ready = false;
-                current.owner_mismatch = owner != self.inner.owner;
-                current.incarnation_mismatch = incarnation != self.inner.incarnation;
-                if let Some(installed) = &current.installed_observation {
-                    installed.close();
-                }
-                return Ok(true);
+        if let Some(current) = states.get_mut(&view.table)
+            && current.target.catalog() == catalog
+            && current.target.object_id() == &view.object_id
+            && (owner != self.inner.owner || incarnation != self.inner.incarnation)
+        {
+            current.ready = false;
+            current.owner_mismatch = owner != self.inner.owner;
+            current.incarnation_mismatch = incarnation != self.inner.incarnation;
+            if let Some(installed) = &current.installed_observation {
+                installed.close();
             }
+            return Ok(true);
         }
         Ok(false)
     }

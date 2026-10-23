@@ -454,10 +454,10 @@ fn source_dictionary_ids_do_not_change_static_value_binding_and_invalid_nominals
         &Control::default(),
     )
     .unwrap();
-    assert!(matches!(
-        FunctionValueType::try_with_logical_type(DataType::Boolean, true, ValueLogicalType::Json),
-        Err(_)
-    ));
+    assert!(
+        FunctionValueType::try_with_logical_type(DataType::Boolean, true, ValueLogicalType::Json)
+            .is_err()
+    );
 }
 
 #[test]
@@ -799,8 +799,7 @@ fn created_type_table_late_slice_retains_only_its_original_arena_owner() {
         Ok::<_, novarocks_type_contract::owned_resources::layout::LayoutResourceError>(())
     };
     source_request(std::alloc::Layout::array::<FunctionArgumentType>(1).unwrap()).unwrap();
-    let mut entries = Vec::with_capacity(1);
-    entries.push(source_value);
+    let entries = vec![source_value];
     let entries = FunctionArgumentTypes::try_from_boxed_observed(
         entries.into_boxed_slice(),
         ValueTypeStorageLifetime::held(arena_hold.clone()),

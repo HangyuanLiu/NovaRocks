@@ -129,14 +129,14 @@ pub(crate) fn admit_writer_family(
                     _ => None,
                 };
                 let mut exact = false;
-                if let Some(input) = input {
-                    if matches!(input.kind, NodeKind::ExchangeSource { .. }) {
-                        for cut in package.cuts().inbound.iter() {
-                            let addressed = cut.destination_node == input.id;
-                            let same = cut.partitioning.destination == target.required_distribution;
-                            work.step()?;
-                            exact |= addressed && same;
-                        }
+                if let Some(input) = input
+                    && matches!(input.kind, NodeKind::ExchangeSource { .. })
+                {
+                    for cut in package.cuts().inbound.iter() {
+                        let addressed = cut.destination_node == input.id;
+                        let same = cut.partitioning.destination == target.required_distribution;
+                        work.step()?;
+                        exact |= addressed && same;
                     }
                 }
                 if !exact {
@@ -297,14 +297,6 @@ fn require_relation_output(
 
 /// One relation layout: the frozen field names and types, positionally, with
 /// compiler-allocated slots.
-pub(crate) fn relation_layout_with_creation<H>(
-    schema: &WriterRelationSchema,
-    slots: &[SlotId],
-    control: &dyn PureCompileControl,
-    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
-) -> Result<StaticLayout, crate::FragmentCreationError<H>> {
-    relation_layout_inner_with_creation(schema, slots, control, creation)
-}
 fn relation_layout_inner_with_creation<H>(
     schema: &WriterRelationSchema,
     slots: &[SlotId],

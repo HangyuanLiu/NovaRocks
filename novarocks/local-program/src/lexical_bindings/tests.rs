@@ -404,7 +404,6 @@ fn build(
     )
 }
 // Keep independent source, control, closure and output axes explicit in fixtures.
-#[allow(clippy::too_many_arguments)]
 fn build_project(
     definitions: Vec<StaticExprKind>,
     uses: Vec<ProgramExpressionUse>,

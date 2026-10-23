@@ -339,7 +339,7 @@ fn build_decoded(
             Err(error) => {
                 if matches!(demand, DecodeDemand::Required) {
                     return Err(KernelFailure::from_domain(RequiredDecodeFailure {
-                        ordinal,
+                        _ordinal: ordinal,
                         cause: error,
                     }));
                 }
@@ -496,7 +496,7 @@ impl std::error::Error for DecodeError {
 }
 #[derive(Debug)]
 struct RequiredDecodeFailure {
-    ordinal: usize,
+    _ordinal: usize,
     cause: DecodeError,
 }
 impl std::fmt::Display for RequiredDecodeFailure {

@@ -341,13 +341,13 @@ impl ConnectorPageStream for IcebergPartitionOnlyPageStream {
             control.request_stop();
         }
         Box::pin(async move {
-            if let Some(control) = &pending {
-                if matches!(
+            if let Some(control) = &pending
+                && matches!(
                     control.wait_drained().await,
                     ConnectorPreparationExit::Unresolved(_)
-                ) {
-                    return futures::future::pending().await;
-                }
+                )
+            {
+                return futures::future::pending().await;
             }
             Ok(())
         })

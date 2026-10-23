@@ -303,7 +303,7 @@ fn mapped_domain(
 
 struct OpaquePayload {
     payload: Vec<u8>,
-    charge: OpaqueRetainedCharge,
+    _charge: OpaqueRetainedCharge,
 }
 impl AsRef<[u8]> for OpaquePayload {
     fn as_ref(&self) -> &[u8] {
@@ -329,7 +329,10 @@ impl EmissionPort {
         let mut lease = charge.reserve_operation(preflight.bounds().additional_headroom_bytes)?;
         let payload = handle.serialize_under_reservation_with_failure(&preflight, &lease, sink)?;
         charge.reconcile_under_reservation(payload.capacity(), &mut lease)?;
-        Ok(OpaquePayload { payload, charge })
+        Ok(OpaquePayload {
+            payload,
+            _charge: charge,
+        })
     }
 }
 impl core::DsHllEmissionPort<FailureSink<'_, '_>> for EmissionPort {
@@ -378,7 +381,10 @@ impl core::DsHllEmissionPort<FailureSink<'_, '_>> for EmissionPort {
         if !empty.payload.is_empty() {
             sink.observe(HllObservation::OpaqueBoundary)?;
         }
-        Ok(OpaquePayload { payload, charge })
+        Ok(OpaquePayload {
+            payload,
+            _charge: charge,
+        })
     }
 }
 struct EmissionStates<'a>(HostVec<&'a DsHllState, HostAggregateAllocator>);

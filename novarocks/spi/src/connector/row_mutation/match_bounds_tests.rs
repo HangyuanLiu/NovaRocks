@@ -259,6 +259,10 @@ fn match_bounds_large_name_refused_before_layout_allocation() {
 }
 
 #[test]
+#[expect(
+    clippy::rc_clone_in_vec_init,
+    reason = "The fixture intentionally shares one field Arc across schema occurrences to verify per-occurrence metadata accounting"
+)]
 fn match_bounds_shared_metadata_amplification_refused_before_layout_allocation() {
     // A 64-KiB retained value and shared Arcs model many schema occurrences;
     // the conservative 16-MiB metadata proof must count every occurrence.

@@ -167,7 +167,7 @@ mod tests {
     fn short_mixed_grammar_matches_independent_arrow_parser() {
         // Cover signs in every position and invalid prefixes, interiors and
         // suffixes, including Arrow's fast invalid-last-byte branch.
-        let alphabet = [b'+', b'-', b'0', b'1', b'9', b' ', b'.', b'x'];
+        let alphabet = *b"+-019 .x";
         for first in alphabet {
             assert_arrow(std::str::from_utf8(&[first]).unwrap());
             for second in alphabet {

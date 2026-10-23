@@ -338,6 +338,7 @@ impl fmt::Display for ScalarInvocationFailure {
 }
 impl std::error::Error for ScalarInvocationFailure {}
 
+#[cfg(test)]
 /// Private lifecycle probe, not a replacement for the shared scalar wrapper.
 /// The public ABI/instance author will consume this nominal result separately.
 pub(super) fn finish_invocation<T>(
@@ -353,10 +354,12 @@ pub(super) fn finish_invocation<T>(
 }
 /// One mutable instance's failure bit. The caller must pass deferred operations;
 /// already evaluating them before this author would replay a failed instance.
+#[cfg(test)]
 #[derive(Default)]
 pub(super) struct ScalarInvocationLatch {
     failed: bool,
 }
+#[cfg(test)]
 impl ScalarInvocationLatch {
     pub(super) fn execute<T>(
         &mut self,
@@ -375,6 +378,7 @@ impl ScalarInvocationLatch {
         result
     }
 }
+
 #[cfg(test)]
 #[path = "scalar_invocation_data_tests.rs"]
 mod tests;

@@ -20,25 +20,8 @@
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Dependency {
     RefUnchanged,
-    NoReadDependency,
+    NoRead,
     RegisteredFilesNotLive(Vec<String>),
     /// Preparation-time check only; metadata publication has no atomic snapshot-existence requirement.
     MeasuredSnapshotExists(i64),
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum ValidationInput {
-    Metadata,
-    LiveSet,
-    HistoryWindow,
-}
-
-impl Dependency {
-    pub fn validation_input(&self) -> Option<ValidationInput> {
-        match self {
-            Self::RefUnchanged | Self::MeasuredSnapshotExists(_) => Some(ValidationInput::Metadata),
-            Self::RegisteredFilesNotLive(_) => Some(ValidationInput::LiveSet),
-            Self::NoReadDependency => None,
-        }
-    }
 }

@@ -260,7 +260,6 @@ pub(crate) fn lower_grouped_topn_with_creation<H>(
                 .into());
             }
             functions.push(crate::aggregate::lower_call(
-                node,
                 call,
                 expressions,
                 &mut work,

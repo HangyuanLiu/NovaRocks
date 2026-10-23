@@ -50,7 +50,9 @@ fn plus(a: usize, b: usize) -> Result<usize, KernelFailure> {
 pub(crate) struct BorrowedSourceNode<'a> {
     pub(crate) array: &'a dyn Array,
     pub(crate) data_buffers: usize,
+    #[cfg(test)]
     pub(crate) child_count: usize,
+    #[cfg(test)]
     pub(crate) copy_nulls: bool,
 }
 pub(crate) trait BorrowedSourceObservation<'source> {
@@ -381,7 +383,9 @@ fn source_metadata_graph<'source, W: MetadataWork>(
             BorrowedSourceNode {
                 array,
                 data_buffers: buffers,
+                #[cfg(test)]
                 child_count: children,
+                #[cfg(test)]
                 copy_nulls,
             },
             work,

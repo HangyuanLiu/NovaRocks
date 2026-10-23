@@ -759,7 +759,7 @@ fn smallest_k_subset(universe: u32, k: u32) -> Option<u32> {
     let mut remaining = k;
     let mut u = universe;
     while remaining > 0 && u != 0 {
-        let low = u & u.wrapping_neg();
+        let low = u.isolate_lowest_one();
         result |= low;
         u &= u - 1;
         remaining -= 1;

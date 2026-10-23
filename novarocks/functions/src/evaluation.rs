@@ -383,20 +383,6 @@ impl RowDataError {
             message: self.message.clone(),
         }
     }
-    pub(crate) fn prepare_host(
-        selected_ordinal: usize,
-        allocator: &crate::aggregate_host_allocator::HostAggregateAllocator,
-        work: &mut crate::kernel_input::EvaluationCheckpoints<'_>,
-        formatter: impl FnOnce(&mut dyn fmt::Write) -> fmt::Result,
-    ) -> Result<Self, crate::KernelFailure> {
-        Self::prepare_host_with_reason(
-            selected_ordinal,
-            DataFailureReason::InvalidValue,
-            allocator,
-            work,
-            formatter,
-        )
-    }
     pub(crate) fn prepare_host_with_reason(
         selected_ordinal: usize,
         reason: DataFailureReason,

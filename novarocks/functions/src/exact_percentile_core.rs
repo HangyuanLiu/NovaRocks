@@ -42,12 +42,20 @@ pub trait ExactPercentileAllocator: ScalarStateAllocator {
         operation: &str,
     ) -> Result<Self::ParserReservation, crate::KernelFailure>;
 }
+
+/// A decoded exact-percentile state with values owned by its supplied allocator.
+#[expect(
+    type_alias_bounds,
+    reason = "The allocator bound is required to form the decoded allocator-backed values"
+)]
+pub type DecodedExactPercentileState<A: ExactPercentileAllocator> =
+    (Option<f64>, ScalarVec<TrackedAggScalarValue<A>, A>);
+
 fn scalar_bytes<A: ExactPercentileAllocator>(
     allocator: A,
     bytes: &[u8],
 ) -> Result<ScalarVec<u8, A>, crate::KernelFailure> {
     crate::aggregate_scalar::scalar_bytes(allocator, bytes, &mut ScalarWork::new(None))
-        .map_err(Into::into)
 }
 /// serde has its own fixed error type. The synchronous decode owns this one
 /// stack slot, so an allocation/control refusal never travels through text.
@@ -143,8 +151,7 @@ impl<A: ExactPercentileAllocator> ExactPercentileState<A> {
         self.values.try_reserve(1).map_err(|source| {
             sink.scalar(
                 self.allocator
-                    .scalar_allocation_error("reserve exact percentile value", source)
-                    .into(),
+                    .scalar_allocation_error("reserve exact percentile value", source),
             )
         })?;
         self.values.push(value);
@@ -269,14 +276,11 @@ impl<'de, A: ExactPercentileAllocator> DeserializeSeed<'de> for ValuesSeed<'_, A
                     sequence.next_element::<BorrowedSerializableScalar<'de>>()?
                 {
                     values.try_reserve(1).map_err(|source| {
-                        self.refusal.serde_error(
-                            self.allocator
-                                .scalar_allocation_error(
-                                    "reserve decoded exact percentile value",
-                                    source,
-                                )
-                                .into(),
-                        )
+                        self.refusal
+                            .serde_error(self.allocator.scalar_allocation_error(
+                                "reserve decoded exact percentile value",
+                                source,
+                            ))
                     })?;
                     let value = match value {
                         BorrowedSerializableScalar::Int64(value) => {
@@ -377,14 +381,14 @@ impl<'de, A: ExactPercentileAllocator> DeserializeSeed<'de> for StateSeed<'_, A>
 pub fn decode_state_into<A: ExactPercentileAllocator>(
     payload: &[u8],
     allocator: &A,
-) -> Result<(Option<f64>, ScalarVec<TrackedAggScalarValue<A>, A>), crate::KernelFailure> {
+) -> Result<DecodedExactPercentileState<A>, crate::KernelFailure> {
     decode_state_into_with_sink(payload, allocator, &mut RequiredPercentileFailure)
 }
 pub fn decode_state_into_with_sink<A: ExactPercentileAllocator, S: PercentileFailureSink<A>>(
     payload: &[u8],
     allocator: &A,
     sink: &mut S,
-) -> Result<(Option<f64>, ScalarVec<TrackedAggScalarValue<A>, A>), S::Error> {
+) -> Result<DecodedExactPercentileState<A>, S::Error> {
     if payload.is_empty() {
         return Ok((None, ScalarVec::new_in(allocator.clone())));
     }
@@ -537,7 +541,7 @@ pub fn update_from_arrays_with_sink<A: ExactPercentileAllocator, S: PercentileFa
         &state.allocator,
         work,
     )
-    .map_err(|error| sink.scalar(error.into()))?
+    .map_err(|error| sink.scalar(error))?
     else {
         return Ok(());
     };
@@ -578,23 +582,22 @@ pub fn merge_from_array_with_sink<A: ExactPercentileAllocator, S: PercentileFail
     else {
         return Ok(());
     };
-    work.flush().map_err(|error| sink.scalar(error.into()))?;
+    work.flush().map_err(|error| sink.scalar(error))?;
     let (rate, incoming) = decode_state_into_with_sink(payload, &state.allocator, sink)?;
     if let Some(rate) = rate {
         apply_rate_with_sink(state, rate, sink)?;
     }
-    work.flush().map_err(|error| sink.scalar(error.into()))?;
+    work.flush().map_err(|error| sink.scalar(error))?;
     state.values.try_reserve(incoming.len()).map_err(|source| {
         sink.scalar(
             state
                 .allocator
-                .scalar_allocation_error("reserve merged exact percentile values", source)
-                .into(),
+                .scalar_allocation_error("reserve merged exact percentile values", source),
         )
     })?;
     // Extend remains the original owned-vector operation, observed as opaque work.
     state.values.extend(incoming);
-    work.flush().map_err(|error| sink.scalar(error.into()))?;
+    work.flush().map_err(|error| sink.scalar(error))?;
     Ok(())
 }
 #[derive(Clone, Copy, Debug)]
@@ -629,10 +632,10 @@ pub fn finalize_cont_with_sink<A: ExactPercentileAllocator, S: PercentileFailure
         .iter()
         .map(|value| crate::aggregate_scalar::tracked_scalar_to_output(value, work))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| sink.scalar(error.into()))?;
-    work.flush().map_err(|error| sink.scalar(error.into()))?;
-    sort_scalar_values(&mut values).map_err(|cause| sink.scalar(cause.into()))?;
-    work.flush().map_err(|error| sink.scalar(error.into()))?;
+        .map_err(|error| sink.scalar(error))?;
+    work.flush().map_err(|error| sink.scalar(error))?;
+    sort_scalar_values(&mut values).map_err(|cause| sink.scalar(cause))?;
+    work.flush().map_err(|error| sink.scalar(error))?;
 
     if values.len() == 1 || rate == 1.0 {
         return match output_type {
@@ -693,10 +696,10 @@ pub fn finalize_disc_with_sink<A: ExactPercentileAllocator, S: PercentileFailure
         .iter()
         .map(|value| crate::aggregate_scalar::tracked_scalar_to_output(value, work))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| sink.scalar(error.into()))?;
-    work.flush().map_err(|error| sink.scalar(error.into()))?;
-    sort_scalar_values(&mut values).map_err(|cause| sink.scalar(cause.into()))?;
-    work.flush().map_err(|error| sink.scalar(error.into()))?;
+        .map_err(|error| sink.scalar(error))?;
+    work.flush().map_err(|error| sink.scalar(error))?;
+    sort_scalar_values(&mut values).map_err(|cause| sink.scalar(cause))?;
+    work.flush().map_err(|error| sink.scalar(error))?;
     if values.len() == 1 || rate == 1.0 {
         return Ok(values.last().cloned());
     }

@@ -162,9 +162,6 @@ impl AdmittedCaptureBytes {
             _charge: charge,
         })
     }
-    pub(crate) fn capacity(&self) -> usize {
-        self.layout.size()
-    }
     pub(crate) fn as_slice(&self) -> &[u8] {
         // SAFETY: Only the prefix initialized by push/write_zeroed is exposed.
         unsafe { std::slice::from_raw_parts(self.data.as_ptr(), self.initialized) }

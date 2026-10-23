@@ -692,7 +692,6 @@ fn bounded_groups(
     Ok(groups)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cohort_plans_from_artifact(
     owner: &ConnectorProviderBindingKey,
     request: &ConnectorDistributedRewritePlanningRequest,
@@ -851,7 +850,6 @@ pub(crate) fn delete_artifact_execution_schema(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn rewrite_preparation(
     owner: &ConnectorProviderBindingKey,
     request: &ConnectorDistributedRewritePlanningRequest,
@@ -1220,7 +1218,7 @@ fn live_delete_file_paths_of(
             if manifest_file.content != crate::iceberg::spec::ManifestContentType::Deletes {
                 continue;
             }
-            let manifest = crate::manifest::load_manifest(&manifest_file, &file_io)
+            let manifest = crate::manifest::load_manifest(manifest_file, &file_io)
                 .await
                 .map_err(|error| format!("load Iceberg rewrite delete manifest: {error}"))?;
             check_active()?;
@@ -1441,7 +1439,7 @@ fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> Result<(), Conne
         Value::Object(values) => {
             output.push(b'{');
             let mut fields = values.iter().collect::<Vec<_>>();
-            fields.sort_by(|(left, _), (right, _)| left.cmp(right));
+            fields.sort_by_key(|(left, _)| *left);
             for (index, (key, value)) in fields.into_iter().enumerate() {
                 if index != 0 {
                     output.push(b',');
@@ -2078,7 +2076,7 @@ mod tests {
             Type::Variant(VariantType),
             Type::Primitive(PrimitiveType::Uuid),
         ] {
-            let (executor, warehouse, runtime, _listener) = admission_runtime("hadoop");
+            let (_executor, warehouse, runtime, _listener) = admission_runtime("hadoop");
             // Model a table authored by another engine. Product CREATE/ALTER
             // admission remains closed to new Variant and uuid columns.
             let table_root = warehouse.path().join("db/t");
@@ -2303,7 +2301,9 @@ mod hex {
         }
         value
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| Ok((nibble(pair[0])? << 4) | nibble(pair[1])?))
             .collect()
     }

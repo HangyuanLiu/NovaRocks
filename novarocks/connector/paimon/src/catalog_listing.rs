@@ -120,10 +120,10 @@ impl SourceBudget {
         if database_root && status.is_dir {
             // Match the SDK's borrowed basename + trailing-slash + .db filter.
             // Do not count ignored physical entries as logical database names.
-            if status.path.ends_with('/') {
-                if let Some(name) = basename.strip_suffix(".db") {
-                    self.databases.admit_names(std::iter::once(name))?;
-                }
+            if status.path.ends_with('/')
+                && let Some(name) = basename.strip_suffix(".db")
+            {
+                self.databases.admit_names(std::iter::once(name))?;
             }
         }
         self.workspace_bytes = bytes;

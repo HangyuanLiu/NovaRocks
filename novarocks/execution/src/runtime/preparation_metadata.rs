@@ -52,27 +52,6 @@ pub trait CompiledSchemaMetadataScope {
         B: FnOnce() -> Result<ChunkSchemaRef, crate::exec::chunk::ChunkConstructionFailure>;
 }
 
-/// Borrowed only while the original synchronous graph is being prepared.
-pub(crate) enum CompiledMetadataMode<'a, H> {
-    Direct,
-    Hosted(&'a mut H),
-}
-pub(crate) struct DirectCompiledSchemaMetadataScope;
-impl CompiledSchemaMetadataScope for DirectCompiledSchemaMetadataScope {
-    fn materialize<B>(
-        &mut self,
-        _: &Arc<LocalProgram>,
-        _: CompiledSchemaSite,
-        _: &StaticLayout,
-        _: B,
-    ) -> ExecutionResult<ChunkSchemaRef>
-    where
-        B: FnOnce() -> Result<ChunkSchemaRef, crate::exec::chunk::ChunkConstructionFailure>,
-    {
-        unreachable!("the explicit Direct metadata mode never invokes a host")
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PreparationMetadataFailure {
     MissingCompiledSite,

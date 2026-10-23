@@ -65,7 +65,6 @@ impl InputProfile {
 #[derive(Debug)]
 pub(super) enum ReceiverContractFailure {
     RootGrant,
-    DuplicateDelivery,
     InputAfterFinish,
     MissingRootGrant,
     ForeignRootTask,
@@ -74,9 +73,6 @@ impl std::fmt::Display for ReceiverContractFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::RootGrant => "ordinary receiver cannot accept a root-covered input",
-            Self::DuplicateDelivery => {
-                "receiver was given another prepared input before its continuation drained"
-            }
             Self::InputAfterFinish => "receiver was given input after data flow finished",
             Self::MissingRootGrant => "root input reached its receiver without pre-pull coverage",
             Self::ForeignRootTask => "root input grant belongs to a different Task",
@@ -90,7 +86,6 @@ impl novarocks_failure_contract::FailureProjection for ReceiverContractFailure {
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let reason = match self {
             Self::RootGrant => ExecutionReason::ReceiverUnexpectedRootGrant,
-            Self::DuplicateDelivery => ExecutionReason::ReceiverDuplicateDelivery,
             Self::InputAfterFinish => ExecutionReason::ReceiverInputAfterFinish,
             Self::MissingRootGrant => ExecutionReason::ReceiverMissingRootGrant,
             Self::ForeignRootTask => ExecutionReason::ReceiverForeignRootTask,

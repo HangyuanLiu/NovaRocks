@@ -24,6 +24,7 @@ use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array, Int64Array, StringA
 #[cfg(test)]
 use arrow::compute::{cast, filter_record_batch};
 use arrow::datatypes::{DataType, Schema};
+#[cfg(test)]
 use arrow::record_batch::RecordBatch;
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
@@ -34,6 +35,7 @@ use crate::query_execution::planning::write_sink::{
 };
 use crate::query_execution::write_session::ConnectorWriteSession;
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
+#[cfg(test)]
 use novarocks_query_application::api::QueryResult;
 #[cfg(test)]
 use novarocks_sql::literal::literal_from_batch;
@@ -153,7 +155,7 @@ enum DmlRowMutationEffectSet {
 /// statement opens its write session or activates its copy-on-write plan.
 #[derive(Clone)]
 pub(crate) struct DmlChangeStreamPreparations {
-    lease: novarocks_spi::connector::ConnectorWriteLease,
+    _lease: novarocks_spi::connector::ConnectorWriteLease,
     preparation: novarocks_spi::connector::ConnectorRowMutationPreparation,
 }
 
@@ -175,7 +177,10 @@ impl DmlChangeStreamPreparations {
         };
         let (lease, preparation) =
             target.prepare_row_mutation(target_ref, operation_id, intent, context)?;
-        Ok(Self { lease, preparation })
+        Ok(Self {
+            _lease: lease,
+            preparation,
+        })
     }
 
     /// Wrap a preparation this statement already obtained.
@@ -188,7 +193,10 @@ impl DmlChangeStreamPreparations {
         lease: novarocks_spi::connector::ConnectorWriteLease,
         preparation: novarocks_spi::connector::ConnectorRowMutationPreparation,
     ) -> Self {
-        Self { lease, preparation }
+        Self {
+            _lease: lease,
+            preparation,
+        }
     }
 }
 
@@ -360,7 +368,6 @@ fn change_stream_routed_targets(
     Ok(routed)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn compile_dml_change_stream_write(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
@@ -1470,7 +1477,7 @@ pub(crate) fn stage_prepared_update_mutation(
                         &connector_context,
                         "COW UPDATE",
                     );
-                    return Err(error.into());
+                    return Err(error);
                 }
             };
             let execution_handle = Arc::new(DistributedCowUpdateExecutor {
@@ -1710,7 +1717,6 @@ fn mutation_source_relation_to_sql(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_update_mor_change_stream_write_plan(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
@@ -2483,14 +2489,13 @@ fn build_cow_update_distributed_write(
                 .map_err(&fail)?;
                 let read = crate::query_execution::cohort_read::QueryPinnedFileSetRead {
                     pinned: source.pinned_source().clone(),
-                    owner: source.source().owner().clone(),
                     frozen_source: Some(source.frozen_read_source().cloned().ok_or_else(|| {
                         fail(closed::BuildError::InvalidSource(
                             "copy-on-write source lost its original provider read receipt",
                         ))
                     })?),
                     planning_lease: planning_lease.clone(),
-                    original: Some(original.clone()),
+                    _original: Some(original.clone()),
                 };
                 (
                     query,
@@ -2702,7 +2707,6 @@ fn build_cow_append_query(
 /// relation of the rows the statement matched inside it. A deleted row is
 /// dropped by the trailing predicate; every other row is re-emitted so the
 /// replacement file is complete.
-#[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 fn build_cow_rewrite_query(
     selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
@@ -3077,10 +3081,6 @@ fn run_cow_target_writes(
     })
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "One copy-on-write branch requires separately validated execution, read, and session inputs."
-)]
 fn run_one_cow_target(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
@@ -3196,7 +3196,7 @@ fn run_one_cow_target(
             plan.original.clone(),
         )
     })?;
-    Ok(assembly.finish()?)
+    assembly.finish()
 }
 
 #[cfg(test)]
@@ -3635,11 +3635,11 @@ fn execute_exact_cow_match_query(
     )
     .and_then(|request| request.with_cow_match_consumer(consumer))
     .map_err(crate::dml::error::DmlExecutionError::from_distributed)?;
-    Ok(state
+    state
         .query_execution()
         .execute(request)
         .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_cow_match)
-        .map_err(crate::dml::error::DmlExecutionError::from_distributed)?)
+        .map_err(crate::dml::error::DmlExecutionError::from_distributed)
 }
 
 #[cfg(test)]
@@ -4170,7 +4170,7 @@ pub(crate) fn stage_prepared_merge_mutation(
         Ok(write) => write,
         Err(error) => {
             release_unplanned_write_session(&write_session, &connector_context, "COW MERGE");
-            return Err(error.into());
+            return Err(error);
         }
     };
     let execution_handle = Arc::new(DistributedCowUpdateExecutor {
@@ -4425,10 +4425,6 @@ impl MergeMatchRows {
 #[allow(
     dead_code,
     reason = "Retained for staged query-execution DML recovery and connector wiring."
-)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "MERGE match materialization retains its independently validated schema and routing inputs."
 )]
 fn materialize_merge_match(
     state: &DmlExecutionKernel,
@@ -4700,7 +4696,10 @@ fn build_exact_cow_merge_selection_query(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The change-stream plan builder keeps mutation facts and connector capabilities explicit through validation; a bundle would duplicate the frozen plan input."
+)]
 fn build_merge_mor_change_stream_write_plan(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
@@ -5320,8 +5319,6 @@ mod tests {
 
     struct CowRewriteQueryFixture {
         selection: novarocks_spi::connector::ConnectorRowMutationSelection,
-        recipe: novarocks_spi::connector::ConnectorRowMutationCohortRecipe,
-        route: novarocks_spi::connector::ConnectorRowMutationRoute,
         /// What the session hands a copy-on-write target: the branch's input
         /// shape, its routing facts, the rows it owns, and the read contract
         /// for the file it rewrites. None of them names a cohort.
@@ -5331,10 +5328,6 @@ mod tests {
         rewrite_source: novarocks_spi::connector::write_stack::ConnectorWriteRewriteSource,
         preparation: novarocks_spi::connector::ConnectorRowMutationPreparation,
         identity: FrozenConnectorScanIdentity,
-        scan_schema: Arc<Schema>,
-        scan_bindings: Vec<novarocks_spi::connector::ConnectorRowMutationScanBinding>,
-        match_tokens: Vec<novarocks_spi::connector::ConnectorWriteFieldToken>,
-        written_version_token: novarocks_spi::connector::ConnectorWriteFieldToken,
     }
 
     /// The scripted provider owns only the original immutable signed source.
@@ -5768,7 +5761,7 @@ mod tests {
             ConnectorRowMutationScanBinding::new(source_version_token, 3),
         ];
         let match_tokens = vec![row_id_token];
-        let recipe = ConnectorRowMutationCohortRecipe::try_rewrite(
+        let _recipe = ConnectorRowMutationCohortRecipe::try_rewrite(
             cohort_id,
             route.route_id(),
             &selection,
@@ -5861,22 +5854,16 @@ mod tests {
 
         CowRewriteQueryFixture {
             selection,
-            recipe,
             input,
             route_facts,
             rows,
             rewrite_source,
-            route,
             preparation,
             identity: FrozenConnectorScanIdentity::new(
                 "default_catalog",
                 "__nr_cow",
                 "__nr_cow_t_abc",
             ),
-            scan_schema,
-            scan_bindings,
-            match_tokens,
-            written_version_token: source_version_token,
         }
     }
 

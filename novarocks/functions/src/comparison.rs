@@ -275,10 +275,6 @@ impl PreparedComparisonRecipe {
     /// The host supplies an actual required row and excludes inherited errors.
     /// This verifies only these two addresses, never scans a whole Selection.
     /// The caller flushes its own pending work before entering this scope.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Keep both actual source addresses and the caller-owned control explicit"
-    )]
     pub fn compare_rows(
         &self,
         left: EvaluatedArgument<'_>,

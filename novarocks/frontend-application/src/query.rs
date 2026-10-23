@@ -60,9 +60,7 @@ use novarocks_query_application::api::{
     QueryExecutionErrorKind, ResultDelivery, StatisticsCommandConsumer,
 };
 use novarocks_query_application::api::{BackendTopologyService, BackendTopologySnapshot};
-use novarocks_query_application::api::{
-    QueryResult, ResultField as QueryResultColumn, build_string_query_result,
-};
+use novarocks_query_application::api::{QueryResult, build_string_query_result};
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
 use novarocks_query_application::client_connection::ClientConnectionControlPort;
 use novarocks_query_application::cpu::{QueryBlockingExecutor, QueryCpuExecutor, QueryCpuRunError};
@@ -100,7 +98,6 @@ use novarocks_query_application::sql::session::{
     apply_session_set_assignment as apply_query_application_session_set_assignment,
 };
 use novarocks_query_application::sql::session_admit::SessionAdmitError;
-use novarocks_query_application::sql::user_variable::query_result_to_user_variable_literal;
 use novarocks_query_application::sql::{
     ProductCommandRouter, ProductSqlCommand, lower_product_sql_command,
 };
@@ -771,7 +768,7 @@ impl SpecializedStatementRoute for TypedCommandRoute {
 
 enum RoutedExecutionError {
     Execution {
-        input: novarocks_query_application::execution_error::ExecutionFailureInput,
+        input: Box<novarocks_query_application::execution_error::ExecutionFailureInput>,
         terminal: Option<novarocks_spi::connector::LakePublicationTerminal>,
         compile_control: Option<novarocks_type_contract::CompileControlError>,
         maintenance_publication_disposition:
@@ -812,7 +809,7 @@ fn routed_distributed_query_failure(
 ) -> RoutedExecutionError {
     let compile_control = error.compile_control_error();
     RoutedExecutionError::Execution {
-        input: error.into_execution_failure_input(),
+        input: Box::new(error.into_execution_failure_input()),
         terminal: None,
         compile_control,
         maintenance_publication_disposition: None,
@@ -829,7 +826,7 @@ fn dml_result<T>(result: Result<T, crate::dml::DmlError>) -> Result<T, RoutedExe
     result.map_err(|mut error| {
         if let Some(input) = error.execution_failure().cloned() {
             return RoutedExecutionError::Execution {
-                input,
+                input: Box::new(input),
                 terminal: error.publication_terminal().cloned(),
                 compile_control: error.compile_control_error(),
                 maintenance_publication_disposition: None,
@@ -886,7 +883,7 @@ fn routed_execution_service_error(error: RoutedExecutionError) -> QueryServiceEr
             compile_control,
             maintenance_publication_disposition,
         } => {
-            let mut service = QueryServiceError::from_execution_failure(input)
+            let mut service = QueryServiceError::from_execution_failure(*input)
                 .with_compile_control(compile_control);
             if let Some(disposition) = maintenance_publication_disposition {
                 service = service.attach_maintenance_publication_disposition(disposition);
@@ -1112,7 +1109,7 @@ fn product_command_error(error: CommandError) -> RoutedExecutionError {
     });
     if let Some(input) = input {
         return RoutedExecutionError::Execution {
-            input,
+            input: Box::new(input),
             terminal: None,
             compile_control: control,
             maintenance_publication_disposition: disposition,
@@ -1188,7 +1185,10 @@ impl FrontendQueryService {
         self
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The query processor constructor wires independent application owners and execution policies; a second aggregate would duplicate the composed service contract."
+    )]
     pub(crate) fn new(
         session_catalog_resolver: SessionCatalogService,
         query_compiler: FrontendQueryCompiler,
@@ -1316,10 +1316,9 @@ impl FrontendQuerySession {
         if matches!(
             error,
             GovernedQueryStatementBeginError::Admission(WorkError::Closed)
-        ) {
-            if let Some(admission) = self.service.serving_admission.admission_error() {
-                return query_service_admission_error(admission);
-            }
+        ) && let Some(admission) = self.service.serving_admission.admission_error()
+        {
+            return query_service_admission_error(admission);
         }
         governed_statement_begin_error(error)
     }
@@ -1405,7 +1404,7 @@ impl FrontendQuerySession {
         ) {
             return result;
         }
-        let mut governed = self
+        let governed = self
             .service
             .query_control
             .begin_governed_statement_with_result(
@@ -1581,6 +1580,10 @@ impl FrontendQuerySession {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The admission step keeps statement facts and owner capabilities explicit until validation completes; bundling would duplicate the frozen operation contract."
+    )]
     async fn prepare_governed_query_operation(
         &self,
         sql: &str,
@@ -1739,10 +1742,10 @@ impl FrontendQuerySession {
             .await
             .map_err(|error| self.governed_statement_begin_error(error))?;
         #[cfg(novarocks_dev_controls)]
-        if let Some(owner) = &self.service.statement_observation {
-            if let Err(error) = owner.bind_statement(statement.token(), &source) {
-                return Ok(self.governed_typed_error(internal_error(error), statement));
-            }
+        if let Some(owner) = &self.service.statement_observation
+            && let Err(error) = owner.bind_statement(statement.token(), &source)
+        {
+            return Ok(self.governed_typed_error(internal_error(error), statement));
         }
         // The staged/live session overlap and every scalar child belong to
         // this one whole window, acquired before copying or compiling them.
@@ -1961,10 +1964,10 @@ impl FrontendQuerySession {
             .await
             .map_err(|error| self.governed_statement_begin_error(error))?;
         #[cfg(novarocks_dev_controls)]
-        if let Some(owner) = &self.service.statement_observation {
-            if let Err(error) = owner.bind_statement(statement.token(), &sql) {
-                return Ok(self.governed_typed_error(internal_error(error), statement));
-            }
+        if let Some(owner) = &self.service.statement_observation
+            && let Err(error) = owner.bind_statement(statement.token(), &sql)
+        {
+            return Ok(self.governed_typed_error(internal_error(error), statement));
         }
 
         let state = self.state.lock().map_err(poisoned_state)?.clone();
@@ -2882,10 +2885,10 @@ fn with_query_hints(
 ) -> QueryOptions {
     let mut raw = *query_options.as_proto();
     raw.allow_throw_exception = sql_semantics.sql_mode().allow_throw_exception();
-    if let Some(query) = query {
-        if let Some(limit) = novarocks_sql::admission::query_mem_limit_hint(query) {
-            raw.query_mem_limit = limit;
-        }
+    if let Some(query) = query
+        && let Some(limit) = novarocks_sql::admission::query_mem_limit_hint(query)
+    {
+        raw.query_mem_limit = limit;
     }
     QueryOptions::from_proto(raw)
 }
@@ -3427,7 +3430,7 @@ mod tests {
         ] {
             let fact = original.failure_fact();
             let selected = novarocks_query_application::coordination::SelectedTaskTermination::new(
-                identity.clone(),
+                identity,
                 novarocks_execution_contract::TerminationDetail::Failed(
                     novarocks_execution_contract::TaskFailure::new_in_phase(
                         fact,
@@ -3525,11 +3528,7 @@ mod tests {
         MutationEngine, MutationOperation, MutationPrepared, MutationStageOutcome,
         MutationStatementKind, PrepareMutationRequest, PreparedMutation,
     };
-    use arrow::{
-        array::{Int64Array, StringArray},
-        datatypes::{DataType, Field, Schema},
-        record_batch::RecordBatch,
-    };
+    use arrow::{array::StringArray, datatypes::DataType};
     use novarocks_query_application::admitted_query_context::QueryExecutionContext;
     use novarocks_query_application::api::BackendTopologySnapshot;
     use novarocks_query_application::api::ResultField;
@@ -4437,7 +4436,7 @@ mod tests {
         assert!(!service.message().contains("Executor:"));
         let delayed = selected_execution_or_worker_fallback(
             Err(RoutedExecutionError::Execution {
-                input: input.clone(),
+                input: Box::new(input.clone()),
                 terminal: Some(terminal.clone()),
                 compile_control: None,
                 maintenance_publication_disposition: None,
@@ -4514,7 +4513,7 @@ mod tests {
                 compile_control,
                 maintenance_publication_disposition,
             });
-            assert_eq!(service.execution_failure(), Some(&input));
+            assert_eq!(service.execution_failure(), Some(input.as_ref()));
             assert_eq!(service.user_error(), Some(&input.user_error()));
             assert_ne!(service.kind(), QueryServiceErrorKind::Interrupted);
             assert_ne!(service.kind(), QueryServiceErrorKind::Timeout);
@@ -5366,7 +5365,6 @@ mod tests {
     /// Test-only router fixture. Production routing is the typed branch in
     /// `execute_typed_statement`; this helper keeps focused unit tests independent of
     /// a running frontend session.
-    #[allow(clippy::too_many_arguments)]
     fn execute_frontend_command<C>(
         dml: &DmlService,
         insert_engine: &dyn InsertEngine,

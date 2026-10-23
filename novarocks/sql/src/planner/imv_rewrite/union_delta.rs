@@ -904,7 +904,7 @@ mod tests {
     fn scan(name: &str, first_id: u32) -> LogicalPlanNode {
         let columns = vec![column_def("k"), column_def("v")];
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: name.to_string(),

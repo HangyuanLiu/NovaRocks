@@ -320,11 +320,10 @@ impl novarocks_type_contract::PureCompileControl for OutputTypeTrace {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push((phase, units));
-        if let Some((at, cause)) = self.refuse.clone() {
-            if trace.len() == at + 1 {
+        if let Some((at, cause)) = self.refuse.clone()
+            && trace.len() == at + 1 {
                 return Err(cause);
             }
-        }
         Ok(())
     }
 }

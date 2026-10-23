@@ -140,7 +140,7 @@ mod tests {
     use novarocks_mv_application::product::MvTarget;
     use novarocks_spi::connector::{
         ConnectorCommittedVersion, ConnectorInstanceId, ConnectorRequestContext,
-        ConnectorTableIdentity, ConnectorTableObjectId, MvObservedSourceField,
+        ConnectorTableIdentity, MvObservedSourceField,
         MvSchemaValidationObservation as SpiObservation,
     };
     use std::collections::BTreeSet;

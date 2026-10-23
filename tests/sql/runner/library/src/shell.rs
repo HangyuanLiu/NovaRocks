@@ -39,6 +39,7 @@ pub fn execute_shell_step(sql: &str) -> (bool, Option<QueryExecution>, String) {
 }
 
 /// The controlled caller supplies its existing absolute scenario clock.
+#[cfg(test)]
 pub(crate) fn execute_shell_step_until(
     sql: &str,
     deadline: Option<Instant>,
@@ -46,6 +47,7 @@ pub(crate) fn execute_shell_step_until(
     execute_shell_step_in_context(sql, deadline, None, false)
 }
 
+#[cfg(test)]
 pub(crate) fn execute_shell_step_in_context(
     sql: &str,
     deadline: Option<Instant>,

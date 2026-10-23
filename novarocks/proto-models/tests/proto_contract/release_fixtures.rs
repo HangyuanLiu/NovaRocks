@@ -178,7 +178,7 @@ fn release_query_execution_id() -> novarocks::QueryExecutionId {
 
 fn release_backend_process_id() -> novarocks::BackendProcessId {
     novarocks::BackendProcessId {
-        value: vec![1, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1].into(),
+        value: vec![1, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1],
     }
 }
 
@@ -187,7 +187,7 @@ fn release_creation_metadata() -> novarocks::CreationMetadata {
         query_context: Some(novarocks::QueryContextRef {
             query_execution_id: Some(release_query_execution_id()),
             frontend_process_id: Some(novarocks::FrontendProcessId {
-                value: vec![1, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 2].into(),
+                value: vec![1, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 2],
             }),
             backend_process_id: Some(release_backend_process_id()),
         }),

@@ -1201,7 +1201,7 @@ mod tests {
     fn base_scan(columns: &[OutputColumn]) -> LogicalPlanNode {
         let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "ns".to_string(),
                 table: iceberg_table("cat", "ns", "t", &names),
                 alias: None,
@@ -1856,7 +1856,7 @@ mod tests {
             JoinKind::Inner,
             base_scan(&[a.clone(), v.clone()]),
             LogicalPlanNode::new(
-                LogicalPlanKind::Scan(PlanScanNode {
+                LogicalPlanKind::scan(PlanScanNode {
                     database: "ns".to_string(),
                     table: iceberg_table("cat", "ns", "t2", &["c"]),
                     alias: None,
@@ -2198,7 +2198,7 @@ mod tests {
         let b = col(2, "b");
         let v = col(3, "v");
         let query_scan = LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "ns".to_string(),
                 table: iceberg_table("cat", "ns", "t", &["a", "b", "v"]),
                 alias: None,

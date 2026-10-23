@@ -67,14 +67,6 @@ pub enum StringDataError<'a> {
         source: &'a RegexSyntax,
     },
 }
-impl StringDataError<'_> {
-    pub(super) fn reason(self) -> DataFailureReason {
-        match self {
-            Self::Money(_) => DataFailureReason::NumericOutOfRange,
-            Self::Regex(_) | Self::RegexLiteral { .. } => DataFailureReason::InvalidValue,
-        }
-    }
-}
 impl fmt::Display for StringDataError<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -100,7 +92,7 @@ enum RequiredStringCause {
 }
 #[derive(Debug)]
 struct RequiredStringRowFailure {
-    row: usize,
+    _row: usize,
     cause: RequiredStringCause,
 }
 impl fmt::Display for RequiredStringRowFailure {
@@ -142,7 +134,7 @@ impl FailureProjection for RequiredStringRowFailure {
 impl OuterFailureProjection for RequiredStringRowFailure {}
 pub(super) fn required_row(row: usize, source: StringDataError<'_>) -> KernelFailure {
     KernelFailure::from_domain(RequiredStringRowFailure {
-        row,
+        _row: row,
         cause: match source {
             StringDataError::Money(source) => RequiredStringCause::Money(source),
             StringDataError::Regex(source) => RequiredStringCause::Regex(source.clone()),
@@ -157,7 +149,7 @@ pub(super) fn required_row(row: usize, source: StringDataError<'_>) -> KernelFai
 }
 pub(super) fn required_journal(source: &RowDataError) -> KernelFailure {
     KernelFailure::from_domain(RequiredStringRowFailure {
-        row: source.selected_ordinal(),
+        _row: source.selected_ordinal(),
         cause: RequiredStringCause::Journal(source.clone()),
     })
 }
@@ -292,7 +284,7 @@ pub(super) fn regex_syntax(source: &Arc<regex::Error>) -> Result<RegexSyntax, Ke
 }
 
 #[cfg(test)]
-pub(super) fn original_source<'a, E: Error + 'static>(failure: &'a KernelFailure) -> &'a E {
+pub(super) fn original_source<E: Error + 'static>(failure: &KernelFailure) -> &E {
     let mut source: &(dyn Error + 'static) = failure;
     loop {
         if let Some(source) = source.downcast_ref::<E>() {
@@ -308,7 +300,7 @@ pub(super) fn original_source<'a, E: Error + 'static>(failure: &'a KernelFailure
 mod properties {
     use super::super::string_extended::{StringOperation, evaluate_required};
     use super::*;
-    use arrow_array::{Array, ArrayRef, Int32Array, StringArray};
+    use arrow_array::{ArrayRef, Int32Array, StringArray};
 
     #[test]
     fn actual_regex_compiled_size_refusal_keeps_original_sdk_and_known_limit() {
@@ -345,7 +337,10 @@ mod properties {
         assert!(weak.iter().all(|input| input.upgrade().is_none()));
         assert_eq!(failure.failure_fact().class(), FailureClass::Data);
         assert_eq!(failure.failure_fact().reason().code(), 40);
-        assert_eq!(original_source::<RequiredStringRowFailure>(&failure).row, 0);
+        assert_eq!(
+            original_source::<RequiredStringRowFailure>(&failure)._row,
+            0
+        );
         assert_eq!(
             original_source::<regex::Error>(&failure).to_string(),
             original
@@ -359,7 +354,10 @@ mod properties {
         let failure = evaluate_required(StringOperation::Money, &[input], 2).unwrap_err();
         assert!(weak.upgrade().is_none());
         assert_eq!(failure.failure_fact().reason().code(), 41);
-        assert_eq!(original_source::<RequiredStringRowFailure>(&failure).row, 0);
+        assert_eq!(
+            original_source::<RequiredStringRowFailure>(&failure)._row,
+            0
+        );
         assert_eq!(
             *original_source::<MoneyDataFailure>(&failure),
             MoneyDataFailure::NonFinite

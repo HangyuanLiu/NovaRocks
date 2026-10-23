@@ -297,7 +297,6 @@ impl ConnectorMetadataMaintenancePlan {
     /// record. This constructor validates every bounded carrier field and the
     /// semantic plan digest; it deliberately cannot recreate an operation from
     /// a current connector generation.
-    #[allow(clippy::too_many_arguments)]
     pub fn try_restore(
         owner: ConnectorProviderBindingKey,
         operation_id: ConnectorMutationOperationId,
@@ -427,7 +426,6 @@ pub struct ConnectorMetadataMaintenanceReceipt {
     provider_payload_digest: [u8; 32],
 }
 impl ConnectorMetadataMaintenanceReceipt {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,

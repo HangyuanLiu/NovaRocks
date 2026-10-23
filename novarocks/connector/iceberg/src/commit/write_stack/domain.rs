@@ -574,7 +574,10 @@ pub struct IcebergWriteTableFacts {
 }
 
 impl IcebergWriteTableFacts {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "This public constructor preserves the frozen write-fact field contract without changing its callers."
+    )]
     pub fn try_new(
         table_uuid: String,
         namespace: String,

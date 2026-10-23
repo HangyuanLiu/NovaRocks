@@ -25,12 +25,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 #[cfg(test)]
-use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::connector::backend::ResolvedTableStatisticsPin;
-use arrow::datatypes::SchemaRef;
 use novarocks_query_application::api::ExactBindingReceiptStore;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorReadSelector, ConnectorTableHandle,
@@ -328,18 +326,13 @@ pub struct QueryWriteTargetAdmission {
 /// request-local binding token rather than from a planner table.
 #[derive(Clone)]
 pub struct QueryScanMaterialization {
-    /// Provider-neutral scan authority.  The handle is opaque to Core; the
-    /// schema is the single projection-ordinal authority and the lease keeps
-    /// the exact control generation alive until native preparation finishes.
+    /// Provider-neutral scan authority. The handle is opaque to Core; the
+    /// lease keeps the exact control generation alive until native preparation.
     pub table: ConnectorTableHandle,
-    /// Exact desired-state identity of the catalog that owns `table`.
-    pub catalog_handle: novarocks_spi::connector::CatalogHandle,
-    pub schema: SchemaRef,
     pub selector: ConnectorReadSelector,
     /// Provider-owned exact file selection for an affected MV target read.
     pub mv_partition_selection:
         Option<novarocks_spi::connector::read_stack::ConnectorMvTargetPartitionSelection>,
-    pub statistics_pin: Option<ResolvedTableStatisticsPin>,
     pub planning_lease: ConnectorControlPlanningLease,
 }
 
@@ -387,46 +380,6 @@ impl QueryTableBinding {
     }
 }
 
-/// Build the complete owner-side admission retained by delta-preparation
-/// tests. The SQL scan itself comes from a sealed SQL fixture; this helper
-/// only pairs its opaque request-local token with one provider-sealed change
-/// window and never exposes a planner table constructor.
-#[cfg(test)]
-pub fn admitted_change_window_binding_for_test(
-    binding: SqlTableBindingId,
-    from_snapshot_id: i64,
-    to_snapshot_id: i64,
-    scan: novarocks_spi::connector::ConnectorScan,
-) -> QueryTableBinding {
-    let resolved = catalog::materialize_connector_read_table(
-        novarocks_sql::planning::catalog::ConnectorReadTableFacts {
-            catalog: "test_catalog".to_string(),
-            namespace: "test_db".to_string(),
-            table: "test_table".to_string(),
-            columns: Vec::new(),
-            iceberg_row_lineage_metadata_columns: Vec::new(),
-            schema: std::sync::Arc::new(arrow::datatypes::Schema::empty()),
-            binding,
-            selector: ConnectorReadSelector::Current,
-            planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
-        },
-    )
-    .expect("test catalog facts materialize")
-    .into_resolved_table();
-    QueryTableBinding {
-        resolved,
-        statistics_pin: None,
-        admission: QueryTableBindingAdmission::Local,
-        source_metadata: None,
-        scan_materialization: None,
-        mv_target_read: None,
-        write_target_admission: None,
-        frozen_cohort_read: None,
-        frozen_snapshot_materializations: BTreeMap::new(),
-        admitted_change_scans: BTreeMap::from([((from_snapshot_id, to_snapshot_id), scan)]),
-    }
-}
-
 struct StoredBinding {
     id: SqlTableBindingId,
 }
@@ -440,6 +393,7 @@ pub struct QueryTableBindingStore {
     /// Once a statement enters a topology-only replan, an unknown lookup must
     /// not materialize a newer catalog/connector `Current` state. Existing
     /// request-local bindings remain readable and keep their exact leases.
+    #[cfg(test)]
     sealed_for_topology_replan: AtomicBool,
 }
 
@@ -454,32 +408,14 @@ impl QueryTableBindingStore {
             exact_binding_receipts,
             entries: Mutex::new(HashMap::new()),
             by_id: Mutex::new(HashMap::new()),
+            #[cfg(test)]
             sealed_for_topology_replan: AtomicBool::new(false),
         })
     }
 
-    /// Construct a deterministic request-local store for owner-side unit
-    /// fixtures.  Production admission must always use `try_new`, which
-    /// allocates a process-unique scope.  Tests use this only alongside
-    /// `test_sql_scan_source`, whose token has the same fixed scope.
+    /// Exercise the topology-replan rule that a sealed request reuses its
+    /// admitted bindings and rejects new catalog or connector state.
     #[cfg(test)]
-    pub fn try_new_with_scope_for_test(scope: NonZeroU64) -> Self {
-        let allocator = SqlTableBindingAllocator::try_new_for_test(scope)
-            .expect("test binding scope must construct SQL allocator");
-        let exact_binding_receipts = ExactBindingReceiptStore::new(&allocator);
-        Self {
-            allocator: Mutex::new(allocator),
-            exact_binding_receipts,
-            entries: Mutex::new(HashMap::new()),
-            by_id: Mutex::new(HashMap::new()),
-            sealed_for_topology_replan: AtomicBool::new(false),
-        }
-    }
-
-    /// Freeze this request-local materializer after the first statement round
-    /// has admitted its semantic bindings. A later distributed topology round
-    /// may only reuse already-captured keys; it must fail closed rather than
-    /// loading a newer table, snapshot, or connector incarnation.
     pub fn seal_for_topology_replan(&self) {
         // Serialize with `resolve_or_insert_with_id`, which keeps `entries`
         // locked across the one permitted first-load callback.
@@ -487,10 +423,6 @@ impl QueryTableBindingStore {
         self.exact_binding_receipts.seal();
         self.sealed_for_topology_replan
             .store(true, Ordering::Release);
-    }
-
-    pub fn is_sealed_for_topology_replan(&self) -> bool {
-        self.sealed_for_topology_replan.load(Ordering::Acquire)
     }
 
     /// Stable, redacted identity material for one admitted binding set.
@@ -541,6 +473,7 @@ impl QueryTableBindingStore {
 
     /// Memoize both success and failure.  The supplied load closure executes
     /// at most once for a canonical key in this request.
+    #[cfg(test)]
     pub fn resolve_or_insert(
         &self,
         key: QueryTableBindingKey,
@@ -566,6 +499,7 @@ impl QueryTableBindingStore {
         if let Some(entry) = entries.get(&key) {
             return entry.as_ref().map(|stored| stored.id).map_err(Clone::clone);
         }
+        #[cfg(test)]
         if self.sealed_for_topology_replan.load(Ordering::Acquire) {
             return Err(
                 "topology replan attempted to materialize a binding absent from the first admitted semantic snapshot"
@@ -621,23 +555,10 @@ impl QueryTableBindingStore {
             .ok_or_else(|| "SQL table binding token is missing from this request".to_string())
     }
 
-    pub fn statistics_pin(
-        &self,
-        id: SqlTableBindingId,
-    ) -> Result<Option<ResolvedTableStatisticsPin>, String> {
-        Ok(self.binding(id)?.statistics_pin.clone())
-    }
-
-    pub fn exact_planning_lease(
-        &self,
-        id: SqlTableBindingId,
-    ) -> Result<ConnectorControlPlanningLease, String> {
-        self.binding(id)?.admission.exact_planning_lease()
-    }
-
     /// Recover provider scan facts only through the exact request-local token.
     /// A missing materialization is a submission-time contract failure, not a
     /// reason to resolve a current table or connector generation.
+    #[cfg(test)]
     pub fn scan_materialization(
         &self,
         id: SqlTableBindingId,
@@ -733,37 +654,10 @@ impl QueryTableBindingStore {
         ))
     }
 
-    /// Return the explicitly admitted Iceberg writer binding for one target.
-    /// Read and write bindings for the same physical table are intentionally
-    /// distinct: the writer token owns its physical output schema and exact
-    /// lease, while scans retain their own selector and materialization.
-    pub fn admitted_iceberg_write_binding_id(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> Result<SqlTableBindingId, String> {
-        let matches = self
-            .captured_bindings()
-            .into_iter()
-            .filter(|(_, binding)| {
-                catalog::materialization_identity_facts(&binding.resolved)
-                    .matches(catalog, namespace, table)
-                    && binding.write_target_admission.is_some()
-            })
-            .collect::<Vec<_>>();
-        let [binding] = matches.as_slice() else {
-            return Err(format!(
-                "SQL write target {catalog}.{namespace}.{table} does not have exactly one admitted Iceberg provider preparation"
-            ));
-        };
-        let binding = &binding.1;
-        Ok(catalog::table_binding_id(&binding.resolved))
-    }
-
     /// Return the one admission-frozen MV target binding.  The UUID and
     /// snapshot are part of the lookup key so a recreated target or a later
     /// refresh baseline can never reuse an earlier request's authority.
+    #[cfg(test)]
     pub fn mv_target_binding_id(
         &self,
         catalog: &str,

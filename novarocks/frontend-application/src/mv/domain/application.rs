@@ -266,15 +266,11 @@ pub struct MvRequestContext<'a> {
 pub enum MvApplicationErrorKind {
     InvalidRequest,
     Engine,
-    Repository,
     Unavailable,
     /// The exact pre-dispatch target binding changed before any provider
     /// effect was emitted. A fresh preparation may be attempted.
     BindingInvalidated,
     AlreadyActive,
-    TargetGone,
-    Corruption,
-    TerminalFailure,
     ShutdownCancelled,
     CommitUnknown,
     KnownCommittedFinalizeFailed,
@@ -446,7 +442,7 @@ impl MvCreateProviderError {
 
 impl fmt::Display for MvCreateProviderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
+        formatter.write_str(self.message())
     }
 }
 

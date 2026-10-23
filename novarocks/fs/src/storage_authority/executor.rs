@@ -63,7 +63,7 @@ impl RefreshExecutor for TokioRefreshExecutor {
     fn execute(&self, job: Box<dyn FnOnce() + Send + 'static>) {
         // The handle is injected, never discovered: this crate does not reach
         // for a current runtime on a connector's behalf.
-        self.handle.spawn_blocking(move || job());
+        self.handle.spawn_blocking(job);
     }
 }
 

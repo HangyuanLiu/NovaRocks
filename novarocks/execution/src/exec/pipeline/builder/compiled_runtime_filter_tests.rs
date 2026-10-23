@@ -1138,13 +1138,12 @@ impl execution::RuntimeFilterSession for FakeSession {
         if let Some(installed) = self
             .installed_producers
             .get(&request.contract().binding_id().get())
+            && request.contract() != installed
         {
-            if request.contract() != installed {
-                return Err(execution::RuntimeFilterContractViolation::new(
-                    execution::RuntimeFilterContractViolationKind::ContractMismatch,
-                    "producer contract differs from the independently installed complete declaration",
-                ));
-            }
+            return Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::ContractMismatch,
+                "producer contract differs from the independently installed complete declaration",
+            ));
         }
         let producer = self
             .producers
@@ -2407,10 +2406,10 @@ fn join_probe_owned_root_frame_every_actual_callback_keeps_seven_causes_and_latc
             let mut calls = self.calls.lock().unwrap();
             let at = calls.len();
             calls.push(units);
-            if let Some((stop, cause)) = &self.refusal {
-                if at == *stop {
-                    return Err(cause.clone());
-                }
+            if let Some((stop, cause)) = &self.refusal
+                && at == *stop
+            {
+                return Err(cause.clone());
             }
             Ok(())
         }

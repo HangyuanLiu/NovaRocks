@@ -19,6 +19,7 @@
 //! These are not Worker ordering oracles. Actual Arrow values are decoded only
 //! for comparison with independent literal results, never to derive expected.
 use super::*;
+use arrow::array::ArrayRef;
 
 const KEYS: [Option<i64>; 8] = [
     Some(3),

@@ -134,13 +134,7 @@ pub(crate) fn baseline_revision_for_occurrence<'a>(
 ) -> Result<&'a ConnectorExactSemanticRevision, String> {
     let RefreshStateBaseline::SnapshotBacked {
         previous_sources, ..
-    } = baseline
-    else {
-        return Err(format!(
-            "MV refresh has no published baseline for {}",
-            occurrence.display()
-        ));
-    };
+    } = baseline;
     let mut matches = previous_sources.iter().filter(|source| {
         source.occurrence_id == occurrence.occurrence_id && source.table == occurrence.table
     });
@@ -208,7 +202,6 @@ pub(crate) fn baseline_predecessors(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RefreshStateBaseline {
-    Pinless,
     SnapshotBacked {
         /// Ordered P inputs. Provider-native data versions remain opaque; a
         /// consumer that needs a typed selector must ask the provider rather

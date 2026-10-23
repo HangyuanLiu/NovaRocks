@@ -328,7 +328,6 @@ async fn write_closing<'writer, W: AsyncWrite + Unpin>(
         Err(refusal) => Err(refusal.disconnect()),
     }
 }
-#[allow(clippy::result_large_err)]
 fn prepare_closing<'writer, W: AsyncWrite + Unpin>(
     mut protocol: GovernedProtocolOwner,
     writer: TerminalWriter<'writer, W>,

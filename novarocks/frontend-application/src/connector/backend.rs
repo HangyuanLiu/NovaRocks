@@ -42,11 +42,5 @@ impl std::fmt::Debug for ResolvedTableStatisticsPin {
 /// and to register the table with the in-memory logical catalog.
 #[derive(Clone, Debug)]
 pub struct ResolvedTable {
-    pub catalog: String,
-    pub namespace: String,
-    pub table: String,
     pub columns: Vec<ColumnDef>,
-    /// This pin is distinct from the schema version and must travel with any
-    /// scan that later consumes connector statistics.
-    pub statistics_pin: Option<ResolvedTableStatisticsPin>,
 }

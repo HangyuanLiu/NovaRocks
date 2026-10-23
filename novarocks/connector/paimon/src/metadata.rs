@@ -302,10 +302,10 @@ pub(crate) fn validate_schema_evolution(
         .map(|field| (field.id(), field))
         .collect::<BTreeMap<_, _>>();
     for (id, old) in &old_by_id {
-        if let Some(current) = output_by_id.get(id) {
-            if data_type(old.data_type())? != data_type(current.data_type())? {
-                return Err(unsupported("Paimon field type evolution is unsupported"));
-            }
+        if let Some(current) = output_by_id.get(id)
+            && data_type(old.data_type())? != data_type(current.data_type())?
+        {
+            return Err(unsupported("Paimon field type evolution is unsupported"));
         }
     }
     for (id, current) in &output_by_id {

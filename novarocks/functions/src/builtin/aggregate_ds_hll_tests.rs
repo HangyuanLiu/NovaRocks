@@ -19,7 +19,7 @@
 use super::*;
 use crate::opaque_memory::OpaqueAllocationHost;
 use arrow_array::StringArray;
-use arrow_schema::{Field, Fields};
+use arrow_schema::Field;
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
     EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,

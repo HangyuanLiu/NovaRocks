@@ -154,10 +154,6 @@ pub type FrozenConnectorScan = ConnectorScan<ConnectorReadRelationRecipeDraft>;
 pub type StaticConnectorScan = ConnectorScan<ConnectorReadRelationRecipe>;
 
 impl<R: AsRef<ConnectorReadRelationRecipeDraft>> ConnectorScan<R> {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The frozen scan has independent public semantics and one provider recipe."
-    )]
     pub fn try_new(
         recipe: R,
         assignments: Vec<StaticScanAssignment>,

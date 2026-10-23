@@ -953,6 +953,7 @@ pub(crate) fn validate_plan_constants_observed(
     result
 }
 
+#[cfg(test)]
 pub(crate) fn validate_plan_constants_in(
     plan: &crate::PhysicalPlan,
     work: &mut CompileCheckpoints<'_>,

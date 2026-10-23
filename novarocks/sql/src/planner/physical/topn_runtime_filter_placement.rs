@@ -155,7 +155,7 @@ fn prove_topn_placement(
         return None;
     }
     let order_expr = &topn.items[0].expr;
-    if !is_supported_topn_key_type(&order_expr.value_type.data_type()) {
+    if !is_supported_topn_key_type(order_expr.value_type.data_type()) {
         return None;
     }
     let direction = if topn.items[0].asc {

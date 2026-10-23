@@ -17,7 +17,7 @@
 //! Exact Physical FSB16 cast profile; nominal LargeInt remains a hidden conversion.
 use super::*;
 use crate::{ConstantPolicy, ConstantPool, SelectedValues, Selection};
-use arrow_array::{ArrayRef, FixedSizeBinaryArray};
+use arrow_array::ArrayRef;
 use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
 use std::{
     sync::{Arc, Mutex},

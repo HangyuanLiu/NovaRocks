@@ -247,7 +247,7 @@ mod tests {
     }
 
     fn scan_plan(scan: PlanScanNode) -> LogicalPlanNode {
-        LogicalPlanNode::new(LogicalPlanKind::Scan(scan), vec![], None)
+        LogicalPlanNode::new(LogicalPlanKind::scan(scan), vec![], None)
     }
 
     #[test]

@@ -113,7 +113,7 @@ pub(crate) fn hash_actual<E, T>(public_capacity: usize) -> Result<u64, Failure<E
         }
         public_capacity.checked_add(1).ok_or(Failure::Overflow)?
     } else {
-        if public_capacity % 7 != 0 {
+        if !public_capacity.is_multiple_of(7) {
             return Err(Failure::ReceiptExceeded);
         }
         public_capacity

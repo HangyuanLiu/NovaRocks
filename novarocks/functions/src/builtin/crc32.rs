@@ -169,11 +169,15 @@ fn evaluate_bytes(
         work.step()?;
         let row = argument.value_row(ordinal, batch_row);
         if selected && row >= values.len() {
-            return Err(internal("crc32 selected row is outside its checked carrier").into());
+            return Err(internal(
+                "crc32 selected row is outside its checked carrier",
+            ));
         }
         if values.is_null(row) {
             if !nullable {
-                return Err(internal("crc32 non-null argument contains selected SQL NULL").into());
+                return Err(internal(
+                    "crc32 non-null argument contains selected SQL NULL",
+                ));
             }
             builder.append_null();
         } else {

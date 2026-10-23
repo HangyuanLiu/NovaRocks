@@ -17,26 +17,16 @@
 
 use std::sync::Arc;
 
-use crate::query_execution::completion::{PreparedImmediateQuery, PreparedQueryCompletion};
 use novarocks_parser::ast::Query;
 use novarocks_proto_codec::lifecycle::QueryOptions;
+#[cfg(test)]
 use novarocks_query_application::api::QueryResult;
-#[cfg(test)]
-use novarocks_query_application::api::build_string_query_result;
-#[cfg(test)]
-use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
-#[cfg(test)]
-use novarocks_sql::planning::catalog::TableLookupMode;
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
-#[cfg(test)]
-use crate::catalog_application::query_materializer::build_catalog_service_provider;
 use novarocks_types::naming::normalize_identifier;
 
 use crate::catalog_application::query_catalog::{CatalogServiceSource, catalog_service_snapshot};
 use crate::query_execution::kernels as domain;
-#[cfg(test)]
-use crate::query_execution::planning::time_travel::TimeTravelRewriteError;
 use crate::query_execution::planning::time_travel::{
     has_time_travel_refs, rewrite_time_travel_refs,
 };
@@ -53,7 +43,6 @@ macro_rules! impl_kernel_catalog_service_source {
 
 impl_kernel_catalog_service_source!(domain::QueryPreparationKernel);
 impl_kernel_catalog_service_source!(domain::DmlExecutionKernel);
-impl_kernel_catalog_service_source!(domain::CatalogCommandKernel);
 impl_kernel_catalog_service_source!(domain::ViewExecutionKernel);
 impl_kernel_catalog_service_source!(domain::MaintenanceExecutionKernel);
 
@@ -1098,51 +1087,6 @@ pub(crate) fn typed_connector_session()
 }
 
 #[cfg(test)]
-fn prepare_explain_query_with_ports(
-    query_kernel: &domain::QueryPreparationKernel,
-    view_kernel: &domain::ViewExecutionKernel,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    query: &Query,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<Query, String> {
-    let mut prepared = query.clone();
-    view_kernel.view_service().rewrite_query(
-        &crate::view::engine::FrontendViewEngine::new(view_kernel.clone()),
-        &mut prepared,
-        novarocks_query_application::view::ViewRequestContext {
-            current_catalog,
-            current_database,
-            connector_context: Some(connector_context),
-        },
-        &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-    )?;
-
-    // Time-travel refs become synthetic local tables. Ordinary Iceberg refs
-    // remain untouched and resolve through the query catalog materializer during analysis.
-    if has_time_travel_refs(&prepared) {
-        rewrite_time_travel_refs(
-            query_kernel,
-            current_catalog,
-            current_database,
-            &mut prepared,
-            connector_context,
-        )
-        .map_err(test_time_travel_rewrite_error)?;
-    }
-
-    Ok(prepared)
-}
-
-#[cfg(test)]
-fn test_time_travel_rewrite_error(error: TimeTravelRewriteError) -> String {
-    match error {
-        TimeTravelRewriteError::Engine(error) => error,
-        TimeTravelRewriteError::Analyze(error) => error.to_string(),
-    }
-}
-
-#[cfg(test)]
 fn query_options_for_explain_analyze(query_options: Option<QueryOptions>) -> QueryOptions {
     let mut raw = query_options
         .as_ref()
@@ -1174,7 +1118,10 @@ pub(crate) fn iceberg_write_shuffle_by_output_index(
 /// The session is both the reason the plan is a dataflow and the source of the
 /// recipes it carries, so it is taken here rather than attached later: a plan
 /// and the session that sealed it must not be separable.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The write compiler keeps its frozen session and owner capabilities explicit for boundary validation; a wrapper would duplicate the write contract."
+)]
 pub(crate) fn prepare_query_as_iceberg_write_with_write_session(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
@@ -1206,7 +1153,10 @@ pub(crate) fn prepare_query_as_iceberg_write_with_write_session(
 
 /// The original constant source author retains complete types separately from
 /// the owned syntax query; ordinary cells use the same compiler body.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The write compiler validates constants, session, and target as separate frozen facts; bundling would duplicate the operation-specific contract."
+)]
 pub(crate) fn prepare_query_as_iceberg_write_with_write_session_and_constants(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
@@ -1252,7 +1202,10 @@ pub(crate) fn prepare_query_as_iceberg_write_with_write_session_and_constants(
 /// replaces: the frozen single-file source is not a durable catalog table, and
 /// the overlay is consumed by the application materializer without ever being
 /// registered in the shared local catalog.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The compiler validates the write target, plan, and owner capabilities independently; a parameter bundle would duplicate the frozen target contract."
+)]
 pub(crate) fn prepare_query_as_iceberg_write_at_write_target(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
@@ -1399,7 +1352,10 @@ enum DmlMaterializedWriteSource {
     Expressions(novarocks_sql::compiler::SqlExpressionConstants),
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The final binding step validates separate plan, target, and connector facts; bundling them would duplicate the validated write contract."
+)]
 fn prepare_query_as_iceberg_write_with_connector_binding(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
@@ -1692,14 +1648,14 @@ pub(crate) struct ChangeStreamWriteTestObserverGuard;
 )]
 impl ChangeStreamWriteTestObserverGuard {
     fn take_observations(&self) -> Vec<ChangeStreamWriteBuildObservation> {
-        change_stream_write_test_observer()
-            .lock()
-            .expect("change-stream write test observer lock")
-            .as_mut()
-            .expect("change-stream write test observer installed")
-            .observations
-            .drain(..)
-            .collect()
+        std::mem::take(
+            &mut change_stream_write_test_observer()
+                .lock()
+                .expect("change-stream write test observer lock")
+                .as_mut()
+                .expect("change-stream write test observer installed")
+                .observations,
+        )
     }
 }
 
@@ -1786,18 +1742,6 @@ fn execute_bound_distributed_write_request(
         .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
         .map(crate::query_execution::outcome::WriteExecutionOutcome::into_execution_result)
         .map_err(|error| error.to_string())
-}
-
-fn change_stream_write_optimizer_settings() -> novarocks_sql::compiler::SessionOptimizerSettings {
-    // A change-stream write carries old/new row pairs and target locators across
-    // independent fragments. A query runtime filter may describe only one data
-    // branch, so pushing it into a locator scan can suppress rows required by a
-    // DELETE. Keep this system-generated mutation plan free of runtime filters;
-    // its explicit predicates and connector pruning remain enabled.
-    novarocks_sql::compiler::SessionOptimizerSettings {
-        enable_global_runtime_filter: Some(false),
-        ..Default::default()
-    }
 }
 
 fn execute_distributed_write_request(

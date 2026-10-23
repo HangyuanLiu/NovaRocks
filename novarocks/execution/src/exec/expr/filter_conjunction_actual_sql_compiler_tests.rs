@@ -17,29 +17,20 @@
 //! Permanent real SQL package and LocalCompiler complete Filter consumer contract.
 use super::ndv_filter_actual_sql_source_tests::ndv_sql_source;
 use super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
-use arrow::{
-    array::{Array, ArrayRef, Int32Array, Int64Array},
-    datatypes::{DataType, Field, Schema},
-    record_batch::RecordBatch,
-};
+use arrow::datatypes::{DataType, Field, Schema};
 use novarocks_connector_contract::*;
 use novarocks_functions::*;
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
 };
-use novarocks_local_program::{
-    KernelAbiVersion, LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole,
-    ProgramNodeKind, ProgramUseRef, StaticExprKind,
-};
+use novarocks_local_program::{KernelAbiVersion, LocalProgram, ProgramNodeKind};
 use novarocks_physical_plan::*;
 use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, author_fragment_package_semantics};
-use novarocks_type_contract::{
-    CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
-};
+use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::{
     collections::BTreeMap,
     num::{NonZeroU64, NonZeroUsize},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 struct Control;
@@ -417,12 +408,12 @@ fn permanent() {
     let mut filter_fragment = None;
     for (&id, fragment) in source.plan().fragments() {
         for node in fragment.nodes().values() {
-            if let NodeKind::Filter { predicates } = &node.kind {
-                if predicates.len() > 1 {
-                    assert_eq!(node.inputs.len(), 1);
-                    assert_eq!(predicates.len(), 2);
-                    assert!(filter_fragment.replace((id, node.id)).is_none());
-                }
+            if let NodeKind::Filter { predicates } = &node.kind
+                && predicates.len() > 1
+            {
+                assert_eq!(node.inputs.len(), 1);
+                assert_eq!(predicates.len(), 2);
+                assert!(filter_fragment.replace((id, node.id)).is_none());
             }
         }
     }

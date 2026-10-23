@@ -25,8 +25,7 @@
 use std::sync::Arc;
 
 use novarocks_spi::connector::{
-    ConnectorProviderBindingKey, ConnectorTableHandle, ConnectorWriteCohortId,
-    ConnectorWriteOperationId,
+    ConnectorProviderBindingKey, ConnectorTableHandle, ConnectorWriteOperationId,
 };
 
 use crate::mv::domain::rewrite::context::{MvRewriteAnalysisFacts, MvRewriteSourceSnapshot};
@@ -51,7 +50,6 @@ pub(crate) enum MvStagedRefreshWriteMode {
 pub(crate) struct MvFirstRefreshLogicalContext {
     pub(crate) mv_definition:
         novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
-    pub(crate) canonical_select_query: novarocks_parser::ast::Query,
     pub(crate) base_refs: Vec<novarocks_types::naming::TableIdentity>,
     pub(crate) pin: Vec<MvRewriteSourceSnapshot>,
     pub(crate) previous: Vec<MvRewriteSourceSnapshot>,
@@ -131,7 +129,10 @@ pub(crate) struct MvFirstRefreshWriteRequest {
 }
 
 impl MvFirstRefreshWriteRequest {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The constructor validates every frozen refresh-artifact field independently; an input wrapper would duplicate the immutable artifact without adding an invariant."
+    )]
     pub(crate) fn try_new(
         target_catalog: String,
         target_namespace: String,
@@ -223,7 +224,6 @@ impl MvFirstRefreshWriteRequest {
 pub struct PreparedMvFirstRefreshWrite {
     request: MvFirstRefreshWriteRequest,
     artifact: MvFirstRefreshExecutionArtifact,
-    primary_cohort: ConnectorWriteCohortId,
     write_mode: MvStagedRefreshWriteMode,
     publication_intent: MvRefreshPublicationIntent,
 }
@@ -231,10 +231,6 @@ pub struct PreparedMvFirstRefreshWrite {
 impl PreparedMvFirstRefreshWrite {
     pub fn operation_id(&self) -> ConnectorWriteOperationId {
         self.request.operation_id()
-    }
-
-    pub fn primary_cohort(&self) -> ConnectorWriteCohortId {
-        self.primary_cohort
     }
 
     pub(crate) fn observed_binding(&self) -> &ConnectorProviderBindingKey {
@@ -267,10 +263,6 @@ impl PreparedMvFirstRefreshWrite {
         self.request.target_name()
     }
 
-    pub(crate) fn staging_branch(&self) -> &str {
-        self.request.staging_branch()
-    }
-
     pub(crate) fn current_catalog(&self) -> Option<&str> {
         self.request.current_catalog()
     }
@@ -281,10 +273,6 @@ impl PreparedMvFirstRefreshWrite {
 
     pub(crate) const fn expected_target_snapshot_id(&self) -> Option<i64> {
         self.request.expected_target_snapshot_id()
-    }
-
-    pub(crate) const fn write_mode(&self) -> MvStagedRefreshWriteMode {
-        self.write_mode
     }
 
     pub(crate) fn into_full_overwrite(mut self) -> Self {
@@ -376,11 +364,9 @@ impl MvFirstRefreshWritePreparer {
                 "MV first-refresh publication intent does not match write target".to_string(),
             );
         }
-        let operation_id = request.operation_id();
         Ok(PreparedMvFirstRefreshWrite {
             request,
             artifact,
-            primary_cohort: ConnectorWriteCohortId::primary(operation_id),
             write_mode,
             publication_intent,
         })
@@ -405,8 +391,6 @@ pub(crate) struct MvIncrementalWriteRequest {
     pub(crate) target_namespace: String,
     pub(crate) target_name: String,
     pub(crate) staging_branch: String,
-    pub(crate) current_catalog: Option<String>,
-    pub(crate) current_database: String,
     pub(crate) expected_target_snapshot_id: Option<i64>,
     pub(crate) observed_binding: ConnectorProviderBindingKey,
     pub(crate) operation_id: ConnectorWriteOperationId,
@@ -420,13 +404,11 @@ impl MvIncrementalWriteRequest {
         &self.target_table
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         target_catalog: String,
         target_namespace: String,
         target_name: String,
         staging_branch: String,
-        current_catalog: Option<String>,
         current_database: String,
         expected_target_snapshot_id: Option<i64>,
         observed_binding: ConnectorProviderBindingKey,
@@ -446,8 +428,6 @@ impl MvIncrementalWriteRequest {
             target_namespace,
             target_name,
             staging_branch,
-            current_catalog,
-            current_database,
             expected_target_snapshot_id,
             observed_binding,
             operation_id,
@@ -469,10 +449,6 @@ pub struct PreparedMvIncrementalWrite {
 impl PreparedMvIncrementalWrite {
     pub fn operation_id(&self) -> ConnectorWriteOperationId {
         self.request.operation_id
-    }
-
-    pub fn primary_cohort(&self) -> ConnectorWriteCohortId {
-        ConnectorWriteCohortId::primary(self.request.operation_id)
     }
 
     pub(crate) fn publication_intent(&self) -> &MvRefreshPublicationIntent {
@@ -600,7 +576,6 @@ mod incremental_tests {
             "db".to_string(),
             "mv".to_string(),
             String::new(),
-            Some("ice".to_string()),
             "db".to_string(),
             Some(7),
             ConnectorProviderBindingKey {

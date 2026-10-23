@@ -272,7 +272,7 @@ fn writer_schema_complete_independent_wire_preserves_roles_names_revision_and_fu
                 DataType::List(f) => f,
                 _ => unreachable!(),
             };
-            assert!(Arc::ptr_eq(&field, &original));
+            assert!(Arc::ptr_eq(field, original));
         } else {
             panic!("lost nested full source type");
         }

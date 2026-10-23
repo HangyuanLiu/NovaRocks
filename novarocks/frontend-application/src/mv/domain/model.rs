@@ -44,6 +44,7 @@ impl MvStorageEngine {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_sql_str(value: &str) -> Result<Self, String> {
         match value.to_ascii_lowercase().as_str() {
             "starrocks" => Err(

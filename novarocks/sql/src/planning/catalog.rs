@@ -283,7 +283,6 @@ pub struct SqlMvTargetLocatorTableFacts {
 }
 
 impl SqlMvTargetLocatorTableFacts {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         catalog: String,
         namespace: String,

@@ -422,10 +422,10 @@ mod failure_tests {
             let mut ledger = self.ledger.lock().unwrap();
             let at = ledger.attempts;
             ledger.attempts += 1;
-            if let Some((stop, cause)) = &*self.refusal.lock().unwrap() {
-                if *stop == at {
-                    return Err(cause.clone());
-                }
+            if let Some((stop, cause)) = &*self.refusal.lock().unwrap()
+                && *stop == at
+            {
+                return Err(cause.clone());
             }
             let pointer = NonNull::new(unsafe { std::alloc::alloc(layout) })
                 .ok_or(KernelFailure::ResourceExhausted)?;
@@ -640,7 +640,7 @@ mod failure_tests {
         };
         assert!(compare(&success).unwrap());
         let trace = success.trace.lock().unwrap().clone();
-        assert!(trace.iter().any(|units| *units == 256));
+        assert!(trace.contains(&256));
         for cause in [
             CompileControlError::Cancelled,
             CompileControlError::DeadlineExceeded,

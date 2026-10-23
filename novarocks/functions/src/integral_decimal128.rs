@@ -24,7 +24,9 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use novarocks_type_contract::DecimalOverflowPolicy;
-use std::{convert::Infallible, sync::Arc};
+use std::convert::Infallible;
+#[cfg(test)]
+use std::sync::Arc;
 #[derive(Clone, Copy)]
 struct Factors {
     up: Option<i128>,

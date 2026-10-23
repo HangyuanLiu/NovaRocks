@@ -249,6 +249,10 @@ impl MysqlFixtureSessionJoins {
     pub(crate) fn abort_remaining_watchers(&self) {
         self.watchers.abort_remaining();
     }
+    #[cfg(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
     pub(crate) fn watchers_empty(&self) -> bool {
         self.watchers.is_empty()
     }

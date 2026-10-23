@@ -1225,7 +1225,7 @@ fn verify_provider_rows(
     fixture: &CheckedFixture,
 ) -> Result<()> {
     ensure!(
-        fixture.facts.row_count % 32 == 0,
+        fixture.facts.row_count.is_multiple_of(32),
         "provider fixture does not match its 32-row input batches"
     );
     let actual: Vec<(u64, u64)> =

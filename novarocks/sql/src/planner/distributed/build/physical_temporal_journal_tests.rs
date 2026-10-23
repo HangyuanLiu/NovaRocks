@@ -23,7 +23,7 @@ use super::expression_occurrences::{
 use crate::{
     analysis::{ExprKind, LiteralValue, TypedExpr},
     binding::SqlFunctionBinding,
-    compiler::{SqlAuthoredPhysicalPlan, SqlFunctionCatalog},
+    compiler::SqlAuthoredPhysicalPlan,
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_functions::FunctionResultType;

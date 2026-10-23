@@ -16,10 +16,10 @@
 // under the License.
 //! Real SQL dependency observation through the production FE constant port.
 use arrow::array::{Array, StringArray};
+use novarocks_functions::ConstantValue;
 use novarocks_functions::{
     ConstantError, FunctionArgumentType, FunctionResultType, ResolvedFunctionBinding,
 };
-use novarocks_functions::{ConstantPool, ConstantValue};
 use novarocks_physical_plan::{ExprKind, PipelineDopDomain, PlanVersionId, ScanReadBudget};
 use novarocks_sql::compiler::{
     DEFAULT_COMPLETION_LIMITS, FoldArg, FoldRequest, FrozenFoldNode, SessionOptimizerSettings,

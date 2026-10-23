@@ -14,13 +14,15 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::fragment::ExecutionFailure;
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::runtime::cache::ExecutionCacheOptions;
+#[cfg(test)]
+use crate::runtime::fragment::ExecutionResult;
 use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker, query_tracker_label};
 use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::query_options::QueryOptions;
@@ -63,7 +65,7 @@ pub struct RuntimeErrorState {
     control: RuntimeFailureControl,
 }
 enum RuntimeFailureControl {
-    Local(LocalFailureState),
+    Local(Box<LocalFailureState>),
     Task(std::sync::Arc<crate::runtime::task_control::TaskExecutionControl>),
 }
 #[derive(Default)]
@@ -95,7 +97,7 @@ struct LocalFailureState {
 impl Default for RuntimeErrorState {
     fn default() -> Self {
         Self {
-            control: RuntimeFailureControl::Local(LocalFailureState::default()),
+            control: RuntimeFailureControl::Local(Box::default()),
         }
     }
 }
@@ -253,6 +255,7 @@ impl RuntimeErrorState {
             }
         }
     }
+    #[cfg(test)]
     pub(crate) fn wait_interruptibly(&self, duration: Duration) -> ExecutionResult<()> {
         match &self.control {
             RuntimeFailureControl::Task(owner) => owner.wait_interruptibly(duration),
@@ -570,7 +573,7 @@ mod tests {
         ));
         state.set_error(first.clone());
         state.set_error(novarocks_functions::KernelFailure::Internal(
-            novarocks_functions::KernelDiagnostic::new(&("later runtime diagnostic")),
+            novarocks_functions::KernelDiagnostic::new("later runtime diagnostic"),
         ));
         assert!(state.is_stopped());
         assert!(state.wait_until_stopped(Duration::from_secs(30)));
@@ -590,7 +593,7 @@ mod tests {
         }
         assert_eq!(state.waiting_count(), 1);
         state.set_error(novarocks_functions::KernelFailure::Internal(
-            novarocks_functions::KernelDiagnostic::new(&("actual runtime stop")),
+            novarocks_functions::KernelDiagnostic::new("actual runtime stop"),
         ));
         assert!(waiter.join().expect("stop reader"));
         assert_eq!(state.waiting_count(), 0);

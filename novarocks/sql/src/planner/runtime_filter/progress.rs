@@ -30,10 +30,6 @@ pub struct FrontierEdge {
 /// filter after only its build-side frontier completes, independent of the
 /// probe side and of the rest of the fragment.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[expect(
-    private_interfaces,
-    reason = "Build-progress proofs retain SQL-internal channel and binding identities for deterministic scheduling."
-)]
 pub struct JoinBuildProgressProof {
     pub channel: ChannelId,
     pub producer_binding: BindingId,
@@ -47,8 +43,6 @@ pub struct JoinBuildProgressProof {
 /// the coarse-grained wait edges and runs the final cycle guard.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrontierSkip {
-    NoRfSides,
-    MissingChild,
     UnauditedNode { node_id: i32 },
 }
 
@@ -74,21 +68,6 @@ pub struct JoinBuildProgressCatalog {
 impl JoinBuildProgressCatalog {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.proofs.len() + self.skips.len()
-    }
-
-    #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
-        self.proofs.is_empty() && self.skips.is_empty()
-    }
-
-    #[cfg(test)]
-    pub fn values(&self) -> impl Iterator<Item = &JoinBuildProgressProof> {
-        self.proofs.values()
     }
 
     pub(crate) fn get(&self, key: &JoinBuildProgressKey) -> Option<&JoinBuildProgressProof> {

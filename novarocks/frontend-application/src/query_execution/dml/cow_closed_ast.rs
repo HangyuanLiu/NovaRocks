@@ -328,7 +328,7 @@ impl ConstructionControl<'_> {
             .visits
             .checked_add(1)
             .ok_or(BuildError::ResourceExhausted)?;
-        if self.visits % 256 == 0 {
+        if self.visits.is_multiple_of(256) {
             (self.check)()?;
         }
         Ok(())
@@ -546,9 +546,7 @@ fn type_name_node(
         }
     }
     let mut spaces = exact_vec(count.saturating_sub(1))?;
-    for _ in 1..count {
-        spaces.push(true);
-    }
+    spaces.resize(count.saturating_sub(1), true);
     Ok(TypeName {
         name: name(word)?,
         arguments,

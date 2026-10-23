@@ -38,7 +38,9 @@ use crate::catalog::view_request::{ValidatedViewReplace, ViewCreate, ViewSchema}
 use crate::iceberg::spec::Schema;
 use crate::iceberg::{NamespaceIdent, TableIdent};
 use crate::rest_protocol::binding::SessionBinding;
-use crate::rest_protocol::endpoints::{RestEndpoints, VENDED_CREDENTIALS};
+use crate::rest_protocol::endpoints::RestEndpoints;
+#[cfg(test)]
+use crate::rest_protocol::endpoints::VENDED_CREDENTIALS;
 use crate::rest_protocol::evidence::{
     AttributionExpectation, BodyRead, BodyReadFailure, DispatchStage, NotWrittenCause,
     ResponseShape, RestEvidence, classify,
@@ -48,6 +50,7 @@ use crate::rest_protocol::json::{JsonScanner, ScanError, ViewSink};
 use crate::rest_protocol::minimal_view::{
     MutationView, NamespaceSink, TableResponseSink, ViewMutationSink,
 };
+#[cfg(test)]
 use crate::rest_protocol::wire::{CommitTableRequest, CreateNamespaceRequest, CreateTableRequest};
 
 // Design: ADR-0176 (docs/adr/ADR-0176-iceberg-rest-request-vocabulary-and-supported-server-floor.md)

@@ -212,7 +212,6 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
 /// original value namespace; function and aggregate tokens must retain that
 /// same immutable correspondence. Source is a mandatory whole coexistence
 /// invoice, not encoded length, a guessed capacity or allocation authority.
-#[allow(clippy::too_many_arguments)]
 pub fn decode_expression_definitions<'loan, 'wire, 'control>(
     definitions: &'wire [wire::ExpressionDefinition],
     values: &'loan DecodedValues<'loan, 'wire, 'control>,
@@ -238,7 +237,6 @@ pub fn decode_expression_definitions<'loan, 'wire, 'control>(
     );
     finish(work, result)
 }
-#[allow(clippy::too_many_arguments)]
 pub fn decode_expression_definitions_in<'loan, 'wire, 'control>(
     definitions: &'wire [wire::ExpressionDefinition],
     values: &'loan DecodedValues<'loan, 'wire, 'control>,
@@ -265,7 +263,6 @@ pub fn decode_expression_definitions_in<'loan, 'wire, 'control>(
         work,
     )
 }
-#[allow(clippy::too_many_arguments)]
 fn decode_core<'loan, 'wire, 'control>(
     definitions: &'wire [wire::ExpressionDefinition],
     values: &'loan DecodedValues<'loan, 'wire, 'control>,
@@ -448,7 +445,6 @@ fn initial_facts(count: usize) -> Result<ExpressionNamespaceReadFacts, Error> {
     vector::<usize>(&mut facts, count)?;
     Ok(facts)
 }
-#[allow(clippy::too_many_arguments)]
 fn preflight(
     definitions: &[wire::ExpressionDefinition],
     values: &DecodedValues<'_, '_, '_>,
@@ -864,7 +860,7 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                 };
                 work.flush()?;
                 let same =
-                    arrow_data_types_exact_borrowed_observed(&header.data_type(), carrier, || {
+                    arrow_data_types_exact_borrowed_observed(header.data_type(), carrier, || {
                         work.step().map_err(TypeCodecError::from)
                     })
                     .map_err(Error::from)?;

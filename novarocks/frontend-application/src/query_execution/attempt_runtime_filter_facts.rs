@@ -23,18 +23,12 @@
 //! deployment stops depending on which one built the execution.
 
 use novarocks_physical_plan::{
-    EdgeId, FragmentId as PhysicalFragmentId, PhysicalPlan, RuntimeFilter,
-    RuntimeFilterApplyPoint as PhysicalApplyPoint, RuntimeFilterCoverage,
+    EdgeId, FragmentId as PhysicalFragmentId, PhysicalPlan, RuntimeFilter, RuntimeFilterCoverage,
     RuntimeFilterCoverageNode, RuntimeFilterProducer,
     RuntimeFilterProducerTarget as PhysicalProducerTarget,
 };
 use novarocks_plan_codec::runtime_filter_comparator_digest;
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum AttemptRuntimeFilterApplyPoint {
-    NodeInput,
-    NodeOutput,
-}
 #[derive(Clone, Debug)]
 pub(crate) enum AttemptRuntimeFilterLogicalDomainFacts {
     Membership {
@@ -77,13 +71,14 @@ pub(crate) enum AttemptRuntimeFilterReductionFacts {
 #[derive(Clone, Debug)]
 pub(crate) enum AttemptRuntimeFilterBindingRoleFacts {
     Producer {
-        contribution_kinds: Vec<AttemptRuntimeFilterContributionKind>,
         completion_requirement: AttemptRuntimeFilterCompletionRequirement,
-        target: AttemptRuntimeFilterProducerTarget,
+        #[cfg(test)]
+        target: Option<AttemptRuntimeFilterProducerTarget>,
     },
     Consumer {
         capabilities: Vec<AttemptRuntimeFilterArtifactCapability>,
         activation: AttemptRuntimeFilterConsumerActivation,
+        #[cfg(test)]
         target: AttemptRuntimeFilterConsumerTarget,
         feedback_scan_type: Option<novarocks_physical_plan::ValueType>,
     },
@@ -120,11 +115,12 @@ pub(crate) enum AttemptRuntimeFilterLateApplyGranularity {
     Split,
     File,
 }
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum AttemptRuntimeFilterProducerTarget {
     JoinBuildKey { ordinal: u32 },
-    AggregateTopNKey { group_key_ordinal: u32, limit: u32 },
 }
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) enum AttemptRuntimeFilterConsumerTarget {
     DirectInput { input_ordinal: u32 },
@@ -180,26 +176,12 @@ pub(crate) enum AttemptRuntimeFilterJoinProgressFacts {
         build_frontier: Vec<AttemptRuntimeFilterFrontierEdgeFacts>,
         non_build_inputs: Vec<AttemptRuntimeFilterFrontierEdgeFacts>,
     },
-    Skipped {
-        channel_id: u32,
-        producer_binding_id: u32,
-        producer_fragment_id: u32,
-        join_node_id: i32,
-        reason: AttemptRuntimeFilterJoinProgressSkipReason,
-    },
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AttemptRuntimeFilterFrontierEdgeFacts {
     pub source_fragment_id: u32,
     pub target_exchange_node_id: i32,
 }
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum AttemptRuntimeFilterJoinProgressSkipReason {
-    NoRfSides,
-    MissingChild,
-    UnauditedNode { node_id: i32 },
-}
-
 /// One plan's runtime filters, as the attempt that deploys them reads them.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AttemptRuntimeFilterFacts {
@@ -532,27 +514,36 @@ fn coverage_tree(
     expand(coverage, coverage.root)
 }
 
-fn apply_point(point: PhysicalApplyPoint) -> AttemptRuntimeFilterApplyPoint {
-    match point {
-        // A scan-source filter is applied to what the scan produces, which is
-        // the node's output; the provider-side pruning it also enables is
-        // named by the scan's own binding rather than by this apply point.
-        PhysicalApplyPoint::NodeOutput | PhysicalApplyPoint::ScanSource => {
-            AttemptRuntimeFilterApplyPoint::NodeOutput
-        }
-        PhysicalApplyPoint::NodeInput { .. } => AttemptRuntimeFilterApplyPoint::NodeInput,
-    }
-}
-
 fn completed_producer_role(
     filter: &RuntimeFilter,
     producer: &RuntimeFilterProducer,
 ) -> Result<AttemptRuntimeFilterBindingRoleFacts, String> {
     use novarocks_physical_plan::RuntimeFilterCompletion;
 
-    let target = match producer.target {
+    validate_producer_target(filter, producer)?;
+    #[cfg(test)]
+    let target = producer_target_facts(filter, producer);
+    Ok(AttemptRuntimeFilterBindingRoleFacts::Producer {
+        completion_requirement: match producer.completion {
+            RuntimeFilterCompletion::ProducerClosed => {
+                AttemptRuntimeFilterCompletionRequirement::ProducerClosed
+            }
+            RuntimeFilterCompletion::FencedCommittedDomain => {
+                AttemptRuntimeFilterCompletionRequirement::FencedCommittedDomainFrozen
+            }
+        },
+        #[cfg(test)]
+        target,
+    })
+}
+
+fn validate_producer_target(
+    filter: &RuntimeFilter,
+    producer: &RuntimeFilterProducer,
+) -> Result<(), String> {
+    match producer.target {
         PhysicalProducerTarget::JoinBuildKey { equality } => {
-            let witness = filter
+            filter
                 .equality_witnesses
                 .iter()
                 .find(|candidate| candidate.id == equality)
@@ -563,56 +554,88 @@ fn completed_producer_role(
                         equality.get()
                     )
                 })?;
-            AttemptRuntimeFilterProducerTarget::JoinBuildKey {
-                ordinal: witness.key_ordinal,
-            }
         }
-        PhysicalProducerTarget::AggregateTopNKey {
-            group_key_ordinal,
-            limit,
-            ..
-        } => AttemptRuntimeFilterProducerTarget::AggregateTopNKey {
-            group_key_ordinal,
-            limit: u32::try_from(limit).map_err(|_| {
+        PhysicalProducerTarget::AggregateTopNKey { limit, .. } => {
+            u32::try_from(limit).map_err(|_| {
                 format!(
                     "runtime filter {} top-k limit exceeds the deployed identity",
                     filter.id.get()
                 )
-            })?,
-        },
-    };
-    Ok(AttemptRuntimeFilterBindingRoleFacts::Producer {
-        contribution_kinds: completed_contribution_kinds_of(producer),
-        completion_requirement: match producer.completion {
-            RuntimeFilterCompletion::ProducerClosed => {
-                AttemptRuntimeFilterCompletionRequirement::ProducerClosed
-            }
-            RuntimeFilterCompletion::FencedCommittedDomain => {
-                AttemptRuntimeFilterCompletionRequirement::FencedCommittedDomainFrozen
-            }
-        },
-        target,
-    })
+            })?;
+        }
+    }
+    Ok(())
 }
 
-fn completed_contribution_kinds_of(
+#[cfg(test)]
+fn producer_target_facts(
+    filter: &RuntimeFilter,
     producer: &RuntimeFilterProducer,
-) -> Vec<AttemptRuntimeFilterContributionKind> {
-    use novarocks_physical_plan::RuntimeFilterContributionKind as Physical;
+) -> Option<AttemptRuntimeFilterProducerTarget> {
+    match producer.target {
+        PhysicalProducerTarget::JoinBuildKey { equality } => {
+            Some(AttemptRuntimeFilterProducerTarget::JoinBuildKey {
+                ordinal: filter
+                    .equality_witnesses
+                    .iter()
+                    .find(|candidate| candidate.id == equality)
+                    .expect("producer target validation found its equality witness")
+                    .key_ordinal,
+            })
+        }
+        PhysicalProducerTarget::AggregateTopNKey { .. } => None,
+    }
+}
 
-    producer
-        .contribution_kinds
-        .iter()
-        .map(|kind| match kind {
-            Physical::ValueDomainDelta => AttemptRuntimeFilterContributionKind::ValueDomainDelta,
-            Physical::FinalDomainShard => AttemptRuntimeFilterContributionKind::FinalDomainShard,
-            Physical::OrderedBoundUpdate => {
-                AttemptRuntimeFilterContributionKind::OrderedBoundUpdate
+fn validate_consumer_target(
+    consumer: &novarocks_physical_plan::RuntimeFilterConsumer,
+    scan_type: Option<&novarocks_physical_plan::ValueType>,
+) -> Result<(), String> {
+    use novarocks_physical_plan::{
+        RuntimeFilterApplyPoint as PhysicalApplyPoint,
+        RuntimeFilterConsumerTarget as PhysicalConsumerTarget,
+    };
+
+    match &consumer.target {
+        PhysicalConsumerTarget::JoinProbeKey { .. } => match consumer.apply_point {
+            PhysicalApplyPoint::NodeInput { .. } => Ok(()),
+            PhysicalApplyPoint::NodeOutput | PhysicalApplyPoint::ScanSource => {
+                Err("a join probe runtime filter applies to a named join input".to_string())
             }
-            Physical::FinalOrderedHullShard => AttemptRuntimeFilterContributionKind::TopKSummary,
-            Physical::ProducerClosed => AttemptRuntimeFilterContributionKind::ProducerClosed,
-        })
-        .collect()
+        },
+        PhysicalConsumerTarget::ScanField { .. }
+        | PhysicalConsumerTarget::AggregateTopNScanField { .. } => {
+            scan_type.ok_or_else(|| {
+                "a completed scan runtime filter has no pinned output type".to_string()
+            })?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+fn consumer_target_facts(
+    consumer: &novarocks_physical_plan::RuntimeFilterConsumer,
+) -> AttemptRuntimeFilterConsumerTarget {
+    use novarocks_physical_plan::{
+        RuntimeFilterApplyPoint as PhysicalApplyPoint,
+        RuntimeFilterConsumerTarget as PhysicalConsumerTarget,
+    };
+
+    match &consumer.target {
+        PhysicalConsumerTarget::JoinProbeKey { .. } => match consumer.apply_point {
+            PhysicalApplyPoint::NodeInput { input_ordinal } => {
+                AttemptRuntimeFilterConsumerTarget::DirectInput { input_ordinal }
+            }
+            PhysicalApplyPoint::NodeOutput | PhysicalApplyPoint::ScanSource => {
+                unreachable!("consumer target validation requires a named join input")
+            }
+        },
+        PhysicalConsumerTarget::ScanField { .. }
+        | PhysicalConsumerTarget::AggregateTopNScanField { .. } => {
+            AttemptRuntimeFilterConsumerTarget::SourceBoundary
+        }
+    }
 }
 
 fn completed_consumer_role(
@@ -622,7 +645,6 @@ fn completed_consumer_role(
     use novarocks_physical_plan::{
         LateApplyGranularity, RuntimeFilterArtifactCapability as PhysicalCapability,
         RuntimeFilterConsumerActivation as PhysicalActivation,
-        RuntimeFilterConsumerTarget as PhysicalConsumerTarget,
     };
 
     let activation = match consumer.activation {
@@ -642,27 +664,9 @@ fn completed_consumer_role(
             })
         }
     };
-    let target = match &consumer.target {
-        PhysicalConsumerTarget::JoinProbeKey { .. } => {
-            AttemptRuntimeFilterConsumerTarget::DirectInput {
-                input_ordinal: match consumer.apply_point {
-                    PhysicalApplyPoint::NodeInput { input_ordinal } => input_ordinal,
-                    PhysicalApplyPoint::NodeOutput | PhysicalApplyPoint::ScanSource => {
-                        return Err(
-                            "a join probe runtime filter applies to a named join input".to_string()
-                        );
-                    }
-                },
-            }
-        }
-        PhysicalConsumerTarget::ScanField { .. }
-        | PhysicalConsumerTarget::AggregateTopNScanField { .. } => {
-            scan_type.ok_or_else(|| {
-                "a completed scan runtime filter has no pinned output type".to_string()
-            })?;
-            AttemptRuntimeFilterConsumerTarget::SourceBoundary
-        }
-    };
+    validate_consumer_target(consumer, scan_type)?;
+    #[cfg(test)]
+    let target = consumer_target_facts(consumer);
     Ok(AttemptRuntimeFilterBindingRoleFacts::Consumer {
         capabilities: consumer
             .capabilities
@@ -680,6 +684,7 @@ fn completed_consumer_role(
             })
             .collect(),
         activation,
+        #[cfg(test)]
         target,
         feedback_scan_type: scan_type.cloned(),
     })
@@ -730,12 +735,12 @@ fn frontier_edges(
 mod tests {
     use arrow::datatypes::DataType;
     use novarocks_physical_plan::{
-        JoinSide, NodeId, RuntimeFilterCompletion, RuntimeFilterConsumer,
-        RuntimeFilterContributionKind as PhysicalContributionKind, RuntimeFilterDomain,
-        RuntimeFilterEndpoint, RuntimeFilterEqualityWitness, RuntimeFilterEqualityWitnessId,
-        RuntimeFilterId, RuntimeFilterKind, RuntimeFilterLifecycle, RuntimeFilterNullSemantics,
-        RuntimeFilterPolicy, RuntimeFilterProducerProgress, RuntimeFilterReduction,
-        RuntimeFilterWitnessId, TopNPhase, ValueId, ValueType,
+        JoinSide, NodeId, RuntimeFilterApplyPoint as PhysicalApplyPoint, RuntimeFilterCompletion,
+        RuntimeFilterConsumer, RuntimeFilterContributionKind as PhysicalContributionKind,
+        RuntimeFilterDomain, RuntimeFilterEndpoint, RuntimeFilterEqualityWitness,
+        RuntimeFilterEqualityWitnessId, RuntimeFilterId, RuntimeFilterKind, RuntimeFilterLifecycle,
+        RuntimeFilterNullSemantics, RuntimeFilterPolicy, RuntimeFilterProducerProgress,
+        RuntimeFilterReduction, RuntimeFilterWitnessId, TopNPhase, ValueId, ValueType,
     };
 
     use super::*;
@@ -882,7 +887,7 @@ mod tests {
         };
         assert!(matches!(
             target,
-            AttemptRuntimeFilterProducerTarget::JoinBuildKey { ordinal: 2 }
+            Some(AttemptRuntimeFilterProducerTarget::JoinBuildKey { ordinal: 2 })
         ));
     }
 

@@ -612,18 +612,16 @@ fn collection_domain(
 ) -> Result<(), FragmentCompileError> {
     work.step()?;
     if source.nullable() {
-        return Err((FragmentCompileError::Invalid(
+        return Err(FragmentCompileError::Invalid(
             "writer grouped Unpivot collection constant must be nonnull",
-        ))
-        .into());
+        ));
     }
     if !source.same_value_domain_observed::<FragmentCompileError>(output, || {
         work.step().map_err(Into::into)
     })? {
-        return Err((FragmentCompileError::Invalid(
+        return Err(FragmentCompileError::Invalid(
             "writer grouped Unpivot collection constant differs from its Root field",
-        ))
-        .into());
+        ));
     }
     Ok(())
 }

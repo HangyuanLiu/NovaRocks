@@ -24,6 +24,7 @@
 //! `equality_ids` populated for `RowDeltaCommit`.
 
 use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::Arc;
 
 use crate::iceberg::io::FileIO;
@@ -398,8 +399,7 @@ mod tests {
                 batch,
             )
             .await
-            .err()
-            .expect("reject before writing");
+            .expect_err("reject before writing");
             assert!(error.contains(expected), "{error}");
             assert!(!dir.path().join("data").exists());
         }

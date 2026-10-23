@@ -457,14 +457,14 @@ fn fold_and_real_lowering_share_operational_selection_and_prepared_effects() {
             panic!("admitted constant input")
         };
         let original = value.clone();
-        let mut args = [FoldArg { value, value_type }];
+        let args = [FoldArg { value, value_type }];
         let owner = authored(expression);
         let (fragment, source) = source_named(&owner, "lower");
         let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
         let call = freeze_fold_call(
             owner.function_catalog().as_ref(),
             &binding,
-            &mut args,
+            &args,
             policy(),
             true,
             &Control::default(),

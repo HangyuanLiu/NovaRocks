@@ -52,7 +52,6 @@ impl super::AnalyzerContext<'_> {
 
 /// The sole assignment/CAST conversion author, also consumed by exact internal
 /// root-output declarations after ordinary query analysis has completed.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn cast_to_value_type(
     source: TypedExpr,
     target: FunctionValueType,

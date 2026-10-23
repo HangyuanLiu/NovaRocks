@@ -208,14 +208,6 @@ fn require_payload_len_with_failure<F: HllFailureSink>(
     Ok(())
 }
 
-fn hll4_aux_allocation(lg_k: u8, count: usize) -> (usize, usize) {
-    match hll4_aux_allocation_observed(lg_k, count, &mut || Ok::<(), std::convert::Infallible>(()))
-    {
-        Ok(bounds) => bounds,
-        Err(impossible) => match impossible {},
-    }
-}
-
 fn hll4_aux_allocation_observed<E>(
     lg_k: u8,
     count: usize,

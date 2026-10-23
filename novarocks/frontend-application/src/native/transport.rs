@@ -221,7 +221,7 @@ pub(super) fn is_observed_connection_loss(error: &(dyn std::error::Error + 'stat
 
 #[derive(Clone)]
 enum FrozenClientEndpoints {
-    Backend(FrozenBackendDescriptor),
+    Backend(Box<FrozenBackendDescriptor>),
     Single {
         endpoint: NativeEndpoint,
         domain: NativeEndpointDomain,
@@ -241,7 +241,7 @@ impl Client {
         data_runtime: FrontendDataRuntime,
     ) -> Self {
         Self {
-            endpoints: FrozenClientEndpoints::Backend(descriptor),
+            endpoints: FrozenClientEndpoints::Backend(Box::new(descriptor)),
             data_runtime,
         }
     }
@@ -813,8 +813,7 @@ mod routing_tests {
         drop(peer);
         let h2 = h2::client::handshake(local)
             .await
-            .err()
-            .expect("the actual closed IO refuses the h2 preface");
+            .expect_err("the actual closed IO refuses the h2 preface");
         assert!(h2.get_io().is_some());
         assert!(is_observed_connection_loss(&h2));
     }

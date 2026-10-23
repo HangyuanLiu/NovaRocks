@@ -773,10 +773,10 @@ impl CatalogApplicationService {
             if attempts.get(&key).is_some_and(|attempt| {
                 attempt.attachment_id == attachment_id && attempt.instance_id == instance_id
             }) {
-                if let Some(completion) = completion {
-                    if let Some(attempt) = attempts.get_mut(&key) {
-                        attempt.completion_waiters.push(completion);
-                    }
+                if let Some(completion) = completion
+                    && let Some(attempt) = attempts.get_mut(&key)
+                {
+                    attempt.completion_waiters.push(completion);
                 }
                 return Ok((true, None));
             }
@@ -1133,10 +1133,10 @@ impl CatalogApplicationService {
 
     fn retire_projection(&self, instance_id: &ConnectorInstanceId) {
         if let Ok(mut attempts) = self.scheduler.attempts.lock() {
-            if let Ok(mut owners) = self.catalog_materializers.lock() {
-                if let Some(old) = owners.current.remove(instance_id) {
-                    owners.retain_draining(&old);
-                }
+            if let Ok(mut owners) = self.catalog_materializers.lock()
+                && let Some(old) = owners.current.remove(instance_id)
+            {
+                owners.retain_draining(&old);
             }
             attempts.retain(|_, attempt| {
                 if &attempt.instance_id == instance_id {
@@ -1318,9 +1318,11 @@ impl CatalogApplicationPort for CatalogApplicationService {
     }
 }
 
+type CatalogCredentialBindingExtraction = (Vec<CatalogCredentialBinding>, Vec<(String, String)>);
+
 fn extract_catalog_credential_bindings(
     properties: Vec<(String, String)>,
-) -> Result<(Vec<CatalogCredentialBinding>, Vec<(String, String)>), CatalogApplicationError> {
+) -> Result<CatalogCredentialBindingExtraction, CatalogApplicationError> {
     let mut credential_fields = BTreeMap::new();
     let mut provider_properties = Vec::with_capacity(properties.len());
     for (key, value) in properties {

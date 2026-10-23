@@ -241,8 +241,7 @@ pub(crate) fn build_aggregate_state_merge(
         ctx,
         &aggregate_calls,
         &aggregate_layout,
-    )
-    .map_err(SqlCompileError::from)?;
+    )?;
 
     build_relational_aggregate_change_stream(
         old_input,
@@ -251,13 +250,8 @@ pub(crate) fn build_aggregate_state_merge(
         ctx,
         &aggregate_layout,
     )
-    .map_err(SqlCompileError::from)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Target-state scan facts are independently validated planner inputs; grouping them would hide their distinct contracts."
-)]
 fn target_state_old_scan(
     target: &novarocks_types::naming::TableIdentity,
     target_columns: Vec<ColumnDef>,
@@ -292,7 +286,7 @@ fn target_state_old_scan(
         .map(|column| column.column_id)
         .collect::<Vec<_>>();
     Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Scan(PlanScanNode {
+        LogicalPlanKind::scan(PlanScanNode {
             database: target.namespace.clone(),
             table: TableDef {
                 name: target.table.clone(),
@@ -1094,7 +1088,7 @@ fn branch_case_arm_expr(
     expr: TypedExpr,
     target: &novarocks_type_contract::FunctionValueType,
 ) -> TypedExpr {
-    if !branch_case_requires_runtime_cast(&target.data_type())
+    if !branch_case_requires_runtime_cast(target.data_type())
         && expr
             .value_type
             .same_physical_binding_ignoring_root_nullability_observed(target, || {
@@ -1560,13 +1554,11 @@ fn group_key_names(
                 for (candidate_index, column) in group_outputs.iter().enumerate() {
                     let same = column.column_id == *column_id;
                     work.step()?;
-                    if same {
-                        if matched.replace(candidate_index).is_some() {
-                            return Err(SqlCompileError::Compilation(
+                    if same && matched.replace(candidate_index).is_some() {
+                        return Err(SqlCompileError::Compilation(
                                 "Iceberg IMV aggregate rewrite found ambiguous GROUP BY output column id"
                                     .to_string(),
                             ));
-                        }
                     }
                 }
                 // A rewritten input reference may have a different ID from
@@ -2930,7 +2922,7 @@ mod tests {
             },
         ];
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: "b".to_string(),
@@ -3623,7 +3615,7 @@ mod tests {
             ]
         );
         for item in &project.items {
-            if branch_case_requires_runtime_cast(&item.expr.value_type.data_type()) {
+            if branch_case_requires_runtime_cast(item.expr.value_type.data_type()) {
                 assert_branch_case_arms_cast_to_output_type(item);
             }
         }
@@ -3886,7 +3878,7 @@ mod tests {
         for (_, then_expr) in when_then {
             assert_cast_target(
                 then_expr,
-                &item.expr.value_type.data_type(),
+                item.expr.value_type.data_type(),
                 &item.output_name,
             );
         }
@@ -3895,7 +3887,7 @@ mod tests {
             .unwrap_or_else(|| panic!("expected CASE ELSE for {}", item.output_name));
         assert_cast_target(
             else_expr,
-            &item.expr.value_type.data_type(),
+            item.expr.value_type.data_type(),
             &item.output_name,
         );
     }

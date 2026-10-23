@@ -37,10 +37,10 @@ pub enum ExtremaOperation {
 }
 type ErrorBoundary<'a> = Option<&'a dyn Fn(&str) -> Result<(), KernelFailure>>;
 fn raw_error(message: String, boundary: ErrorBoundary<'_>) -> KernelFailure {
-    if let Some(boundary) = boundary {
-        if let Err(failure) = boundary(&message) {
-            return failure;
-        }
+    if let Some(boundary) = boundary
+        && let Err(failure) = boundary(&message)
+    {
+        return failure;
     }
     internal(&message)
 }
@@ -319,7 +319,7 @@ fn evaluate_values(
             work.flush()?;
             return Ok(out);
         }
-        return cast(ts, Some(output_type), work, boundary);
+        return cast(ts, Some(output_type), work);
     }
     let mut views = reserve(args.len(), work)?;
     for arg in args {
@@ -355,13 +355,12 @@ fn evaluate_values(
     work.flush()?;
     let out = Arc::new(Float64Array::from(values)) as ArrayRef;
     work.flush()?;
-    cast(out, target, work, boundary)
+    cast(out, target, work)
 }
 fn cast(
     out: ArrayRef,
     target: Option<&DataType>,
     work: &mut EvaluationCheckpoints<'_>,
-    boundary: ErrorBoundary<'_>,
 ) -> Result<ArrayRef, KernelFailure> {
     work.flush()?;
     let out = cast_output_observed(out, target, &mut |event| match event {

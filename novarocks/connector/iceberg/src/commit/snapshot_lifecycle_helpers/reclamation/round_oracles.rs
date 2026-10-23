@@ -65,6 +65,8 @@ struct Event {
     path: String,
     ms: u64,
 }
+type ReadGate = (String, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+
 struct Events {
     clock: Arc<ManualClock>,
     log: Mutex<Vec<Event>>,
@@ -76,7 +78,7 @@ struct Events {
     cancel_read: Mutex<Option<(String, ConnectorStopOwner)>>,
     delete_delay: Duration,
     actual_gc_deadline: Mutex<Option<Instant>>,
-    read_gate: Mutex<Option<(String, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    read_gate: Mutex<Option<ReadGate>>,
     delete_access_started: tokio::sync::Notify,
 }
 impl std::fmt::Debug for Events {
@@ -651,10 +653,12 @@ impl Fixture {
         let mut cache = ScanCache::default();
         let mut report = ReclamationReport::default();
         let result = reclaim_round_using(
-            self.owner.novarocks_catalog().as_ref(),
-            self.owner.resources().planning_binding(),
-            self.events.clock.as_ref(),
-            &self.storage,
+            &ReclamationPorts {
+                catalog: self.owner.novarocks_catalog().as_ref(),
+                planning_binding: self.owner.resources().planning_binding(),
+                clock: self.events.clock.as_ref(),
+                storage: &self.storage,
+            },
             CatalogTableName::new("db", "t"),
             &self.retention,
             "exact-operation",

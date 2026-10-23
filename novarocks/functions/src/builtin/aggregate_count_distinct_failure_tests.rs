@@ -106,10 +106,10 @@ impl AggregateStateAllocator for Host {
         let at = ledger.attempts;
         ledger.attempts += 1;
         ledger.layouts.push(layout);
-        if let Some((stop, cause)) = &*self.refusal.lock().unwrap() {
-            if *stop == at {
-                return Err(cause.clone());
-            }
+        if let Some((stop, cause)) = &*self.refusal.lock().unwrap()
+            && *stop == at
+        {
+            return Err(cause.clone());
         }
         let pointer = NonNull::new(unsafe { std::alloc::alloc(layout) })
             .ok_or(KernelFailure::ResourceExhausted)?;

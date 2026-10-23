@@ -89,14 +89,6 @@ impl ConnectorWriteTargetBinding {
         &self.metadata.identity
     }
 
-    /// The write target's neutral Arrow schema.
-    ///
-    /// This replaces reading `current_schema()` off a concrete provider table:
-    /// column shaping, projection and default filling all work from here.
-    pub fn arrow_schema(&self) -> &arrow::datatypes::Schema {
-        self.metadata.schema()
-    }
-
     /// SQL-visible columns in the shape row DML must write.
     ///
     /// Visibility, row-lineage ownership and provider-declared write type

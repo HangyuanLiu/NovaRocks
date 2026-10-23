@@ -109,9 +109,7 @@ impl std::error::Error for PackageFreezeError {
 }
 impl novarocks_failure_contract::FailureProjection for PackageFreezeError {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use novarocks_failure_contract::{
-            FailureClass, FailureFact, FailureProjection, FailureReason, domain,
-        };
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
         let code = match self {
             Self::Control(cause) => return cause.failure_fact(),
             Self::Semantics(source) => return source.failure_fact(),
@@ -143,6 +141,7 @@ impl From<PackageFreezeError> for novarocks_plan_codec::PhysicalEncodeError {
 /// are caller-owned configuration; none is defaulted here. `encodings` are
 /// what the freeze of each of the plan's provider reads kept; `writes` is the
 /// frozen recipe of exactly each target the plan writes.
+#[cfg(test)]
 pub(crate) fn freeze_fragment_packages(
     candidate: &CompletedPhysicalPlanCandidate,
     encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
@@ -196,7 +195,7 @@ pub(crate) fn extract_checked_packages(
         uses.insert(id, authored.expression_uses);
         calls.insert(id, authored.calls);
         pruning.insert(id, authored.pruning);
-        admissions.insert(id, admission.clone());
+        admissions.insert(id, *admission);
     }
     extract_fragment_packages(
         plan,

@@ -144,13 +144,6 @@ pub(crate) fn validate<H>(value: &wire::ScalarValue) -> Result<S, Failure<H>> {
     Ok(kind)
 }
 
-pub(crate) fn decode<H>(
-    value: &wire::ScalarValue,
-    context: &mut Context<'_, '_, H>,
-) -> Result<ValueKind, Failure<H>> {
-    decode_with_source_facts(value, context).map(|(kind, _)| kind)
-}
-
 pub(crate) fn decode_with_source_facts<H>(
     value: &wire::ScalarValue,
     context: &mut Context<'_, '_, H>,

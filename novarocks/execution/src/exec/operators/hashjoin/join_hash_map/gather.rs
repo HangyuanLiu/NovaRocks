@@ -56,7 +56,7 @@ impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
 impl JoinGatherError {
     pub(crate) fn into_execution(self) -> ExecutionFailure {
         match self {
-            Self::Source(cause) => cause.into(),
+            Self::Source(cause) => cause,
             Self::Construction(cause) => cause.into(),
             Self::Kernel(cause) => cause.into(),
         }
@@ -155,37 +155,6 @@ impl From<JoinGatherError> for ExecutionFailure {
     }
 }
 
-#[derive(Debug)]
-struct JoinIndexAdoptionExtent;
-impl std::fmt::Display for JoinIndexAdoptionExtent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("join index adoption exceeds its representation")
-    }
-}
-impl std::error::Error for JoinIndexAdoptionExtent {}
-impl novarocks_failure_contract::FailureProjection for JoinIndexAdoptionExtent {
-    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use novarocks_failure_contract::{
-            FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
-            RepresentationLayout, domain,
-        };
-        FailureFact::new(
-            FailureClass::Representation,
-            crate::runtime::fragment::ExecutionReason::JoinIndexAdoptionExtent.reason(),
-        )
-        .with_representation(RepresentationFacts {
-            boundary: RepresentationBoundary::SingleOutput,
-            layout: RepresentationLayout {
-                domain: domain::EXECUTION,
-                code: std::num::NonZeroU16::new(28).unwrap(),
-            },
-            required: None,
-            extent_limit: None,
-            representable_prefix: None,
-        })
-    }
-}
-
 /// One owned batch and its actual declaration/header/source custody. This
 /// stack carrier allocates no holder and exposes no bare owning batch escape.
 /// Take/filter payload allocation is outside this wrapper's construction facts.
@@ -248,7 +217,6 @@ impl TypedJoinBatch {
             |layout| owner.request(layout).map_err(Into::into),
             |step| owner.observe(0, &[], step).map_err(Into::into),
         )
-        .map_err(Into::into)
     }
 }
 
@@ -529,6 +497,7 @@ pub(crate) struct GatherTimings {
 #[derive(Debug)]
 pub(crate) struct GatherBatches<B = RecordBatch> {
     pub(crate) batches: Vec<B>,
+    #[cfg(test)]
     pub(crate) timings: GatherTimings,
 }
 
@@ -702,6 +671,7 @@ pub(crate) fn gather_join_batches(
     Ok(batches)
 }
 
+#[cfg(test)]
 pub(crate) fn gather_probe_build_batches(
     probe: &Chunk,
     build: &Chunk,
@@ -743,6 +713,7 @@ fn gather_probe_build_batches_in<A: GatherAuthor>(
     if probe_indices.is_empty() {
         return Ok(GatherBatches {
             batches: Vec::new(),
+            #[cfg(test)]
             timings: GatherTimings::default(),
         });
     }
@@ -817,9 +788,14 @@ fn gather_probe_build_batches_in<A: GatherAuthor>(
         batches.push(author.finish(columns, row_count, "join all-match-one output")?);
         offset = end;
     }
-    Ok(GatherBatches { batches, timings })
+    Ok(GatherBatches {
+        batches,
+        #[cfg(test)]
+        timings,
+    })
 }
 
+#[cfg(test)]
 pub(crate) fn gather_left_with_null_right(
     left: &Chunk,
     left_indices: &[u32],
@@ -998,6 +974,7 @@ pub(crate) fn gather_left_with_null_right_typed(
     gather_left_with_null_right_in(left, left_indices, &right.arrow_schema_ref(), &author)
 }
 
+#[cfg(test)]
 pub(crate) fn gather_null_left_with_right(
     right: &Chunk,
     right_indices: &[u32],

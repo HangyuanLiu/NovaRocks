@@ -385,12 +385,6 @@ pub(crate) struct DictionaryCarrierStats {
     pub unsupported_columns: i64,
 }
 
-impl DictionaryCarrierStats {
-    pub fn has_input(self) -> bool {
-        self.input_columns > 0
-    }
-}
-
 pub(crate) fn dictionary_carrier_stats(
     chunk: &Chunk,
     downstream: &(impl InputEncodingPolicy + ?Sized),
@@ -810,7 +804,7 @@ mod typed_input_construction_tests {
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+
     use std::sync::Arc;
 
     use super::{

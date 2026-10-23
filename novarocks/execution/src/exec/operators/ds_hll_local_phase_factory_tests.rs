@@ -212,7 +212,7 @@ fn ds_hll_local_phase_before_real_factories_100k() {
         let source = input(&single);
         let raw = run(
             &factory(&single, P::Single),
-            &[source.clone()],
+            std::slice::from_ref(&source),
             tracker.clone(),
         );
         println!(

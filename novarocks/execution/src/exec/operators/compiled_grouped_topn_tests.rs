@@ -28,9 +28,11 @@ use super::aggregate_fixture::{
 };
 use super::family_fixture::{FixtureControl, cell, int64};
 use super::*;
+use crate::exec::chunk::ChunkSchema;
 use crate::exec::operators::compiled_aggregate::CompiledAggregateProcessorFactory;
 use crate::exec::pipeline::test_driver::TestDriver;
 use crate::runtime::fragment::ExecutionFailureCause;
+use arrow::array::ArrayRef;
 use arrow::array::{
     BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray, Int8Array, Int16Array,
     Int32Array, Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
@@ -901,7 +903,7 @@ fn compiled_grouped_topn_cancel_destroys_live_owners_and_keeps_the_first_cause()
     assert!(tracker.current() > 0);
     error.set_error(novarocks_functions::KernelFailure::Internal(
         novarocks_functions::KernelDiagnostic::new(
-            &("stop the actual grouped consumer after accumulation"),
+            "stop the actual grouped consumer after accumulation",
         ),
     ));
     let first = processor.input_without_output(f.input.clone()).unwrap_err();
@@ -1103,7 +1105,7 @@ fn key_domains() -> Vec<(FunctionValueType, Vec<LiteralValue>)> {
     ] {
         for zone in [None, Some("UTC".into()), Some("Asia/Shanghai".into())] {
             domains.push((
-                FunctionValueType::new(DataType::Timestamp(unit.clone(), zone), true),
+                FunctionValueType::new(DataType::Timestamp(unit, zone), true),
                 vec![
                     LiteralValue::Null,
                     LiteralValue::Timestamp(i64::MIN),

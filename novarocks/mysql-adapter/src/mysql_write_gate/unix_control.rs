@@ -28,7 +28,7 @@ use std::future::Future;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, PathBuf};
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Instant;
@@ -45,6 +45,7 @@ const SOCKET_PATH_CAP: usize = 90;
 #[repr(u8)]
 enum WireVersion {
     V1 = 1,
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
     V2 = 2,
 }
 const ARM: u8 = 1;
@@ -285,6 +286,7 @@ impl UnixMysqlWriteControl {
         )
     }
     /// Explicit private native fixture revision; never inferred from incoming frames.
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
     pub(crate) fn bind_v2(
         path: PathBuf,
         actual_frontend: FrontendProcessId,
@@ -699,6 +701,7 @@ impl UnixMysqlWriteControl {
         self.controller.stop()
     }
     /// Only after the original MySQL listener/session/watcher future actually joined.
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
     pub(crate) fn finish_after_protocol_join(&mut self) -> io::Result<MysqlWriteHubSnapshot> {
         self.controller.finish_after_protocol_join()
     }
@@ -984,15 +987,11 @@ fn encode_reply(
     writer.failure(hub.failure)?;
     writer.flag(hub.original_writer_exited)?;
     writer.gate(hub.gate)?;
+    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
     if matches!(wire_version, WireVersion::V2) {
-        #[cfg(not(feature = "mem-1-m07-exact-mysql-write"))]
-        return Err(ControlClass::Fields);
-        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-        {
-            writer.original_freeze_scalars(hub.original_freeze)?;
-            if writer.length > 744 {
-                return Err(ControlClass::Length);
-            }
+        writer.original_freeze_scalars(hub.original_freeze)?;
+        if writer.length > 744 {
+            return Err(ControlClass::Length);
         }
     }
     let length = writer.length;

@@ -32,6 +32,7 @@ use novarocks_spi::connector::{
     ExternalMutationOutcome,
 };
 
+#[cfg(test)]
 use novarocks_query_application::engine_error::EngineError;
 
 /// The statement-level operation before its provider-owned table handle is
@@ -137,7 +138,7 @@ pub enum ResolvedDataMutation {
 
 /// Execute a data mutation and project its typed truth state to the existing
 /// user-facing engine error vocabulary.
-#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn execute_data_mutation(
     resolver: &dyn ConnectorDataMutationResolver,
     cache_finalizer: &dyn DataMutationCacheFinalizer,
@@ -185,7 +186,7 @@ pub fn execute_data_mutation(
 /// planning error is therefore known uncommitted. Once execute is called, an
 /// outer SPI error is conservatively possibly dispatched. A provider unknown
 /// is reconciled once through the retained lease and is never re-executed.
-#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn resolve_data_mutation(
     resolver: &dyn ConnectorDataMutationResolver,
     cache_finalizer: &dyn DataMutationCacheFinalizer,
@@ -224,14 +225,13 @@ pub struct DataMutationSession {
 enum DataMutationSessionPhase {
     Planned,
     AwaitingAdjudication {
-        evidence: ExternalMutationEvidence,
+        evidence: Box<ExternalMutationEvidence>,
         failure: ConnectorMutationFailure,
     },
     Terminal,
 }
 
 impl DataMutationSession {
-    #[allow(clippy::result_large_err)]
     pub fn plan(
         resolver: &dyn ConnectorDataMutationResolver,
         instance_id: &ConnectorInstanceId,
@@ -342,7 +342,7 @@ impl DataMutationSession {
         self.phase = match &outcome {
             ExternalMutationOutcome::CommitUnknown { evidence, failure } => {
                 DataMutationSessionPhase::AwaitingAdjudication {
-                    evidence: evidence.clone(),
+                    evidence: Box::new(evidence.clone()),
                     failure: failure.clone(),
                 }
             }
@@ -372,7 +372,7 @@ impl DataMutationSession {
                 DataMutationDispatchState::ConfirmedNotDispatched,
             );
         };
-        if expected != &evidence {
+        if expected.as_ref() != &evidence {
             return contract_failure(
                 ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
@@ -384,10 +384,10 @@ impl DataMutationSession {
         // Wire carriers validate identity, while the same-statement session
         // retains the original provider owner and its exact journal entry.
         let original_failure = original_failure.clone();
-        let original_evidence = expected.clone();
+        let original_evidence = expected.as_ref().clone();
         let reconcile = match ConnectorDataMutationReconcileRequest::try_new(
             &self.plan,
-            expected.clone(),
+            expected.as_ref().clone(),
             self.context.clone(),
         ) {
             Ok(request) => request,

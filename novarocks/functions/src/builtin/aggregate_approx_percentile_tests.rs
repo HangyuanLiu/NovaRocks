@@ -17,7 +17,6 @@
 
 //! Actual approximate percentile full-data/host consumers; root runs after owner wiring.
 use super::*;
-use crate::aggregate_scalar::AggScalarValue as V;
 use arrow_array::{BinaryArray, Decimal128Array, Float64Array, Int64Array, ListArray};
 use arrow_schema::{Field, Fields};
 use novarocks_type_contract::{
@@ -75,10 +74,10 @@ impl AggregateStateAllocator for Host {
         let mut ledger = self.ledger.lock().unwrap();
         let at = ledger.attempts;
         ledger.attempts += 1;
-        if let Some((stop, cause)) = &*self.refusal.lock().unwrap() {
-            if *stop == at {
-                return Err(cause.clone());
-            }
+        if let Some((stop, cause)) = &*self.refusal.lock().unwrap()
+            && *stop == at
+        {
+            return Err(cause.clone());
         }
         let pointer = NonNull::new(unsafe { std::alloc::alloc(layout) })
             .ok_or(KernelFailure::ResourceExhausted)?;

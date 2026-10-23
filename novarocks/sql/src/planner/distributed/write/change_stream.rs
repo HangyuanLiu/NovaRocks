@@ -345,6 +345,7 @@ fn validate_partition_input_positions(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn route_output_ordinals(route: &ChangeStreamWriteRouteSpec) -> Vec<usize> {
     route
         .input_ordinals

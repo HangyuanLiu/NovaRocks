@@ -301,18 +301,15 @@ impl CatalogSymbols {
             // actual command preserves quoted database identifiers and leaves
             // unqualified/external/invalid controls under their original owner.
             let command = format!("USE {database}");
-            if let Ok(statements) = novarocks_parser::parse(&command) {
-                if let [Statement::Session(SessionStatement::Use(context))] = statements.as_slice()
-                {
-                    if let Some(catalog) = &context.catalog {
-                        if let Some(mapped) = self.lookup(&catalog.value) {
-                            database.replace_range(
-                                catalog.span.start() - 4..catalog.span.end() - 4,
-                                &quoted(&command, catalog.span, mapped),
-                            );
-                        }
-                    }
-                }
+            if let Ok(statements) = novarocks_parser::parse(&command)
+                && let [Statement::Session(SessionStatement::Use(context))] = statements.as_slice()
+                && let Some(catalog) = &context.catalog
+                && let Some(mapped) = self.lookup(&catalog.value)
+            {
+                database.replace_range(
+                    catalog.span.start() - 4..catalog.span.end() - 4,
+                    &quoted(&command, catalog.span, mapped),
+                );
             }
         }
         let output = catalog_output_plan(sql);
@@ -321,30 +318,28 @@ impl CatalogSymbols {
             .iter_mut()
             .chain(meta.result_rows_expect.iter_mut())
         {
-            if control_catalog_column(sql, &output, column) {
-                if let Some(new) = self.lookup(value) {
-                    *value = new.into();
-                }
+            if control_catalog_column(sql, &output, column)
+                && let Some(new) = self.lookup(value)
+            {
+                *value = new.into();
             }
         }
-        if let Some(control) = &mut meta.mv_resume_management {
-            if let Some(new) = self.lookup(&control.catalog) {
-                control.catalog = new.into();
-            }
+        if let Some(control) = &mut meta.mv_resume_management
+            && let Some(new) = self.lookup(&control.catalog)
+        {
+            control.catalog = new.into();
         }
-        if let Some(control) = &mut meta.imv_accelerator_wipe_restart {
-            if let Some(catalog) = &mut control.catalog {
-                if let Some(new) = self.lookup(catalog) {
-                    *catalog = new.into();
-                }
-            }
+        if let Some(control) = &mut meta.imv_accelerator_wipe_restart
+            && let Some(catalog) = &mut control.catalog
+            && let Some(new) = self.lookup(catalog)
+        {
+            *catalog = new.into();
         }
-        if let Some(control) = &mut meta.imv_stateless_rebuild {
-            if let Some(catalog) = &mut control.catalog {
-                if let Some(new) = self.lookup(catalog) {
-                    *catalog = new.into();
-                }
-            }
+        if let Some(control) = &mut meta.imv_stateless_rebuild
+            && let Some(catalog) = &mut control.catalog
+            && let Some(new) = self.lookup(catalog)
+        {
+            *catalog = new.into();
         }
         // Expected errors and these metadata/plan displays own qualified object
         // identities. Ordinary query result literals never enter this adapter.
@@ -473,13 +468,13 @@ impl CatalogEdits<'_> {
         }
     }
     fn literal(&mut self, literal: &Literal) {
-        if let LiteralKind::String(value) = &literal.kind {
-            if let Some(new) = self.symbols.lookup(value) {
-                self.edits.insert(
-                    literal.span.start(),
-                    (literal.span.end(), quoted(self.sql, literal.span, new)),
-                );
-            }
+        if let LiteralKind::String(value) = &literal.kind
+            && let Some(new) = self.symbols.lookup(value)
+        {
+            self.edits.insert(
+                literal.span.start(),
+                (literal.span.end(), quoted(self.sql, literal.span, new)),
+            );
         }
     }
 }
@@ -537,14 +532,12 @@ impl Visit for CatalogEdits<'_> {
                 if call.procedure.parts.last().is_some_and(|n| {
                     n.value
                         .eq_ignore_ascii_case("novarocks_mv_management_status")
-                }) {
-                    if let Some(ProcedureArgument {
-                        value: MaintenanceValue::Literal(l),
-                        ..
-                    }) = call.arguments.first()
-                    {
-                        self.literal(l);
-                    }
+                }) && let Some(ProcedureArgument {
+                    value: MaintenanceValue::Literal(l),
+                    ..
+                }) = call.arguments.first()
+                {
+                    self.literal(l);
                 }
             }
             _ => {}
@@ -562,37 +555,34 @@ impl Visit for CatalogEdits<'_> {
             && call.name.parts[0]
                 .value
                 .eq_ignore_ascii_case("__nr_ivm_delta")
+            && let Some(Expr::Literal(literal)) = call.arguments.first()
+            && let LiteralKind::String(value) = &literal.kind
         {
-            if let Some(Expr::Literal(literal)) = call.arguments.first() {
-                if let LiteralKind::String(value) = &literal.kind {
-                    match self.symbols.display(value, Display::MvIdentity) {
-                        Ok(new) if new != *value => {
-                            self.edits.insert(
-                                literal.span.start(),
-                                (literal.span.end(), quoted(self.sql, literal.span, &new)),
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(error) => self.error = Some(error.to_string()),
-                    }
+            match self.symbols.display(value, Display::MvIdentity) {
+                Ok(new) if new != *value => {
+                    self.edits.insert(
+                        literal.span.start(),
+                        (literal.span.end(), quoted(self.sql, literal.span, &new)),
+                    );
                 }
+                Ok(_) => {}
+                Err(error) => self.error = Some(error.to_string()),
             }
         }
         walk_function_call(self, call);
     }
     fn visit_expr(&mut self, e: &Expr) {
-        if let Expr::CompoundIdentifier(name) = e {
-            if name.parts.len() >= 4
-                && self.relations.contains(
-                    &name.parts[..3]
-                        .iter()
-                        .map(|part| key(&part.value))
-                        .collect::<Vec<_>>(),
-                )
-                && !self.aliases.contains(&key(&name.parts[0].value))
-            {
-                self.ident(&name.parts[0]);
-            }
+        if let Expr::CompoundIdentifier(name) = e
+            && name.parts.len() >= 4
+            && self.relations.contains(
+                &name.parts[..3]
+                    .iter()
+                    .map(|part| key(&part.value))
+                    .collect::<Vec<_>>(),
+            )
+            && !self.aliases.contains(&key(&name.parts[0].value))
+        {
+            self.ident(&name.parts[0]);
         }
         walk_expr(self, e);
     }
@@ -605,15 +595,15 @@ impl Visit for CatalogEdits<'_> {
                 for factor in std::iter::once(&table.relation)
                     .chain(table.joins.iter().map(|join| &join.relation))
                 {
-                    if let TableFactor::Table { name, .. } = factor {
-                        if name.parts.len() >= 3 {
-                            self.relations.insert(
-                                name.parts[..3]
-                                    .iter()
-                                    .map(|part| key(&part.value))
-                                    .collect(),
-                            );
-                        }
+                    if let TableFactor::Table { name, .. } = factor
+                        && name.parts.len() >= 3
+                    {
+                        self.relations.insert(
+                            name.parts[..3]
+                                .iter()
+                                .map(|part| key(&part.value))
+                                .collect(),
+                        );
                     }
                     let alias = match factor {
                         TableFactor::Table { alias, .. }
@@ -628,18 +618,17 @@ impl Visit for CatalogEdits<'_> {
                 }
             }
             for item in &select.projection {
-                if let SelectItem::QualifiedWildcard { prefix, .. } = item {
-                    if prefix.len() >= 3
-                        && self.relations.contains(
-                            &prefix[..3]
-                                .iter()
-                                .map(|part| key(&part.value))
-                                .collect::<Vec<_>>(),
-                        )
-                        && !self.aliases.contains(&key(&prefix[0].value))
-                    {
-                        self.ident(&prefix[0]);
-                    }
+                if let SelectItem::QualifiedWildcard { prefix, .. } = item
+                    && prefix.len() >= 3
+                    && self.relations.contains(
+                        &prefix[..3]
+                            .iter()
+                            .map(|part| key(&part.value))
+                            .collect::<Vec<_>>(),
+                    )
+                    && !self.aliases.contains(&key(&prefix[0].value))
+                {
+                    self.ident(&prefix[0]);
                 }
             }
         }
@@ -656,15 +645,15 @@ impl Visit for CatalogEdits<'_> {
                 BinaryOperator::Equal | BinaryOperator::NotEqual | BinaryOperator::NullSafeEqual
             )
         {
-            if catalog_column(&e.left).is_some() {
-                if let Expr::Literal(l) = &*e.right {
-                    self.literal(l);
-                }
+            if catalog_column(&e.left).is_some()
+                && let Expr::Literal(l) = &*e.right
+            {
+                self.literal(l);
             }
-            if catalog_column(&e.right).is_some() {
-                if let Expr::Literal(l) = &*e.left {
-                    self.literal(l);
-                }
+            if catalog_column(&e.right).is_some()
+                && let Expr::Literal(l) = &*e.left
+            {
+                self.literal(l);
             }
         }
         walk_binary_expr(self, e);

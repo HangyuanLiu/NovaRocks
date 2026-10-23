@@ -81,7 +81,10 @@ pub(crate) struct QueryCompilerPorts {
 }
 
 impl QueryCompilerPorts {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "This constructor binds distinct FE capability owners; a second configuration aggregate would duplicate the authoritative capability shape."
+    )]
     pub(crate) fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -189,7 +192,10 @@ pub struct DmlEnginePorts {
 }
 
 impl DmlEnginePorts {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "This constructor binds distinct FE capability owners; a second configuration aggregate would duplicate the authoritative capability shape."
+    )]
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -384,7 +390,10 @@ pub struct MaintenanceCommandPorts {
 }
 
 impl MaintenanceCommandPorts {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "This constructor binds distinct FE capability owners; a second configuration aggregate would duplicate the authoritative capability shape."
+    )]
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -480,6 +489,10 @@ pub struct MvCommandPorts {
 }
 
 impl MvCommandPorts {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "This constructor binds distinct FE capability owners; a second configuration aggregate would duplicate the authoritative capability shape."
+    )]
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -665,7 +678,10 @@ pub(crate) struct MvRefreshProviderActivationPorts {
 }
 
 impl MvRefreshProviderActivationPorts {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "This constructor binds distinct FE capability owners; a second configuration aggregate would duplicate the authoritative capability shape."
+    )]
     pub(crate) fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,

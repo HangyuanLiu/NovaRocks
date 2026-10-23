@@ -97,8 +97,8 @@ impl LogicalRewriteRule for PruneAggregateColumns {
         for ((aggregate, is_merge), layout_column) in node
             .aggregates
             .into_iter()
-            .zip(node.is_merge.into_iter())
-            .zip(node.output_layout.aggregate_columns.into_iter())
+            .zip(node.is_merge)
+            .zip(node.output_layout.aggregate_columns)
         {
             if aggregate.output_column_id != layout_column.column_id {
                 return Err(SqlCompileError::Compilation(format!(

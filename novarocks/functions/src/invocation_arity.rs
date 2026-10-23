@@ -85,7 +85,10 @@ mod tests {
             maximum: 3,
         };
         for actual in 0..5 {
-            assert_eq!(original.failure(actual).is_some(), actual < 2 || actual > 3);
+            assert_eq!(
+                original.failure(actual).is_some(),
+                !(2..=3).contains(&actual)
+            );
         }
     }
 }

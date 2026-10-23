@@ -1380,6 +1380,30 @@ fn aggregate_extrema_layout_and_dishonest_iterator_refuse_before_growth() {
 }
 
 #[test]
+fn installed_extrema_dispatch_clone_honors_compile_control() {
+    use crate::builtin::aggregate_extrema_dispatch::PreparedExtrema;
+
+    let fixture = Fixture::new("min", ty(true), DecimalOverflowPolicy::OutputNull);
+    let kernel = PreparedExtrema::Fixed(fixture.kernel(AggregateKernelPhase::Single));
+    let expected = CompileControlError::Cancelled;
+    let control = CompileControl {
+        refusal: Some((0, expected.clone())),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        kernel
+            .clone_for_local_phase(std::sync::Arc::clone(kernel.contract()), &control)
+            .unwrap_err(),
+        KernelFailure::CompileControl(expected)
+    );
+    assert_eq!(
+        *control.trace.lock().unwrap(),
+        vec![(CompilePhase::FunctionSpecialization, 0)]
+    );
+}
+
+#[test]
 fn installed_extrema_dispatch_borrowed_output_keeps_actual_prefix_and_typed_iterator_failures() {
     use crate::builtin::aggregate_extrema_dispatch::{ExtremaState, PreparedExtrema};
     let fixture = Fixture::new("min", ty(true), DecimalOverflowPolicy::OutputNull);

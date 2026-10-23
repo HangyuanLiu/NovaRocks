@@ -159,7 +159,7 @@ impl Drop for Resource {
     }
 }
 struct Secondary {
-    resource: Arc<Resource>,
+    _resource: Arc<Resource>,
     drops: Arc<AtomicUsize>,
 }
 impl Drop for Secondary {
@@ -177,7 +177,7 @@ impl Drop for Primary {
         self.drops.fetch_add(1, Ordering::SeqCst);
         let resource = unsafe { ManuallyDrop::take(&mut self.resource) };
         std::panic::panic_any(Secondary {
-            resource,
+            _resource: resource,
             drops: self.secondary.clone(),
         });
     }

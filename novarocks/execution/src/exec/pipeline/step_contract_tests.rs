@@ -335,7 +335,6 @@ impl Drop for Collect {
 
 #[test]
 fn actual_driver_turn_shares_allowance_across_operators_and_nested_reborrows_without_repreparing() {
-    assert!(DEFAULT_TURN_WORK_UNITS > 2);
     let expected = (0..DEFAULT_TURN_WORK_UNITS - 2)
         .map(|i| i as i32 * 3 + 7)
         .collect::<Vec<_>>();

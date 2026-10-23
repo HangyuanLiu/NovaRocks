@@ -198,16 +198,16 @@ fn validate_type(
                 return Err(invalid(path, "empty scalar timestamp timezone"));
             }
         }
-        K::ScalarOpaque => {
+        K::ScalarOpaque
             if !matches!(
                 wire::OpaqueKind::try_from(ty.opaque_kind),
                 Ok(wire::OpaqueKind::Hll
                     | wire::OpaqueKind::Bitmap
                     | wire::OpaqueKind::Object
                     | wire::OpaqueKind::Percentile)
-            ) {
-                return Err(invalid(path, "unknown scalar opaque identity"));
-            }
+            ) =>
+        {
+            return Err(invalid(path, "unknown scalar opaque identity"));
         }
         _ => {}
     }

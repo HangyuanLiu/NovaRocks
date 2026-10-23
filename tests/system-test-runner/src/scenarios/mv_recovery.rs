@@ -2299,10 +2299,8 @@ pub(super) fn protobuf_bytes_field(
                 if end > input.len() {
                     bail!("protobuf field exceeds L document");
                 }
-                if field == expected_field {
-                    if selected.replace(offset..end).is_some() {
-                        bail!("L document repeats protobuf field {expected_field}");
-                    }
+                if field == expected_field && selected.replace(offset..end).is_some() {
+                    bail!("L document repeats protobuf field {expected_field}");
                 }
                 offset = end;
             }

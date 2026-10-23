@@ -91,6 +91,7 @@ impl CatalogEvidencePolicy {
 /// the one request already permitted to enter the external-effect interval.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EvidenceContext {
+    #[cfg(test)]
     started: Instant,
     deadline: Instant,
 }
@@ -103,11 +104,16 @@ impl EvidenceContext {
                 "Publication deadline exceeds the monotonic clock range",
             )
         })?;
-        Ok(Self { started, deadline })
+        Ok(Self {
+            #[cfg(test)]
+            started,
+            deadline,
+        })
     }
     pub(crate) const fn deadline(&self) -> Instant {
         self.deadline
     }
+    #[cfg(test)]
     pub(crate) const fn started(&self) -> Instant {
         self.started
     }

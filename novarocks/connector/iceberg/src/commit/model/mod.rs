@@ -30,8 +30,10 @@ pub use artifacts::{
     ArtifactClass, ArtifactKind, ArtifactLedger, ArtifactRecord, ArtifactWriteState,
     ArtifactWriter, AttemptArtifacts, CleanupScope,
 };
-pub use dependency::{Dependency, ValidationInput};
-pub use fields::{AddedContent, EntryFacts, FrozenEntry, SeqField};
+pub use dependency::Dependency;
+#[cfg(test)]
+pub(crate) use fields::EntryFacts;
+pub use fields::{AddedContent, FrozenEntry, SeqField};
 pub use identity::{
     AttemptToken, EntryIdentity, ObjectIdentity, OperationAuthority, OperationToken,
 };

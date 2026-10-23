@@ -31,6 +31,11 @@
 mod progress;
 use progress::ProgressEndpoint;
 
+#[cfg(test)]
+use crate::exec::chunk::Chunk;
+#[cfg(test)]
+use crate::exec::pipeline::dependency::DependencyHandle;
+#[cfg(test)]
 use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult, PipelineOperation};
 
@@ -38,11 +43,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use super::operator::{
-    BlockedReason, DriverBlockDeadline, ExitObservation, ExitProgress, FinishWatch, Operator,
-};
+use super::operator::{BlockedReason, DriverBlockDeadline, ExitProgress, FinishWatch, Operator};
 use super::{
-    driver_failure::{DriverFailure, ExitHook},
+    driver_failure::DriverFailure,
     driver_retirement::{
         DriverExitCustody, EdgeRetirement, ProcessPanicCustody, RetainedDriverOwners,
     },
@@ -52,8 +55,6 @@ use super::{
     step::{AdmissionNext, InputResult, NextStep, RootPending, RootStep, UpstreamPull, WaitFact},
     step_context::{DEFAULT_TURN_WORK_UNITS, StepContext, TurnWork},
 };
-use crate::exec::chunk::Chunk;
-use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::fragment::io::{
     FragmentEvent, FragmentEventSink, FragmentProgress, NoopFragmentEventSink, RootInputPermit,
@@ -243,7 +244,6 @@ pub struct PipelineDriver {
     activated: bool,
     schedule_state: Arc<DriverScheduleState>,
     blocked_observable: Option<(Arc<Observable>, u64, Option<DriverBlockDeadline>)>,
-    input_wait_observables: Option<(Arc<Observable>, Arc<Observable>, Arc<Observable>)>,
     control_wait_observables: Option<ControlWatch>,
     frontier_watch: Option<ControlWatch>,
     frontier_observable: Arc<Observable>,
@@ -512,7 +512,6 @@ impl PipelineDriver {
             activated: false,
             schedule_state: Arc::new(DriverScheduleState::new()),
             blocked_observable: None,
-            input_wait_observables: None,
             control_wait_observables: None,
             frontier_watch: None,
             frontier_observable: Arc::new(Observable::new()),
@@ -693,18 +692,18 @@ impl PipelineDriver {
         loop {
             let mut added = false;
             for watch in &watches {
-                if let FinishWatch::Notify(observable) = watch {
-                    if !self.is_finish_watched(observable) {
-                        let target = Arc::downgrade(&self.finish_observable);
-                        let subscription = observable.try_subscribe(Arc::new(move || {
-                            if let Some(target) = target.upgrade() {
-                                target.notify_observers();
-                            }
-                        }))?;
-                        self.finish_watched
-                            .push((Arc::downgrade(observable), subscription));
-                        added = true;
-                    }
+                if let FinishWatch::Notify(observable) = watch
+                    && !self.is_finish_watched(observable)
+                {
+                    let target = Arc::downgrade(&self.finish_observable);
+                    let subscription = observable.try_subscribe(Arc::new(move || {
+                        if let Some(target) = target.upgrade() {
+                            target.notify_observers();
+                        }
+                    }))?;
+                    self.finish_watched
+                        .push((Arc::downgrade(observable), subscription));
+                    added = true;
                 }
             }
             if !added {
@@ -1003,13 +1002,6 @@ impl PipelineDriver {
             .unwrap_or("unknown")
     }
 
-    pub(crate) fn sink_name(&self) -> &str {
-        self.operators
-            .last()
-            .map(|op| op.name())
-            .unwrap_or("unknown")
-    }
-
     /// Wait only on operations which can advance an unoccupied output edge or
     /// an actual input delivery. Independent continuations contribute a union
     /// of wake sources; an empty source cannot hide accepted downstream work.
@@ -1049,12 +1041,11 @@ impl PipelineDriver {
             // The exact returned wait belongs to the receiver, not the source.
             if let Some(AdmissionNext::Wait(wait)) =
                 downstream.and_then(OperatorInstance::admission_next)
+                && !wait.is_ready()
             {
-                if !wait.is_ready() {
-                    output_wait = true;
-                    self.frontier_waits.push(wait.clone());
-                    continue;
-                }
+                output_wait = true;
+                self.frontier_waits.push(wait.clone());
+                continue;
             }
             match operator.work_next() {
                 Some(NextStep::Wait(wait)) => {
@@ -1362,16 +1353,16 @@ impl PipelineDriver {
             self.state = DriverState::PendingFinish;
             return self.state.clone();
         }
-        if matches!(state, DriverState::Finished) {
-            if let Some(error) = self.runtime_state.error() {
-                state = DriverState::Failed(error);
-            }
+        if matches!(state, DriverState::Finished)
+            && let Some(error) = self.runtime_state.error()
+        {
+            state = DriverState::Failed(error);
         }
         self.close_operators();
-        if matches!(state, DriverState::Finished) {
-            if let Some(error) = self.runtime_state.error() {
-                state = DriverState::Failed(error);
-            }
+        if matches!(state, DriverState::Finished)
+            && let Some(error) = self.runtime_state.error()
+        {
+            state = DriverState::Failed(error);
         }
         // A synchronous hook cannot certify an asynchronous owner. Even an
         // exceptional hook which initiated exit remains owned until observed.
@@ -2027,15 +2018,15 @@ impl Drop for PipelineDriver {
             let control = self.runtime_state.error_state();
             let cause = DriverFailure::DroppedWithPendingExit.into();
             self.exit_custody.retain(RetainedDriverOwners {
-                process_panic: std::mem::take(&mut self.process_panic),
-                operators: std::mem::take(&mut self.operators),
-                edges: std::mem::take(&mut self.edge_retirement),
-                edge_inputs: std::mem::take(&mut self.edge_chunks),
-                upstream_grant: self.edge_root_input.take(),
-                runtime: self.runtime_state.clone(),
-                query_memory: self.query_memory.take(),
-                edge_trackers: std::mem::take(&mut self.edge_mem_trackers),
-                event_sink: std::mem::ManuallyDrop::into_inner(
+                _process_panic: std::mem::take(&mut self.process_panic),
+                _operators: std::mem::take(&mut self.operators),
+                _edges: std::mem::take(&mut self.edge_retirement),
+                _edge_inputs: std::mem::take(&mut self.edge_chunks),
+                _upstream_grant: self.edge_root_input.take(),
+                _runtime: self.runtime_state.clone(),
+                _query_memory: self.query_memory.take(),
+                _edge_trackers: std::mem::take(&mut self.edge_mem_trackers),
+                _event_sink: std::mem::ManuallyDrop::into_inner(
                     self.event_sink
                         .take()
                         .expect("the original progress holder transfers with unresolved work"),
@@ -2061,11 +2052,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{BlockedReason, DriverState, Observable, PipelineDriver};
-    use crate::exec::chunk::Chunk;
+
     use crate::exec::pipeline::input::PreparedInput;
-    use crate::exec::pipeline::operator::{
-        ExitProgress, FinishWatch, InputEncodingPolicy, Operator,
-    };
+    use crate::exec::pipeline::operator::{FinishWatch, InputEncodingPolicy};
     use crate::exec::pipeline::shape::{
         SinkKernel, SinkStep, Source, SourceKernel, SourceStart, Transform,
     };
@@ -2179,10 +2168,6 @@ mod tests {
                 open_after_first_wait_check: true,
                 wait_checks: AtomicUsize::new(0),
             }
-        }
-
-        fn wait(&self) -> FinalizationState {
-            *self.wait.lock().expect("scripted wait lock")
         }
     }
 
@@ -2695,7 +2680,6 @@ mod terminal_signal_tests {
 
     struct BufferedOnceOperator {
         output: Option<Chunk>,
-        observable: Arc<Observable>,
     }
 
     struct RecoveringTerminal {
@@ -3198,7 +3182,6 @@ mod terminal_signal_tests {
     #[test]
     fn retained_internal_output_resumes_from_the_downstream_generation() {
         let source_observable = Arc::new(Observable::new());
-        let internal_observable = Arc::new(Observable::new());
         let terminal_observable = Arc::new(Observable::new());
         let terminal_ready = Arc::new(AtomicBool::new(false));
         let terminal_pushed = Arc::new(AtomicUsize::new(0));
@@ -3214,7 +3197,6 @@ mod terminal_signal_tests {
                 Box::new(crate::exec::pipeline::shape::Transform::hydrating(
                     BufferedOnceOperator {
                         output: Some(Chunk::default()),
-                        observable: internal_observable,
                     },
                 )),
                 Box::new(crate::exec::pipeline::shape::Transform::hydrating(
@@ -3559,7 +3541,7 @@ mod terminal_signal_tests {
         );
 
         let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Internal(
-            novarocks_functions::KernelDiagnostic::new(&("first failure")),
+            novarocks_functions::KernelDiagnostic::new("first failure"),
         ));
         assert_eq!(
             driver.finish_with_state(DriverState::Failed(original.clone())),
@@ -4397,7 +4379,8 @@ mod terminal_signal_tests {
         }
         #[test]
         fn driver_shares_accepted_encoding_without_new_scope_or_owner() {
-            for keep_encoding in [true] {
+            {
+                let keep_encoding = true;
                 let tracker = MemTracker::new_root("typed driver sharing");
                 let received = Arc::new(Mutex::new(None));
                 let factory = factory(&tracker, Arc::new(RuntimeErrorState::default()));
@@ -4426,18 +4409,6 @@ mod terminal_signal_tests {
                 drop(retained);
             }
         }
-    }
-}
-
-fn step_wait_decision(wait: &WaitFact) -> WorkerBlockDecision {
-    if wait.is_ready() {
-        WorkerBlockDecision::Runnable
-    } else {
-        WorkerBlockDecision::Blocked(
-            Arc::clone(&wait.observable),
-            wait.observed_generation,
-            wait.deadline,
-        )
     }
 }
 

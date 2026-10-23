@@ -18,7 +18,6 @@
 use super::super::cow_necessary_before_begin::{
     Error as NecessaryError, before_request, before_request_owned,
 };
-use super::*;
 use novarocks_spi::connector as spi;
 use spi::ConnectorOperationControl;
 

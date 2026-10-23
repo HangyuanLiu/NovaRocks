@@ -86,3 +86,6 @@ disallowed-types = [
   { path = "tokio::fs::File", reason = "native trust owns no filesystem input or output", allow-invalid = true },
   { path = "tokio::fs::OpenOptions", reason = "native trust owns no filesystem input or output", allow-invalid = true },
 ]
+
+# Copy of the repository root threshold; Clippy reads only the nearest config.
+too-many-arguments-threshold = 10

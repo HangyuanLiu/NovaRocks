@@ -18,7 +18,7 @@
 use super::result_delivery_support::await_idle;
 use crate::actors::mysql_stream::{AsyncMysqlStream, TextColumnObservation, TextResultObservation};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
-use crate::scenarios::query_lifecycle::native_sql_controls::{SqlIntentOwner, StatementSpec};
+use crate::scenarios::native_sql_controls::{SqlIntentOwner, StatementSpec};
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::{QueryLifecycleStatementObservation, ServerHandle};
 use novarocks_execution_contract::failure::{FailureClass, FailureFact, FailureReason, domain};
@@ -1186,77 +1186,79 @@ fn installed_root_protocol(
             }
             _ => false,
         };
-        if one_byte && matches && matches!(operation.as_str(), "fetch1" | "fetch2") {
-            if let RootReadOutcome::Data(data) = &reply.outcome {
-                match cursor.validate_body(row_profile, data.body()) {
-                    Ok(validated) => {
-                        let after = validated.after();
-                        let continuation = operation == "fetch2";
-                        let spans = validated.payload_spans().collect::<Vec<_>>();
-                        let exact_span = !continuation
-                            || (spans.len() == 1
-                                && spans[0].starts_row.is_none()
-                                && spans[0].bytes == b"x"
-                                && spans[0].completes_row);
-                        matches = after.remaining() == u32::from(!continuation)
-                            && after.completed_rows() == u64::from(continuation)
-                            && exact_span;
-                        observation["client_row_cursor"] = serde_json::json!({
-                            "before_remaining": cursor.remaining(), "after_remaining": after.remaining(),
-                            "completed_rows": after.completed_rows(), "spans": spans.len(),
-                            "one_byte_continuation": continuation && exact_span,
-                        });
-                        if matches {
-                            cursor = after;
-                        }
+        if one_byte
+            && matches
+            && matches!(operation.as_str(), "fetch1" | "fetch2")
+            && let RootReadOutcome::Data(data) = &reply.outcome
+        {
+            match cursor.validate_body(row_profile, data.body()) {
+                Ok(validated) => {
+                    let after = validated.after();
+                    let continuation = operation == "fetch2";
+                    let spans = validated.payload_spans().collect::<Vec<_>>();
+                    let exact_span = !continuation
+                        || (spans.len() == 1
+                            && spans[0].starts_row.is_none()
+                            && spans[0].bytes == b"x"
+                            && spans[0].completes_row);
+                    matches = after.remaining() == u32::from(!continuation)
+                        && after.completed_rows() == u64::from(continuation)
+                        && exact_span;
+                    observation["client_row_cursor"] = serde_json::json!({
+                        "before_remaining": cursor.remaining(), "after_remaining": after.remaining(),
+                        "completed_rows": after.completed_rows(), "spans": spans.len(),
+                        "one_byte_continuation": continuation && exact_span,
+                    });
+                    if matches {
+                        cursor = after;
                     }
-                    Err(error) => {
-                        observation["client_row_cursor_error"] =
-                            serde_json::json!(error.to_string());
-                        matches = false;
-                    }
+                }
+                Err(error) => {
+                    observation["client_row_cursor_error"] = serde_json::json!(error.to_string());
+                    matches = false;
                 }
             }
         }
-        if minimum_new_row && matches && matches!(operation.as_str(), "fetch1" | "fetch2") {
-            if let RootReadOutcome::Data(data) = &reply.outcome {
-                match cursor.validate_body(row_profile, data.body()) {
-                    Ok(validated) => {
-                        let after = validated.after();
-                        let second_row = operation == "fetch2";
-                        let spans = validated.payload_spans().collect::<Vec<_>>();
-                        let expected_payload = if second_row {
-                            1
-                        } else {
-                            freeze.data1_bytes - 4
-                        };
-                        let exact_span = spans.len() == 1
-                            && spans[0].starts_row.map(|length| length.get() as usize)
-                                == Some(expected_payload)
-                            && spans[0].bytes.len() == expected_payload
-                            && spans[0].completes_row
-                            && (!second_row || spans[0].bytes == [0]);
-                        matches = cursor.remaining() == 0
-                            && cursor.completed_rows() == u64::from(second_row)
-                            && after.remaining() == 0
-                            && after.completed_rows() == 1 + u64::from(second_row)
-                            && exact_span
-                            && (!second_row || data.body().as_ref() == &[1, 0, 0, 0, 0][..]);
-                        observation["client_row_cursor"] = serde_json::json!({
-                            "before_remaining": cursor.remaining(), "after_remaining": after.remaining(),
-                            "before_completed_rows": cursor.completed_rows(), "completed_rows": after.completed_rows(),
-                            "spans": spans.len(), "starts_row_payload_bytes": spans.first().and_then(|span| span.starts_row).map(|length| length.get()),
-                            "minimum_new_row": second_row && exact_span,
-                        });
-                        if matches {
-                            cursor = after;
-                        }
+        if minimum_new_row
+            && matches
+            && matches!(operation.as_str(), "fetch1" | "fetch2")
+            && let RootReadOutcome::Data(data) = &reply.outcome
+        {
+            match cursor.validate_body(row_profile, data.body()) {
+                Ok(validated) => {
+                    let after = validated.after();
+                    let second_row = operation == "fetch2";
+                    let spans = validated.payload_spans().collect::<Vec<_>>();
+                    let expected_payload = if second_row {
+                        1
+                    } else {
+                        freeze.data1_bytes - 4
+                    };
+                    let exact_span = spans.len() == 1
+                        && spans[0].starts_row.map(|length| length.get() as usize)
+                            == Some(expected_payload)
+                        && spans[0].bytes.len() == expected_payload
+                        && spans[0].completes_row
+                        && (!second_row || spans[0].bytes == [0]);
+                    matches = cursor.remaining() == 0
+                        && cursor.completed_rows() == u64::from(second_row)
+                        && after.remaining() == 0
+                        && after.completed_rows() == 1 + u64::from(second_row)
+                        && exact_span
+                        && (!second_row || data.body().as_ref() == &[1, 0, 0, 0, 0][..]);
+                    observation["client_row_cursor"] = serde_json::json!({
+                        "before_remaining": cursor.remaining(), "after_remaining": after.remaining(),
+                        "before_completed_rows": cursor.completed_rows(), "completed_rows": after.completed_rows(),
+                        "spans": spans.len(), "starts_row_payload_bytes": spans.first().and_then(|span| span.starts_row).map(|length| length.get()),
+                        "minimum_new_row": second_row && exact_span,
+                    });
+                    if matches {
+                        cursor = after;
                     }
-                    Err(error) => {
-                        observation["client_row_cursor_error"] =
-                            serde_json::json!(error.to_string());
-                        matches = false;
-                    }
+                }
+                Err(error) => {
+                    observation["client_row_cursor_error"] = serde_json::json!(error.to_string());
+                    matches = false;
                 }
             }
         }
@@ -1515,7 +1517,7 @@ mod root_refusal_v2_tests {
         proto::FetchRootResultResponse {
             root_task: request.root_task.clone(),
             profile_id: request.profile_id,
-            output_kind: request.output_kind.clone(),
+            output_kind: request.output_kind,
             result: Some(proto::fetch_root_result_response::Result::Refused(
                 proto::RootReadRefusal {
                     fact: Some(novarocks_task_codec::status::encode_failure_fact(

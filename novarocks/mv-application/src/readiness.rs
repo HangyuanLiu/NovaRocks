@@ -296,21 +296,20 @@ impl MvKeyedReadinessService {
         let unchanged = expected
             .as_ref()
             .is_some_and(|old| old.projection.facts.source_revision() == facts.source_revision());
-        if expected.is_none() {
-            if let Some(existing) = self
+        if expected.is_none()
+            && let Some(existing) = self
                 .repository
                 .find_keyed_by_target_object(&facts.source_revision().target_object_id)
                 .await?
-            {
-                let other = existing.projection.facts.target();
-                self.runtime.set_unavailable(
-                    target,
-                    "target object is already projected through another catalog".into(),
-                );
-                return Ok(MvKeyedProjectionInstallOutcome::AlreadyProjectedElsewhere(
-                    other,
-                ));
-            }
+        {
+            let other = existing.projection.facts.target();
+            self.runtime.set_unavailable(
+                target,
+                "target object is already projected through another catalog".into(),
+            );
+            return Ok(MvKeyedProjectionInstallOutcome::AlreadyProjectedElsewhere(
+                other,
+            ));
         }
         let loaded = if unchanged {
             expected.expect("unchanged requires an expected root")
@@ -849,20 +848,19 @@ impl MvKeyedReadinessService {
         let unchanged = expected
             .as_ref()
             .is_some_and(|v| v.projection.facts.source_revision() == facts.source_revision());
-        if expected.is_none() {
-            if let Some(existing) = self
+        if expected.is_none()
+            && let Some(existing) = self
                 .repository
                 .find_keyed_by_target_object(&facts.source_revision().target_object_id)
                 .await?
-            {
-                self.runtime.set_unavailable(
-                    target,
-                    "target object is already projected through another catalog".into(),
-                );
-                return Ok(MvKeyedProjectionInstallOutcome::AlreadyProjectedElsewhere(
-                    existing.projection.facts.target(),
-                ));
-            }
+        {
+            self.runtime.set_unavailable(
+                target,
+                "target object is already projected through another catalog".into(),
+            );
+            return Ok(MvKeyedProjectionInstallOutcome::AlreadyProjectedElsewhere(
+                existing.projection.facts.target(),
+            ));
         }
         let loaded = if unchanged {
             expected.expect("unchanged requires a root")

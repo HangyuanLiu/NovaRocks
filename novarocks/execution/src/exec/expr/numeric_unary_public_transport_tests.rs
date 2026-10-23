@@ -118,15 +118,19 @@ fn freeze(
         .fragments()
         .values()
         .flat_map(|fragment| {
-            fragment.nodes().values().filter_map(move |node| {
-                matches!(&node.kind, novarocks_physical_plan::NodeKind::Scan { .. }).then(|| {
+            fragment
+                .nodes()
+                .values()
+                .filter(|&node| {
+                    matches!(&node.kind, novarocks_physical_plan::NodeKind::Scan { .. })
+                })
+                .map(|node| {
                     novarocks_query_application::api::PlanScanIdentity::new(
                         novarocks_query_application::api::PlanSeal::Version(version),
                         fragment.id().get(),
                         i32::try_from(node.id.get()).unwrap(),
                     )
                 })
-            })
         })
         .collect();
     FrozenExecutionDescription::for_completed_plan(

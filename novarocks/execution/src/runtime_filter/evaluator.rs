@@ -23,7 +23,7 @@
 // Design: ADR-0043 (docs/adr/ADR-0043-runtime-filter-artifact-query-and-evaluator-boundary.md)
 
 mod controlled;
-pub(crate) use controlled::{ControlledRowOutcome, evaluate_rows_controlled};
+pub(crate) use controlled::evaluate_rows_controlled;
 
 use arrow::array::{Array, ArrayData, ArrayRef, BooleanArray};
 use arrow::datatypes::{DataType, TimeUnit};

@@ -242,7 +242,6 @@ pub type RuntimeFilterParticipantCloseHook = Arc<
 >;
 
 impl RuntimeFilterParticipant {
-    #[allow(clippy::too_many_arguments)]
     fn from_installed(
         execution_id: QueryExecutionId,
         install: BackendParticipantInstall,
@@ -573,10 +572,6 @@ impl BackendParticipantOutbound {
         }
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The contribution envelope is frozen from distinct backend routing facts at the native boundary."
-    )]
     fn forward_producer_contribution(
         &self,
         channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
@@ -1047,7 +1042,6 @@ mod tests {
     use novarocks_worker::runtime_filter::fixture::BackendRuntimeFilterFixture;
 
     impl RuntimeFilterParticipant {
-        #[allow(clippy::too_many_arguments)]
         fn from_test_parts(
             execution_id: QueryExecutionId,
             install: BackendParticipantInstall,

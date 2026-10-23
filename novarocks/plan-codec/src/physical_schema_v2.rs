@@ -735,7 +735,7 @@ fn prepare_schemas_decode_core<'loan, 'control, H>(
     source_retained_bytes: usize,
     limits: NodeProjectionLimits,
     admit: &mut Admission<'_>,
-    mut creation: Option<&mut ValueSchemaCreation<'_, H>>,
+    creation: Option<&mut ValueSchemaCreation<'_, H>>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedSchemasDecode<'loan, 'control>, ProjectionFailure<Error, H>> {
     let (_, facts) = decode_preflight(
@@ -746,7 +746,7 @@ fn prepare_schemas_decode_core<'loan, 'control, H>(
         admit,
         work,
     )?;
-    let storage = if let Some(creation) = creation.as_deref_mut() {
+    let storage = if let Some(creation) = creation {
         creator::observe_schema_construction(definitions, creation, work)?;
         creation
             .storage_lifetime()

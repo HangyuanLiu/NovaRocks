@@ -1312,6 +1312,25 @@ fn combine_shutdown_results(
 mod application_host_tests;
 
 #[cfg(test)]
+pub(crate) fn test_compiled_static_plan() -> CompiledStaticPlan {
+    let limits = novarocks_plan_codec::physical_package_v2::test_support::decode_limits();
+    let model = Arc::new(FragmentDecodeResourceModel::try_new(&CompositionControl).unwrap());
+    CompiledStaticPlan {
+        compiler: Arc::new(crate::backend_task_execution::execution_host::tests::compiled_package_host::interpreter()),
+        admission: Arc::new(StaticPackageAdmission::new(model, limits.wire)),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_static_package_admission() -> Arc<StaticPackageAdmission> {
+    let limits = novarocks_plan_codec::physical_package_v2::test_support::decode_limits();
+    Arc::new(StaticPackageAdmission::new(
+        Arc::new(FragmentDecodeResourceModel::try_new(&CompositionControl).unwrap()),
+        limits.wire,
+    ))
+}
+
+#[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -2148,7 +2167,6 @@ mod tests {
         };
         let carrier = protocol::FrozenFragment {
             package: vec![0; 65].into(),
-            ..Default::default()
         };
         let error = services
             .task_execution_ingress
@@ -2180,23 +2198,4 @@ mod tests {
             "a refused create leaves no task behind"
         );
     }
-}
-
-#[cfg(test)]
-pub(crate) fn test_compiled_static_plan() -> CompiledStaticPlan {
-    let limits = novarocks_plan_codec::physical_package_v2::test_support::decode_limits();
-    let model = Arc::new(FragmentDecodeResourceModel::try_new(&CompositionControl).unwrap());
-    CompiledStaticPlan {
-        compiler: Arc::new(crate::backend_task_execution::execution_host::tests::compiled_package_host::interpreter()),
-        admission: Arc::new(StaticPackageAdmission::new(model, limits.wire)),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn test_static_package_admission() -> Arc<StaticPackageAdmission> {
-    let limits = novarocks_plan_codec::physical_package_v2::test_support::decode_limits();
-    Arc::new(StaticPackageAdmission::new(
-        Arc::new(FragmentDecodeResourceModel::try_new(&CompositionControl).unwrap()),
-        limits.wire,
-    ))
 }

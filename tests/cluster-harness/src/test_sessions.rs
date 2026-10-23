@@ -880,10 +880,9 @@ impl ClusterTestSessionPlan {
                     .iter()
                     .find(|closed| closed.session_id == selected.session_id)
             })
+            && let Err(error) = &closed.result
         {
-            if let Err(error) = &closed.result {
-                failures.push(format!("original role controller cleanup failed: {error}"));
-            }
+            failures.push(format!("original role controller cleanup failed: {error}"));
         }
         if Instant::now() >= self.deadline {
             failures.push("Native action retirement completed after original deadline".into());
@@ -910,10 +909,10 @@ impl ClusterTestSessionPlan {
             if let Err(error) = result {
                 bail!(error);
             }
-        } else if let Some(closed) = self.closed_roles.get(&role).and_then(|roles| roles.last()) {
-            if let Err(error) = &closed.result {
-                bail!(error.clone());
-            }
+        } else if let Some(closed) = self.closed_roles.get(&role).and_then(|roles| roles.last())
+            && let Err(error) = &closed.result
+        {
+            bail!(error.clone());
         }
         Ok(())
     }

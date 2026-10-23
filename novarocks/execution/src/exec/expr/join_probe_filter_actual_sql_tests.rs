@@ -105,10 +105,10 @@ fn join_probe_owned_actual_sql_compiler_every_callback_preserves_three_causes() 
             let mut events = self.events.lock().unwrap();
             let at = events.len();
             events.push((phase, units));
-            if let Some((stop, cause)) = self.refusal.clone() {
-                if at == stop {
-                    return Err(cause);
-                }
+            if let Some((stop, cause)) = self.refusal.clone()
+                && at == stop
+            {
+                return Err(cause);
             }
             Ok(())
         }

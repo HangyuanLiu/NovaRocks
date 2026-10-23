@@ -721,8 +721,9 @@ run_cargo_gates() {
   run_fail_fast_stage "shared benchmark fixture contract" "shared-benchmark-fixture-contract.log" \
     python3 tests/sql/fixtures/benchmarks/tests/fixture-contract-test.py
   run_fail_fast_stage "cargo fmt" "cargo-fmt.log" cargo fmt --check
+  # Design: ADR-0194 (docs/adr/ADR-0194-strict-clippy-ci-baseline.md)
   run_fail_fast_stage "cargo clippy" "cargo-clippy.log" \
-    ci_main_cargo clippy --all-targets
+    ci_main_cargo clippy --all-targets -- -D warnings
   # The SQL error manifest is a generated whitelist that other tools consume as
   # fact: the sql-test runner include_str!s it and rejects any @expect_sql_code
   # missing from it. A stale manifest therefore does not surface as "this file

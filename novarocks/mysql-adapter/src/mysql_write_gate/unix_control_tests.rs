@@ -279,10 +279,10 @@ impl Fixture {
                 .flatten()
                 .filter(|entry| entry.directory == directory)
             {
-                if let Err(error) = remove_artifact(artifact) {
-                    if cleanup.is_none() {
-                        cleanup = Some(finite_error("artifact-cleanup", &error));
-                    }
+                if let Err(error) = remove_artifact(artifact)
+                    && cleanup.is_none()
+                {
+                    cleanup = Some(finite_error("artifact-cleanup", &error));
                 }
             }
         }
@@ -389,7 +389,6 @@ fn wire(body: &[u8]) -> Vec<u8> {
 struct Reply {
     opcode: u8,
     commands: u8,
-    request_bytes: u64,
     earlier_response_bytes: u64,
     explicit_stop: bool,
     used_arm: bool,
@@ -425,7 +424,6 @@ async fn read_reply(peer: &mut UnixStream, frontend: FrontendProcessId) -> io::R
     Ok(Reply {
         opcode: bytes[1],
         commands: bytes[20],
-        request_bytes: u64::from_le_bytes(bytes[21..29].try_into().unwrap()),
         earlier_response_bytes: u64::from_le_bytes(bytes[29..37].try_into().unwrap()),
         explicit_stop: bytes[37] == 1,
         used_arm: bytes[38] == 1,

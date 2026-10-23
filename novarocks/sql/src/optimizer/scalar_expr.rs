@@ -743,10 +743,9 @@ fn cast_has_intrinsic_row_error(source: &DataType, target: &DataType, root: bool
         DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => Some((*p, *s)),
         _ => None,
     };
-    if root {
-        if let (Some((sp, ss)), Some((tp, ts))) = (decimal_parts(source), decimal_parts(target)) {
-            return ss != ts || tp < sp;
-        }
+    if root && let (Some((sp, ss)), Some((tp, ts))) = (decimal_parts(source), decimal_parts(target))
+    {
+        return ss != ts || tp < sp;
     }
     // ALLOW_THROW_EXCEPTION is an existing statement setting rather than a
     // per-node Decimal policy. Conservatively preserve its lawful error route.

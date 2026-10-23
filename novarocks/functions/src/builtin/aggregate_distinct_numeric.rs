@@ -273,11 +273,10 @@ pub fn sum_from_set(
                     .map_err(DistinctComputationError::Arrow)?;
                 Ok(std::sync::Arc::new(array))
             }
-            other => Err((distinct_contract(format_args!(
+            other => Err(distinct_contract(format_args!(
                 "multi_distinct_sum output type unsupported: {:?}",
                 other
-            )))
-            .into()),
+            ))),
         };
     }
 
@@ -293,11 +292,10 @@ pub fn sum_from_set(
                     DataType::Int64 => i64::from_le_bytes(read_fixed_numeric::<8>(v)?) as i128,
                     DataType::Boolean => i8::from_le_bytes(read_fixed_numeric::<1>(v)?) as i128,
                     other => {
-                        return Err((distinct_contract(format_args!(
+                        return Err(distinct_contract(format_args!(
                             "multi_distinct_sum unsupported input type for int output: {:?}",
                             other
-                        )))
-                        .into());
+                        )));
                     }
                 };
                 sum += value;
@@ -314,11 +312,10 @@ pub fn sum_from_set(
                     DataType::Float32 => f32::from_le_bytes(read_fixed_numeric::<4>(v)?) as f64,
                     DataType::Float64 => f64::from_le_bytes(read_fixed_numeric::<8>(v)?),
                     other => {
-                        return Err((distinct_contract(format_args!(
+                        return Err(distinct_contract(format_args!(
                             "multi_distinct_sum unsupported input type for float output: {:?}",
                             other
-                        )))
-                        .into());
+                        )));
                     }
                 };
                 sum += value;
@@ -332,11 +329,10 @@ pub fn sum_from_set(
                 let value = match input_type {
                     DataType::Decimal128(_, _) => i128::from_le_bytes(read_fixed_numeric::<16>(v)?),
                     other => {
-                        return Err((distinct_contract(format_args!(
+                        return Err(distinct_contract(format_args!(
                             "multi_distinct_sum unsupported input type for decimal output: {:?}",
                             other
-                        )))
-                        .into());
+                        )));
                     }
                 };
                 sum = sum.checked_add(value).ok_or_else(numeric_overflow)?;
@@ -353,11 +349,10 @@ pub fn sum_from_set(
                 let value = match input_type {
                     DataType::Decimal256(_, _) => i256::from_le_bytes(read_fixed_numeric::<32>(v)?),
                     other => {
-                        return Err((distinct_contract(format_args!(
+                        return Err(distinct_contract(format_args!(
                             "multi_distinct_sum unsupported input type for decimal output: {:?}",
                             other
-                        )))
-                        .into());
+                        )));
                     }
                 };
                 sum = sum.checked_add(value).ok_or_else(numeric_overflow)?;
@@ -367,11 +362,10 @@ pub fn sum_from_set(
                 .map_err(DistinctComputationError::Arrow)?;
             Ok(std::sync::Arc::new(array))
         }
-        other => Err((distinct_contract(format_args!(
+        other => Err(distinct_contract(format_args!(
             "multi_distinct_sum output type unsupported: {:?}",
             other
-        )))
-        .into()),
+        ))),
     }
 }
 
@@ -397,10 +391,9 @@ pub fn avg_from_set(
                     DataType::Float32 => f32::from_le_bytes(read_fixed_numeric::<4>(value)?) as f64,
                     DataType::Float64 => f64::from_le_bytes(read_fixed_numeric::<8>(value)?),
                     other => {
-                        return Err((distinct_contract(format_args!(
+                        return Err(distinct_contract(format_args!(
                             "distinct avg numeric input unsupported: {other:?}"
-                        )))
-                        .into());
+                        )));
                     }
                 };
             }
@@ -410,9 +403,9 @@ pub fn avg_from_set(
         }
         DataType::Decimal128(precision, scale) => {
             let DataType::Decimal128(_, input_scale) = input_type else {
-                return Err(
-                    (distinct_contract("distinct avg decimal input signature mismatch")).into(),
-                );
+                return Err(distinct_contract(
+                    "distinct avg decimal input signature mismatch",
+                ));
             };
             let mut sum = i256::ZERO;
             for value in set.keys() {
@@ -427,7 +420,7 @@ pub fn avg_from_set(
             if difference >= 0 {
                 sum = sum.checked_mul(factor).ok_or_else(numeric_overflow)?;
             } else {
-                sum = sum / factor;
+                sum /= factor;
             }
             let coefficient = round(sum, i256::from_i128(set.len() as i128))?
                 .to_i128()
@@ -442,10 +435,9 @@ pub fn avg_from_set(
         }
         DataType::Decimal256(precision, scale) => {
             if input_type != output_type {
-                return Err((distinct_contract(
+                return Err(distinct_contract(
                     "distinct avg decimal256 bound precision/scale mismatch",
-                ))
-                .into());
+                ));
             }
             // Divide each coefficient before accumulation. A valid DECIMAL256
             // mean can fit even when the sum of its inputs exceeds i256.
@@ -465,15 +457,15 @@ pub fn avg_from_set(
             quotient = quotient
                 .checked_add(remainder / count)
                 .ok_or_else(numeric_overflow)?;
-            remainder = remainder % count;
+            remainder %= count;
             // Normalize to the truncated quotient of the complete sum so that
             // half-up rounding also handles opposite-sign coefficients.
             if quotient > i256::ZERO && remainder < i256::ZERO {
-                quotient = quotient - i256::ONE;
-                remainder = remainder + count;
+                quotient -= i256::ONE;
+                remainder += count;
             } else if quotient < i256::ZERO && remainder > i256::ZERO {
-                quotient = quotient + i256::ONE;
-                remainder = remainder - count;
+                quotient += i256::ONE;
+                remainder -= count;
             }
             let rounded = quotient
                 .checked_add(round(remainder, count)?)
@@ -486,10 +478,9 @@ pub fn avg_from_set(
                 .map_err(DistinctComputationError::NumericPrecision)?;
             Ok(Arc::new(result))
         }
-        other => Err((distinct_contract(format_args!(
+        other => Err(distinct_contract(format_args!(
             "distinct avg output unsupported: {other:?}"
-        )))
-        .into()),
+        ))),
     }
 }
 
@@ -639,11 +630,10 @@ pub fn encode_numeric_row(
             encode_le(arr.value(row).to_le_bytes())
         }
         other => {
-            return Err((distinct_contract(format_args!(
+            return Err(distinct_contract(format_args!(
                 "multi_distinct_sum unsupported input type: {:?}",
                 other
-            )))
-            .into());
+            )));
         }
     };
     Ok(Some(encoded))
@@ -693,10 +683,9 @@ pub fn numeric_key_width(data_type: &DataType) -> Result<usize, DistinctComputat
         DataType::Int64 | DataType::Float64 => Ok(8),
         DataType::Decimal128(..) => Ok(16),
         DataType::Decimal256(..) => Ok(32),
-        other => Err((distinct_contract(format_args!(
+        other => Err(distinct_contract(format_args!(
             "distinct numeric key type unsupported: {other:?}"
-        )))
-        .into()),
+        ))),
     }
 }
 
@@ -735,15 +724,14 @@ pub fn visit_serialized_keys_with_work(
         .and_then(|length| length.checked_add(4))
         .ok_or_else(|| DistinctComputationError::Arithmetic)?;
     if bytes.len() != expected {
-        return Err((distinct_contract("invalid distinct set payload length")).into());
+        return Err(distinct_contract("invalid distinct set payload length"));
     }
     for index in 0..count {
         work.step()?;
         if read(4 + index * stride)? as usize != width {
-            return Err((distinct_contract(
+            return Err(distinct_contract(
                 "distinct set key width differs from selected input type",
-            ))
-            .into());
+            ));
         }
     }
     for index in 0..count {

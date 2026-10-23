@@ -120,8 +120,8 @@ pub(crate) fn load_iceberg_mv_target_binding_typed(
     #[cfg(novarocks_dev_controls)] controls: Option<&crate::mv::test_controls::MvTestControls>,
 ) -> Result<MvTargetBinding, ConnectorError> {
     #[cfg(novarocks_dev_controls)]
-    if let Some(controls) = controls {
-        if controls
+    if let Some(controls) = controls
+        && controls
             .transient_preparation(&target.catalog, &target.namespace, &target.table)
             .map_err(|error| {
                 ConnectorError::new(
@@ -129,15 +129,14 @@ pub(crate) fn load_iceberg_mv_target_binding_typed(
                     error,
                 )
             })?
-        {
-            return Err(ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::Unavailable,
-                format!(
-                    "test-injected temporary connector unavailability while preparing {}.{}.{}",
-                    target.catalog, target.namespace, target.table
-                ),
-            ));
-        }
+    {
+        return Err(ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+            format!(
+                "test-injected temporary connector unavailability while preparing {}.{}.{}",
+                target.catalog, target.namespace, target.table
+            ),
+        ));
     }
     load_mv_target_binding_with_ports_typed(
         connector_control,

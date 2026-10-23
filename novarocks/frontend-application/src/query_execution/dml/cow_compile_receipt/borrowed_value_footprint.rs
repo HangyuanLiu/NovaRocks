@@ -145,7 +145,7 @@ impl WalkControl<'_> {
             .visits
             .checked_add(1)
             .ok_or(Failure::ResourceExhausted)?;
-        if self.visits % 256 == 0 {
+        if self.visits.is_multiple_of(256) {
             (self.check)()?;
         }
         Ok(())

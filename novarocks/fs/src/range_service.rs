@@ -83,6 +83,10 @@ pub enum FileRangeClass {
     Prefetch,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Accepted range requests move directly to their drivers; boxing would allocate for every admitted range"
+)]
 pub enum FileRangeStart {
     Started(FileRangeRequest),
     Deferred,

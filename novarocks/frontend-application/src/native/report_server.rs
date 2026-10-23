@@ -43,14 +43,10 @@ struct LifecycleConvergenceDebugSnapshot {
 
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "The typed frontend protocol model intentionally keeps payloads inline."
-)]
 enum RuntimeFilterTerminalRollupDebug {
     Available {
         participants: Vec<RuntimeFilterParticipantTerminalDebug>,
-        totals: RuntimeFilterTerminalTotalsDebug,
+        totals: Box<RuntimeFilterTerminalTotalsDebug>,
     },
     Unavailable {
         reason: &'static str,
@@ -147,10 +143,6 @@ struct RuntimeFilterUniqueIdDebug {
 
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "The typed frontend protocol model intentionally keeps payloads inline."
-)]
 enum RuntimeFilterTerminalTotalsDebug {
     Available {
         channels: RuntimeFilterChannelTotalsDebug,
@@ -221,7 +213,6 @@ fn lifecycle_convergence_debug_snapshot(
     let error_source = snapshot.error_source.map(|source| match source {
         QueryLifecycleConvergenceErrorSource::BackendAttestation => "backend-attestation",
         QueryLifecycleConvergenceErrorSource::FrontendLiveness => "frontend-liveness",
-        QueryLifecycleConvergenceErrorSource::NoOutcome => "no-outcome",
     });
     LifecycleConvergenceDebugSnapshot {
         execution_id: format!(
@@ -292,7 +283,7 @@ fn runtime_filter_terminal_rollup_debug(
                     .into_iter()
                     .map(runtime_filter_participant_debug)
                     .collect(),
-                totals: runtime_filter_totals_debug(rollup.totals),
+                totals: Box::new(runtime_filter_totals_debug(rollup.totals)),
             }
         }
         RuntimeFilterTerminalRollupSnapshot::Unavailable(reason) => {
@@ -705,6 +696,96 @@ fn status_from_domain_source(
         FailureClass::Invariant | FailureClass::Unexpected => tonic::Status::internal(detail),
         // A control observation is not necessarily this RPC caller's cancellation.
         FailureClass::Control => tonic::Status::aborted(detail),
+    }
+}
+
+/// Instance-owned report listener. The host exposes only lifecycle methods,
+/// never a Tonic service or a Core listener handle.
+pub struct FrontendReportServerHandle {
+    inner: NativeRpcServerHandle,
+}
+
+impl FrontendReportServerHandle {
+    pub(crate) fn start(
+        address: SocketAddr,
+        membership: Arc<ClusterBackendService>,
+        _convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
+        native_trust: Arc<NativeTrust>,
+        native_transport: FrontendNativeTransport,
+        native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
+        transport_admission: novarocks_native_adapter::native_transport_admission::NativeTransportAdmission,
+    ) -> Result<Self, String> {
+        Self::start_at_host(
+            &address.ip().to_string(),
+            address.port(),
+            membership,
+            native_trust,
+            native_transport,
+            native_ingress,
+            transport_admission,
+        )
+    }
+
+    pub(crate) fn start_from_host(
+        host: &str,
+        port: u16,
+        membership: Arc<ClusterBackendService>,
+        _convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
+        native_trust: Arc<NativeTrust>,
+        native_transport: FrontendNativeTransport,
+        native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
+        transport_admission: novarocks_native_adapter::native_transport_admission::NativeTransportAdmission,
+    ) -> Result<Self, String> {
+        Self::start_at_host(
+            host,
+            port,
+            membership,
+            native_trust,
+            native_transport,
+            native_ingress,
+            transport_admission,
+        )
+    }
+
+    fn start_at_host(
+        host: &str,
+        port: u16,
+        membership: Arc<ClusterBackendService>,
+        native_trust: Arc<NativeTrust>,
+        native_transport: FrontendNativeTransport,
+        native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
+        transport_admission: novarocks_native_adapter::native_transport_admission::NativeTransportAdmission,
+    ) -> Result<Self, String> {
+        let deployment_id = native_trust.deployment_id().as_str().to_string();
+        let inner = NativeRpcServerHandle::start_frontend_membership(
+            host,
+            port,
+            FrontendReportService {
+                membership,
+                deployment_id,
+            },
+            native_trust,
+            native_transport.incoming_adapter(),
+            "frontend report endpoint",
+            "frontend-report-grpc",
+            || {},
+            || crate::metrics::observe_native_trust_transport_rejection("report_listener"),
+            native_ingress,
+            transport_admission,
+        )?;
+        Ok(Self { inner })
+    }
+
+    pub const fn bound_addr(&self) -> SocketAddr {
+        self.inner.bound_addr()
+    }
+
+    pub fn poll_failure(&mut self) -> Result<Option<String>, String> {
+        self.inner.poll_failure()
+    }
+
+    pub fn stop(&mut self) -> Result<(), String> {
+        self.inner.stop()
     }
 }
 
@@ -1137,95 +1218,5 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::Unauthenticated);
 
         server.stop().expect("stop frontend report server");
-    }
-}
-
-/// Instance-owned report listener. The host exposes only lifecycle methods,
-/// never a Tonic service or a Core listener handle.
-pub struct FrontendReportServerHandle {
-    inner: NativeRpcServerHandle,
-}
-
-impl FrontendReportServerHandle {
-    pub(crate) fn start(
-        address: SocketAddr,
-        membership: Arc<ClusterBackendService>,
-        _convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
-        native_trust: Arc<NativeTrust>,
-        native_transport: FrontendNativeTransport,
-        native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
-        transport_admission: novarocks_native_adapter::native_transport_admission::NativeTransportAdmission,
-    ) -> Result<Self, String> {
-        Self::start_at_host(
-            &address.ip().to_string(),
-            address.port(),
-            membership,
-            native_trust,
-            native_transport,
-            native_ingress,
-            transport_admission,
-        )
-    }
-
-    pub(crate) fn start_from_host(
-        host: &str,
-        port: u16,
-        membership: Arc<ClusterBackendService>,
-        _convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
-        native_trust: Arc<NativeTrust>,
-        native_transport: FrontendNativeTransport,
-        native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
-        transport_admission: novarocks_native_adapter::native_transport_admission::NativeTransportAdmission,
-    ) -> Result<Self, String> {
-        Self::start_at_host(
-            host,
-            port,
-            membership,
-            native_trust,
-            native_transport,
-            native_ingress,
-            transport_admission,
-        )
-    }
-
-    fn start_at_host(
-        host: &str,
-        port: u16,
-        membership: Arc<ClusterBackendService>,
-        native_trust: Arc<NativeTrust>,
-        native_transport: FrontendNativeTransport,
-        native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
-        transport_admission: novarocks_native_adapter::native_transport_admission::NativeTransportAdmission,
-    ) -> Result<Self, String> {
-        let deployment_id = native_trust.deployment_id().as_str().to_string();
-        let inner = NativeRpcServerHandle::start_frontend_membership(
-            host,
-            port,
-            FrontendReportService {
-                membership,
-                deployment_id,
-            },
-            native_trust,
-            native_transport.incoming_adapter(),
-            "frontend report endpoint",
-            "frontend-report-grpc",
-            || {},
-            || crate::metrics::observe_native_trust_transport_rejection("report_listener"),
-            native_ingress,
-            transport_admission,
-        )?;
-        Ok(Self { inner })
-    }
-
-    pub const fn bound_addr(&self) -> SocketAddr {
-        self.inner.bound_addr()
-    }
-
-    pub fn poll_failure(&mut self) -> Result<Option<String>, String> {
-        self.inner.poll_failure()
-    }
-
-    pub fn stop(&mut self) -> Result<(), String> {
-        self.inner.stop()
     }
 }

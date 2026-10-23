@@ -295,10 +295,10 @@ pub fn encoded_public_source_schemas_backing_bytes(
         for fact in &def.field_facts {
             bytes = add(bytes, layout::<u32>(fact.field_path.capacity())?.size())?;
             bytes = add(bytes, attrs(&fact.attributes)?)?;
-            if let Some(default) = &fact.initial_default {
-                if let Some(json) = &default.json {
-                    bytes = add(bytes, json.capacity())?;
-                }
+            if let Some(default) = &fact.initial_default
+                && let Some(json) = &default.json
+            {
+                bytes = add(bytes, json.capacity())?;
             }
         }
     }
@@ -363,13 +363,13 @@ fn request_vec<T, H>(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<T>, ProjectionFailure<Error, H>> {
     let l = layout::<T>(count)?;
-    if l.size() != 0 {
-        if let Some(creation) = creation.as_deref_mut() {
-            work.flush()?;
-            creation
-                .request_layout(l)
-                .map_err(ProjectionFailure::Host)?;
-        }
+    if l.size() != 0
+        && let Some(creation) = creation.as_deref_mut()
+    {
+        work.flush()?;
+        creation
+            .request_layout(l)
+            .map_err(ProjectionFailure::Host)?;
     }
     Ok(reserve(count, work)?)
 }
@@ -387,13 +387,13 @@ fn decode_attributes<H>(
     }
     let map =
         hashmap::fresh_table_layout::<String, String>(source.len()).map_err(map_layout_error)?;
-    if let Some(l) = map.layout {
-        if let Some(creation) = creation.as_deref_mut() {
-            work.flush()?;
-            creation
-                .observe_opaque_upper_bound(l.size())
-                .map_err(ProjectionFailure::Host)?;
-        }
+    if let Some(l) = map.layout
+        && let Some(creation) = creation.as_deref_mut()
+    {
+        work.flush()?;
+        creation
+            .observe_opaque_upper_bound(l.size())
+            .map_err(ProjectionFailure::Host)?;
     }
     work.flush()?;
     let mut values = HashMap::new();
@@ -402,13 +402,13 @@ fn decode_attributes<H>(
     for entry in source {
         for text in [&entry.key, &entry.value] {
             let l = layout::<u8>(text.len())?;
-            if l.size() != 0 {
-                if let Some(creation) = creation.as_deref_mut() {
-                    work.flush()?;
-                    creation
-                        .request_layout(l)
-                        .map_err(ProjectionFailure::Host)?;
-                }
+            if l.size() != 0
+                && let Some(creation) = creation.as_deref_mut()
+            {
+                work.flush()?;
+                creation
+                    .request_layout(l)
+                    .map_err(ProjectionFailure::Host)?;
             }
         }
         let key = copy_string(&entry.key, work)?;
@@ -634,7 +634,6 @@ fn decode_core<H, F: ValueSchemaCreationFactory<H>>(
             .map(|port| &mut **port as &mut dyn ValueSchemaCreationScope<H>)
     };
     let mut entries = request_vec::<Entry, H>(defs.len(), &mut container_port, work)?;
-    drop(container_port);
     for def in defs {
         let id = def
             .id
@@ -687,14 +686,14 @@ fn decode_core<H, F: ValueSchemaCreationFactory<H>>(
         } else {
             storage.clone()
         };
-        let mut shape_port = if let Some(scope) = shape_scope.as_mut() {
+        let shape_port = if let Some(scope) = shape_scope.as_mut() {
             Some(scope as &mut dyn ValueSchemaCreationScope<H>)
         } else {
             creation
                 .as_mut()
                 .map(|port| &mut **port as &mut dyn ValueSchemaCreationScope<H>)
         };
-        if let Some(port) = shape_port.as_deref_mut() {
+        if let Some(port) = shape_port {
             work.flush()?;
             port.request_layout(arc_layout(Layout::new::<arrow::datatypes::Schema>())?)
                 .map_err(ProjectionFailure::Host)?;
@@ -706,7 +705,6 @@ fn decode_core<H, F: ValueSchemaCreationFactory<H>>(
             ConnectorSourceSchemaShape::try_new_observed(shape_schema, shape_storage, |units| {
                 work_units(work, units).map_err(ProjectionFailure::<Error, H>::from)
             })?;
-        drop(shape_port);
         let mut facts_scope = begin(
             factory,
             &mut model,
@@ -733,7 +731,6 @@ fn decode_core<H, F: ValueSchemaCreationFactory<H>>(
             &mut facts_port,
             work,
         )?;
-        drop(facts_port);
         for fact in &def.field_facts {
             let mut field_scope = begin(
                 factory,
@@ -759,17 +756,16 @@ fn decode_core<H, F: ValueSchemaCreationFactory<H>>(
                 path.push(part);
                 work.step()?;
             }
-            if !path.is_empty() {
-                if let Some(creation) = field_port.as_deref_mut() {
-                    creation
-                        .observe_opaque_upper_bound(layout::<u32>(path.len())?.size())
-                        .map_err(ProjectionFailure::Host)?;
-                }
+            if !path.is_empty()
+                && let Some(creation) = field_port
+            {
+                creation
+                    .observe_opaque_upper_bound(layout::<u32>(path.len())?.size())
+                    .map_err(ProjectionFailure::Host)?;
             }
             work.flush()?;
             let path = path.into_boxed_slice();
             work.flush()?;
-            drop(field_port);
             let default = if let Some(default) = &fact.initial_default {
                 let json = default
                     .json
@@ -787,14 +783,14 @@ fn decode_core<H, F: ValueSchemaCreationFactory<H>>(
                     .as_ref()
                     .map(ValueSchemaCreationScope::<H>::storage_lifetime)
                     .unwrap_or_else(|| storage.clone());
-                let mut default_port = if let Some(scope) = default_scope.as_mut() {
+                let default_port = if let Some(scope) = default_scope.as_mut() {
                     Some(scope as &mut dyn ValueSchemaCreationScope<H>)
                 } else {
                     creation
                         .as_mut()
                         .map(|port| &mut **port as &mut dyn ValueSchemaCreationScope<H>)
                 };
-                if let Some(port) = default_port.as_deref_mut() {
+                if let Some(port) = default_port {
                     work.flush()?;
                     port.request_layout(arc_layout(layout::<u8>(json.len())?)?)
                         .map_err(ProjectionFailure::Host)?;
@@ -843,14 +839,14 @@ fn decode_core<H, F: ValueSchemaCreationFactory<H>>(
                 .as_mut()
                 .map(|port| &mut **port as &mut dyn ValueSchemaCreationScope<H>)
         };
-        if !fields.is_empty() {
-            if let Some(creation) = facts_port.as_deref_mut() {
-                creation
-                    .observe_opaque_upper_bound(
-                        layout::<ConnectorSourceFieldFacts>(fields.len())?.size(),
-                    )
-                    .map_err(ProjectionFailure::Host)?;
-            }
+        if !fields.is_empty()
+            && let Some(creation) = facts_port.as_deref_mut()
+        {
+            creation
+                .observe_opaque_upper_bound(
+                    layout::<ConnectorSourceFieldFacts>(fields.len())?.size(),
+                )
+                .map_err(ProjectionFailure::Host)?;
         }
         work.flush()?;
         let fields = fields.into_boxed_slice();

@@ -515,7 +515,7 @@ impl TableMaintenanceAutomaticRunner {
             ));
         }
         if documents.management_dependencies(control.control_runtime_id()) != dependencies
-            || &documents.configuration != &first_documents.configuration
+            || documents.configuration != first_documents.configuration
         {
             return Err(automatic_stale_policy_error(
                 "MV maintenance documents changed during admission",

@@ -342,6 +342,7 @@ impl PreparedConstantNamespace<'_, '_, '_> {
     /// Reuses the original ConstantPools duplicate author. No second pool map
     /// or byte-based backing deduplication exists. Package closure is later.
     pub fn materialize(self) -> Result<ConstantPools, Error> {
+        let _storage_lifetime = &self.preparation_storage;
         let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Decode)?;
         let result = self
             .materialize_core::<Error, crate::value_type_table::resources::NoFactory>(
@@ -822,10 +823,6 @@ fn initial_header(
 /// geometry allocation, and all receiving pools/table requests before the
 /// first materialization. Each record's official metadata and reader model are
 /// consumed once; inactive profiles never supply a fallback.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Explicit original source, policy, profiles, verifier and control are independently authored"
-)]
 pub fn prepare_constant_namespace<'raw, 'table, 'control>(
     records: &'raw [wire::IpcConstantPool],
     types: &'table DecodedTypeTable,
@@ -881,6 +878,10 @@ pub(crate) fn prepare_constant_namespace_in<'raw, 'table, 'control>(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen decode contract keeps source, policy, limits, creator, admission, and checkpoints explicit."
+)]
 pub fn prepare_constant_namespace_with_creator_in<'raw, 'table, 'control, H>(
     records: &'raw [wire::IpcConstantPool],
     types: &'table DecodedTypeTable,
@@ -932,6 +933,10 @@ pub fn prepare_constant_namespace_with_creator_in<'raw, 'table, 'control, H>(
 
 /// All-record preparation on the actual factory. The original reader model,
 /// source law, receiving profiles and cumulative parent gate are unchanged.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen decode contract keeps source metadata, policy, limits, factory, admission, and checkpoints explicit."
+)]
 pub fn prepare_constant_namespace_with_factory_in<
     'raw,
     'table,
@@ -973,6 +978,10 @@ pub fn prepare_constant_namespace_with_factory_in<
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The internal composer keeps source, policy, limits, creator, admission, and progress owners distinct."
+)]
 fn prepare_core<'raw, 'table, 'control, E: NamespaceFailure, F: ValueSchemaCreationFactory<E>>(
     records: &'raw [wire::IpcConstantPool],
     types: &'table DecodedTypeTable,
@@ -1306,10 +1315,6 @@ fn prepare_core<'raw, 'table, 'control, E: NamespaceFailure, F: ValueSchemaCreat
     })()
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Explicit original source, policy, profiles, verifier and control are independently authored"
-)]
 pub fn decode_constant_namespace(
     records: &[wire::IpcConstantPool],
     types: &DecodedTypeTable,

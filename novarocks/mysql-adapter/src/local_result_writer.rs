@@ -114,7 +114,7 @@ pub(crate) async fn write_local_result_one<'writer, W: AsyncWrite + Unpin>(
     let cancellation = protocol.cancellation();
     let started = tokio::select! {
         biased;
-        reason = cancellation.cancelled() => Err(LocalWriteInterruption::Query(cancelled(reason))),
+        reason = cancellation.cancelled() => Err(LocalWriteInterruption::Query(Box::new(cancelled(reason)))),
         outcome = budget.run(async {
             lease.writer().start_metadata(buffers.metadata.take().expect("frozen Local metadata"))?;
             lease.writer().finish_metadata().await
@@ -191,7 +191,7 @@ pub(crate) async fn write_local_result_one<'writer, W: AsyncWrite + Unpin>(
             let cancellation = protocol.cancellation();
             let written = tokio::select! {
                 biased;
-                reason = cancellation.cancelled() => Err(LocalWriteInterruption::Query(cancelled(reason))),
+                reason = cancellation.cancelled() => Err(LocalWriteInterruption::Query(Box::new(cancelled(reason)))),
                 outcome = budget.run(write_body(lease.writer(), &body)) => outcome.map_err(LocalWriteInterruption::Io),
             };
             if let Err(error) = written {
@@ -301,7 +301,7 @@ fn local_metadata(
     crate::relay_metadata::frozen_result_metadata(&columns, capabilities, limits)
 }
 enum LocalWriteInterruption {
-    Query(QueryExecutionError),
+    Query(Box<QueryExecutionError>),
     Io(io::Error),
 }
 async fn interrupt<'writer, W: AsyncWrite + Unpin>(
@@ -313,7 +313,7 @@ async fn interrupt<'writer, W: AsyncWrite + Unpin>(
 ) -> io::Result<MysqlStatementWriteOutcome<'writer, W>> {
     match error {
         LocalWriteInterruption::Query(error) => {
-            close_local(protocol, lease, buffers, error, current).await
+            close_local(protocol, lease, buffers, *error, current).await
         }
         LocalWriteInterruption::Io(error) => {
             drop(lease);
@@ -668,12 +668,12 @@ mod tests {
             }
             let count = bytes.len().min(remaining);
             let result = std::pin::Pin::new(&mut self.inner).poll_write(cx, &bytes[..count]);
-            if let std::task::Poll::Ready(Ok(written)) = &result {
-                if remaining != usize::MAX {
-                    self.gate
-                        .remaining
-                        .fetch_sub(*written, std::sync::atomic::Ordering::SeqCst);
-                }
+            if let std::task::Poll::Ready(Ok(written)) = &result
+                && remaining != usize::MAX
+            {
+                self.gate
+                    .remaining
+                    .fetch_sub(*written, std::sync::atomic::Ordering::SeqCst);
             }
             result
         }

@@ -796,7 +796,7 @@ mod frozen_geometry_tests {
                 input.columns + 3,
             ],
             header_written: input.cut.min(4) as u8,
-            zero_terminal_pending: payload % U24 == 0,
+            zero_terminal_pending: payload.is_multiple_of(U24),
             committed_wire_bytes: baseline(input).committed_wire_bytes + input.cut,
             rows_completed: 0,
         }

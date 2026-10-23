@@ -358,7 +358,7 @@ impl FrontendWorkloadDeadlineSupervisor {
                     _ = deadlines.wait_state_change(after) => {}
                     _ = async {
                         match next_deadline {
-                            Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
                             None => std::future::pending::<()>().await,
                         }
                     } => {}
@@ -564,13 +564,9 @@ impl FrontendExecutionRuntimeOwner {
         }
         self.deadline_supervisor.shutdown().await;
 
-        if let Err(error) = self.query_cpu.shutdown_until(deadline).await {
-            return Err(error);
-        }
+        self.query_cpu.shutdown_until(deadline).await?;
 
-        if let Err(error) = self.query_blocking.shutdown_until(deadline).await {
-            return Err(error);
-        }
+        self.query_blocking.shutdown_until(deadline).await?;
 
         self.internal_result_cpu.shutdown_until(deadline).await?;
 
@@ -1223,7 +1219,6 @@ impl FrontendApplicationHost {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn open_with_role_factories_and_state_store_registry(
         state_store: Option<StateStoreHostInput>,
         state_store_registry: &StateStoreProviderRegistry,
@@ -1257,7 +1252,6 @@ impl FrontendApplicationHost {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn open_with_connector_control_host_and_state_store_registry(
         state_store: Option<StateStoreHostInput>,
         state_store_registry: &StateStoreProviderRegistry,
@@ -1416,18 +1410,18 @@ impl FrontendApplicationHost {
             }
         }
         #[cfg(novarocks_dev_controls)]
-        if let Some(session) = &mut host.test_session {
-            if let Err(error) = session.start_cleanup(
+        if let Some(session) = &mut host.test_session
+            && let Err(error) = session.start_cleanup(
                 host.execution_runtime_owner.lifecycle_diagnostics(),
                 host.catalog_runtime_projection.clone(),
-            ) {
-                return Err(host
-                    .cleanup_open_error(FrontendApplicationError::new(
-                        FrontendApplicationErrorKind::CoordinatorOpen,
-                        error,
-                    ))
-                    .await);
-            }
+            )
+        {
+            return Err(host
+                .cleanup_open_error(FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::CoordinatorOpen,
+                    error,
+                ))
+                .await);
         }
 
         // Unique original Apply owner is now in Host. No Native caller has
@@ -2133,13 +2127,13 @@ impl FrontendApplicationHost {
     /// has exhausted its bounded convergence attempts and committed to exit.
     pub fn abandon_for_process_exit(&mut self) {
         self.serving_lifecycle.mark_stopping();
-        if let Some(topology) = self.topology.as_ref() {
-            if let Err(error) = topology.request_heartbeat_stop_for_process_exit() {
-                tracing::error!(
-                    %error,
-                    "failed to signal frontend heartbeat manager before process exit"
-                );
-            }
+        if let Some(topology) = self.topology.as_ref()
+            && let Err(error) = topology.request_heartbeat_stop_for_process_exit()
+        {
+            tracing::error!(
+                %error,
+                "failed to signal frontend heartbeat manager before process exit"
+            );
         }
         self.execution_runtime_owner.abandon_for_process_exit();
     }

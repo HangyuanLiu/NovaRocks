@@ -148,7 +148,7 @@ impl WriteRecipe {
         ) && handle.repartition().is_none()
             && handle.document_publication().is_none()
         {
-            Dependency::NoReadDependency
+            Dependency::NoRead
         } else {
             Dependency::RefUnchanged
         }];
@@ -549,7 +549,7 @@ impl IcebergWriteSessionControl {
             };
         let preflight_journal = journal.clone();
         let receipt_partitioning = handle.repartition().map(|r| r.committed().clone());
-        let receipt_output_facts = recipe.output_facts.clone();
+        let receipt_output_facts = recipe.output_facts;
         let retained_evidence = handle.recovery_evidence_slot();
         let preflight = Arc::new(
             move |request: &FrozenRequest, operation: &IcebergCommitOperation| {
@@ -561,7 +561,7 @@ impl IcebergWriteSessionControl {
                 // possible. Catalog reload and row-count enrichment are optional.
                 let receipt = match request.ref_snapshot_after(request.target_ref()) {
                     Some(snapshot) => crate::write_codec::connector_write_receipt_with_partitioning_and_output_facts(
-                        snapshot, None, receipt_partitioning.clone(), Some(receipt_output_facts.clone()),
+                        snapshot, None, receipt_partitioning.clone(), Some(receipt_output_facts),
                     ).map_err(|error| format_error(corrupt(error)))?,
                     None => unprojected_committed_receipt(),
                 };
@@ -581,7 +581,7 @@ impl IcebergWriteSessionControl {
             op_kind: recipe.op_kind,
             drafts: statistics,
         };
-        let output_facts = recipe.output_facts.clone();
+        let output_facts = recipe.output_facts;
         let run_operation = operation.clone();
         let result = self
             .runtime
@@ -1155,7 +1155,7 @@ mod recovery_tests {
                     added,
                     removed: Vec::new(),
                 },
-                dependencies: vec![Dependency::NoReadDependency],
+                dependencies: vec![Dependency::NoRead],
                 isolation: IsolationLevel::Serializable,
                 shape: RequestShape::SnapshotProducing,
                 summary: BTreeMap::from([(

@@ -538,11 +538,11 @@ pub(crate) mod tests {
 
     use super::*;
 
+    pub(crate) type RangeReceipt = (String, u64, Option<u64>);
+    pub(crate) type RangeReceiptLog = Arc<std::sync::Mutex<Vec<RangeReceipt>>>;
+
     #[derive(Clone, Debug, Default)]
-    pub(crate) struct RangeReceipts(
-        pub(crate) Arc<std::sync::Mutex<Vec<(String, u64, Option<u64>)>>>,
-        Option<opendal::ErrorKind>,
-    );
+    pub(crate) struct RangeReceipts(pub(crate) RangeReceiptLog, Option<opendal::ErrorKind>);
     #[derive(Debug)]
     pub(crate) struct RangeReceiptAccessor<A: opendal::raw::Access> {
         inner: A,

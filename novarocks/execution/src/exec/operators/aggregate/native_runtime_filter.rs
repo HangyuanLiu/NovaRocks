@@ -60,6 +60,33 @@ enum SessionFailure {
     },
     Execution(ExecutionFailure),
 }
+#[derive(Debug)]
+struct AggregateTopNFailureContext<E> {
+    binding: u32,
+    operation: &'static str,
+    cause: E,
+}
+impl<E: std::fmt::Display> std::fmt::Display for AggregateTopNFailureContext<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "aggregate TopN runtime-filter binding {} failed during {}: {}",
+            self.binding, self.operation, self.cause
+        )
+    }
+}
+impl<E: std::error::Error + 'static> std::error::Error for AggregateTopNFailureContext<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+impl<E: novarocks_failure_contract::FailureProjection> novarocks_failure_contract::FailureProjection
+    for AggregateTopNFailureContext<E>
+{
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        self.cause.failure_fact()
+    }
+}
 impl SessionFailure {
     fn contract(detail: String) -> Self {
         Self::Definition(execution::RuntimeFilterContractViolation::new(
@@ -70,8 +97,22 @@ impl SessionFailure {
     fn execution(self) -> ExecutionFailure {
         match self {
             Self::Definition(cause) => cause.into(),
-            Self::Contract { cause, .. } => cause.into(),
-            Self::Codec { cause, .. } => cause.into(),
+            Self::Contract {
+                binding,
+                operation,
+                cause,
+            } => ExecutionFailure::from_domain(AggregateTopNFailureContext {
+                binding,
+                operation,
+                cause,
+            }),
+            Self::Codec { binding, cause } => {
+                ExecutionFailure::from_domain(AggregateTopNFailureContext {
+                    binding,
+                    operation: "encode ordered contribution",
+                    cause,
+                })
+            }
             Self::Execution(cause) => cause,
         }
     }
@@ -161,8 +202,7 @@ impl AggregateTopNProducerSessionFactory {
         host: &OrderedTopNAllocationHost,
         control: &dyn KernelEvaluationControl,
     ) -> ExecutionResult<Self> {
-        let local_partition_count =
-            validate_partition_count(actual_dop).map_err(ExecutionFailure::from)?;
+        let local_partition_count = validate_partition_count(actual_dop)?;
         control.checkpoint(0)?;
         let mut bindings = AggregateVec::new_in(host.vector_allocator());
         bindings
@@ -180,6 +220,7 @@ impl AggregateTopNProducerSessionFactory {
                 )
                 .into());
             }
+
             let order = host.shared_order_contract(spec.producer.contract(), control)?;
             let contract = execution::RuntimeFilterProducerContract::ordered_bound(
                 execution::RuntimeFilterBindingId::new(spec.producer.binding_id()),
@@ -208,6 +249,8 @@ impl AggregateTopNProducerSessionFactory {
             host: Some(host.clone()),
         })
     }
+
+    #[cfg(test)]
     pub(crate) const fn local_partition_count(&self) -> u32 {
         self.local_partition_count
     }
@@ -230,9 +273,7 @@ impl AggregateTopNProducerSessionFactory {
         local_index: i32,
         control: &dyn KernelEvaluationControl,
     ) -> ExecutionResult<AggregateTopNProducerSession> {
-        let partition = self
-            .driver_partition(actual_dop, local_index)
-            .map_err(ExecutionFailure::from)?;
+        let partition = self.driver_partition(actual_dop, local_index)?;
         let host = self.host.as_ref().ok_or_else(|| {
             SessionFailure::contract("compiled aggregate TopN producer has no creating host".into())
                 .execution()
@@ -610,10 +651,10 @@ impl AggregateTopNProducerStream {
             Err(cause) => return Err(self.error("contribution failed", cause)),
         }
         self.next_sequence = self.next_sequence.checked_add(1).ok_or_else(|| {
-            SessionFailure::Execution(
-                execution::producer_sequence_extent(self.binding.binding_id, self.next_sequence)
-                    .into(),
-            )
+            SessionFailure::Execution(execution::producer_sequence_extent(
+                self.binding.binding_id,
+                self.next_sequence,
+            ))
         })?;
         Ok(())
     }
@@ -695,7 +736,43 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use super::{AggregateTopNProducerSessionFactory, execution};
+    use super::{AggregateTopNProducerSessionFactory, SessionFailure, execution};
+
+    #[test]
+    fn failure_context_preserves_binding_operation_and_reason() {
+        use novarocks_failure_contract::FailureProjection;
+
+        let contract_cause = execution::RuntimeFilterContractViolation::new(
+            execution::RuntimeFilterContractViolationKind::ContractMismatch,
+            "producer contract mismatch",
+        );
+        let contract_fact = contract_cause.failure_fact();
+        let contract_failure = SessionFailure::Contract {
+            binding: 73,
+            operation: "submit contribution",
+            cause: contract_cause,
+        }
+        .execution();
+        assert_eq!(contract_failure.failure_fact(), contract_fact);
+        assert!(contract_failure.detail().contains("binding 73"));
+        assert!(contract_failure.detail().contains("submit contribution"));
+
+        let codec_cause =
+            crate::runtime_filter::contribution::ContributionCodecError::SchemaMismatch;
+        let codec_fact = codec_cause.failure_fact();
+        let codec_failure = SessionFailure::Codec {
+            binding: 74,
+            cause: codec_cause,
+        }
+        .execution();
+        assert_eq!(codec_failure.failure_fact(), codec_fact);
+        assert!(codec_failure.detail().contains("binding 74"));
+        assert!(
+            codec_failure
+                .detail()
+                .contains("encode ordered contribution")
+        );
+    }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum Event {
@@ -1439,15 +1516,21 @@ mod tests {
         .unwrap();
         let mut session = factory.create_for_driver_owned(1, 0, &control).unwrap();
         let cause = session.bind_owned(&control).unwrap_err();
+        let crate::runtime::fragment::ExecutionFailureCause::Domain(shared) = cause.cause() else {
+            panic!("the contextual failure must retain its original domain source: {cause:?}");
+        };
+        let context = shared
+            .downcast_ref::<super::AggregateTopNFailureContext<
+                execution::RuntimeFilterContractViolation,
+            >>()
+            .expect("context retains the nominal runtime-filter cause");
+        assert_eq!(context.binding, 33);
+        assert_eq!(context.operation, "open failed during operator bind");
         assert_eq!(
-            cause.cause(),
-            &crate::runtime::fragment::ExecutionFailureCause::RuntimeFilter(
-                execution::RuntimeFilterFailure::Contract(
-                    execution::RuntimeFilterContractViolation::new(
-                        execution::RuntimeFilterContractViolationKind::UnauthorizedBinding,
-                        "recording session rejects this binding",
-                    )
-                )
+            &context.cause,
+            &execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::UnauthorizedBinding,
+                "recording session rejects this binding",
             )
         );
         session

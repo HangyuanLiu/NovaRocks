@@ -394,6 +394,10 @@ impl fmt::Display for AbortCause {
 }
 
 /// The cause a non-finished terminal or terminating state must carry.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "This shared FE/BE status contract carries typed TaskFailure inline; boxing would change status ownership and allocate during failure publication."
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TerminationDetail {
     Canceled(CancelReason),
@@ -643,6 +647,10 @@ impl TaskWriterFacts {
 }
 
 /// Why a status snapshot is not a legal value.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "This shared FE/BE validator returns the typed mismatch directly; boxing would change the error contract and allocate on rejection."
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskStatusError {
     /// `FAILED` or `FAILING` without a failure cause, and the mirror cases.

@@ -19,7 +19,7 @@
 //! Real account lifecycle lane records exist independently of physical attribution.
 use crate::actors::{mysql as mysql_actor, mysql_stream::MysqlStream};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
-use crate::scenarios::query_lifecycle::native_sql_controls::{SqlIntentOwner, StatementSpec};
+use crate::scenarios::native_sql_controls::{SqlIntentOwner, StatementSpec};
 use crate::scenarios::{query_lifecycle, task_evidence};
 use anyhow::{Context, Result, ensure};
 use mysql::prelude::Queryable;

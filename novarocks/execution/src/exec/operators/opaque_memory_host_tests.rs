@@ -16,7 +16,8 @@
 // under the License.
 
 //! The same permanent probes consume both real production tracker adapters.
-use super::{MemTracker, TrackedStateAllocator};
+use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::tracked_state_allocator::TrackedStateAllocator;
 use novarocks_functions::opaque_memory::OpaqueRetainedCharge;
 use novarocks_functions::{AggregateStateAllocator, KernelFailure};
 use std::{alloc::Layout, sync::Arc};

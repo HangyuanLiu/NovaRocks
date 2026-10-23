@@ -200,7 +200,6 @@ impl BuildView {
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;
-    use novarocks_failure_contract::FailureProjection;
 
     use crate::exec::operators::hashjoin::build_requirements::{
         BuildComponentRequirements, LookupRequirement, MatchFlagRequirement, NullKeyRequirement,

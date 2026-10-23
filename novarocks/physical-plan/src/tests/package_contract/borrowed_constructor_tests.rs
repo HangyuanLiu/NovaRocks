@@ -323,7 +323,7 @@ fn borrowed_package_parameter_projection_has_independent_vec_tree_and_unique_box
             tree.facts().allocation_request_bytes_upper_bound + "Asia/Shanghai".len()
         );
         let mut previous = unique;
-        for pair in tail[4..].chunks_exact(2) {
+        for pair in tail[4..].as_chunks::<2>().0 {
             assert_eq!(
                 pair[0].0.allocation_requests_upper_bound,
                 unique.allocation_requests_upper_bound

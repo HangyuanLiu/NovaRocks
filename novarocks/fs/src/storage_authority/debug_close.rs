@@ -653,6 +653,30 @@ fn read_trigger(path: &std::path::Path) -> Result<Option<String>, String> {
     Ok(Some(requested))
 }
 
+fn publish(path: &std::path::Path, record: String) -> Result<(), String> {
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, record)
+        .and_then(|_| fs::rename(temporary, path))
+        .map_err(|error| format!("publish authority closure: {error}"))
+}
+
+pub(super) fn close_if_key(shared: &AuthorityShared, requested: &str) -> bool {
+    if requested != control_key(&shared.id) {
+        return false;
+    }
+    let mut state = shared.lock_state();
+    if state.closed.is_some() {
+        return false;
+    }
+    state.closed = Some(AcquisitionFailure::Denied(
+        "runner confirmed storage authority closure".into(),
+    ));
+    state.generation = state.generation.wrapping_add(1);
+    state.material = None;
+    state.inflight = None;
+    true
+}
+
 #[cfg(test)]
 mod publication_tests {
     use super::{publish_identity, stage_identity};
@@ -685,28 +709,4 @@ mod publication_tests {
             std::fs::remove_file(temporary).unwrap();
         }
     }
-}
-
-fn publish(path: &std::path::Path, record: String) -> Result<(), String> {
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, record)
-        .and_then(|_| fs::rename(temporary, path))
-        .map_err(|error| format!("publish authority closure: {error}"))
-}
-
-pub(super) fn close_if_key(shared: &AuthorityShared, requested: &str) -> bool {
-    if requested != control_key(&shared.id) {
-        return false;
-    }
-    let mut state = shared.lock_state();
-    if state.closed.is_some() {
-        return false;
-    }
-    state.closed = Some(AcquisitionFailure::Denied(
-        "runner confirmed storage authority closure".into(),
-    ));
-    state.generation = state.generation.wrapping_add(1);
-    state.material = None;
-    state.inflight = None;
-    true
 }

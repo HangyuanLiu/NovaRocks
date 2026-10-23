@@ -57,14 +57,15 @@ use novarocks_execution::connector::{
 };
 use novarocks_execution::exec::node::scan::BoundScanRanges;
 use novarocks_execution::runtime::execution_runtime::ExecutionRuntime;
+#[cfg(test)]
+use novarocks_execution::runtime::fragment::ExecutionFailureCause;
 use novarocks_execution::runtime::fragment::io::{
     ExchangeDestinationKey, ExchangeEdgeGates, ExchangeFrameTransmitter, ExchangeReceiverPort,
     FragmentCommitPort, FragmentEvent, FragmentEventSink, FragmentResultWriter,
 };
 use novarocks_execution::runtime::fragment::scan::compiled_scan_nodes;
 use novarocks_execution::runtime::fragment::{
-    CompiledFragmentSubmission, DormantFragmentHandle, ExchangeReceiverRetirement,
-    ExecutionFailure, ExecutionFailureCause, FragmentCancelReason, FragmentExecutionError,
+    CompiledFragmentSubmission, ExchangeReceiverRetirement, ExecutionFailure, FragmentCancelReason,
     FragmentInstanceSpec, FragmentLaunchError, FragmentOutcome, FragmentRuntimeOptions,
     FragmentTerminalFact, RunningFragmentHandle, ScanAssignments, compiled_sink_kind,
     prepare_compiled_fragment,
@@ -80,8 +81,8 @@ use novarocks_execution_contract::task_execution::domain::{CodecOwnedContent, Do
 use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
 use novarocks_execution_contract::task_execution::operation::TaskDomainUpdate;
 use novarocks_execution_contract::task_execution::status::{
-    AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
-    TaskState, TerminationDetail,
+    AbortCause, CancelReason, SafeDetail, TaskFailureCategory, TaskOutputFacts, TaskState,
+    TerminationDetail,
 };
 use novarocks_execution_contract::{FragmentNodeId, FragmentSinkKind};
 use novarocks_proto_codec::FieldPath;
@@ -100,8 +101,7 @@ use novarocks_worker::{TaskCompletionSupervisor, TaskInboundCapabilities};
 use tracing::debug;
 
 use super::compiled_package::{
-    CompiledPackageCompiler, CompiledPackageError, CompiledTaskOptions, CompiledTaskProgram,
-    TaskPreparationControl,
+    CompiledPackageCompiler, CompiledPackageError, CompiledTaskOptions, TaskPreparationControl,
 };
 use crate::compiled_runtime_filter::program_runtime_filter_bindings;
 use crate::compiled_scan_binding::{CompiledScanTask, bind_compiled_scans};
@@ -634,7 +634,7 @@ impl NativeTaskExecutionHost {
             task_stop.view(),
             preparation_stop.clone(),
         )
-        .map_err(|error| native_type_construction_failure_to_host(identity, &error))?;
+        .map_err(|error| native_type_construction_failure_to_host(&error))?;
         let type_scopes = super::compiled_package::CompiledTypeScopes::new(&type_creation);
         let mut request = |layout| type_creation.request_layout(layout);
         let mut opaque = |bytes| type_creation.request_opaque_upper_bound(bytes);
@@ -689,7 +689,7 @@ impl NativeTaskExecutionHost {
         // whether the task needs the query context's filter session. The
         // session must host exactly these bindings for this instance.
         let runtime_filter_bindings =
-            program_runtime_filter_bindings(program.graph().requirements(), &runtime_filters)
+            program_runtime_filter_bindings(program.graph().requirements(), runtime_filters)
                 .map_err(protocol_failure)?;
         let sink = program.graph().sink().ok_or_else(|| {
             internal_failure(NativePreparationContractFailure::new(
@@ -707,17 +707,17 @@ impl NativeTaskExecutionHost {
         )
         .map_err(protocol_failure)?;
         let scan_assignments =
-            compiled_scan_assignments(identity, descriptor, &program, &instance_input)?;
+            compiled_scan_assignments(identity, descriptor, program, &instance_input)?;
         // Every compiled scan binds its typed source here, before anything is
         // published: a refusal rolls back this attempt's lease and local state.
         let scans = bind_compiled_scans(
-            &program,
+            program,
             &CompiledScanTask {
                 runtime: &typed_runtime,
                 fragment_instance_id: kernel_key,
                 query_options: &instance_input.query_options,
                 stop: task_stop.view(),
-                runtime_filters: &runtime_filters,
+                runtime_filters,
                 #[cfg(novarocks_dev_controls)]
                 observation_controls: self.queries.observation_controls(),
             },
@@ -727,7 +727,7 @@ impl NativeTaskExecutionHost {
         // its carrier validator here, before anything is published; a write
         // execution is opened only when a driver activates.
         let writers = bind_compiled_writers(
-            &program,
+            program,
             &CompiledWriteTask {
                 #[cfg(novarocks_dev_controls)]
                 test_controls: self.test_controls.clone(),
@@ -846,8 +846,8 @@ impl NativeTaskExecutionHost {
             .with_result_identity(identity)
             .with_edge_gates(Arc::clone(&edges));
         #[cfg(novarocks_dev_controls)]
-        if let Some(observations) = self.queries.observation_controls() {
-            if let Some(observer) = observations
+        if let Some(observations) = self.queries.observation_controls()
+            && let Some(observer) = observations
                 .observation_for("exchange-snapshot", execution)
                 .map_err(|detail| {
                     internal_failure(NativePreparationContractFailure::new(
@@ -855,12 +855,11 @@ impl NativeTaskExecutionHost {
                         detail,
                     ))
                 })?
-            {
-                let receiver = novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort::new(self.execution_runtime.clone()).with_test_observer(observer.clone());
-                context = context
-                    .with_exchange_test_observer(Some(observer))
-                    .with_exchange_receiver_port(Arc::new(receiver));
-            }
+        {
+            let receiver = novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort::new(self.execution_runtime.clone()).with_test_observer(observer.clone());
+            context = context
+                .with_exchange_test_observer(Some(observer))
+                .with_exchange_receiver_port(Arc::new(receiver));
         }
         if let Some(session) = root_session {
             context = context.with_root_result_session(session);
@@ -888,8 +887,8 @@ impl NativeTaskExecutionHost {
         let dormant = prepared.map_err(|error| preparation_failure_to_host(identity, &error))?;
         kernel_construction.install(dormant, registration, kernel_control);
         #[cfg(novarocks_dev_controls)]
-        if let Some(controls) = self.test_controls.as_deref() {
-            if let Some(cause) = preparation_child
+        if let Some(controls) = self.test_controls.as_deref()
+            && let Some(cause) = preparation_child
                 .inject_prepared_exit_failure(controls)
                 .map_err(|detail| {
                     internal_failure(NativePreparationContractFailure::new(
@@ -897,9 +896,8 @@ impl NativeTaskExecutionHost {
                         detail,
                     ))
                 })?
-            {
-                return Err(HostRejection::from_failure(failure_category(&cause), cause));
-            }
+        {
+            return Err(HostRejection::from_failure(failure_category(&cause), cause));
         }
 
         tracing::debug!(resource_scope = "project-prepare-metadata", receipt = ?project_journal, "Project preparation resource receipt");
@@ -1162,19 +1160,17 @@ impl NativeTaskExecutionHost {
             .lock()
             .expect("task replay gate lock")
             .as_ref()
+            && assignment.no_more_splits()
+            && !sequences.is_empty()
+            && preflight.duplicate_sequences().len() == sequences.len()
         {
-            if assignment.no_more_splits()
-                && !sequences.is_empty()
-                && preflight.duplicate_sequences().len() == sequences.len()
-            {
-                gate.observe_duplicate(
-                    identity,
-                    _operation,
-                    node,
-                    sequences.first().expect("nonempty").sequence_id(),
-                    sequences.last().expect("nonempty").sequence_id(),
-                );
-            }
+            gate.observe_duplicate(
+                identity,
+                _operation,
+                node,
+                sequences.first().expect("nonempty").sequence_id(),
+                sequences.last().expect("nonempty").sequence_id(),
+            );
         }
         Ok(queue.stats().queued_splits as u64)
     }
@@ -1447,7 +1443,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                         .expect(DORMANT_LOCK)
                         .as_mut()
                     {
-                        retirement.record_terminal(&fact);
+                        retirement.record_terminal(fact);
                     }
                     // The sampling tick stops firing the moment the drivers
                     // finish, so the last event-driven snapshot predates the
@@ -1460,7 +1456,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                         &completion_reporter,
                         sink_kind,
                         root_channel.as_deref(),
-                        &fact,
+                        fact,
                         completion_worker.stand_down(),
                     );
                     completion_worker.finish(
@@ -1859,17 +1855,15 @@ impl NativeRunnableTask {
         #[cfg(novarocks_dev_controls)]
         let initial_failure = if stopped_before_start {
             None
-        } else if let Some(claim) =
-            injected_execution_failure.filter(|claim| claim.cancellation().is_active())
-        {
-            Some(
-                match fault::record_task_execution_failure(self.identity, &claim) {
-                    Ok(()) => fault::injected_task_execution_failure(),
-                    Err(error) => error,
-                },
-            )
         } else {
-            None
+            injected_execution_failure
+                .filter(|claim| claim.cancellation().is_active())
+                .map(
+                    |claim| match fault::record_task_execution_failure(self.identity, &claim) {
+                        Ok(()) => fault::injected_task_execution_failure(),
+                        Err(error) => error,
+                    },
+                )
         };
         #[cfg(not(novarocks_dev_controls))]
         let initial_failure = None;
@@ -2009,17 +2003,16 @@ impl RunnableTask for NativeRunnableTask {
         self.accept_control(StandDown::Abort(cause));
         // Receiver construction follows the registration's lifetime, not the
         // first kernel stand-down. A later true abort must still stop it.
-        if let Some(runtime) = self.receiver_runtime.as_ref().and_then(Weak::upgrade) {
-            if let Some(retirement) = runtime
+        if let Some(runtime) = self.receiver_runtime.as_ref().and_then(Weak::upgrade)
+            && let Some(retirement) = runtime
                 .exchange_retirement
                 .lock()
                 .expect(DORMANT_LOCK)
                 .as_ref()
-            {
-                retirement.stop_construction(ExecutionFailure::from_domain(
-                    ReceiverConstructionAborted(cause),
-                ));
-            }
+        {
+            retirement.stop_construction(ExecutionFailure::from_domain(
+                ReceiverConstructionAborted(cause),
+            ));
         }
         // Release the retirement lock before reaching the original latch or
         // kernel cancellation, which may run completion callbacks.
@@ -2290,7 +2283,7 @@ fn compiled_scan_assignments(
             NativePreparationReason::CompiledSplitCoverage,
             format_args!(
                 "task {identity} names split-driven nodes {:?}, but its compiled scans are {:?}",
-                &split_nodes, &scan_nodes
+                split_nodes, scan_nodes
             ),
         )));
     }
@@ -2411,10 +2404,8 @@ enum NativePreparationReason {
     UnknownSplitRead = 9602,
     WrongSplitCarrier = 9603,
     AlreadyPrepared = 9604,
-    SinkDisagreement = 9605,
     SubmitWithoutPreparation = 9606,
     SubmitTwice = 9607,
-    MissingRegistration = 9608,
     DomainWithoutPreparation = 9609,
     SplitIntentNodeMismatch = 9610,
     UnfrozenExchangeDestination = 9611,
@@ -2526,7 +2517,6 @@ fn memory_admission_failure_to_host(
 }
 
 fn native_type_construction_failure_to_host(
-    identity: TaskIdentity,
     error: &crate::native_type_construction::NativeTypeConstructionError,
 ) -> HostRejection {
     HostRejection::from_domain(
@@ -4644,7 +4634,7 @@ pub(crate) mod tests {
         let edge = ExchangeEdgeId::new(1).expect("edge");
         let descriptor = descriptor_with(
             producer,
-            UniqueId::new(261, 262),
+            UniqueId::new(261, 263),
             1,
             outbound_topology(edge, consumer),
         );
@@ -4707,7 +4697,8 @@ pub(crate) mod tests {
             gate.is_normally_canceled(),
             "opening the edge cannot revive a closed destination"
         );
-        host.remove_receiver(&descriptor);
+        rollback_direct_host_preparation(&host, &descriptor, Arc::clone(preparation.status()));
+        host.root_producer_pool.shutdown().unwrap();
     }
 
     #[test]
@@ -7505,8 +7496,7 @@ pub(crate) mod tests {
             .unwrap();
         let refusal = host
             .submit_runnable(&descriptor, reporter)
-            .err()
-            .expect("actual late completion refusal");
+            .expect_err("actual late completion refusal");
         let original = refusal.clone().into_failure();
         let novarocks_execution::runtime::fragment::ExecutionFailureCause::Domain(source) =
             original.cause()
@@ -7655,10 +7645,13 @@ pub(crate) mod tests {
     fn root_opaque_rollback_does_not_skip_actual_kernel_stop_or_registration_exit() {
         use novarocks_execution_contract::{TaskConclusionPort, TaskConclusionProposal};
         use novarocks_worker::{TaskPreparationChild, TaskPreparationChildExit};
-        struct Secondary(std::mem::ManuallyDrop<Arc<Vec<u8>>>, Arc<AtomicUsize>);
+        struct Secondary {
+            _bytes: std::mem::ManuallyDrop<Arc<Vec<u8>>>,
+            drops: Arc<AtomicUsize>,
+        }
         impl Drop for Secondary {
             fn drop(&mut self) {
-                self.1.fetch_add(1, Ordering::SeqCst);
+                self.drops.fetch_add(1, Ordering::SeqCst);
             }
         }
         struct Primary(
@@ -7670,10 +7663,10 @@ pub(crate) mod tests {
             fn drop(&mut self) {
                 self.1.fetch_add(1, Ordering::SeqCst);
                 let original = unsafe { std::mem::ManuallyDrop::take(&mut self.0) };
-                std::panic::panic_any(Secondary(
-                    std::mem::ManuallyDrop::new(original),
-                    self.2.clone(),
-                ));
+                std::panic::panic_any(Secondary {
+                    _bytes: std::mem::ManuallyDrop::new(original),
+                    drops: self.2.clone(),
+                });
             }
         }
         struct JobResource(Arc<Vec<u8>>, Arc<AtomicUsize>);
@@ -8452,7 +8445,7 @@ pub(crate) mod tests {
         use novarocks_worker::root_result_channel::ContextRootRoute;
         let fixture = OwnerFixture::new(91_005);
         let root = fixture.identity(1);
-        let descriptor = consistent_descriptor(root, UniqueId::new(91_005, 1));
+        let descriptor = consistent_descriptor(root, UniqueId::new(91_005, 2));
         let receipt = fixture.create(&descriptor, &Body::bounded_statistics());
         assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{receipt:?}");
         wait_bounded_root_finished(&fixture, root);
@@ -8696,7 +8689,7 @@ pub(crate) mod tests {
         host.install_receiver(&descriptor, body.input(&descriptor), preparation.scope())
             .expect("an installed scalar producer admits its typed root");
         assert!(host.task_runtime(root).is_some());
-        host.remove_receiver(&descriptor);
+        rollback_direct_host_preparation(&host, &descriptor, Arc::clone(preparation.status()));
         host.root_producer_pool.shutdown().unwrap();
     }
     #[test]
@@ -9011,19 +9004,21 @@ pub(crate) mod tests {
             remaining_after_exit: i64,
         }
 
+        type NamespaceAuditResult = Result<
+            (
+                novarocks_physical_plan::ConstantPools,
+                novarocks_plan_codec::physical_constant_v2::ConstantNamespaceResourceFacts,
+            ),
+            novarocks_plan_codec::host_projection_v2::ProjectionFailure<
+                novarocks_plan_codec::physical_constant_v2::PhysicalConstantCodecError,
+                crate::native_type_construction::NativeTypeConstructionError,
+            >,
+        >;
+
         fn candidate_pool_namespace_audit(
             cap: Option<usize>,
         ) -> (
-            Result<
-                (
-                    novarocks_physical_plan::ConstantPools,
-                    novarocks_plan_codec::physical_constant_v2::ConstantNamespaceResourceFacts,
-                ),
-                novarocks_plan_codec::host_projection_v2::ProjectionFailure<
-                    novarocks_plan_codec::physical_constant_v2::PhysicalConstantCodecError,
-                    crate::native_type_construction::NativeTypeConstructionError,
-                >,
-            >,
+            NamespaceAuditResult,
             Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
             usize,
         ) {
@@ -9122,9 +9117,13 @@ pub(crate) mod tests {
                 prepared.materialize_with_factory_in(&factory, &mut |_| Ok(()), &mut work)
             });
             let quoted = factory.construction_request_bytes_upper_bound();
-            drop(factory);
+            {
+                let _factory = factory;
+            }
             drop(types);
-            drop(type_factory);
+            {
+                let _type_factory = type_factory;
+            }
             drop(creator);
             drop(wire);
             drop(work);
@@ -9224,7 +9223,9 @@ pub(crate) mod tests {
             assert_eq!(late.value(0).unwrap().try_i64().unwrap(), Some(1));
             drop(compiled);
             drop(creation);
-            drop(scopes);
+            {
+                let _scopes = scopes;
+            }
             drop(scratch);
             drop(actual);
             (late, tracker)
@@ -9320,7 +9321,9 @@ pub(crate) mod tests {
             let original_creator_bytes = original.get();
             let scoped_creator_bytes = factory.construction_request_bytes_upper_bound();
             drop(creator);
-            drop(factory);
+            {
+                let _factory = factory;
+            }
             drop(wire);
             drop(work);
             drop(actual);
@@ -9510,7 +9513,6 @@ pub(crate) mod tests {
             FrozenBytes::freeze(
                 proto::FrozenFragment {
                     package: bytes::Bytes::copy_from_slice(package),
-                    ..Default::default()
                 }
                 .encode_to_vec()
                 .into(),
@@ -9524,6 +9526,8 @@ pub(crate) mod tests {
             receiver: u32,
             split_nodes: &[i32],
         ) -> TaskDescriptor {
+            static NEXT_FRAGMENT_INSTANCE_ID: std::sync::atomic::AtomicI64 =
+                std::sync::atomic::AtomicI64::new(1);
             let node = FragmentNodeId::new(i32::try_from(receiver).expect("small node"));
             let destination = ExchangeDestination::new(
                 super::identity(70, 2, 1),
@@ -9548,7 +9552,10 @@ pub(crate) mod tests {
             .expect("a legal topology");
             TaskDescriptor::try_new(
                 identity,
-                UniqueId::new(701, 702),
+                UniqueId::new(
+                    701,
+                    NEXT_FRAGMENT_INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                ),
                 NonZeroUsize::new(1).expect("nonzero dop"),
                 split_nodes
                     .iter()
@@ -9741,7 +9748,8 @@ pub(crate) mod tests {
                 vec![BTreeSet::new()]
             );
             assert_eq!(facts.filter_sessions_requested.load(Ordering::SeqCst), 0);
-            host.remove_receiver(&descriptor);
+            rollback_direct_host_preparation(&host, &descriptor, Arc::clone(preparation.status()));
+            host.root_producer_pool.shutdown().unwrap();
             assert!(host.task_runtime(identity).is_none());
         }
 
@@ -9930,7 +9938,9 @@ pub(crate) mod tests {
             ));
             drop(compiled);
             drop(creation);
-            drop(scopes);
+            {
+                let _scopes = scopes;
+            }
             drop(actual);
             let own = NativeTypeScope::reservation_allocation_layout()
                 .unwrap()
@@ -9992,7 +10002,9 @@ pub(crate) mod tests {
                 .clone();
             drop(compiled);
             drop(creation);
-            drop(scopes);
+            {
+                let _scopes = scopes;
+            }
             drop(scratch);
             drop(actual);
             (late, tracker)
@@ -10138,7 +10150,9 @@ pub(crate) mod tests {
             drop(decoded);
             drop(wire);
             work.finish().unwrap();
-            drop(factory);
+            {
+                let _factory = factory;
+            }
             drop(scratch);
             drop(actual);
             (child, tracker)
@@ -10255,7 +10269,9 @@ pub(crate) mod tests {
                 "entity scopes cannot replace the original complete-table cap"
             );
             drop(creation);
-            drop(scopes);
+            {
+                let _scopes = scopes;
+            }
             drop(actual);
             assert_eq!(tracker.current(), 0);
         }
@@ -10329,7 +10345,9 @@ pub(crate) mod tests {
                 "failed prospective request is rolled back"
             );
             drop(creation);
-            drop(scopes);
+            {
+                let _scopes = scopes;
+            }
             drop(actual);
             assert_eq!(tracker.current(), 0);
         }

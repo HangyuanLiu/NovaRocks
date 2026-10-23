@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 struct SliceSource<C> {
     source: ArrayRef,
-    original_owner: C,
+    _original_owner: C,
 }
 impl<C> crate::arrow_result_custody::CopyInputBacking for SliceSource<C> {
     fn source_count(&self) -> usize {
@@ -72,7 +72,7 @@ pub fn slice_copy_in<C: Send + Sync + 'static>(
 ) -> Result<RetainedSliceResult, CopyOperationError> {
     let source = SliceSource {
         source,
-        original_owner,
+        _original_owner: original_owner,
     };
     let observed = KernelControlObservation::new(control);
     observed.checkpoint(0)?;

@@ -26,7 +26,6 @@ use novarocks_types::QueryExecutionId;
 pub(crate) enum QueryLifecycleConvergenceErrorSource {
     BackendAttestation,
     FrontendLiveness,
-    NoOutcome,
 }
 
 /// Immutable, query-scoped terminal convergence evidence. It is intentionally
@@ -106,11 +105,10 @@ impl FrontendLifecycleDiagnostics {
         }
         #[cfg(novarocks_dev_controls)]
         {
-            return self
-                .observer
+            self.observer
                 .get()
                 .and_then(std::sync::Weak::upgrade)
-                .is_some_and(|owner| owner.is_active());
+                .is_some_and(|owner| owner.is_active())
         }
         #[cfg(not(novarocks_dev_controls))]
         false

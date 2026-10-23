@@ -145,7 +145,7 @@ impl SqlFunctionBinding {
                         let carrier =
                             novarocks_type_contract::arrow_data_type_fingerprint_observed::<
                                 ConstantError,
-                            >(&ty.data_type(), &mut || {
+                            >(ty.data_type(), &mut || {
                                 work.step().map_err(Into::into)
                             })
                             .map_err(SqlCompileError::from)?;

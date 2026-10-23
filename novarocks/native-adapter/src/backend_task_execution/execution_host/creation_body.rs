@@ -250,7 +250,6 @@ fn finish(
     Body {
         frozen: proto::FrozenFragment {
             package: encoded.encode_to_vec().into(),
-            ..Default::default()
         },
         assignment: proto::TaskAssignment {
             instance_ordinal: 3,

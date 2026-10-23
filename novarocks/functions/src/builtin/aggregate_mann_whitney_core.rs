@@ -887,7 +887,6 @@ mod tests {
             crate::KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
                 operation, source,
             ))
-            .into()
         }
     }
 
@@ -989,8 +988,8 @@ mod tests {
             observe_operation(operation, &control).unwrap();
             let units = control.units.lock().unwrap();
             assert_eq!(units.iter().copied().sum::<u32>(), expected);
-            assert!(units.iter().any(|units| *units == 256));
-            assert!(units.iter().any(|units| *units == 0));
+            assert!(units.contains(&256));
+            assert!(units.contains(&0));
         }
     }
     #[test]

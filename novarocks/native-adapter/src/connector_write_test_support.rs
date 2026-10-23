@@ -26,7 +26,6 @@ use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
 use bytes::Bytes;
-use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::connector_common::encode_connector_payload_message;
 use novarocks_proto_models::catalog as catalog_dto;
 use novarocks_proto_models::connector_write as write_dto;
@@ -180,6 +179,12 @@ pub struct WriterTerminals {
     pub finished: usize,
     pub aborted: usize,
     pub appended_rows: usize,
+}
+
+impl Default for RecordingWriteExecution {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RecordingWriteExecution {

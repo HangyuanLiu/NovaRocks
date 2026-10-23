@@ -386,16 +386,15 @@ impl BoundedRecordRange {
         if raw_peak > bound.raw_page_bytes {
             return Err(invalid("MV inventory exceeds its raw page byte bound"));
         }
-        if let Some(token) = &page.continuation {
-            if token
+        if let Some(token) = &page.continuation
+            && token
                 .resume_after(&request)
                 .map_err(operation::state_store_error)?
                 != record.key
-            {
-                return Err(corruption(
-                    "MV inventory continuation differs from its last page key",
-                ));
-            }
+        {
+            return Err(corruption(
+                "MV inventory continuation differs from its last page key",
+            ));
         }
         self.exhausted = page.continuation.is_none();
         self.continuation = page

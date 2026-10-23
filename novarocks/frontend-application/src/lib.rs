@@ -80,6 +80,7 @@ pub use server::{
 };
 #[cfg(feature = "mem-1-m07-hms-listing-observe")]
 pub use server::{HmsListingObservationHandler, HmsListingObservationSetup};
+#[cfg(test)]
 mod state_family;
 pub(crate) mod state_store;
 pub(crate) mod statistics;

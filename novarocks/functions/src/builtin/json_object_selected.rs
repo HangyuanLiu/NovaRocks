@@ -217,7 +217,7 @@ pub(super) fn evaluate<'a>(
             )?;
             let values = SelectedValues::try_new_observed::<KernelFailure>(
                 selection,
-                &input.contract().result_type().data_type(),
+                input.contract().result_type().data_type(),
                 retained.values,
                 Box::default(),
                 || work.step(),

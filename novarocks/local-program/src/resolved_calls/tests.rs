@@ -1586,7 +1586,7 @@ pub(crate) fn typed_call_fixture(kind: TypedCallFixture) -> ProgramResolvedCalls
                     source_schema,
                     types
                         .iter()
-                        .map(|ty| arrow_array::new_null_array(&ty.data_type(), 0))
+                        .map(|ty| arrow_array::new_null_array(ty.data_type(), 0))
                         .collect(),
                 )
                 .unwrap(),

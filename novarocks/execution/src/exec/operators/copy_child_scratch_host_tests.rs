@@ -366,7 +366,11 @@ fn by_copy_child_scratch_host_actual_tracker_capacity_refusal_rolls_back() {
     else {
         panic!("the real child scratch host must refuse");
     };
-    super::opaque_memory_host_tests::assert_tracker_refusal(&refusal, required_peak - 1, None);
+    crate::exec::operators::opaque_memory_host_tests::assert_tracker_refusal(
+        &refusal,
+        required_peak - 1,
+        None,
+    );
     assert_released(&host);
 }
 #[test]
@@ -498,7 +502,7 @@ fn by_copy_child_scratch_host_original_panic_unwinds_actual_recursive_blocks() {
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         evaluate(array.as_ref(), &plan, &host, &PanicControl(&control, floor))
     }));
-    let payload = caught.err().expect("host panic remains a panic");
+    let payload = caught.expect_err("host panic remains a panic");
     assert_eq!(
         payload.downcast_ref::<&str>().copied(),
         Some("recursive scratch original checkpoint panic")

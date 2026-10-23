@@ -264,8 +264,10 @@ fn string_repeat_row_cap_exact_boundary_remains_success_or_null_not_resource_err
         array
             .value(2)
             .as_bytes()
-            .chunks_exact(2)
-            .all(|p| p == [0xc3, 0xa9])
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|p| *p == [0xc3, 0xa9])
     );
     for row in [1, 3, 4] {
         assert!(array.is_null(row));

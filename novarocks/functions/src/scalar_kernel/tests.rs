@@ -952,7 +952,8 @@ fn primary_scalar_control_survives_retained_growth_and_latches_without_replay() 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
     // A successful implementation still has to obey its retained contract.
-    for mode in [Mode::Grow] {
+    {
+        let mode = Mode::Grow;
         let (prepared, calls) = preparation(
             ArgumentControl::Eager,
             mode,

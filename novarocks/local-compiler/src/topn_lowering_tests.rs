@@ -901,10 +901,10 @@ mod scan_split {
     use novarocks_type_contract::{
         CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationDomainId,
         ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
-        ExpressionInvocation, ExpressionUseId, PureCompileControl, ValueLogicalType,
+        ExpressionInvocation, ExpressionUseId, PureCompileControl,
     };
     use std::{
-        collections::{BTreeMap, HashMap},
+        collections::BTreeMap,
         num::{NonZeroU64, NonZeroUsize},
         sync::Arc,
         time::Duration,

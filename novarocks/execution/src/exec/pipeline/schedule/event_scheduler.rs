@@ -30,7 +30,9 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+#[cfg(test)]
 use crate::exec::pipeline::operator::OperatorLifecycle;
+#[cfg(test)]
 use crate::runtime::fragment::ExecutionResult;
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -1227,31 +1229,29 @@ impl EventScheduler {
             let mut blocked = self.blocked.lock().expect("event scheduler blocked lock");
             let entry = blocked.remove(&key);
             #[cfg(novarocks_dev_controls)]
-            if let Some(entry) = entry.as_ref() {
-                if entry.task.source_name().contains("EXCHANGE") {
-                    if let Some(observer) = entry
-                        .task
-                        .exchange_test_observer()
-                        .filter(|observer| observer.is_active())
-                    {
-                        let (blocked_generation, current_generation) = entry
-                            .observable
-                            .as_ref()
-                            .and_then(|(observable, blocked_generation)| {
-                                observable.upgrade().map(|observable| {
-                                    (*blocked_generation, observable.generation())
-                                })
-                            })
-                            .unwrap_or((0, 0));
-                        if blocked_generation == 0 {
-                            exchange_marker = Some((
-                                observer,
-                                blocked_generation,
-                                current_generation,
-                                entry.block_epoch,
-                            ));
-                        }
-                    }
+            if let Some(entry) = entry.as_ref()
+                && entry.task.source_name().contains("EXCHANGE")
+                && let Some(observer) = entry
+                    .task
+                    .exchange_test_observer()
+                    .filter(|observer| observer.is_active())
+            {
+                let (blocked_generation, current_generation) = entry
+                    .observable
+                    .as_ref()
+                    .and_then(|(observable, blocked_generation)| {
+                        observable
+                            .upgrade()
+                            .map(|observable| (*blocked_generation, observable.generation()))
+                    })
+                    .unwrap_or((0, 0));
+                if blocked_generation == 0 {
+                    exchange_marker = Some((
+                        observer,
+                        blocked_generation,
+                        current_generation,
+                        entry.block_epoch,
+                    ));
                 }
             }
             let mut state = self
@@ -1321,9 +1321,7 @@ mod tests {
     use crate::exec::pipeline::fragment_context::FragmentContext;
     use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
     use crate::exec::pipeline::input::{PreparedInput, RawInput};
-    use crate::exec::pipeline::operator::{
-        ExitProgress, FinishWatch, InputEncodingPolicy, Operator,
-    };
+    use crate::exec::pipeline::operator::{FinishWatch, InputEncodingPolicy, Operator};
     use crate::exec::pipeline::shape::{
         SinkKernel, SinkStep, Source, SourceKernel, Transform, TransformStart,
     };
@@ -2165,7 +2163,6 @@ mod tests {
             "COUNTING_SINK"
         }
         fn observe_exit(&mut self) -> crate::exec::pipeline::operator::ExitObservation {
-            use crate::exec::pipeline::operator::ExitProgress;
             match &self.exit {
                 Some((pending, event)) if pending.load(Ordering::Acquire) => {
                     crate::exec::pipeline::operator::ExitObservation::pending(FinishWatch::Notify(

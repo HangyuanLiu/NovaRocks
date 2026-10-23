@@ -1,7 +1,7 @@
 //! FE attempt-local admission state for terminal runtime-filter feedback.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Condvar, Mutex};
+use std::sync::Mutex;
 
 use novarocks_execution::runtime_filter::contribution::MembershipValues;
 use novarocks_execution::runtime_filter::feedback_domain::RuntimeFilterFeedbackDomain;
@@ -20,7 +20,6 @@ use super::install_encoder::{
 #[derive(Default)]
 struct FeedbackState {
     closed: bool,
-    generation: u64,
     channels: BTreeMap<u32, ChannelState>,
 }
 
@@ -48,7 +47,7 @@ struct ChannelState {
 /// StateStore reference or process-global registration.
 pub(crate) struct RuntimeFilterFeedbackState {
     execution_id: QueryExecutionId,
-    state: (Mutex<FeedbackState>, Condvar),
+    state: Mutex<FeedbackState>,
 }
 
 /// Admission dispositions that preserve the distinction between an accepted
@@ -67,14 +66,10 @@ impl RuntimeFilterFeedbackState {
     ) -> Result<Self, String> {
         Ok(Self {
             execution_id,
-            state: (
-                Mutex::new(FeedbackState {
-                    closed: false,
-                    generation: 0,
-                    channels: channel_states(declaration)?,
-                }),
-                Condvar::new(),
-            ),
+            state: Mutex::new(FeedbackState {
+                closed: false,
+                channels: channel_states(declaration)?,
+            }),
         })
     }
 
@@ -85,45 +80,17 @@ impl RuntimeFilterFeedbackState {
         &self,
         declaration: FrontendRuntimeFilterFeedbackDeclaration,
     ) -> Result<(), String> {
-        let mut state = self.state.0.lock().expect("runtime filter feedback state");
+        let mut state = self.state.lock().expect("runtime filter feedback state");
         if state.closed {
             return Err("cannot configure closed runtime filter feedback state".into());
         }
         state.channels = channel_states(declaration)?;
-        state.generation = state.generation.saturating_add(1);
-        self.state.1.notify_all();
         Ok(())
     }
 
     pub(crate) fn close(&self) {
-        let mut state = self.state.0.lock().expect("runtime filter feedback state");
+        let mut state = self.state.lock().expect("runtime filter feedback state");
         state.closed = true;
-        state.generation = state.generation.saturating_add(1);
-        self.state.1.notify_all();
-    }
-
-    /// Block the split-assignment worker until feedback changes or the small
-    /// scheduler-owned budget elapses. The caller always rechecks its stop
-    /// handle and its source deadline, so feedback is never a cancellation
-    /// authority and this method never sleeps a connector implementation.
-    pub(crate) fn wait_for_change(&self, observed_generation: u64, budget: std::time::Duration) {
-        let state = self.state.0.lock().expect("runtime filter feedback state");
-        if state.closed || state.generation != observed_generation || budget.is_zero() {
-            return;
-        }
-        let _ = self
-            .state
-            .1
-            .wait_timeout(state, budget)
-            .expect("runtime filter feedback condvar");
-    }
-
-    pub(crate) fn generation(&self) -> u64 {
-        self.state
-            .0
-            .lock()
-            .expect("runtime filter feedback state")
-            .generation
     }
 
     /// Snapshot the currently admitted domains for one connector scan.  A
@@ -135,7 +102,7 @@ impl RuntimeFilterFeedbackState {
         plan_node_id: i32,
         bindings: &[(u32, ConnectorReadColumnHandle)],
     ) -> ConnectorReadDynamicFilterSnapshot {
-        let state = self.state.0.lock().expect("runtime filter feedback state");
+        let state = self.state.lock().expect("runtime filter feedback state");
         if state.closed {
             return ConnectorReadDynamicFilterSnapshot::all_complete();
         }
@@ -196,7 +163,7 @@ impl RuntimeFilterFeedbackState {
         plan_node_id: i32,
         bindings: impl IntoIterator<Item = u32>,
     ) -> bool {
-        let state = self.state.0.lock().expect("runtime filter feedback state");
+        let state = self.state.lock().expect("runtime filter feedback state");
         if state.closed {
             return false;
         }
@@ -272,7 +239,7 @@ impl RuntimeFilterFeedbackState {
                 "runtime filter feedback deployment epoch differs from active attempt".into(),
             );
         }
-        let mut state = self.state.0.lock().expect("runtime filter feedback state");
+        let mut state = self.state.lock().expect("runtime filter feedback state");
         if state.closed {
             return Ok(RuntimeFilterFeedbackAdmission::Applied);
         }
@@ -307,8 +274,6 @@ impl RuntimeFilterFeedbackState {
                     ),
                     None => {
                         channel.winner = Some(encoded.to_vec());
-                        state.generation = state.generation.saturating_add(1);
-                        self.state.1.notify_all();
                         Ok(RuntimeFilterFeedbackAdmission::Applied)
                     }
                 }
@@ -316,8 +281,6 @@ impl RuntimeFilterFeedbackState {
             TerminalFeedback::Unavailable => {
                 if channel.winner.is_none() {
                     channel.unavailable.insert(participant_id);
-                    state.generation = state.generation.saturating_add(1);
-                    self.state.1.notify_all();
                 }
                 Ok(RuntimeFilterFeedbackAdmission::Applied)
             }
@@ -674,7 +637,6 @@ mod tests {
                 plan_node_id: 17,
                 binding_id: 7,
                 data_type: DataType::Int64,
-                nullable: false,
             }],
             wait_eligibility: FrontendRuntimeFilterFeedbackWaitEligibility::Eligible,
         }])
@@ -758,7 +720,7 @@ mod tests {
             .expect_err("a distinct terminal domain cannot replace the winner");
         assert!(conflict.contains("conflicts with first winner"));
 
-        let state = state.state.0.lock().expect("feedback state");
+        let state = state.state.lock().expect("feedback state");
         assert_eq!(state.channels[&7].winner.as_deref(), Some(first.as_slice()));
         assert!(state.channels[&7].is_terminal());
     }
@@ -792,7 +754,6 @@ mod tests {
                     plan_node_id: 17,
                     binding_id: 7,
                     data_type: DataType::Int64,
-                    nullable: false,
                 }],
                 wait_eligibility: FrontendRuntimeFilterFeedbackWaitEligibility::Eligible,
             }])
@@ -805,11 +766,11 @@ mod tests {
         state
             .admit_task_feedback(&feedback, first)
             .expect("first unavailable is admitted");
-        assert!(!state.state.0.lock().expect("state").channels[&7].is_terminal());
+        assert!(!state.state.lock().expect("state").channels[&7].is_terminal());
         state
             .admit_task_feedback(&feedback, second)
             .expect("second unavailable is admitted");
-        let state = state.state.0.lock().expect("state");
+        let state = state.state.lock().expect("state");
         assert!(state.channels[&7].winner.is_none());
         assert!(state.channels[&7].is_terminal());
     }
@@ -827,7 +788,7 @@ mod tests {
         state
             .admit_task_feedback(&feedback, process)
             .expect("closed state drops late feedback");
-        let state = state.state.0.lock().expect("feedback state");
+        let state = state.state.lock().expect("feedback state");
         assert!(state.closed);
         assert!(state.channels[&7].winner.is_none());
     }
@@ -883,7 +844,7 @@ mod tests {
             "{stranger}"
         );
         assert!(
-            state.state.0.lock().expect("state").channels[&7]
+            state.state.lock().expect("state").channels[&7]
                 .winner
                 .is_none()
         );
@@ -895,7 +856,7 @@ mod tests {
             RuntimeFilterFeedbackAdmission::Applied
         );
         assert_eq!(
-            state.state.0.lock().expect("state").channels[&7]
+            state.state.lock().expect("state").channels[&7]
                 .winner
                 .as_deref(),
             Some(domain.as_slice())
@@ -944,11 +905,11 @@ mod tests {
         envelope.kind = filter::RuntimeFilterEnvelopeKind::Unavailable as i32;
         let feedback = TaskRuntimeFilterFeedback::parse(&envelope).expect("a legal envelope");
 
-        assert!(!state.state.0.lock().expect("state").channels[&7].is_terminal());
+        assert!(!state.state.lock().expect("state").channels[&7].is_terminal());
         state
             .admit_task_feedback(&feedback, process)
             .expect("an unavailable channel is admitted");
-        let locked = state.state.0.lock().expect("state");
+        let locked = state.state.lock().expect("state");
         assert!(locked.channels[&7].winner.is_none());
         assert!(locked.channels[&7].is_terminal());
     }
@@ -999,7 +960,6 @@ mod tests {
                     plan_node_id: 17,
                     binding_id: 7,
                     data_type: DataType::Int64,
-                    nullable: false,
                 }],
                 wait_eligibility: FrontendRuntimeFilterFeedbackWaitEligibility::Eligible,
             },
@@ -1017,7 +977,6 @@ mod tests {
                     plan_node_id: 17,
                     binding_id: 8,
                     data_type: DataType::Int64,
-                    nullable: false,
                 }],
                 wait_eligibility: FrontendRuntimeFilterFeedbackWaitEligibility::Eligible,
             },

@@ -16,6 +16,9 @@
 // under the License.
 
 //! Inline keyed application documents, exact observations and admission.
+#[cfg(test)]
+#[path = "tests/admission_support.rs"]
+pub(crate) mod admission_support;
 mod context;
 mod create;
 mod discovery;

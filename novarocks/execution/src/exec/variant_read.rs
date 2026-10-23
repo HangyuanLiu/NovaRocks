@@ -26,8 +26,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use arrow::array::LargeBinaryBuilder;
 use arrow::array::{
-    Array, ArrayRef, BinaryBuilder, BooleanBufferBuilder, LargeBinaryArray, RecordBatch,
-    StructArray,
+    Array, ArrayRef, BooleanBufferBuilder, LargeBinaryArray, RecordBatch, StructArray,
 };
 use arrow::buffer::NullBuffer;
 use arrow::compute::CastOptions;
@@ -167,11 +166,15 @@ fn kernel_path<'a>(
     segments: &'a [VariantPathSegment],
     owner: Option<&dyn crate::exec::pipeline::operator::InputConstructionOwner>,
 ) -> Result<parquet::variant::VariantPath<'a>, VariantMaterializationFailure> {
-    if let Some(owner) = owner {
-        if !segments.is_empty() {
-            owner.request(std::alloc::Layout::array::<parquet::variant::VariantPathElement<'a>>(segments.len())
-                .map_err(|_| novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic)?)?;
-        }
+    if let Some(owner) = owner
+        && !segments.is_empty()
+    {
+        owner.request(
+            std::alloc::Layout::array::<parquet::variant::VariantPathElement<'a>>(segments.len())
+                .map_err(|_| {
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic
+            })?,
+        )?;
     }
     let mut elems = Vec::with_capacity(segments.len());
     for seg in segments {
@@ -645,7 +648,7 @@ mod tests {
         assert!(!is_variant_struct_data_type(&DataType::LargeBinary));
     }
 
-    use arrow::array::{Float64Array, Int64Array, LargeBinaryArray};
+    use arrow::array::{Float64Array, Int64Array};
 
     use super::VariantPathSpec;
     use novarocks_types::SlotId;

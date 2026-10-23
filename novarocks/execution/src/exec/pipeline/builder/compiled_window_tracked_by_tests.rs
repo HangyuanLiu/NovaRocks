@@ -19,7 +19,7 @@
 //! The old FixedZero driver helper and its oracle remain untouched.
 use super::super::window_fixture::window_catalog_from_actual;
 use super::*;
-use crate::exec::pipeline::{step::NextStep, test_driver::TestDriver};
+use crate::exec::pipeline::test_driver::TestDriver;
 use crate::runtime::fragment::ExecutionFailureCause;
 use crate::runtime::mem_tracker::MemTracker;
 use novarocks_functions::FunctionKind;
@@ -319,69 +319,76 @@ fn by_window_step_keeps_arrival_boundaries_and_yields_before_output_construction
     let state = RuntimeState::default();
     let error = state.error_state();
     let mut turn = TurnWork::new(NonZeroU64::new(1).unwrap(), 0);
-    let mut context = StepContext::new(&error, &mut turn);
     let step = operator.as_mut();
-    for (offset, rows) in [(0, 1), (1, 2)] {
+    {
+        let mut context = StepContext::new(&error, &mut turn);
+        for (offset, rows) in [(0, 1), (1, 2)] {
+            assert!(matches!(
+                step.try_push(
+                    &mut context,
+                    RawInput::for_test(chunk(&program, batch.slice(offset, rows)))
+                ),
+                InputResult::Accepted(Ok(_))
+            ));
+            let applied = step.drive(&mut context).unwrap();
+            assert!(applied.output.is_none());
+            assert!(matches!(applied.next, NextStep::NeedInput));
+        }
+        step.finish(&mut context).unwrap();
+        let finalized = step.drive(&mut context).unwrap();
+        assert!(finalized.output.is_none());
+        assert!(matches!(finalized.next, NextStep::Runnable));
+        let allocated = tracker.allocated();
         assert!(matches!(
-            step.try_push(
-                &mut context,
-                RawInput::for_test(chunk(&program, batch.slice(offset, rows)))
-            ),
-            InputResult::Accepted(Ok(_))
+            step.drive(&mut context).unwrap().next,
+            NextStep::Yield
         ));
-        let applied = step.drive(&mut context).unwrap();
-        assert!(applied.output.is_none());
-        assert!(matches!(applied.next, NextStep::NeedInput));
+        assert_eq!(tracker.allocated(), allocated);
     }
-    step.finish(&mut context).unwrap();
-    let finalized = step.drive(&mut context).unwrap();
-    assert!(finalized.output.is_none());
-    assert!(matches!(finalized.next, NextStep::Runnable));
-    let allocated = tracker.allocated();
-    assert!(matches!(
-        step.drive(&mut context).unwrap().next,
-        NextStep::Yield
-    ));
-    assert_eq!(tracker.allocated(), allocated);
-    drop(context);
     turn.begin_turn(1).unwrap();
-    let mut context = StepContext::new(&error, &mut turn);
-    let first = step.drive(&mut context).unwrap();
-    assert!(matches!(first.next, NextStep::Runnable));
-    let first = first.output.unwrap();
-    assert_eq!(first.len(), 1);
-    let allocated = tracker.allocated();
-    assert!(matches!(
-        step.drive(&mut context).unwrap().next,
-        NextStep::Yield
-    ));
-    assert_eq!(tracker.allocated(), allocated);
-    drop(context);
-    turn.begin_turn(1).unwrap();
-    let mut context = StepContext::new(&error, &mut turn);
-    let last = step.drive(&mut context).unwrap();
-    assert!(matches!(last.next, NextStep::Finished));
-    let last = last.output.unwrap();
-    assert_eq!(last.len(), 2);
-    let values = [
-        first.record_batch().column(3),
-        last.record_batch().column(3),
-    ]
-    .into_iter()
-    .flat_map(|array| array.as_any().downcast_ref::<Int64Array>().unwrap().iter())
-    .collect::<Vec<_>>();
-    assert_eq!(values, vec![Some(7), Some(7), Some(7)]);
-    assert!(step.drive(&mut context).unwrap().output.is_none());
-    let raw = chunk(&program, batch.slice(0, 1));
-    let original = raw.columns()[0].clone();
-    let InputResult::Rejected { input, .. } = step.try_push(&mut context, RawInput::for_test(raw))
-    else {
-        panic!("finished window rejects a new delivery");
+    let first = {
+        let mut context = StepContext::new(&error, &mut turn);
+        let first = step.drive(&mut context).unwrap();
+        assert!(matches!(first.next, NextStep::Runnable));
+        let first = first.output.unwrap();
+        assert_eq!(first.len(), 1);
+        let allocated = tracker.allocated();
+        assert!(matches!(
+            step.drive(&mut context).unwrap().next,
+            NextStep::Yield
+        ));
+        assert_eq!(tracker.allocated(), allocated);
+        first
     };
-    assert!(Arc::ptr_eq(
-        input.original_for_test().columns().first().unwrap(),
-        &original
-    ));
+    turn.begin_turn(1).unwrap();
+    let last = {
+        let mut context = StepContext::new(&error, &mut turn);
+        let last = step.drive(&mut context).unwrap();
+        assert!(matches!(last.next, NextStep::Finished));
+        let last = last.output.unwrap();
+        assert_eq!(last.len(), 2);
+        let values = [
+            first.record_batch().column(3),
+            last.record_batch().column(3),
+        ]
+        .into_iter()
+        .flat_map(|array| array.as_any().downcast_ref::<Int64Array>().unwrap().iter())
+        .collect::<Vec<_>>();
+        assert_eq!(values, vec![Some(7), Some(7), Some(7)]);
+        assert!(step.drive(&mut context).unwrap().output.is_none());
+        let raw = chunk(&program, batch.slice(0, 1));
+        let original = raw.columns()[0].clone();
+        let InputResult::Rejected { input, .. } =
+            step.try_push(&mut context, RawInput::for_test(raw))
+        else {
+            panic!("finished window rejects a new delivery");
+        };
+        assert!(Arc::ptr_eq(
+            input.original_for_test().columns().first().unwrap(),
+            &original
+        ));
+        last
+    };
     drop(operator);
     drop(first);
     assert!(

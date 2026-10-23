@@ -342,7 +342,7 @@ fn array_match_compile_callbacks_preserve_primary_causes_on_success_and_rejectio
             assert_eq!(
                 prepared_for_test_with_control(
                     name,
-                    &[source.clone()],
+                    std::slice::from_ref(&source),
                     DecimalOverflowPolicy::OutputNull,
                     &good,
                 )
@@ -363,12 +363,11 @@ fn array_match_compile_callbacks_preserve_primary_causes_on_success_and_rejectio
                     };
                     let error = prepared_for_test_with_control(
                         name,
-                        &[source.clone()],
+                        std::slice::from_ref(&source),
                         DecimalOverflowPolicy::OutputNull,
                         &control,
                     )
-                    .err()
-                    .expect("refused compilation must not publish a prepared kernel");
+                    .expect_err("refused compilation must not publish a prepared kernel");
                     let actual = match error {
                         crate::FunctionSpecializationFailure::Control(actual) => Some(actual),
                         crate::FunctionSpecializationFailure::Kernel(KernelFailure::Cancelled) => {

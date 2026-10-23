@@ -766,8 +766,10 @@ IDE 测试按钮与私有 target 配置、清理责任见 [测试治理](docs/gu
 ### 8.3 Code Quality
 
 - `cargo fmt`
-- `cargo clippy`
+- `cargo clippy --workspace --all-targets -- -D warnings`（CI 严格 Clippy 阶段；CI wrapper 另固定 `--profile dev --locked --target-dir target`）
 - `cargo build`
+- 全局基线只放宽 Databend 与 RisingWave 共同放宽的项：`Cargo.toml` 的 `[workspace.lints.clippy] result_large_err = "allow"`，根 `clippy.toml` 的 `too-many-arguments-threshold = 10`；`large_enum_variant` 与 `type_complexity` 保持默认。新增局部例外使用带理由的 `#[expect(lint, reason = "...")]`，不新增 `#[allow]`。升级 `rust-toolchain.toml` 时，负责修复新诊断，或按相同对齐规则调整并写明理由。
+- Clippy 只读取离 crate 最近的一份 `clippy.toml`，不合并配置；修改根配置时同步更新 `novarocks/native-trust/clippy.toml`。
 - 改动 crate 依赖时参考 [SPI](docs/guides/development/spi-boundary.md)、[StateStore](docs/guides/development/state-store-boundary.md) 与 [Memory](docs/guides/development/memory-boundary.md) 边界指南；依赖方向由 crate 结构与 review 维持，CI 不做依赖边界检查。
 - 按影响面执行 nextest；独立 Cargo doctest，局部调试可用 `cargo test -p <owner>`
 

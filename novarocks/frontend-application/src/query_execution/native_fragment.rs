@@ -37,7 +37,6 @@ use crate::query_execution::artifact::FragmentId;
 pub struct NativeFragmentAttachment {
     by_fragment: BTreeMap<FragmentId, Arc<FragmentArtifact>>,
     root: FragmentId,
-    provenance: Option<u64>,
 }
 
 impl NativeFragmentAttachment {
@@ -50,15 +49,13 @@ impl NativeFragmentAttachment {
     pub(crate) fn for_completed_plan(
         by_fragment: BTreeMap<FragmentId, Arc<FragmentArtifact>>,
         root: FragmentId,
-        provenance: u64,
     ) -> Result<Self, String> {
-        Self::sealed(by_fragment, root, Some(provenance))
+        Self::sealed(by_fragment, root)
     }
 
     fn sealed(
         by_fragment: BTreeMap<FragmentId, Arc<FragmentArtifact>>,
         root: FragmentId,
-        provenance: Option<u64>,
     ) -> Result<Self, String> {
         for (&fragment_id, fragment) in &by_fragment {
             if fragment.facts().fragment_id() != fragment_id {
@@ -73,11 +70,7 @@ impl NativeFragmentAttachment {
                 "completed plan root fragment {root} has no frozen native plan"
             ));
         }
-        Ok(Self {
-            by_fragment,
-            root,
-            provenance,
-        })
+        Ok(Self { by_fragment, root })
     }
 
     /// Whether every fragment of this payload was already encoded with its
@@ -104,17 +97,12 @@ impl NativeFragmentAttachment {
     pub(crate) const fn root(&self) -> FragmentId {
         self.root
     }
-
-    pub(crate) fn matches_provenance(&self, provenance: u64) -> bool {
-        self.provenance == Some(provenance)
-    }
 }
 
 #[cfg(test)]
 pub(crate) fn native_fragment_attachment_for_test(
     fragments: impl IntoIterator<Item = Arc<FragmentArtifact>>,
     root: FragmentId,
-    provenance: Option<u64>,
 ) -> Result<NativeFragmentAttachment, String> {
     let mut by_fragment = BTreeMap::new();
     for fragment in fragments {
@@ -125,7 +113,7 @@ pub(crate) fn native_fragment_attachment_for_test(
             ));
         }
     }
-    NativeFragmentAttachment::sealed(by_fragment, root, provenance)
+    NativeFragmentAttachment::sealed(by_fragment, root)
 }
 
 #[cfg(test)]
@@ -151,7 +139,7 @@ mod tests {
 
     #[test]
     fn test_fixture_rejects_duplicate_ids() {
-        let error = native_fragment_attachment_for_test(vec![fragment(3), fragment(3)], 3, None)
+        let error = native_fragment_attachment_for_test(vec![fragment(3), fragment(3)], 3)
             .expect_err("duplicate attachment ids must fail");
         assert_eq!(
             error,
@@ -162,12 +150,12 @@ mod tests {
     #[test]
     fn an_attachment_must_hold_its_root_under_its_own_id() {
         let error =
-            NativeFragmentAttachment::for_completed_plan(BTreeMap::from([(3, fragment(3))]), 4, 7)
+            NativeFragmentAttachment::for_completed_plan(BTreeMap::from([(3, fragment(3))]), 4)
                 .expect_err("a root that was never frozen is refused");
         assert!(error.contains("root fragment 4"), "{error}");
 
         let error =
-            NativeFragmentAttachment::for_completed_plan(BTreeMap::from([(3, fragment(5))]), 3, 7)
+            NativeFragmentAttachment::for_completed_plan(BTreeMap::from([(3, fragment(5))]), 3)
                 .expect_err("a fragment filed under another id is refused");
         assert!(error.contains("filed under 3"), "{error}");
     }

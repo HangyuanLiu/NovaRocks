@@ -34,21 +34,20 @@ pub mod fixture;
 pub mod scan_model;
 
 pub use application::{
-    acquire_metadata_planning_lease, connector_default_to_column_default,
-    connector_request_context, connector_request_context_for_deadline,
-    connector_request_context_for_execution, connector_request_context_for_query,
+    acquire_metadata_planning_lease, connector_request_context,
+    connector_request_context_for_deadline, connector_request_context_for_execution,
     connector_write_default_at, metadata_list_namespaces_with_planning_lease,
     metadata_list_tables_with_planning_lease, metadata_load_connector_table_with_planning_lease,
-    metadata_load_table, metadata_load_table_with_planning_lease, metadata_namespace_exists,
+    metadata_load_table, metadata_namespace_exists,
     metadata_read_reference_facts_with_planning_lease, metadata_table_exists_with_planning_lease,
     validate_request_context,
 };
 pub(crate) use application::{
-    connector_planning_context_for_query, connector_planning_context_for_query_on_runtime,
+    connector_planning_context_for_query_on_runtime,
     connector_request_context_for_execution_on_runtime,
     connector_request_context_for_query_on_runtime, connector_write_column,
     context_for_planning_lease, context_for_planning_lease_typed, metadata_binding_typed,
-    metadata_load_connector_table_with_planning_lease_typed, query_connector_request_context,
+    metadata_load_connector_table_with_planning_lease_typed,
     query_connector_request_context_on_runtime, sql_column_from_connector_binding,
 };
 pub use unified_statistics::UnifiedStatisticsResolver;

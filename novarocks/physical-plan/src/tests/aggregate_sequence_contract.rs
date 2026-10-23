@@ -221,7 +221,6 @@ fn add_exchange_source(
     (node, imports)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn add_aggregate(
     builder: &mut FragmentBuilder,
     input: NodeId,
@@ -251,7 +250,6 @@ fn add_aggregate(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn add_aggregate_with_grouping(
     builder: &mut FragmentBuilder,
     input: NodeId,
@@ -338,7 +336,6 @@ fn add_aggregate_with_grouping(
     (node, columns)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn add_edge(
     plan: &mut PlanBuilder,
     edge: EdgeId,

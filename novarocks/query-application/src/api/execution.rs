@@ -119,7 +119,7 @@ enum QueryExecutionErrorBody {
         kind: QueryExecutionErrorKind,
         message: Arc<str>,
     },
-    Execution(crate::execution_error::ExecutionFailureInput),
+    Execution(Box<crate::execution_error::ExecutionFailureInput>),
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryExecutionError {
@@ -137,12 +137,12 @@ impl QueryExecutionError {
     }
     pub fn from_execution(input: crate::execution_error::ExecutionFailureInput) -> Self {
         Self {
-            body: QueryExecutionErrorBody::Execution(input),
+            body: QueryExecutionErrorBody::Execution(Box::new(input)),
         }
     }
     pub fn execution_failure(&self) -> Option<&crate::execution_error::ExecutionFailureInput> {
         match &self.body {
-            QueryExecutionErrorBody::Execution(input) => Some(input),
+            QueryExecutionErrorBody::Execution(input) => Some(input.as_ref()),
             QueryExecutionErrorBody::Application { .. } => None,
         }
     }

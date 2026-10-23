@@ -109,7 +109,7 @@ fn require(
     if condition {
         Ok(())
     } else {
-        Err(shape(message).into())
+        Err(shape(message))
     }
 }
 
@@ -182,15 +182,7 @@ pub(crate) fn preflight_recursive_record_batch<'a>(
     result
 }
 
-pub(crate) fn preflight_verified_recursive_record_batch<'a>(
-    message: arrow::ipc::Message<'_>,
-    body: &[u8],
-    expected: &'a Field,
-    limits: RecursiveBatchProjectionLimits,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<CheckedRecursiveBatch<'a>, TypeCodecError> {
-    preflight_core(message, body, expected, limits, None, work)
-}
+#[cfg(test)]
 pub(crate) fn preflight_verified_recursive_record_batch_in<'a, E: ReaderGeometryFailure>(
     message: arrow::ipc::Message<'_>,
     body: &[u8],
@@ -200,6 +192,16 @@ pub(crate) fn preflight_verified_recursive_record_batch_in<'a, E: ReaderGeometry
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<CheckedRecursiveBatch<'a>, E> {
     preflight_core(message, body, expected, limits, Some(admission), work)
+}
+
+pub(crate) fn preflight_verified_recursive_record_batch<'a>(
+    message: arrow::ipc::Message<'_>,
+    body: &[u8],
+    expected: &'a Field,
+    limits: RecursiveBatchProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<CheckedRecursiveBatch<'a>, TypeCodecError> {
+    preflight_core(message, body, expected, limits, None, work)
 }
 fn preflight_core<'a, E: ReaderGeometryFailure>(
     message: arrow::ipc::Message<'_>,

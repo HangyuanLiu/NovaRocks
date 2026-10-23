@@ -179,8 +179,4 @@ impl MvDesiredRefreshPolicy {
             Self::AsyncInterval => "ASYNC_INTERVAL",
         }
     }
-
-    pub(crate) fn accepts_interval(&self) -> bool {
-        matches!(self, Self::AsyncInterval)
-    }
 }

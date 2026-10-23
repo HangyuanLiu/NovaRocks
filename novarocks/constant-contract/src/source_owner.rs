@@ -176,69 +176,68 @@ impl ConstantSourceOwner {
         use novarocks_type_contract::ValueSchemaScopeBeginFailure as Begin;
         let (count, payload) = Self::checked_receipts::<H>(field, metadata, work)?;
         let mut scopes = ConstantSourceCreationFacts::default();
-        let mut begin = |retained: bool| {
-            work.flush()?;
-            factory
-                .begin_scope_observed(&mut |layout| {
-                    let bytes = if retained {
-                        &mut scopes.retained_request_bytes
-                    } else {
-                        &mut scopes.temporary_request_bytes
-                    };
-                    *bytes = bytes
-                        .checked_add(layout.size())
-                        .ok_or(CompileControlError::ResourceExhausted)?;
-                    scopes.allocation_requests = scopes
-                        .allocation_requests
-                        .checked_add(1)
-                        .ok_or(CompileControlError::ResourceExhausted)?;
-                    admit(&scopes)
-                })
-                .map_err(|error| match error {
-                    Begin::Observer(error) => error,
-                    Begin::Creator(error) => ConstantCreationFailure::Creator(error),
-                })
+        let (mut temporary, mut retained) = {
+            let mut begin = |retained: bool| {
+                work.flush()?;
+                factory
+                    .begin_scope_observed(&mut |layout| {
+                        let bytes = if retained {
+                            &mut scopes.retained_request_bytes
+                        } else {
+                            &mut scopes.temporary_request_bytes
+                        };
+                        *bytes = bytes
+                            .checked_add(layout.size())
+                            .ok_or(CompileControlError::ResourceExhausted)?;
+                        scopes.allocation_requests = scopes
+                            .allocation_requests
+                            .checked_add(1)
+                            .ok_or(CompileControlError::ResourceExhausted)?;
+                        admit(&scopes)
+                    })
+                    .map_err(|error| match error {
+                        Begin::Observer(error) => error,
+                        Begin::Creator(error) => ConstantCreationFailure::Creator(error),
+                    })
+            };
+            (begin(false)?, begin(true)?)
         };
-        let mut temporary = begin(false)?;
-        let mut retained = begin(true)?;
-        // Do not keep the closure's mutable observation borrows while the
-        // original constructor publishes its independent receipt backing.
-        drop(begin);
         let scope_prefix = scopes;
         let mut completed = scope_prefix;
-        let mut observe = |facts: &ConstantSourceCreationFacts| {
-            completed = ConstantSourceCreationFacts {
-                temporary_request_bytes: scope_prefix
-                    .temporary_request_bytes
-                    .checked_add(facts.temporary_request_bytes)
-                    .ok_or(CompileControlError::ResourceExhausted)?,
-                retained_request_bytes: scope_prefix
-                    .retained_request_bytes
-                    .checked_add(facts.retained_request_bytes)
-                    .ok_or(CompileControlError::ResourceExhausted)?,
-                allocation_requests: scope_prefix
-                    .allocation_requests
-                    .checked_add(facts.allocation_requests)
-                    .ok_or(CompileControlError::ResourceExhausted)?,
+        let value = {
+            let mut observe = |facts: &ConstantSourceCreationFacts| {
+                completed = ConstantSourceCreationFacts {
+                    temporary_request_bytes: scope_prefix
+                        .temporary_request_bytes
+                        .checked_add(facts.temporary_request_bytes)
+                        .ok_or(CompileControlError::ResourceExhausted)?,
+                    retained_request_bytes: scope_prefix
+                        .retained_request_bytes
+                        .checked_add(facts.retained_request_bytes)
+                        .ok_or(CompileControlError::ResourceExhausted)?,
+                    allocation_requests: scope_prefix
+                        .allocation_requests
+                        .checked_add(facts.allocation_requests)
+                        .ok_or(CompileControlError::ResourceExhausted)?,
+                };
+                admit(&completed)
             };
-            admit(&completed)
+            Self::materialize_receipts(
+                field,
+                metadata,
+                original_source_bytes,
+                source_storage,
+                count,
+                payload,
+                &mut SourceCreation::Paired {
+                    temporary: &mut temporary,
+                    retained: &mut retained,
+                    admit: &mut observe,
+                    facts: ConstantSourceCreationFacts::default(),
+                },
+                work,
+            )?
         };
-        let value = Self::materialize_receipts(
-            field,
-            metadata,
-            original_source_bytes,
-            source_storage,
-            count,
-            payload,
-            &mut SourceCreation::Paired {
-                temporary: &mut temporary,
-                retained: &mut retained,
-                admit: &mut observe,
-                facts: ConstantSourceCreationFacts::default(),
-            },
-            work,
-        )?;
-        drop(observe);
         Ok((value, completed))
     }
     fn try_new_core<H>(
@@ -282,73 +281,73 @@ impl ConstantSourceOwner {
         let (count, payload) =
             Self::checked_root_receipts(roots.clone().map(|(field, _)| field), metadata, work)?;
         let mut scopes = ConstantSourceCreationFacts::default();
-        let mut begin = |retained: bool| {
-            work.flush()?;
-            factory
-                .begin_scope_observed(&mut |layout| {
-                    let bytes = if retained {
-                        &mut scopes.retained_request_bytes
-                    } else {
-                        &mut scopes.temporary_request_bytes
-                    };
-                    *bytes = bytes
-                        .checked_add(layout.size())
-                        .ok_or(CompileControlError::ResourceExhausted)?;
-                    scopes.allocation_requests = scopes
-                        .allocation_requests
-                        .checked_add(1)
-                        .ok_or(CompileControlError::ResourceExhausted)?;
-                    admit(&scopes)
-                })
-                .map_err(|error| match error {
-                    Begin::Observer(error) => error,
-                    Begin::Creator(error) => ConstantCreationFailure::Creator(error),
-                })
+        let (mut temporary, mut retained) = {
+            let mut begin = |retained: bool| {
+                work.flush()?;
+                factory
+                    .begin_scope_observed(&mut |layout| {
+                        let bytes = if retained {
+                            &mut scopes.retained_request_bytes
+                        } else {
+                            &mut scopes.temporary_request_bytes
+                        };
+                        *bytes = bytes
+                            .checked_add(layout.size())
+                            .ok_or(CompileControlError::ResourceExhausted)?;
+                        scopes.allocation_requests = scopes
+                            .allocation_requests
+                            .checked_add(1)
+                            .ok_or(CompileControlError::ResourceExhausted)?;
+                        admit(&scopes)
+                    })
+                    .map_err(|error| match error {
+                        Begin::Observer(error) => error,
+                        Begin::Creator(error) => ConstantCreationFailure::Creator(error),
+                    })
+            };
+            (begin(false)?, begin(true)?)
         };
-        let mut temporary = begin(false)?;
-        let mut retained = begin(true)?;
-        drop(begin);
         let prefix = scopes;
         let mut completed = prefix;
-        let mut observe = |facts: &ConstantSourceCreationFacts| {
-            completed = ConstantSourceCreationFacts {
-                temporary_request_bytes: prefix
-                    .temporary_request_bytes
-                    .checked_add(facts.temporary_request_bytes)
-                    .ok_or(CompileControlError::ResourceExhausted)?,
-                retained_request_bytes: prefix
-                    .retained_request_bytes
-                    .checked_add(facts.retained_request_bytes)
-                    .ok_or(CompileControlError::ResourceExhausted)?,
-                allocation_requests: prefix
-                    .allocation_requests
-                    .checked_add(facts.allocation_requests)
-                    .ok_or(CompileControlError::ResourceExhausted)?,
+        let namespace = {
+            let mut observe = |facts: &ConstantSourceCreationFacts| {
+                completed = ConstantSourceCreationFacts {
+                    temporary_request_bytes: prefix
+                        .temporary_request_bytes
+                        .checked_add(facts.temporary_request_bytes)
+                        .ok_or(CompileControlError::ResourceExhausted)?,
+                    retained_request_bytes: prefix
+                        .retained_request_bytes
+                        .checked_add(facts.retained_request_bytes)
+                        .ok_or(CompileControlError::ResourceExhausted)?,
+                    allocation_requests: prefix
+                        .allocation_requests
+                        .checked_add(facts.allocation_requests)
+                        .ok_or(CompileControlError::ResourceExhausted)?,
+                };
+                admit(&completed)
             };
-            admit(&completed)
+            let mut creation = SourceCreation::Paired {
+                temporary: &mut temporary,
+                retained: &mut retained,
+                admit: &mut observe,
+                facts: ConstantSourceCreationFacts::default(),
+            };
+            let namespace = Self::materialize_root_receipts(
+                roots.clone().map(|(field, _)| field),
+                metadata,
+                count,
+                payload,
+                &mut creation,
+                work,
+            )?;
+            let storage = creation.storage().retaining_flat_observed(
+                roots.map(|(_, storage)| Ok(storage)),
+                |layout| creation.request(layout, true),
+                work,
+            )?;
+            namespace.with_storage_lifetime(storage)
         };
-        let mut creation = SourceCreation::Paired {
-            temporary: &mut temporary,
-            retained: &mut retained,
-            admit: &mut observe,
-            facts: ConstantSourceCreationFacts::default(),
-        };
-        let namespace = Self::materialize_root_receipts(
-            roots.clone().map(|(field, _)| field),
-            metadata,
-            count,
-            payload,
-            &mut creation,
-            work,
-        )?;
-        let storage = creation.storage().retaining_flat_observed(
-            roots.map(|(_, storage)| Ok(storage)),
-            |layout| creation.request(layout, true),
-            work,
-        )?;
-        let namespace = namespace.with_storage_lifetime(storage);
-        drop(creation);
-        drop(observe);
         Ok((namespace, completed))
     }
     fn checked_receipts<H>(

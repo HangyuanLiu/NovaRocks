@@ -455,18 +455,18 @@ impl BuiltinAggregateResolver {
         {
             return Err(FunctionBindingError::NoMatchingOverload);
         }
-        if let Some(overload) = selected {
-            if !builtin_identity_matches(
+        if let Some(overload) = selected
+            && !builtin_identity_matches(
                 overload.as_str(),
                 "builtin.aggregate/",
                 name,
                 "/derived-v1",
                 work,
-            )? {
-                return Err(FunctionBindingError::InvalidBinding(
-                    "builtin aggregate references a foreign overload".into(),
-                ));
-            }
+            )?
+        {
+            return Err(FunctionBindingError::InvalidBinding(
+                "builtin aggregate references a foreign overload".into(),
+            ));
         }
         if matches!(
             name,
@@ -2315,8 +2315,8 @@ fn dynamic_scalar_data_type_with_construction<E>(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             creation.arc_slice::<Arc<arrow_schema::Field>>(fields.len())?;
-            let result = DataType::Struct(fields.into());
-            result
+
+            DataType::Struct(fields.into())
         }
         "null_or_empty" => DataType::Boolean,
         "row" | "struct" => {
@@ -2330,8 +2330,8 @@ fn dynamic_scalar_data_type_with_construction<E>(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             creation.arc_slice::<Arc<arrow_schema::Field>>(fields.len())?;
-            let result = DataType::Struct(fields.into());
-            result
+
+            DataType::Struct(fields.into())
         }
         "str_to_map" => map_type_with_construction(DataType::Utf8, DataType::Utf8, creation)?,
         "try_variant_get" | "variant_get" => DataType::LargeBinary,
@@ -2587,7 +2587,7 @@ fn bind_dynamic_scalar_result_with_creation<H>(
                 cx.array::<Arc<arrow_schema::Field>>(request.arguments.len() / 2)
             })?;
             let mut fields = Vec::with_capacity(request.arguments.len() / 2);
-            for pair in request.arguments.chunks_exact(2) {
+            for pair in request.arguments.as_chunks::<2>().0 {
                 work.step()?;
                 let Some(field_name) = utf8_constant(pair.first(), work)? else {
                     return Err(FunctionBindingError::NoMatchingOverload.into());
@@ -2929,7 +2929,9 @@ fn bind_dynamic_scalar_result_with_creation<H>(
                 })?;
                 request
                     .arguments
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| {
                         work.step()?;
                         let name = utf8_constant(pair.first(), work)?
@@ -5826,13 +5828,6 @@ fn nullable_arguments(
     Ok(all)
 }
 
-fn dynamic_values<'a>(
-    request: FunctionBindingRequest<'a>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<Vec<&'a FunctionValueType>, FunctionBindingError> {
-    dynamic_values_with_creation::<std::convert::Infallible>(request, work, None)
-        .map_err(FunctionBindingCreationFailure::into_pure)
-}
 fn dynamic_values_with_creation<'a, H>(
     request: FunctionBindingRequest<'a>,
     work: &mut CompileCheckpoints<'_>,

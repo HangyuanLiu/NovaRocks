@@ -456,7 +456,7 @@ fn failure(program: &Arc<LocalProgram>) -> ExecutionFailure {
         .join()
         .expect_err("a failing Values cell fails the fragment");
     assert!(
-        output.take_chunks().iter().all(|chunk| chunk.len() == 0),
+        output.take_chunks().iter().all(|chunk| chunk.is_empty()),
         "no Values row is published before every cell succeeded"
     );
     failure
@@ -607,7 +607,7 @@ fn values_nested_mixed_cells_materialize_original_order_nulls_and_exact_list_fie
             vec![Cell::Cast(1, 1)],
         ],
         pools,
-        &[ty.clone()],
+        std::slice::from_ref(&ty),
     );
     let tracker =
         crate::runtime::mem_tracker::MemTracker::new_root("nested Values actual construction");

@@ -117,6 +117,26 @@ impl fmt::Debug for FoundationDbClientConfig {
     }
 }
 
+fn validate_readable_file(path: &Path, name: &str) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        bail!("InvalidStateStoreConfig: {name} must not be empty");
+    }
+    let path_text = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("InvalidStateStoreConfig: {name} must be valid UTF-8"))?;
+    if path_text.contains('\0') {
+        bail!("InvalidStateStoreConfig: {name} must not contain NUL");
+    }
+    let metadata = std::fs::metadata(path)
+        .map_err(|_| anyhow::anyhow!("InvalidStateStoreConfig: {name} must exist"))?;
+    if !metadata.is_file() {
+        bail!("InvalidStateStoreConfig: {name} must be a regular file");
+    }
+    File::open(path)
+        .map_err(|_| anyhow::anyhow!("InvalidStateStoreConfig: {name} must be readable"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::FoundationDbClientConfig;
@@ -186,24 +206,4 @@ mod tests {
 
         assert!(!error.to_string().contains(canary));
     }
-}
-
-fn validate_readable_file(path: &Path, name: &str) -> Result<()> {
-    if path.as_os_str().is_empty() {
-        bail!("InvalidStateStoreConfig: {name} must not be empty");
-    }
-    let path_text = path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("InvalidStateStoreConfig: {name} must be valid UTF-8"))?;
-    if path_text.contains('\0') {
-        bail!("InvalidStateStoreConfig: {name} must not contain NUL");
-    }
-    let metadata = std::fs::metadata(path)
-        .map_err(|_| anyhow::anyhow!("InvalidStateStoreConfig: {name} must exist"))?;
-    if !metadata.is_file() {
-        bail!("InvalidStateStoreConfig: {name} must be a regular file");
-    }
-    File::open(path)
-        .map_err(|_| anyhow::anyhow!("InvalidStateStoreConfig: {name} must be readable"))?;
-    Ok(())
 }

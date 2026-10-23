@@ -221,7 +221,7 @@ fn original_full_lambda_and_nested_typed_null_retain_fields_and_nominal_types() 
     let pool = ConstantPool::try_new(
         Arc::new(nested.try_to_field("request.null").unwrap()),
         nested.clone(),
-        new_null_array(&nested.data_type(), 2).to_data(),
+        new_null_array(nested.data_type(), 2).to_data(),
         policy(),
         PHASE,
         &Control::default(),

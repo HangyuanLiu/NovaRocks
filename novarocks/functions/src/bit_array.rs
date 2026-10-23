@@ -163,10 +163,7 @@ pub fn shift_values_observed<T, C: ShiftCount, E>(
     observe(BitArrayObservation::OpaqueBoundary)?;
     for (ordinal, row) in selection.iter().enumerate() {
         observe(BitArrayObservation::Step)?;
-        out.push(match read_pair(ordinal, row)? {
-            Some((value, count)) => Some(func(value, count.wrapping_u32())),
-            None => None,
-        });
+        out.push(read_pair(ordinal, row)?.map(|(value, count)| func(value, count.wrapping_u32())));
     }
     Ok(out)
 }

@@ -578,11 +578,11 @@ impl IcebergWriteAdmission for OperationState {
             .mark_written(object)
     }
     fn record_exit_failure(&self, object: &ObjectIdentity, failure: StreamExitFailure) {
-        if let Ok(mut failures) = self.exit_failures.lock() {
-            if !matches!(failure, StreamExitFailure::Unconfirmed) || !failures.contains_key(object)
-            {
-                failures.insert(object.clone(), failure);
-            }
+        if let Ok(mut failures) = self.exit_failures.lock()
+            && (!matches!(failure, StreamExitFailure::Unconfirmed)
+                || !failures.contains_key(object))
+        {
+            failures.insert(object.clone(), failure);
         }
     }
     async fn io_permit(&self) -> Result<OwnedSemaphorePermit> {

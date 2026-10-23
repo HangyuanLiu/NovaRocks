@@ -153,6 +153,7 @@ fn input_contribution(
     }
 }
 impl<'source, 'control, const N: usize> SourceInputPrefix<'source, 'control, N> {
+    #[cfg(test)]
     pub(crate) fn new_in(
         requests: [SourceInputReserve<'source>; N],
         budget: &mut TypeViewBudget<'source, 'control, '_>,
@@ -188,6 +189,7 @@ impl<'source, 'control, const N: usize> SourceInputPrefix<'source, 'control, N> 
         }
         budget.require_collection_floor(self.floor)
     }
+    #[cfg(test)]
     pub(crate) fn extend_in(
         &mut self,
         requests: [SourceInputReserve<'source>; N],
@@ -510,6 +512,7 @@ pub(crate) struct PackageTypeViews<'source> {
     writer_roots: Vec<WriterRoots<'source>>,
 }
 impl<'source> PackageTypeViews<'source> {
+    #[cfg(test)]
     pub(crate) fn occurrences(&self) -> &[TypeOccurrenceRow<'source>] {
         &self.occurrences
     }
@@ -804,7 +807,7 @@ impl<'source> PackageTypeSourceSink<'source, TypeViewError> for Capture<'source,
                 });
                 self.next_field_id = add(self.next_field_id, 1)?;
             }
-            PackageTypeSource::Carrier(_) => {
+            PackageTypeSource::Carrier => {
                 let previous =
                     self.views
                         .occurrences
@@ -833,8 +836,16 @@ impl<'source> PackageTypeSourceSink<'source, TypeViewError> for Capture<'source,
                 self.budget.reserve(&mut self.views.occurrences, work)?;
             }
             PackageTypeSource::WriterField {
-                recipe, binding, ..
+                recipe,
+                role,
+                ordinal,
+                binding,
             } => {
+                if occurrence.channel != (PackageTypeChannel::WriterField { role, ordinal }) {
+                    return Err(TypeViewError::InvalidSource(
+                        "writer field coordinates differ from its type occurrence",
+                    ));
+                }
                 let PackageTypeOwner::Recipe(node) = occurrence.owner else {
                     return Err(TypeViewError::InvalidSource(
                         "writer field has no original recipe owner",

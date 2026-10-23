@@ -27,12 +27,7 @@ use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
 use super::admission::{CatalogAdmissionTarget, CatalogOperation};
 use super::delegate::CatalogDelegate;
 use super::error::{CatalogOutcome, CatalogUnsupported};
-use super::{
-    CatalogCreateIntent, CatalogNamespaceName, CatalogTableName, ConditionalCreateEvidence,
-    ConditionalCreateVerdict, NovaRocksCatalog,
-};
-#[cfg(test)]
-use super::{ConditionalCreateAttempt, ConditionalCreateReceipt, ConditionalCreateRequest};
+use super::{CatalogNamespaceName, CatalogTableName, NovaRocksCatalog};
 
 /// A Hive Metastore Iceberg catalog.
 ///
@@ -319,44 +314,5 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         CatalogOutcome::Unsupported(
             self.refuse_operation(CatalogOperation::AnchorWrittenMetadata, _table),
         )
-    }
-
-    #[cfg(test)]
-
-    async fn prepare_conditional_create(
-        &self,
-        _request: ConditionalCreateRequest,
-    ) -> CatalogOutcome<ConditionalCreateAttempt> {
-        CatalogOutcome::Unsupported(self.refuse_operation(
-            CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable),
-            CatalogTableName::new(
-                Arc::clone(&_request.namespace.namespace),
-                _request.creation.name,
-            ),
-        ))
-    }
-
-    #[cfg(test)]
-
-    async fn publish_conditional_create(
-        &self,
-        _attempt: ConditionalCreateAttempt,
-    ) -> CatalogOutcome<ConditionalCreateReceipt> {
-        CatalogOutcome::Unsupported(self.refuse_operation(
-            CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable),
-            _attempt.target,
-        ))
-    }
-
-    async fn adjudicate_conditional_create(
-        &self,
-        _evidence: ConditionalCreateEvidence,
-    ) -> Result<ConditionalCreateVerdict, ConnectorError> {
-        Err(crate::catalog::admission::connector_unsupported(
-            self.refuse_operation(
-                CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable),
-                CatalogTableName::new(_evidence.namespace, _evidence.table),
-            ),
-        ))
     }
 }

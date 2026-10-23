@@ -95,7 +95,7 @@ use crate::{
     FinalTaskInfoOutcome, OperationReceipt, QueryContextHost, QueryContextOutcome,
     QuiesceQueryContextOutcome, ReleaseAcknowledgement, ReleaseQueryContextOutcome,
     ReleasedContextEvidence, RootResultBinding, RootResultRoute, RunnableTask, SharedFactsRequest,
-    StatusAdvance, TaskDomains, TaskExecutionHost, TaskExecutionRegistryConfig, TaskStatusOwner,
+    TaskDomains, TaskExecutionHost, TaskExecutionRegistryConfig, TaskStatusOwner,
     TaskStatusReporter, TaskStatusSource, UpdateTaskOutcome, WorkerAdmissionEpochAuthority,
     apply_planned_task_domain_updates, apply_task_domain_updates,
     commit_task_domain_execution_updates, plan_task_domain_execution_updates,
@@ -4794,16 +4794,16 @@ impl CreationTransaction<'_> {
                 // observers. Accepted tasks already have a source fact and
                 // retain it until their physical convergence is observed.
                 entry.source.withhold(self.identity);
-            } else if !closed {
-                if !novarocks_execution::runtime::task_control::TaskExecutionPort::is_stopped(
+            } else if !closed
+                && !novarocks_execution::runtime::task_control::TaskExecutionPort::is_stopped(
                     status.as_ref(),
-                ) {
-                    let (_, publication) = status.prepare_installed();
-                    installed_publication = Some(publication);
-                }
-                // The exact Installed snapshot and Live record are installed
-                // under this fence. Its detached notification is foreign work.
+                )
+            {
+                let (_, publication) = status.prepare_installed();
+                installed_publication = Some(publication);
             }
+            // The exact Installed snapshot and Live record are installed
+            // under this fence. Its detached notification is foreign work.
         }
         if let Some(publication) = installed_publication {
             publication.publish();

@@ -2799,7 +2799,7 @@ fn a_document_publication_prepares_exact_keyed_records_closure_and_session_marke
     );
     assert_eq!(
         updates
-            .get(&"novarocks.doc.v2.root.novarocks.test".to_string())
+            .get("novarocks.doc.v2.root.novarocks.test")
             .map(|v| v.as_str()),
         Some(binding.identity().to_hex().as_str())
     );
@@ -3531,8 +3531,7 @@ fn real_begin_rejects_storage_i32_forgery_even_when_statistics_are_disabled() {
 }
 
 // Reuse the catalog and filesystem tripwires used by document admission tests.
-#[path = "../../document_storage/tests/admission_support.rs"]
-mod owner_admission_support;
+use crate::document_storage::admission_support as owner_admission_support;
 
 fn refusing_write_runtime(
     kind: &str,

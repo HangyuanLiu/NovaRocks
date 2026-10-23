@@ -16,8 +16,10 @@
 // under the License.
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Read, Write};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// A live, bounded test observation supplied by the exact application owner.
@@ -45,7 +47,7 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 
-use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label, retag_column};
+use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::observable::Observable;
@@ -274,6 +276,7 @@ impl ExchangeWireMeta {
     }
 }
 
+#[cfg(test)]
 struct DecodedExchangePayload<'a> {
     wire_meta: Option<ExchangeWireMeta>,
     arrow_payload: &'a [u8],
@@ -601,10 +604,6 @@ impl ExecutionExchangeRegistry {
         self.push_chunks_with_stats(key, sender, chunks, eos, 0, 0);
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Exchange transport accounting remains explicit at the receive boundary."
-    )]
     pub fn push_chunks_with_stats(
         &self,
         key: ExchangeKey,
@@ -1160,6 +1159,10 @@ impl BoundedExchangePayload {
         self.bytes.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
     pub const fn retained_bytes(&self) -> usize {
         self.retained_bytes
     }
@@ -1253,8 +1256,10 @@ impl<'a> BorrowedExchangeWireMeta<'a> {
     }
     fn ids(self) -> impl Iterator<Item = SlotId> + 'a {
         self.words
-            .chunks_exact(4)
-            .map(|word| SlotId::new(u32::from_le_bytes([word[0], word[1], word[2], word[3]])))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| SlotId::new(u32::from_le_bytes(*word)))
     }
     fn matches(
         self,
@@ -1406,6 +1411,7 @@ fn borrow_exchange_payload_envelope(
     })
 }
 
+#[cfg(test)]
 fn decode_exchange_payload_envelope(
     bytes: &[u8],
 ) -> Result<DecodedExchangePayload<'_>, ExchangeFailure> {
@@ -1436,7 +1442,7 @@ fn normalize_exchange_array_for_field(
 fn check_exchange_data_type(
     expected: &arrow::datatypes::DataType,
     actual: &arrow::datatypes::DataType,
-    root_label: &str,
+    _root_label: &str,
 ) -> Result<(), ExchangeFailure> {
     check_exact(expected, actual).map_err(Into::into)
 }
@@ -1517,15 +1523,6 @@ fn validate_exchange_dictionary_batch(batch: &RecordBatch) -> Result<(), Exchang
     Ok(())
 }
 
-fn is_exchange_dictionary_carrier_for_expected(expected: &DataType, actual: &DataType) -> bool {
-    match (expected, actual) {
-        (DataType::Utf8 | DataType::LargeUtf8, DataType::Dictionary(key_type, value_type)) => {
-            key_type.as_ref() == &DataType::Int32 && value_type.as_ref() == expected
-        }
-        _ => false,
-    }
-}
-
 fn encode_arrow_ipc_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, ExchangeFailure> {
     let mut buffer = Vec::new();
     encode_arrow_ipc_chunks_to(chunks, &mut buffer)?;
@@ -1576,6 +1573,7 @@ fn encode_arrow_ipc_chunks_to<W: std::io::Write>(
     Ok(())
 }
 
+#[cfg(test)]
 fn decode_arrow_ipc_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>, ExchangeFailure> {
     if bytes.is_empty() {
         return Ok(vec![]);
@@ -1618,6 +1616,7 @@ fn build_zero_column_marker_batch(row_count: usize) -> Result<RecordBatch, Excha
         .map_err(|source| failure::arrow(failure::ArrowOperation::Construct, source))
 }
 
+#[cfg(test)]
 fn restore_zero_column_batch_if_needed(
     batch: RecordBatch,
     wire_meta: &ExchangeWireMeta,
@@ -1635,6 +1634,7 @@ fn restore_zero_column_batch_if_needed(
         .map_err(|source| failure::arrow(failure::ArrowOperation::Construct, source))
 }
 
+#[cfg(test)]
 fn chunk_from_exchange_batch(
     batch: RecordBatch,
     chunk_schema: ChunkSchemaRef,
@@ -1645,10 +1645,12 @@ fn chunk_from_exchange_batch(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DecodeCarrierContract {
     Exchange,
+    #[cfg(test)]
     RootResult,
 }
 
 enum ExchangeHeaderCreation<'a> {
+    #[cfg(test)]
     Runtime(&'a dyn crate::exec::pipeline::operator::InputConstructionOwner),
     RuntimeWithSource {
         owner: &'a dyn crate::exec::pipeline::operator::InputConstructionOwner,
@@ -1660,6 +1662,7 @@ enum ExchangeHeaderCreation<'a> {
 impl ExchangeHeaderCreation<'_> {
     fn storage(&self) -> novarocks_type_contract::ValueTypeStorageLifetime {
         match self {
+            #[cfg(test)]
             Self::Runtime(owner) => owner.storage_lifetime(),
             Self::RuntimeWithSource { storage, .. } => storage.clone(),
             #[cfg(test)]
@@ -1668,9 +1671,9 @@ impl ExchangeHeaderCreation<'_> {
     }
     fn request(&self, layout: std::alloc::Layout) -> Result<(), ExchangeFailure> {
         match self {
-            Self::Runtime(owner) | Self::RuntimeWithSource { owner, .. } => {
-                owner.request(layout).map_err(Into::into)
-            }
+            #[cfg(test)]
+            Self::Runtime(owner) => owner.request(layout).map_err(Into::into),
+            Self::RuntimeWithSource { owner, .. } => owner.request(layout).map_err(Into::into),
             #[cfg(test)]
             Self::PureInspection => {
                 let _ = layout;
@@ -1684,7 +1687,9 @@ impl ExchangeHeaderCreation<'_> {
         step: crate::exec::chunk::ArrayNormalizationStep<'_>,
     ) -> Result<(), ExchangeFailure> {
         match self {
-            Self::Runtime(owner) | Self::RuntimeWithSource { owner, .. } => {
+            #[cfg(test)]
+            Self::Runtime(owner) => owner.observe(ordinal, &[], step).map_err(Into::into),
+            Self::RuntimeWithSource { owner, .. } => {
                 owner.observe(ordinal, &[], step).map_err(Into::into)
             }
             #[cfg(test)]
@@ -1938,7 +1943,7 @@ fn build_zero_column_marker_batch_for_schema_with_creation(
         control,
     )
     .map_err(|cause| -> crate::runtime::fragment::ExecutionFailure {
-        use novarocks_functions::selected_copy::{CopyConstructionError, CopyError};
+        use novarocks_functions::selected_copy::CopyConstructionError;
         match cause {
             CopyConstructionError::Creator(cause) => cause.into(),
             CopyConstructionError::Resource(cause) => ConstructionFailure::Resource(cause).into(),
@@ -2785,11 +2790,20 @@ mod tests {
         let expected = encode_chunks(std::slice::from_ref(&chunk), true).expect("encode payload");
         let packet_cap = expected.len() + 1024;
         let encoded = encode_chunks_bounded(&[chunk], true, packet_cap).expect("bounded encode");
+        assert!(!encoded.is_empty());
         let (payload, retained_bytes) = encoded.into_parts();
 
         assert_eq!(payload.as_ref(), expected.as_slice());
         assert!(retained_bytes >= payload.len());
         assert!(retained_bytes <= packet_cap);
+    }
+
+    #[test]
+    fn bounded_encode_reports_empty_payload() {
+        let encoded = encode_chunks_bounded(&[], true, 0).expect("empty bounded encode");
+
+        assert!(encoded.is_empty());
+        assert_eq!(encoded.retained_bytes(), 0);
     }
 
     #[test]
@@ -2914,7 +2928,7 @@ mod tests {
         )
         .expect("compressed stream writer");
         writer
-            .write(&chunk.record_batch())
+            .write(chunk.record_batch())
             .expect("compressed batch");
         writer.finish().expect("finish compressed stream");
         let wire_meta = ExchangeWireMeta::from_chunks(std::slice::from_ref(&chunk))
@@ -3205,19 +3219,6 @@ mod tests {
                 _ => unreachable!(),
             };
             Field::new("root", data_type, true)
-        }
-        fn schema(field: Field, slot: u32) -> ChunkSchemaRef {
-            Arc::new(
-                crate::exec::chunk::ChunkSchema::try_new(vec![
-                    crate::exec::chunk::ChunkSlotSchema::new_with_field(
-                        SlotId::new(slot),
-                        field,
-                        None,
-                        None,
-                    ),
-                ])
-                .unwrap(),
-            )
         }
         for kind in 0..5 {
             let declared = nested(

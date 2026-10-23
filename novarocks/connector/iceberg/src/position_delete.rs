@@ -418,7 +418,7 @@ mod tests {
             .to_le_bytes()
             .to_vec();
         let mut flags = vec![255; containers.div_ceil(8)];
-        if containers % 8 != 0 {
+        if !containers.is_multiple_of(8) {
             *flags.last_mut().unwrap() = (1u8 << (containers % 8)) - 1;
         }
         out.extend_from_slice(&flags);
@@ -888,7 +888,7 @@ mod tests {
         };
 
         let deleted = load_position_deletes_with_context(
-            &[spec.clone()],
+            std::slice::from_ref(&spec),
             "/data/a.parquet",
             &access,
             &context,

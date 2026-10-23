@@ -227,7 +227,7 @@ impl Scenario for SameProducerNormalClose {
             let a = &sessions[0];
             let b = &sessions[1];
             let p = &sessions[2];
-            let producer_base = RawCreate::values(&p, 3);
+            let producer_base = RawCreate::values(p, 3);
             let producer_identity = proto::TaskIdentity {
                 query_execution_id: producer_base.context.query_execution_id,
                 stage_id: 2,
@@ -239,7 +239,7 @@ impl Scenario for SameProducerNormalClose {
                 lo: producer_base.kernel_key_low,
             };
             let receiver_a = receiver(
-                &a,
+                a,
                 1,
                 false,
                 &producer_identity,
@@ -247,7 +247,7 @@ impl Scenario for SameProducerNormalClose {
                 self.multicast,
             )?;
             let receiver_b = receiver(
-                &b,
+                b,
                 2,
                 true,
                 &producer_identity,
@@ -266,12 +266,12 @@ impl Scenario for SameProducerNormalClose {
             // Submit the actual multicast package first so an unsupported sink
             // is reported by the compiler, rather than a fabricated verdict.
             if self.multicast {
-                producer.accept_and_await_installed(context, &p)?;
+                producer.accept_and_await_installed(context, p)?;
             }
-            receiver_a.accept_and_await_installed(context, &a)?;
-            receiver_b.accept_and_await_installed(context, &b)?;
+            receiver_a.accept_and_await_installed(context, a)?;
+            receiver_b.accept_and_await_installed(context, b)?;
             if !self.multicast {
-                producer.accept_and_await_installed(context, &p)?;
+                producer.accept_and_await_installed(context, p)?;
             }
             context.action(format!(
                 "froze attempt={:?} P={:?} finst={producer_finst:?} A={:?} B={:?}; P Installed with edges Closed; multicast={}",
@@ -283,7 +283,7 @@ impl Scenario for SameProducerNormalClose {
                 "frozen P edge 1 -> exact A and B; both destinations use the same P source finst and sender ordinal 0/count 1"
             });
             let cancel = session_control(
-                &a,
+                a,
                 proto::task_control_operation::Control::CancelTask(proto::CancelTaskRequest {
                     identity: Some(receiver_a.identity.clone()),
                     reason: proto::TaskCancelReason::UpstreamNoLongerNeeded as i32,
@@ -300,7 +300,7 @@ impl Scenario for SameProducerNormalClose {
             // is an explicit test authority, not a business unknown-A source.
             observe_task_terminal_and_stopped(
                 context,
-                &a,
+                a,
                 &receiver_a.identity,
                 proto::TaskState::Canceled,
             )?;
@@ -331,21 +331,21 @@ impl Scenario for SameProducerNormalClose {
                 ),
                 "producer open failed: {open:?}"
             );
-            let rows = fetch_rows(context, &b, &receiver_b.identity)?;
+            let rows = fetch_rows(context, b, &receiver_b.identity)?;
             ensure!(
                 rows == ROWS,
                 "B lost or changed rows after A closed: {rows:?}"
             );
-            await_normal_close_marker(context, &p, &receiver_a, &producer)?;
+            await_normal_close_marker(context, p, &receiver_a, &producer)?;
             observe_task_terminal_and_stopped(
                 context,
-                &b,
+                b,
                 &receiver_b.identity,
                 proto::TaskState::Finished,
             )?;
             observe_task_terminal_and_stopped(
                 context,
-                &p,
+                p,
                 &producer.identity,
                 proto::TaskState::Finished,
             )?;

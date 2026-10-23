@@ -99,6 +99,9 @@ const PAIMON_FILESYSTEM_BINDING: &str = "filesystem";
 const MAX_PRIVATE_READ_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PRIVATE_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 
+type FrozenReadSlot = Arc<OnceLock<Result<Arc<PaimonFrozenRead>, ConnectorError>>>;
+type FrozenReadCache = HashMap<(CatalogHandle, SchemaTableName), FrozenReadSlot>;
+
 /// Server-owned authorization hook. Implementations resolve one exact role,
 /// catalog generation and admitted request into a warehouse-bounded FileIO.
 /// The provider has no environment, global credential or storage fallback.
@@ -146,12 +149,7 @@ impl PaimonAsyncRuntime {
 
 #[derive(Default)]
 struct PaimonRequestCache {
-    frozen: Mutex<
-        HashMap<
-            (CatalogHandle, SchemaTableName),
-            Arc<OnceLock<Result<Arc<PaimonFrozenRead>, ConnectorError>>>,
-        >,
-    >,
+    frozen: Mutex<FrozenReadCache>,
 }
 
 impl PaimonRequestCache {
@@ -366,7 +364,6 @@ impl ProviderReadMetadata for PaimonReadRuntime {
         Ok(recipe
             .columns()
             .iter()
-            .cloned()
             .map(|column| ProviderReadColumnBinding::new(column.name(), column.clone(), false))
             .collect())
     }
@@ -1113,7 +1110,6 @@ impl ProviderReadPageSourceProvider<PaimonReadRuntime> for PaimonExecutionPageSo
     /// validates and registers frozen facts; its first poll loads the exact
     /// schema and opens the SDK stream, awaited through the split's own
     /// operations, without parking a thread.
-    #[allow(clippy::too_many_arguments)]
     fn create_page_stream(
         &self,
         _session: &ConnectorSession,
@@ -1546,12 +1542,12 @@ impl ConnectorReadWireDecoder for PaimonConnectorReadWireAdapter {
         let view = self.decode_private(
             relation.view(),
             ConnectorCodecCategory::ReadView,
-            |payload, context| decode_read_view(payload, context),
+            decode_read_view,
         )?;
         let table = self.decode_private(
             relation.table(),
             ConnectorCodecCategory::ReadTable,
-            |payload, context| decode_table(payload, context),
+            decode_table,
         )?;
         let bound = PaimonBoundTable::decoded(table, view.clone()).map_err(|error| {
             self.inconsistent(
@@ -1570,11 +1566,8 @@ impl ConnectorReadWireDecoder for PaimonConnectorReadWireAdapter {
         &self,
         column: &ConnectorEncodedPayload,
     ) -> Result<ConnectorReadColumnHandle, ConnectorCodecError> {
-        let value = self.decode_private(
-            column,
-            ConnectorCodecCategory::ReadColumn,
-            |payload, context| decode_column(payload, context),
-        )?;
+        let value =
+            self.decode_private(column, ConnectorCodecCategory::ReadColumn, decode_column)?;
         Ok(self.adapter.wrap_column(value))
     }
 
@@ -1585,7 +1578,7 @@ impl ConnectorReadWireDecoder for PaimonConnectorReadWireAdapter {
         let value = self.decode_private(
             transaction,
             ConnectorCodecCategory::ReadView,
-            |payload, context| decode_read_view(payload, context),
+            decode_read_view,
         )?;
         Ok(self.adapter.wrap_transaction(Some(value)))
     }

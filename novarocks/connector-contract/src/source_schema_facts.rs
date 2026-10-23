@@ -49,7 +49,7 @@ fn arc_layout<T>() -> Result<Layout, ConnectorError> {
 #[derive(Clone, Debug)]
 pub struct ConnectorSourceSchemaShape {
     schema: Arc<Schema>,
-    storage: ValueTypeStorageLifetime,
+    _storage: ValueTypeStorageLifetime,
 }
 impl ConnectorSourceSchemaShape {
     /// The caller has already covered the supplied Schema and each Field.
@@ -66,7 +66,10 @@ impl ConnectorSourceSchemaShape {
         mut work: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<Self, E> {
         validate_empty_metadata_shape(&schema, &mut work)?;
-        Ok(Self { schema, storage })
+        Ok(Self {
+            schema,
+            _storage: storage,
+        })
     }
     pub fn schema(&self) -> &Schema {
         &self.schema
@@ -577,12 +580,12 @@ fn validate_empty_metadata_shape<E: From<ConnectorError>>(
             &mut scratch,
             |visit| {
                 work(1).map_err(ShapeFailure::Caller)?;
-                if let ValueTypeVisit::Field(field) = visit {
-                    if !field.metadata().is_empty() {
-                        return Err(ShapeFailure::Source(invalid(
-                            "source/execution nested shape field retains generic attributes",
-                        )));
-                    }
+                if let ValueTypeVisit::Field(field) = visit
+                    && !field.metadata().is_empty()
+                {
+                    return Err(ShapeFailure::Source(invalid(
+                        "source/execution nested shape field retains generic attributes",
+                    )));
                 }
                 Ok(())
             },

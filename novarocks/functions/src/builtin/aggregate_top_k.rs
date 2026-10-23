@@ -28,7 +28,7 @@ use crate::scalar_output_operation;
 use crate::scalar_output_resources::ScalarOutputResources;
 use crate::*;
 use allocator_api2::vec::Vec as HostVec;
-use arrow_array::{Array, ArrayRef, BinaryArray, builder::BinaryBuilder};
+use arrow_array::{Array, ArrayRef, BinaryArray};
 use arrow_schema::DataType;
 use novarocks_type_contract::CompileCheckpoints;
 use std::sync::Arc;
@@ -262,7 +262,7 @@ fn topk_error(origin: KernelFailure, sink: &mut FailureSink<'_, '_>) -> Evaluati
         EvaluationFailure::Kernel(diagnostic) => {
             KernelFailure::from_domain(TopKDiagnosticFailure {
                 origin,
-                diagnostic,
+                _diagnostic: diagnostic,
                 phase,
             })
             .into()
@@ -272,7 +272,7 @@ fn topk_error(origin: KernelFailure, sink: &mut FailureSink<'_, '_>) -> Evaluati
 #[derive(Debug)]
 struct TopKDiagnosticFailure {
     origin: KernelFailure,
-    diagnostic: KernelFailure,
+    _diagnostic: KernelFailure,
     phase: AggregateInvocationPhase,
 }
 impl std::fmt::Display for TopKDiagnosticFailure {
@@ -546,24 +546,23 @@ impl PreparedAggregateKernel for TopKKernel {
                 .clone()
                 .ok_or_else(|| invalid("approx_top_k update requires its actual host allocator"))?;
             let (allocator, mapping) = mapped_domain(mapping, input.selection(), host, work)?;
-            if input.logical_arguments().len() == 1 {
-                if let Some(recipe) =
+            if input.logical_arguments().len() == 1
+                && let Some(recipe) =
                     core::update_input_failure(input.logical_arguments()[0].array())
-                {
-                    return Err(topk_error(
-                        KernelFailure::from_domain(recipe),
-                        &mut FailureSink {
-                            allocator: &allocator,
-                            domain: FailureDomain::Mutation {
-                                contract: &self.contract,
-                                phase: AggregateInvocationPhase::Update,
-                                selection: input.selection(),
-                                mapping: &mapping,
-                            },
-                            control,
+            {
+                return Err(topk_error(
+                    KernelFailure::from_domain(recipe),
+                    &mut FailureSink {
+                        allocator: &allocator,
+                        domain: FailureDomain::Mutation {
+                            contract: &self.contract,
+                            phase: AggregateInvocationPhase::Update,
+                            selection: input.selection(),
+                            mapping: &mapping,
                         },
-                    ));
-                }
+                        control,
+                    },
+                ));
             }
             Ok(TopKUpdate {
                 input,

@@ -462,7 +462,7 @@ pub(crate) fn validate_runtime_filter_shape(
                 "ordered runtime-filter key has Null type",
             ));
         }
-        if !comparator.supports_order_key(&key.ty.data_type()) {
+        if !comparator.supports_order_key(key.ty.data_type()) {
             errors.push(ValidationError::new(
                 path,
                 "ordered runtime-filter key type is unsupported by its comparison algorithm",
@@ -1570,10 +1570,6 @@ pub(crate) fn validate_runtime_filter_consumer_lineage(
 /// Recheck every locally addressable lineage segment using the whole-plan
 /// rules. Cross-fragment connectivity is FE-owned; no executable peer graph
 /// is materialized to reconstruct it here.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "local boundary indexes and diagnostics share one validation walk"
-)]
 pub(crate) fn validate_local_runtime_filter_consumer_lineage(
     fragment: &Fragment,
     inbound: &BTreeMap<EdgeId, &crate::InboundFragmentCut>,
@@ -1636,10 +1632,6 @@ pub(crate) fn validate_local_runtime_filter_consumer_lineage(
 /// State changes between local and remote only at an exact exchange mapping.
 /// Remote executable facts stay FE-owned; every locally addressable segment
 /// uses the same node/occurrence/adjacency rules as the complete-plan walk.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one local projection of the whole-plan lineage contract"
-)]
 fn validate_runtime_filter_local_segments(
     fragment: &Fragment,
     inbound: &BTreeMap<EdgeId, &crate::InboundFragmentCut>,
@@ -1771,10 +1763,6 @@ pub(crate) enum RuntimeFilterLineageOrigin {
     AggregateTopN(crate::RuntimeFilterWitnessId),
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "carrier-neutral lookups preserve one shared global lineage walk"
-)]
 pub(crate) fn runtime_filter_scan_lineage_is_valid<'a>(
     get_fragment: impl Fn(FragmentId) -> Option<&'a Fragment>,
     get_edge: impl Fn(EdgeId) -> Option<&'a crate::Edge>,

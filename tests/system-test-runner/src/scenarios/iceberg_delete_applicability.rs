@@ -140,7 +140,9 @@ pub(super) fn create_catalog_sql_from_parts(
     )
 }
 
-fn row_bag(case: &Value) -> Result<Vec<(Option<i64>, Option<i64>, Option<String>)>> {
+type ExpectedRow = (Option<i64>, Option<i64>, Option<String>);
+
+fn row_bag(case: &Value) -> Result<Vec<ExpectedRow>> {
     Ok(serde_json::from_value(
         case["independent_expected_rows"].clone(),
     )?)

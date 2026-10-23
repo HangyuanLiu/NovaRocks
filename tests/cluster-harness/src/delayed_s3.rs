@@ -139,6 +139,8 @@ pub struct DelayedS3Snapshot {
     pub completed_response_bytes: u64,
 }
 
+type ReadClassKey = (String, String, Option<String>);
+
 struct ProxyState {
     started_at: Instant,
     downstream: reqwest::Url,
@@ -163,7 +165,7 @@ struct ProxyState {
     upstream_bytes_read: AtomicU64,
     completed_response_bytes: AtomicU64,
     object_labels: Mutex<BTreeMap<String, String>>,
-    read_classes: Mutex<BTreeMap<(String, String, Option<String>), DelayedS3ReadClass>>,
+    read_classes: Mutex<BTreeMap<ReadClassKey, DelayedS3ReadClass>>,
     holds: Mutex<Vec<std::sync::Weak<ReadHoldState>>>,
     body_tasks: Mutex<Vec<TokioJoinHandle<()>>>,
     next_hold: Mutex<Option<Arc<ReadHoldState>>>,

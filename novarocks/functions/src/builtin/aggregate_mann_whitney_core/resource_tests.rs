@@ -43,7 +43,7 @@ impl ScalarStateAllocator for Storage {
         _: &str,
         _source: E,
     ) -> crate::KernelFailure {
-        KernelFailure::ResourceExhausted.into()
+        KernelFailure::ResourceExhausted
     }
 }
 #[derive(Debug, PartialEq)]

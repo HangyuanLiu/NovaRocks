@@ -157,10 +157,6 @@ fn kv<'a>(
     let value = value.map(|value| builder.create_string(value));
     ipc::KeyValue::create(builder, &ipc::KeyValueArgs { key, value })
 }
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Adversarial fixtures independently author every actual IPC Field attribute"
-)]
 fn field<'a>(
     builder: &mut FlatBufferBuilder<'a>,
     name: &str,

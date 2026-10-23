@@ -1286,10 +1286,6 @@ mod tests {
         );
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Dictionary metrics are emitted as distinct stable counters for the query-profile contract."
-    )]
     fn add_dictionary_metrics(
         parent: &Profiler,
         name: &str,

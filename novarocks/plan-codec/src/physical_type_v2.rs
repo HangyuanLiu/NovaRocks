@@ -922,6 +922,7 @@ impl<'source> EncodedTypeTable<'source> {
     pub fn into_wire(self) -> wire::TypeTable {
         self.table
     }
+    #[cfg(test)]
     pub(crate) fn as_source_wire(&self) -> Option<&wire::SourceFieldTable> {
         self.source_table.as_ref()
     }
@@ -1665,6 +1666,7 @@ pub(crate) fn validate_type(
 /// The same carrier and Field author on the sole shared grammar. The caller
 /// admits initialization and captured source work before any later observation;
 /// the fixed scratch has no heap request, control scope or namespace authority.
+#[cfg(test)]
 pub(crate) fn validate_type_with_scratch_observed<'source>(
     ty: &'source DataType,
     admit_scratch: &mut impl FnMut(std::alloc::Layout) -> Result<(), CompileControlError>,
@@ -1761,6 +1763,28 @@ mod typed_binding_tests;
 #[path = "physical_type_v2/source_fields_tests.rs"]
 pub(crate) mod source_fields_tests;
 
+/// Explicit pure sender: both namespaces borrow their real original authors.
+/// No receiving memory/work profile or source invoice is minted for FE.
+#[cfg(test)]
+pub(crate) fn encode_borrowed_type_namespaces_pure_in<'source>(
+    values: &'source [(u32, &'source FunctionValueType)],
+    fields: &'source [BorrowedFieldTypeRoot<'source>],
+    source_fields: &'source [(u32, &'source Arc<Field>)],
+    limits: TypeProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<EncodedTypeTable<'source>, TypeCodecError> {
+    let table = encode::encode_associated_sources_pure_in(values, fields, limits, work)?;
+    let source_table = encode::encode_source_fields_pure_in(source_fields, limits, work)?;
+    Ok(EncodedTypeTable {
+        table,
+        values: ValueRootSources::Borrowed(values),
+        fields: FieldRootSources::Associated(fields),
+        source_table: Some(source_table),
+        source_fields: FieldRootSources::Borrowed(source_fields),
+        writers: &[],
+    })
+}
+
 /// Actual package sender: independent execution and source owners share the
 /// original numerical admission prefix, source invoice and caller checkpoints.
 pub(crate) fn encode_borrowed_type_namespaces_sources_in<'source>(
@@ -1807,26 +1831,5 @@ pub(crate) fn encode_borrowed_type_namespaces_sources_in<'source>(
         source_table: Some(source_table),
         source_fields: FieldRootSources::Borrowed(source_fields),
         writers,
-    })
-}
-
-/// Explicit pure sender: both namespaces borrow their real original authors.
-/// No receiving memory/work profile or source invoice is minted for FE.
-pub(crate) fn encode_borrowed_type_namespaces_pure_in<'source>(
-    values: &'source [(u32, &'source FunctionValueType)],
-    fields: &'source [BorrowedFieldTypeRoot<'source>],
-    source_fields: &'source [(u32, &'source Arc<Field>)],
-    limits: TypeProjectionLimits,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<EncodedTypeTable<'source>, TypeCodecError> {
-    let table = encode::encode_associated_sources_pure_in(values, fields, limits, work)?;
-    let source_table = encode::encode_source_fields_pure_in(source_fields, limits, work)?;
-    Ok(EncodedTypeTable {
-        table,
-        values: ValueRootSources::Borrowed(values),
-        fields: FieldRootSources::Associated(fields),
-        source_table: Some(source_table),
-        source_fields: FieldRootSources::Borrowed(source_fields),
-        writers: &[],
     })
 }

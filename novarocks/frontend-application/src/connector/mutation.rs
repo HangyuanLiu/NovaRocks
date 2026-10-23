@@ -21,16 +21,14 @@ use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt,
     ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationResolver, ConnectorError,
     ConnectorInstanceId, ConnectorMutationFailure, ConnectorMutationOperationId,
-    ConnectorRequestContext, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome,
+    ConnectorRequestContext, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome,
 };
 
 use novarocks_query_application::engine_error::EngineError;
 
 #[derive(Clone, Debug)]
 pub struct CompletedCatalogMutation {
-    pub effect: ExternalMutationEffect,
-    pub receipt: ConnectorCatalogMutationReceipt,
     pub finalization: ExternalMutationFinalization,
 }
 
@@ -201,15 +199,9 @@ pub fn dispatch_catalog_mutation_once_with_lease(
     context: ConnectorRequestContext,
 ) -> ResolvedCatalogMutation {
     match lease.execute_operation(operation_id, operation, context) {
-        Ok(ExternalMutationOutcome::KnownCommitted {
-            effect,
-            receipt,
-            finalization,
-        }) => ResolvedCatalogMutation::KnownCommitted(CompletedCatalogMutation {
-            effect,
-            receipt,
-            finalization,
-        }),
+        Ok(ExternalMutationOutcome::KnownCommitted { finalization, .. }) => {
+            ResolvedCatalogMutation::KnownCommitted(CompletedCatalogMutation { finalization })
+        }
         Ok(ExternalMutationOutcome::KnownUncommitted { failure, cleanup }) => {
             ResolvedCatalogMutation::KnownUncommitted { failure, cleanup }
         }
@@ -243,15 +235,9 @@ fn resolve_outcome(
         outcome => outcome,
     };
     match outcome {
-        ExternalMutationOutcome::KnownCommitted {
-            effect,
-            receipt,
-            finalization,
-        } => ResolvedCatalogMutation::KnownCommitted(CompletedCatalogMutation {
-            effect,
-            receipt,
-            finalization,
-        }),
+        ExternalMutationOutcome::KnownCommitted { finalization, .. } => {
+            ResolvedCatalogMutation::KnownCommitted(CompletedCatalogMutation { finalization })
+        }
         ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
             ResolvedCatalogMutation::KnownUncommitted { failure, cleanup }
         }
@@ -474,14 +460,6 @@ mod tests {
         let incarnation = ProviderBindingEpoch::from_bytes([1; 16]);
         let operation_id = ConnectorMutationOperationId::new();
         let operation = create_namespace_operation(descriptor.instance_id.clone());
-        let receipt = ConnectorCatalogMutationReceipt::try_new(
-            descriptor.clone(),
-            incarnation,
-            operation_id,
-            operation.kind(),
-            None,
-        )
-        .unwrap();
         let failure = ConnectorMutationFailure::new(
             ConnectorMutationFailureKind::Unavailable,
             "publication failed",
@@ -491,8 +469,6 @@ mod tests {
         let finalization = ExternalMutationFinalization::Failed(cleanup_failure.clone());
         let committed = present_catalog_mutation_result(ResolvedCatalogMutation::KnownCommitted(
             CompletedCatalogMutation {
-                effect: ExternalMutationEffect::Applied,
-                receipt,
                 finalization: finalization.clone(),
             },
         ))
@@ -563,14 +539,13 @@ mod tests {
             incarnation: ProviderBindingEpoch::from_bytes([3; 16]),
             negative_reconciliation: false,
         });
-        let result = execute_catalog_mutation(
+        execute_catalog_mutation(
             &Resolver(mutation),
             &descriptor.instance_id,
             create_namespace_operation(descriptor.instance_id.clone()),
             test_context(),
         )
         .expect("reconciled committed result");
-        assert_eq!(result.effect, ExternalMutationEffect::Applied);
     }
 
     #[test]

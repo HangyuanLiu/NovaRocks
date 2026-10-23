@@ -305,7 +305,7 @@ impl ValueLayout {
         )
         .map_err(|error| match error {
             LayoutProfileFailure::Caller(error) => error,
-            LayoutProfileFailure::Source(_) => {
+            LayoutProfileFailure::Source => {
                 E::from(crate::owned_resources::layout::LayoutResourceError::SourceModel)
             }
         })?;
@@ -359,11 +359,11 @@ impl Hash for ValueLayout {
 
 enum LayoutProfileFailure<E> {
     Caller(E),
-    Source(ExecutionValueTypeError),
+    Source,
 }
 impl<E> From<ExecutionValueTypeError> for LayoutProfileFailure<E> {
-    fn from(error: ExecutionValueTypeError) -> Self {
-        Self::Source(error)
+    fn from(_: ExecutionValueTypeError) -> Self {
+        Self::Source
     }
 }
 
@@ -737,6 +737,28 @@ fn normalize_field<E>(
     construction
         .exact(|| crate::owned_resources::layout::arc_layout(std::alloc::Layout::new::<Field>()))?;
     Ok(Arc::new(field))
+}
+
+/// Only immutable validated bindings invoke this borrowed structural projection.
+pub(crate) fn normalized_child_type_at(data_type: &DataType, index: usize) -> Option<&DataType> {
+    match data_type {
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+            if index == 0 =>
+        {
+            Some(field.data_type())
+        }
+        DataType::Struct(fields) => fields.get(index).map(|field| field.data_type()),
+        DataType::Map(entries, _) => match entries.data_type() {
+            DataType::Struct(fields) => fields.get(index).map(|field| field.data_type()),
+            _ => None,
+        },
+        DataType::Union(fields, _) => fields.iter().nth(index).map(|(_, field)| field.data_type()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1175,27 +1197,5 @@ mod tests {
             ValueLayout::try_new(&wide, ValueTypeStorageLifetime::pure()),
             Err(ExecutionValueTypeError::Nodes)
         ));
-    }
-}
-
-/// Only immutable validated bindings invoke this borrowed structural projection.
-pub(crate) fn normalized_child_type_at(data_type: &DataType, index: usize) -> Option<&DataType> {
-    match data_type {
-        DataType::List(field)
-        | DataType::LargeList(field)
-        | DataType::ListView(field)
-        | DataType::LargeListView(field)
-        | DataType::FixedSizeList(field, _)
-            if index == 0 =>
-        {
-            Some(field.data_type())
-        }
-        DataType::Struct(fields) => fields.get(index).map(|field| field.data_type()),
-        DataType::Map(entries, _) => match entries.data_type() {
-            DataType::Struct(fields) => fields.get(index).map(|field| field.data_type()),
-            _ => None,
-        },
-        DataType::Union(fields, _) => fields.iter().nth(index).map(|(_, field)| field.data_type()),
-        _ => None,
     }
 }

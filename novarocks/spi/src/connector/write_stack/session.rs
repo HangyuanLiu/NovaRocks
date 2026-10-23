@@ -316,7 +316,6 @@ struct ConnectorWriteRewriteSourceFacts {
     _storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
 impl ConnectorWriteRewriteSource {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new_typed(
         source: ConnectorTableHandle,
         pinned_source: ConnectorPinnedFileSet,
@@ -1060,6 +1059,10 @@ pub struct ConnectorWriteFinishRequest<'a> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The public finish publication union carries the exact keyed intent by value; boxing it would change the shared SPI contract"
+)]
 pub enum ConnectorWriteFinishPublication {
     None,
     KeyedDocuments(crate::connector::KeyedPublicationIntent),

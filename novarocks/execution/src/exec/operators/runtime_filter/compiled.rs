@@ -56,6 +56,8 @@ impl CompiledRuntimeFilterConsumers {
     /// bindings in their frozen order; binding `i` is keyed by the node's
     /// `RuntimeFilter { binding: i }` root, whose static type must be exactly
     /// the binding's membership key type.
+    #[cfg(test)]
+    #[cfg(test)]
     pub(crate) fn try_new(
         owner: &'static str,
         program: Arc<LocalProgram>,
@@ -254,7 +256,7 @@ impl RuntimeFilterKeyProvider for CompiledRuntimeFilterKeys {
         if self.controlled_host.is_some() {
             evaluate_chunk_all(instance, site, input, &self.control)
         } else {
-            evaluate_all(instance, site, &input.record_batch(), &self.control)
+            evaluate_all(instance, site, input.record_batch(), &self.control)
         }
     }
 }

@@ -169,7 +169,7 @@ async fn shared_manifest_root_deltas_do_one_real_get_and_zero_head_and_inline_co
     let mut manifest = writer.write_manifest_file().await.unwrap();
     manifest.sequence_number = 1;
     manifest.min_sequence_number = 1;
-    let roots = vec![
+    let roots = [
         root(&original, 1, "memory://gc/a.avro", manifest.clone()).await,
         root(&original, 2, "memory://gc/b.avro", manifest.clone()).await,
         root(&original, 3, "memory://gc/c.avro", manifest.clone()).await,

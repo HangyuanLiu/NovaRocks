@@ -67,9 +67,7 @@ pub(crate) use resolver::{ResolveError, ResolvedScalarFunction};
 /// the same decision.
 pub(crate) use novarocks_functions::FunctionVolatility;
 
-/// Project an already authored result declaration for SQL presentation.
-/// Function identity and selection validity belong to the original catalogue
-/// request validator; an output projection cannot repair a plain declaration.
+#[cfg(test)]
 fn declared_output_logical_type(
     result: &FunctionValueType,
 ) -> Option<novarocks_types::schema::SqlType> {
@@ -83,6 +81,7 @@ fn declared_output_logical_type(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn scalar_output_logical_type(
     binding: &ResolvedFunctionBinding,
 ) -> Option<novarocks_types::schema::SqlType> {
@@ -95,7 +94,7 @@ pub(crate) fn scalar_output_logical_type(
     declared_output_logical_type(result)
 }
 
-/// Aggregate result and intermediate-state declarations have distinct owners.
+#[cfg(test)]
 pub(crate) fn aggregate_output_logical_type(
     binding: &ResolvedFunctionBinding,
 ) -> Option<novarocks_types::schema::SqlType> {
@@ -483,7 +482,12 @@ pub fn builtin_sql_function_catalog() -> &'static dyn crate::compiler::SqlFuncti
     builtin_engine_function_catalog()
 }
 
-#[cfg(any(test, novarocks_dev_controls))]
+#[cfg(test)]
+pub(crate) fn test_function_catalog_snapshot() -> Arc<dyn crate::compiler::SqlFunctionCatalog> {
+    builtin_sql_function_catalog().snapshot()
+}
+
+#[cfg(test)]
 pub(crate) fn test_resolved_aggregate(
     name: &str,
     argument_types: &[DataType],
@@ -517,11 +521,6 @@ pub(crate) fn test_resolved_aggregate(
         exact,
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
     )
-}
-
-#[cfg(any(test, novarocks_dev_controls))]
-pub(crate) fn test_function_catalog_snapshot() -> Arc<dyn crate::compiler::SqlFunctionCatalog> {
-    builtin_sql_function_catalog().snapshot()
 }
 
 #[cfg(test)]
@@ -624,7 +623,7 @@ impl FunctionBindingResolver for TestExactAggregateBindingResolver {
                     return Err(FunctionBindingError::NoMatchingOverload);
                 };
                 let exact = novarocks_type_contract::arrow_data_types_exact_observed(
-                    &value_type.data_type(),
+                    value_type.data_type(),
                     expected,
                     || work.step().map_err(FunctionBindingError::from),
                 )?;

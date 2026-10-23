@@ -370,7 +370,11 @@ fn by_copy_joint_take_real_host_capacity_denial_rolls_back_full_copy_scope() {
     else {
         panic!("the real complete-copy host must refuse");
     };
-    super::opaque_memory_host_tests::assert_tracker_refusal(&refusal, peak - 1, None);
+    crate::exec::operators::opaque_memory_host_tests::assert_tracker_refusal(
+        &refusal,
+        peak - 1,
+        None,
+    );
     assert_released(&host);
 }
 #[test]

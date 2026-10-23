@@ -37,6 +37,9 @@ use novarocks_type_contract::{
     ValueSchemaCreation, ValueTypeStorageLifetime,
 };
 use std::{alloc::Layout, sync::Arc};
+
+type CreatorReaderAdmit<'a, H> =
+    dyn FnMut(&IpcReaderProgressFacts) -> Result<(), ProjectionFailure<FlatReaderError, H>> + 'a;
 pub(crate) enum PreparedReader<'raw, 'table, 'control> {
     Flat(PreparedFlatReader<'raw, 'table, 'table, 'control>),
     Recursive(PreparedRecursiveReader<'raw, 'table, 'table, 'control>),
@@ -120,9 +123,7 @@ impl PreparedReader<'_, '_, '_> {
         self,
         source: ConstantSourceOwner,
         creation: &mut ValueSchemaCreation<'_, H>,
-        admit: &mut dyn FnMut(
-            &IpcReaderProgressFacts,
-        ) -> Result<(), ProjectionFailure<FlatReaderError, H>>,
+        admit: &mut CreatorReaderAdmit<'_, H>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<ConstantPool, ProjectionFailure<FlatReaderError, H>> {
         match self {
@@ -134,31 +135,13 @@ impl PreparedReader<'_, '_, '_> {
             }
         }
     }
-    pub(crate) fn materialize_with_scope_observed<E: ReaderFailure>(
-        self,
-        source: ConstantSourceOwner,
-        creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<E>,
-        admit: &mut dyn FnMut(&IpcReaderProgressFacts) -> Result<(), E>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<ConstantPool, E> {
-        match self {
-            Self::Flat(reader) => {
-                reader.materialize_with_scope_observed(source, creation, admit, work)
-            }
-            Self::Recursive(reader) => {
-                reader.materialize_with_scope_observed(source, creation, admit, work)
-            }
-        }
-    }
     pub(crate) fn materialize_with_paired_creator_observed<H>(
         self,
         source: ConstantSourceOwner,
         temporary: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
         retained: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
         pool: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
-        admit: &mut dyn FnMut(
-            &IpcReaderProgressFacts,
-        ) -> Result<(), ProjectionFailure<FlatReaderError, H>>,
+        admit: &mut CreatorReaderAdmit<'_, H>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<ConstantPool, ProjectionFailure<FlatReaderError, H>> {
         match self {
@@ -169,16 +152,6 @@ impl PreparedReader<'_, '_, '_> {
                 source, temporary, retained, pool, admit, work,
             ),
         }
-    }
-    pub(crate) fn materialize_in(
-        self,
-        admit: &mut dyn FnMut(&IpcReaderProgressFacts) -> Result<(), CompileControlError>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<ConstantPool, Error> {
-        Ok(match self {
-            Self::Flat(value) => value.materialize_in(admit, work)?,
-            Self::Recursive(value) => value.materialize_in(admit, work)?,
-        })
     }
 }
 
@@ -346,6 +319,10 @@ fn reader_failure<H>(error: ProjectionFailure<FlatReaderError, H>) -> Projection
 /// Explicit source authors resolve both IDs before this borrowed entry. The
 /// value namespace supplies meaning; the independent source namespace supplies
 /// the exact original Field and metadata creation receipt. No table is rebuilt.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The record boundary keeps original owners, source invoices, decode policy, verifier, creator, and progress ports explicit."
+)]
 pub fn prepare_constant_record_from_sources_with_creator_in<'raw, 'source, 'control, H>(
     record: &'raw wire::IpcConstantPool,
     value_type: &'source FunctionValueType,
@@ -456,7 +433,9 @@ pub(crate) fn checked_record_source_header(
 ) -> Result<(), Error> {
     work.step().map_err(Error::from)?;
     if record.compression != wire::IpcCompression::Uncompressed as i32 {
-        return Err(Error::InvalidShape("constant IPC compression is not supported").into());
+        return Err(Error::InvalidShape(
+            "constant IPC compression is not supported",
+        ));
     }
     super::required(
         record.value_type_id,
@@ -469,9 +448,9 @@ pub(crate) fn checked_record_source_header(
         work,
     )?;
     if original_source_bytes < record.arrow_ipc.capacity() {
-        return Err(
-            Error::InvalidShape("constant source invoice is below original IPC backing").into(),
-        );
+        return Err(Error::InvalidShape(
+            "constant source invoice is below original IPC backing",
+        ));
     }
     Ok(())
 }

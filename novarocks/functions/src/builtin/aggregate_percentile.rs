@@ -28,7 +28,7 @@ use allocator_api2::{
     alloc::{AllocError, Allocator},
     vec::Vec as HostVec,
 };
-use arrow_array::{ArrayRef, builder::BinaryBuilder};
+use arrow_array::ArrayRef;
 use arrow_schema::DataType;
 use novarocks_type_contract::CompileCheckpoints;
 use std::{alloc::Layout, ptr::NonNull, sync::Arc};
@@ -656,9 +656,7 @@ impl PreparedAggregateKernel for PercentileKernel {
                         internal("percentile final iterator exceeded its actual extent").into(),
                     );
                 }
-                scalar_work
-                    .step()
-                    .map_err(|error| sink.scalar(error.into()))?;
+                scalar_work.step().map_err(|error| sink.scalar(error))?;
                 output.push(match self.operation {
                     PercentileOperation::Continuous => core::finalize_cont_with_sink(
                         &state.core,
@@ -677,7 +675,7 @@ impl PreparedAggregateKernel for PercentileKernel {
                 );
             }
             scalar::build_scalar_array(self.output_type(), output, &mut scalar_work)
-                .map_err(|error| sink.scalar(error.into()))
+                .map_err(|error| sink.scalar(error))
         })
     }
 }

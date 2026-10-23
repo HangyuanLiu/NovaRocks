@@ -1630,15 +1630,14 @@ impl IcebergWriteSessionControl {
                 .summary()
                 .additional_properties
                 .get(ICEBERG_WRITE_SESSION_MARKER_PROPERTY);
-            if marker.is_some_and(|value| *value == expected) {
-                if matched
+            if marker.is_some_and(|value| *value == expected)
+                && matched
                     .replace((snapshot.snapshot_id(), marker.unwrap().clone()))
                     .is_some()
-                {
-                    return Err(corrupt(
-                        "Iceberg write session marker matches multiple snapshots",
-                    ));
-                }
+            {
+                return Err(corrupt(
+                    "Iceberg write session marker matches multiple snapshots",
+                ));
             }
         }
         let Some((snapshot_id, marker_value)) = matched else {
@@ -1977,7 +1976,7 @@ fn resolve_statistics_field(
 /// COW retains the already-loaded immutable generation. No capacity is minted.
 enum IcebergAdmissionStatisticsMetadata {
     Shared(Arc<TableMetadata>),
-    Owned(TableMetadata),
+    Owned(Box<TableMetadata>),
 }
 
 impl IcebergAdmissionStatisticsMetadata {
@@ -1985,14 +1984,14 @@ impl IcebergAdmissionStatisticsMetadata {
         if copy_on_write {
             Self::Shared(table.metadata_ref())
         } else {
-            Self::Owned(table.metadata().clone())
+            Self::Owned(Box::new(table.metadata().clone()))
         }
     }
 
     fn into_source_metadata(self) -> Arc<TableMetadata> {
         match self {
             Self::Shared(value) => value,
-            Self::Owned(value) => Arc::new(value),
+            Self::Owned(value) => Arc::new(*value),
         }
     }
 
@@ -2009,9 +2008,9 @@ impl IcebergAdmissionStatisticsMetadata {
                 )),
             }
         } else {
-            Ok(Self::Owned(
+            Ok(Self::Owned(Box::new(
                 prospective.unwrap_or_else(|| self.as_ref()).clone(),
-            ))
+            )))
         }
     }
 }
@@ -2020,7 +2019,7 @@ impl AsRef<TableMetadata> for IcebergAdmissionStatisticsMetadata {
     fn as_ref(&self) -> &TableMetadata {
         match self {
             Self::Shared(value) => value.as_ref(),
-            Self::Owned(value) => value,
+            Self::Owned(value) => value.as_ref(),
         }
     }
 }
@@ -2137,7 +2136,7 @@ impl IcebergWriteSessionControl {
                 }
                 (
                     None,
-                    IcebergAdmissionStatisticsMetadata::Owned(staged.metadata.clone()),
+                    IcebergAdmissionStatisticsMetadata::Owned(Box::new(staged.metadata.clone())),
                     None,
                 )
             }
@@ -3441,7 +3440,7 @@ mod statistics_contract_tests {
         let metadata = metadata
             .into_builder(None)
             .set_ref(
-                "dev".into(),
+                "dev",
                 SnapshotReference::new(
                     main,
                     SnapshotRetention::Branch {
@@ -3810,16 +3809,15 @@ mod eager_attempt_io_tests {
     use crate::commit::attempt::observation::{
         DispatchEvidence, ProtocolObservation, PublicationJournal,
     };
+    use crate::iceberg::TableIdent;
     use crate::iceberg::io::{
         FileIO, FileIOBuilder, FileMetadata, FileRead, FileWrite, InputFile, MemoryStorage,
         OutputFile, Storage, StorageConfig, StorageFactory,
     };
-    use crate::iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use crate::iceberg::spec::{
         DataContentType, DataFileFormat, FormatVersion, NestedField, PartitionSpec, PrimitiveType,
         Schema, SortOrder, Struct, TableMetadataBuilder, Type,
     };
-    use crate::iceberg::{CatalogBuilder, Error as IcebergError, ErrorKind, TableIdent};
 
     const DATA_PATH: &str = "memory://warehouse/db/t/data/already-written.parquet";
 
@@ -4253,7 +4251,6 @@ mod eager_attempt_io_tests {
 
     struct Fixture {
         table: crate::iceberg::table::Table,
-        catalog: crate::iceberg::MemoryCatalog,
         reusable: ReusableEagerWriteInputs,
         original_body_address: usize,
         trace: Arc<IoTrace>,
@@ -4265,7 +4262,7 @@ mod eager_attempt_io_tests {
             inner: MemoryStorage::new(),
             trace: Arc::clone(&trace),
         });
-        let file_io = FileIOBuilder::new(factory.clone()).build();
+        let file_io = FileIOBuilder::new(factory).build();
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::required(
                 1,
@@ -4294,18 +4291,6 @@ mod eager_attempt_io_tests {
             .runtime(sdk_runtime.clone())
             .build()
             .expect("table");
-        let catalog = MemoryCatalogBuilder::default()
-            .with_runtime(sdk_runtime)
-            .with_storage_factory(factory)
-            .load(
-                "counting",
-                HashMap::from([(
-                    MEMORY_CATALOG_WAREHOUSE.to_string(),
-                    "memory://warehouse".to_string(),
-                )]),
-            )
-            .await
-            .expect("memory catalog");
         let body = Bytes::from_static(include_bytes!(
             "../../../../../../tests/datasketches-tck/fixtures/theta/rust_quickselect_n1000_ordered_v3.sk"
         ));
@@ -4344,7 +4329,6 @@ mod eager_attempt_io_tests {
         };
         Fixture {
             table,
-            catalog,
             reusable: ReusableEagerWriteInputs::new(vec![file], vec![statistics]),
             original_body_address,
             trace,
@@ -4471,7 +4455,7 @@ mod eager_attempt_io_tests {
                     .collect(),
                 removed: vec![],
             },
-            dependencies: vec![crate::commit::model::Dependency::NoReadDependency],
+            dependencies: vec![crate::commit::model::Dependency::NoRead],
             isolation: IsolationLevel::Snapshot,
             shape: RequestShape::SnapshotProducing,
             summary: BTreeMap::new(),

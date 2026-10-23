@@ -141,10 +141,6 @@ pub(crate) fn append_union_roots<R: DerivedSlotRoot>(
     outcome
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "original derived-root inputs and actual scratch port remain explicit"
-)]
 pub(crate) fn append_union_roots_with_creator<R: DerivedSlotRoot, H>(
     roots: &[R],
     minted: &BTreeSet<ExpressionUseId>,

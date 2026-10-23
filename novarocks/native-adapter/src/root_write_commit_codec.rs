@@ -400,8 +400,10 @@ impl<'a> WriteCommitRecordView<'a> {
     pub fn field_ids(&self) -> impl Iterator<Item = i32> + 'a {
         let fields = &self.payload[..self.header.field_count() * 4];
         fields
-            .chunks_exact(4)
-            .map(|id| i32::from_le_bytes(id.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|id| i32::from_le_bytes(*id))
     }
     fn blob_bytes(&self) -> &'a [u8] {
         let start = self.header.field_count() * 4;

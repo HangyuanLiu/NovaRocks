@@ -40,7 +40,7 @@ use novarocks_execution_contract::{
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::native_rpc::NativeRpcMethod;
 use novarocks_query_application::{
-    api::{QueryExecutionError, QueryExecutionErrorKind},
+    api::QueryExecutionError,
     coordination::RootResultFetchFailure,
     execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
 };
@@ -66,7 +66,7 @@ use super::transport::Client;
     reason = "The production cutover routes the coordinator's result loop onto this face."
 )]
 pub enum FinalTaskInfoRead {
-    Available(FinalTaskInfo),
+    Available(Box<FinalTaskInfo>),
     Unavailable(OperationOutcome),
 }
 
@@ -397,7 +397,7 @@ impl TaskResultTransport for NativeTaskResultTransport {
             match result {
             novarocks_proto_models::novarocks::get_final_task_info_response::Result::Info(info) => {
                 decode_final_task_info(identity, &info, FieldPath::root("final_task_info"))
-                    .map(FinalTaskInfoRead::Available)
+                    .map(|info| FinalTaskInfoRead::Available(Box::new(info)))
                     .map_err(|error| format!("{address}: {error}"))
             }
             novarocks_proto_models::novarocks::get_final_task_info_response::Result::Unavailable(

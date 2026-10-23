@@ -993,7 +993,6 @@ pub struct SqlAnalyzeRequest<'a> {
 }
 
 impl<'a> SqlAnalyzeRequest<'a> {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         statement: SqlStatementInput,
         intent: SqlCompileIntent,
@@ -1030,7 +1029,6 @@ impl<'a> SqlAnalyzeRequest<'a> {
     /// Constant evaluation stays available: it materializes no binding and
     /// touches no catalog, and withholding it would make a re-entered plan
     /// fold differently from the same plan compiled directly.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_logical(
         plan: crate::planner::logical::LogicalPlanNode,
         factory: crate::column_id::ColumnRefFactory,
@@ -1148,6 +1146,10 @@ impl SqlAnalyzedQuery {
 
 /// Typed phase-one outcome. Analyze-only and logical-only requests terminate
 /// here; every optimizer or distributed terminal returns one opaque handle.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Both public outcomes carry similarly large per-query compiler snapshots; boxing only one adds an allocation and changes the API for a 288-byte size delta."
+)]
 pub enum SqlAnalyzeOutput {
     Complete(SqlCompileOutput),
     Pending(SqlAnalyzedQuery),
@@ -1362,7 +1364,10 @@ pub fn compile_imv_refresh_explain_lines(
     output.into_explain_lines(level, true, &explain_control)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The helper forwards each independently frozen explain input into the existing request contract without creating a second aggregate type."
+)]
 fn imv_refresh_explain_request<'a>(
     query: novarocks_parser::ast::Query,
     imv_rewrite: &'a SqlImvPlanningInput,
@@ -2729,12 +2734,13 @@ mod tests {
         };
         let output = analyze_then_optimize(request).expect("compile ordinary EXPLAIN");
         assert!(output.is_optimized());
-        let _: fn(
+        type ExplainLinesFn = fn(
             SqlCompileOutput,
             ExplainLevel,
             bool,
             &dyn novarocks_type_contract::PureCompileControl,
-        ) -> Result<Vec<String>, SqlCompileError> = SqlCompileOutput::into_explain_lines;
+        ) -> Result<Vec<String>, SqlCompileError>;
+        let _: ExplainLinesFn = SqlCompileOutput::into_explain_lines;
     }
 
     #[test]
@@ -2850,8 +2856,7 @@ mod tests {
             functions: &functions,
             control: SqlCompileControl::unbounded(),
         })
-        .err()
-        .expect("unsupported persisted semantics");
+        .expect_err("unsupported persisted semantics");
         assert!(error.to_string().starts_with("Unsupported:"));
         assert!(error.to_string().contains("GROUP_CONCAT_LEGACY"));
         assert!(

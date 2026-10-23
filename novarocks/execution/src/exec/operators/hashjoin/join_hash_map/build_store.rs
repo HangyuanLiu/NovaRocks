@@ -169,6 +169,7 @@ impl BuildStoreBuilder {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn push_chunk(&mut self, chunk: &Chunk) -> Result<(), ExecutionFailure> {
         self.push_chunk_core(chunk, None)
     }
@@ -229,10 +230,12 @@ impl BuildStoreBuilder {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn row_count(&self) -> usize {
         self.row_count
     }
 
+    #[cfg(test)]
     pub(crate) fn finish(self) -> Result<Option<BuildStore>, ExecutionFailure> {
         self.finish_core(None)
     }
@@ -377,7 +380,7 @@ impl novarocks_failure_contract::FailureProjection for JoinStoreRows {
 }
 #[cfg(test)]
 mod tests {
-    use novarocks_failure_contract::FailureProjection;
+
     use std::sync::Arc;
 
     use arrow::array::{Array, ArrayRef, Int32Array, RecordBatch};

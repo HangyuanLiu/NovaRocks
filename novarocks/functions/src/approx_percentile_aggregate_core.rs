@@ -112,11 +112,11 @@ fn numeric_value_at(
         source.into_failure(PercentileInputDiagnostic::LegacyLabel(context.as_str()))
     })
 }
-fn payload_bytes_at<'a>(
-    array: &'a ArrayRef,
+fn payload_bytes_at(
+    array: &ArrayRef,
     row: usize,
     context: ApproxPercentileDiagnostic,
-) -> Result<Option<&'a [u8]>, crate::KernelFailure> {
+) -> Result<Option<&[u8]>, crate::KernelFailure> {
     percentile_input::payload_bytes_at_with_failure(array, row, &mut |source| {
         source.into_failure(PercentileInputDiagnostic::LegacyLabel(context.as_str()))
     })
@@ -127,37 +127,6 @@ fn integer_value_at(
     context: ApproxPercentileDiagnostic,
 ) -> Result<Option<i64>, crate::KernelFailure> {
     Ok(numeric_value_at(array, row, context)?.map(|value| value as i64))
-}
-fn validate_quantile(
-    context: ApproxPercentileDiagnostic,
-    quantile: f64,
-) -> Result<(), crate::KernelFailure> {
-    if !(0.0..=1.0).contains(&quantile) {
-        return Err(crate::approx_percentile_failure::value_failure(
-            format_args!(
-                "{context}: percentile parameter must be between 0 and 1, got {}",
-                quantile
-            ),
-            crate::DataFailureReason::InvalidValue,
-        ));
-    }
-    Ok(())
-}
-
-fn apply_quantiles<A: Allocator + Clone>(
-    state: &mut percentile::PercentileState<A>,
-    array: &ArrayRef,
-    row: usize,
-    context: ApproxPercentileDiagnostic,
-) -> Result<(), crate::KernelFailure> {
-    apply_quantiles_with_sink(
-        state,
-        array,
-        row,
-        context,
-        &LegacyQuantileScratch,
-        &mut RequiredApproxPercentileFailure,
-    )
 }
 fn apply_quantiles_with_sink<
     A: Allocator + Clone,
@@ -228,20 +197,6 @@ fn apply_quantiles_with_sink<
     }
 }
 
-fn apply_compression<A: Allocator + Clone>(
-    state: &mut percentile::PercentileState<A>,
-    array: &ArrayRef,
-    row: usize,
-    context: ApproxPercentileDiagnostic,
-) -> Result<(), crate::KernelFailure> {
-    apply_compression_with_sink(
-        state,
-        array,
-        row,
-        context,
-        &mut RequiredApproxPercentileFailure,
-    )
-}
 fn apply_compression_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
     state: &mut percentile::PercentileState<A>,
     array: &ArrayRef,
@@ -482,11 +437,11 @@ impl WeightedInput {
     }
 }
 
-pub fn payload_for_merge<'a>(
-    array: &'a ArrayRef,
+pub fn payload_for_merge(
+    array: &ArrayRef,
     row: usize,
     context: ApproxPercentileDiagnostic,
-) -> Result<Option<&'a [u8]>, crate::KernelFailure> {
+) -> Result<Option<&[u8]>, crate::KernelFailure> {
     payload_bytes_at(array, row, context)
 }
 pub fn merge_payload<A: Allocator + Clone>(

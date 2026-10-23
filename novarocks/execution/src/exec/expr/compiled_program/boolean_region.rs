@@ -61,10 +61,6 @@ impl BooleanRows {
         *remaining = next;
         Ok(())
     }
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Keep the exact operand mapping, demand, scoped effect verdict and caller-owned error/control domains explicit"
-    )]
     pub(super) fn consume(
         &mut self,
         output: &SelectedValues<'_>,

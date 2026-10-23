@@ -3,7 +3,7 @@ pub mod effect;
 pub mod mysql;
 pub mod mysql_stream;
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 pub(crate) mod exact_mysql_control;
 
 #[cfg(unix)]

@@ -93,7 +93,7 @@ pub fn evaluate_observed(
         let row = address(ordinal, batch_row);
         observe(Observation::Step)?;
         if row >= input.len() {
-            return Err(internal("null_or_empty selected address is out of bounds").into());
+            return Err(internal("null_or_empty selected address is out of bounds"));
         }
         let value = match &source {
             Source::Null | Source::AllNull => true,
@@ -141,11 +141,13 @@ pub(super) fn validate_profile(
         ));
     };
     step()?;
-    let exact = match (&source.logical_type(), source.data_type()) {
-        (ValueLogicalType::Physical, DataType::Null | DataType::Utf8 | DataType::List(_)) => true,
-        (ValueLogicalType::Json, DataType::Utf8) => true,
-        _ => false,
-    };
+    let exact = matches!(
+        (&source.logical_type(), source.data_type()),
+        (
+            ValueLogicalType::Physical,
+            DataType::Null | DataType::Utf8 | DataType::List(_)
+        ) | (ValueLogicalType::Json, DataType::Utf8)
+    );
     if !exact {
         return Err(invalid(
             "null_or_empty source has no stable exact string or List profile",

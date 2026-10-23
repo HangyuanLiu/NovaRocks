@@ -16,9 +16,7 @@ use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[path = "native_sql_controls.rs"]
-pub(super) mod native_sql_controls;
-use native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpec};
+use crate::scenarios::native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpec};
 
 mod limit_zero;
 

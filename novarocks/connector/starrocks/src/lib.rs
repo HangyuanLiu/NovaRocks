@@ -48,7 +48,6 @@
 //! - The provider-private StarOS, tablet-storage and remote-scan protobuf IDL
 //!   those readers spoke, and the build script that compiled it.
 
-mod codec;
 mod domain;
 mod role_binding;
 

@@ -63,26 +63,13 @@ fn parse_access_domain(value: &str) -> Result<StorageAccessDomainId> {
         anyhow::bail!("--access-domain must be exactly 64 lowercase hexadecimal characters");
     }
     let mut bytes = [0_u8; 32];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let text = std::str::from_utf8(chunk).expect("ASCII checked");
         bytes[index] = u8::from_str_radix(text, 16).with_context(
             || "--access-domain must be exactly 64 lowercase hexadecimal characters",
         )?;
     }
     Ok(StorageAccessDomainId::from_bytes(bytes))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_access_domain;
-
-    #[test]
-    fn access_domain_requires_lowercase_32_byte_hex() {
-        assert!(parse_access_domain(&"ab".repeat(32)).is_ok());
-        assert!(parse_access_domain(&"AB".repeat(32)).is_err());
-        assert!(parse_access_domain(&"gg".repeat(32)).is_err());
-        assert!(parse_access_domain(&"a".repeat(63)).is_err());
-    }
 }
 
 fn probe_parquet_bytes(path: &str, bytes: Bytes) -> Result<ParquetProbe> {
@@ -291,4 +278,17 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_access_domain;
+
+    #[test]
+    fn access_domain_requires_lowercase_32_byte_hex() {
+        assert!(parse_access_domain(&"ab".repeat(32)).is_ok());
+        assert!(parse_access_domain(&"AB".repeat(32)).is_err());
+        assert!(parse_access_domain(&"gg".repeat(32)).is_err());
+        assert!(parse_access_domain(&"a".repeat(63)).is_err());
+    }
 }

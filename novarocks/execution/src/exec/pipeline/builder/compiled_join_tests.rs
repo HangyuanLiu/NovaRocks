@@ -22,7 +22,7 @@
 //! loopback. Every expected relation comes from an independent nested-loop
 //! oracle over the literal rows.
 
-use crate::exec::pipeline::{step::NextStep, test_driver::TestDriver};
+use crate::exec::pipeline::test_driver::TestDriver;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -1392,17 +1392,17 @@ fn partitioned_join_runs_each_instance_over_its_colocated_partition() {
     }
 }
 
-/// Direct preparation witnesses use the same genuine Physical package/compiler
-/// and installed build/probe factories as the existing relational oracle.
-fn schema_owner_join_operators(
-    nested: bool,
-) -> (
+type StepJoinOperators = (
     Arc<LocalProgram>,
     Box<dyn crate::exec::pipeline::operator::Operator>,
     Box<dyn crate::exec::pipeline::operator::Operator>,
     crate::exec::chunk::Chunk,
     Arc<crate::runtime::runtime_state::RuntimeErrorState>,
-) {
+);
+
+/// Direct preparation witnesses use the same genuine Physical package/compiler
+/// and installed build/probe factories as the existing relational oracle.
+fn schema_owner_join_operators(nested: bool) -> StepJoinOperators {
     let spec = if nested {
         Spec::nested(JoinKind::LeftAnti, false)
     } else {
@@ -1411,17 +1411,7 @@ fn schema_owner_join_operators(
     step_join_operators(spec, &LEFT_ROWS, &[])
 }
 
-fn step_join_operators(
-    spec: Spec,
-    left_rows: &[Row],
-    right_rows: &[Row],
-) -> (
-    Arc<LocalProgram>,
-    Box<dyn crate::exec::pipeline::operator::Operator>,
-    Box<dyn crate::exec::pipeline::operator::Operator>,
-    crate::exec::chunk::Chunk,
-    Arc<crate::runtime::runtime_state::RuntimeErrorState>,
-) {
+fn step_join_operators(spec: Spec, left_rows: &[Row], right_rows: &[Row]) -> StepJoinOperators {
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::operators::compiled_nljoin::{
         CompiledNlJoinPlan, CompiledNlJoinProbeProcessorFactory,
@@ -1468,7 +1458,7 @@ fn step_join_operators(
         Box<dyn crate::exec::pipeline::operator::Operator>,
     ) = if nested {
         let plan = Arc::new(CompiledNlJoinPlan::try_new(&program, node).unwrap());
-        let state = Arc::new(NlJoinSharedState::new(17, 1, DependencyManager::default()));
+        let state = Arc::new(NlJoinSharedState::new(17, DependencyManager::default()));
         (
             CompiledNlJoinProbeProcessorFactory::new(
                 program.clone(),
@@ -1970,56 +1960,57 @@ fn compiled_nested_loop_step_waits_before_preparation_and_drains_after_eos() {
     drop(factory);
     let original = input.columns()[0].clone();
     let mut turn = TurnWork::new(NonZeroU64::new(1).unwrap(), 0);
-    let mut ctx = StepContext::new(&error, &mut turn);
     let step = probe.as_mut();
-    let allocated = tracker.allocated();
-    let InputResult::Deferred {
-        input,
-        next: AdmissionNext::Wait(wait),
-    } = step.try_push(&mut ctx, RawInput::for_test(input))
-    else {
-        panic!("build dependency must leave the raw input on its edge");
-    };
-    assert!(Arc::ptr_eq(
-        &input.original_for_test().columns()[0],
-        &original
-    ));
-    let InputResult::Deferred {
-        input,
-        next: AdmissionNext::Wait(same),
-    } = step.try_push(&mut ctx, input)
-    else {
-        panic!("unpublished build must keep waiting");
-    };
-    assert!(Arc::ptr_eq(&wait.observable, &same.observable));
-    assert_eq!(wait.observed_generation, same.observed_generation);
-    assert_eq!(
-        tracker.allocated(),
-        allocated,
-        "no receiver preparation while build is absent"
-    );
-    let build_step = build.as_mut();
-    build_step.finish(&mut ctx).unwrap();
-    assert!(matches!(
-        build_step.drive(&mut ctx).unwrap().next,
-        NextStep::Finished
-    ));
-    assert_ne!(wait.observable.generation(), wait.observed_generation);
-    assert!(matches!(
-        step.try_push(&mut ctx, input),
-        InputResult::Accepted(Ok(_))
-    ));
-    let applied = step.drive(&mut ctx).unwrap();
-    assert!(applied.output.is_none());
-    assert!(matches!(applied.next, NextStep::Runnable));
-    step.finish(&mut ctx).unwrap();
-    let allocated = tracker.allocated();
-    assert!(matches!(
-        step.drive(&mut ctx).unwrap().next,
-        NextStep::Yield
-    ));
-    assert_eq!(tracker.allocated(), allocated);
-    drop(ctx);
+    {
+        let mut ctx = StepContext::new(&error, &mut turn);
+        let allocated = tracker.allocated();
+        let InputResult::Deferred {
+            input,
+            next: AdmissionNext::Wait(wait),
+        } = step.try_push(&mut ctx, RawInput::for_test(input))
+        else {
+            panic!("build dependency must leave the raw input on its edge");
+        };
+        assert!(Arc::ptr_eq(
+            &input.original_for_test().columns()[0],
+            &original
+        ));
+        let InputResult::Deferred {
+            input,
+            next: AdmissionNext::Wait(same),
+        } = step.try_push(&mut ctx, input)
+        else {
+            panic!("unpublished build must keep waiting");
+        };
+        assert!(Arc::ptr_eq(&wait.observable, &same.observable));
+        assert_eq!(wait.observed_generation, same.observed_generation);
+        assert_eq!(
+            tracker.allocated(),
+            allocated,
+            "no receiver preparation while build is absent"
+        );
+        let build_step = build.as_mut();
+        build_step.finish(&mut ctx).unwrap();
+        assert!(matches!(
+            build_step.drive(&mut ctx).unwrap().next,
+            NextStep::Finished
+        ));
+        assert_ne!(wait.observable.generation(), wait.observed_generation);
+        assert!(matches!(
+            step.try_push(&mut ctx, input),
+            InputResult::Accepted(Ok(_))
+        ));
+        let applied = step.drive(&mut ctx).unwrap();
+        assert!(applied.output.is_none());
+        assert!(matches!(applied.next, NextStep::Runnable));
+        step.finish(&mut ctx).unwrap();
+        let allocated = tracker.allocated();
+        assert!(matches!(
+            step.drive(&mut ctx).unwrap().next,
+            NextStep::Yield
+        ));
+        assert_eq!(tracker.allocated(), allocated);
+    }
     turn.begin_turn(1).unwrap();
     let mut ctx = StepContext::new(&error, &mut turn);
     let emitted = step.drive(&mut ctx).unwrap();
@@ -2092,56 +2083,57 @@ fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_curs
     }
     drop(factory);
     let mut turn = TurnWork::new(NonZeroU64::new(1).unwrap(), 0);
-    let mut ctx = StepContext::new(&error, &mut turn);
     let step = probe.as_mut();
-    let allocated = tracker.allocated();
-    let original = input.columns()[0].clone();
-    let InputResult::Deferred {
-        input,
-        next: AdmissionNext::Wait(wait),
-    } = step.try_push(&mut ctx, RawInput::for_test(input))
-    else {
-        panic!("absent build leaves the original input unprepared");
-    };
-    assert!(Arc::ptr_eq(
-        &input.original_for_test().columns()[0],
-        &original
-    ));
-    assert_eq!(tracker.allocated(), allocated);
-    let build_step = build.as_mut();
-    assert!(matches!(
-        build_step.try_push(&mut ctx, RawInput::for_test(build_input)),
-        InputResult::Accepted(Ok(_))
-    ));
-    assert!(build_step.drive(&mut ctx).unwrap().output.is_none());
-    build_step.finish(&mut ctx).unwrap();
-    assert!(matches!(
-        build_step.drive(&mut ctx).unwrap().next,
-        NextStep::Finished
-    ));
-    assert_ne!(wait.observable.generation(), wait.observed_generation);
-    assert!(matches!(
-        step.try_push(&mut ctx, input),
-        InputResult::Accepted(Ok(_))
-    ));
-    let applied = step.drive(&mut ctx).unwrap();
-    assert!(applied.output.is_none());
-    assert!(matches!(applied.next, NextStep::Runnable));
-    step.finish(&mut ctx).unwrap();
-    let allocated = tracker.allocated();
-    assert!(matches!(
-        step.drive(&mut ctx).unwrap().next,
-        NextStep::Yield
-    ));
-    assert_eq!(tracker.allocated(), allocated);
+    {
+        let mut ctx = StepContext::new(&error, &mut turn);
+        let allocated = tracker.allocated();
+        let original = input.columns()[0].clone();
+        let InputResult::Deferred {
+            input,
+            next: AdmissionNext::Wait(wait),
+        } = step.try_push(&mut ctx, RawInput::for_test(input))
+        else {
+            panic!("absent build leaves the original input unprepared");
+        };
+        assert!(Arc::ptr_eq(
+            &input.original_for_test().columns()[0],
+            &original
+        ));
+        assert_eq!(tracker.allocated(), allocated);
+        let build_step = build.as_mut();
+        assert!(matches!(
+            build_step.try_push(&mut ctx, RawInput::for_test(build_input)),
+            InputResult::Accepted(Ok(_))
+        ));
+        assert!(build_step.drive(&mut ctx).unwrap().output.is_none());
+        build_step.finish(&mut ctx).unwrap();
+        assert!(matches!(
+            build_step.drive(&mut ctx).unwrap().next,
+            NextStep::Finished
+        ));
+        assert_ne!(wait.observable.generation(), wait.observed_generation);
+        assert!(matches!(
+            step.try_push(&mut ctx, input),
+            InputResult::Accepted(Ok(_))
+        ));
+        let applied = step.drive(&mut ctx).unwrap();
+        assert!(applied.output.is_none());
+        assert!(matches!(applied.next, NextStep::Runnable));
+        step.finish(&mut ctx).unwrap();
+        let allocated = tracker.allocated();
+        assert!(matches!(
+            step.drive(&mut ctx).unwrap().next,
+            NextStep::Yield
+        ));
+        assert_eq!(tracker.allocated(), allocated);
+    }
     let mut output = Vec::new();
     for expected in [
         MAX_JOIN_OUTPUT_ROWS_PER_BATCH,
         rows.len() * rows.len() - MAX_JOIN_OUTPUT_ROWS_PER_BATCH,
     ] {
-        drop(ctx);
         turn.begin_turn(1).unwrap();
-        ctx = StepContext::new(&error, &mut turn);
+        let mut ctx = StepContext::new(&error, &mut turn);
         let page = step.drive(&mut ctx).unwrap();
         assert!(matches!(page.next, NextStep::Runnable));
         let page = page.output.unwrap();
@@ -2157,7 +2149,6 @@ fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_curs
         sorted(int64_rows(&output)),
         sorted(oracle(spec, &rows, &rows))
     );
-    drop(ctx);
     turn.begin_turn(1).unwrap();
     let mut ctx = StepContext::new(&error, &mut turn);
     let tail = step.drive(&mut ctx).unwrap();

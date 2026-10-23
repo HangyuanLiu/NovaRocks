@@ -279,7 +279,7 @@ mod tests {
 
     fn scan_plan_with_source(table_name: &str, source: ScanSource) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: table_name.to_string(),
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn logical_explain_formats_apply_and_assert_one_row() {
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 kind: ApplyKind::Exists { negated: true },
                 subquery_expr: TypedExpr {
                     kind: ExprKind::ColumnRef {
@@ -476,7 +476,7 @@ mod tests {
     fn shared_logical_formatter_path_covers_scan_filter_project_and_window() {
         let scan_columns = vec![output_column(1, "k", DataType::Int64, false)];
         let scan = LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "test_db".to_string(),
                 table: test_table_def(),
                 alias: Some("t".to_string()),

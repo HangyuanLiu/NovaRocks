@@ -52,7 +52,7 @@ pub(crate) use optimized_tree::OptimizedOperatorNode;
 pub(crate) use property::{DistributionSpec, OrderingSpec, PhysicalPropertySet};
 
 use std::cell::RefCell;
-#[cfg(any(test, novarocks_dev_controls))]
+#[cfg(test)]
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -63,7 +63,7 @@ use crate::column_id::ColumnRefFactory;
 use crate::compiler::SqlCompileError;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::scalar::ScalarArena;
-#[cfg(any(test, novarocks_dev_controls))]
+#[cfg(test)]
 use crate::optimizer::statistics::TableStatistics;
 use crate::optimizer::stats_input::{OptimizerStatsInput, QueryStatsSnapshot};
 use memo::MExpr;
@@ -183,7 +183,7 @@ pub(crate) fn optimize_with_root_distribution(
     )
 }
 
-#[cfg(any(test, novarocks_dev_controls))]
+#[cfg(test)]
 pub(crate) fn optimize_with_test_table_statistics(
     plan_expr: OptExpr,
     scalar_arena: ScalarArena,
@@ -1624,7 +1624,7 @@ mod is_known_rule_name_tests {
             )
         };
         let plan = LogicalPlanNode::new(
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 subquery_expr: TypedExpr {
                     kind: ExprKind::ColumnRef {

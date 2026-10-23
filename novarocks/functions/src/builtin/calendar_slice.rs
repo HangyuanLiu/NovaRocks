@@ -463,6 +463,9 @@ impl SliceValues {
         }
     }
 }
+type SliceRowErrorPort<'a, E> =
+    Option<&'a dyn Fn(&SliceRowError, usize) -> Result<RowDataError, E>>;
+
 struct SliceInput<'a, E = std::convert::Infallible> {
     domain: CalendarSliceDomain,
     selection: Selection<'a>,
@@ -471,7 +474,7 @@ struct SliceInput<'a, E = std::convert::Infallible> {
     count: SliceCount<'a>,
     unit: SliceText<'a>,
     boundary: Option<SliceText<'a>>,
-    row_error: Option<&'a dyn Fn(&SliceRowError, usize) -> Result<RowDataError, E>>,
+    row_error: SliceRowErrorPort<'a, E>,
 }
 fn evaluate_input<'a, E>(
     input: SliceInput<'a, E>,

@@ -34,9 +34,7 @@ fn compile(score_type: DataType, predicate: &str) -> SqlOptimizedOutput {
         let source = crate::planner::table::test_sql_scan_source(
             crate::planner::table::SqlScanKind::ConnectorRead,
         );
-        let crate::planner::table::ScanSource::Sql(scan) = &source else {
-            unreachable!()
-        };
+        let crate::planner::table::ScanSource::Sql(scan) = &source;
         evidence.push(crate::planning::dml::DmlStatisticsEvidence::Missing {
             binding: scan.binding,
             label: format!(
@@ -124,7 +122,10 @@ fn unwrap_nested(arena: &ScalarArena, mut id: ScalarId) -> ScalarId {
     }
     id
 }
-fn score_origin(arena: &ScalarArena, id: ScalarId) -> Option<(String, Vec<(DataType, DataType)>)> {
+type ScoreOrigin = (String, Vec<(DataType, DataType)>);
+type ScoreInterval = (String, Vec<(DataType, DataType)>, i64, i64);
+
+fn score_origin(arena: &ScalarArena, id: ScalarId) -> Option<ScoreOrigin> {
     let id = unwrap_nested(arena, id);
     match arena.node(id) {
         ScalarNode::ColumnRef(column) => {
@@ -139,10 +140,7 @@ fn score_origin(arena: &ScalarArena, id: ScalarId) -> Option<(String, Vec<(DataT
         _ => None,
     }
 }
-fn interval(
-    arena: &ScalarArena,
-    id: ScalarId,
-) -> Option<(String, Vec<(DataType, DataType)>, i64, i64)> {
+fn interval(arena: &ScalarArena, id: ScalarId) -> Option<ScoreInterval> {
     let ScalarNode::Between {
         child,
         low,

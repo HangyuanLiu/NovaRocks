@@ -79,6 +79,11 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use toml::Value;
 
+/// Validates the prepared role configuration before a fixture launches processes.
+pub type PrelaunchConfigCheck<'a> = &'a dyn Fn(&EffectiveLaunchConfigEvidence) -> Result<()>;
+/// Validates a process log source against the identity captured at spawn time.
+pub type ProcessLogOwnerCheck<'a> = &'a dyn Fn(&str, &ManagedProcessLogSource) -> Result<()>;
+
 const LIFECYCLE_CONVERGENCE_DEBUG_PATH: &str = "/debug/query-lifecycle/latest";
 const SYSTEM_NATIVE_TRUST_SECRET_ENV: &str = "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET";
 const MAX_FAILURE_LOG_REDACTION_VALUE_BYTES: usize = 64 * 1024;
@@ -3367,10 +3372,6 @@ impl QueryLifecycleFaultFiles {
         })
     }
 
-    fn root(&self) -> &Path {
-        &self.root
-    }
-
     fn terminal_ack_drop_path(&self, index: usize) -> Result<PathBuf> {
         self.be_path(index, QueryLifecycleFaultKind::TerminalAckDrop)
     }
@@ -3867,8 +3868,8 @@ impl CrossProcessServerHandle {
         plan: ClusterTestSessionPlan,
         proxy_config: CrossProcessNativeFaultProxyConfig,
         root_reply_fault: Option<CrossProcessRootReplyFaultConfig>,
-        prelaunch_check: Option<&dyn Fn(&EffectiveLaunchConfigEvidence) -> Result<()>>,
-        log_owner_check: Option<&dyn Fn(&str, &ManagedProcessLogSource) -> Result<()>>,
+        prelaunch_check: Option<PrelaunchConfigCheck<'_>>,
+        log_owner_check: Option<ProcessLogOwnerCheck<'_>>,
     ) -> Result<Self> {
         Self::launch_with_native_fault_options(
             options,
@@ -3887,8 +3888,8 @@ impl CrossProcessServerHandle {
         test_sessions: Option<ClusterTestSessionPlan>,
         proxy_config: CrossProcessNativeFaultProxyConfig,
         root_reply_fault: Option<CrossProcessRootReplyFaultConfig>,
-        prelaunch_check: Option<&dyn Fn(&EffectiveLaunchConfigEvidence) -> Result<()>>,
-        log_owner_check: Option<&dyn Fn(&str, &ManagedProcessLogSource) -> Result<()>>,
+        prelaunch_check: Option<PrelaunchConfigCheck<'_>>,
+        log_owner_check: Option<ProcessLogOwnerCheck<'_>>,
         budget: fixture_run::RunBudget,
     ) -> Result<Self> {
         Self::launch_with_native_fault_options(
@@ -3906,8 +3907,8 @@ impl CrossProcessServerHandle {
         options: CrossProcessClusterOptions,
         proxy_config: CrossProcessNativeFaultProxyConfig,
         root_reply_fault_config: Option<CrossProcessRootReplyFaultConfig>,
-        prelaunch_check: Option<&dyn Fn(&EffectiveLaunchConfigEvidence) -> Result<()>>,
-        log_owner_check: Option<&dyn Fn(&str, &ManagedProcessLogSource) -> Result<()>>,
+        prelaunch_check: Option<PrelaunchConfigCheck<'_>>,
+        log_owner_check: Option<ProcessLogOwnerCheck<'_>>,
         mut test_sessions: Option<ClusterTestSessionPlan>,
         fixture_budget: Option<fixture_run::RunBudget>,
     ) -> Result<Self> {
@@ -4295,15 +4296,15 @@ impl CrossProcessServerHandle {
             Ok(identities) => identities,
             Err(primary) => {
                 let mut failures = vec![format!("{primary:#}")];
-                if let Some(plan) = &mut test_sessions {
-                    if let Err(error) = plan.end_and_join() {
-                        failures.push(format!("join startup role sessions: {error:#}"));
-                    }
+                if let Some(plan) = &mut test_sessions
+                    && let Err(error) = plan.end_and_join()
+                {
+                    failures.push(format!("join startup role sessions: {error:#}"));
                 }
-                if let Some(process) = &mut initial_fe {
-                    if let Err(error) = process.stop() {
-                        failures.push(format!("reap partial startup FE: {error:#}"));
-                    }
+                if let Some(process) = &mut initial_fe
+                    && let Err(error) = process.stop()
+                {
+                    failures.push(format!("reap partial startup FE: {error:#}"));
                 }
                 for (index, process) in initial_be.iter_mut().enumerate() {
                     if let Err(error) = process.stop() {
@@ -4864,15 +4865,15 @@ impl CrossProcessServerHandle {
         }
         // Always settle this same FE, including failed/expired successful-exit wait.
         self.role_sessions_joined = true;
-        if let Some(plan) = &mut self.test_sessions {
-            if let Err(error) = plan.end_and_join() {
-                self.role_sessions_joined = false;
-                let detail = format!("join exact fixture role sessions: {error:#}");
-                failures[0] = Some(match failures[0].take() {
-                    Some(primary) => anyhow::anyhow!("{primary:#}; {detail}"),
-                    None => anyhow::anyhow!(detail),
-                });
-            }
+        if let Some(plan) = &mut self.test_sessions
+            && let Err(error) = plan.end_and_join()
+        {
+            self.role_sessions_joined = false;
+            let detail = format!("join exact fixture role sessions: {error:#}");
+            failures[0] = Some(match failures[0].take() {
+                Some(primary) => anyhow::anyhow!("{primary:#}; {detail}"),
+                None => anyhow::anyhow!(detail),
+            });
         }
         if let Err(error) = self.fe_process.stop() {
             failures[2] = Some(error);
@@ -4883,12 +4884,12 @@ impl CrossProcessServerHandle {
             }
         }
         self.native_fault_proxies.stop();
-        if failures.iter().all(Option::is_none) && !self.retain_runtime_artifacts {
-            if let Err(error) = fs::remove_dir_all(&self.runtime_dir) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    failures[6] = Some(error.into());
-                }
-            }
+        if failures.iter().all(Option::is_none)
+            && !self.retain_runtime_artifacts
+            && let Err(error) = fs::remove_dir_all(&self.runtime_dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            failures[6] = Some(error.into());
         }
         self.native_trust_fixture.cleanup_sensitive_material();
         if failures.iter().any(Option::is_some) {
@@ -4917,11 +4918,11 @@ impl CrossProcessServerHandle {
             failures.push(format!("retain actual role build information: {error:#}"));
         }
         self.role_sessions_joined = true;
-        if let Some(plan) = &mut self.test_sessions {
-            if let Err(error) = plan.end_and_join() {
-                self.role_sessions_joined = false;
-                failures.push(format!("join role test sessions: {error:#}"));
-            }
+        if let Some(plan) = &mut self.test_sessions
+            && let Err(error) = plan.end_and_join()
+        {
+            self.role_sessions_joined = false;
+            failures.push(format!("join role test sessions: {error:#}"));
         }
         // Special H2 actors join while the role owners still exist. The
         // ordinary TCP Data/Control proxies retain their original later stop.

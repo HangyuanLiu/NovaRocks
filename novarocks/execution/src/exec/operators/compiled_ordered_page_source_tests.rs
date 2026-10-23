@@ -21,6 +21,7 @@
 use super::*;
 use crate::connector::SourcePageConverter;
 use crate::exec::pipeline::operator::ConstructionFailure;
+use arrow::array::ArrayRef;
 use novarocks_spi::connector::read_stack::SourcePage;
 
 fn converted_plain_page(consumer: &Consumer) -> Chunk {

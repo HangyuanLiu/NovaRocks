@@ -16,15 +16,20 @@
 // under the License.
 //! Flat build-row match tracking and broadcast merge accumulator.
 
+#[cfg(test)]
 use crate::runtime::fragment::ExecutionFailure;
+#[cfg(test)]
 #[derive(Debug)]
 struct JoinMatchContract(novarocks_failure_contract::BoundedDetail);
+#[cfg(test)]
 impl std::fmt::Display for JoinMatchContract {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.0.as_str())
     }
 }
+#[cfg(test)]
 impl std::error::Error for JoinMatchContract {}
+#[cfg(test)]
 impl novarocks_failure_contract::FailureProjection for JoinMatchContract {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::new(
@@ -33,21 +38,20 @@ impl novarocks_failure_contract::FailureProjection for JoinMatchContract {
         )
     }
 }
+#[cfg(test)]
 fn contract(detail: impl std::fmt::Display) -> ExecutionFailure {
     ExecutionFailure::from_domain(JoinMatchContract(
         novarocks_failure_contract::BoundedDetail::truncating_display(detail),
     ))
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BuildMatchFlags {
     flags: Vec<bool>,
 }
 
-#[allow(
-    dead_code,
-    reason = "Match-flag inspection helpers are retained for outer-join regression coverage."
-)]
+#[cfg(test)]
 impl BuildMatchFlags {
     pub(crate) fn new(row_count: usize) -> Self {
         Self {
@@ -90,12 +94,9 @@ impl BuildMatchFlags {
             .map(|(row, _matched)| u32::try_from(row).expect("join build row id exceeds u32"))
             .collect()
     }
-
-    pub(crate) fn into_vec(self) -> Vec<bool> {
-        self.flags
-    }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct BuildMatchMerge {
     merged: Vec<bool>,
@@ -103,6 +104,7 @@ pub(crate) struct BuildMatchMerge {
     total_drivers: usize,
 }
 
+#[cfg(test)]
 impl BuildMatchMerge {
     pub(crate) fn new(total_drivers: usize, row_count: usize) -> Self {
         Self {
@@ -126,7 +128,7 @@ impl BuildMatchMerge {
                 self.merged.len()
             )));
         }
-        for (slot, matched) in self.merged.iter_mut().zip(local.into_iter()) {
+        for (slot, matched) in self.merged.iter_mut().zip(local) {
             *slot = *slot || matched;
         }
         self.drivers_merged += 1;

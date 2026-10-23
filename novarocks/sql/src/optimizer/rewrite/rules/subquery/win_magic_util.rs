@@ -268,7 +268,7 @@ mod tests {
     fn make_scan(table_id: i64, cols: Vec<(ColumnId, &str)>) -> LogicalPlanNode {
         let table_name = format!("t{table_id}");
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: table_name.clone(),
@@ -395,7 +395,7 @@ mod tests {
             variant_columns: vec![],
             mv_rewritten_from: None,
         };
-        let plan = LogicalPlanNode::new(LogicalPlanKind::Scan(scan_node), vec![], None);
+        let plan = LogicalPlanNode::new(LogicalPlanKind::scan(scan_node), vec![], None);
         let mut arena = ScalarArena::new();
         let expr = to_optimizer_expr(&plan, &mut arena);
         let Operator::LogicalScan(scan) = &expr.op else {

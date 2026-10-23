@@ -548,16 +548,6 @@ impl<K> Frame<K> {
                     work,
                 )?;
             if let Some(source) = data_error {
-                #[cfg(test)]
-                super::guarded_tests::record_temporal_invocation_data(
-                    source_shape,
-                    self.next - 1,
-                    source.detail(),
-                    novarocks_failure_contract::FailureProjection::failure_fact(&source),
-                    &self.rows,
-                    &ordinals,
-                    &self.errors,
-                );
                 for &parent in &ordinals {
                     work.step()?;
                     self.errors
@@ -767,8 +757,8 @@ impl<K> Frame<K> {
             between_comparison_operand(left, &parents, &self.rows, selection, batch_rows, work)?;
         let right =
             between_comparison_operand(right, &parents, &self.rows, selection, batch_rows, work)?;
-        let left = left.materialize(selection, &expected.data_type(), work)?;
-        let right = right.materialize(selection, &expected.data_type(), work)?;
+        let left = left.materialize(selection, expected.data_type(), work)?;
+        let right = right.materialize(selection, expected.data_type(), work)?;
         let state = self
             .membership
             .as_mut()
@@ -805,10 +795,6 @@ impl<K> Frame<K> {
         work.flush()?;
         Ok(())
     }
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Keep the immutable recipe owner, selected child, parent semantics and work scope explicit"
-    )]
     fn attach(
         &mut self,
         child: Child,
@@ -1197,7 +1183,7 @@ fn complete_node<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
                 .ok_or_else(|| internal("missing original IN source"))?;
             let source = source.value.into_value(local_selection, work)?;
             let output =
-                source.materialize(local_selection, &recipe.source_type().data_type(), work)?;
+                source.materialize(local_selection, recipe.source_type().data_type(), work)?;
             let mut failed = Vec::with_capacity(frame.errors.len());
             for &row in frame.errors.keys() {
                 failed.push(row);
@@ -1222,7 +1208,7 @@ fn complete_node<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
             work.flush()?;
             OwnedValue::from_selected(SelectedValues::try_new_observed(
                 local_selection,
-                &result_type.data_type(),
+                result_type.data_type(),
                 Arc::new(result),
                 errors.into_boxed_slice(),
                 || work.step(),
@@ -1244,7 +1230,7 @@ fn complete_node<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
             )?;
             OwnedValue::from_selected(SelectedValues::try_new_observed(
                 local_selection,
-                &result_type.data_type(),
+                result_type.data_type(),
                 array,
                 errors,
                 || work.step(),
@@ -1259,7 +1245,7 @@ fn complete_node<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
                 state.finish(shape, demand, std::mem::take(&mut frame.errors), work)?;
             OwnedValue::from_selected(SelectedValues::try_new_observed(
                 local_selection,
-                &result_type.data_type(),
+                result_type.data_type(),
                 array,
                 errors,
                 || work.step(),
@@ -1283,7 +1269,7 @@ fn complete_node<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
                 // only the frozen nullability widens.
                 OwnedValue::from_materialized(child.materialize(
                     local_selection,
-                    &recipe.result_type().data_type(),
+                    recipe.result_type().data_type(),
                     work,
                 )?)
             } else {
@@ -1394,7 +1380,7 @@ fn complete_node<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
             &frame.children,
             &frame.choices,
             &mut frame.errors,
-            &result_type.data_type(),
+            result_type.data_type(),
             local_selection,
             work,
         )?,
@@ -1479,7 +1465,7 @@ fn complete_node<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
                             &mut frame.errors,
                             &frame.routes,
                             local_selection.is_empty(),
-                            &result_type.data_type(),
+                            result_type.data_type(),
                             local_selection,
                             work,
                         )?
@@ -1488,7 +1474,7 @@ fn complete_node<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
                             &frame.children,
                             &frame.choices,
                             &mut frame.errors,
-                            &result_type.data_type(),
+                            result_type.data_type(),
                             local_selection,
                             work,
                         )?
@@ -1808,15 +1794,14 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                 resolved.calls().get(&ProgramCallSite::Expression(parent.occurrence)).map(|call|call.specialization().prepared()),
                 Some(PreparedPureKernel::ScalarInvocation(prepared)) if scalar_invocation::PreparedCall::Invocation(prepared).input_domain_policy() == novarocks_functions::InvocationInputDomainPolicy::OriginalActualDomain
             );
-            if parent_requires_original {
-                if let OwnedValue::Selected(_, errors) = value.uncontinued() {
-                    if let Some(error) = errors.first() {
-                        work.control
-                            .operation_aborted
-                            .store(true, Ordering::Relaxed);
-                        return Err(E::required(root, output_selection, error.clone()));
-                    }
-                }
+            if parent_requires_original
+                && let OwnedValue::Selected(_, errors) = value.uncontinued()
+                && let Some(error) = errors.first()
+            {
+                work.control
+                    .operation_aborted
+                    .store(true, Ordering::Relaxed);
+                return Err(E::required(root, output_selection, error.clone()));
             }
         }
         // Preserve the original leaf/required-child failure before any new
@@ -1880,10 +1865,6 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
 
 /// Only the typed owner policy enters this path. Sources are already evaluated
 /// in the exact actual domain; success projects output, never required errors.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Keep actual source scope and outer demand explicit"
-)]
 fn evaluate_original_invocation<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
     occurrence: K,
     prepared: scalar_invocation::PreparedCall<'_>,
@@ -1949,7 +1930,7 @@ fn evaluate_original_invocation<'a, E: scalar_invocation::FrameFailure, K: Ord +
     let (_, array, errors) = output.into_parts();
     SelectedValues::try_new_observed(
         demand,
-        &prepared.contract().result_type().data_type(),
+        prepared.contract().result_type().data_type(),
         array,
         errors,
         || work.step(),
@@ -3073,7 +3054,7 @@ fn validate_membership_phase(
     let values = gather(output.values(), &indices, work)?;
     let successful = SelectedValues::try_new_observed(
         selected,
-        &expected.data_type(),
+        expected.data_type(),
         values,
         Box::default(),
         || work.step(),

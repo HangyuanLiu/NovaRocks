@@ -600,8 +600,8 @@ fn ordered_topn_owned_frozen_key_slots_preserve_control_causes_and_named_uninsta
 // the new paid-slot entry. Corrupting either digest must never publish slots.
 #[test]
 fn ordered_topn_owned_frozen_contract_rejects_changed_digests_with_original_typed_cause() {
-    use crate::runtime::fragment::{ExecutionFailure, ExecutionFailureCause};
-    use crate::runtime_filter::RuntimeFilterFailure;
+    use crate::runtime::fragment::ExecutionFailureCause;
+
     use novarocks_local_program::{FilterNullOrder, FilterSortDirection, StaticFilterContract};
     for direction in [
         FilterSortDirection::Ascending,
@@ -657,9 +657,7 @@ fn ordered_topn_owned_frozen_contract_rejects_changed_digests_with_original_type
                 .unwrap_err();
                 let tracker = MemTracker::new_root("ordered-frozen-digest-refusal");
                 let host = OrderedTopNAllocationHost::new(tracker.clone());
-                let actual = ExecutionFailure::from(
-                    host.order_contract(&changed, &Control::pass()).unwrap_err(),
-                );
+                let actual = host.order_contract(&changed, &Control::pass()).unwrap_err();
                 assert_eq!(
                     actual.cause(),
                     &ExecutionFailureCause::RuntimeFilter(expected.clone())

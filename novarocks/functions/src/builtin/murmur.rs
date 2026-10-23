@@ -209,13 +209,13 @@ fn hash(
     const C2: u32 = 0x1b873593;
 
     let mut hash = seed;
-    let mut chunks = data.chunks_exact(4);
-    for chunk in &mut chunks {
+    let (chunks, rem) = data.as_chunks::<4>();
+    for chunk in chunks {
         work.step()?;
         work.step()?;
         work.step()?;
         work.step()?;
-        let mut k = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let mut k = u32::from_le_bytes(*chunk);
         k = k.wrapping_mul(C1);
         k = k.rotate_left(15);
         k = k.wrapping_mul(C2);
@@ -224,7 +224,6 @@ fn hash(
         hash = hash.wrapping_mul(5).wrapping_add(0xe6546b64);
     }
 
-    let rem = chunks.remainder();
     for _ in rem {
         work.step()?;
     }
@@ -375,6 +374,14 @@ pub fn format_timestamp_for_varchar(unit: &TimeUnit, value: i64, tz: Option<&str
     }
 }
 
+/// The v1 test adapter enters the same observed byte computation.
+pub fn murmur_hash3_32(data: &[u8], seed: u32) -> u32 {
+    let mut work = EvaluationCheckpoints::new(&super::string_extended::DirectStringControl);
+    let value = hash(data, seed, &mut work).expect("unrestricted legacy Murmur3 control");
+    work.finish().expect("unrestricted legacy Murmur3 control");
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,12 +437,4 @@ mod tests {
         ));
         assert_eq!(control.calls.load(Ordering::Relaxed), 2);
     }
-}
-
-/// The v1 test adapter enters the same observed byte computation.
-pub fn murmur_hash3_32(data: &[u8], seed: u32) -> u32 {
-    let mut work = EvaluationCheckpoints::new(&super::string_extended::DirectStringControl);
-    let value = hash(data, seed, &mut work).expect("unrestricted legacy Murmur3 control");
-    work.finish().expect("unrestricted legacy Murmur3 control");
-    value
 }

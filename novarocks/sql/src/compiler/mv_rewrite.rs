@@ -1319,7 +1319,6 @@ pub struct SqlImvSchemaContractFacts {
 }
 
 impl SqlImvSchemaContractFacts {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         bases: Vec<SqlImvBaseContractFacts>,
         output_columns: Vec<SqlImvOutputColumnFacts>,
@@ -1418,7 +1417,6 @@ pub struct SqlImvAggregateExecutionStateColumnFacts {
 }
 
 impl SqlImvAggregateExecutionStateColumnFacts {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         name: String,
         value_type: novarocks_type_contract::FunctionValueType,
@@ -1458,7 +1456,6 @@ pub struct SqlImvAggregateExecutionFacts {
 }
 
 impl SqlImvAggregateExecutionFacts {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         group_key_count: usize,
         visible_outputs: Vec<crate::mv_refresh::VisibleAggregateOutput>,
@@ -1543,7 +1540,10 @@ pub(crate) struct SqlImvRewriteSnapshot {
 }
 
 impl SqlImvRewriteSnapshot {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The constructor validates each frozen field against occurrence identity before publishing the snapshot; a bundle would obscure those cross-field checks."
+    )]
     pub(crate) fn from_frozen_parts(
         target: novarocks_types::naming::TableIdentity,
         target_binding: SqlTableBindingId,
@@ -1985,7 +1985,7 @@ pub(crate) fn test_aggregate_snapshot(
 
 /// SQL-owned join fixture for rewrite rules. It has no persistence, provider,
 /// or application-context dependency.
-#[cfg(any(test, novarocks_dev_controls))]
+#[cfg(test)]
 pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> {
     let qualified =
         |table_fqn: &str, qualifier_at_create: &str, field_id: u32| SqlImvQualifiedFieldLineage {
@@ -2510,7 +2510,6 @@ pub struct SqlMvRewriteDefinitionFacts {
 }
 
 impl SqlMvRewriteDefinitionFacts {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         mv_id: i64,
         definition_revision: [u8; 32],
@@ -3069,10 +3068,6 @@ pub(super) fn completion_statistics_tables(
 /// descriptor construction and catalog materialization happen before the
 /// application freezes request-local statistics. Statistics attachment and
 /// warn-and-skip selection are deliberately deferred to the seal phase.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "These are distinct frozen SQL planning facts and grouping them would obscure the compiler boundary."
-)]
 pub(crate) fn analyze_candidates(
     definitions: &MvRewriteDefinitionIndex,
     analyzer_catalog: &dyn PlannerTableProvider,

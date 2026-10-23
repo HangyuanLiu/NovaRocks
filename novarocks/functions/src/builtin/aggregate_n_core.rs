@@ -27,6 +27,14 @@ use std::cmp::Ordering;
 #[path = "aggregate_n_source_failure.rs"]
 mod source_failure;
 
+/// Decoded N state containing its source slot and allocator-owned values.
+#[expect(
+    type_alias_bounds,
+    reason = "The allocator bound is required to form the decoded allocator-backed values"
+)]
+pub type DecodedNValue<A: ScalarStateAllocator> =
+    Option<(usize, ScalarVec<TrackedAggScalarValue<A>, A>)>;
+
 /// Source-qualified consumers provide an owned scope around the original sort.
 /// This interface does not itself grant memory or cover other N operations.
 pub trait NSortResources {
@@ -403,7 +411,7 @@ pub fn decode_payload_at<A: ScalarStateAllocator>(
     row: usize,
     allocator: &A,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Option<(usize, ScalarVec<TrackedAggScalarValue<A>, A>)>, crate::KernelFailure> {
+) -> Result<DecodedNValue<A>, crate::KernelFailure> {
     decode_payload_at_with_codec_resources(array, row, allocator, &mut NoopCodecResources, work)
 }
 pub fn decode_payload_at_with_codec_resources<A: ScalarStateAllocator, R: NCodecResources>(
@@ -412,7 +420,7 @@ pub fn decode_payload_at_with_codec_resources<A: ScalarStateAllocator, R: NCodec
     allocator: &A,
     resources: &mut R,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Option<(usize, ScalarVec<TrackedAggScalarValue<A>, A>)>, crate::KernelFailure> {
+) -> Result<DecodedNValue<A>, crate::KernelFailure> {
     work.step()?;
     let payload = match array.data_type() {
         DataType::Binary => {

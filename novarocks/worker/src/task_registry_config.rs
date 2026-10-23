@@ -149,7 +149,8 @@ mod tests {
     #[test]
     fn zero_capacity_and_mismatched_completion_capacity_are_rejected() {
         let baseline = TaskExecutionRegistryConfig::for_process(BackendProcessId::new_v7(), 17, 9);
-        let invalid: [(&str, fn(&mut TaskExecutionRegistryConfig)); 6] = [
+        type ConfigMutation = (&'static str, fn(&mut TaskExecutionRegistryConfig));
+        let invalid: [ConfigMutation; 6] = [
             (
                 "max_tasks_per_context",
                 |config: &mut TaskExecutionRegistryConfig| config.max_tasks_per_context = 0,

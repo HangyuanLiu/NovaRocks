@@ -127,7 +127,7 @@ mod tests {
         let mut seed = 0x6a09_e667_f3bc_c909u64;
         for _ in 0..128 {
             let mut raw = [0u8; 32];
-            for bytes in raw.chunks_exact_mut(8) {
+            for bytes in raw.as_chunks_mut::<8>().0 {
                 seed ^= seed << 13;
                 seed ^= seed >> 7;
                 seed ^= seed << 17;

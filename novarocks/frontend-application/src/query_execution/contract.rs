@@ -70,7 +70,6 @@ impl ResolvedQueryOptions {
                 .runtime
                 .pipeline_dop
                 .expect("core resolves pipeline DOP before request handoff"),
-            enable_profile: self.runtime.enable_profile,
         }
     }
 
@@ -167,16 +166,11 @@ fn reconstruct_runtime_query_options(options: &QueryOptions) -> RuntimeQueryOpti
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeSubmissionOptionsView {
     pipeline_dop: i32,
-    enable_profile: bool,
 }
 
 impl NativeSubmissionOptionsView {
     pub const fn pipeline_dop(self) -> i32 {
         self.pipeline_dop
-    }
-
-    pub const fn enable_profile(self) -> bool {
-        self.enable_profile
     }
 }
 
@@ -199,6 +193,7 @@ impl RuntimeFilterLifecycleView {
 /// The engine-visible purpose of a distributed execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DistributedQueryIntent {
+    #[cfg(test)]
     Result,
     /// Signed bounded selection, validated before external COW write admission.
     CowMatch,
@@ -277,11 +272,6 @@ impl RestartableReadExecution {
             statistics_program: None,
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn instantiate_artifacts_for_test(&self) -> PreparedDistributedQuery {
-        self.attempt_template.instantiate()
-    }
 }
 
 impl DistributedQueryRequest {
@@ -299,42 +289,6 @@ impl DistributedQueryRequest {
         Ok(self)
     }
 
-    /// Bind runtime capacity supplied by statement admission. This never enters
-    /// the frozen semantic description or constructs a new result allowance.
-    pub(crate) fn with_result_window(
-        mut self,
-        window: novarocks_workload_control::ResultWindowAlias,
-        scope: &novarocks_workload_control::WorkScope,
-    ) -> Result<Self, DistributedQueryError> {
-        if !window.is_for_scope(scope) {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "distributed request result window belongs to a foreign scope",
-            ));
-        }
-        if self.result_capacity.is_some() {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "distributed request already owns its result window",
-            ));
-        }
-        scope.check().map_err(|error| {
-            DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                error.to_string(),
-            )
-        })?;
-        self.result_capacity = Some(novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(scope, window).map_err(|error| DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error.to_string()))?);
-        Ok(self)
-    }
-
-    pub fn frozen_description(&self) -> &FrozenExecutionDescription {
-        match &self.payload {
-            DistributedQueryPayload::RestartableRead(read) => read.description.as_ref(),
-            DistributedQueryPayload::SingleUse { description, .. } => description.as_ref(),
-        }
-    }
-
     pub fn intent(&self) -> DistributedQueryIntent {
         self.completion.intent()
     }
@@ -346,20 +300,12 @@ impl DistributedQueryRequest {
         }
     }
 
-    pub fn cancellation(&self) -> &QueryCancellationView {
-        &self.cancellation
-    }
-
     pub fn topology(&self) -> &novarocks_query_application::api::BackendTopologySnapshot {
         &self.topology
     }
 
     pub const fn deadline(&self) -> Option<Instant> {
         self.deadline
-    }
-
-    pub fn statistics_program(&self) -> Option<&StatisticsCollectionProgram> {
-        self.statistics_program.as_ref()
     }
 
     fn write_root_targets(
@@ -402,7 +348,6 @@ impl DistributedQueryRequest {
             artifacts,
             options,
             topology: self.topology,
-            deadline: self.deadline,
             cancellation: self.cancellation,
             completion: self.completion,
             write_stack_session: self.write_stack_session,
@@ -425,7 +370,6 @@ pub struct DistributedQueryRequestParts {
     pub artifacts: PreparedDistributedQuery,
     pub options: Arc<ResolvedQueryOptions>,
     pub topology: novarocks_query_application::api::BackendTopologySnapshot,
-    pub deadline: Option<Instant>,
     pub cancellation: QueryCancellationView,
     pub completion: QueryOutcomeFactory,
     pub(crate) write_root_decode_contract:
@@ -466,10 +410,13 @@ pub(crate) fn build_request_from_finalized_execution(
     let options = Arc::new(ResolvedQueryOptions::from_upstream(options));
     let control = crate::query_execution::planning::sql_compile_control_from_execution(execution);
     validate_completed_runtime_options(&description, &options, &control)?;
-    let restartable_read = matches!(
-        intent,
-        DistributedQueryIntent::Result | DistributedQueryIntent::Profile
-    ) && description.kind()
+    let restartable_read_intent = match intent {
+        DistributedQueryIntent::Profile => true,
+        #[cfg(test)]
+        DistributedQueryIntent::Result => true,
+        _ => false,
+    };
+    let restartable_read = restartable_read_intent && description.kind()
         == novarocks_query_application::api::QueryExecutionKind::Read
         && description.recovery()
             == novarocks_query_application::coordination::RecoveryMode::RestartAttemptBeforeVisibility;
@@ -563,10 +510,12 @@ pub enum DistributedQueryErrorKind {
 /// coordinator evidence rather than reconstructed from an error string.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PreReadyTopologyOutcome {
+    #[cfg(test)]
     BackendDraining {
         backend_idx: usize,
         process_id: BackendProcessId,
     },
+    #[cfg(test)]
     BackendProcessMismatch {
         backend_idx: usize,
         process_id: BackendProcessId,
@@ -578,6 +527,7 @@ pub(crate) enum PreReadyTopologyOutcome {
     /// The backend rejected the FE's exact native compatibility identity
     /// before ControlReady. This is retryable only through the existing
     /// effect-gated whole-round controller.
+    #[cfg(test)]
     CompatibilityMismatch {
         backend_idx: usize,
         process_id: BackendProcessId,
@@ -590,9 +540,12 @@ impl novarocks_execution_contract::failure::FailureProjection for PreReadyTopolo
             FailureClass, FailureFact, FailureReason, domain,
         };
         let (class, code) = match self {
+            #[cfg(test)]
             Self::BackendDraining { .. } => (FailureClass::Dependency, 35),
+            #[cfg(test)]
             Self::BackendProcessMismatch { .. } => (FailureClass::Dependency, 36),
             Self::BackendNotEligible { .. } => (FailureClass::Dependency, 37),
+            #[cfg(test)]
             Self::CompatibilityMismatch { .. } => (FailureClass::Invariant, 38),
         };
         FailureFact::new(
@@ -604,24 +557,30 @@ impl novarocks_execution_contract::failure::FailureProjection for PreReadyTopolo
 impl PreReadyTopologyOutcome {
     fn failure_site(self) -> novarocks_query_application::execution_error::ExecutionFailureSite {
         let process = match self {
-            Self::BackendDraining { process_id, .. }
-            | Self::BackendProcessMismatch { process_id, .. }
-            | Self::BackendNotEligible { process_id, .. }
-            | Self::CompatibilityMismatch { process_id, .. } => process_id,
+            #[cfg(test)]
+            Self::BackendDraining { process_id, .. } => process_id,
+            #[cfg(test)]
+            Self::BackendProcessMismatch { process_id, .. } => process_id,
+            Self::BackendNotEligible { process_id, .. } => process_id,
+            #[cfg(test)]
+            Self::CompatibilityMismatch { process_id, .. } => process_id,
         };
         novarocks_query_application::execution_error::ExecutionFailureSite::Backend { process }
     }
     fn safe_detail(self) -> &'static str {
         match self {
+            #[cfg(test)]
             Self::BackendDraining { .. } => {
                 "the captured backend is draining before context readiness"
             }
+            #[cfg(test)]
             Self::BackendProcessMismatch { .. } => {
                 "the captured backend process did not match before context readiness"
             }
             Self::BackendNotEligible { .. } => {
                 "the captured backend is ineligible before context readiness"
             }
+            #[cfg(test)]
             Self::CompatibilityMismatch { .. } => {
                 "native compatibility was rejected before context readiness"
             }
@@ -634,7 +593,7 @@ impl PreReadyTopologyOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DistributedQueryErrorBody {
     Coordinator(String),
-    Execution(novarocks_query_application::execution_error::ExecutionFailureInput),
+    Execution(Box<novarocks_query_application::execution_error::ExecutionFailureInput>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -657,7 +616,7 @@ impl DistributedQueryError {
             domain_source: None,
             root_fetch_failure: None,
             kind: DistributedQueryErrorKind::Failed,
-            body: DistributedQueryErrorBody::Execution(input),
+            body: DistributedQueryErrorBody::Execution(Box::new(input)),
             pre_ready_topology_outcome: None,
             pre_ready_topology_observation: false,
             compile_control: None,
@@ -842,10 +801,11 @@ impl DistributedQueryError {
             C::ContractViolation => DistributedQueryErrorKind::ContractViolation,
             _ => DistributedQueryErrorKind::Failed,
         };
-        self.body = DistributedQueryErrorBody::Execution(failure.input().clone());
+        self.body = DistributedQueryErrorBody::Execution(Box::new(failure.input().clone()));
         self.root_fetch_failure = Some(failure);
         self
     }
+    #[cfg(test)]
     pub(crate) fn root_fetch_failure(
         &self,
     ) -> Option<&novarocks_query_application::coordination::RootResultFetchFailure> {
@@ -863,7 +823,7 @@ impl DistributedQueryError {
             ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
         };
         let message = match self.body {
-            DistributedQueryErrorBody::Execution(input) => return input,
+            DistributedQueryErrorBody::Execution(input) => return *input,
             DistributedQueryErrorBody::Coordinator(message) => message,
         };
         if let Some(failure) = self.root_fetch_failure {
@@ -920,6 +880,7 @@ impl DistributedQueryError {
         )
     }
 
+    #[cfg(test)]
     pub fn kind(&self) -> DistributedQueryErrorKind {
         self.kind
     }
@@ -1079,7 +1040,7 @@ mod tests {
         ] {
             let fact = original.failure_fact();
             let selected = novarocks_query_application::coordination::SelectedTaskTermination::new(
-                identity.clone(),
+                identity,
                 novarocks_execution_contract::TerminationDetail::Failed(
                     novarocks_execution_contract::TaskFailure::new_in_phase(
                         fact,

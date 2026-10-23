@@ -824,8 +824,8 @@ mod tests {
     use crate::planner::runtime_filter::coverage::Coverage;
     use crate::planner::runtime_filter::graph::{
         ApplyPoint, ConsumerBindingTarget, ConsumerRequirementData, PlanLocation,
-        ProducerBindingTarget, ProducerRequirement, RuntimeFilterBindingRoleData,
-        RuntimeFilterBindingSpecData, RuntimeFilterChannelSpec, RuntimeFilterGraphData,
+        ProducerRequirement, RuntimeFilterBindingRoleData, RuntimeFilterBindingSpecData,
+        RuntimeFilterChannelSpec, RuntimeFilterGraphData,
     };
     use crate::planner::runtime_filter::progress::{
         FrontierEdge, FrontierSkip, JoinBuildProgressCatalog, JoinBuildProgressProof,
@@ -933,7 +933,6 @@ mod tests {
                         ContributionKind::ProducerClosed,
                     ]),
                     completion_requirement: CompletionRequirement::ProducerClosed,
-                    target: ProducerBindingTarget::JoinBuildKey { ordinal: 0 },
                 }),
             );
             graph

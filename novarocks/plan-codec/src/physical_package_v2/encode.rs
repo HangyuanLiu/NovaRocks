@@ -312,7 +312,6 @@ fn encode_fragment_package_in<'s>(
     let mut source = budget
         .facts()
         .coexisting_source_and_request_bytes_upper_bound;
-    drop(budget);
 
     // Original component encoders in hard dependency order. A completed
     // namespace stays live for later components, so its requested-backing

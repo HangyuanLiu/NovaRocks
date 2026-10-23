@@ -45,6 +45,9 @@ use novarocks_mv_application::maintenance::{
     MvBackgroundEngineError, MvBackgroundEngineErrorKind, MvMaintenanceFacts,
 };
 
+type SourceRevisionKey = (String, String, String, Vec<u8>);
+type SourceRevision = (ObjectIdentity, NativeDataVersion);
+
 fn background_connector_request_context() -> Result<ConnectorRequestContext, String> {
     ConnectorRequestContext::try_new(
         Instant::now() + Duration::from_secs(300),
@@ -174,10 +177,7 @@ impl MvBackgroundEngine for FrontendMvBackgroundEngine {
         let connector_context = background_connector_request_context().map_err(|error| {
             MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::TransientUnavailable, error)
         })?;
-        let mut revisions: BTreeMap<
-            (String, String, String, Vec<u8>),
-            (ObjectIdentity, NativeDataVersion),
-        > = BTreeMap::new();
+        let mut revisions: BTreeMap<SourceRevisionKey, SourceRevision> = BTreeMap::new();
         occurrences
             .iter()
             .map(|occurrence| {
@@ -285,10 +285,6 @@ fn preparation_error(error: RefreshError) -> MvBackgroundEngineError {
     let kind = match error.kind {
         RefreshErrorKind::PreCommitFailed => MvBackgroundEngineErrorKind::TransientUnavailable,
         RefreshErrorKind::UserError => MvBackgroundEngineErrorKind::InvalidDefinition,
-        RefreshErrorKind::CommitFailedKnownUncommitted
-        | RefreshErrorKind::CommitFailedKnownCommitted
-        | RefreshErrorKind::CommitUnknown
-        | RefreshErrorKind::MetadataFinalizeFailed => MvBackgroundEngineErrorKind::TerminalFailure,
     };
     MvBackgroundEngineError::new(kind, error.message.clone())
         .with_compile_control(error.compile_control_error())

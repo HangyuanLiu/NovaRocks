@@ -412,8 +412,9 @@ fn assertion(
 fn has_scan_label(source: &ScanSource) -> bool {
     matches!(source, ScanSource::Sql(source) if matches!(source.kind,
         SqlScanKind::Delta { .. }
-        | SqlScanKind::FrozenInputSet { version: crate::planner::table::SqlTableVersionSelector::Snapshot(_)
-            | crate::planner::table::SqlTableVersionSelector::TimestampMillis(_) }
+        | SqlScanKind::FrozenInputSet {
+            version: crate::planner::table::SqlTableVersionSelector::Snapshot(_),
+        }
         | SqlScanKind::MvTargetState { .. } | SqlScanKind::MvTargetLocator { .. }))
 }
 
@@ -432,9 +433,6 @@ impl fmt::Display for ScanLabel<'_> {
             SqlScanKind::FrozenInputSet { version } => match version {
                 crate::planner::table::SqlTableVersionSelector::Snapshot(id) => {
                     write!(out, "IcebergVersionTable snapshot_id={id}")
-                }
-                crate::planner::table::SqlTableVersionSelector::TimestampMillis(time) => {
-                    write!(out, "IcebergVersionTable timestamp_millis={time}")
                 }
                 crate::planner::table::SqlTableVersionSelector::Current => Err(fmt::Error),
             },
@@ -547,7 +545,10 @@ impl fmt::Write for ComparingWrite<'_, '_> {
     }
 }
 
+#[cfg(test)]
 pub(super) struct Project<'a>(pub &'a ProjectItem, pub Option<&'a RenderDiagnostic<'a>>);
+
+#[cfg(test)]
 impl fmt::Display for Project<'_> {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         project(out, self.0, self.1)
@@ -1001,13 +1002,6 @@ fn validate_type_depth(data_type: &DataType, depth: usize) -> fmt::Result {
         }
         _ => Ok(()),
     }
-}
-
-#[cfg(test)]
-pub(super) fn single(arguments: fmt::Arguments<'_>) -> String {
-    let mut output = ExplainRenderOutput::new(ExplainRenderBudget::default());
-    output.push(arguments).expect("bounded test rendering");
-    output.finish().pop().expect("one test line")
 }
 
 #[cfg(test)]

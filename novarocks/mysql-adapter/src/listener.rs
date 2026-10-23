@@ -30,7 +30,6 @@ use tracing::warn;
 ))]
 mod fixture_join_observation;
 #[cfg(any(
-    test,
     feature = "mem-1-m07-exact-mysql-write",
     feature = "mem-1-m07-closing-pressure"
 ))]
@@ -46,7 +45,12 @@ pub(crate) use fixture_join_observation::MysqlFixtureSessionJoins;
     feature = "mem-1-m07-exact-mysql-write",
     feature = "mem-1-m07-closing-pressure"
 ))]
-pub(crate) use fixture_join_observation::{WatcherAbortGuard, WatcherFacts, WatcherPermit};
+pub(crate) use fixture_join_observation::WatcherAbortGuard;
+#[cfg(any(
+    feature = "mem-1-m07-exact-mysql-write",
+    feature = "mem-1-m07-closing-pressure"
+))]
+pub(crate) use fixture_join_observation::{WatcherFacts, WatcherPermit};
 
 /// Bind a TCP listener and retain accepted protocol tasks until `shutdown`.
 ///
@@ -519,9 +523,8 @@ mod tests {
             tokio::select! {
                 result = &mut server, if server_result.is_none() => server_result = Some(result),
                 result = &mut client, if client_result.is_none() => {
-                    if result.is_err() {
-                        if let Some(sender) = drain.lock().unwrap().take() { let _ = sender.send(()); }
-                    }
+                    if result.is_err()
+                        && let Some(sender) = drain.lock().unwrap().take() { let _ = sender.send(()); }
                     client_result = Some(result);
                 },
                 _ = &mut deadline => { timed_out = true; break; },

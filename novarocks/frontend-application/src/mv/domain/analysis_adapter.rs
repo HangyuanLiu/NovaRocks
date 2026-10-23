@@ -27,7 +27,7 @@ use crate::mv::domain::readiness::MvReadinessPort;
 use novarocks_mv_application::persistence::codec::{ConfigurationDocument, RefreshPolicy};
 use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_mv_application::readiness::MvListedManageability;
-use novarocks_query_application::api::{QueryResult, build_utf8_table_query_result};
+use novarocks_query_application::api::QueryResult;
 
 /// Lightweight projection of the iceberg base table that
 /// `validate_ivm_primary_key` needs. Built once at the top of `create_mv`
@@ -670,7 +670,7 @@ mod tests {
         );
         assert_eq!(row.last_refresh_time.as_deref(), Some("1700000001234"),);
         assert_eq!(row.last_refresh_rows.as_deref(), Some("7"));
-        let Some(published) = projection.facts.publication() else {
+        let Some(_published) = projection.facts.publication() else {
             panic!("expected a published projection");
         };
     }

@@ -174,25 +174,6 @@ impl MvRefreshExecutionPort for FrontendRefreshExecution<'_> {
     }
 }
 
-/// Close one publication's management responsibility.
-///
-/// A failure to close is logged rather than substituted for the refresh's own
-/// outcome: the commit already happened or did not, and the record cannot
-/// change that.
-fn record_publication_terminal(
-    admitted: crate::mv::domain::staged_create::AdmittedMvPublication,
-    committed: bool,
-) {
-    let disposition = if committed {
-        novarocks_mv_application::management::EffectDisposition::KnownCommitted
-    } else {
-        novarocks_mv_application::management::EffectDisposition::KnownUncommitted
-    };
-    if let Err(error) = admitted.record_terminal(disposition) {
-        tracing::warn!(%error, "recording the MV publication terminal failed");
-    }
-}
-
 /// Close one data publication's management responsibility with what the
 /// provider actually said.
 ///
@@ -220,7 +201,6 @@ fn record_data_publication_terminal(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn execute_data(
     dependencies: &FrontendMvRefreshDependencies,
     planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
@@ -442,7 +422,6 @@ fn bind_and_execute_data_write(
 /// fast-forwarded -- three commits, an intermediate branch a crash could
 /// strand, and no P document at all, so the canonical projection had nothing
 /// to read and the refresh failed after its external effects had landed.
-#[allow(clippy::too_many_arguments)]
 fn execute_metadata_only(
     dependencies: &FrontendMvRefreshDependencies,
     planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
@@ -645,38 +624,6 @@ fn wait_for_mv_recovery_phase(
     Ok(())
 }
 
-fn require_catalog_commit(
-    resolution: crate::connector::mutation::ResolvedCatalogMutation,
-    operation: &str,
-) -> Result<crate::connector::mutation::CompletedCatalogMutation, MvApplicationError> {
-    match resolution {
-        crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(completed) => {
-            match &completed.finalization {
-                ExternalMutationFinalization::Complete => Ok(completed),
-                ExternalMutationFinalization::Failed(error) => Err(MvApplicationError::new(
-                    MvApplicationErrorKind::KnownCommittedFinalizeFailed,
-                    format!("{operation} finalization failed: {error}"),
-                )),
-            }
-        }
-        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted {
-            failure, ..
-        } => Err(MvApplicationError::new(
-            MvApplicationErrorKind::Engine,
-            format!("{operation} was not committed: {failure}"),
-        )),
-        crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { failure, .. } => {
-            Err(MvApplicationError::new(
-                MvApplicationErrorKind::CommitUnknown,
-                format!("{operation} outcome is unknown: {failure}"),
-            ))
-        }
-        crate::connector::mutation::ResolvedCatalogMutation::ContractFailure { error, .. } => {
-            Err(invalid(format!("{operation} contract failed: {error}")))
-        }
-    }
-}
-
 /// Commit the empty write of a metadata-only publication.
 ///
 /// It is the same terminal as `commit_known` and reports the same three
@@ -772,17 +719,11 @@ fn provider_failure(error: MvApplicationError) -> MvProviderFailure {
     let kind = match error.kind() {
         MvApplicationErrorKind::InvalidRequest => MvProviderFailureKind::InvalidRequest,
         MvApplicationErrorKind::Unavailable
-        | MvApplicationErrorKind::Repository
         | MvApplicationErrorKind::AlreadyActive
         | MvApplicationErrorKind::ShutdownCancelled => MvProviderFailureKind::Unavailable,
-        MvApplicationErrorKind::BindingInvalidated | MvApplicationErrorKind::TargetGone => {
-            MvProviderFailureKind::TargetReplaced
-        }
+        MvApplicationErrorKind::BindingInvalidated => MvProviderFailureKind::TargetReplaced,
         MvApplicationErrorKind::CommitUnknown => MvProviderFailureKind::CommitUnknown,
-        MvApplicationErrorKind::Corruption => MvProviderFailureKind::Corruption,
-        MvApplicationErrorKind::Engine
-        | MvApplicationErrorKind::TerminalFailure
-        | MvApplicationErrorKind::KnownCommittedFinalizeFailed => {
+        MvApplicationErrorKind::Engine | MvApplicationErrorKind::KnownCommittedFinalizeFailed => {
             MvProviderFailureKind::KnownUncommitted
         }
     };

@@ -27,7 +27,6 @@ use novarocks_types::naming::TableIdentity;
 pub struct NonJoinBaseChange<'a> {
     pub occurrence_id: SqlMvRelationOccurrenceId,
     pub base_ref: &'a TableIdentity,
-    pub previous_snapshot_id: i64,
     pub current_snapshot_id: i64,
     pub current_table_object_id: &'a ConnectorTableObjectId,
     pub admission: ConnectorChangeWindowAdmission,

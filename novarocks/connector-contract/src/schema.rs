@@ -53,6 +53,7 @@ pub(crate) fn owned_field(field: &Field) -> Result<Field, ConnectorError> {
 /// Count and materialize share every source occurrence and request author.
 /// Count returns no partial Field and is not a schema-validity certificate;
 /// Arrow Union identity validation remains with try_new during actual copy.
+#[cfg(test)]
 pub(crate) fn owned_field_core<O: OwnedCopy>(
     field: &Field,
     context: &mut O,

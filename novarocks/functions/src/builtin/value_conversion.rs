@@ -177,16 +177,6 @@ pub fn resolve_value_conversion(
     })
 }
 
-// A pure declaration recipe is not an invocation of a catalogue resolver. It
-// preserves the existing logical-coercion predicates without minting a control
-// capability or pretending their legacy recursive work is cooperative.
-pub(super) fn recipe_selection(
-    source: &FunctionValueType,
-    target: &FunctionValueType,
-) -> Result<FunctionBindingSelection, FunctionBindingError> {
-    selection(recipe_family(source, target)?, source, target)
-}
-
 /// The original declaration's family decision, before any selection backing.
 /// Authorization borrows this decision; real publication uses selection above.
 pub(super) fn recipe_family(
@@ -238,14 +228,6 @@ fn selection(
 /// Same-domain carrier coercion remains with the existing type owner. A
 /// decided logical-domain change must be admitted by the exact conversion
 /// owner; untyped NULL does not establish a domain and follows the variable.
-pub(crate) fn assignment_domains_authorized(
-    source: &FunctionValueType,
-    target: &FunctionValueType,
-) -> bool {
-    is_default_json_structure_cast(source, target)
-        || conversion_intermediate_type(source, target).is_ok()
-}
-
 pub(super) fn assignment_domains_authorized_with_construction<E>(
     source: &FunctionValueType,
     target: &FunctionValueType,

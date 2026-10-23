@@ -190,21 +190,22 @@ impl Scenario for ClientProgress {
             Ok(())
         })().err();
         let mut cleanup = Vec::new();
-        if !control_completed && !job.is_finished() {
-            if let Err(error) = context.handle().kill_query_until(connection, deadline) {
-                cleanup.push(format!("held client cleanup KILL: {error:#}"));
-            }
+        if !control_completed
+            && !job.is_finished()
+            && let Err(error) = context.handle().kill_query_until(connection, deadline)
+        {
+            cleanup.push(format!("held client cleanup KILL: {error:#}"));
         }
         // Every gate is released before join, even if a census/probe/control failed.
         if let Some(resume) = resume_metadata.take() {
             let _ = resume.send(());
         }
-        if matches!(mode, Mode::Slow) {
-            if let Err(error) = permits.try_send(PayloadReadPermit::Drain) {
-                // Closed means the actor already exited; Full is a cleanup defect.
-                if matches!(error, tokio::sync::mpsc::error::TrySendError::Full(_)) {
-                    cleanup.push("payload Drain command could not be published".to_owned());
-                }
+        if matches!(mode, Mode::Slow)
+            && let Err(error) = permits.try_send(PayloadReadPermit::Drain)
+        {
+            // Closed means the actor already exited; Full is a cleanup defect.
+            if matches!(error, tokio::sync::mpsc::error::TrySendError::Full(_)) {
+                cleanup.push("payload Drain command could not be published".to_owned());
             }
         }
         drop(permits);

@@ -55,6 +55,7 @@ novarocks-secret.workspace = true
 novarocks-spi.workspace = true
 
 [dev-dependencies]
+novarocks-failpoint = { workspace = true, features = ["typed"] }
 serde_json.workspace = true
 tempfile.workspace = true
 

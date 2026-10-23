@@ -429,8 +429,8 @@ impl<'a> SortCreation<'a> {
                     .map_err(|source| failure::arrow(Operation::Take, source))?,
             );
         }
-        Ok(RecordBatch::try_new(batch.schema(), columns)
-            .map_err(|source| failure::arrow(Operation::Batch, source))?)
+        RecordBatch::try_new(batch.schema(), columns)
+            .map_err(|source| failure::arrow(Operation::Batch, source))
     }
 
     pub(crate) fn normalize_key(
@@ -476,11 +476,6 @@ impl<'a> SortCreation<'a> {
                     )?,
                 )?),
                 SortKeyConstruction::BufferAdoption => self.buffer_adoption(owner),
-                SortKeyConstruction::Type(ty) => types.observe(
-                    0,
-                    &[],
-                    crate::exec::chunk::ArrayNormalizationStep::RebuildType { source: ty },
-                ),
                 SortKeyConstruction::Work(units) => self.factory.observe_input_work(units),
                 SortKeyConstruction::ArrayHeader(ty) => {
                     let layout = match ty {
@@ -652,10 +647,8 @@ impl<'a> SortCreation<'a> {
         }
         // Original payload algorithm and SchemeS are unchanged. Complete
         // declarations are already exact; there is no NULL/name inference.
-        Ok(
-            arrow::compute::concat_batches(&schema, chunks.iter().map(Chunk::record_batch))
-                .map_err(|source| failure::arrow(Operation::ConcatBatches, source))?,
-        )
+        arrow::compute::concat_batches(&schema, chunks.iter().map(Chunk::record_batch))
+            .map_err(|source| failure::arrow(Operation::ConcatBatches, source))
     }
 
     pub(crate) fn source_type_storage(
@@ -712,7 +705,7 @@ impl<'a> SortCreation<'a> {
 fn copy_failure(
     error: novarocks_functions::selected_copy::CopyConstructionError<ConstructionFailure>,
 ) -> crate::runtime::fragment::ExecutionFailure {
-    use novarocks_functions::selected_copy::{CopyConstructionError, CopyError};
+    use novarocks_functions::selected_copy::CopyConstructionError;
     match error {
         CopyConstructionError::Creator(cause) => cause.into(),
         CopyConstructionError::Resource(cause) => ConstructionFailure::Resource(cause).into(),

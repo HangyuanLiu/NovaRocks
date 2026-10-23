@@ -31,6 +31,7 @@ use novarocks_type_contract::CompileCheckpoints;
 fn invalid() -> TypeCodecError {
     TypeCodecError::InvalidShape("flat pool batch metadata differs from checked geometry")
 }
+#[cfg(test)]
 pub(super) fn backing(geometry: &Geometry) -> Result<usize, TypeCodecError> {
     backing_counts(1, geometry.buffers, usize::from(geometry.views))
 }

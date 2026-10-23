@@ -64,10 +64,6 @@ impl TransportBudget {
     /// the same reason — a
     /// `QueryContextRef` names one query on one backend, so one context's
     /// tasks are a subset of that backend's.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "every bound is independent; grouping them would invent a hierarchy the contract does not have"
-    )]
     pub fn new(
         max_batch_items: usize,
         max_batch_encoded_bytes: usize,

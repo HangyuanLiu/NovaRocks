@@ -1467,7 +1467,7 @@ fn verify_runtime_filter_structured_assertion(
         return Ok(());
     }
 
-    if assertion.runtime_filter_availability.is_some()
+    if let Some(expected_availability) = assertion.runtime_filter_availability.as_ref()
         && !matches!(
             after.runtime_filter,
             novarocks_cluster_harness::RuntimeFilterTerminalRollup::Available { .. }
@@ -1475,10 +1475,7 @@ fn verify_runtime_filter_structured_assertion(
     {
         bail!(
             "runtime-filter availability mismatch: expected {}, actual {:?}, execution_id={:?}",
-            assertion
-                .runtime_filter_availability
-                .expect("checked")
-                .as_str(),
+            expected_availability.as_str(),
             after.runtime_filter,
             after.execution_id
         );
@@ -1710,11 +1707,11 @@ fn execute_target_query_with_selected_control(
         )
     });
     #[cfg(unix)]
-    if let Some(owner) = &mut operation_owner {
-        if let Err(error) = owner.close_and_join() {
-            result.0 = false;
-            result.2 = format!("{}; query socket owner cleanup: {error:#}", result.2);
-        }
+    if let Some(owner) = &mut operation_owner
+        && let Err(error) = owner.close_and_join()
+    {
+        result.0 = false;
+        result.2 = format!("{}; query socket owner cleanup: {error:#}", result.2);
     }
     if meta.kill_fe_after_mv_known_committed_before_projector_cas
         || meta.kill_fe_after_be_log_contains.is_some()
@@ -2567,24 +2564,23 @@ fn run_case_observed(
                     for (query, result) in &mut results {
                         if let Some(step) =
                             case.steps.iter().find(|step| step.query_number == *query)
-                        {
-                            if let Err(error) = fixture_context::render_expected_result(
+                            && let Err(error) = fixture_context::render_expected_result(
                                 &step.sql,
                                 result,
                                 &case.expected_variables,
                                 &case.namespace_rewrites,
-                            ) {
-                                let _ = writeln!(
-                                    log,
-                                    "    ❌ expected catalog metadata binding failed: {error:#}"
-                                );
-                                return CaseOutcome {
-                                    case_id: case.case_id.clone(),
-                                    status: CaseStatus::Fail,
-                                    elapsed: case_elapsed,
-                                    log,
-                                };
-                            }
+                            )
+                        {
+                            let _ = writeln!(
+                                log,
+                                "    ❌ expected catalog metadata binding failed: {error:#}"
+                            );
+                            return CaseOutcome {
+                                case_id: case.case_id.clone(),
+                                status: CaseStatus::Fail,
+                                elapsed: case_elapsed,
+                                log,
+                            };
                         }
                     }
                     Some(results)
@@ -4682,12 +4678,11 @@ fn run_suite_with_hooks(
                 .init_hook
                 .as_ref()
                 .is_some_and(|init| init.path == hook.path)
+                && let Err(error) = &result
             {
-                if let Err(error) = &result {
-                    init_errors.push(format!("{error:#}"));
-                    if let Some(recorder) = &ps.ctx.results {
-                        recorder.init_failed(&ps.cases);
-                    }
+                init_errors.push(format!("{error:#}"));
+                if let Some(recorder) = &ps.ctx.results {
+                    recorder.init_failed(&ps.cases);
                 }
             }
             result
@@ -6746,7 +6741,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             }
 
             let mut slowest_case_timings = all_case_timings.clone();
-            slowest_case_timings.sort_by(|a, b| b.elapsed.cmp(&a.elapsed));
+            slowest_case_timings.sort_by_key(|timing| std::cmp::Reverse(timing.elapsed));
             println!("\nslowest cases (top 5):");
             for timing in slowest_case_timings.iter().take(5) {
                 println!(
@@ -6802,23 +6797,23 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         result
     })();
     let mut fixture_failures = Vec::new();
-    if let Some(fixture) = publication_catalog_fixture.as_mut() {
-        if let Err(error) = fixture.shutdown() {
-            fixture_failures.push(format!("join publication fixture: {error:#}"));
-        }
+    if let Some(fixture) = publication_catalog_fixture.as_mut()
+        && let Err(error) = fixture.shutdown()
+    {
+        fixture_failures.push(format!("join publication fixture: {error:#}"));
     }
     // Consumers and proxy actors have actually exited before the physical fixture is reclaimed.
     if let Some(fixture) = isolated_rest_catalog.as_mut() {
         let workspace = fixture.workspace_root().to_path_buf();
         match fixture.shutdown() {
             Ok(()) => {
-                if let Err(error) = fs::remove_dir_all(&workspace) {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        fixture_failures.push(format!(
-                            "remove isolated fixture workspace {}: {error}",
-                            workspace.display()
-                        ));
-                    }
+                if let Err(error) = fs::remove_dir_all(&workspace)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    fixture_failures.push(format!(
+                        "remove isolated fixture workspace {}: {error}",
+                        workspace.display()
+                    ));
                 }
             }
             Err(error) => fixture_failures.push(format!("stop isolated fixture: {error:#}")),

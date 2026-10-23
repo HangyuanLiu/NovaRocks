@@ -459,10 +459,10 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for MysqlWriteGate<W> {
         }
         let result = Pin::new(this.inner.as_mut().expect("attached MySQL test IO"))
             .poll_write(cx, &bytes[..count]);
-        if let Poll::Ready(Ok(n)) = &result {
-            if let Err(e) = accepted(&mut state, &[IoSlice::new(&bytes[..count])], *n, count) {
-                return Poll::Ready(Err(e));
-            }
+        if let Poll::Ready(Ok(n)) = &result
+            && let Err(e) = accepted(&mut state, &[IoSlice::new(&bytes[..count])], *n, count)
+        {
+            return Poll::Ready(Err(e));
         }
         result
     }
@@ -526,10 +526,10 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for MysqlWriteGate<W> {
             return Pin::new(this.inner.as_mut().expect("attached MySQL test IO"))
                 .poll_write_vectored(cx, bytes);
         };
-        if let Poll::Ready(Ok(n)) = &result {
-            if let Err(e) = accepted(&mut state, &slices[..count], *n, offered) {
-                return Poll::Ready(Err(e));
-            }
+        if let Poll::Ready(Ok(n)) = &result
+            && let Err(e) = accepted(&mut state, &slices[..count], *n, offered)
+        {
+            return Poll::Ready(Err(e));
         }
         result
     }

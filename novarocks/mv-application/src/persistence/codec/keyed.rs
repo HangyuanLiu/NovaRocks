@@ -334,6 +334,53 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// Charge the simultaneously retained D/L/B/C models before any DTO allocation.
+pub fn preflight_keyed_document_set(
+    d: &[u8],
+    l: &[u8],
+    b: &[u8],
+    c: &[u8],
+    p: Option<&[u8]>,
+    budget: PersistenceDecodeBudget,
+) -> Result<(), PersistenceCodecError> {
+    let mut bytes = p.map_or(0, |p| p.len());
+    let mut working = p.map_or(0, |p| p.len().saturating_mul(6));
+    let mut items = 0usize;
+    for (content, schema) in [
+        (d, wire::Schema::DefinitionDocument),
+        (l, wire::Schema::InterpretationDocument),
+        (b, wire::Schema::BindingDocument),
+        (c, wire::Schema::ConfigurationDocument),
+    ] {
+        let usage = wire::preflight(content, schema, budget)?;
+        bytes = bytes.saturating_add(usage.encoded_bytes);
+        working = working.saturating_add(usage.estimated_working_set_bytes);
+        items = items.saturating_add(usage.expanded_items);
+    }
+    for (resource, actual, maximum) in [
+        (
+            "keyed Current encoded set",
+            bytes,
+            crate::persistence::validation::DEFAULT_MAX_DOCUMENT_SET_BYTES,
+        ),
+        (
+            "keyed Current decode working set",
+            working,
+            budget.max_working_set_bytes,
+        ),
+        ("keyed Current items", items, budget.max_items),
+    ] {
+        if actual > maximum {
+            return Err(PersistenceCodecError::ResourceBudget {
+                resource,
+                actual,
+                maximum,
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,51 +522,4 @@ mod tests {
         assert!(decode_binding(&bytes, PersistenceDecodeBudget::default()).is_err());
         assert!(decode_binding(&[8, 2], PersistenceDecodeBudget::default()).is_err());
     }
-}
-
-/// Charge the simultaneously retained D/L/B/C models before any DTO allocation.
-pub fn preflight_keyed_document_set(
-    d: &[u8],
-    l: &[u8],
-    b: &[u8],
-    c: &[u8],
-    p: Option<&[u8]>,
-    budget: PersistenceDecodeBudget,
-) -> Result<(), PersistenceCodecError> {
-    let mut bytes = p.map_or(0, |p| p.len());
-    let mut working = p.map_or(0, |p| p.len().saturating_mul(6));
-    let mut items = 0usize;
-    for (content, schema) in [
-        (d, wire::Schema::DefinitionDocument),
-        (l, wire::Schema::InterpretationDocument),
-        (b, wire::Schema::BindingDocument),
-        (c, wire::Schema::ConfigurationDocument),
-    ] {
-        let usage = wire::preflight(content, schema, budget)?;
-        bytes = bytes.saturating_add(usage.encoded_bytes);
-        working = working.saturating_add(usage.estimated_working_set_bytes);
-        items = items.saturating_add(usage.expanded_items);
-    }
-    for (resource, actual, maximum) in [
-        (
-            "keyed Current encoded set",
-            bytes,
-            crate::persistence::validation::DEFAULT_MAX_DOCUMENT_SET_BYTES,
-        ),
-        (
-            "keyed Current decode working set",
-            working,
-            budget.max_working_set_bytes,
-        ),
-        ("keyed Current items", items, budget.max_items),
-    ] {
-        if actual > maximum {
-            return Err(PersistenceCodecError::ResourceBudget {
-                resource,
-                actual,
-                maximum,
-            });
-        }
-    }
-    Ok(())
 }

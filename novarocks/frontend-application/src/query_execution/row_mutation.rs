@@ -539,11 +539,13 @@ impl RelayedCowSelectionCollector {
     }
 
     /// Bytes held by the bounded collector.
+    #[cfg(test)]
     pub const fn byte_count(&self) -> u64 {
         self.collector.byte_count()
     }
 
     /// Bytes held by an unfinished record.
+    #[cfg(test)]
     pub fn assembly_bytes(&self) -> usize {
         self.assembly.retained_bytes()
     }
@@ -1212,7 +1214,7 @@ mod tests {
         let mut collector =
             RelayedCowSelectionCollector::try_new(context(stop, 1 << 20), None, signed).unwrap();
         let error = collector
-            .push_body(&relayed_stream(&[input.clone()]))
+            .push_body(&relayed_stream(std::slice::from_ref(&input)))
             .unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         assert!(error.to_string().contains("required field contains NULL"));

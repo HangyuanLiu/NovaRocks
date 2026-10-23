@@ -205,16 +205,17 @@ impl ListingUriContext {
                 // Preauthorize the worst-case join before PathBuf copies. Keep
                 // std Path::join semantics, including absolute child paths.
                 let root = self.local_root.as_deref().filter(|root| *root != ".");
-                let length = if Path::new(path).is_absolute() || root.is_none() {
-                    path.len()
-                } else {
-                    let root = root.unwrap();
-                    let separator =
-                        usize::from(!root.is_empty() && !root.ends_with(std::path::MAIN_SEPARATOR));
-                    root.len()
-                        .checked_add(separator)
-                        .and_then(|bytes| bytes.checked_add(path.len()))
-                        .ok_or_else(listing_path_exhausted)?
+                let length = match root {
+                    Some(root) if !Path::new(path).is_absolute() => {
+                        let separator = usize::from(
+                            !root.is_empty() && !root.ends_with(std::path::MAIN_SEPARATOR),
+                        );
+                        root.len()
+                            .checked_add(separator)
+                            .and_then(|bytes| bytes.checked_add(path.len()))
+                            .ok_or_else(listing_path_exhausted)?
+                    }
+                    _ => path.len(),
                 };
                 self.bounds.check_path_length(length)?;
                 self.bounds.check_workspace(
@@ -223,10 +224,10 @@ impl ListingUriContext {
                         .ok_or_else(listing_workspace_exhausted)?,
                 )?;
                 let mut joined = PathBuf::with_capacity(length);
-                if !Path::new(path).is_absolute() {
-                    if let Some(root) = root {
-                        joined.push(root);
-                    }
+                if !Path::new(path).is_absolute()
+                    && let Some(root) = root
+                {
+                    joined.push(root);
                 }
                 joined.push(path);
                 self.bounds.check_path_length(joined.capacity())?;

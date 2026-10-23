@@ -51,7 +51,6 @@ pub struct ConnectorDocumentManagementAdmissionRequest {
 }
 
 impl ConnectorDocumentManagementAdmissionRequest {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         owner: ConnectorProviderBindingKey,
         catalog_handle: CatalogHandle,
@@ -223,7 +222,6 @@ pub struct ConnectorDocumentPublicationDeclaration {
 }
 
 impl ConnectorDocumentPublicationDeclaration {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         publication_id: LakePublicationId,
         admission: ConnectorDocumentManagementAdmission,

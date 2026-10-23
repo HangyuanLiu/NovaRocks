@@ -295,25 +295,6 @@ fn inspect_span_policy_core<H>(
     Ok(result)
 }
 
-pub(crate) fn inspect_in(
-    pool: &ConstantPool,
-    max_rows: usize,
-    max_buffers: usize,
-    max_body_bytes: usize,
-    capture: &mut dyn FnMut(&Geometry) -> Result<(), TypeCodecError>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<Geometry, TypeCodecError> {
-    inspect_with_host_in(
-        pool,
-        max_rows,
-        max_buffers,
-        max_body_bytes,
-        &mut |geometry| capture(geometry).map_err(HostError::<std::convert::Infallible>::from),
-        work,
-    )
-    .map_err(ProjectionFailure::without_host)
-}
-
 pub(crate) fn inspect_with_host_in<H>(
     pool: &ConstantPool,
     max_rows: usize,

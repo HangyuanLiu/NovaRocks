@@ -15,20 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! SQL-private runtime-filter planning algebra.
-// Design: ADR-0027 (docs/adr/ADR-0027-sql-runtime-filter-planning-ownership.md)
+//! Runtime-filter vocabulary retained by SQL's physical planner.
 //!
-//! This module owns the planner's declarative graph, activation and progress
-//! proofs. Runtime installation, transport and execution consume only typed
-//! projections of these facts; they never own or reconstruct this graph.
+//! Production uses the null-semantics and ordering declarations in `contract`.
+//! The richer graph, activation, and progress models are available only to
+//! unit tests.
 
+#[cfg(test)]
 pub(crate) mod activation;
+#[cfg(test)]
 pub(crate) mod comparator;
 pub(crate) mod contract;
+#[cfg(test)]
 pub(crate) mod coverage;
+#[cfg(test)]
 pub(crate) mod graph;
+#[cfg(test)]
 pub(crate) mod policy;
+#[cfg(test)]
 pub(crate) mod progress;
+#[cfg(test)]
 pub(crate) mod sealed;
+#[cfg(test)]
 pub(crate) mod validation;
+#[cfg(test)]
 pub(crate) mod wait_graph;

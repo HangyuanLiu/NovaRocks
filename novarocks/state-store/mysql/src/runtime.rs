@@ -226,7 +226,6 @@ impl MysqlRuntime {
     }
 
     // The spawned open task must own every resource independently of its caller.
-    #[allow(clippy::too_many_arguments)]
     async fn open_store_owned(
         shared: Arc<MysqlRuntimeShared>,
         pool: Arc<dyn PoolLifecycle>,

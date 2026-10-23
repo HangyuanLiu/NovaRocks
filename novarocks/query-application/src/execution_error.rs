@@ -125,27 +125,27 @@ impl ExecutionFailureInput {
         {
             return AttemptFailureClass::RecoverableInfrastructure;
         }
-        if (self.fact.evidence()
+        if self.fact.evidence()
             == novarocks_execution_contract::failure::FailureEvidence::Originating
             && matches!(self.site, ExecutionFailureSite::Coordinator)
             && self.fact.class() == QueryFailureReason::Cancelled.failure_fact().class()
-            && self.fact.reason() == QueryFailureReason::Cancelled.failure_fact().reason())
+            && self.fact.reason() == QueryFailureReason::Cancelled.failure_fact().reason()
         {
             return AttemptFailureClass::Cancelled;
         }
-        if (self.fact.evidence()
+        if self.fact.evidence()
             == novarocks_execution_contract::failure::FailureEvidence::Originating
             && matches!(self.site, ExecutionFailureSite::Coordinator)
             && self.fact.class() == QueryFailureReason::DeadlineExceeded.failure_fact().class()
-            && self.fact.reason() == QueryFailureReason::DeadlineExceeded.failure_fact().reason())
+            && self.fact.reason() == QueryFailureReason::DeadlineExceeded.failure_fact().reason()
         {
             return AttemptFailureClass::DeadlineExceeded;
         }
-        if (self.fact.evidence()
+        if self.fact.evidence()
             == novarocks_execution_contract::failure::FailureEvidence::Originating
             && matches!(self.site, ExecutionFailureSite::Coordinator)
             && self.fact.class() == QueryFailureReason::CommitUnknown.failure_fact().class()
-            && self.fact.reason() == QueryFailureReason::CommitUnknown.failure_fact().reason())
+            && self.fact.reason() == QueryFailureReason::CommitUnknown.failure_fact().reason()
         {
             return AttemptFailureClass::CommitUnknown;
         }
@@ -179,25 +179,25 @@ impl ExecutionFailureInput {
     }
     pub fn descriptor(&self) -> SqlExecutionErrorDescriptor {
         use SqlExecutionErrorKind as K;
-        let kind = if (self.fact.evidence()
+        let kind = if self.fact.evidence()
             == novarocks_execution_contract::failure::FailureEvidence::Originating
             && matches!(self.site, ExecutionFailureSite::Coordinator)
             && self.fact.class() == QueryFailureReason::Cancelled.failure_fact().class()
-            && self.fact.reason() == QueryFailureReason::Cancelled.failure_fact().reason())
+            && self.fact.reason() == QueryFailureReason::Cancelled.failure_fact().reason()
         {
             K::Cancelled
-        } else if (self.fact.evidence()
+        } else if self.fact.evidence()
             == novarocks_execution_contract::failure::FailureEvidence::Originating
             && matches!(self.site, ExecutionFailureSite::Coordinator)
             && self.fact.class() == QueryFailureReason::DeadlineExceeded.failure_fact().class()
-            && self.fact.reason() == QueryFailureReason::DeadlineExceeded.failure_fact().reason())
+            && self.fact.reason() == QueryFailureReason::DeadlineExceeded.failure_fact().reason()
         {
             K::DeadlineExceeded
-        } else if (self.fact.evidence()
+        } else if self.fact.evidence()
             == novarocks_execution_contract::failure::FailureEvidence::Originating
             && matches!(self.site, ExecutionFailureSite::Coordinator)
             && self.fact.class() == QueryFailureReason::CommitUnknown.failure_fact().class()
-            && self.fact.reason() == QueryFailureReason::CommitUnknown.failure_fact().reason())
+            && self.fact.reason() == QueryFailureReason::CommitUnknown.failure_fact().reason()
         {
             K::CommitUnknown
         } else if self.fact.class() == FailureClass::Data

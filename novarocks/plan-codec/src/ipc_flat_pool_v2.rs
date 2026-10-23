@@ -425,6 +425,7 @@ impl PreparedFlatPoolWriter<'_, '_> {
             .as_ref()
             .expect("receiving writer owns source facts")
     }
+    #[cfg(test)]
     pub(crate) fn emit_in(
         self,
         admit: &mut dyn FnMut(&FlatPoolWriteFacts) -> Result<(), CompileControlError>,
@@ -508,6 +509,7 @@ pub(crate) fn prepare_flat_pool_write<'p>(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_flat_pool_write_in<'pool, 'control>(
     pool: &'pool ConstantPool,
     source: usize,

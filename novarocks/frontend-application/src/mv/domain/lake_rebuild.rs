@@ -638,7 +638,7 @@ fn verify_published_base_identities(
     projection: &StoredKeyedMvProjection,
     connector_context: &ConnectorRequestContext,
 ) -> Result<(), String> {
-    if matches!(projection.facts.publication(), None) {
+    if projection.facts.publication().is_none() {
         return Ok(());
     }
     for occurrence in &projection.facts.definition().relation_occurrences {

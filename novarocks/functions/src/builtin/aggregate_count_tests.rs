@@ -287,8 +287,11 @@ fn apply_typed(
 #[test]
 fn installed_aggregate_source_lookup_keeps_missing_ordinal_and_control_first_causes() {
     let source = FunctionValueType::new(arrow_schema::DataType::Utf8, true);
-    let kernel = Fixture::new(&[source.clone()], DecimalOverflowPolicy::OutputNull)
-        .kernel(AggregateKernelPhase::Single);
+    let kernel = Fixture::new(
+        std::slice::from_ref(&source),
+        DecimalOverflowPolicy::OutputNull,
+    )
+    .kernel(AggregateKernelPhase::Single);
     let array: ArrayRef = Arc::new(StringArray::from(vec!["x"]));
     let args = [EvaluatedArgument::Column(&array)];
     let original =
@@ -355,7 +358,10 @@ fn aggregate_installed_owner_is_adapter_identity_even_for_same_contract_and_kern
 #[test]
 fn installed_count_dictionary_uses_explicit_typed_source_and_selected_logical_nulls() {
     let source = FunctionValueType::new(arrow_schema::DataType::Utf8, true);
-    let fixture = Fixture::new(&[source.clone()], DecimalOverflowPolicy::OutputNull);
+    let fixture = Fixture::new(
+        std::slice::from_ref(&source),
+        DecimalOverflowPolicy::OutputNull,
+    );
     let kernel = fixture.kernel(AggregateKernelPhase::Single);
     let values: ArrayRef = Arc::new(StringArray::from(vec![None, Some("x"), None]));
     let dictionary: ArrayRef = Arc::new(
@@ -437,8 +443,11 @@ fn installed_count_dictionary_uses_explicit_typed_source_and_selected_logical_nu
 #[test]
 fn installed_count_dictionary_refuses_unsupported_encoding_and_original_control_prefix() {
     let source = FunctionValueType::new(arrow_schema::DataType::Utf8, true);
-    let kernel = Fixture::new(&[source.clone()], DecimalOverflowPolicy::OutputNull)
-        .kernel(AggregateKernelPhase::Single);
+    let kernel = Fixture::new(
+        std::slice::from_ref(&source),
+        DecimalOverflowPolicy::OutputNull,
+    )
+    .kernel(AggregateKernelPhase::Single);
     let values: ArrayRef = Arc::new(StringArray::from(vec![None, Some("x")]));
     let dictionary: ArrayRef = Arc::new(
         DictionaryArray::<Int32Type>::try_new(
@@ -495,8 +504,11 @@ fn installed_count_dictionary_refuses_unsupported_encoding_and_original_control_
         .is_err()
     );
     let numeric_source = FunctionValueType::new(arrow_schema::DataType::Int64, true);
-    let numeric_kernel = Fixture::new(&[numeric_source.clone()], DecimalOverflowPolicy::OutputNull)
-        .kernel(AggregateKernelPhase::Single);
+    let numeric_kernel = Fixture::new(
+        std::slice::from_ref(&numeric_source),
+        DecimalOverflowPolicy::OutputNull,
+    )
+    .kernel(AggregateKernelPhase::Single);
     let numeric: ArrayRef = Arc::new(
         DictionaryArray::<Int32Type>::try_new(
             Int32Array::from(vec![Some(0), Some(1), None]),
@@ -1444,8 +1456,11 @@ impl PreparedAggregateKernel for PlainCount {
 fn installed_dictionary_proof_cannot_cross_rewrapped_or_plain_adapter_at_actual_frame() {
     let source = FunctionValueType::new(arrow_schema::DataType::Utf8, true);
     let kernel = Arc::new(
-        Fixture::new(&[source.clone()], DecimalOverflowPolicy::OutputNull)
-            .kernel(AggregateKernelPhase::Single),
+        Fixture::new(
+            std::slice::from_ref(&source),
+            DecimalOverflowPolicy::OutputNull,
+        )
+        .kernel(AggregateKernelPhase::Single),
     );
     let first =
         PreparedAggregateHandle::from_typed(Arc::clone(&kernel), &CompileControl::default())

@@ -329,7 +329,7 @@ fn materialize_signature<E>(
     } else {
         // Keep pure construction's temporary owned label and original stable
         // identity constructor; no scope/observer is fabricated for that path.
-        AggregateOverloadIdentity::try_new(recipe.original.identity.as_str().to_owned())
+        AggregateOverloadIdentity::try_new(recipe.original.identity.as_str())
     }
     .map_err(|error| invalid(&error.to_string()))?;
     construction.array::<arrow_schema::DataType>(recipe.argument_types.len())?;

@@ -138,7 +138,6 @@ impl PreparedMvSessionWrite {
 /// Complete one MV write after its SQL producer has stated every provider read.
 /// The sink contracts supply field names; the session supplies the exact
 /// handles it sealed for the writer nodes.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_completed_mv_write(
     kernel: &QueryPreparationKernel,
     execution: &QueryExecutionContext,

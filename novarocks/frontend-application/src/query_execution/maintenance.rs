@@ -25,30 +25,28 @@ use std::sync::Arc;
 
 pub mod command;
 pub(crate) mod iceberg;
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::connector::cleanup_maintenance::{CleanupBatchExecution, CleanupMaintenanceSession};
 use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
-use crate::connector::metadata_maintenance::{
-    CompletedMetadataMaintenance, MetadataMaintenanceIntent, MetadataMaintenanceSession,
-};
 use crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession;
 use novarocks_query_application::api::QueryResult;
 use novarocks_query_application::cancellation::QueryCancellationView;
 use novarocks_spi::connector::{
     CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
     ConnectorControlResolver, ConnectorDistributedRewriteReceipt, ConnectorError,
-    ConnectorMutationOperationId, ConnectorRewriteCohortRead, ConnectorTableObjectBindingFailure,
+    ConnectorRewriteCohortRead, ConnectorTableObjectBindingFailure,
     ConnectorTableObjectCaptureRequest, ConnectorTableObjectId, ConnectorTableObjectRebindRequest,
     ConnectorTableObjectSelector, ConnectorTableResolution, ConnectorWriteAbortOutcome,
     ConnectorWriteCohortId, ConnectorWriteInputShape, ConnectorWriteReceipt,
     ExternalMutationOutcome, PreparedBatch,
 };
-use novarocks_table_maintenance::runtime::{JobHandle, MaintenanceJobState, TerminalError};
+use novarocks_table_maintenance::runtime::TerminalError;
 use novarocks_table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceEffectId, MaintenanceTarget,
-    MaintenanceTargetRebind, OptimizeSubmission,
+    MaintenanceTargetRebind,
 };
 
 pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance service is not injected";
@@ -175,22 +173,6 @@ pub struct AutomaticMaintenanceContext {
 }
 
 impl AutomaticMaintenanceContext {
-    pub fn new(cancellation: QueryCancellationView) -> Self {
-        Self {
-            cancellation,
-            deadline: None,
-            runtime: None,
-        }
-    }
-
-    pub fn with_deadline(cancellation: QueryCancellationView, deadline: Instant) -> Self {
-        Self {
-            cancellation,
-            deadline: Some(deadline),
-            runtime: None,
-        }
-    }
-
     pub fn with_deadline_on_runtime(
         cancellation: QueryCancellationView,
         deadline: Instant,
@@ -249,12 +231,14 @@ impl AutomaticMaintenanceContext {
 /// source and passes only [`MaintenanceAttemptContext`] through the engine
 /// port, so a lost coordination lease can stop subsequent connector work
 /// without exposing a lease, repository, or provider object to Core.
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
 pub struct MaintenanceAttemptCancellationSource {
     cancelled: Arc<AtomicBool>,
     stop: novarocks_spi::connector::ConnectorStopOwner,
 }
 
+#[cfg(test)]
 impl MaintenanceAttemptCancellationSource {
     pub fn new() -> Self {
         Self::default()
@@ -293,14 +277,12 @@ impl MaintenanceAttemptContext {
         Self::default()
     }
 
+    #[cfg(test)]
     pub fn is_cancelled(&self) -> bool {
         self.stop.is_stopped()
     }
 
-    #[allow(
-        dead_code,
-        reason = "Retained for staged query-execution contract and lifecycle integration."
-    )]
+    #[cfg(test)]
     fn connector_request_context(
         &self,
     ) -> Result<novarocks_spi::connector::ConnectorRequestContext, String> {
@@ -408,35 +390,6 @@ pub trait TableMaintenanceEngine: Send + Sync {
         ))
     }
 
-    fn plan_metadata_maintenance(
-        &self,
-        _target: &MaintenanceTarget,
-        _operation_id: ConnectorMutationOperationId,
-        _intent: MetadataMaintenanceIntent,
-    ) -> Result<MetadataMaintenanceSession, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
-    }
-
-    /// Context-aware planning entrypoint used by a fenced frontend attempt.
-    /// Existing engine implementations remain source-compatible: until they
-    /// override this method, the legacy planning method is used.
-    fn plan_metadata_maintenance_with_attempt_context(
-        &self,
-        target: &MaintenanceTarget,
-        operation_id: ConnectorMutationOperationId,
-        intent: MetadataMaintenanceIntent,
-        _attempt: &MaintenanceAttemptContext,
-    ) -> Result<MetadataMaintenanceSession, String> {
-        self.plan_metadata_maintenance(target, operation_id, intent)
-    }
-
-    fn execute_planned_metadata_maintenance(
-        &self,
-        _session: MetadataMaintenanceSession,
-    ) -> Result<CompletedMetadataMaintenance, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
-    }
-
     /// Plan a provider-neutral FE-only orphan cleanup operation. The returned
     /// session owns its exact connector generation for the durable frontend
     /// operation; no BE or generic action route participates.
@@ -529,16 +482,6 @@ pub trait TableMaintenanceEngine: Send + Sync {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
     }
 
-    fn plan_distributed_rewrite_with_attempt_context(
-        &self,
-        target: &MaintenanceTarget,
-        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
-        intent: DistributedRewriteIntent,
-        _attempt: &MaintenanceAttemptContext,
-    ) -> Result<DistributedRewriteMaintenanceSession, String> {
-        self.plan_distributed_rewrite(target, operation_id, intent)
-    }
-
     fn prepare_distributed_rewrite_cohort(
         &self,
         _session: &DistributedRewriteMaintenanceSession,
@@ -611,22 +554,6 @@ pub trait TableMaintenanceService: Send + Sync {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
     }
 
-    async fn execute_automatic_action(
-        &self,
-        engine: &dyn TableMaintenanceEngine,
-        request: MaintenanceActionRequest,
-    ) -> Result<MaintenanceActionOutcome, TerminalError>;
-
-    async fn execute_automatic_action_with_context(
-        &self,
-        engine: &dyn TableMaintenanceEngine,
-        request: MaintenanceActionRequest,
-        context: &AutomaticMaintenanceContext,
-    ) -> Result<MaintenanceActionOutcome, TerminalError> {
-        context.ensure_active()?;
-        self.execute_automatic_action(engine, request).await
-    }
-
     /// The MV management owner has already frozen and admitted this action's
     /// effect identity. Implementations must pass it to the provider and keep
     /// the exact terminal classification.
@@ -640,42 +567,6 @@ pub trait TableMaintenanceService: Send + Sync {
         Err(TerminalError::pre_dispatch_failed(
             "automatic maintenance effect identity is unsupported",
         ))
-    }
-
-    fn submit_automatic_optimize(
-        &self,
-        engine: &dyn TableMaintenanceEngine,
-        target: MaintenanceTarget,
-    ) -> Result<OptimizeSubmission, String>;
-
-    /// Wait for the exact job named by a prior `Submitted` result. A completed
-    /// job is returned even if it completed before the caller subscribed.
-    async fn wait_for_automatic_optimize(
-        &self,
-        _handle: JobHandle,
-    ) -> Result<MaintenanceJobState, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_owned())
-    }
-
-    /// Execute an automatic OPTIMIZE as one complete durable job lifecycle.
-    /// Unlike submission, success means the job was claimed, executed and
-    /// terminally persisted before the caller releases its MV activity gate.
-    fn execute_automatic_optimize_durably(
-        &self,
-        _engine: &dyn TableMaintenanceEngine,
-        _target: MaintenanceTarget,
-    ) -> Result<OptimizeSubmission, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_owned())
-    }
-
-    fn execute_automatic_optimize_durably_with_context(
-        &self,
-        engine: &dyn TableMaintenanceEngine,
-        target: MaintenanceTarget,
-        context: &AutomaticMaintenanceContext,
-    ) -> Result<OptimizeSubmission, String> {
-        context.ensure_active()?;
-        self.execute_automatic_optimize_durably(engine, target)
     }
 
     /// An automatic MV OPTIMIZE runs under one caller-owned management effect.
@@ -1157,45 +1048,6 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         )
     }
 
-    fn plan_metadata_maintenance(
-        &self,
-        target: &MaintenanceTarget,
-        operation_id: ConnectorMutationOperationId,
-        intent: MetadataMaintenanceIntent,
-    ) -> Result<MetadataMaintenanceSession, String> {
-        self.plan_metadata_maintenance_with_attempt_context(
-            target,
-            operation_id,
-            intent,
-            &MaintenanceAttemptContext::uncancelled(),
-        )
-    }
-
-    fn plan_metadata_maintenance_with_attempt_context(
-        &self,
-        target: &MaintenanceTarget,
-        operation_id: ConnectorMutationOperationId,
-        intent: MetadataMaintenanceIntent,
-        attempt: &MaintenanceAttemptContext,
-    ) -> Result<MetadataMaintenanceSession, String> {
-        let identity = Self::target_identity(target)?;
-        crate::connector::metadata_maintenance::plan_metadata_maintenance_session(
-            self.kernel.connector_control().as_ref(),
-            &identity.instance_id.clone(),
-            operation_id,
-            identity,
-            intent,
-            self.connector_context_for_attempt(attempt)?,
-        )
-    }
-
-    fn execute_planned_metadata_maintenance(
-        &self,
-        session: MetadataMaintenanceSession,
-    ) -> Result<CompletedMetadataMaintenance, String> {
-        crate::connector::metadata_maintenance::execute_planned_metadata_maintenance(session, self)
-    }
-
     fn plan_cleanup_maintenance(
         &self,
         target: &MaintenanceTarget,
@@ -1314,21 +1166,6 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
             operation_id,
             intent,
             self.connector_context.clone(),
-        )
-    }
-
-    fn plan_distributed_rewrite_with_attempt_context(
-        &self,
-        target: &MaintenanceTarget,
-        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
-        intent: DistributedRewriteIntent,
-        attempt: &MaintenanceAttemptContext,
-    ) -> Result<DistributedRewriteMaintenanceSession, String> {
-        self.plan_distributed_rewrite_with_context(
-            target,
-            operation_id,
-            intent,
-            self.connector_context_for_attempt(attempt)?,
         )
     }
 
@@ -1508,35 +1345,6 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
             .execute_automatic_metadata_action(request, effect_id)
     }
 
-    fn plan_metadata_maintenance(
-        &self,
-        target: &MaintenanceTarget,
-        operation_id: ConnectorMutationOperationId,
-        intent: MetadataMaintenanceIntent,
-    ) -> Result<MetadataMaintenanceSession, String> {
-        self.request_engine()?
-            .plan_metadata_maintenance(target, operation_id, intent)
-    }
-
-    fn plan_metadata_maintenance_with_attempt_context(
-        &self,
-        target: &MaintenanceTarget,
-        operation_id: ConnectorMutationOperationId,
-        intent: MetadataMaintenanceIntent,
-        attempt: &MaintenanceAttemptContext,
-    ) -> Result<MetadataMaintenanceSession, String> {
-        self.request_engine()?
-            .plan_metadata_maintenance_with_attempt_context(target, operation_id, intent, attempt)
-    }
-
-    fn execute_planned_metadata_maintenance(
-        &self,
-        session: MetadataMaintenanceSession,
-    ) -> Result<CompletedMetadataMaintenance, String> {
-        self.request_engine()?
-            .execute_planned_metadata_maintenance(session)
-    }
-
     fn plan_cleanup_maintenance(
         &self,
         target: &MaintenanceTarget,
@@ -1639,17 +1447,6 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
             .plan_distributed_rewrite(target, operation_id, intent)
     }
 
-    fn plan_distributed_rewrite_with_attempt_context(
-        &self,
-        target: &MaintenanceTarget,
-        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
-        intent: DistributedRewriteIntent,
-        attempt: &MaintenanceAttemptContext,
-    ) -> Result<DistributedRewriteMaintenanceSession, String> {
-        self.request_engine()?
-            .plan_distributed_rewrite_with_attempt_context(target, operation_id, intent, attempt)
-    }
-
     fn prepare_distributed_rewrite_cohort(
         &self,
         session: &DistributedRewriteMaintenanceSession,
@@ -1695,8 +1492,12 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
 /// Prepare one provider-frozen rewrite cohort through the ordinary connector
 /// read and write contracts retained by its exact composite lease. Native
 /// assembly remains a Frontend-only step after this sealed Core preparation.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen rewrite cohort validates each maintenance port and plan fact independently; bundling would obscure the exact owner boundary."
+)]
 fn prepare_frozen_rewrite_cohort_with_ports(
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    _connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     static_plan_carrier: &crate::query_execution::package_freeze::CompiledPackageCarrier,
@@ -1721,21 +1522,13 @@ fn prepare_frozen_rewrite_cohort_with_ports(
     // rewrites delete artifacts reads no table rows at all, so it has no data
     // file set to be frozen from and names its frozen group instead -- the
     // same group its commit resolves the replaced artifacts from.
-    let owner = session
-        .lease()
-        .planning_lease()
-        .binding()
-        .descriptor()
-        .instance_id
-        .clone();
     let (cohort_read, source_binding, physical_plan) = match cohort.read() {
         ConnectorRewriteCohortRead::PinnedFileSet(pinned) => {
             let read = crate::query_execution::cohort_read::QueryPinnedFileSetRead {
                 pinned: pinned.clone(),
-                owner: owner.clone(),
                 frozen_source: None,
                 planning_lease: session.lease().planning_lease(),
-                original: None,
+                _original: None,
             };
             let source_binding =
                 crate::query_execution::distributed_rewrite::admit_pinned_rewrite_scan_binding(
@@ -1760,7 +1553,6 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             let read = crate::query_execution::cohort_read::QueryRewriteGroupRead {
                 group: group.clone(),
                 group_digest: cohort.group_digest(),
-                owner: owner.clone(),
                 planning_lease: session.lease().planning_lease(),
             };
             let source_binding =
@@ -1977,11 +1769,12 @@ mod maintenance_attempt_context_tests {
     };
 
     use super::{
-        MaintenanceAttemptCancellationSource, MaintenanceAttemptContext, MaintenanceJobState,
+        MaintenanceAttemptCancellationSource, MaintenanceAttemptContext,
         captured_target_object_id_from_connector_result,
         maintenance_target_rebind_from_connector_result,
     };
     use novarocks_table_maintenance::MaintenanceTargetRebind;
+    use novarocks_table_maintenance::runtime::MaintenanceJobState;
 
     #[test]
     fn optimize_admission_capture_and_snapshot_use_one_generation() {

@@ -57,14 +57,13 @@ pub struct WriteTransactionOutcome {
 pub enum CoordinatedWriteReport<H, A = Infallible> {
     NoOp,
     CommitRequired(H),
-    AbortRequired { reason: DmlError, handle: A },
+    AbortRequired { reason: Box<DmlError>, handle: A },
 }
 
 pub trait WriteExecutor {
     type CommitHandle;
     type AbortHandle;
 
-    #[allow(clippy::result_large_err)]
     fn run_coordinated_write(
         &self,
         spec: &WriteTransactionSpec,
@@ -109,7 +108,6 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
         Self { executor, family }
     }
 
-    #[allow(clippy::result_large_err)]
     pub(crate) fn run(
         &self,
         spec: WriteTransactionSpec,
@@ -161,7 +159,7 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
                             .terminal_known_uncommitted()
                             .map_err(attempt_error)?;
                         Err(with_terminal(
-                            reason.with_uncommitted_cleanup(&cleanup),
+                            (*reason).with_uncommitted_cleanup(&cleanup),
                             &attempt,
                         ))
                     }
@@ -179,7 +177,7 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
                             }
                             // Actual publication is committed; the earlier Task
                             // failure remains the selected SQL failure.
-                            Err(with_terminal(reason, &attempt))
+                            Err(with_terminal(*reason, &attempt))
                         } else {
                             settled
                         }
@@ -188,7 +186,8 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
                         attempt.mark_dispatch_possible().map_err(attempt_error)?;
                         attempt.terminal_commit_unknown().map_err(attempt_error)?;
                         Err(with_terminal(
-                            reason.prefer_selected_execution(DmlError::commit(failure.message())),
+                            (*reason)
+                                .prefer_selected_execution(DmlError::commit(failure.message())),
                             &attempt,
                         ))
                     }
@@ -198,7 +197,7 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
                             .terminal_after_outer_failure()
                             .map_err(attempt_error)?;
                         Err(with_terminal(
-                            reason.prefer_selected_execution(DmlError::commit(message)),
+                            (*reason).prefer_selected_execution(DmlError::commit(message)),
                             &attempt,
                         ))
                     }
@@ -207,7 +206,6 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
         }
     }
 
-    #[allow(clippy::result_large_err)]
     fn complete_commit(
         &self,
         spec: &WriteTransactionSpec,
@@ -306,7 +304,6 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
         }
     }
 
-    #[allow(clippy::result_large_err)]
     fn finish_committed(
         &self,
         spec: &WriteTransactionSpec,
@@ -387,9 +384,9 @@ mod tests {
             _: &WriteTransactionSpec,
         ) -> Result<CoordinatedWriteReport<(), ()>, DmlError> {
             Ok(CoordinatedWriteReport::AbortRequired {
-                reason: DmlError::from_execution(novarocks_query_application::execution_error::ExecutionFailureInput::new(
+                reason: Box::new(DmlError::from_execution(novarocks_query_application::execution_error::ExecutionFailureInput::new(
                     self.fact, novarocks_execution_contract::SafeDetail::truncating("unsupported diagnostic"),
-                    novarocks_query_application::execution_error::ExecutionFailureSite::Coordinator)),
+                    novarocks_query_application::execution_error::ExecutionFailureSite::Coordinator))),
                 handle: (),
             })
         }
@@ -612,9 +609,9 @@ mod tests {
             self.stages.fetch_add(1, Ordering::SeqCst);
             Ok(CoordinatedWriteReport::AbortRequired {
                 reason: if self.legacy {
-                    DmlError::executor("legacy staging rejection")
+                    Box::new(DmlError::executor("legacy staging rejection"))
                 } else {
-                    DmlError::from_execution(self.input.clone())
+                    Box::new(DmlError::from_execution(self.input.clone()))
                 },
                 handle: (),
             })

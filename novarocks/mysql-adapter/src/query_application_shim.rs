@@ -1158,14 +1158,13 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
                 owner.reject_unsupported_batch(self.connection)?;
             }
         }
-        if self.connection_class == MysqlConnectionClass::Control {
-            if let Err(error) =
+        if self.connection_class == MysqlConnectionClass::Control
+            && let Err(error) =
                 novarocks_query_application::sql::admission::admit_control_connection_batch(query)
-            {
-                return results
-                    .reject_connection(crate::mysql_error_kind(&error), error.message().as_bytes())
-                    .await;
-            }
+        {
+            return results
+                .reject_connection(crate::mysql_error_kind(&error), error.message().as_bytes())
+                .await;
         }
         let session = match self.session() {
             Ok(session) => session,

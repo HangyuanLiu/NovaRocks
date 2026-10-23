@@ -204,7 +204,7 @@ fn single_range(value_type: ConnectorValueType, low: Bound, high: Bound) -> Opti
 fn lower_literal(expression: &TypedExpr, expected: ConnectorValueType) -> Option<ConnectorValue> {
     let expression = unnest(expression);
     if expression.value_type.nullable()
-        || exact_predicate_value_type(&expression.value_type.data_type())? != expected
+        || exact_predicate_value_type(expression.value_type.data_type())? != expected
     {
         return None;
     }

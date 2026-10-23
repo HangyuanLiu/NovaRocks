@@ -67,7 +67,9 @@ fn compiled_in_source(sql: &str, scratch_len: usize) -> (CompiledTaskProgram, Ar
         )
         .expect("real FE IN package compiles on its Native creator");
     drop(creation);
-    drop(scopes);
+    {
+        let _scopes = scopes;
+    }
     drop(scratch);
     drop(actual);
     (compiled, tracker)
@@ -125,7 +127,7 @@ fn late_in(
     Arc<MemTracker>,
 ) {
     let (compiled, tracker) = compiled_in_source(sql, scratch);
-    let sites = actual_in_sites(&compiled.program());
+    let sites = actual_in_sites(compiled.program());
     assert_eq!(
         sites.len(),
         expected_calls,
@@ -356,7 +358,7 @@ impl ValueSchemaCreationFactory<NativeTypeConstructionError> for TracedFactory<'
 #[test]
 fn actual_host_expression_all_family_and_final_arc_scopes_exit_independently() {
     let (compiled, source_tracker) = compiled_in_source(ONE_IN, 0);
-    let sites = actual_in_sites(&compiled.program());
+    let sites = actual_in_sites(compiled.program());
     assert_eq!(sites.len(), 1);
     let checked = compiled.program().checked().clone();
     let tracker = MemTracker::new_root("actual expression entity scopes");
@@ -417,7 +419,9 @@ fn actual_host_expression_all_family_and_final_arc_scopes_exit_independently() {
     drop(program);
     drop(compiled);
     drop(temporary);
-    drop(factory);
+    {
+        let _factory = factory;
+    }
     drop(actual);
     assert!(
         tracker.current() > recipe_charge,
@@ -456,7 +460,9 @@ fn actual_constructor_events(checked: ProgramLexicalBindings) -> Vec<ActualScope
     let events = trace.events.lock().unwrap().clone();
     drop(program);
     drop(temporary);
-    drop(factory);
+    {
+        let _factory = factory;
+    }
     drop(actual);
     assert_eq!(tracker.current(), 0);
     events
@@ -464,7 +470,7 @@ fn actual_constructor_events(checked: ProgramLexicalBindings) -> Vec<ActualScope
 #[test]
 fn actual_host_expression_each_first_tracker_refusal_preserves_cause_and_has_no_tail() {
     let (compiled, source_tracker) = compiled_in_source(ONE_IN, 0);
-    assert_eq!(actual_in_sites(&compiled.program()).len(), 1);
+    assert_eq!(actual_in_sites(compiled.program()).len(), 1);
     let checked = compiled.program().checked().clone();
     let discovered = actual_constructor_events(checked.clone());
     assert!(!discovered.is_empty());
@@ -528,7 +534,9 @@ fn actual_host_expression_each_first_tracker_refusal_preserves_cause_and_has_no_
             "only the caller's actual successful temporary prefix remains"
         );
         drop(temporary);
-        drop(factory);
+        {
+        let _factory = factory;
+    }
         drop(actual);
         assert_eq!(tracker.current(), 0);
     }

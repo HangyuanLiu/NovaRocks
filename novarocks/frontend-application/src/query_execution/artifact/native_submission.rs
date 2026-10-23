@@ -21,7 +21,7 @@
 //! consuming and verifies that a mapper returns exactly one native submission
 //! for every sealed placement before any task descriptor is built from it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use super::{FragmentId, RootFetchMetadata, ValidatedNativeSubmission};
@@ -59,18 +59,6 @@ impl NativeSubmissionKey {
             fragment_instance_id,
         }
     }
-
-    pub const fn backend_idx(self) -> usize {
-        self.backend_idx
-    }
-
-    pub const fn fragment_id(self) -> FragmentId {
-        self.fragment_id
-    }
-
-    pub const fn fragment_instance_id(self) -> UniqueId {
-        self.fragment_instance_id
-    }
 }
 
 /// Borrow-only facts for encoding one fully prepared, control-ready native
@@ -89,10 +77,6 @@ pub struct NativeSubmissionEncodingView<'a> {
 }
 
 impl<'a> NativeSubmissionEncodingView<'a> {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Native submission must retain independently frozen fragment, schedule, connector, and output facts."
-    )]
     pub(crate) fn new(
         handoff_id: u64,
         execution_id: QueryExecutionId,
@@ -120,14 +104,6 @@ impl<'a> NativeSubmissionEncodingView<'a> {
 
     pub fn execution_id(&self) -> QueryExecutionId {
         self.execution_id
-    }
-
-    pub fn placement_keys(&self) -> impl ExactSizeIterator<Item = NativeSubmissionKey> + '_ {
-        self.keys.iter().copied()
-    }
-
-    pub fn root_key(&self) -> NativeSubmissionKey {
-        self.root
     }
 
     /// One fragment's static plan, as the completed plan froze it.

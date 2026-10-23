@@ -367,7 +367,7 @@ impl ScanPreparationConfig {
         if pause_release.is_zero() || rearm.is_zero() || progress_bucket.is_zero() {
             return Err("scan preparation durations must be nonzero".to_string());
         }
-        if rearm.as_nanos() % progress_bucket.as_nanos() != 0 {
+        if !rearm.as_nanos().is_multiple_of(progress_bucket.as_nanos()) {
             return Err(
                 "scan preparation rearm must be a multiple of its progress bucket".to_string(),
             );
@@ -396,7 +396,6 @@ impl Default for ScanPreparationConfig {
 }
 
 impl TypedScanRuntime {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         execution_id: QueryExecutionId,
         catalog_read_execution: CatalogReadExecutionResolver,
@@ -609,8 +608,7 @@ mod tests {
         admitted.install_limit_once(10).expect("set admitted limit");
         let error = resources
             .try_reserve(ConnectorResourceClass::ReaderState, 11)
-            .err()
-            .expect("reservation above the real tracker limit must fail");
+            .expect_err("reservation above the real tracker limit must fail");
         assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
         assert_eq!(admitted.current(), 0);
     }

@@ -301,18 +301,17 @@ impl QueryContextOwner {
         Ok(())
     }
 
-    pub const fn context(&self) -> QueryContextRef {
-        self.context
-    }
-
+    #[cfg(test)]
     pub const fn state(&self) -> QueryContextState {
         self.state
     }
 
+    #[cfg(test)]
     pub const fn lease_sequence(&self) -> LeaseSequence {
         self.lease_sequence
     }
 
+    #[cfg(test)]
     pub const fn renew_schedule(&self) -> Option<RenewSchedule> {
         self.renew_schedule
     }
@@ -604,14 +603,13 @@ impl QueryContextOwner {
                 ));
             };
             self.context.verify_matches(receipt.context())?;
-            if let Some(previous) = &self.quiesce_receipt {
-                if previous.fence_version() != receipt.fence_version()
-                    || previous.accepted_tasks() != receipt.accepted_tasks()
-                {
-                    return Err(TaskExecutionError::DomainReceipt(
-                        "a replayed Quiesce changed its cumulative accepted set".to_owned(),
-                    ));
-                }
+            if let Some(previous) = &self.quiesce_receipt
+                && (previous.fence_version() != receipt.fence_version()
+                    || previous.accepted_tasks() != receipt.accepted_tasks())
+            {
+                return Err(TaskExecutionError::DomainReceipt(
+                    "a replayed Quiesce changed its cumulative accepted set".to_owned(),
+                ));
             }
             self.state = receipt.state();
             self.quiesce_receipt = Some(receipt.clone());
@@ -625,7 +623,7 @@ impl QueryContextOwner {
         if ack.dispatch_result() == OperationDispatchResult::TransportUnknown {
             return Ok(None);
         }
-        if let Some(outcome) = ack.worker_outcome() {
+        if let Some(_outcome) = ack.worker_outcome() {
             return Err(TaskExecutionError::OperationFailed {
                 context: self.context,
                 operation_id: ack.operation_id(),
@@ -641,6 +639,7 @@ impl QueryContextOwner {
         })
     }
 
+    #[cfg(test)]
     pub const fn quiesce_acknowledged(&self) -> bool {
         self.quiesce_receipt.is_some()
     }
@@ -843,7 +842,7 @@ impl QueryContextOwner {
         }
         if !ack.is_applied() {
             self.fail_admission();
-            let Some(outcome) = ack.worker_outcome() else {
+            let Some(_outcome) = ack.worker_outcome() else {
                 return Err(TaskExecutionError::DispatchRejected {
                     kind: OperationKind::AcquireQueryContextAdmissionTicket,
                     result: ack.dispatch_result(),
@@ -1017,7 +1016,7 @@ impl QueryContextOwner {
         } else {
             self.renewal = None;
         }
-        let Some(outcome) = ack.worker_outcome() else {
+        let Some(_outcome) = ack.worker_outcome() else {
             // The admission grant may still occupy Worker capacity. Keep the
             // context open so failure cleanup issues its exact Abort.
             return Err(TaskExecutionError::DispatchRejected {
@@ -1171,11 +1170,7 @@ impl QueryContextOwner {
         self.released = true;
     }
 
-    /// How long this owner may sleep before its next renewal is due.
-    pub fn renew_delay(&self, now: MonotonicInstant) -> Option<Duration> {
-        self.renew_schedule.map(|schedule| schedule.delay_from(now))
-    }
-
+    /// Delays another release attempt while local work remains unsettled.
     fn defer_release_retry(&mut self, now: MonotonicInstant) {
         self.release_blocked_at = Some(self.progress);
         self.release_retry_at = Some(now.saturating_add(self.release_retry_delay));

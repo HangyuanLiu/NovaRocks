@@ -120,10 +120,10 @@ impl KernelEvaluationControl for Control {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push(units);
-        if let Some((at, cause)) = &self.fail {
-            if trace.len() == *at {
-                return Err(cause.clone());
-            }
+        if let Some((at, cause)) = &self.fail
+            && trace.len() == *at
+        {
+            return Err(cause.clone());
         }
         Ok(())
     }
@@ -167,7 +167,7 @@ fn inlist_core_every_real_callback_preserves_all_seven_causes_without_footer() {
             .all(|v| v == Some(true))
     );
     let trace = success.trace.into_inner().unwrap();
-    assert!(trace.iter().any(|v| *v == 256));
+    assert!(trace.contains(&256));
     let causes = [
         KernelFailure::Cancelled,
         KernelFailure::DeadlineExceeded,

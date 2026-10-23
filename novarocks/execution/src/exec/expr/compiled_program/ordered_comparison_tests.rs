@@ -168,7 +168,7 @@ fn ordered_value_program(
             .add_filter(output, input, Box::from([expr]))
             .unwrap();
         fields.extend(columns.iter().enumerate().map(|(i, (id, ty))| ResultField {
-            domain: crate::test_result_domain::result_value_domain(&ty),
+            domain: crate::test_result_domain::result_value_domain(ty),
             name: format!("input_{i}").into(),
             alias: None,
             value: *id,

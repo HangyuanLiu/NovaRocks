@@ -93,22 +93,21 @@ pub(crate) fn prepare_write(
             ));
         }
     };
-    if matches!(request.purpose, ConnectorWriteAdmissionPurpose::OrdinaryDml) {
-        if managed
+    if matches!(request.purpose, ConnectorWriteAdmissionPurpose::OrdinaryDml)
+        && (managed
             || metadata
                 .properties()
-                .contains_key(MV_DESCRIPTOR_PACKAGE_ID_PROP)
-        {
-            return Ok(ConnectorWritePreparationOutcome::Denied(
-                ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    format!(
-                        "table {}.{}.{} is a materialized view; use REFRESH MATERIALIZED VIEW to update it",
-                        table.catalog, table.namespace, table.table
-                    ),
+                .contains_key(MV_DESCRIPTOR_PACKAGE_ID_PROP))
+    {
+        return Ok(ConnectorWritePreparationOutcome::Denied(
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                format!(
+                    "table {}.{}.{} is a materialized view; use REFRESH MATERIALIZED VIEW to update it",
+                    table.catalog, table.namespace, table.table
                 ),
-            ));
-        }
+            ),
+        ));
     }
 
     let target_fqn = format!("{}.{}.{}", table.catalog, table.namespace, table.table);
@@ -881,7 +880,7 @@ fn bind_write_fields(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{

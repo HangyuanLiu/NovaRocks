@@ -73,9 +73,6 @@ pub struct MysqlSession {
 }
 
 impl MysqlSession {
-    pub fn new(conn: &ConnectionConfig) -> Result<Self> {
-        Self::create(conn, None)
-    }
     pub(crate) fn new_with_deadline(
         conn: &ConnectionConfig,
         deadline: Option<Instant>,
@@ -284,10 +281,10 @@ impl MysqlSession {
                 );
             }
 
-            if let Some(db) = db_override {
-                if let Some(guard) = &mut self.namespace_guard {
-                    guard.set_database(db);
-                }
+            if let Some(db) = db_override
+                && let Some(guard) = &mut self.namespace_guard
+            {
+                guard.set_database(db);
             }
             if let Err(exc) = self
                 .conn
@@ -338,14 +335,14 @@ impl MysqlSession {
                         ),
                     );
                 }
-                if let Some(guard) = &self.namespace_guard {
-                    if let Err(error) = guard.before(statement) {
-                        failed = Some((
-                            statement_index,
-                            format!("fixture namespace write guard: {error:#}"),
-                        ));
-                        break;
-                    }
+                if let Some(guard) = &self.namespace_guard
+                    && let Err(error) = guard.before(statement)
+                {
+                    failed = Some((
+                        statement_index,
+                        format!("fixture namespace write guard: {error:#}"),
+                    ));
+                    break;
                 }
                 match self.conn.query_iter(statement) {
                     Ok(mut query_result) => {
@@ -407,15 +404,14 @@ impl MysqlSession {
                     }
                 }
 
-                if failed.is_none() {
-                    if let Some(guard) = &mut self.namespace_guard {
-                        if let Err(error) = guard.after(statement) {
-                            failed = Some((
-                                statement_index,
-                                format!("fixture namespace placement: {error:#}"),
-                            ));
-                        }
-                    }
+                if failed.is_none()
+                    && let Some(guard) = &mut self.namespace_guard
+                    && let Err(error) = guard.after(statement)
+                {
+                    failed = Some((
+                        statement_index,
+                        format!("fixture namespace placement: {error:#}"),
+                    ));
                 }
                 if failed.is_some() {
                     break;
@@ -659,10 +655,6 @@ fn normalize_statement_fragment(fragment: &str) -> Option<String> {
     }
 }
 
-pub fn run_mysql_sql(conn: &ConnectionConfig, query_timeout: u64, sql: &str) -> Result<String> {
-    run_mysql_sql_until(conn, query_timeout, sql, None)
-}
-
 pub(crate) fn run_mysql_sql_until(
     conn: &ConnectionConfig,
     query_timeout: u64,
@@ -693,26 +685,6 @@ pub(crate) fn run_mysql_sql_scoped_until(
         (true, Ok(())) => {}
     }
     Ok(execution.map_or_else(String::new, |execution| execution.text_output))
-}
-
-pub fn execute_suite_hook(
-    conn: &ConnectionConfig,
-    query_timeout: u64,
-    hook: &SuiteHook,
-    label: &str,
-) -> Result<()> {
-    execute_suite_hook_until(conn, query_timeout, hook, label, None)
-}
-pub(crate) fn execute_suite_hook_until(
-    conn: &ConnectionConfig,
-    query_timeout: u64,
-    hook: &SuiteHook,
-    label: &str,
-    deadline: Option<Instant>,
-) -> Result<()> {
-    run_mysql_sql_until(conn, query_timeout, &hook.sql, deadline)
-        .with_context(|| format!("{} suite hook failed: {}", label, hook.path.display()))?;
-    Ok(())
 }
 
 /// Names of the tables a case database currently holds.
@@ -753,23 +725,6 @@ fn case_table_names(
         .collect())
 }
 
-pub fn reset_case_database(
-    conn: &ConnectionConfig,
-    query_timeout: u64,
-    db_name: &str,
-    label: &str,
-) -> Result<()> {
-    reset_case_database_until(conn, query_timeout, db_name, label, None)
-}
-pub(crate) fn reset_case_database_until(
-    conn: &ConnectionConfig,
-    query_timeout: u64,
-    db_name: &str,
-    label: &str,
-    deadline: Option<Instant>,
-) -> Result<()> {
-    reset_case_database_scoped_until(conn, query_timeout, db_name, label, deadline, None)
-}
 pub(crate) fn reset_case_database_scoped_until(
     conn: &ConnectionConfig,
     query_timeout: u64,
@@ -790,14 +745,6 @@ pub(crate) fn reset_case_database_scoped_until(
     Ok(())
 }
 
-pub fn drop_case_database(
-    conn: &ConnectionConfig,
-    query_timeout: u64,
-    db_name: &str,
-    label: &str,
-) -> Result<()> {
-    drop_case_database_until(conn, query_timeout, db_name, label, None)
-}
 pub(crate) fn drop_case_database_until(
     conn: &ConnectionConfig,
     query_timeout: u64,

@@ -82,6 +82,16 @@ pub(crate) fn prove_unique_delete_owner(
     Ok(owner)
 }
 
+type IcebergWriteTargetPlanParts = (
+    WriteTargetOrdinal,
+    IcebergWriterHandle,
+    ConnectorWriteInputShape,
+    Option<ConnectorWriteRouteFacts>,
+    Option<ConnectorWriteCohortRoutingProof>,
+    Option<ConnectorWriteRewriteSource>,
+    Option<[u8; 32]>,
+);
+
 /// One logical target the sealed plan exposes.
 #[derive(Clone, Debug)]
 pub struct IcebergWriteTargetPlan {
@@ -128,17 +138,7 @@ impl IcebergWriteTargetPlan {
     pub const fn rewrite_group_digest(&self) -> Option<[u8; 32]> {
         self.rewrite_group_digest
     }
-    pub fn into_parts(
-        self,
-    ) -> (
-        WriteTargetOrdinal,
-        IcebergWriterHandle,
-        ConnectorWriteInputShape,
-        Option<ConnectorWriteRouteFacts>,
-        Option<ConnectorWriteCohortRoutingProof>,
-        Option<ConnectorWriteRewriteSource>,
-        Option<[u8; 32]>,
-    ) {
+    pub fn into_parts(self) -> IcebergWriteTargetPlanParts {
         (
             self.ordinal,
             self.handle,

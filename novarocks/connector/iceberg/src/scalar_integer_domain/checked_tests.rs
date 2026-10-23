@@ -38,18 +38,18 @@ impl Drop for Canary {
     }
 }
 enum Cause {
-    Provider(ConnectorError),
+    Provider,
     Check(Box<Canary>),
 }
 impl From<ConnectorError> for Cause {
-    fn from(error: ConnectorError) -> Self {
-        Self::Provider(error)
+    fn from(_: ConnectorError) -> Self {
+        Self::Provider
     }
 }
 impl std::fmt::Debug for Cause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Provider(_) => "Provider",
+            Self::Provider => "Provider",
             Self::Check(_) => "Check",
         })
     }
@@ -106,7 +106,7 @@ fn collect_cause<T>(
 ) -> (bool, bool) {
     match result {
         Err(Cause::Check(raw)) => {
-            let same = (&*raw) as *const Canary == identity;
+            let same = std::ptr::eq(&*raw, identity);
             let held = drops.load(Ordering::SeqCst) == 0;
             drop(raw);
             (same, held)

@@ -1087,7 +1087,7 @@ fn metadata_cv_source_cross_entry(functions: &PureEngineFunctionCatalog, spare_e
     );
     let ConstantNodeOutcome::Value(single) = evaluate_constant_node(
         ConstantNode::Conversion(ConstantConversion::Identity),
-        &[original.clone()],
+        std::slice::from_ref(&original),
         &ty,
         &Control,
         CompilePhase::FunctionSpecialization,

@@ -169,7 +169,7 @@ fn calendar_timestamp_check(unit: TimeUnit) {
         Some("Asia/Shanghai".into()),
         Some("opaque-original-zone".into()),
     ] {
-        calendar_check(DataType::Timestamp(unit.clone(), zone));
+        calendar_check(DataType::Timestamp(unit, zone));
     }
 }
 #[test]

@@ -292,6 +292,7 @@ impl ValidationError {
     /// Copy these actual spellings after caller admission. Their formatter
     /// must already have been admitted by its own source author. Standard Box
     /// allocation failure is not promised to be a recoverable control error.
+    #[cfg(test)]
     pub(crate) fn categorized_in(
         category: ValidationErrorCategory,
         path: &str,
@@ -426,6 +427,7 @@ impl ValidationContext {
     /// The incoming diagnostic's spellings and all possible error cleanup
     /// must already be admitted. Saturation retains the original candidate
     /// construction/drop; it does not skip the 129th or later candidate.
+    #[cfg(test)]
     pub(crate) fn push_in(
         &mut self,
         error: ValidationError,
@@ -596,6 +598,7 @@ impl ValidationErrors {
 
     /// The original final trim on the caller's counter, with already-admitted
     /// diagnostic payload/cleanup. This leaf creates neither entry nor footer.
+    #[cfg(test)]
     pub(crate) fn from_collector_in(
         errors: ValidationContext,
         resources: &mut ControlResourceCounter,

@@ -32,9 +32,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[path = "native_sql_controls.rs"]
-mod native_sql_controls;
-use native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpec};
+use crate::scenarios::native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpec};
 
 const REQUIRED_BACKENDS: usize = 3;
 const ACK_DROP_FAULT_KIND: &str = "runtime-filter-contribution-ack-drop";

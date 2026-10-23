@@ -37,7 +37,6 @@ pub struct StateStoreConsumer(&'static str);
 impl StateStoreConsumer {
     pub const CATALOG_ATTACHMENT: Self = Self("catalog-attachment");
     pub const MV_ACCELERATOR: Self = Self("mv-accelerator");
-    pub const GC_OBSERVATION: Self = Self("gc-observation");
 
     pub const fn as_str(self) -> &'static str {
         self.0
@@ -84,10 +83,6 @@ impl StateStoreMetrics {
             deadlines: AtomicU64::new(0),
             unresolved: AtomicU64::new(0),
         }
-    }
-
-    pub const fn consumer(&self) -> StateStoreConsumer {
-        self.consumer
     }
 
     pub fn record_retry(&self) {

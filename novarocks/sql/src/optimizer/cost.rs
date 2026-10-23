@@ -1555,10 +1555,6 @@ mod tests {
         }
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "These are distinct frozen SQL planning facts and grouping them would obscure the compiler boundary."
-    )]
     fn broadcast_input_with_scalars<'a>(
         op: &'a Operator,
         own: &'a Statistics,

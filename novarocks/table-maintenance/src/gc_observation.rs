@@ -99,7 +99,6 @@ pub struct GcOwnedRefObservation {
 }
 
 impl GcOwnedRefObservation {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         table_uuid: Uuid,
         ref_name: String,

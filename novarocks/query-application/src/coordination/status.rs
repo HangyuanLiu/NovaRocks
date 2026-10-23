@@ -27,6 +27,10 @@ use novarocks_execution_contract::{
 /// change a Worker task. The coordinator resubscribes from its retained
 /// cursors when it receives `ObservationLost`.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "status events carry the exact TaskStatus inline across the role adapter boundary"
+)]
 pub enum StatusObservationPortEvent {
     Published(TaskStatus),
     Gone(TaskIdentity),
@@ -94,19 +98,17 @@ pub fn classify_observation(
     // A catch-up snapshot may skip lifecycle states, but cannot skip the
     // already accepted cause. This semantic check is independent of adjacent
     // version shape validation. Only a derived peer placeholder may refine.
-    if let Some(existing) = held.and_then(TaskStatus::termination) {
-        if observed.termination() != Some(existing) {
-            use novarocks_execution_contract::{
-                ConclusionDecision, TaskConclusion, decide_conclusion,
-            };
-            let current = TaskConclusion::Terminated(existing.clone());
-            let proposed = observed
-                .termination()
-                .cloned()
-                .map_or(TaskConclusion::Succeeded, TaskConclusion::Terminated);
-            if decide_conclusion(Some(&current), &proposed) != ConclusionDecision::RefineDerived {
-                return StatusObservation::ConclusionOverwrite;
-            }
+    if let Some(existing) = held.and_then(TaskStatus::termination)
+        && observed.termination() != Some(existing)
+    {
+        use novarocks_execution_contract::{ConclusionDecision, TaskConclusion, decide_conclusion};
+        let current = TaskConclusion::Terminated(existing.clone());
+        let proposed = observed
+            .termination()
+            .cloned()
+            .map_or(TaskConclusion::Succeeded, TaskConclusion::Terminated);
+        if decide_conclusion(Some(&current), &proposed) != ConclusionDecision::RefineDerived {
+            return StatusObservation::ConclusionOverwrite;
         }
     }
     StatusObservation::Accept

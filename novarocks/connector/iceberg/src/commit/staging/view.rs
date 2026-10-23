@@ -40,9 +40,6 @@ impl<'a> StagedView<'a> {
     pub fn metadata(&self) -> &TableMetadata {
         self.metadata
     }
-    pub fn intent(&self) -> &OperationIntent {
-        self.intent
-    }
     pub fn artifacts(&self) -> &dyn ArtifactWriter {
         self.artifacts
     }

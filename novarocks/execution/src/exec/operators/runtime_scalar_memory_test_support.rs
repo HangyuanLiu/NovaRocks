@@ -125,10 +125,6 @@ impl RuntimeScalarFrameForTest {
             _state: state,
         })
     }
-    #[expect(
-        clippy::result_large_err,
-        reason = "The original nominal runtime cause remains inline."
-    )]
     pub fn evaluate(&mut self, input: &RecordBatch) -> ExecutionResult<ArrayRef> {
         evaluate_all(&mut self.instance, self.site, input, &self.control)
     }

@@ -46,6 +46,7 @@ impl SqlScanOccurrence {
         (anchor != ColumnId::UNSET).then_some(Self { binding, anchor })
     }
 
+    #[cfg(test)]
     pub const fn binding(self) -> SqlTableBindingId {
         self.binding
     }
@@ -58,14 +59,12 @@ pub struct MvRewriteInputSelection {
 }
 
 impl MvRewriteInputSelection {
+    #[cfg(test)]
     pub const fn binding(self) -> SqlTableBindingId {
         self.occurrence.binding()
     }
 
-    pub const fn occurrence(self) -> SqlScanOccurrence {
-        self.occurrence
-    }
-
+    #[cfg(test)]
     pub const fn definition_occurrence_id(self) -> crate::compiler::SqlMvRelationOccurrenceId {
         self.definition_occurrence_id
     }
@@ -88,7 +87,7 @@ pub struct MvRewriteSelection {
 }
 
 impl MvRewriteSelection {
-    #[cfg(any(test, novarocks_dev_controls))]
+    #[cfg(test)]
     pub(crate) fn unverified(name: String) -> Self {
         Self {
             name,
@@ -162,6 +161,7 @@ impl MvRewriteSelection {
         self.publication_provenance.as_deref()
     }
 
+    #[cfg(test)]
     pub(crate) fn input_mapping(&self) -> &[MvRewriteInputSelection] {
         &self.input_mapping
     }
@@ -244,10 +244,6 @@ pub(crate) struct PlanUnpivotValueMapping {
 }
 
 impl PlanUnpivotNode {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The typed unpivot contract keeps independently validated column roles explicit."
-    )]
     #[allow(dead_code)]
     pub(crate) fn try_new(
         input_columns: &[OutputColumn],

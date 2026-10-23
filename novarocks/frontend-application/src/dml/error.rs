@@ -34,7 +34,7 @@ pub enum DmlErrorKind {
 #[derive(Debug)]
 enum DmlErrorBody {
     Legacy(String),
-    Execution(ExecutionFailureInput),
+    Execution(Box<ExecutionFailureInput>),
 }
 
 #[derive(Debug)]
@@ -202,7 +202,21 @@ impl From<crate::query_execution::dml::mutation_flow::CowFailure> for DmlExecuti
 /// Positive stage evidence retained independently of final publication.
 #[derive(Debug)]
 pub struct DmlStagedCreateFailure {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained as typed staged-create evidence in DML failure diagnostics"
+        )
+    )]
     pub receipt: novarocks_spi::connector::ConnectorStagedCreateReceipt,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained as typed staged-create evidence in DML failure diagnostics"
+        )
+    )]
     pub finalization: novarocks_spi::connector::ExternalMutationFinalization,
 }
 
@@ -210,7 +224,7 @@ impl DmlError {
     pub(crate) fn from_execution(input: ExecutionFailureInput) -> Self {
         Self {
             kind: DmlErrorKind::Executor,
-            body: DmlErrorBody::Execution(input),
+            body: DmlErrorBody::Execution(Box::new(input)),
             publication_terminal: None,
             user_error: None,
             engine_error_code: None,
@@ -232,7 +246,7 @@ impl DmlError {
 
     pub(crate) fn execution_failure(&self) -> Option<&ExecutionFailureInput> {
         match &self.body {
-            DmlErrorBody::Execution(input) => Some(input),
+            DmlErrorBody::Execution(input) => Some(input.as_ref()),
             DmlErrorBody::Legacy(_) => None,
         }
     }
@@ -388,6 +402,7 @@ impl DmlError {
         self.compile_control.clone()
     }
 
+    #[cfg(test)]
     pub const fn kind(&self) -> DmlErrorKind {
         self.kind
     }
@@ -412,6 +427,7 @@ impl DmlError {
         self
     }
 
+    #[cfg(test)]
     pub fn staged_create_preparation(&self) -> Option<&DmlStagedCreateFailure> {
         self.staged_create_preparation.as_deref()
     }

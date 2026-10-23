@@ -24,7 +24,7 @@
 
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
-use crate::scenarios::query_lifecycle::native_sql_controls::SqlIntentOwner;
+use crate::scenarios::native_sql_controls::SqlIntentOwner;
 use crate::scenarios::task_evidence;
 
 #[path = "native_trust_controls.rs"]
@@ -905,7 +905,7 @@ fn raw_grpc_probe_with_deadline(
                 let (mut sender, connection) = client::handshake(stream)
                     .await
                     .context("perform Native raw probe HTTP/2 handshake")?;
-                driver = Some(tokio::spawn(async move { connection.await }));
+                driver = Some(tokio::spawn(connection));
                 let mut request = Request::builder()
                     .method("POST")
                     .uri(path)

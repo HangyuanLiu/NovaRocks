@@ -69,6 +69,7 @@ impl fmt::Debug for NativeAbortEffectAdapter {
 }
 
 impl NativeAbortEffectAdapter {
+    #[cfg(test)]
     pub(crate) fn bounded(
         capacity: NonZeroUsize,
         wake: Arc<dyn StatusIntakeWake>,
@@ -79,6 +80,7 @@ impl NativeAbortEffectAdapter {
 
     /// Builds one attempt-local intake while publishing capacity changes on
     /// its logical execution's shared Abort port.
+    #[cfg(test)]
     pub(crate) fn bounded_with_capacity_epoch(
         capacity: NonZeroUsize,
         wake: Arc<dyn StatusIntakeWake>,
@@ -664,16 +666,20 @@ pub(crate) enum NativeAbortEffectSettleError {
     /// silently reclassified as an unknown transport result.
     Rejected {
         reason: NativeAbortEffectAckError,
-        effect: NativeAbortEffect,
+        effect: Box<NativeAbortEffect>,
     },
     Application(ContextStandDownError),
 }
 
 impl NativeAbortEffectSettleError {
     fn rejected(reason: NativeAbortEffectAckError, effect: NativeAbortEffect) -> Self {
-        Self::Rejected { reason, effect }
+        Self::Rejected {
+            reason,
+            effect: Box::new(effect),
+        }
     }
 
+    #[cfg(test)]
     pub(crate) const fn reason(&self) -> Option<NativeAbortEffectAckError> {
         match self {
             Self::Rejected { reason, .. } => Some(*reason),
@@ -681,16 +687,17 @@ impl NativeAbortEffectSettleError {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn into_effect(self) -> Option<NativeAbortEffect> {
         match self {
-            Self::Rejected { effect, .. } => Some(effect),
+            Self::Rejected { effect, .. } => Some(*effect),
             Self::Application(_) => None,
         }
     }
 
     pub(crate) fn fail_closed(self) -> Result<(), ContextStandDownError> {
         match self {
-            Self::Rejected { effect, .. } => effect.fail_closed(),
+            Self::Rejected { effect, .. } => (*effect).fail_closed(),
             Self::Application(error) => Err(error),
         }
     }

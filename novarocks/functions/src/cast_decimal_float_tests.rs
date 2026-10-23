@@ -45,10 +45,10 @@ impl KernelEvaluationControl for Control {
             assert!(at <= *stop, "callback after original refusal");
         }
         calls.push(n);
-        if let Some((stop, cause)) = &self.refusal {
-            if at == *stop {
-                return Err(cause.clone());
-            }
+        if let Some((stop, cause)) = &self.refusal
+            && at == *stop
+        {
+            return Err(cause.clone());
         }
         Ok(())
     }
@@ -136,13 +136,12 @@ fn decimal_float_complete_metadata_policy_nullability_and_effect_contract() {
                                 assert_eq!(prepared.result_type(), &target);
                                 assert_eq!(prepared.policy(), policy);
                                 assert_eq!(prepared.allow_throw_exception(), allow);
-                                assert_eq!(
-                                    prepared
+                                assert!(
+                                    !prepared
                                         .own_effects(context)
                                         .for_use(context)
                                         .unwrap()
-                                        .may_raise_row_error,
-                                    false
+                                        .may_raise_row_error
                                 );
                                 assert!(!carrier_cast_can_produce_null(
                                     source.data_type(),
@@ -396,10 +395,10 @@ fn decimal_float_compile_callbacks_preserve_primary_causes_on_success_and_reject
                 assert!(at <= stop, "callback after primary compile refusal");
             }
             calls.push((phase, items));
-            if let Some((stop, cause)) = self.refusal.clone() {
-                if at == stop {
-                    return Err(cause);
-                }
+            if let Some((stop, cause)) = self.refusal.clone()
+                && at == stop
+            {
+                return Err(cause);
             }
             Ok(())
         }

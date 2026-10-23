@@ -430,7 +430,6 @@ pub struct MvSchemaValidationObservation {
 }
 
 impl MvSchemaValidationObservation {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         table: ConnectorTableIdentity,
         object_id: ConnectorTableObjectId,
@@ -607,7 +606,6 @@ pub struct MvRefreshTargetObservation {
 }
 
 impl MvRefreshTargetObservation {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         table: ConnectorTableIdentity,
         table_uuid: String,
@@ -749,7 +747,6 @@ pub struct MvMaintenanceMetadataObservation {
 }
 
 impl MvMaintenanceMetadataObservation {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         current_snapshot_id: Option<i64>,
         snapshots: Vec<MvObservedSnapshot>,

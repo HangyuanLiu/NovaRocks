@@ -113,7 +113,7 @@ fn evaluate_rows(
         let (row, delimiter_row) = address(ordinal, batch_row);
         observe(Observation::Step)?;
         if row >= left.len() || delimiter_row >= right.len() {
-            return Err(internal("split selected address is out of bounds").into());
+            return Err(internal("split selected address is out of bounds"));
         }
         if left.is_null(row) || right.is_null(delimiter_row) {
             observe(Observation::OpaqueBoundary)?;

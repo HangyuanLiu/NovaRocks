@@ -53,12 +53,12 @@ impl Host {
         assert!(!ledger.refused, "no request after a refusal");
         let at = ledger.events.len();
         ledger.events.push((opaque, bytes));
-        if let Some((stop, cause)) = &ledger.refusal {
-            if *stop == at {
-                let cause = cause.clone();
-                ledger.refused = true;
-                return Err(cause);
-            }
+        if let Some((stop, cause)) = &ledger.refusal
+            && *stop == at
+        {
+            let cause = cause.clone();
+            ledger.refused = true;
+            return Err(cause);
         }
         if opaque {
             ledger.opaque += bytes;
@@ -128,10 +128,10 @@ impl KernelEvaluationControl for Control {
             let mut trace = self.trace.lock().unwrap();
             let at = trace.len();
             trace.push(units);
-            if let Some((stop, cause)) = &self.refusal {
-                if *stop == at {
-                    return Err(cause.clone());
-                }
+            if let Some((stop, cause)) = &self.refusal
+                && *stop == at
+            {
+                return Err(cause.clone());
             }
             Ok(())
         })

@@ -325,6 +325,86 @@ pub(super) fn prepared_for_test(
 ) -> Result<Arc<dyn PreparedScalarKernel>, crate::FunctionSpecializationFailure> {
     tests::prepared_for_test(sources, literals, policy)
 }
+
+impl RoundOwner {
+    fn refine_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(FunctionEffectOwnerError::Control)?;
+        work.step().map_err(FunctionEffectOwnerError::Control)?;
+        if input.function_id != self.declaration.function_id() || input.kind != FunctionKind::Scalar
+        {
+            return Err(FunctionBindingError::UnknownFunction.into());
+        }
+        if !input.environment.is_empty()
+            || !matches!(input.proof_scope, CallProofScope::Unconditional)
+                && input.proof_scope != CallProofScope::Domain(input.context.domain)
+        {
+            return Err(FunctionBindingError::InvalidBinding(
+                "round has no environment dependencies and requires an exact proof scope".into(),
+            )
+            .into());
+        }
+        work.flush().map_err(FunctionEffectOwnerError::Control)?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+            other => FunctionEffectOwnerError::Owner(other),
+        })?;
+        let result = self
+            .call_effects(input, &mut work)
+            .map_err(|error| match error {
+                FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+                other => FunctionEffectOwnerError::Owner(other),
+            })?;
+        work.finish().map_err(FunctionEffectOwnerError::Control)?;
+        Ok(result)
+    }
+    fn prepare_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(compile_failure)?;
+        work.step().map_err(compile_failure)?;
+        if input.function_id != self.declaration.function_id()
+            || input.kind != FunctionKind::Scalar
+            || contract.function_id() != input.function_id
+            || !std::ptr::eq(contract.selected(), input.selected)
+            || contract.context() != input.context
+            || contract.decimal_overflow_policy() != input.decimal_overflow_policy
+            || !input.environment.is_empty()
+        {
+            return Err(invalid(
+                "round preparation differs from its exact checked call",
+            ));
+        }
+        work.flush().map_err(compile_failure)?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => compile_failure(error),
+            _ => invalid("round preparation has a stale selected binding"),
+        })?;
+        let expected_effects = self
+            .call_effects(input, &mut work)
+            .map_err(binding_failure)?;
+        if contract.effects() != &expected_effects {
+            return Err(invalid("round preparation has foreign frozen effects"));
+        }
+        work.flush().map_err(compile_failure)?;
+        let recipe =
+            RoundRecipe::prepare(input.selected, control).map_err(specialization_failure)?;
+        work.finish().map_err(compile_failure)?;
+        // The prepared object retains the same canonical contract. Its body is
+        // a static pure implementation and needs no live resolver or authority.
+        Ok(Arc::new(PreparedRound { contract, recipe }))
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::super::catalogue::constant_binding_tests as cv;
@@ -1212,85 +1292,5 @@ mod tests {
         )
         .unwrap();
         assert!(prepared_for_test(&[uuid], &[None], DecimalOverflowPolicy::OutputNull).is_err());
-    }
-}
-
-impl RoundOwner {
-    fn refine_selected_core(
-        &self,
-        input: CallEffectInput<'_>,
-        control: &dyn PureCompileControl,
-        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
-    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(FunctionEffectOwnerError::Control)?;
-        work.step().map_err(FunctionEffectOwnerError::Control)?;
-        if input.function_id != self.declaration.function_id() || input.kind != FunctionKind::Scalar
-        {
-            return Err(FunctionBindingError::UnknownFunction.into());
-        }
-        if !input.environment.is_empty()
-            || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                && input.proof_scope != CallProofScope::Domain(input.context.domain)
-        {
-            return Err(FunctionBindingError::InvalidBinding(
-                "round has no environment dependencies and requires an exact proof scope".into(),
-            )
-            .into());
-        }
-        work.flush().map_err(FunctionEffectOwnerError::Control)?;
-        validate().map_err(|error| match error {
-            FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
-            other => FunctionEffectOwnerError::Owner(other),
-        })?;
-        let result = self
-            .call_effects(input, &mut work)
-            .map_err(|error| match error {
-                FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
-                other => FunctionEffectOwnerError::Owner(other),
-            })?;
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        Ok(result)
-    }
-    fn prepare_selected_core(
-        &self,
-        input: CallEffectInput<'_>,
-        contract: Arc<ScalarCallContract>,
-        control: &dyn PureCompileControl,
-        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
-    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(compile_failure)?;
-        work.step().map_err(compile_failure)?;
-        if input.function_id != self.declaration.function_id()
-            || input.kind != FunctionKind::Scalar
-            || contract.function_id() != input.function_id
-            || !std::ptr::eq(contract.selected(), input.selected)
-            || contract.context() != input.context
-            || contract.decimal_overflow_policy() != input.decimal_overflow_policy
-            || !input.environment.is_empty()
-        {
-            return Err(invalid(
-                "round preparation differs from its exact checked call",
-            ));
-        }
-        work.flush().map_err(compile_failure)?;
-        validate().map_err(|error| match error {
-            FunctionBindingError::Control(error) => compile_failure(error),
-            _ => invalid("round preparation has a stale selected binding"),
-        })?;
-        let expected_effects = self
-            .call_effects(input, &mut work)
-            .map_err(binding_failure)?;
-        if contract.effects() != &expected_effects {
-            return Err(invalid("round preparation has foreign frozen effects"));
-        }
-        work.flush().map_err(compile_failure)?;
-        let recipe =
-            RoundRecipe::prepare(input.selected, control).map_err(specialization_failure)?;
-        work.finish().map_err(compile_failure)?;
-        // The prepared object retains the same canonical contract. Its body is
-        // a static pure implementation and needs no live resolver or authority.
-        Ok(Arc::new(PreparedRound { contract, recipe }))
     }
 }

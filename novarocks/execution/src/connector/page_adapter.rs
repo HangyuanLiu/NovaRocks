@@ -26,6 +26,7 @@
 //!
 //! Key exported interfaces:
 //! - Types: `SourcePageConverter`, `PageAdapterError`, `PageAdapterErrorKind`.
+//!
 //! Every page binds the scan's immutable complete typed output declaration.
 //! Runtime construction uses the installed scan factory; page arrays never
 //! author a competing schema.
@@ -459,7 +460,7 @@ mod tests {
         let factory = actual_factory(&tracker, error.clone());
         let initial = tracker.current();
         let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Internal(
-            novarocks_functions::KernelDiagnostic::new(&("original scan stop".to_owned())),
+            novarocks_functions::KernelDiagnostic::new("original scan stop"),
         ));
         error.set_error(original.clone());
         let mut converter = SourcePageConverter::with_output_schema(declared_schema(true));

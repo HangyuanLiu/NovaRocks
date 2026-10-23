@@ -16,7 +16,7 @@
 // under the License.
 //! Actual observer refusal points for the shared loop/materializers.
 use super::*;
-use crate::{KernelDiagnostic, ScalarEvaluationInstance, Selection};
+use crate::{KernelDiagnostic, ScalarEvaluationInstance};
 use std::{sync::Mutex, time::Duration};
 #[derive(Default)]
 struct Trace {
@@ -29,10 +29,10 @@ impl KernelEvaluationControl for Trace {
         let mut calls = self.calls.lock().unwrap();
         let index = calls.len();
         calls.push(units);
-        if let Some((at, failure)) = &self.refusal {
-            if index == *at {
-                return Err(failure.clone());
-            }
+        if let Some((at, failure)) = &self.refusal
+            && index == *at
+        {
+            return Err(failure.clone());
         }
         Ok(())
     }

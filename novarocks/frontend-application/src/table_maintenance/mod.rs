@@ -46,8 +46,8 @@ use crate::query_execution::maintenance::{
 use novarocks_table_maintenance::product::TableMaintenanceProduct;
 use novarocks_table_maintenance::runtime::{MaintenanceJobState, TerminalError};
 use novarocks_table_maintenance::{
-    AutomaticMaintenanceOutcome, AutomaticOptimizeOutcome, MaintenanceActionOutcome,
-    MaintenanceActionRequest, MaintenanceEffectId, MaintenanceTarget, OptimizeSubmission,
+    AutomaticMaintenanceOutcome, AutomaticOptimizeOutcome, MaintenanceActionRequest,
+    MaintenanceEffectId, MaintenanceTarget, OptimizeSubmission,
 };
 
 // Both public OPTIMIZE and automatic callers consume this same original
@@ -206,11 +206,14 @@ impl FrontendTableMaintenanceService {
             None => None,
         };
         #[cfg(novarocks_dev_controls)]
-        let capture = capture.with_test_receipt(receipt.as_ref());
+        let submission = {
+            let capture = capture.with_test_receipt(receipt.as_ref());
+            self.block_on(self.product.submit_optimize(target, &capture))
+        };
+        #[cfg(not(novarocks_dev_controls))]
         let submission = self.block_on(self.product.submit_optimize(target, &capture));
         #[cfg(novarocks_dev_controls)]
         {
-            drop(capture);
             if let (Some(receipt), Ok(OptimizeSubmission::Submitted { job_id, .. })) =
                 (receipt, &submission)
             {
@@ -226,15 +229,6 @@ impl FrontendTableMaintenanceService {
         } else {
             self.runtime.block_on(future)
         }
-    }
-
-    fn submit_optimize(
-        &self,
-        engine: &dyn TableMaintenanceEngine,
-        target: MaintenanceTarget,
-    ) -> Result<OptimizeSubmission, String> {
-        let capture = FrontendOptimizeTargetCapturePort::new(engine);
-        self.block_on(self.product.submit_optimize(target, &capture))
     }
 
     fn show_optimize(
@@ -323,35 +317,34 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                             novarocks_table_maintenance::OptimizeCompletionMode::AwaitTerminal,
                         ..
                     }
-                ) {
-                    if let Some(handle) = submission.handle() {
-                        let control = engine
-                            .statement_cancellation()
-                            .expect("AwaitTerminal verified statement control before submission");
-                        let wait = self.product.wait_optimize_terminal_record(handle);
-                        tokio::pin!(wait);
-                        let mut cancelled = false;
-                        let mut cancellation_error = None;
-                        let terminal = tokio::select! {
-                            terminal = &mut wait => terminal,
-                            _ = control.0.stopped() => {
-                                cancelled = true;
-                                cancellation_error = self.product.request_cancel_optimize(handle).await.err();
-                                wait.await
-                            },
-                            _ = tokio::time::sleep_until(control.1.into()) => {
-                                cancelled = true;
-                                cancellation_error = self.product.request_cancel_optimize(handle).await.err();
-                                wait.await
-                            },
-                        }?;
-                        optimize_statement_terminal_result(
-                            handle,
-                            terminal,
-                            cancelled,
-                            cancellation_error,
-                        )?;
-                    }
+                ) && let Some(handle) = submission.handle()
+                {
+                    let control = engine
+                        .statement_cancellation()
+                        .expect("AwaitTerminal verified statement control before submission");
+                    let wait = self.product.wait_optimize_terminal_record(handle);
+                    tokio::pin!(wait);
+                    let mut cancelled = false;
+                    let mut cancellation_error = None;
+                    let terminal = tokio::select! {
+                        terminal = &mut wait => terminal,
+                        _ = control.0.stopped() => {
+                            cancelled = true;
+                            cancellation_error = self.product.request_cancel_optimize(handle).await.err();
+                            wait.await
+                        },
+                        _ = tokio::time::sleep_until(control.1.into()) => {
+                            cancelled = true;
+                            cancellation_error = self.product.request_cancel_optimize(handle).await.err();
+                            wait.await
+                        },
+                    }?;
+                    optimize_statement_terminal_result(
+                        handle,
+                        terminal,
+                        cancelled,
+                        cancellation_error,
+                    )?;
                 }
                 Ok(MaintenanceStatementResult::Ok)
             }
@@ -371,16 +364,6 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         self.show_optimize(statement, context)
     }
 
-    async fn execute_automatic_action(
-        &self,
-        engine: &dyn TableMaintenanceEngine,
-        request: MaintenanceActionRequest,
-    ) -> Result<MaintenanceActionOutcome, TerminalError> {
-        self.product
-            .execute_action(&FrontendMaintenanceEffectPort::new(engine), request)
-            .await
-    }
-
     async fn execute_automatic_action_with_effect_id(
         &self,
         engine: &dyn TableMaintenanceEngine,
@@ -398,42 +381,6 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                 effect_id,
             )
             .await
-    }
-
-    fn submit_automatic_optimize(
-        &self,
-        engine: &dyn TableMaintenanceEngine,
-        target: MaintenanceTarget,
-    ) -> Result<OptimizeSubmission, String> {
-        self.submit_optimize(engine, target)
-    }
-
-    async fn wait_for_automatic_optimize(
-        &self,
-        handle: novarocks_table_maintenance::runtime::JobHandle,
-    ) -> Result<novarocks_table_maintenance::runtime::MaintenanceJobState, String> {
-        self.product.wait_optimize(handle).await
-    }
-
-    fn execute_automatic_optimize_durably(
-        &self,
-        engine: &dyn TableMaintenanceEngine,
-        target: MaintenanceTarget,
-    ) -> Result<OptimizeSubmission, String> {
-        let submission = self.submit_optimize(engine, target)?;
-        let Some(handle) = submission.handle() else {
-            return Ok(submission);
-        };
-        let terminal = self.block_on(self.wait_for_automatic_optimize(handle))?;
-        if terminal == novarocks_table_maintenance::runtime::MaintenanceJobState::Finished {
-            Ok(submission)
-        } else {
-            Err(format!(
-                "optimize job {} completed with terminal state {}",
-                handle.job_id(),
-                terminal.as_str()
-            ))
-        }
     }
 
     fn execute_automatic_optimize_with_effect_id(

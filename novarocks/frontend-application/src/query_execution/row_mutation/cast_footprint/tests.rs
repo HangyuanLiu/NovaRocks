@@ -108,6 +108,7 @@ fn layout_preflight_preserves_utf8_extent_from_small_legal_dictionary() {
 
     const ROWS: usize = 524_288;
     const VALUE_BYTES: usize = 4096;
+    const _: () = assert!(ROWS <= MAX_ROWS);
     let dictionary: ArrayRef = Arc::new(
         DictionaryArray::<Int32Type>::try_new(
             Int32Array::from(vec![0; ROWS]),
@@ -117,7 +118,6 @@ fn layout_preflight_preserves_utf8_extent_from_small_legal_dictionary() {
     );
     let input = batch(Arc::clone(&dictionary));
     let schema = Schema::new(vec![Field::new("v", DataType::Utf8, true)]);
-    assert!(ROWS <= MAX_ROWS);
     assert!(ConnectorRowConversionFootprint::retained_batch_bytes(&input).unwrap() < INPUT_BYTES);
     assert!(dictionary.get_buffer_memory_size() < 3 * 1024 * 1024);
 

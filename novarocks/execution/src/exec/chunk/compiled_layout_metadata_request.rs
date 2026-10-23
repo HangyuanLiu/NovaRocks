@@ -177,9 +177,7 @@ mod tests {
         ObservedInputConstructionFactory,
         runtime::{RuntimeInputConstructionControl, TrackedInputConstructionHost},
     };
-    use novarocks_type_contract::{
-        CompileControlError, FunctionValueType, TypedValueBinding, ValueLogicalType,
-    };
+    use novarocks_type_contract::{CompileControlError, FunctionValueType, ValueLogicalType};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},

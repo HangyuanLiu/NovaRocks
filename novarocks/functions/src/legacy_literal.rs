@@ -196,7 +196,7 @@ impl novarocks_failure_contract::FailureProjection for LiteralFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         use novarocks_failure_contract::{
             FailureClass, FailureFact, FailureReason, RepresentationBoundary, RepresentationFacts,
-            RepresentationLayout, ResourceDimension, ResourceFacts, ResourceScope, domain,
+            RepresentationLayout, domain,
         };
         let (class, code) = match self {
             Self::Decimal(_) => (FailureClass::Invariant, 198),

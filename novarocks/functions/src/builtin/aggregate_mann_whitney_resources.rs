@@ -22,7 +22,6 @@ use super::aggregate_mann_whitney_core::{MannResourceEvent, MannStateExtents};
 use crate::arrow_result_custody::{
     FlatByteKind, FlatDirectByteFacts, RequestUpper, direct_flat_byte_facts,
 };
-use crate::builtin::aggregate_mann_whitney_core::MannFailure;
 use crate::scalar_copy_geometry::{
     ScalarCopyDiagnosticGeometry, arrow_default_debug_bytes_upper, scalar_copy_diagnostic_geometry,
 };
@@ -242,7 +241,7 @@ pub(crate) fn default_byte_payload(
     let data = vector::<u8>(1024, data_bytes, 8)?;
     let offsets = vector::<i32>(1025, add(rows, 1)?, 4)?;
     let bitmap = if validity && rows != 0 {
-        let ceil_bytes = add(rows / 8, usize::from(rows % 8 != 0))?;
+        let ceil_bytes = add(rows / 8, usize::from(!rows.is_multiple_of(8)))?;
         let rounded = mul(add(ceil_bytes / 64, usize::from(ceil_bytes % 64 != 0))?, 64)?;
         let capacity_upper = add(128, rounded)?;
         let retained = mul(2, capacity_upper)?;

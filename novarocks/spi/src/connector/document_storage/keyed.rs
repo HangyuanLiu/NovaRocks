@@ -532,6 +532,10 @@ impl Default for KeyedDocumentLimits {
 }
 
 /// The exact admission remains attached to every catalog mutation.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The public keyed-mutation union carries exact owned intents by value; boxing a payload would change the shared SPI contract"
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KeyedMutation {
     Markers(KeyedMarkerWrite),
@@ -673,6 +677,24 @@ impl std::error::Error for KeyedDocumentReadError {
             Self::Invalid(error) => Some(error),
             Self::LegacyFormat { .. } => None,
         }
+    }
+}
+
+impl KeyedDocumentView {
+    pub fn validate_for(
+        &self,
+        request: &KeyedDocumentObservationRequest,
+    ) -> Result<(), ConnectorError> {
+        self.metadata_version.validate()?;
+        if self.owner != request.owner
+            || self.table != request.target
+            || self.object_id != request.object_id
+        {
+            return Err(invalid(
+                "keyed observation returned a different table or control generation",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -837,23 +859,5 @@ mod tests {
             }
             .is_empty()
         );
-    }
-}
-
-impl KeyedDocumentView {
-    pub fn validate_for(
-        &self,
-        request: &KeyedDocumentObservationRequest,
-    ) -> Result<(), ConnectorError> {
-        self.metadata_version.validate()?;
-        if self.owner != request.owner
-            || self.table != request.target
-            || self.object_id != request.object_id
-        {
-            return Err(invalid(
-                "keyed observation returned a different table or control generation",
-            ));
-        }
-        Ok(())
     }
 }

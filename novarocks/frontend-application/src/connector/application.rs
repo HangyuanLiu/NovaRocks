@@ -22,10 +22,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use novarocks_spi::connector::{
-    ConnectorAttemptContext, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
-    ConnectorListNamespacesRequest, ConnectorNamespaceIdentity, ConnectorPlanningContext,
-    ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest, ConnectorRequestContext,
-    ConnectorStopOwner, ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceId, ConnectorListNamespacesRequest,
+    ConnectorNamespaceIdentity, ConnectorPlanningContext, ConnectorReadReferenceFacts,
+    ConnectorReadReferenceFactsRequest, ConnectorRequestContext, ConnectorStopOwner,
+    ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
 };
 
 struct QueryStopRelay {
@@ -105,6 +105,7 @@ pub fn connector_request_context(
 ///
 /// Frontend-owned typed command capabilities use this same constructor so
 /// provider requests share the statement cancellation identity and options.
+#[cfg(test)]
 pub fn connector_request_context_for_query(
     query_options: Option<&QueryOptions>,
     cancellation: novarocks_query_application::cancellation::QueryCancellationView,
@@ -126,19 +127,6 @@ pub(crate) fn connector_request_context_for_query_on_runtime(
     )
 }
 
-/// Build the FE planning context used for metadata observation and Connector
-/// scan negotiation. This path has no execution-attempt credential collector.
-pub fn connector_planning_context_for_query(
-    query_options: Option<&QueryOptions>,
-    cancellation: novarocks_query_application::cancellation::QueryCancellationView,
-) -> Result<ConnectorPlanningContext, String> {
-    ConnectorPlanningContext::try_from_request(connector_request_context_for_query(
-        query_options,
-        cancellation,
-    )?)
-    .map_err(|error| error.to_string())
-}
-
 pub(crate) fn connector_planning_context_for_query_on_runtime(
     runtime: &tokio::runtime::Handle,
     query_options: Option<&QueryOptions>,
@@ -150,12 +138,6 @@ pub(crate) fn connector_planning_context_for_query_on_runtime(
         cancellation,
     )?)
     .map_err(|error| error.to_string())
-}
-
-/// Mark an already-admitted and attempt-decorated request for the SPI surface
-/// that can instantiate runtime access from frozen scan semantics.
-pub fn connector_attempt_context(request: ConnectorRequestContext) -> ConnectorAttemptContext {
-    ConnectorAttemptContext::from_admitted_request(request)
 }
 
 /// Freeze a Connector request context to the execution round's authoritative
@@ -234,10 +216,6 @@ pub fn test_request_context() -> ConnectorRequestContext {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::items_after_test_module,
-    reason = "The request-context tests remain adjacent to their test-only factory."
-)]
 mod request_context_tests {
     use std::time::{Duration, Instant};
 
@@ -594,22 +572,7 @@ pub fn metadata_load_table_with_planning_lease(
             .ok()
             .map(i32::from_le_bytes)
     });
-    Ok((
-        backend::ResolvedTable {
-            catalog: metadata.identity.instance_id.as_str().to_string(),
-            namespace: metadata.identity.namespace.to_string(),
-            table: metadata.identity.table.to_string(),
-            columns,
-            statistics_pin: metadata
-                .statistics_data_version
-                .clone()
-                .map(|data_version| backend::ResolvedTableStatisticsPin {
-                    table: metadata.table.clone(),
-                    data_version,
-                }),
-        },
-        schema_id,
-    ))
+    Ok((backend::ResolvedTable { columns }, schema_id))
 }
 
 /// Load the exact connector metadata admitted by a retained planning lease.

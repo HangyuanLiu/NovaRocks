@@ -47,7 +47,6 @@ const MAX_UNPIVOT_OUTPUT_BYTES: usize =
 #[derive(Clone, Debug)]
 pub struct WriterPartialAggregateCall {
     pub(crate) input_slot_id: u32,
-    pub(crate) function_name: String,
     pub(crate) source:
         crate::binding::AggregateArgumentSource<TypedExpr, crate::analysis::SortItem>,
     pub(crate) intermediate_slot_id: u32,
@@ -57,14 +56,8 @@ impl WriterPartialAggregateCall {
     pub const fn input_slot_id(&self) -> u32 {
         self.input_slot_id
     }
-    pub fn function_name(&self) -> &str {
-        &self.function_name
-    }
     pub fn resolved(&self) -> &ResolvedFunctionBinding {
         self.source.binding().resolved()
-    }
-    pub fn binding(&self) -> &SqlFunctionBinding {
-        self.source.binding()
     }
     pub const fn intermediate_slot_id(&self) -> u32 {
         self.intermediate_slot_id
@@ -84,7 +77,6 @@ impl WriterPartialAggregatePlan {
 
 #[derive(Clone, Debug)]
 pub struct WriterFinalAggregateCall {
-    pub(crate) function_name: String,
     pub(crate) source:
         crate::binding::AggregateArgumentSource<TypedExpr, crate::analysis::SortItem>,
     pub(crate) intermediate_input_slot_id: u32,
@@ -92,14 +84,8 @@ pub struct WriterFinalAggregateCall {
 }
 
 impl WriterFinalAggregateCall {
-    pub fn function_name(&self) -> &str {
-        &self.function_name
-    }
     pub fn resolved(&self) -> &ResolvedFunctionBinding {
         self.source.binding().resolved()
-    }
-    pub fn binding(&self) -> &SqlFunctionBinding {
-        self.source.binding()
     }
     pub const fn intermediate_input_slot_id(&self) -> u32 {
         self.intermediate_input_slot_id
@@ -131,7 +117,6 @@ impl WriteUnpivotMapping {
 #[derive(Clone, Debug)]
 pub struct WriterUnpivotPlan {
     pub(crate) grouping_input_slot_id: u32,
-    pub(crate) grouping_output_slot_id: u32,
     pub(crate) passthrough_output_slot_id: u32,
     pub(crate) value_output_slot_id: u32,
     pub(crate) literal_output_slot_ids: Vec<u32>,
@@ -143,9 +128,6 @@ pub struct WriterUnpivotPlan {
 impl WriterUnpivotPlan {
     pub const fn grouping_input_slot_id(&self) -> u32 {
         self.grouping_input_slot_id
-    }
-    pub const fn grouping_output_slot_id(&self) -> u32 {
-        self.grouping_output_slot_id
     }
     pub const fn passthrough_output_slot_id(&self) -> u32 {
         self.passthrough_output_slot_id
@@ -334,7 +316,6 @@ pub fn plan_writer_statistics(
     }
 
     let mut next_slot = first_free_internal_slot(targets)?;
-    let grouping_output_slot_id = allocate_slot(&mut next_slot)?;
     let mut channels = Vec::new();
     let mut partial_by_target = BTreeMap::new();
     let mut final_calls = Vec::new();
@@ -470,7 +451,6 @@ pub fn plan_writer_statistics(
                     .map_err(|error| error.to_string())?,
                 );
                 final_calls.push(WriterFinalAggregateCall {
-                    function_name: requirement.function_name().to_string(),
                     source: source.clone(),
                     intermediate_input_slot_id: intermediate_slot_id,
                     final_output_slot_id,
@@ -480,7 +460,6 @@ pub fn plan_writer_statistics(
             };
             partial_calls.push(WriterPartialAggregateCall {
                 input_slot_id: target_input_slot_id(requirement.input().ordinal())?,
-                function_name: requirement.function_name().to_string(),
                 source,
                 intermediate_slot_id,
             });
@@ -513,7 +492,6 @@ pub fn plan_writer_statistics(
     let schema = WriterMultiplexSchema::try_new(channels).map_err(|error| error.to_string())?;
     let unpivot = WriterUnpivotPlan {
         grouping_input_slot_id: write_relation_column_id(WRITE_RELATION_TARGET_INDEX),
-        grouping_output_slot_id,
         passthrough_output_slot_id: root_write_result_column_id(ROOT_WRITE_RESULT_TARGET_INDEX),
         value_output_slot_id: root_write_result_column_id(ROOT_WRITE_RESULT_BODY_INDEX),
         literal_output_slot_ids: vec![
@@ -958,14 +936,17 @@ mod tests {
             let partial = plan.partial_for(target).unwrap();
             let partial = &partial.calls()[0];
             let final_call = &plan.final_plan().calls()[0];
-            assert_eq!(partial.binding().decimal_overflow_policy(), policy);
-            assert_eq!(final_call.binding().decimal_overflow_policy(), policy);
+            assert_eq!(partial.source.binding().decimal_overflow_policy(), policy);
+            assert_eq!(
+                final_call.source.binding().decimal_overflow_policy(),
+                policy
+            );
             assert!(std::ptr::eq(partial.resolved(), final_call.resolved()));
             assert_eq!(
                 partial.intermediate_slot_id(),
                 final_call.intermediate_input_slot_id()
             );
-            authored.push(final_call.binding().clone());
+            authored.push(final_call.source.binding().clone());
         }
         assert_eq!(authored[0].resolved(), authored[1].resolved());
         assert_ne!(authored[0], authored[1]);

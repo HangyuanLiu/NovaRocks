@@ -414,7 +414,6 @@ pub(super) fn validate_schema_root<H>(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_field<H>(
     field: &wire::ArrowPhysicalField,
     id: u32,
@@ -450,7 +449,6 @@ fn validate_field<H>(
         context,
     )
 }
-#[allow(clippy::too_many_arguments)]
 pub(super) fn validate<H>(
     value: &wire::ArrowPhysicalType,
     id: u32,
@@ -615,10 +613,10 @@ pub(super) fn validate<H>(
         }
         _ => {
             let actual = scalars::validate(kind, context)?;
-            if let P::Timestamp(value) = kind {
-                if let Some(zone) = &value.timezone {
-                    counts.string(zone.len(), limits)?;
-                }
+            if let P::Timestamp(value) = kind
+                && let Some(zone) = &value.timezone
+            {
+                counts.string(zone.len(), limits)?;
             }
             let expected = logical
                 .get_observed(id, context.work)?

@@ -230,7 +230,7 @@ fn source_type_requires_exact_nullable_nested_metadata_and_nominal_identity() {
             .with_metadata([("provider.id".into(), "a".into())].into()),
     );
     let nested = FunctionValueType::new(DataType::List(child), true);
-    let backing = plain(new_null_array(&nested.data_type(), 1), true);
+    let backing = plain(new_null_array(nested.data_type(), 1), true);
     table.insert(ConstantPoolId::new(1), backing).unwrap();
     for (index, bad) in [
         FunctionValueType::new(
@@ -287,7 +287,7 @@ fn source_type_requires_exact_nullable_nested_metadata_and_nominal_identity() {
     table
         .insert(
             ConstantPoolId::new(3),
-            plain(new_null_array(&exact.data_type(), 1), true),
+            plain(new_null_array(exact.data_type(), 1), true),
         )
         .unwrap();
     for equivalent in [encoded(74, true), encoded(73, false)] {

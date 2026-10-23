@@ -298,14 +298,6 @@ pub(super) fn owner_for_test(name: &str) -> CalendarSliceOwner {
     CalendarSliceOwner::new(name, declaration, resolver).unwrap()
 }
 #[cfg(test)]
-pub(super) fn prepared_for_test_with_policy(
-    name: &str,
-    sources: &[crate::FunctionValueType],
-    policy: novarocks_type_contract::DecimalOverflowPolicy,
-) -> Result<Arc<dyn PreparedScalarKernel>, crate::FunctionSpecializationFailure> {
-    prepared_for_test_with_control(name, sources, policy, crate::binding_test_control())
-}
-#[cfg(test)]
 pub(super) fn prepared_for_test_with_control(
     name: &str,
     sources: &[crate::FunctionValueType],

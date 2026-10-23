@@ -76,10 +76,10 @@ impl AggregateStateAllocator for Host {
         let mut ledger = self.ledger.lock().unwrap();
         let at = ledger.attempts;
         ledger.attempts += 1;
-        if let Some((stop, cause)) = &*self.refusal.lock().unwrap() {
-            if *stop == at {
-                return Err(cause.clone());
-            }
+        if let Some((stop, cause)) = &*self.refusal.lock().unwrap()
+            && *stop == at
+        {
+            return Err(cause.clone());
         }
         let pointer = NonNull::new(unsafe { std::alloc::alloc(layout) })
             .ok_or(KernelFailure::ResourceExhausted)?;
@@ -702,51 +702,52 @@ fn concat_runtime_borrowed_types_preserve_raw_source_child_nulls_and_primary_con
     };
     assert!(std::ptr::eq(borrowed, item.data_type()));
 
-    let mut run = |control: &Control| {
-        let mut state = GroupConcatState::new(alloc.clone());
-        let mut checkpoints = crate::kernel_input::EvaluationCheckpoints::new(control);
-        let outcome = {
-            let mut work = ScalarWork::new(Some(&mut checkpoints));
-            merge.merge_row(&mut state, 0, &ty, &mut work)
-        };
-        let outcome = checkpoints.finish_result(outcome);
-        if outcome.is_ok() {
-            let output = core::build_final_array(
-                &ty,
-                std::iter::once(&state),
-                false,
-                &[],
-                &[],
-                1024,
-                &mut raw,
-            )
-            .unwrap();
-            assert_eq!(
-                output
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap()
-                    .value(0),
-                "original"
-            );
-        }
-        outcome
-    };
-    let success = Control::default();
-    run(&success).unwrap();
-    let trace = success.trace.lock().unwrap().clone();
-    assert!(!trace.is_empty());
-    for cause in causes() {
-        for at in 0..trace.len() {
-            let control = Control {
-                refusal: Some((at, cause.clone())),
-                ..Default::default()
+    {
+        let mut run = |control: &Control| {
+            let mut state = GroupConcatState::new(alloc.clone());
+            let mut checkpoints = crate::kernel_input::EvaluationCheckpoints::new(control);
+            let outcome = {
+                let mut work = ScalarWork::new(Some(&mut checkpoints));
+                merge.merge_row(&mut state, 0, &ty, &mut work)
             };
-            assert_eq!(run(&control), Err(cause.clone()));
-            assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+            let outcome = checkpoints.finish_result(outcome);
+            if outcome.is_ok() {
+                let output = core::build_final_array(
+                    &ty,
+                    std::iter::once(&state),
+                    false,
+                    &[],
+                    &[],
+                    1024,
+                    &mut raw,
+                )
+                .unwrap();
+                assert_eq!(
+                    output
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .value(0),
+                    "original"
+                );
+            }
+            outcome
+        };
+        let success = Control::default();
+        run(&success).unwrap();
+        let trace = success.trace.lock().unwrap().clone();
+        assert!(!trace.is_empty());
+        for cause in causes() {
+            for at in 0..trace.len() {
+                let control = Control {
+                    refusal: Some((at, cause.clone())),
+                    ..Default::default()
+                };
+                assert_eq!(run(&control), Err(cause.clone()));
+                assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+            }
         }
     }
-    drop(run);
 
     // The actual array child, not its enclosing declared field, remains the
     // borrowed merge source. A recursive child NULL disagreement must refuse

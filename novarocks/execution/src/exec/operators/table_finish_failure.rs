@@ -70,6 +70,7 @@ pub(super) enum FinishArrowOperation {
     Fragment,
     Encoding,
     Filter,
+    #[cfg(test)]
     Artifact,
     List,
     Map,

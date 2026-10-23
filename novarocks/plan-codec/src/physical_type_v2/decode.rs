@@ -50,6 +50,11 @@ use std::{alloc::Layout, convert::Infallible};
 
 type E = TypeCodecError;
 type HostError<H> = ProjectionFailure<E, H>;
+type ReceiverAdmit<'a, H> =
+    dyn FnMut(&PackageTypeProjectionFacts, usize) -> Result<(), HostError<H>> + 'a;
+type PureTypeAdmit<'a> =
+    dyn FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError> + 'a;
+type TypeGraphTopology = (Vec<Node>, usize, usize, BTreeMap<Node, Summary>);
 impl<H> From<crate::value_type_table::LogicalTypeCodecError> for HostError<H> {
     fn from(error: crate::value_type_table::LogicalTypeCodecError) -> Self {
         Self::Codec(error.into())
@@ -142,7 +147,7 @@ struct Receiver<'graph, 'source, 'caller, H> {
     graph: Option<&'graph PreparedPackageTypeGraph<'source>>,
     model: TypeDecodeModel,
     limits: Option<PackageTypeProjectionLimits>,
-    admit: &'caller mut dyn FnMut(&PackageTypeProjectionFacts, usize) -> Result<(), HostError<H>>,
+    admit: &'caller mut ReceiverAdmit<'caller, H>,
     scoped_request_bytes: usize,
 }
 impl<H> Receiver<'_, '_, '_, H> {
@@ -479,7 +484,7 @@ fn topology<H>(
     limits: TypeProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
     receiver: &mut Option<Receiver<'_, '_, '_, H>>,
-) -> Result<(Vec<Node>, usize, usize, BTreeMap<Node, Summary>), HostError<H>> {
+) -> Result<TypeGraphTopology, HostError<H>> {
     let mut summaries = BTreeMap::<Node, Summary>::new();
     let mut active = BTreeMap::<Node, bool>::new();
     let mut order = Vec::new();
@@ -978,7 +983,6 @@ fn materialized_layout<H, F: novarocks_type_contract::ValueSchemaCreationFactory
     id: u32,
     index: &Index<'_>,
     carriers: &mut BTreeMap<u32, Materialized<DataType>>,
-    fields: &BTreeMap<u32, Materialized<Arc<Field>>>,
     factory: Option<&F>,
     original_storage: &ValueTypeStorageLifetime,
     receiver: &mut Option<Receiver<'_, '_, '_, H>>,
@@ -1038,7 +1042,6 @@ fn materialized_layout<H, F: novarocks_type_contract::ValueSchemaCreationFactory
             child,
             index,
             carriers,
-            fields,
             factory,
             original_storage,
             receiver,
@@ -1529,12 +1532,10 @@ fn decode_body<'source, H, F: novarocks_type_contract::ValueSchemaCreationFactor
     };
     for field in &table.fields {
         work.step()?;
-        if let Some(id) = field.logical_type_id {
-            if definitions.get(id, work)?.nullable != field.nullable {
-                return Err(
-                    E::InvalidShape("field nullability conflicts with logical owner").into(),
-                );
-            }
+        if let Some(id) = field.logical_type_id
+            && definitions.get(id, work)?.nullable != field.nullable
+        {
+            return Err(E::InvalidShape("field nullability conflicts with logical owner").into());
         }
         if let Some(binding_id) = field.value_binding_id {
             // Explicit binding identity selects physical layout independently
@@ -1831,7 +1832,6 @@ fn decode_body<'source, H, F: novarocks_type_contract::ValueSchemaCreationFactor
                 carrier_id,
                 &index,
                 &mut carriers,
-                &fields,
                 factory,
                 &storage,
                 &mut receiver,
@@ -2026,9 +2026,7 @@ fn decode_body<'source, H, F: novarocks_type_contract::ValueSchemaCreationFactor
 /// The source invoice enters coexistence once, never as a new capacity grant.
 struct PackageDecodeResources<'host, 'creation, 'callback, H> {
     creation: Option<&'host mut novarocks_type_contract::ValueSchemaCreation<'creation, H>>,
-    pure_admit: Option<
-        &'callback mut dyn FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
-    >,
+    pure_admit: Option<&'callback mut PureTypeAdmit<'callback>>,
     limits: PackageTypeProjectionLimits,
     source: usize,
     completed: PackageTypeProjectionFacts,

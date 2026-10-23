@@ -329,7 +329,7 @@ fn collection_gate_preserves_complete_domains_and_rejects_wrong_nullable_profile
         ))
     );
     let nullable = FunctionValueType::new(backing.value_type().data_type().clone(), true);
-    let null_pool = plain(new_null_array(&nullable.data_type(), 1), true);
+    let null_pool = plain(new_null_array(nullable.data_type(), 1), true);
     let nulls = table(&null_pool, &[0]);
     let (null_fragment, _) = collection_fragment(
         &[UnpivotConstant::Int32List(reference(0, 0))],
@@ -383,7 +383,7 @@ fn collection_gate_preserves_complete_domains_and_rejects_wrong_nullable_profile
         )
     };
     let exact = encoded(73, true);
-    let encoded_pool = plain(new_null_array(&exact.data_type(), 2), true);
+    let encoded_pool = plain(new_null_array(exact.data_type(), 2), true);
     let encoded_pools = table(&encoded_pool, &[u32::MAX]);
     for equivalent in [encoded(74, true), encoded(73, false)] {
         let fragment = constant_fragment(92, &[(reference(u32::MAX, 1), equivalent)]);

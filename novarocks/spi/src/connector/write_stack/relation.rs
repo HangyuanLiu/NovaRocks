@@ -198,12 +198,12 @@ impl<H> WriterSchemaConstruction<'_, '_, '_, '_, H> {
         layout: std::alloc::Layout,
     ) -> Result<(), WriterSchemaCreationFailure<H>> {
         self.check()?;
-        if layout.size() != 0 {
-            if let Some(creation) = self.creation.as_deref_mut() {
-                creation
-                    .request_layout(layout)
-                    .map_err(WriterSchemaCreationFailure::Creator)?;
-            }
+        if layout.size() != 0
+            && let Some(creation) = self.creation.as_deref_mut()
+        {
+            creation
+                .request_layout(layout)
+                .map_err(WriterSchemaCreationFailure::Creator)?;
         }
         Ok(())
     }
@@ -1918,7 +1918,7 @@ mod tests {
         .unwrap();
         let prefix_charge = WRITE_RELATION_COLUMN_COUNT * WRITE_FIELD_ALLOCATION_CHARGE;
         let count = (MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES - prefix_charge) / individual_charge;
-        assert!(count + 1 <= MAX_WRITER_AUXILIARY_CHANNELS);
+        assert!(count < MAX_WRITER_AUXILIARY_CHANNELS);
         let channels = (0..count + 1)
             .map(|index| {
                 WriterAuxiliaryChannel::try_new(

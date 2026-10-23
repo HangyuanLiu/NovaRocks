@@ -22,19 +22,19 @@
 use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
+#[cfg(test)]
+use crate::exec::pipeline::operator::ExitProgress;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Wake, Waker};
 
-use arrow::datatypes::DataType;
 use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
-use novarocks_types::SlotId;
 
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
     input::RawInput,
-    operator::{ExitObservation, ExitProgress, FinishWatch, Operator},
+    operator::{ExitObservation, FinishWatch, Operator},
     shape::{
         ControlStep, ReceiverPreparation, ReceiverSlot, RootInputPreparation, RootInputTarget,
         StepOperator,
@@ -48,6 +48,10 @@ use crate::runtime::fragment::io::{
 };
 use crate::runtime::observable::Observable;
 use crate::runtime::runtime_state::RuntimeState;
+#[cfg(test)]
+use arrow::datatypes::DataType;
+#[cfg(test)]
+use novarocks_types::SlotId;
 
 const NAME: &str = "BOUNDED_ROOT_RESULT_SINK";
 
@@ -761,9 +765,7 @@ mod tests {
         fn fail(&self) {
             *self.state.lock().unwrap() = RootProducerState::Failed(
                 novarocks_functions::KernelFailure::Internal(
-                    novarocks_functions::KernelDiagnostic::new(
-                        &("root producer failed".to_string()),
-                    ),
+                    novarocks_functions::KernelDiagnostic::new("root producer failed"),
                 )
                 .into(),
             );
@@ -1559,9 +1561,7 @@ mod tests {
                         0,
                     ))),
                     QuantumExit::Error => Err(novarocks_functions::KernelFailure::Internal(
-                        novarocks_functions::KernelDiagnostic::new(
-                            &("protected materializer failed"),
-                        ),
+                        novarocks_functions::KernelDiagnostic::new("protected materializer failed"),
                     )
                     .into()),
                     QuantumExit::Panic => panic!("protected materializer panic"),
@@ -1590,7 +1590,6 @@ mod tests {
                     }
                 }
             })()
-            .map_err(Into::into)
         }
         fn release_root_workspace(&mut self) {
             if self.workspace.is_some() {

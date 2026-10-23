@@ -175,7 +175,6 @@ fn layout_equal(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_root_output_declaration(
     query: &mut ResolvedQuery,
     factory: &mut ColumnRefFactory,

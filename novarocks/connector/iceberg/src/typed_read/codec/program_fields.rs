@@ -38,8 +38,6 @@ use novarocks_spi::connector::read_stack::ConnectorReadPublicSchema;
 use novarocks_spi::connector::{
     ConnectorCodecError, ConnectorCodecErrorKind, ConnectorError, ConnectorFieldPath,
 };
-#[cfg(test)]
-use novarocks_type_contract::PureCompileControl;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, ValueLogicalType,
 };
@@ -186,6 +184,7 @@ pub(crate) fn public_read_schema(
 /// system-table field author from the pinned table metadata the reference
 /// verifies. Each column takes its field by name and is then checked through
 /// the same mirror the pure read compiler applies to a frozen public field.
+#[cfg(test)]
 pub(crate) fn system_public_read_schema(
     kind: IcebergSystemTableType,
     columns: &[&IcebergColumnHandle],
@@ -1356,7 +1355,7 @@ mod tests {
                     None,
                 )));
                 rejected(&relation, &columns, &system_public(kind, bad));
-                let mut bad = fields.fields().to_vec();
+                let bad = fields.fields().to_vec();
                 let DataType::Map(entries, sorted) = bad[5].data_type() else {
                     panic!("real summary map")
                 };

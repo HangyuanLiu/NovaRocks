@@ -32,8 +32,7 @@ use novarocks_spi::connector::{
     ConnectorMetadataMaintenanceResolver, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorMutationOperationId, ConnectorRequestContext, ConnectorTableHandle,
     ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
-    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome,
+    ExternalMutationEffect, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
 use novarocks_query_application::engine_error::EngineError;
@@ -139,7 +138,6 @@ pub enum ResolvedMetadataMaintenance {
     },
     CommitUnknown {
         failure: ConnectorMutationFailure,
-        evidence: ExternalMutationEvidence,
     },
     ContractFailure {
         error: ConnectorError,
@@ -148,7 +146,6 @@ pub enum ResolvedMetadataMaintenance {
 }
 
 /// Compatibility projection for a synchronous statement caller.
-#[allow(clippy::too_many_arguments)]
 pub fn execute_metadata_maintenance(
     resolver: &dyn ConnectorMetadataMaintenanceResolver,
     cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
@@ -183,7 +180,7 @@ pub fn execute_metadata_maintenance(
             ))
             .to_string(),
         ),
-        ResolvedMetadataMaintenance::CommitUnknown { failure, .. } => {
+        ResolvedMetadataMaintenance::CommitUnknown { failure } => {
             Err(EngineError::commit_unknown(failure.to_string()).to_bracketed_user_message())
         }
         ResolvedMetadataMaintenance::ContractFailure { error, .. } => Err(error.to_string()),
@@ -193,6 +190,7 @@ pub fn execute_metadata_maintenance(
 /// Execute a plan that a frontend durable-operation owner has already made
 /// visible as RUNNING.  The session owns the exact-generation lease until the
 /// provider returns a terminal outcome.
+#[cfg(test)]
 pub fn execute_planned_metadata_maintenance(
     session: MetadataMaintenanceSession,
     cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
@@ -214,38 +212,10 @@ pub fn execute_planned_metadata_maintenance(
             ))
             .to_string(),
         ),
-        ResolvedMetadataMaintenance::CommitUnknown { failure, .. } => {
+        ResolvedMetadataMaintenance::CommitUnknown { failure } => {
             Err(EngineError::commit_unknown(failure.to_string()).to_bracketed_user_message())
         }
         ResolvedMetadataMaintenance::ContractFailure { error, .. } => Err(error.to_string()),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn plan_metadata_maintenance_session(
-    resolver: &dyn ConnectorMetadataMaintenanceResolver,
-    instance_id: &ConnectorInstanceId,
-    operation_id: ConnectorMutationOperationId,
-    table: ConnectorTableIdentity,
-    intent: MetadataMaintenanceIntent,
-    context: ConnectorRequestContext,
-) -> Result<MetadataMaintenanceSession, String> {
-    MetadataMaintenanceSession::plan(resolver, instance_id, operation_id, table, intent, context)
-        .map_err(resolved_error_message)
-}
-
-fn resolved_error_message(value: ResolvedMetadataMaintenance) -> String {
-    match value {
-        ResolvedMetadataMaintenance::KnownUncommitted { failure, cleanup } => {
-            super::mutation::known_uncommitted_message(failure, &cleanup)
-        }
-        ResolvedMetadataMaintenance::CommitUnknown { failure, .. } => {
-            EngineError::commit_unknown(failure.to_string()).to_bracketed_user_message()
-        }
-        ResolvedMetadataMaintenance::ContractFailure { error, .. } => error.to_string(),
-        ResolvedMetadataMaintenance::KnownCommitted(_) => {
-            "metadata maintenance planning unexpectedly committed".to_string()
-        }
     }
 }
 
@@ -290,7 +260,6 @@ pub fn read_max_compactable_data_files(
 }
 
 /// Plan and execute one operation using a newly acquired current lease.
-#[allow(clippy::too_many_arguments)]
 pub fn resolve_metadata_maintenance(
     resolver: &dyn ConnectorMetadataMaintenanceResolver,
     cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
@@ -324,7 +293,6 @@ pub struct MetadataMaintenanceSession {
 impl MetadataMaintenanceSession {
     /// Acquire the current exact lease, strictly load the base table, and make
     /// one immutable provider plan. This is the only entry point that plans.
-    #[allow(clippy::result_large_err)]
     pub(crate) fn plan(
         resolver: &dyn ConnectorMetadataMaintenanceResolver,
         instance_id: &ConnectorInstanceId,
@@ -390,6 +358,7 @@ impl MetadataMaintenanceSession {
         })
     }
 
+    #[cfg(test)]
     pub fn plan_ref(&self) -> &ConnectorMetadataMaintenancePlan {
         &self.plan
     }
@@ -448,8 +417,8 @@ fn resolve_terminal_outcome(
                 cleanup,
             }
         }
-        ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
-            ResolvedMetadataMaintenance::CommitUnknown { failure, evidence }
+        ExternalMutationOutcome::CommitUnknown { failure, .. } => {
+            ResolvedMetadataMaintenance::CommitUnknown { failure }
         }
     }
 }
@@ -502,7 +471,7 @@ mod tests {
         ConnectorMetadataMaintenancePlanSummary, ConnectorMetadataMaintenancePlanningRequest,
         ConnectorMetadataMaintenanceReceiptSummary, ConnectorNamespaceRequest,
         ConnectorProviderBindingKey, ConnectorProviderId, ConnectorTableMetadata,
-        ConnectorTablePlanningFacts, ProviderBindingEpoch,
+        ConnectorTablePlanningFacts, ExternalMutationEvidence, ProviderBindingEpoch,
     };
 
     use super::*;

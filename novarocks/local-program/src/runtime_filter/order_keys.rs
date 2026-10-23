@@ -189,10 +189,10 @@ mod tests {
         fn request_layout(&mut self, layout: Layout) -> Result<(), Refusal> {
             let ordinal = self.calls;
             self.calls += 1;
-            if let Some((stop, cause)) = self.stop.clone() {
-                if stop == ordinal {
-                    return Err(Refusal::Control(cause));
-                }
+            if let Some((stop, cause)) = self.stop.clone()
+                && stop == ordinal
+            {
+                return Err(Refusal::Control(cause));
             }
             if layout.size() > self.remaining {
                 return Err(Refusal::Host);

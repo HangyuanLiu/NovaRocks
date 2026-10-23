@@ -153,17 +153,6 @@ impl Requests {
         // A subset of the already checked cumulative sum cannot overflow.
         self.retained += self.bytes - previous;
     }
-    pub(crate) fn retained_record<W: ResourceWork>(
-        &mut self,
-        layout: Layout,
-        copies: usize,
-        work: &mut W,
-    ) -> Result<(), W::Error> {
-        let previous = self.bytes;
-        self.record(layout, copies, work)?;
-        self.retain_delta(previous);
-        Ok(())
-    }
     pub(crate) fn retained_arc<W: ResourceWork>(
         &mut self,
         payload: Layout,
@@ -172,17 +161,6 @@ impl Requests {
     ) -> Result<(), W::Error> {
         let previous = self.bytes;
         self.arc(payload, copies, work)?;
-        self.retain_delta(previous);
-        Ok(())
-    }
-    pub(crate) fn retained_vec<T, W: ResourceWork>(
-        &mut self,
-        count: usize,
-        copies: usize,
-        work: &mut W,
-    ) -> Result<(), W::Error> {
-        let previous = self.bytes;
-        self.exact_vec::<T, W>(count, copies, work)?;
         self.retain_delta(previous);
         Ok(())
     }

@@ -351,7 +351,7 @@ impl<'a> RoaringBitmapPayload<'a> {
             let intervals = take_payload_bytes(self.body, &mut self.cursor, runs * 4)?;
             let mut previous_end = None;
             let mut actual = 0u64;
-            for interval in intervals.chunks_exact(4) {
+            for interval in intervals.as_chunks::<4>().0 {
                 let first = u16::from_le_bytes(interval[..2].try_into()?);
                 let length = u16::from_le_bytes(interval[2..].try_into()?);
                 let last = first
@@ -452,6 +452,7 @@ fn read_le_u64_from(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
 }
 
 /// Write a DV through the explicit operation or attempt artifact owner.
+#[cfg(test)]
 pub(crate) async fn write_single_deletion_vector_puffin_allocated(
     writer: &dyn super::model::ArtifactWriter,
     class: super::model::ArtifactClass,
@@ -472,6 +473,7 @@ pub(crate) async fn write_single_deletion_vector_puffin_allocated(
     Ok(written)
 }
 
+#[cfg(test)]
 pub(crate) async fn write_multi_deletion_vector_puffin_allocated(
     writer: &dyn super::model::ArtifactWriter,
     class: super::model::ArtifactClass,
@@ -490,6 +492,7 @@ pub(crate) async fn write_multi_deletion_vector_puffin_allocated(
     Ok(written)
 }
 
+#[cfg(test)]
 fn validate_allocated_dv_class(class: super::model::ArtifactClass) -> Result<()> {
     ensure!(
         matches!(

@@ -255,7 +255,7 @@ pub enum ExecutionOutput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ResultDeliveryDisposition {
     Completed,
-    Failed(QueryExecutionError),
+    Failed(Box<QueryExecutionError>),
     Dropped,
 }
 
@@ -361,7 +361,8 @@ impl SchemaDelivery {
     }
 
     pub fn fail(mut self, error: QueryExecutionError) {
-        self.signal.finish(ResultDeliveryDisposition::Failed(error));
+        self.signal
+            .finish(ResultDeliveryDisposition::Failed(Box::new(error)));
     }
 }
 
@@ -423,7 +424,8 @@ impl EndDelivery {
     /// Records failed transport of the actor-authorized EOF. The protocol or
     /// application owner decides its externally visible outcome separately.
     pub fn fail(mut self, error: QueryExecutionError) {
-        self.signal.finish(ResultDeliveryDisposition::Failed(error));
+        self.signal
+            .finish(ResultDeliveryDisposition::Failed(Box::new(error)));
     }
 }
 
@@ -551,7 +553,8 @@ impl RootSegmentDelivery {
     }
     pub fn fail(mut self, error: QueryExecutionError) {
         drop(self.reply.take());
-        self.signal.finish(ResultDeliveryDisposition::Failed(error));
+        self.signal
+            .finish(ResultDeliveryDisposition::Failed(Box::new(error)));
     }
 }
 
@@ -661,21 +664,20 @@ pub struct QueryResultStream {
     terminal_seen: bool,
 }
 
+type QueryResultChannel = (
+    QueryResultTransport,
+    ResultDeliveryReceipt,
+    watch::Sender<Option<QueryExecutionError>>,
+    QueryResultStream,
+);
+
 impl QueryResultStream {
     pub(crate) fn try_channel(
         query_id: QueryId,
         schema: ResultSchema,
         carrier: ResultRowCarrier,
         delivery_capacity: usize,
-    ) -> Result<
-        (
-            QueryResultTransport,
-            ResultDeliveryReceipt,
-            watch::Sender<Option<QueryExecutionError>>,
-            Self,
-        ),
-        QueryExecutionError,
-    > {
+    ) -> Result<QueryResultChannel, QueryExecutionError> {
         if delivery_capacity == 0 {
             return Err(invalid_result_delivery(
                 "result delivery capacity must be nonzero",
@@ -1096,7 +1098,7 @@ mod tests {
         failed.fail(expected.clone());
         assert_eq!(
             failed_receipt.await.unwrap(),
-            ResultDeliveryDisposition::Failed(expected)
+            ResultDeliveryDisposition::Failed(Box::new(expected))
         );
 
         let (dropped, dropped_receipt) =
@@ -1211,7 +1213,7 @@ mod tests {
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
         assert_eq!(
             receipt.await.unwrap(),
-            ResultDeliveryDisposition::Failed(original)
+            ResultDeliveryDisposition::Failed(Box::new(original))
         );
 
         let (eof, eof_receipt) = EndDelivery::success_eof(id, ResultPacketSequence::new(1));

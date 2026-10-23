@@ -963,13 +963,7 @@ fn estimate_selectivity_scalar(
             op: UnOp::Not,
             child,
         } => 1.0 - estimate_selectivity_scalar(arena, *child, column_stats, work)?,
-        ScalarNode::IsTruthValue { negated, .. } => {
-            if *negated {
-                1.0 - 0.5
-            } else {
-                0.5
-            }
-        }
+        ScalarNode::IsTruthValue { .. } => 0.5,
         ScalarNode::Nested(inner) => {
             estimate_selectivity_scalar(arena, *inner, column_stats, work)?
         }
@@ -3105,7 +3099,7 @@ mod tests {
             })
             .collect();
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: name.to_string(),

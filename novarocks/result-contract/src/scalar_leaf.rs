@@ -542,8 +542,8 @@ fn opaque_kind(kind: ScalarOpaqueType) -> u8 {
 // multiplies plus fixed-size copies/comparisons fit one existing work turn.
 pub(crate) fn decimal_in_range(bytes: &[u8], precision: u8) -> bool {
     let mut value = [0u64; 4];
-    for (index, bytes) in bytes.chunks_exact(8).enumerate() {
-        value[index] = u64::from_le_bytes(bytes.try_into().expect("exact decimal limb"));
+    for (index, limb_bytes) in bytes.as_chunks::<8>().0.iter().enumerate() {
+        value[index] = u64::from_le_bytes(*limb_bytes);
     }
     let limbs = bytes.len() / 8;
     if bytes[bytes.len() - 1] & 0x80 != 0 {

@@ -74,7 +74,7 @@ fn by_copy_original_fixed_list_negative_i32_offset_is_original_u32_bits() {
 #[cfg(target_pointer_width = "64")]
 #[test]
 fn by_copy_original_fixed_list_wrapped_u32_offset_keeps_original_success() {
-    let row = (u32::MAX as usize + 1) / 2;
+    let row = (u32::MAX as usize).div_ceil(2);
     let (source, _) = original_wide_fixed_list(row);
     let source = source
         .as_any()

@@ -88,6 +88,13 @@ impl ReclamationStorage for AuthorizedStorage {
     }
 }
 
+struct ReclamationPorts<'a> {
+    catalog: &'a dyn crate::catalog::NovaRocksCatalog,
+    planning_binding: &'a IcebergReadBinding,
+    clock: &'a dyn ReclamationClock,
+    storage: &'a dyn ReclamationStorage,
+}
+
 #[derive(Clone, Default)]
 struct Reachability {
     paths: BTreeSet<String>,
@@ -441,7 +448,7 @@ fn accept_complete_load(
     match loaded {
         CatalogMetadataLoad::Complete { base, validator } => {
             *view = Some(FreshView {
-                base,
+                base: *base,
                 validator,
                 requested,
             })
@@ -480,17 +487,16 @@ async fn audit_predecessor(
             .previous
             .clone()
             .or_else(|| {
-                if proof.metadata_location.as_deref() == Some(location.as_str()) {
-                    if let MetadataPredecessorObservation::Candidate {
+                if proof.metadata_location.as_deref() == Some(location.as_str())
+                    && let MetadataPredecessorObservation::Candidate {
                         location,
                         timestamp_ms,
                     } = &proof.metadata_predecessor
-                    {
-                        return Some(crate::iceberg::spec::MetadataLog {
-                            metadata_file: location.clone(),
-                            timestamp_ms: *timestamp_ms,
-                        });
-                    }
+                {
+                    return Some(crate::iceberg::spec::MetadataLog {
+                        metadata_file: location.clone(),
+                        timestamp_ms: *timestamp_ms,
+                    });
                 }
                 None
             })
@@ -878,7 +884,6 @@ pub(crate) async fn reclaim(
     );
     report
 }
-#[allow(clippy::too_many_arguments)]
 async fn reclaim_round(
     owner: &IcebergMetadataContext,
     target: CatalogTableName,
@@ -890,10 +895,12 @@ async fn reclaim_round(
     report: &mut ReclamationReport,
 ) -> Result<(), ConnectorError> {
     reclaim_round_using(
-        owner.novarocks_catalog().as_ref(),
-        owner.resources().planning_binding(),
-        &MonotonicClock,
-        &AuthorizedStorage,
+        &ReclamationPorts {
+            catalog: owner.novarocks_catalog().as_ref(),
+            planning_binding: owner.resources().planning_binding(),
+            clock: &MonotonicClock,
+            storage: &AuthorizedStorage,
+        },
         target,
         retention,
         marker,
@@ -904,12 +911,8 @@ async fn reclaim_round(
     )
     .await
 }
-#[allow(clippy::too_many_arguments)]
 async fn reclaim_round_using(
-    catalog: &dyn crate::catalog::NovaRocksCatalog,
-    planning_binding: &IcebergReadBinding,
-    clock: &dyn ReclamationClock,
-    storage: &dyn ReclamationStorage,
+    ports: &ReclamationPorts<'_>,
     target: CatalogTableName,
     retention: &RetentionPlan,
     marker: &str,
@@ -918,6 +921,10 @@ async fn reclaim_round_using(
     cache: &mut ScanCache,
     report: &mut ReclamationReport,
 ) -> Result<(), ConnectorError> {
+    let catalog = ports.catalog;
+    let planning_binding = ports.planning_binding;
+    let clock = ports.clock;
+    let storage = ports.storage;
     if proof.effect != novarocks_spi::connector::ExternalMutationEffect::Applied {
         return Err(corrupt("Reclamation requires exact Applied publication"));
     }
@@ -1356,10 +1363,10 @@ mod tests {
         accept_complete_load(
             &mut view,
             CatalogMetadataLoad::Complete {
-                base: CatalogCommitBase {
+                base: Box::new(CatalogCommitBase {
                     metadata: metadata(),
                     metadata_location: "memory://gc/v1.json".into(),
-                },
+                }),
                 validator: None,
             },
             Instant::now(),

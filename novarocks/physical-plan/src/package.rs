@@ -773,10 +773,6 @@ fn pruning_error(error: FrozenPruningError) -> FragmentPackageError {
 /// Extract from the immutable complete-plan authority. No second global plan
 /// validation or executable peer graph is performed here. Boundary derivation
 /// is indexed once for all fragments; each output uses the BE constructor.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Extraction requires every explicit frozen table; no missing semantic facts are inferred."
-)]
 pub fn extract_fragment_packages(
     plan: &PhysicalPlan,
     scans: &BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead>,

@@ -184,14 +184,14 @@ fn ds_hll_local_stage_after_actual_partial_and_final_cancel_first_cause_no_repla
             .into_local_update_stages()
             .unwrap();
         let source = Chunk::new_like(source.record_batch().slice(0, 50_000), &source);
-        let partial_output = run(&partial, &[source.clone()], tracker.clone());
+        let partial_output = run(&partial, std::slice::from_ref(&source), tracker.clone());
         let phase = if final_phase { &final_stage } else { &partial };
         let first = if final_phase {
             partial_output.clone()
         } else {
             source.clone()
         };
-        let state = RuntimeState::default();
+        let _state = RuntimeState::default();
         let mut operator = phase.create(if final_phase { 1 } else { 2 }, 0);
         operator.set_construction_factory(aggregate_fixture::runtime_construction_factory(
             tracker.clone(),

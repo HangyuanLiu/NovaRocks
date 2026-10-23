@@ -138,12 +138,12 @@ impl ProjectionPort for HostProjectionDiagnostics<'_, '_, '_> {
             // This diagnostic-only slice is not an installed owner. It refuses
             // actual compute allocations whose complete author is not present;
             // no signature/profile is narrowed or advertised as supported.
-            ProjectionOperation::Indices { .. }
-            | ProjectionOperation::IndicesArray { .. }
+            ProjectionOperation::Indices
+            | ProjectionOperation::IndicesArray
             | ProjectionOperation::Take { .. }
-            | ProjectionOperation::TargetTypeClone { .. }
-            | ProjectionOperation::Cast { .. }
-            | ProjectionOperation::ListResult { .. } => Err(ScalarInvocationFailure::Kernel(
+            | ProjectionOperation::TargetTypeClone
+            | ProjectionOperation::Cast
+            | ProjectionOperation::ListResult => Err(ScalarInvocationFailure::Kernel(
                 crate::kernel_control::invalid(
                     "ARRAY projection computation requires its actual opaque operation host",
                 ),

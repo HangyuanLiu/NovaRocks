@@ -241,13 +241,13 @@ fn same_original_guard_stays_until_the_last_actual_projection_exits() {
         .schema(&metadata)
         .unwrap();
     let (scope, drops) = scope(u64::MAX);
-    let mut checked = Plan::inspect(&metadata, &schema, &scope)
-        .unwrap()
-        .authorize(2, 0, 0, &scope)
-        .unwrap();
-    let first = checked.build_one().unwrap();
-    let last = checked.build_one().unwrap();
-    drop(checked);
+    let (first, last) = {
+        let mut checked = Plan::inspect(&metadata, &schema, &scope)
+            .unwrap()
+            .authorize(2, 0, 0, &scope)
+            .unwrap();
+        (checked.build_one().unwrap(), checked.build_one().unwrap())
+    };
     drop(scope);
     drop(metadata);
     drop(schema);

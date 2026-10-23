@@ -553,7 +553,7 @@ mod tests {
             kind: ExprKind::Literal(LiteralValue::String("bigint".to_string())),
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         };
-        let args = vec![source, path, requested_type];
+        let args = [source, path, requested_type];
         scan.columns.push(OutputColumn {
             column_id: synthetic_id,
             name: "__nr_var_payload_0".to_string(),

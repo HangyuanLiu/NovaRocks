@@ -214,7 +214,7 @@ pub fn iceberg_connector_table_handle(
         context
     };
     let metadata = crate::connector::schema_creation::load_write_table(
-        &exact_lease,
+        exact_lease,
         ConnectorTableRequest {
             table: ConnectorTableIdentity {
                 instance_id,

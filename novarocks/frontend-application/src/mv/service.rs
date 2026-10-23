@@ -283,11 +283,6 @@ fn preparation_application_error(
     let kind = match error.kind {
         RefreshErrorKind::PreCommitFailed => MvApplicationErrorKind::Unavailable,
         RefreshErrorKind::UserError => MvApplicationErrorKind::InvalidRequest,
-        RefreshErrorKind::CommitFailedKnownUncommitted => MvApplicationErrorKind::TerminalFailure,
-        RefreshErrorKind::CommitFailedKnownCommitted | RefreshErrorKind::MetadataFinalizeFailed => {
-            MvApplicationErrorKind::KnownCommittedFinalizeFailed
-        }
-        RefreshErrorKind::CommitUnknown => MvApplicationErrorKind::CommitUnknown,
     };
     MvApplicationError::new(kind, error.message.clone())
         .with_compile_control(error.compile_control_error())
@@ -739,28 +734,6 @@ fn execute_scheduled_refresh(
     }
 }
 
-fn repository_disposition(
-    error: novarocks_mv_application::repository::MvRepositoryError,
-) -> ScheduledRefreshDisposition {
-    use novarocks_mv_application::repository::MvRepositoryErrorKind;
-    match error.kind() {
-        MvRepositoryErrorKind::Conflict => ScheduledRefreshDisposition::AlreadyActive(None),
-        MvRepositoryErrorKind::NotFound => ScheduledRefreshDisposition::TargetGone(None),
-        MvRepositoryErrorKind::Unavailable => {
-            ScheduledRefreshDisposition::TransientUnavailable(error.to_string().into())
-        }
-        MvRepositoryErrorKind::Corruption => {
-            ScheduledRefreshDisposition::Corruption(error.to_string().into())
-        }
-        MvRepositoryErrorKind::CommitUnknown => {
-            ScheduledRefreshDisposition::TerminalFailure(error.to_string().into())
-        }
-        MvRepositoryErrorKind::InvalidRequest => {
-            ScheduledRefreshDisposition::InvariantViolation(error.to_string().into())
-        }
-    }
-}
-
 fn application_disposition(error: MvApplicationError) -> ScheduledRefreshDisposition {
     use crate::mv::domain::application::MvApplicationErrorKind;
     let failure = novarocks_mv_application::scheduler_runtime::MvRefreshFailure::new(
@@ -771,27 +744,20 @@ fn application_disposition(error: MvApplicationError) -> ScheduledRefreshDisposi
         MvApplicationErrorKind::AlreadyActive => {
             ScheduledRefreshDisposition::AlreadyActive(error.compile_control_error())
         }
-        MvApplicationErrorKind::TargetGone => {
-            ScheduledRefreshDisposition::TargetGone(error.compile_control_error())
-        }
         MvApplicationErrorKind::Unavailable | MvApplicationErrorKind::BindingInvalidated => {
             ScheduledRefreshDisposition::TransientUnavailable(failure)
         }
         MvApplicationErrorKind::InvalidRequest => {
             ScheduledRefreshDisposition::InvalidDefinition(failure)
         }
-        MvApplicationErrorKind::Corruption => ScheduledRefreshDisposition::Corruption(failure),
-        MvApplicationErrorKind::TerminalFailure
-        | MvApplicationErrorKind::CommitUnknown
+        MvApplicationErrorKind::CommitUnknown
         | MvApplicationErrorKind::KnownCommittedFinalizeFailed => {
             ScheduledRefreshDisposition::TerminalFailure(failure)
         }
         MvApplicationErrorKind::ShutdownCancelled => {
             ScheduledRefreshDisposition::ShutdownCancelled(error.compile_control_error())
         }
-        MvApplicationErrorKind::Engine | MvApplicationErrorKind::Repository => {
-            ScheduledRefreshDisposition::InvariantViolation(failure)
-        }
+        MvApplicationErrorKind::Engine => ScheduledRefreshDisposition::InvariantViolation(failure),
     }
 }
 

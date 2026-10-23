@@ -32,21 +32,6 @@ pub struct AppendColumn<'a> {
     pub writer_type: &'a FunctionValueType,
     pub signed_selection_type: &'a FunctionValueType,
 }
-pub fn append(
-    rows: u64,
-    columns: &[AppendColumn<'_>],
-    owned_target_metadata_upper: u64,
-    construction_views_upper: u64,
-) -> Result<SkeletonEvidence> {
-    append_in(
-        rows,
-        columns,
-        owned_target_metadata_upper,
-        construction_views_upper,
-        false,
-    )
-}
-
 pub fn append_in(
     rows: u64,
     columns: &[AppendColumn<'_>],
@@ -139,9 +124,6 @@ pub struct Rewrite<'a> {
     pub construction_views_upper: u64,
 }
 
-pub fn rewrite(spec: Rewrite<'_>) -> Result<SkeletonEvidence> {
-    rewrite_in(spec, false)
-}
 pub fn rewrite_in(spec: Rewrite<'_>, materialized: bool) -> Result<SkeletonEvidence> {
     if spec.rows == 0 {
         return Err(Failure::OriginalSemantic("COW empty VALUES relation"));

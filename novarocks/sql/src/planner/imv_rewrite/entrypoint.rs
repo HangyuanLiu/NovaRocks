@@ -542,7 +542,7 @@ fn collect_column_id(column_id: ColumnId, max_id: &mut u32) {
     }
 }
 
-#[cfg(any(test, novarocks_dev_controls))]
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
@@ -923,7 +923,7 @@ pub(crate) mod tests {
             logical_type: None,
         };
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: "b".to_string(),
@@ -1404,7 +1404,7 @@ pub(crate) mod tests {
             },
         ];
         let scan = LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: "b".to_string(),
@@ -1507,7 +1507,7 @@ pub(crate) mod tests {
             },
         ];
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: table.to_string(),
@@ -3260,124 +3260,6 @@ crate::constant::test_constant_policy(),
             .expect("join side-filter physical scope test");
     }
 
-    pub(crate) mod tests_support {
-        use super::*;
-
-        /// Request-local token assignment for the join-refresh coalesce
-        /// lowering fixture. The old SQL-only builder intentionally reused
-        /// its placeholder token for every scan. Owner tests that exercise
-        /// preparation must instead retain one exact binding per physical
-        /// base/target identity.
-        #[derive(Clone, Copy, Debug)]
-        pub(crate) struct JoinRefreshCoalesceBindingTokens {
-            pub(crate) left: crate::binding::SqlTableBindingId,
-            pub(crate) right: crate::binding::SqlTableBindingId,
-            pub(crate) target: crate::binding::SqlTableBindingId,
-        }
-
-        impl JoinRefreshCoalesceBindingTokens {
-            pub(crate) fn for_scope(scope: crate::binding::SqlTableBindingScopeId) -> Self {
-                use std::num::NonZeroU32;
-
-                Self {
-                    left: crate::binding::SqlTableBindingId::new(
-                        scope,
-                        NonZeroU32::new(1).expect("nonzero fixture ordinal"),
-                    ),
-                    right: crate::binding::SqlTableBindingId::new(
-                        scope,
-                        NonZeroU32::new(2).expect("nonzero fixture ordinal"),
-                    ),
-                    target: crate::binding::SqlTableBindingId::new(
-                        scope,
-                        NonZeroU32::new(3).expect("nonzero fixture ordinal"),
-                    ),
-                }
-            }
-        }
-
-        pub(crate) fn build_join_refresh_coalesce_plan_for_lowering()
-        -> crate::optimizer::OptimizedOperatorNode {
-            let plan = join_projection_plan();
-            let factory_cell = test_column_ref_factory_reserved_until(30);
-            let snapshot = crate::compiler::mv_rewrite::test_join_snapshot(false);
-            let outcome = run_imv_rewrite(ImvRewriteInput {
-                plan,
-                snapshot: Arc::clone(&snapshot),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
-
-                constant_policy: crate::constant::test_constant_policy(),
-                control: crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
-                column_ref_factory: Rc::clone(&factory_cell),
-                #[cfg(not(test))]
-                function_catalog: crate::functions::test_function_catalog_snapshot(),
-            })
-            .expect("join projection IMV pipeline must rewrite and validate");
-            let descriptor = outcome
-                .annotation
-                .change_stream
-                .join_refresh
-                .as_ref()
-                .expect("join projection rewrite must record join refresh descriptor");
-            let coalesce = {
-                let mut factory = factory_cell.borrow_mut();
-                crate::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
-                    outcome.plan,
-                    descriptor,
-                    &crate::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_snapshot(&snapshot),
-                    &mut factory,
-                    200,
-                    201,
-                    202,
-                    203,
-                    204,
-                    #[cfg(not(test))]
-                    crate::functions::builtin_sql_function_catalog(),
-                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-crate::constant::test_constant_policy(),
-        &crate::compiler::SqlCompileControl::unbounded())
-            }
-            .expect("join projection coalesce plan");
-            optimize_logical_for_test(coalesce)
-        }
-
-        /// Build the same coalesce plan as the SQL-only rule test, but bind
-        /// every scan to the request-local identity that preparation will
-        /// materialize. Repeated scans of the same base deliberately reuse
-        /// its one exact admitted binding; the target locator has its own
-        /// target binding.
-        pub(crate) fn build_tokenized_join_refresh_coalesce_plan_for_lowering(
-            scope: crate::binding::SqlTableBindingScopeId,
-        ) -> (
-            crate::optimizer::OptimizedOperatorNode,
-            JoinRefreshCoalesceBindingTokens,
-        ) {
-            let tokens = JoinRefreshCoalesceBindingTokens::for_scope(scope);
-            let mut optimized = build_join_refresh_coalesce_plan_for_lowering();
-            retokenize_coalesce_scans(&mut optimized, tokens);
-            (optimized, tokens)
-        }
-
-        fn retokenize_coalesce_scans(
-            node: &mut crate::optimizer::OptimizedOperatorNode,
-            tokens: JoinRefreshCoalesceBindingTokens,
-        ) {
-            if let crate::optimizer::Operator::PhysicalScan(scan) = &mut node.op {
-                let ScanSource::Sql(source) = &mut scan.table.source;
-                source.binding = match source.table.table.as_str() {
-                    "l" => tokens.left,
-                    "r" => tokens.right,
-                    "mv" => tokens.target,
-                    table => panic!("unexpected coalesce fixture scan table {table}"),
-                };
-            }
-            for child in &mut node.children {
-                retokenize_coalesce_scans(child, tokens);
-            }
-        }
-    }
-
     #[test]
     fn imv_pipeline_uses_aggregate_change_stream_without_join_contract() {
         let ctx = join_aggregate_mv_ctx_customized(|snapshot| {
@@ -3450,23 +3332,19 @@ crate::constant::test_constant_policy(),
                     *crosses += 1;
                 }
             }
-            if let LogicalPlanKind::Scan(scan) = &plan.kind {
-                if let ScanSource::Sql(source) = &scan.table.source {
-                    match source.kind {
-                        SqlScanKind::Delta {
-                            from_snapshot_id,
-                            to_snapshot_id,
-                        } => delta.push((
-                            source.table.table.clone(),
-                            from_snapshot_id,
-                            to_snapshot_id,
-                        )),
-                        SqlScanKind::FrozenInputSet {
-                            version: SqlTableVersionSelector::Snapshot(id),
-                            ..
-                        } => versions.push((source.table.table.clone(), id)),
-                        _ => {}
-                    }
+            if let LogicalPlanKind::Scan(scan) = &plan.kind
+                && let ScanSource::Sql(source) = &scan.table.source
+            {
+                match source.kind {
+                    SqlScanKind::Delta {
+                        from_snapshot_id,
+                        to_snapshot_id,
+                    } => delta.push((source.table.table.clone(), from_snapshot_id, to_snapshot_id)),
+                    SqlScanKind::FrozenInputSet {
+                        version: SqlTableVersionSelector::Snapshot(id),
+                        ..
+                    } => versions.push((source.table.table.clone(), id)),
+                    _ => {}
                 }
             }
             for child in &plan.children {
@@ -3836,16 +3714,14 @@ crate::constant::test_constant_policy(),
     fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
         matches!(
             &plan.kind,
-            LogicalPlanKind::Scan(PlanScanNode {
-                table: TableDef {
-                    source: ScanSource::Sql(SqlScanSource {
+            LogicalPlanKind::Scan(scan)
+                if matches!(
+                    &scan.table.source,
+                    ScanSource::Sql(SqlScanSource {
                         kind: SqlScanKind::MvTargetState { .. },
                         ..
-                    }),
-                    ..
-                },
-                ..
-            })
+                    })
+                )
         ) || plan.children.iter().any(contains_target_state_scan)
     }
 

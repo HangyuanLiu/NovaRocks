@@ -1110,11 +1110,11 @@ mod tests {
             cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Option<Self::Item>> {
             let this = self.get_mut();
-            if let Some(exit) = &mut this.exit {
-                if let std::task::Poll::Ready(proof) = exit.as_mut().poll(cx) {
-                    this.proof = Some(proof);
-                    this.exit = None;
-                }
+            if let Some(exit) = &mut this.exit
+                && let std::task::Poll::Ready(proof) = exit.as_mut().poll(cx)
+            {
+                this.proof = Some(proof);
+                this.exit = None;
             }
             this.stream.as_mut().poll_next(cx)
         }

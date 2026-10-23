@@ -286,15 +286,14 @@ pub(super) fn evaluate<'a>(
                 })?;
             }
         }
-        if let Some(value) = argument.constant_value() {
-            if !value
+        if let Some(value) = argument.constant_value()
+            && !value
                 .value_type()
                 .fits_value_type_observed(&recipe.source, || work.borrow_mut().step())?
-            {
-                return Err(invalid(
-                    "selected CAST constant differs from its frozen declaration",
-                ));
-            }
+        {
+            return Err(invalid(
+                "selected CAST constant differs from its frozen declaration",
+            ));
         }
         if !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
             argument.array().data_type(),
@@ -688,26 +687,23 @@ fn cast_one(source: &ArrayRef, result: &DataType) -> Result<ArrayRef, ArrayCastF
             }
             _ => None,
         };
-        if let Some((precision, scale, coefficient)) = input {
-            if let Some(value) = arrow_decimal_wide_delta(
+        if let Some((precision, scale, coefficient)) = input
+            && let Some(value) = arrow_decimal_wide_delta(
                 coefficient,
                 precision,
                 scale,
                 *target_precision,
                 *target_scale,
                 arrow_schema::DECIMAL256_MAX_PRECISION,
-            ) {
-                let array = Decimal256Array::from(vec![value])
-                    .with_precision_and_scale(*target_precision, *target_scale)
-                    .map_err(|cause| {
-                        crate::control_values::AssemblyFailure::arrow(
-                            "CAST decimal metadata",
-                            cause,
-                        )
+            )
+        {
+            let array = Decimal256Array::from(vec![value])
+                .with_precision_and_scale(*target_precision, *target_scale)
+                .map_err(|cause| {
+                    crate::control_values::AssemblyFailure::arrow("CAST decimal metadata", cause)
                         .into_kernel()
-                    })?;
-                return Ok(Arc::new(array));
-            }
+                })?;
+            return Ok(Arc::new(array));
         }
     }
 
@@ -751,39 +747,39 @@ fn cast_one(source: &ArrayRef, result: &DataType) -> Result<ArrayRef, ArrayCastF
             _ => Err(invalid("fixed numeric CAST lost its selected target").into()),
         };
     }
-    if source.data_type() == &DataType::Boolean {
-        if let DataType::Decimal256(precision, scale) = result {
-            let mut factor = Some(arrow_buffer::i256::ONE);
-            for _ in 0..scale.unsigned_abs() {
-                factor = factor.and_then(|v| v.checked_mul(arrow_buffer::i256::from_i128(10)));
-            }
-            let factor = factor.ok_or(crate::legacy_decimal::DecimalMathFailure::Overflow)?;
-            let source = source
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| invalid("boolean CAST has a foreign carrier"))?;
-            let value = if source.is_null(0) {
-                None
-            } else {
-                let value = arrow_buffer::i256::from_i128(i128::from(source.value(0)));
-                if *scale < 0 {
-                    value.checked_div(factor)
-                } else {
-                    value.checked_mul(factor)
-                }
-            };
-            // Arrow's precision mask uses unary_opt, which creates a fresh
-            // primitive array with default decimal metadata. Apply the exact
-            // frozen precision/scale after masking, before output assembly.
-            let array = Decimal256Array::from(vec![value])
-                .null_if_overflow_precision(*precision)
-                .with_precision_and_scale(*precision, *scale)
-                .map_err(|cause| {
-                    crate::control_values::AssemblyFailure::arrow("CAST decimal metadata", cause)
-                        .into_kernel()
-                })?;
-            return Ok(Arc::new(array));
+    if source.data_type() == &DataType::Boolean
+        && let DataType::Decimal256(precision, scale) = result
+    {
+        let mut factor = Some(arrow_buffer::i256::ONE);
+        for _ in 0..scale.unsigned_abs() {
+            factor = factor.and_then(|v| v.checked_mul(arrow_buffer::i256::from_i128(10)));
         }
+        let factor = factor.ok_or(crate::legacy_decimal::DecimalMathFailure::Overflow)?;
+        let source = source
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| invalid("boolean CAST has a foreign carrier"))?;
+        let value = if source.is_null(0) {
+            None
+        } else {
+            let value = arrow_buffer::i256::from_i128(i128::from(source.value(0)));
+            if *scale < 0 {
+                value.checked_div(factor)
+            } else {
+                value.checked_mul(factor)
+            }
+        };
+        // Arrow's precision mask uses unary_opt, which creates a fresh
+        // primitive array with default decimal metadata. Apply the exact
+        // frozen precision/scale after masking, before output assembly.
+        let array = Decimal256Array::from(vec![value])
+            .null_if_overflow_precision(*precision)
+            .with_precision_and_scale(*precision, *scale)
+            .map_err(|cause| {
+                crate::control_values::AssemblyFailure::arrow("CAST decimal metadata", cause)
+                    .into_kernel()
+            })?;
+        return Ok(Arc::new(array));
     }
     let out = arrow_cast::cast(source.as_ref(), result).map_err(ArrayCastFailure::Arrow)?;
     // The old scalar evaluator sanitized parser-produced non-finite floats.

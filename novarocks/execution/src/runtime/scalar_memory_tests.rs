@@ -530,7 +530,7 @@ fn runtime_invocation_memory_shape_refusal_latches_and_failed_replay_reads_no_st
     assert_completed_operation(&journal.body);
     let error = Arc::new(RuntimeErrorState::default());
     error.set_error(novarocks_functions::KernelFailure::Internal(
-        novarocks_functions::KernelDiagnostic::new(&("stopped")),
+        novarocks_functions::KernelDiagnostic::new("stopped"),
     ));
     let stopped = super::contract_tests::control(None, error);
     let replay = RuntimeScalarMemoryScope::new(&stopped, &mut journal).evaluate_invocation(
@@ -738,7 +738,7 @@ fn runtime_scalar_memory_stop_after_actual_grant_returns_unused_rights() {
             };
             *domain.borrow_mut() = Some(ready.domain().clone());
             error.set_error(novarocks_functions::KernelFailure::Internal(
-                novarocks_functions::KernelDiagnostic::new(&("stop during qualification")),
+                novarocks_functions::KernelDiagnostic::new("stop during qualification"),
             ));
             admission
         },
@@ -804,7 +804,7 @@ fn runtime_scalar_memory_pending_uses_original_registered_stop_notification() {
                         std::thread::yield_now();
                     }
                     error.set_error(novarocks_functions::KernelFailure::Internal(
-                        novarocks_functions::KernelDiagnostic::new(&("registered stop")),
+                        novarocks_functions::KernelDiagnostic::new("registered stop"),
                     ));
                 })
             });
@@ -827,9 +827,7 @@ fn runtime_scalar_memory_pending_uses_original_registered_stop_notification() {
                     ));
                     if !registered {
                         error.set_error(novarocks_functions::KernelFailure::Internal(
-                            novarocks_functions::KernelDiagnostic::new(
-                                &("stop before registration"),
-                            ),
+                            novarocks_functions::KernelDiagnostic::new("stop before registration"),
                         ));
                     }
                     admission

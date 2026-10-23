@@ -75,10 +75,10 @@ pub(super) enum TypeNamespace {
     Source,
 }
 impl TypeNamespace {
-    pub(super) fn table<'a>(
+    pub(super) fn table(
         self,
-        package: &'a raw::FragmentPackage,
-    ) -> Result<&'a types::TypeTable, TypeCodecError> {
+        package: &raw::FragmentPackage,
+    ) -> Result<&types::TypeTable, TypeCodecError> {
         match self {
             Self::Execution => package.types.as_ref().ok_or(TypeCodecError::InvalidShape(
                 "package execution types are absent",

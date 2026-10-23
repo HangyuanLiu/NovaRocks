@@ -334,8 +334,8 @@ fn fact_at<'a>(
         .field_fact_observed(path, |count| units(work, count))
         .map_err(Failure::Control)
 }
-fn attribute<'a>(
-    fact: &'a novarocks_connector_contract::ConnectorSourceFieldFacts,
+fn attribute(
+    fact: &novarocks_connector_contract::ConnectorSourceFieldFacts,
     key: &str,
     expected: Option<&str>,
     work: &mut CompileCheckpoints<'_>,

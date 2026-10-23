@@ -302,7 +302,7 @@ impl ScalarArena {
     }
 
     pub(crate) fn data_type(&self, id: ScalarId) -> &DataType {
-        &self.value_type(id).data_type()
+        self.value_type(id).data_type()
     }
 
     pub(crate) fn nullable(&self, id: ScalarId) -> bool {

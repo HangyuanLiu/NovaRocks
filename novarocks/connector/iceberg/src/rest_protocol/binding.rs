@@ -463,7 +463,6 @@ mod tests {
     use reqwest::Url;
 
     use super::*;
-    use crate::iceberg::Catalog;
     use crate::rest_protocol::http::RestHttpClient;
     use crate::rest_protocol::test_server::{
         FrontendFixture, Reply, Script, TestServer, bearer_identity,

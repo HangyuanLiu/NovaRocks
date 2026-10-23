@@ -218,57 +218,6 @@ pub(crate) struct CatalogDropTableReceipt {
     pub(crate) last_updated_ms: i64,
 }
 
-/// Inputs for a conditional create.
-#[derive(Debug)]
-#[cfg(test)]
-pub(crate) struct ConditionalCreateRequest {
-    pub(crate) namespace: CatalogNamespaceName,
-    pub(crate) creation: crate::iceberg::TableCreation,
-    /// Caller-owned operation identity, stamped into the attempt so a later
-    /// adjudication can recognise this exact attempt rather than any create.
-    pub(crate) operation_id: Arc<str>,
-}
-
-/// A prepared-but-unpublished conditional create.
-///
-/// Opaque above this module: the concrete attempt state belongs to whichever
-/// implementation prepared it.
-#[derive(Debug)]
-#[cfg(test)]
-pub(crate) struct ConditionalCreateAttempt {
-    pub(crate) target: CatalogTableName,
-    pub(crate) facts: ConditionalCreateFacts,
-    inner: ConditionalCreateAttemptState,
-}
-
-#[derive(Debug)]
-#[cfg(test)]
-enum ConditionalCreateAttemptState {
-    Hadoop(Box<crate::hadoop_catalog::HadoopCreateAttempt>),
-}
-
-#[cfg(test)]
-
-impl ConditionalCreateAttempt {
-    pub(crate) fn hadoop(
-        attempt: crate::hadoop_catalog::HadoopCreateAttempt,
-        facts: ConditionalCreateFacts,
-        target: CatalogTableName,
-    ) -> Self {
-        Self {
-            target,
-            facts,
-            inner: ConditionalCreateAttemptState::Hadoop(Box::new(attempt)),
-        }
-    }
-
-    pub(crate) fn into_hadoop(self) -> Option<crate::hadoop_catalog::HadoopCreateAttempt> {
-        match self.inner {
-            ConditionalCreateAttemptState::Hadoop(attempt) => Some(*attempt),
-        }
-    }
-}
-
 /// Facts a prepared attempt exposes so its caller can build publication
 /// evidence before the attempt is dispatched.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -277,23 +226,6 @@ pub(crate) struct ConditionalCreateFacts {
     pub(crate) table_uuid: Arc<str>,
     pub(crate) metadata_location: Arc<str>,
     pub(crate) metadata_digest: Arc<str>,
-}
-
-/// What a published conditional create produced.
-// Produced only by `publish_conditional_create`; see the note there.
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-#[cfg(test)]
-pub(crate) struct ConditionalCreateReceipt {
-    pub(crate) facts: ConditionalCreateFacts,
-    pub(crate) already_existed: bool,
-    pub(crate) authoritative_table_uuid: Arc<str>,
-    pub(crate) authoritative_metadata_digest: Arc<str>,
-    /// Metadata location the published table now resolves to.
-    pub(crate) published_metadata_location: Option<Arc<str>>,
-    /// A failure that happened after the create committed. It never downgrades
-    /// the commit; it is finalization state.
-    pub(crate) finalization_failure: Option<Arc<str>>,
 }
 
 /// Identity a later adjudication compares against.
@@ -772,40 +704,10 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         metadata_location: Arc<str>,
     ) -> CatalogOutcome<CatalogTableName>;
 
-    /// Stage a conditional create against storage, without publishing it.
-    ///
-    /// A filesystem catalog's create is not a catalog call: its linearization
-    /// point is a conditional write of the canonical metadata (ADR-0077). That
-    /// primitive has no equivalent on the generic catalog trait, so it lives
-    /// here rather than being reached for through a concrete client -- which is
-    /// how a catalog kind used to escape the factory.
-    ///
-    /// Preparing is local: it builds metadata and sends nothing.
-    #[cfg(test)]
-    async fn prepare_conditional_create(
-        &self,
-        request: ConditionalCreateRequest,
-    ) -> CatalogOutcome<ConditionalCreateAttempt>;
-
-    /// Publish a prepared conditional create with exactly one storage request.
-    // Reached only by tests, which is the only way the lost-response path can
-    // be exercised at all: production publishes through `ConditionalCreateDispatch`.
-    #[allow(dead_code)]
-    #[cfg(test)]
-    async fn publish_conditional_create(
-        &self,
-        attempt: ConditionalCreateAttempt,
-    ) -> CatalogOutcome<ConditionalCreateReceipt>;
-
     /// Read-only adjudication of a conditional create whose outcome is unknown.
     ///
     /// Exact-positive only: an absent target proves nothing, and this must never
     /// write or delete.
-    async fn adjudicate_conditional_create(
-        &self,
-        evidence: ConditionalCreateEvidence,
-    ) -> Result<ConditionalCreateVerdict, ConnectorError>;
-
     async fn adjudicate_conditional_create_for_read(
         &self,
         _evidence: ConditionalCreateEvidence,

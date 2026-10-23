@@ -37,92 +37,6 @@ pub(crate) struct ScenarioSettlement {
     written: Cell<bool>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::scenario::ScenarioContext;
-
-    struct Fixture {
-        fails: bool,
-    }
-    impl Scenario for Fixture {
-        fn name(&self) -> &'static str {
-            "component/settlement"
-        }
-        fn run(&self, _: &mut ScenarioContext) -> Result<()> {
-            unreachable!()
-        }
-        fn teardown(&self) -> Result<()> {
-            anyhow::ensure!(!self.fails, "actual fixture cleanup failure");
-            Ok(())
-        }
-    }
-
-    fn read(root: &Path) -> Value {
-        serde_json::from_slice(&fs::read(root.join("scenario-teardown.json")).unwrap()).unwrap()
-    }
-
-    #[test]
-    fn passing_and_assertion_failure_cleanup_facts_are_independent_of_outcome() {
-        // Both outcomes use exactly the same owner observations. Assertion
-        // verdicts are intentionally absent from this cleanup-only record.
-        for _assertions_passed in [true, false] {
-            for fixture_fails in [true, false] {
-                for cluster_fails in [true, false] {
-                    let root = tempfile::tempdir().unwrap();
-                    let observation =
-                        ScenarioSettlement::new("component/settlement", root.path()).unwrap();
-                    observation.launch_config_succeeded();
-                    observation.cluster_launch_attempted();
-                    observation.cluster_launched();
-                    observation.cluster_shutdown(&if cluster_fails {
-                        Err(anyhow::anyhow!("actual cluster cleanup failure"))
-                    } else {
-                        Ok(())
-                    });
-                    let _ = observation.teardown(&Fixture {
-                        fails: fixture_fails,
-                    });
-                    observation.write().unwrap();
-                    let record = read(root.path());
-                    assert_eq!(record["fixture"]["launch_config"], "ok");
-                    assert_eq!(
-                        record["fixture"]["teardown"]["status"],
-                        if fixture_fails { "failed" } else { "ok" }
-                    );
-                    assert_eq!(record["cluster"]["launch"], "ok");
-                    assert_eq!(
-                        record["cluster"]["shutdown"],
-                        if cluster_fails { "failed" } else { "ok" }
-                    );
-                    assert!(record["cluster"]["partial_cleanup"].is_null());
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn partially_started_cluster_failure_defers_process_cleanup_to_monitor() {
-        let root = tempfile::tempdir().unwrap();
-        let observation = ScenarioSettlement::new("component/settlement", root.path()).unwrap();
-        observation.launch_config_succeeded();
-        let mut registration =
-            resource_registration::register(root.path(), "fixture", "released", "released-project")
-                .unwrap();
-        registration.settle(&Ok(())).unwrap();
-        observation.cluster_launch_attempted();
-        observation.cluster_launch_failed(&anyhow::anyhow!("partial startup failure"));
-        observation.teardown(&Fixture { fails: false }).unwrap();
-        observation.write().unwrap();
-        let record = read(root.path());
-        assert_eq!(record["cluster"]["launch"], "failed");
-        assert_eq!(record["cluster"]["partial_cleanup"], "monitor");
-        assert_eq!(record["cluster"]["shutdown"], "not_applicable");
-        assert_eq!(record["cluster"]["error"], "partial startup failure");
-        assert_eq!(record["fixture"]["resources"][0]["state"], "released");
-    }
-}
-
 impl ScenarioSettlement {
     pub(crate) fn new(scenario: &str, root: &Path) -> Result<Self> {
         Ok(Self {
@@ -212,5 +126,91 @@ impl ScenarioSettlement {
             self.written.set(true);
         }
         write.context("write scenario teardown record")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scenario::ScenarioContext;
+
+    struct Fixture {
+        fails: bool,
+    }
+    impl Scenario for Fixture {
+        fn name(&self) -> &'static str {
+            "component/settlement"
+        }
+        fn run(&self, _: &mut ScenarioContext) -> Result<()> {
+            unreachable!()
+        }
+        fn teardown(&self) -> Result<()> {
+            anyhow::ensure!(!self.fails, "actual fixture cleanup failure");
+            Ok(())
+        }
+    }
+
+    fn read(root: &Path) -> Value {
+        serde_json::from_slice(&fs::read(root.join("scenario-teardown.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn passing_and_assertion_failure_cleanup_facts_are_independent_of_outcome() {
+        // Both outcomes use exactly the same owner observations. Assertion
+        // verdicts are intentionally absent from this cleanup-only record.
+        for _assertions_passed in [true, false] {
+            for fixture_fails in [true, false] {
+                for cluster_fails in [true, false] {
+                    let root = tempfile::tempdir().unwrap();
+                    let observation =
+                        ScenarioSettlement::new("component/settlement", root.path()).unwrap();
+                    observation.launch_config_succeeded();
+                    observation.cluster_launch_attempted();
+                    observation.cluster_launched();
+                    observation.cluster_shutdown(&if cluster_fails {
+                        Err(anyhow::anyhow!("actual cluster cleanup failure"))
+                    } else {
+                        Ok(())
+                    });
+                    let _ = observation.teardown(&Fixture {
+                        fails: fixture_fails,
+                    });
+                    observation.write().unwrap();
+                    let record = read(root.path());
+                    assert_eq!(record["fixture"]["launch_config"], "ok");
+                    assert_eq!(
+                        record["fixture"]["teardown"]["status"],
+                        if fixture_fails { "failed" } else { "ok" }
+                    );
+                    assert_eq!(record["cluster"]["launch"], "ok");
+                    assert_eq!(
+                        record["cluster"]["shutdown"],
+                        if cluster_fails { "failed" } else { "ok" }
+                    );
+                    assert!(record["cluster"]["partial_cleanup"].is_null());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partially_started_cluster_failure_defers_process_cleanup_to_monitor() {
+        let root = tempfile::tempdir().unwrap();
+        let observation = ScenarioSettlement::new("component/settlement", root.path()).unwrap();
+        observation.launch_config_succeeded();
+        let mut registration =
+            resource_registration::register(root.path(), "fixture", "released", "released-project")
+                .unwrap();
+        registration.settle(&Ok(())).unwrap();
+        observation.cluster_launch_attempted();
+        observation.cluster_launch_failed(&anyhow::anyhow!("partial startup failure"));
+        observation.teardown(&Fixture { fails: false }).unwrap();
+        observation.write().unwrap();
+        let record = read(root.path());
+        assert_eq!(record["cluster"]["launch"], "failed");
+        assert_eq!(record["cluster"]["partial_cleanup"], "monitor");
+        assert_eq!(record["cluster"]["shutdown"], "not_applicable");
+        assert_eq!(record["cluster"]["error"], "partial startup failure");
+        assert_eq!(record["fixture"]["resources"][0]["state"], "released");
     }
 }

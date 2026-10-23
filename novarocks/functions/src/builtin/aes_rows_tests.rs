@@ -317,7 +317,7 @@ fn required_aes_preserves_domain_aad_refusal_and_separates_invalid_addresses() {
         .unwrap()
         .downcast_ref::<RequiredAesFailure>()
         .unwrap();
-    assert_eq!(source.ordinal, 7);
+    assert_eq!(source._ordinal, 7);
     for rows in [&[0][..], &[0, 0, 0, 0, 1][..]] {
         let failure = evaluate_required_row(
             Operation::Encrypt,

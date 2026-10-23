@@ -31,9 +31,8 @@ use arrow::{
 };
 use novarocks_functions::{
     EvaluatedArgument, FunctionArgumentType, KernelDiagnostic, KernelEvaluationControl,
-    KernelFailure, PreparedPureKernel, RowDataError, ScalarEvaluationInstance,
-    ScopedExpressionEffects, SelectedValues, Selection, validate_evaluated_argument_observed,
-    visit_selected_nulls,
+    KernelFailure, PreparedPureKernel, RowDataError, ScopedExpressionEffects, SelectedValues,
+    Selection, validate_evaluated_argument_observed, visit_selected_nulls,
 };
 use novarocks_local_program::{
     ExpressionProgram, LocalProgram, ProgramCallSite, ProgramChannelLayoutRole, ProgramChannelSite,
@@ -960,7 +959,7 @@ fn finish_root_value<'a, E: scalar_invocation::FrameFailure>(
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     work: &mut Work<'_, '_>,
 ) -> Result<SelectedValues<'a>, E> {
-    let result = result.materialize(selection, &ty.data_type(), work)?;
+    let result = result.materialize(selection, ty.data_type(), work)?;
     let (_, array, errors) = result.into_parts();
     let array = input_source::retain_result_type(array, ty, allocator, work.control)?;
     let result =
@@ -979,9 +978,9 @@ fn finish_root_value<'a, E: scalar_invocation::FrameFailure>(
                 {
                     errors.next();
                 } else if is_null {
-                    return Err(
-                        internal("non-null compiled root returned a successful SQL NULL").into(),
-                    );
+                    return Err(internal(
+                        "non-null compiled root returned a successful SQL NULL",
+                    ));
                 }
                 Ok(())
             },
@@ -1046,7 +1045,7 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
     {
         work.flush()?;
         let values = new_null_array(
-            &prepared.contract().result_type().data_type(),
+            prepared.contract().result_type().data_type(),
             selection.len(),
         );
         work.flush()?;
@@ -1057,7 +1056,7 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
         }
         return SelectedValues::try_new_observed(
             selection,
-            &prepared.contract().result_type().data_type(),
+            prepared.contract().result_type().data_type(),
             values,
             errors.into_boxed_slice(),
             || work.step(),
@@ -1144,7 +1143,7 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
             work.control
                 .operation_aborted
                 .store(true, Ordering::Relaxed);
-            return Err(cause.into());
+            return Err(cause);
         }
     };
     let (_, array, own_errors) = output.into_parts();
@@ -1176,7 +1175,7 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
     work.flush()?;
     SelectedValues::try_new_observed(
         selection,
-        &prepared.contract().result_type().data_type(),
+        prepared.contract().result_type().data_type(),
         array,
         errors.into_boxed_slice(),
         || work.step(),

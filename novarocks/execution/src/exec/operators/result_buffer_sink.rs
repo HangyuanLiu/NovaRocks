@@ -15,8 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::OperatorLifecycle;
+#[cfg(test)]
+use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::pipeline::{
     input::{AcceptedInput, InputPreparationFailure, RawInput},
     operator::{ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator},
@@ -35,7 +38,6 @@ use crate::runtime::{
         ResultWriteFailure,
     },
     mem_tracker::MemTracker,
-    observable::Observable,
 };
 use arrow::datatypes::DataType;
 use novarocks_types::SlotId;

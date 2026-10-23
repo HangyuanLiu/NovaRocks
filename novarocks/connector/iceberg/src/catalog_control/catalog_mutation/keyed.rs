@@ -148,7 +148,7 @@ pub(super) fn execute(
         dependencies: vec![if shape == RequestShape::SnapshotProducing {
             Dependency::RefUnchanged
         } else {
-            Dependency::NoReadDependency
+            Dependency::NoRead
         }],
         isolation: IsolationLevel::Snapshot,
         shape,
@@ -299,17 +299,16 @@ pub(super) fn execute(
         && let ExternalMutationOutcome::KnownUncommitted {
             failure: rejection, ..
         } = &mut outcome
+        && rejection.kind() == ConnectorMutationFailureKind::InvalidRequest
     {
-        if rejection.kind() == ConnectorMutationFailureKind::InvalidRequest {
-            let error = keyed::write::refusal_with_retained_bytes(
-                provider.runtime(),
-                &target.namespace,
-                &target.table,
-                &request.context,
-                invalid(rejection.message()),
-            );
-            *rejection = failure(&error);
-        }
+        let error = keyed::write::refusal_with_retained_bytes(
+            provider.runtime(),
+            &target.namespace,
+            &target.table,
+            &request.context,
+            invalid(rejection.message()),
+        );
+        *rejection = failure(&error);
     }
     if matches!(outcome, ExternalMutationOutcome::KnownCommitted { .. }) {
         provider

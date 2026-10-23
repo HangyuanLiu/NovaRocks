@@ -231,14 +231,13 @@ pub(super) fn validate_projection(
                 "field logical reference or nullability conflicts with its owner",
             ));
         }
-        if !source {
-            if let Some(role) = role {
-                if !name_equal(&field.name, role, work)? {
-                    return Err(E::InvalidShape(
-                        "execution layout role label is not canonical",
-                    ));
-                }
-            }
+        if !source
+            && let Some(role) = role
+            && !name_equal(&field.name, role, work)?
+        {
+            return Err(E::InvalidShape(
+                "execution layout role label is not canonical",
+            ));
         }
         validate_projection(
             index,

@@ -103,10 +103,6 @@ impl FloatArithmetic {
             mask_right_zero,
         }))
     }
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Retain both actual compact and logical addresses"
-    )]
     pub(super) fn evaluate_row(
         &self,
         left: EvaluatedArgument<'_>,

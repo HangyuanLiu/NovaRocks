@@ -136,7 +136,7 @@ fn md5sum_owner_exact_flat_profiles_and_called_on_null_contract() {
     ];
     for ty in profiles {
         let source = FunctionValueType::from_legacy_declared_projection(ty, true);
-        let prepared = prepared_for_test("md5sum", &[source.clone()]).unwrap();
+        let prepared = prepared_for_test("md5sum", std::slice::from_ref(&source)).unwrap();
         assert_eq!(
             prepared.contract().selected().argument_types.as_ref(),
             &[crate::FunctionArgumentType::Value(source)]
@@ -187,7 +187,7 @@ fn md5sum_owner_exact_flat_profiles_and_called_on_null_contract() {
         );
     }
     for source in nominal {
-        let prepared = prepared_for_test("md5sum", &[source.clone()]).unwrap();
+        let prepared = prepared_for_test("md5sum", std::slice::from_ref(&source)).unwrap();
         assert_eq!(
             prepared.contract().selected().argument_types.as_ref(),
             &[crate::FunctionArgumentType::Value(source)]

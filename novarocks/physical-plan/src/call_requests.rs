@@ -267,7 +267,7 @@ impl FragmentCallRequests {
         fragment: &Fragment,
         entries: Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
         storage: novarocks_type_contract::ValueTypeStorageLifetime,
-        mut creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, E>>,
+        creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, E>>,
         work: &mut CompileCheckpoints<'_>,
         validate: impl FnOnce(&Self, &Fragment, &mut CompileCheckpoints<'_>) -> Result<(), E>,
     ) -> Result<Self, E>
@@ -277,7 +277,7 @@ impl FragmentCallRequests {
             + From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
     {
         crate::resource::validate_call_request_source_observed(&entries, entries.capacity(), work)?;
-        let storage = if let Some(creation) = creation.as_deref_mut() {
+        let storage = if let Some(creation) = creation {
             work.flush()?;
             let storage = creation
                 .storage_lifetime()

@@ -254,6 +254,7 @@ impl CompiledAggregateProcessorFactory {
         Self::try_new_parts(program, node, error, false)
     }
 
+    #[cfg(test)]
     pub(crate) fn try_new_ordered(
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
@@ -952,7 +953,7 @@ impl CompiledAggregateProcessor {
                 values.push(evaluate_all(
                     instance,
                     *site,
-                    &chunk.record_batch(),
+                    chunk.record_batch(),
                     &self.control,
                 )?);
             }
@@ -1294,15 +1295,8 @@ impl TransformKernel for CompiledAggregateProcessor {
     }
 }
 
-// Reuse the checked physical-plan fixture; tests never forge a LocalProgram.
 #[cfg(test)]
-#[allow(dead_code)]
-#[path = "../pipeline/builder/compiled_aggregate_fixture.rs"]
-mod aggregate_fixture;
-#[cfg(test)]
-#[allow(dead_code)]
-#[path = "../pipeline/builder/compiled_family_fixture.rs"]
-mod family_fixture;
+use super::{aggregate_fixture, family_fixture};
 
 #[cfg(test)]
 mod failure_latch_tests {
@@ -1563,7 +1557,7 @@ mod failure_latch_tests {
         assert_eq!(processor.groups, 2);
         assert!(tracker.current() > 0);
         let stop = ExecutionFailure::from(KernelFailure::Internal(
-            novarocks_functions::KernelDiagnostic::new(&("originating task stop")),
+            novarocks_functions::KernelDiagnostic::new("originating task stop"),
         ));
         error.set_error(stop.clone());
         let original = processor.apply_for_test(&state, input.clone()).unwrap_err();
@@ -1585,7 +1579,7 @@ mod failure_latch_tests {
         let prefix = pending_prefix(&mut processor, &input);
         assert!(prefix.upgrade().is_some());
         error.set_error(novarocks_functions::KernelFailure::Internal(
-            novarocks_functions::KernelDiagnostic::new(&("stop before aggregate emission")),
+            novarocks_functions::KernelDiagnostic::new("stop before aggregate emission"),
         ));
         let originating = error.error().unwrap();
         let original = processor.finalize_for_test(&state).unwrap_err();
@@ -1837,10 +1831,6 @@ mod failure_latch_tests {
         assert_eq!(tracker.current(), 0);
     }
 }
-
-#[cfg(test)]
-#[path = "opaque_memory_host_tests.rs"]
-mod opaque_memory_host_tests;
 
 #[cfg(test)]
 #[path = "ds_hll_local_phase_factory_tests.rs"]

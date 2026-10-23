@@ -32,7 +32,7 @@ use crate::{
     KernelEvaluationControl, KernelFailure,
 };
 use allocator_api2::vec::Vec as HostVec;
-use arrow_array::{ArrayRef, builder::BinaryBuilder};
+use arrow_array::ArrayRef;
 use std::sync::Arc;
 
 pub(super) trait NEmissionAccess {
@@ -109,11 +109,10 @@ where
                 })?;
             }
             scalar::build_scalar_array_with_largeint_observation(
-                &contract.final_type().data_type(),
+                contract.final_type().data_type(),
                 values,
                 &mut scalar_work,
             )
-            .map_err(Into::into)
         } else {
             scalar_work.flush()?;
             let mut builder = crate::aggregate_scalar::BinaryResultBuilder::new();
@@ -129,7 +128,7 @@ where
                     core.serialize_with_codec_resources(&mut bytes, &mut codec, &mut scalar_work)?;
                     scalar_work.flush()?;
                     builder.append_value(&bytes.0)?;
-                    scalar_work.flush().map_err(Into::into)
+                    scalar_work.flush()
                 })?;
             }
             scalar_work.flush()?;

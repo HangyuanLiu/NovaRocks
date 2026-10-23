@@ -706,10 +706,6 @@ async fn notified_or_forever(close: Option<&Notify>) {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Listener composition keeps the admission and signed caller inputs explicit."
-)]
 async fn serve_native_listener<S>(
     listener: TokioTcpListener,
     app: S,

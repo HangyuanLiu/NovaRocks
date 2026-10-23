@@ -551,6 +551,7 @@ impl<K: TransformKernel, P: InputPreparation<K>> StepOperator for Transform<K, P
 pub(crate) mod child;
 
 #[path = "shape/fanout.rs"]
+#[cfg(test)]
 pub(crate) mod fanout;
 
 #[path = "shape/hydration.rs"]

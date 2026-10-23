@@ -153,7 +153,7 @@ impl UnifiedStatisticsResolver {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Arc;
+
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;

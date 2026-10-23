@@ -37,10 +37,10 @@ impl KernelEvaluationControl for Control {
             assert!(at <= *stop, "callback after first refusal");
         }
         trace.push(units);
-        if let Some((stop, cause)) = &self.reject {
-            if at == *stop {
-                return Err(cause.clone());
-            }
+        if let Some((stop, cause)) = &self.reject
+            && at == *stop
+        {
+            return Err(cause.clone());
         }
         Ok(())
     }

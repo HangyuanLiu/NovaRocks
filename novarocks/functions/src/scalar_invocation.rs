@@ -258,7 +258,7 @@ pub struct InvocationScalarEvaluationInstance {
     contract: Arc<ScalarCallContract>,
     retained_upper_bound: usize,
     failed: bool,
-    inline_charge: OpaqueRetainedCharge,
+    _inline_charge: OpaqueRetainedCharge,
     host: Arc<dyn AggregateStateAllocator>,
 }
 impl InvocationScalarEvaluationInstance {
@@ -295,7 +295,7 @@ impl InvocationScalarEvaluationInstance {
             contract,
             retained_upper_bound,
             failed: false,
-            inline_charge,
+            _inline_charge: inline_charge,
             host: actual,
         })
     }

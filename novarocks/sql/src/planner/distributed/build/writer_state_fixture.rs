@@ -19,7 +19,7 @@
 use super::contract_lowering::*;
 use crate::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
 use crate::column_id::ColumnId;
-use crate::compiler::{SqlAuthoredPhysicalPlan, SqlFunctionCatalog};
+use crate::compiler::SqlAuthoredPhysicalPlan;
 use crate::planner::distributed::write::ConnectorWriteInputBinding;
 use crate::planner::distributed::write::auxiliary::{
     WriterStatisticsTargetInput, plan_writer_statistics,

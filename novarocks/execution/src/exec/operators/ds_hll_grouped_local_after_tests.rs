@@ -81,7 +81,9 @@ fn ds_hll_grouped_local_after_hash_slots_real_identity_native_and_nulls() {
             ];
             let references = source_parts
                 .iter()
-                .filter_map(|chunk| run_optional(&refpartial, &[chunk.clone()], tracker.clone()))
+                .filter_map(|chunk| {
+                    run_optional(&refpartial, std::slice::from_ref(chunk), tracker.clone())
+                })
                 .collect::<Vec<_>>();
             let expected =
                 run_optional(&factory(&reference, P::Final), &references, tracker.clone())
@@ -196,7 +198,8 @@ fn ds_hll_grouped_local_after_original_dop_one_raw_unchanged() {
         let program = grouped_program(false, false);
         let single = factory(&program, P::Single);
         let source = grouped_input(&program, 100_000, false);
-        let left = run_optional_dop(&single, &[source.clone()], tracker.clone(), 1).unwrap();
+        let left =
+            run_optional_dop(&single, std::slice::from_ref(&source), tracker.clone(), 1).unwrap();
         let right = run(&single, &[source], tracker.clone());
         assert_eq!(estimates(&left), estimates(&right));
         assert_eq!(
@@ -218,10 +221,10 @@ fn ds_hll_grouped_local_after_actual_partial_final_cancel_latch_drop() {
             let (partial, final_stage) = factory(&program, P::Single)
                 .into_local_update_stages()
                 .unwrap();
-            let partial_output = run(&partial, &[source.clone()], tracker.clone());
+            let partial_output = run(&partial, std::slice::from_ref(&source), tracker.clone());
             let phase = if final_phase { &final_stage } else { &partial };
             let first = if final_phase { partial_output } else { source };
-            let state = RuntimeState::default();
+            let _state = RuntimeState::default();
             let mut operator = phase.create(2, 0);
             operator.set_construction_factory(aggregate_fixture::runtime_construction_factory(
                 tracker.clone(),

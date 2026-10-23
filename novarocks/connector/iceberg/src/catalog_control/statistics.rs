@@ -30,13 +30,13 @@ use novarocks_connector_iceberg_functions::{
     validate_compact_theta,
 };
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorOperationControl, ConnectorStatistics, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
-    StatisticsArtifactDraft, StatisticsArtifactIdentity, StatisticsBasisRelation,
-    StatisticsCollection, StatisticsCollectionSession, StatisticsCollectionStart,
-    StatisticsCollectionStartRequest, StatisticsColumnSelection, StatisticsDataVersion,
-    StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricObservation,
+    ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorOperationControl,
+    ConnectorStatistics, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome, StatisticsArtifactDraft,
+    StatisticsArtifactIdentity, StatisticsBasisRelation, StatisticsCollection,
+    StatisticsCollectionSession, StatisticsCollectionStart, StatisticsCollectionStartRequest,
+    StatisticsColumnSelection, StatisticsDataVersion, StatisticsEvidence,
+    StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricObservation,
     StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
     StatisticsMissingKind, StatisticsNumericNature, StatisticsReadRequest, StatisticsReader,
     StatisticsReceipt, StatisticsRequiredAggregation, StatisticsRowCoverage, StatisticsScanColumn,
@@ -896,11 +896,6 @@ fn known_uncommitted(error: ConnectorError) -> ExternalMutationOutcome<Statistic
     }
 }
 
-#[cfg(test)]
-fn failure_kind(kind: ConnectorErrorKind) -> ConnectorMutationFailureKind {
-    kind.into()
-}
-
 fn validate_context(
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), ConnectorError> {
@@ -1043,21 +1038,6 @@ mod tests {
             runtime,
         );
         (executor, warehouse, provider)
-    }
-
-    fn table_payload() -> IcebergTablePayload {
-        IcebergTablePayload {
-            namespace: "db".to_string(),
-            table: "t".to_string(),
-            metadata_location: None,
-            table_info: None,
-            metadata_columns: Vec::new(),
-            metadata_table_type: None,
-            prepared_files: Vec::new(),
-            explicit_files: None,
-            row_mutation_frozen_source: false,
-            hidden_columns: Vec::new(),
-        }
     }
 
     #[test]

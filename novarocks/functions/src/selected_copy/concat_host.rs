@@ -33,7 +33,7 @@ use std::sync::Arc;
 struct ConcatSources<C> {
     // Destroy original array aliases before their same-site source lease.
     sources: Vec<ArrayRef>,
-    original_owner: C,
+    _original_owner: C,
 }
 impl<C> crate::arrow_result_custody::CopyInputBacking for ConcatSources<C> {
     fn source_count(&self) -> usize {
@@ -82,7 +82,7 @@ pub fn concat_copy_in<C: Send + Sync + 'static>(
 ) -> Result<RetainedConcatResult, CopyOperationError> {
     let sources = ConcatSources {
         sources: arrays,
-        original_owner,
+        _original_owner: original_owner,
     };
     let observed = KernelControlObservation::new(control);
     observed.checkpoint(0)?;

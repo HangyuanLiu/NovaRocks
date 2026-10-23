@@ -48,6 +48,10 @@ use novarocks_execution_contract::task_execution::task_convergence::{
 };
 
 /// The facts share one source revision, independent of their protocol versions.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "This Worker-to-adapter fact carries the immutable TaskStatus snapshot by value; boxing would change the consumer contract and allocate per status event."
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CoveredObservationFact {
     Status(TaskStatus),
@@ -386,6 +390,10 @@ impl CoveredSubscription {
 }
 
 /// One immutable observation frame.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "This Worker-to-adapter event carries the immutable TaskStatus snapshot by value; boxing would change the consumer contract and allocate per status event."
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskStatusEvent {
     /// The worker has closed every responsibility of this exact context.

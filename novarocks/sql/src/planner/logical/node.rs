@@ -40,7 +40,7 @@ pub(crate) struct LogicalPlanNode {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) enum LogicalPlanKind {
-    Scan(PlanScanNode),
+    Scan(Box<PlanScanNode>),
     Filter(PlanFilterNode),
     Project(PlanProjectNode),
     Sort(PlanSortNode),
@@ -61,12 +61,20 @@ pub(crate) enum LogicalPlanKind {
     CTEAnchor(PlanCTEAnchorNode),
     CTEProduce(PlanCTEProduceNode),
     CTEConsume(PlanCTEConsumeNode),
-    Apply(LogicalApplyNode),
+    Apply(Box<LogicalApplyNode>),
     ImvDelta(LogicalImvDeltaNode),
     ImvVersion(LogicalImvVersionNode),
 }
 
 impl LogicalPlanKind {
+    pub(crate) fn scan(scan: PlanScanNode) -> Self {
+        Self::Scan(Box::new(scan))
+    }
+
+    pub(crate) fn apply(apply: LogicalApplyNode) -> Self {
+        Self::Apply(Box::new(apply))
+    }
+
     pub(crate) fn variant_name(&self) -> &'static str {
         match self {
             LogicalPlanKind::Scan(_) => "Scan",
@@ -414,7 +422,7 @@ mod plan_tests {
                 crate::planner::table::SqlScanKind::ConnectorRead,
             ),
         };
-        let node = LogicalPlanKind::Scan(PlanScanNode {
+        let node = LogicalPlanKind::scan(PlanScanNode {
             database: "default".to_string(),
             table,
             alias: None,

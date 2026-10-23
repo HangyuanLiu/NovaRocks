@@ -532,10 +532,9 @@ impl RootReplyFaultProxy {
                         .shutdown_joined = true;
                 }
             })
-            .map_err(|error| {
+            .inspect_err(|_error| {
                 core.listeners.fetch_sub(1, Ordering::AcqRel);
                 core.failure("root actor listener thread spawn failed");
-                error
             })?;
         Ok(Self {
             address,

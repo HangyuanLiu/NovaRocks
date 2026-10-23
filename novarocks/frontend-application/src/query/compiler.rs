@@ -570,7 +570,6 @@ impl FrontendQueryCompiler {
     /// for execution -- the same driver, the same facts, the same version --
     /// and then printed rather than run. Nothing is executed, and the
     /// capabilities the completion takes are released with it.
-    #[allow(clippy::too_many_arguments)]
     fn complete_distributed_explain(
         &self,
         query: &Query,
@@ -579,7 +578,7 @@ impl FrontendQueryCompiler {
         query_options: Option<QueryOptions>,
         connector_planning_context: novarocks_spi::connector::ConnectorPlanningContext,
         execution: &QueryExecutionContext,
-        context: &RequestContext,
+        _context: &RequestContext,
         scope: &novarocks_workload_control::WorkScope,
         level: ExplainLevel,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
@@ -642,8 +641,7 @@ impl FrontendQueryCompiler {
                 &control,
             )
             .map_err(|error| FrontendQueryCompilerError::from_completion(&error))?;
-        Ok(PreparedQueryOperation::explain_lines(lines)
-            .map_err(FrontendQueryCompilerError::Engine)?)
+        PreparedQueryOperation::explain_lines(lines).map_err(FrontendQueryCompilerError::Engine)
     }
 
     /// Compile one plain read into a completed plan, and hand the execution
@@ -660,7 +658,10 @@ impl FrontendQueryCompiler {
     /// -- the sealed path reached the same catalogs synchronously from the
     /// same threads -- and leaves making preparation itself asynchronous as
     /// its own change.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The completion path receives distinct frozen read facts and live owner ports; bundling them would duplicate the operation contract."
+    )]
     fn complete_distributed_read(
         &self,
         purpose: FrontendQueryPurpose,
@@ -670,7 +671,7 @@ impl FrontendQueryCompiler {
         query_options: Option<QueryOptions>,
         connector_planning_context: novarocks_spi::connector::ConnectorPlanningContext,
         execution: &QueryExecutionContext,
-        context: &RequestContext,
+        _context: &RequestContext,
         scope: &novarocks_workload_control::WorkScope,
         #[cfg(novarocks_dev_controls)] rewrite_statement: Option<
             &crate::mv::test_controls::MvRewriteStatementTarget,
@@ -829,7 +830,6 @@ impl FrontendQueryCompiler {
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn complete_distributed_profile(
         &self,
         query: &Query,
@@ -838,7 +838,7 @@ impl FrontendQueryCompiler {
         query_options: Option<QueryOptions>,
         connector_planning_context: &novarocks_spi::connector::ConnectorPlanningContext,
         execution: &QueryExecutionContext,
-        context: &RequestContext,
+        _context: &RequestContext,
         scope: &novarocks_workload_control::WorkScope,
         planning_started_at: std::time::Instant,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
@@ -992,7 +992,6 @@ impl FrontendQueryCompiler {
         Ok(PreparedQueryOperation::Distributed(operation))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn analyze_request<'a>(
         &'a self,
         query: &Query,

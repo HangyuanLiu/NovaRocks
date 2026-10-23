@@ -17,6 +17,7 @@
 
 //! Planner-owned physical plan nodes.
 
+#[cfg(test)]
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::ProviderReadOccurrenceId;
 use std::ops::{Deref, DerefMut};
@@ -197,16 +198,6 @@ impl PhysicalScanNode {
             provider_read_occurrence: occurrence,
         }))
     }
-
-    pub(crate) fn into_planning_payload(self) -> Result<PlanScanNode, String> {
-        match self {
-            Self::Planning(payload) => Ok(payload),
-            Self::Finalized(scan) => Err(format!(
-                "finalized physical scan occurrence {} cannot be converted to a stage that has no occurrence identity",
-                scan.provider_read_occurrence.get()
-            )),
-        }
-    }
 }
 
 impl From<PlanScanNode> for PhysicalScanNode {
@@ -237,10 +228,6 @@ impl DerefMut for PhysicalScanNode {
 
 #[allow(dead_code)]
 #[expect(
-    private_interfaces,
-    reason = "The optimizer bridge exposes plan variants while payload construction remains internal to SQL planning."
-)]
-#[expect(
     clippy::large_enum_variant,
     reason = "Physical plan payloads remain inline to avoid changing the established plan traversal representation."
 )]
@@ -270,8 +257,8 @@ pub enum PhysicalPlanKind {
     Redistribute(RedistributeNode),
 }
 
+#[cfg(test)]
 impl PhysicalPlanKind {
-    #[cfg(any(test, novarocks_dev_controls))]
     pub(crate) fn variant_names_for_test() -> &'static [&'static str] {
         &[
             "Scan",
@@ -298,6 +285,19 @@ impl PhysicalPlanKind {
             "Redistribute",
         ]
     }
+}
+
+#[cfg(test)]
+pub(crate) fn hash_aggregate_outputs_intermediate(mode: AggMode) -> bool {
+    !matches!(mode, AggMode::Single | AggMode::Global)
+}
+
+#[cfg(test)]
+pub(crate) fn aggregate_intermediate_type(call: &AggregateCall) -> Result<DataType, String> {
+    Ok(crate::functions::aggregate_selection(call.source.binding())
+        .intermediate_type
+        .data_type()
+        .clone())
 }
 
 #[allow(dead_code)]
@@ -327,26 +327,6 @@ pub enum RedistributeMode {
 // the canonical aggregate type contract in `novarocks_types::aggregate` (which stays
 // a pure, planner-free leaf). Consumed by the distributed planner's aggregate
 // output finalization (`sql::planner::distributed::output::finalize_hash_aggregate_wire`).
-
-/// Whether a `HashAggregate` running in `mode` emits intermediate aggregate-state
-/// types on the wire. Partial modes (`Local` / `DistinctGlobal` / `DistinctLocal`)
-/// emit intermediate state; the terminal modes (`Single` / `Global`) emit the
-/// final result type.
-pub(crate) fn hash_aggregate_outputs_intermediate(mode: AggMode) -> bool {
-    !matches!(mode, AggMode::Single | AggMode::Global)
-}
-
-/// The intermediate aggregate-state Arrow type an aggregate `call` exposes,
-/// frozen by analyzer resolution in the call's immutable catalog signature.
-///
-/// Only the call's positional `args` participate (matching the wire the encoder
-/// historically emitted); `order_by` inputs are intentionally excluded.
-pub(crate) fn aggregate_intermediate_type(call: &AggregateCall) -> Result<DataType, String> {
-    Ok(crate::functions::aggregate_selection(call.source.binding())
-        .intermediate_type
-        .data_type()
-        .clone())
-}
 
 /// The canonical aggregate function name for a `call`, delegating the DISTINCT
 /// name-mangling table to the single source of truth

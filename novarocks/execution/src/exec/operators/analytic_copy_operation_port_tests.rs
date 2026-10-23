@@ -51,8 +51,9 @@ fn project(
     error: AnalyticCopyFailure<std::convert::Infallible>,
 ) -> AnalyticCopyFailure<KernelFailure> {
     match error {
-        AnalyticCopyFailure::OriginalArrow(error) => AnalyticCopyFailure::OriginalArrow(error),
-        AnalyticCopyFailure::Source(text) => AnalyticCopyFailure::Source(text),
+        AnalyticCopyFailure::OriginalArrow { source, .. } => {
+            AnalyticCopyFailure::original_arrow(source)
+        }
         AnalyticCopyFailure::Control(never) => match never {},
     }
 }
@@ -205,7 +206,7 @@ fn analytic_copy_operation_port_zero_columns_single_source_and_identity_skip_cop
     assert_eq!(result.value.len(), 5);
     assert!(work.occurrences.is_empty());
     let single = ints(vec![Some(1), Some(2)]);
-    let one = stages::gather(&[single.clone()], &mut work).unwrap();
+    let one = stages::gather(std::slice::from_ref(&single), &mut work).unwrap();
     assert!(Arc::ptr_eq(
         one.value.record_batch().column(0),
         single.record_batch().column(0)
@@ -234,14 +235,14 @@ fn analytic_copy_operation_port_same_default_control_trace_and_data_formatter() 
                     let key: ArrayRef = Arc::new(BinaryArray::from(vec![b"x".as_slice(), b"z".as_slice(), b"y".as_slice(), b"w".as_slice()]));
                     drop(stages::regroup(&source, &[key], work)?);
                 }
-                AnalyticInputStage::OutputSplit => { drop(stages::split(schema(DataType::Int64), source.columns(), &[source.clone()], work)?); }
+                AnalyticInputStage::OutputSplit => { drop(stages::split(schema(DataType::Int64), source.columns(), std::slice::from_ref(&source), work)?); }
             }
             Ok(())
         };
         let control = Control::new(None);
         let observed = KernelControlObservation::new(&control);
         let mut work = Ports::new(&observed, false);
-        let error = evaluate(&mut work).err().expect("original Data");
+        let error = evaluate(&mut work).expect_err("original Data");
         let expected = match stage {
             AnalyticInputStage::Gather => {
                 let second = chunk(Arc::new(Int64Array::from(vec![1, 2])));
@@ -249,16 +250,14 @@ fn analytic_copy_operation_port_same_default_control_trace_and_data_formatter() 
                     &source.schema(),
                     [source.record_batch(), second.record_batch()],
                 )
-                .err()
-                .expect("original upstream Data");
+                .expect_err("original upstream Data");
                 format!("concat_batches: {error}")
             }
             AnalyticInputStage::Regroup => "unsupported type for min/max: Binary".to_owned(),
             AnalyticInputStage::OutputSplit => {
                 let error =
                     Chunk::try_new_with_columns(schema(DataType::Int64), source.columns().to_vec())
-                        .err()
-                        .expect("original Chunk Data");
+                        .expect_err("original Chunk Data");
                 format!("build analytic output batch: {error}")
             }
         };

@@ -50,7 +50,7 @@ pub(crate) fn selected_scalar_control(
     let selected_control = if abi == PureKernelAbi::ScalarInvocationV1 {
         declaration
             .selected_argument_control_observed(function, selected, logical_argument_count, control)
-            .map_err(|e| FunctionSpecializationFailure::Binding(e.into()))?
+            .map_err(FunctionSpecializationFailure::Binding)?
     } else {
         declaration.effects().argument_control
     };
@@ -672,20 +672,14 @@ pub(crate) fn freeze_conversion(
         PlannedConversion::Identity => Ok(ConversionPlan::Identity),
         PlannedConversion::Carrier(step) => Ok(ConversionPlan::Carrier(step)),
         PlannedConversion::ValueConversion { binding, tail } => {
-            let mut args = [source.clone()];
-            let call = freeze_fold_call(
-                functions,
-                &binding,
-                &mut args,
-                constant_policy,
-                false,
-                control,
-            )?
-            .ok_or_else(|| {
-                super::SqlCompileError::InvalidRequest(
-                    "value conversion unexpectedly requires temporal sources".into(),
-                )
-            })?;
+            let args = [source.clone()];
+            let call =
+                freeze_fold_call(functions, &binding, &args, constant_policy, false, control)?
+                    .ok_or_else(|| {
+                        super::SqlCompileError::InvalidRequest(
+                            "value conversion unexpectedly requires temporal sources".into(),
+                        )
+                    })?;
             Ok(ConversionPlan::ValueConversion { call, tail })
         }
     }
@@ -728,7 +722,7 @@ mod tests {
 
     #[test]
     fn canonical_scalar_fold_reuses_exact_selection_and_retains_admitted_constant() {
-        let mut args = [arg(
+        let args = [arg(
             LiteralValue::Int(-7),
             FunctionValueType::new(DataType::Int64, false),
         )];
@@ -738,7 +732,7 @@ mod tests {
         let call = freeze_fold_call(
             catalog,
             &binding,
-            &mut args,
+            &args,
             crate::constant::test_constant_policy(),
             true,
             control(),
@@ -779,7 +773,7 @@ mod tests {
 
     #[test]
     fn canonical_null_uses_lowering_target_for_both_preparation_and_runtime_argument() {
-        let mut args = [arg(
+        let args = [arg(
             LiteralValue::Null,
             FunctionValueType::new(DataType::Null, true),
         )];
@@ -791,7 +785,7 @@ mod tests {
         let call = freeze_fold_call(
             crate::functions::builtin_sql_function_catalog(),
             &binding,
-            &mut args,
+            &args,
             crate::constant::test_constant_policy(),
             true,
             control(),
@@ -875,7 +869,7 @@ mod tests {
     #[test]
     fn constant_control_calls_keep_the_installed_guard_shape() {
         let catalog = crate::functions::builtin_sql_function_catalog();
-        for (name, mut args, expected) in [
+        for (name, args, expected) in [
             (
                 "if",
                 vec![
@@ -913,7 +907,7 @@ mod tests {
             let call = freeze_fold_call(
                 catalog,
                 &binding,
-                &mut args,
+                &args,
                 crate::constant::test_constant_policy(),
                 true,
                 control(),

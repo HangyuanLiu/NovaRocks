@@ -115,12 +115,31 @@ impl fmt::Display for BoundedWorkerError {
 
 impl std::error::Error for BoundedWorkerError {}
 
-/// A refused submission returns the still-unexecuted move-only job.
+/// A refused submission is reported to the caller; tests can recover the job
+/// to verify retryability before production closes the executor.
 pub(crate) struct BoundedWorkerSubmitError<R> {
+    #[cfg(test)]
     job: BoundedWorkerJob<R>,
+    #[cfg(not(test))]
+    _result: std::marker::PhantomData<fn() -> R>,
 }
 
 impl<R> BoundedWorkerSubmitError<R> {
+    fn rejected(job: BoundedWorkerJob<R>) -> Self {
+        #[cfg(test)]
+        {
+            Self { job }
+        }
+        #[cfg(not(test))]
+        {
+            drop(job);
+            Self {
+                _result: std::marker::PhantomData,
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn into_job(self) -> BoundedWorkerJob<R> {
         self.job
     }
@@ -295,6 +314,7 @@ impl<R> BoundedWorkerOwner<R> {
     /// from a Tokio coordinator worker. Drop only closes admission and hands
     /// the workers to the process reaper; it never joins on the dropping
     /// thread.
+    #[cfg(test)]
     pub(crate) fn shutdown_and_join(mut self) -> Result<(), BoundedWorkerShutdownError> {
         self.shutdown_and_join_inner()
     }
@@ -326,6 +346,7 @@ impl<R> BoundedWorkerOwner<R> {
         self.join_finished_workers()
     }
 
+    #[cfg(test)]
     fn shutdown_and_join_inner(&mut self) -> Result<(), BoundedWorkerShutdownError> {
         close_queue(&self.shared);
         self.join_finished_workers()
@@ -383,7 +404,7 @@ impl<R: Send + 'static> BoundedWorkerHandle<R> {
     ) -> Result<BoundedWorkerReceipt<R>, BoundedWorkerSubmitError<R>> {
         let queue_slot = match Arc::clone(&self.shared.queue_slots).acquire_owned().await {
             Ok(slot) => slot,
-            Err(_) => return Err(BoundedWorkerSubmitError { job }),
+            Err(_) => return Err(BoundedWorkerSubmitError::rejected(job)),
         };
         let (completion, receiver) = oneshot::channel();
         let queued = QueuedJob {
@@ -397,7 +418,7 @@ impl<R: Send + 'static> BoundedWorkerHandle<R> {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if state.closed {
-            return Err(BoundedWorkerSubmitError { job: queued.job });
+            return Err(BoundedWorkerSubmitError::rejected(queued.job));
         }
         debug_assert!(state.jobs.len() < self.shared.queue_capacity);
         state.jobs.push_back(queued);

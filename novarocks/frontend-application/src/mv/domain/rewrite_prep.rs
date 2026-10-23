@@ -26,10 +26,8 @@ use std::{collections::HashSet, fmt, sync::Arc};
 use crate::mv::domain::readiness::MvCandidateReader;
 use crate::mv::domain::refresh::definition::parse_mv_select_query;
 use novarocks_mv_application::persistence::{
-    exact_revision::restore_exact_query_revision,
+    exact_revision::restore_exact_query_revision, keyed_documents::MvKeyedObservedCurrentDocuments,
     keyed_documents::StoredKeyedMvProjection,
-    keyed_documents::{MvKeyedObservedCurrentDocuments, observe_current_keyed_documents},
-    validation::PersistenceDecodeBudget,
 };
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::compiler::{

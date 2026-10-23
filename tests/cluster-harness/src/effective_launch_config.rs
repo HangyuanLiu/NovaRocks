@@ -596,20 +596,34 @@ mod tests {
     use crate::{BePorts, CrossProcessRuntime};
     use std::path::PathBuf;
 
-    #[allow(clippy::too_many_arguments)]
-    fn config(
-        role: &str,
+    struct TestRoleConfig<'a> {
+        role: &'a str,
         http: u16,
         grpc: u16,
         control_grpc: Option<u16>,
         mysql: Option<u16>,
-        fe_grpc: u16,
-        runtime: &Path,
-        extra: &str,
-        transport_mode: &str,
+        frontend_grpc: u16,
+        runtime_dir: &'a Path,
+        extra: &'a str,
+        transport_mode: &'a str,
         advertised_port: Option<u16>,
         advertised_control_port: Option<u16>,
-    ) -> String {
+    }
+
+    fn config(input: TestRoleConfig<'_>) -> String {
+        let TestRoleConfig {
+            role,
+            http,
+            grpc,
+            control_grpc,
+            mysql,
+            frontend_grpc,
+            runtime_dir,
+            extra,
+            transport_mode,
+            advertised_port,
+            advertised_control_port,
+        } = input;
         let control = control_grpc
             .map(|port| format!("control_grpc_port = {port}\n"))
             .unwrap_or_default();
@@ -619,7 +633,7 @@ mod tests {
         let role_fields = if role == "fe" {
             format!(
                 "[state_store]\npath = {:?}\n",
-                runtime.join("frontend-state.sqlite").to_string_lossy()
+                runtime_dir.join("frontend-state.sqlite").to_string_lossy()
             )
         } else {
             let advertise = advertised_port
@@ -628,7 +642,9 @@ mod tests {
             let advertise_control = advertised_control_port
                 .map(|port| format!("advertise_control_port = {port}\n"))
                 .unwrap_or_default();
-            format!("frontend_endpoint = \"127.0.0.1:{fe_grpc}\"\n{advertise}{advertise_control}")
+            format!(
+                "frontend_endpoint = \"127.0.0.1:{frontend_grpc}\"\n{advertise}{advertise_control}"
+            )
         };
         format!(
             "[server]\nhost = \"127.0.0.1\"\nhttp_port = {http}\ngrpc_port = {grpc}\n{control}\
@@ -650,7 +666,6 @@ mod tests {
         evidence_with_options(root, ports, secret, extra, profile, "disabled", None, None)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn evidence_with_options(
         root: &Path,
         ports: (u16, u16, u16, u16, u16, u16),
@@ -673,32 +688,32 @@ mod tests {
         };
         let advertised_port = proxy_limit.map(|_| ports.4 + 1);
         let advertised_control_port = proxy_limit.map(|_| ports.5 + 1);
-        let frontend = config(
-            "fe",
-            ports.0,
-            ports.1,
-            None,
-            Some(ports.2),
-            ports.1,
-            root,
+        let frontend = config(TestRoleConfig {
+            role: "fe",
+            http: ports.0,
+            grpc: ports.1,
+            control_grpc: None,
+            mysql: Some(ports.2),
+            frontend_grpc: ports.1,
+            runtime_dir: root,
             extra,
             transport_mode,
-            None,
-            None,
-        );
-        let backend = config(
-            "be",
-            ports.3,
-            ports.4,
-            Some(ports.5),
-            None,
-            ports.1,
-            root,
+            advertised_port: None,
+            advertised_control_port: None,
+        });
+        let backend = config(TestRoleConfig {
+            role: "be",
+            http: ports.3,
+            grpc: ports.4,
+            control_grpc: Some(ports.5),
+            mysql: None,
+            frontend_grpc: ports.1,
+            runtime_dir: root,
             extra,
             transport_mode,
             advertised_port,
             advertised_control_port,
-        );
+        });
         let mut environments = BTreeMap::from([(
             "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET".to_string(),
             secret.to_string(),
@@ -949,37 +964,37 @@ mod tests {
         };
         let frontend = format!(
             "{}\n[catalog_source]\nmode = \"static-file\"\nstatic_file_path = \"catalogs.toml\"\n",
-            config(
-                "fe",
-                1101,
-                1102,
-                None,
-                Some(1103),
-                1102,
-                &runtime_dir,
-                "worker_threads = 4",
-                "disabled",
-                None,
-                None,
-            )
+            config(TestRoleConfig {
+                role: "fe",
+                http: 1101,
+                grpc: 1102,
+                control_grpc: None,
+                mysql: Some(1103),
+                frontend_grpc: 1102,
+                runtime_dir: &runtime_dir,
+                extra: "worker_threads = 4",
+                transport_mode: "disabled",
+                advertised_port: None,
+                advertised_control_port: None,
+            })
         );
         let environments = BTreeMap::from([(
             "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET".to_string(),
             "secret".to_string(),
         )]);
-        let backend_configs = vec![config(
-            "be",
-            1104,
-            1105,
-            Some(1205),
-            None,
-            1102,
-            &runtime_dir,
-            "worker_threads = 4",
-            "disabled",
-            None,
-            None,
-        )];
+        let backend_configs = vec![config(TestRoleConfig {
+            role: "be",
+            http: 1104,
+            grpc: 1105,
+            control_grpc: Some(1205),
+            mysql: None,
+            frontend_grpc: 1102,
+            runtime_dir: &runtime_dir,
+            extra: "worker_threads = 4",
+            transport_mode: "disabled",
+            advertised_port: None,
+            advertised_control_port: None,
+        })];
         let proxy = CrossProcessNativeFaultProxyConfig::default();
         let input = EffectiveLaunchConfigInput {
             launch_profile: LaunchProfile::Performance,
@@ -991,7 +1006,7 @@ mod tests {
             frontend_config: &frontend,
             backend_configs: &backend_configs,
             frontend_environment: &environments,
-            backend_environments: &[environments.clone()],
+            backend_environments: std::slice::from_ref(&environments),
             native_proxy_config: &proxy,
             native_root_reply_fault: None,
             advertised_backend_grpc_ports: &[1105],

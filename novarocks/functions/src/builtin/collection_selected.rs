@@ -38,7 +38,7 @@ pub(super) enum Operation {
 pub(super) fn copy_error(error: CopyError) -> KernelFailure {
     error.into_kernel()
 }
-fn value<'a>(arg: &'a FunctionArgumentType) -> Result<&'a FunctionValueType, KernelFailure> {
+fn value(arg: &FunctionArgumentType) -> Result<&FunctionValueType, KernelFailure> {
     match arg {
         FunctionArgumentType::Value(value) => Ok(value),
         _ => Err(invalid("collection call requires exact value arguments")),

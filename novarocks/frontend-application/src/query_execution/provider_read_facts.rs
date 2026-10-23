@@ -112,17 +112,12 @@ pub(crate) struct FrozenProviderRead {
 /// would and would not enforce. Nothing downstream can recover them from the
 /// plan, so they are kept from the moment the read stops being negotiable.
 pub(crate) struct FrozenReadEncoding {
-    /// The relation this read names, which the plan deliberately does not
-    /// carry: a physical plan addresses a provider relation by frozen
-    /// reference, not by the name a statement used to reach it.
-    pub(crate) identity: TableIdentity,
     /// Each provider column this read projects, paired with how the request
     /// named it. The plan addresses these columns by provider reference; what
     /// a column is *called* is SQL-local and survives only here, so the pairing
     /// is kept rather than the two halves separately - matching them again by
     /// position later is how a rename becomes a mislabelled column.
     pub(crate) columns: Box<[(ProviderColumnReference, ProviderReadColumnNeed)]>,
-    pub(crate) relation: novarocks_spi::connector::read_stack::ConnectorReadRelation,
     pub(crate) assignments: Vec<ConnectorReadAssignment>,
     /// The constraint the provider was offered.
     ///
@@ -137,7 +132,6 @@ pub(crate) struct FrozenReadEncoding {
     pub(crate) unenforced_predicate: TupleDomain<ConnectorReadColumnHandle>,
     pub(crate) remaining_expression: Option<ConnectorExpression>,
     pub(crate) placement: RuntimeSplitPlacement,
-    pub(crate) encoder: Arc<dyn ConnectorReadWireEncoder>,
     /// The provider's own static facts, exactly as it froze them.
     ///
     /// The physical contract and compiled program retain the provider's own
@@ -488,16 +482,13 @@ pub(crate) fn freeze_one_read(
                     generation: planning_lease.clone(),
                     catalog: catalog_properties,
                     encoding: FrozenReadEncoding {
-                        identity: identity.clone(),
                         columns: named_columns,
-                        relation: provider_relation.clone(),
                         assignments: assignments.clone(),
                         offered_constraint: offered_constraint(&offer),
                         enforced_predicate,
                         unenforced_predicate,
                         remaining_expression,
                         placement,
-                        encoder: Arc::clone(&encoder),
                         static_facts: frozen.clone(),
                         public_schema,
                     },
@@ -1094,18 +1085,17 @@ fn filter_responsibility(
 
 /// The provider's column identity for each requested ordinal, and the name the
 /// request used for it.
+type ProviderColumnFacts = (
+    Box<[ProviderReadColumnFact]>,
+    Box<[(ProviderColumnReference, ProviderReadColumnNeed)]>,
+);
+
 fn column_facts(
     columns: &[ProviderReadColumnNeed],
     assignments: &[ConnectorReadAssignment],
     encoder: &dyn ConnectorReadWireEncoder,
     name: &str,
-) -> Result<
-    (
-        Box<[ProviderReadColumnFact]>,
-        Box<[(ProviderColumnReference, ProviderReadColumnNeed)]>,
-    ),
-    String,
-> {
+) -> Result<ProviderColumnFacts, String> {
     let mut facts = Vec::with_capacity(columns.len());
     let mut named = Vec::with_capacity(columns.len());
     for (column, assignment) in columns.iter().zip(assignments.iter()) {

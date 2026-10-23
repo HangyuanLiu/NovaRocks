@@ -15,10 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
 use std::num::NonZeroU32;
 
+#[cfg(test)]
 use arrow::datatypes::DataType;
 
+#[cfg(test)]
 macro_rules! model_id {
     ($name:ident, $raw:ty) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -35,15 +38,22 @@ macro_rules! model_id {
         }
     };
 }
+#[cfg(test)]
 model_id!(ChannelId, u32);
+#[cfg(test)]
 model_id!(BindingId, u32);
+#[cfg(test)]
 model_id!(CoverageWitnessId, u32);
+#[cfg(test)]
 model_id!(PlanFragmentId, u32);
+#[cfg(test)]
 model_id!(PlanNodeId, i32);
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ComparatorDigest([u8; 32]);
 
+#[cfg(test)]
 impl ComparatorDigest {
     pub const fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
@@ -54,6 +64,7 @@ impl ComparatorDigest {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeFilterLogicalDomain {
     Membership {
@@ -81,6 +92,7 @@ pub enum NullOrder {
     Last,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrderKeyContract {
     pub data_type: DataType,
@@ -88,6 +100,7 @@ pub struct OrderKeyContract {
     pub null_order: NullOrder,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrderContract {
     pub keys: Vec<OrderKeyContract>,
@@ -95,6 +108,7 @@ pub struct OrderContract {
     pub comparator_digest: ComparatorDigest,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ContributionKind {
     ValueDomainDelta,
@@ -104,20 +118,19 @@ pub enum ContributionKind {
     ProducerClosed,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeFilterLifecycle {
     CompleteOnce,
     MonotonicUpdates,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct TopKSummaryRequirement(NonZeroU32);
 
+#[cfg(test)]
 impl TopKSummaryRequirement {
-    #[allow(
-        dead_code,
-        reason = "Retained for TopK runtime-filter planning variants enabled by other targets."
-    )]
     pub fn try_new(k: u32) -> Option<Self> {
         NonZeroU32::new(k).map(Self)
     }
@@ -127,28 +140,28 @@ impl TopKSummaryRequirement {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-#[allow(
-    dead_code,
-    reason = "All reduction variants remain part of the frozen runtime-filter planner contract."
-)]
 pub enum ReductionRequirement {
     SetUnion,
     TightenOrderedBound,
     MergeTopKSummary(TopKSummaryRequirement),
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CompletionFenceKind {
     CommittedDomainFrozen,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CompletionRequirement {
     ProducerClosed,
     FencedFinalDomain(CompletionFenceKind),
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ArtifactCapability {
     Membership,
@@ -156,6 +169,7 @@ pub enum ArtifactCapability {
     EmptyDomain,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum LateApplyGranularity {
     Row,
@@ -165,12 +179,14 @@ pub enum LateApplyGranularity {
     File,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConsumerActivation {
     BlockingSnapshot,
     NonBlockingLive { late_apply: LateApplyGranularity },
 }
 
+#[cfg(test)]
 impl ConsumerActivation {
     pub fn is_blocking_or_batch_live(self) -> bool {
         matches!(
@@ -183,6 +199,7 @@ impl ConsumerActivation {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeFilterPolicyRequirement {
     pub max_contribution_bytes: u64,
