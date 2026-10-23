@@ -20,10 +20,20 @@
 //! This crate owns value algorithms and original failure facts. Input acceptance,
 //! capacity authorization, scheduling and SQL semantics remain with callers.
 
+pub mod access;
 pub(crate) mod arrow_raw;
 pub mod carrier;
 pub mod control;
 pub mod error;
+pub mod reachability;
 
 pub use carrier::ByteLayout;
 pub use error::{ValueError, ValueFailure, ValueViolation};
+
+pub mod build;
+
+pub mod storage;
+
+pub mod decode;
+
+pub mod hash_eq;

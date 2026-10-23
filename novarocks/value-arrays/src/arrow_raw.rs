@@ -398,6 +398,37 @@ pub(crate) fn borrowed_node(array: &dyn Array) -> Result<BorrowedNode, ValueErro
         DataType::RunEndEncoded(..) => (0, 2),
         _ => (1, 0),
     };
+    // Match actual built-in headers before publishing structural facts. An
+    // empty container still needs this check, even without a child to visit.
+    if data_buffers != 0 {
+        borrowed_buffer(array, 0)?;
+    } else {
+        use arrow_array::{FixedSizeListArray, NullArray, RunArray, StructArray, types::*};
+        match array.data_type() {
+            DataType::Null => {
+                concrete::<NullArray>(array)?;
+            }
+            DataType::Struct(_) => {
+                concrete::<StructArray>(array)?;
+            }
+            DataType::FixedSizeList(..) => {
+                concrete::<FixedSizeListArray>(array)?;
+            }
+            DataType::RunEndEncoded(ends, _) => match ends.data_type() {
+                DataType::Int16 => {
+                    concrete::<RunArray<Int16Type>>(array)?;
+                }
+                DataType::Int32 => {
+                    concrete::<RunArray<Int32Type>>(array)?;
+                }
+                DataType::Int64 => {
+                    concrete::<RunArray<Int64Type>>(array)?;
+                }
+                _ => return Err(ValueError::Invariant(ValueViolation::Carrier)),
+            },
+            _ => return Err(ValueError::Invariant(ValueViolation::Carrier)),
+        }
+    }
     Ok(BorrowedNode {
         data_buffers,
         child_count,
@@ -566,4 +597,391 @@ mod structural_tests {
         assert_ne!(ka[1], kb[1]);
         assert_ne!(ka[8], kb[8]);
     }
+}
+
+/// Descriptor-only fast path. External payload is never touched for length or
+/// prefix; inline bytes borrow the admitted descriptor through Arrow's value API.
+pub(crate) fn view_inline_prefix(
+    array: &dyn Array,
+    row: usize,
+) -> Result<(usize, [u8; 4], Option<&[u8]>), ValueError> {
+    if row >= array.len() {
+        return Err(ValueError::Invariant(ValueViolation::Bounds));
+    }
+    let (views, _) = view_parts(array)?;
+    let raw = views[row];
+    let bytes = raw.to_le_bytes();
+    let length = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+    let prefix = bytes[4..8].try_into().unwrap();
+    let inline = if length <= 12 {
+        Some(match array.data_type() {
+            arrow_schema::DataType::Utf8View => {
+                concrete::<StringViewArray>(array)?.value(row).as_bytes()
+            }
+            arrow_schema::DataType::BinaryView => concrete::<BinaryViewArray>(array)?.value(row),
+            _ => return Err(ValueError::Invariant(ValueViolation::Layout)),
+        })
+    } else {
+        None
+    };
+    Ok((length, prefix, inline))
+}
+
+/// Borrow only a node's mounted data buffers, independently of logical row
+/// reachability. NULL buffers are exposed separately by Array::nulls().
+pub(crate) fn borrowed_buffer(array: &dyn Array, index: usize) -> Result<&Buffer, ValueError> {
+    use arrow_array::types::*;
+    use arrow_array::*;
+    use arrow_schema::{DataType, IntervalUnit, TimeUnit};
+    let invalid = || ValueError::Invariant(ValueViolation::Bounds);
+    macro_rules! single {
+        ($value:expr) => {{
+            if index != 0 {
+                return Err(invalid());
+            }
+            $value
+        }};
+    }
+    macro_rules! primitive {
+        ($ty:ty) => {
+            single!(concrete::<PrimitiveArray<$ty>>(array)?.values().inner())
+        };
+    }
+    macro_rules! dictionary {
+        ($ty:ty) => {
+            single!(
+                concrete::<DictionaryArray<$ty>>(array)?
+                    .keys()
+                    .values()
+                    .inner()
+            )
+        };
+    }
+    macro_rules! bytes {
+        ($ty:ty) => {{
+            let array = concrete::<$ty>(array)?;
+            match index {
+                0 => array.offsets().inner().inner(),
+                1 => array.values(),
+                _ => return Err(invalid()),
+            }
+        }};
+    }
+    Ok(match array.data_type() {
+        DataType::Boolean => single!(concrete::<BooleanArray>(array)?.values().inner()),
+        DataType::Int8 => primitive!(Int8Type),
+        DataType::Int16 => primitive!(Int16Type),
+        DataType::Int32 => primitive!(Int32Type),
+        DataType::Int64 => primitive!(Int64Type),
+        DataType::UInt8 => primitive!(UInt8Type),
+        DataType::UInt16 => primitive!(UInt16Type),
+        DataType::UInt32 => primitive!(UInt32Type),
+        DataType::UInt64 => primitive!(UInt64Type),
+        DataType::Float16 => primitive!(Float16Type),
+        DataType::Float32 => primitive!(Float32Type),
+        DataType::Float64 => primitive!(Float64Type),
+        DataType::Date32 => primitive!(Date32Type),
+        DataType::Date64 => primitive!(Date64Type),
+        DataType::Time32(TimeUnit::Second) => primitive!(Time32SecondType),
+        DataType::Time32(TimeUnit::Millisecond) => primitive!(Time32MillisecondType),
+        DataType::Time64(TimeUnit::Microsecond) => primitive!(Time64MicrosecondType),
+        DataType::Time64(TimeUnit::Nanosecond) => primitive!(Time64NanosecondType),
+        DataType::Timestamp(TimeUnit::Second, _) => primitive!(TimestampSecondType),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => primitive!(TimestampMillisecondType),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => primitive!(TimestampMicrosecondType),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => primitive!(TimestampNanosecondType),
+        DataType::Duration(TimeUnit::Second) => primitive!(DurationSecondType),
+        DataType::Duration(TimeUnit::Millisecond) => primitive!(DurationMillisecondType),
+        DataType::Duration(TimeUnit::Microsecond) => primitive!(DurationMicrosecondType),
+        DataType::Duration(TimeUnit::Nanosecond) => primitive!(DurationNanosecondType),
+        DataType::Interval(IntervalUnit::YearMonth) => primitive!(IntervalYearMonthType),
+        DataType::Interval(IntervalUnit::DayTime) => primitive!(IntervalDayTimeType),
+        DataType::Interval(IntervalUnit::MonthDayNano) => primitive!(IntervalMonthDayNanoType),
+        DataType::Decimal32(..) => primitive!(Decimal32Type),
+        DataType::Decimal64(..) => primitive!(Decimal64Type),
+        DataType::Decimal128(..) => primitive!(Decimal128Type),
+        DataType::Decimal256(..) => primitive!(Decimal256Type),
+        DataType::Utf8 => bytes!(StringArray),
+        DataType::LargeUtf8 => bytes!(LargeStringArray),
+        DataType::Binary => bytes!(BinaryArray),
+        DataType::LargeBinary => bytes!(LargeBinaryArray),
+        DataType::FixedSizeBinary(_) => single!(concrete::<FixedSizeBinaryArray>(array)?.values()),
+        DataType::Utf8View | DataType::BinaryView => {
+            let (views, buffers) = view_parts(array)?;
+            if index == 0 {
+                views.inner()
+            } else {
+                buffers.get(index - 1).ok_or_else(invalid)?
+            }
+        }
+        DataType::List(_) => single!(concrete::<ListArray>(array)?.offsets().inner().inner()),
+        DataType::LargeList(_) => {
+            single!(concrete::<LargeListArray>(array)?.offsets().inner().inner())
+        }
+        DataType::ListView(_) => {
+            let a = concrete::<ListViewArray>(array)?;
+            match index {
+                0 => a.offsets().inner(),
+                1 => a.sizes().inner(),
+                _ => return Err(invalid()),
+            }
+        }
+        DataType::LargeListView(_) => {
+            let a = concrete::<LargeListViewArray>(array)?;
+            match index {
+                0 => a.offsets().inner(),
+                1 => a.sizes().inner(),
+                _ => return Err(invalid()),
+            }
+        }
+        DataType::Map(_, _) => single!(concrete::<MapArray>(array)?.offsets().inner().inner()),
+        DataType::Union(..) => {
+            let a = concrete::<UnionArray>(array)?;
+            match index {
+                0 => a.type_ids().inner(),
+                1 => a.offsets().ok_or_else(invalid)?.inner(),
+                _ => return Err(invalid()),
+            }
+        }
+        DataType::Dictionary(key, _) => match key.as_ref() {
+            DataType::Int8 => dictionary!(Int8Type),
+            DataType::Int16 => dictionary!(Int16Type),
+            DataType::Int32 => dictionary!(Int32Type),
+            DataType::Int64 => dictionary!(Int64Type),
+            DataType::UInt8 => dictionary!(UInt8Type),
+            DataType::UInt16 => dictionary!(UInt16Type),
+            DataType::UInt32 => dictionary!(UInt32Type),
+            DataType::UInt64 => dictionary!(UInt64Type),
+            _ => return Err(invalid()),
+        },
+        _ => return Err(invalid()),
+    })
+}
+
+pub(crate) enum StructuralRef<'a> {
+    Leaf,
+    Struct {
+        fields: &'a arrow_schema::Fields,
+        children: &'a [ArrayRef],
+    },
+    List32 {
+        field: &'a arrow_schema::FieldRef,
+        offsets: &'a arrow_buffer::OffsetBuffer<i32>,
+        values: &'a ArrayRef,
+    },
+    List64 {
+        field: &'a arrow_schema::FieldRef,
+        offsets: &'a arrow_buffer::OffsetBuffer<i64>,
+        values: &'a ArrayRef,
+    },
+    FixedSizeList {
+        field: &'a arrow_schema::FieldRef,
+        width: usize,
+        values: &'a ArrayRef,
+        child_start: usize,
+    },
+    Map {
+        entries_field: &'a arrow_schema::FieldRef,
+        sorted: bool,
+        offsets: &'a arrow_buffer::OffsetBuffer<i32>,
+        keys: &'a ArrayRef,
+        values: &'a ArrayRef,
+    },
+}
+pub(crate) fn structural_view(source: &ArrayRef) -> Result<StructuralRef<'_>, ValueError> {
+    use arrow_array::*;
+    use arrow_schema::DataType;
+    Ok(match source.data_type() {
+        DataType::Struct(fields) => StructuralRef::Struct {
+            fields,
+            children: concrete::<StructArray>(source.as_ref())?.columns(),
+        },
+        DataType::List(field) => {
+            let a = concrete::<ListArray>(source.as_ref())?;
+            StructuralRef::List32 {
+                field,
+                offsets: a.offsets(),
+                values: a.values(),
+            }
+        }
+        DataType::LargeList(field) => {
+            let a = concrete::<LargeListArray>(source.as_ref())?;
+            StructuralRef::List64 {
+                field,
+                offsets: a.offsets(),
+                values: a.values(),
+            }
+        }
+        DataType::FixedSizeList(field, width) => {
+            let a = concrete::<FixedSizeListArray>(source.as_ref())?;
+            StructuralRef::FixedSizeList {
+                field,
+                width: usize::try_from(*width)
+                    .map_err(|_| ValueError::Invariant(ValueViolation::Structure))?,
+                values: a.values(),
+                child_start: 0,
+            }
+        }
+        DataType::Map(entries_field, sorted) => {
+            let a = concrete::<MapArray>(source.as_ref())?;
+            StructuralRef::Map {
+                entries_field,
+                sorted: *sorted,
+                offsets: a.offsets(),
+                keys: a.keys(),
+                values: a.values(),
+            }
+        }
+        _ => StructuralRef::Leaf,
+    })
+}
+
+/// Rebox admitted containers with their original offset/null geometry. The
+/// caller has observed the actual wrapper/field work before entering here.
+pub(crate) fn rebuild_structural(
+    source: &ArrayRef,
+    target: &arrow_schema::DataType,
+    children: Vec<ArrayRef>,
+) -> Result<ArrayRef, ValueError> {
+    use arrow_array::{MapArray, make_array};
+    use arrow_schema::DataType;
+    let child_data = match target {
+        DataType::Struct(fields) if fields.len() == children.len() => {
+            children.iter().map(|c| c.to_data()).collect()
+        }
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..)
+            if children.len() == 1 =>
+        {
+            children.iter().map(|c| c.to_data()).collect()
+        }
+        DataType::Map(entries, _) if children.len() == 2 => {
+            let a = concrete::<MapArray>(source.as_ref())?;
+            let entries = a
+                .entries()
+                .to_data()
+                .into_builder()
+                .data_type(entries.data_type().clone())
+                .child_data(children.iter().map(|c| c.to_data()).collect())
+                .build()?;
+            vec![entries]
+        }
+        _ => return Err(ValueError::Invariant(ValueViolation::Structure)),
+    };
+    let data = source
+        .to_data()
+        .into_builder()
+        .data_type(target.clone())
+        .child_data(child_data)
+        .build()?;
+    Ok(make_array(data))
+}
+
+pub(crate) fn source_dictionary(
+    source: &ArrayRef,
+) -> Result<(&arrow_array::Int32Array, &ArrayRef), ValueError> {
+    let dictionary =
+        concrete::<arrow_array::DictionaryArray<arrow_array::types::Int32Type>>(source.as_ref())?;
+    Ok((dictionary.keys(), dictionary.values()))
+}
+
+/// Project actual child encodings into the frozen parent layout. Field names
+/// and NULL declarations come exclusively from the frozen layout author.
+pub(crate) fn metadata_free_type_rebuild(
+    target: &arrow_schema::DataType,
+    children: &[arrow_schema::DataType],
+) -> Result<arrow_schema::DataType, ValueError> {
+    use arrow_schema::{DataType, Field};
+    let field = |original: &Field, data_type: &DataType| {
+        Arc::new(Field::new(
+            original.name(),
+            data_type.clone(),
+            original.is_nullable(),
+        ))
+    };
+    Ok(match target {
+        DataType::Struct(fields) if fields.len() == children.len() => DataType::Struct(
+            fields
+                .iter()
+                .zip(children)
+                .map(|(f, t)| field(f, t))
+                .collect(),
+        ),
+        DataType::List(f) if children.len() == 1 => DataType::List(field(f, &children[0])),
+        DataType::LargeList(f) if children.len() == 1 => {
+            DataType::LargeList(field(f, &children[0]))
+        }
+        DataType::FixedSizeList(f, width) if children.len() == 1 => {
+            DataType::FixedSizeList(field(f, &children[0]), *width)
+        }
+        DataType::Map(entries, sorted) if children.len() == 2 => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(ValueError::Invariant(ValueViolation::Structure));
+            };
+            if fields.len() != 2 {
+                return Err(ValueError::Invariant(ValueViolation::Structure));
+            }
+            let fields = fields
+                .iter()
+                .zip(children)
+                .map(|(f, t)| field(f, t))
+                .collect();
+            DataType::Map(field(entries, &DataType::Struct(fields)), *sorted)
+        }
+        _ => return Err(ValueError::Invariant(ValueViolation::Structure)),
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn tracked_string_source(
+    values: &[&str],
+    drops: Arc<std::sync::atomic::AtomicUsize>,
+) -> ArrayRef {
+    use std::ptr::NonNull;
+    struct Owner {
+        bytes: Vec<u8>,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let mut bytes = Vec::new();
+    let mut offsets = vec![0i32];
+    for value in values {
+        bytes.extend_from_slice(value.as_bytes());
+        offsets.push(i32::try_from(bytes.len()).unwrap());
+    }
+    let owner = Arc::new(Owner { bytes, drops });
+    let ptr = NonNull::new(owner.bytes.as_ptr().cast_mut()).unwrap();
+    let len = owner.bytes.len();
+    // SAFETY: the owner keeps the unchanged Vec allocation alive for every
+    // Buffer clone/slice. Its normal Drop releases Vec exactly once; zero length
+    // still uses Vec's nonnull dangling pointer and grants no readable bytes.
+    let payload = unsafe { Buffer::from_custom_allocation(ptr, len, owner) };
+    make_offsets(ByteLayout::Utf8, Buffer::from_vec(offsets), payload, None).unwrap()
+}
+
+pub(crate) fn rewrap_dictionary(
+    keys: &arrow_array::Int32Array,
+    values: ArrayRef,
+    validity: Option<NullBuffer>,
+) -> Result<ArrayRef, ValueError> {
+    use arrow_array::{DictionaryArray, Int32Array, types::Int32Type};
+    let keys = Int32Array::new(keys.values().clone(), validity);
+    Ok(Arc::new(DictionaryArray::<Int32Type>::try_new(
+        keys, values,
+    )?))
+}
+
+pub(crate) fn byte_declared_backing_capacity(array: &dyn Array) -> Result<usize, ValueError> {
+    let node = borrowed_node(array)?;
+    let mut capacity = 0usize;
+    for index in 0..node.data_buffers {
+        capacity = capacity.saturating_add(borrowed_buffer(array, index)?.capacity());
+    }
+    if let Some(nulls) = array.nulls() {
+        capacity = capacity.saturating_add(nulls.inner().inner().capacity());
+    }
+    Ok(capacity)
 }

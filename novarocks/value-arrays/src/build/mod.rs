@@ -39,10 +39,14 @@ pub enum WriteFailure<E> {
     Failure(ValueFailure<E>),
 }
 impl<E> From<ValueError> for WriteFailure<E> {
-    fn from(error: ValueError) -> Self { Self::Failure(error.into()) }
+    fn from(error: ValueError) -> Self {
+        Self::Failure(error.into())
+    }
 }
 impl<E> From<ValueFailure<E>> for WriteFailure<E> {
-    fn from(error: ValueFailure<E>) -> Self { Self::Failure(error) }
+    fn from(error: ValueFailure<E>) -> Self {
+        Self::Failure(error)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -84,7 +88,9 @@ pub struct ValueBuilder<A: Allocator + Clone + 'static = Global> {
 }
 
 impl ValueBuilder<Global> {
-    pub fn new(layout: ByteLayout) -> Self { Self::new_in(layout, Global) }
+    pub fn new(layout: ByteLayout) -> Self {
+        Self::new_in(layout, Global)
+    }
 }
 
 impl<A: Allocator + Clone + 'static> ValueBuilder<A> {
@@ -106,9 +112,15 @@ impl<A: Allocator + Clone + 'static> ValueBuilder<A> {
         }
     }
 
-    pub fn layout(&self) -> ByteLayout { self.layout }
-    pub fn len(&self) -> usize { self.rows }
-    pub fn is_empty(&self) -> bool { self.rows == 0 }
+    pub fn layout(&self) -> ByteLayout {
+        self.layout
+    }
+    pub fn len(&self) -> usize {
+        self.rows
+    }
+    pub fn is_empty(&self) -> bool {
+        self.rows == 0
+    }
 
     pub fn begin_row(&mut self) -> RowWriter<'_, A> {
         let current_len = self.current.map(|i| match &self.regions[i] {
@@ -122,28 +134,53 @@ impl<A: Allocator + Clone + 'static> ValueBuilder<A> {
             current_len,
             copied_bytes: self.copied_bytes,
         };
-        RowWriter { builder: self, mark, data: Pending::Empty, done: false }
+        RowWriter {
+            builder: self,
+            mark,
+            data: Pending::Empty,
+            done: false,
+        }
     }
 
-    pub fn append_str<E>(&mut self, value: &str, growth: &mut Growth<'_, E>, work: &mut Work<'_, E>) -> Result<(), WriteFailure<E>> {
+    pub fn append_str<E>(
+        &mut self,
+        value: &str,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<(), WriteFailure<E>> {
         let mut row = self.begin_row();
         row.write_str(value, growth, work)?;
         row.commit(growth, work)
     }
 
-    pub fn append_bytes<E>(&mut self, value: &[u8], growth: &mut Growth<'_, E>, work: &mut Work<'_, E>) -> Result<(), WriteFailure<E>> {
+    pub fn append_bytes<E>(
+        &mut self,
+        value: &[u8],
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<(), WriteFailure<E>> {
         let mut row = self.begin_row();
         row.write_bytes(value, growth, work)?;
         row.commit(growth, work)
     }
 
-    pub fn append_null<E>(&mut self, growth: &mut Growth<'_, E>, work: &mut Work<'_, E>) -> Result<(), WriteFailure<E>> {
+    pub fn append_null<E>(
+        &mut self,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<(), WriteFailure<E>> {
         self.begin_row().commit_null(growth, work)
     }
 
     /// Adopt a value from a valid Arrow string/binary source without UTF8
     /// revalidation. A NULL source appends a logical NULL, not an empty value.
-    pub fn append_array_value<E>(&mut self, source: &dyn Array, index: usize, growth: &mut Growth<'_, E>, work: &mut Work<'_, E>) -> Result<(), WriteFailure<E>> {
+    pub fn append_array_value<E>(
+        &mut self,
+        source: &dyn Array,
+        index: usize,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<(), WriteFailure<E>> {
         let mut row = self.begin_row();
         row.write_array_value(source, index, growth, work)?;
         row.commit(growth, work)
@@ -152,14 +189,25 @@ impl<A: Allocator + Clone + 'static> ValueBuilder<A> {
     pub fn finish(self) -> Result<BuiltArray, ValueError> {
         let facts = self.facts();
         if self.rows == 0 {
-            return Ok(BuiltArray { array: arrow_array::new_empty_array(&self.layout.data_type()), facts });
+            return Ok(BuiltArray {
+                array: arrow_array::new_empty_array(&self.layout.data_type()),
+                facts,
+            });
         }
-        let nulls = arrow_raw::make_nulls(arrow_raw::into_arrow_buffer(self.validity), self.rows, self.null_count);
+        let nulls = arrow_raw::make_nulls(
+            arrow_raw::into_arrow_buffer(self.validity),
+            self.rows,
+            self.null_count,
+        );
         let array = if self.layout.is_view() {
-            let buffers = self.regions.into_iter().map(|r| match r {
-                Region::Owned(bytes) => arrow_raw::into_arrow_buffer(bytes),
-                Region::Shared(buffer) => buffer,
-            }).collect();
+            let buffers = self
+                .regions
+                .into_iter()
+                .map(|r| match r {
+                    Region::Owned(bytes) => arrow_raw::into_arrow_buffer(bytes),
+                    Region::Shared(buffer) => buffer,
+                })
+                .collect();
             let views = arrow_raw::into_arrow_buffer(self.views).into();
             // SAFETY: commits create only checked descriptors into retained
             // regions; strings originate from str or admitted Arrow strings.
@@ -172,7 +220,12 @@ impl<A: Allocator + Clone + 'static> ValueBuilder<A> {
             } else {
                 arrow_raw::into_arrow_buffer(self.offsets64)
             };
-            arrow_raw::make_offsets(self.layout, offsets, arrow_raw::into_arrow_buffer(self.payload), nulls)?
+            arrow_raw::make_offsets(
+                self.layout,
+                offsets,
+                arrow_raw::into_arrow_buffer(self.payload),
+                nulls,
+            )?
         };
         debug_assert!(array.to_data().validate_full().is_ok());
         Ok(BuiltArray { array, facts })
@@ -189,9 +242,13 @@ impl<A: Allocator + Clone + 'static> ValueBuilder<A> {
         for region in &self.regions {
             let capacity = match region {
                 Region::Owned(bytes) => bytes.capacity(),
-                Region::Shared(bytes) => { facts.adopted_regions += 1; bytes.capacity() }
+                Region::Shared(bytes) => {
+                    facts.adopted_regions += 1;
+                    bytes.capacity()
+                }
             };
-            facts.declared_payload_capacity = facts.declared_payload_capacity.saturating_add(capacity);
+            facts.declared_payload_capacity =
+                facts.declared_payload_capacity.saturating_add(capacity);
         }
         facts
     }
@@ -208,12 +265,23 @@ struct RowMark {
 enum Pending {
     Empty,
     Null,
-    Owned { region: Option<usize>, start: usize, len: usize },
-    Shared { buffer: Buffer, offset: usize, len: usize },
+    Owned {
+        region: Option<usize>,
+        start: usize,
+        len: usize,
+    },
+    Shared {
+        buffer: Buffer,
+        offset: usize,
+        len: usize,
+    },
 }
 impl Pending {
     fn len(&self) -> usize {
-        match self { Self::Owned { len, .. } | Self::Shared { len, .. } => *len, _ => 0 }
+        match self {
+            Self::Owned { len, .. } | Self::Shared { len, .. } => *len,
+            _ => 0,
+        }
     }
 }
 
@@ -227,12 +295,16 @@ pub struct RowWriter<'a, A: Allocator + Clone + 'static = Global> {
 }
 
 impl<A: Allocator + Clone + 'static> Drop for RowWriter<'_, A> {
-    fn drop(&mut self) { self.rollback(); }
+    fn drop(&mut self) {
+        self.rollback();
+    }
 }
 
 impl<A: Allocator + Clone + 'static> RowWriter<'_, A> {
     fn rollback(&mut self) {
-        if self.done { return; }
+        if self.done {
+            return;
+        }
         self.builder.payload.truncate(self.mark.payload);
         self.builder.regions.truncate(self.mark.region_count);
         self.builder.current = self.mark.current;
@@ -247,109 +319,231 @@ impl<A: Allocator + Clone + 'static> RowWriter<'_, A> {
         self.done = true;
     }
 
-    pub fn abort(mut self) { self.rollback(); }
+    pub fn abort(mut self) {
+        self.rollback();
+    }
 
-    fn checked<E>(&mut self, operation: impl FnOnce(&mut Self) -> Result<(), WriteFailure<E>>) -> Result<(), WriteFailure<E>> {
-        if self.done { return Err(ValueError::Invariant(ValueViolation::RowTransaction).into()); }
+    fn checked<E>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<(), WriteFailure<E>>,
+    ) -> Result<(), WriteFailure<E>> {
+        if self.done {
+            return Err(ValueError::Invariant(ValueViolation::RowTransaction).into());
+        }
         let result = operation(self);
-        if result.is_err() { self.rollback(); }
+        if result.is_err() {
+            self.rollback();
+        }
         result
     }
 
-    pub fn write_str<E>(&mut self, value: &str, growth: &mut Growth<'_, E>, work: &mut Work<'_, E>) -> Result<(), WriteFailure<E>> {
+    pub fn write_str<E>(
+        &mut self,
+        value: &str,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<(), WriteFailure<E>> {
         self.checked(|this| {
-            if !this.builder.layout.is_utf8() { return Err(ValueError::Invariant(ValueViolation::Layout).into()); }
+            if !this.builder.layout.is_utf8() {
+                return Err(ValueError::Invariant(ValueViolation::Layout).into());
+            }
             this.write_admitted(value.as_bytes(), growth, work)
         })
     }
 
-    pub fn write_bytes<E>(&mut self, value: &[u8], growth: &mut Growth<'_, E>, work: &mut Work<'_, E>) -> Result<(), WriteFailure<E>> {
+    pub fn write_bytes<E>(
+        &mut self,
+        value: &[u8],
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<(), WriteFailure<E>> {
         self.checked(|this| {
-            if this.builder.layout.is_utf8() { return Err(ValueError::Invariant(ValueViolation::Layout).into()); }
+            if this.builder.layout.is_utf8() {
+                return Err(ValueError::Invariant(ValueViolation::Layout).into());
+            }
             this.write_admitted(value, growth, work)
         })
     }
 
-    pub fn write_array_value<E>(&mut self, source: &dyn Array, index: usize, growth: &mut Growth<'_, E>, work: &mut Work<'_, E>) -> Result<(), WriteFailure<E>> {
+    pub fn write_array_value<E>(
+        &mut self,
+        source: &dyn Array,
+        index: usize,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<(), WriteFailure<E>> {
         self.checked(|this| {
-            let source_layout = ByteLayout::from_data_type(source.data_type()).ok_or(ValueError::Invariant(ValueViolation::Carrier))?;
-            if source_layout.is_utf8() != this.builder.layout.is_utf8() { return Err(ValueError::Invariant(ValueViolation::Layout).into()); }
+            let source_layout = ByteLayout::from_data_type(source.data_type())
+                .ok_or(ValueError::Invariant(ValueViolation::Carrier))?;
+            if source_layout.is_utf8() != this.builder.layout.is_utf8() {
+                return Err(ValueError::Invariant(ValueViolation::Layout).into());
+            }
             match arrow_raw::byte_span(source, index)? {
                 None => {
-                    if !matches!(this.data, Pending::Empty) { return Err(ValueError::Invariant(ValueViolation::RowTransaction).into()); }
+                    if !matches!(this.data, Pending::Empty) {
+                        return Err(ValueError::Invariant(ValueViolation::RowTransaction).into());
+                    }
                     this.data = Pending::Null;
                     Ok(())
                 }
                 Some(ByteSpan::Inline(bytes)) => this.write_admitted(bytes, growth, work),
-                Some(ByteSpan::Region { buffer, offset, len }) => this.adopt_admitted(buffer, offset..offset+len, growth, work),
+                Some(ByteSpan::Region {
+                    buffer,
+                    offset,
+                    len,
+                }) => this.adopt_admitted(buffer, offset..offset + len, growth, work),
             }
         })
     }
 
-    pub fn write_binary_region<E>(&mut self, buffer: &Buffer, range: Range<usize>, growth: &mut Growth<'_, E>, work: &mut Work<'_, E>) -> Result<(), WriteFailure<E>> {
+    pub fn write_binary_region<E>(
+        &mut self,
+        buffer: &Buffer,
+        range: Range<usize>,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<(), WriteFailure<E>> {
         self.checked(|this| {
-            if this.builder.layout.is_utf8() { return Err(ValueError::Invariant(ValueViolation::Layout).into()); }
+            if this.builder.layout.is_utf8() {
+                return Err(ValueError::Invariant(ValueViolation::Layout).into());
+            }
             this.adopt_admitted(buffer, range, growth, work)
         })
     }
 
     /// The str's pointer and length must describe exactly the selected region.
     /// That proof avoids rescanning a previously validated string's bytes.
-    pub fn write_string_region<E>(&mut self, buffer: &Buffer, range: Range<usize>, value: &str, growth: &mut Growth<'_, E>, work: &mut Work<'_, E>) -> Result<(), WriteFailure<E>> {
+    pub fn write_string_region<E>(
+        &mut self,
+        buffer: &Buffer,
+        range: Range<usize>,
+        value: &str,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<(), WriteFailure<E>> {
         self.checked(|this| {
-            if !this.builder.layout.is_utf8() || range.start > range.end || range.end > buffer.len() { return Err(ValueError::Invariant(ValueViolation::Bounds).into()); }
+            if !this.builder.layout.is_utf8() || range.start > range.end || range.end > buffer.len()
+            {
+                return Err(ValueError::Invariant(ValueViolation::Bounds).into());
+            }
             let bytes = &buffer.as_slice()[range.clone()];
-            if bytes.as_ptr() != value.as_ptr() || bytes.len() != value.len() { return Err(ValueError::Invariant(ValueViolation::Utf8Boundary).into()); }
+            if bytes.as_ptr() != value.as_ptr() || bytes.len() != value.len() {
+                return Err(ValueError::Invariant(ValueViolation::Utf8Boundary).into());
+            }
             this.adopt_admitted(buffer, range, growth, work)
         })
     }
 
-    fn adopt_admitted<E>(&mut self, buffer: &Buffer, range: Range<usize>, growth: &mut Growth<'_, E>, work: &mut Work<'_, E>) -> Result<(), WriteFailure<E>> {
-        if range.start > range.end || range.end > buffer.len() { return Err(ValueError::Invariant(ValueViolation::Bounds).into()); }
-        if self.builder.layout.is_view() && matches!(self.data, Pending::Empty) && range.len() > 12 {
-            check_value_extent(self.builder.layout, 0, range.len() as u64, self.builder.rows)?;
+    fn adopt_admitted<E>(
+        &mut self,
+        buffer: &Buffer,
+        range: Range<usize>,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<(), WriteFailure<E>> {
+        if range.start > range.end || range.end > buffer.len() {
+            return Err(ValueError::Invariant(ValueViolation::Bounds).into());
+        }
+        if self.builder.layout.is_view() && matches!(self.data, Pending::Empty) && range.len() > 12
+        {
+            check_value_extent(
+                self.builder.layout,
+                0,
+                range.len() as u64,
+                self.builder.rows,
+            )?;
             work(1).map_err(ValueFailure::Caller)?;
-            self.data = Pending::Shared { buffer: buffer.clone(), offset: range.start, len: range.len() };
+            self.data = Pending::Shared {
+                buffer: buffer.clone(),
+                offset: range.start,
+                len: range.len(),
+            };
             Ok(())
         } else {
             self.write_admitted(&buffer.as_slice()[range], growth, work)
         }
     }
 
-    fn write_admitted<E>(&mut self, value: &[u8], growth: &mut Growth<'_, E>, work: &mut Work<'_, E>) -> Result<(), WriteFailure<E>> {
-        if matches!(self.data, Pending::Null) { return Err(ValueError::Invariant(ValueViolation::RowTransaction).into()); }
+    fn write_admitted<E>(
+        &mut self,
+        value: &[u8],
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<(), WriteFailure<E>> {
+        if matches!(self.data, Pending::Null) {
+            return Err(ValueError::Invariant(ValueViolation::RowTransaction).into());
+        }
         let old_len = self.data.len();
-        let total = old_len.checked_add(value.len()).ok_or_else(|| allocation_extent(self.builder.rows, None))?;
-        check_value_extent(self.builder.layout, self.mark.payload as u64, total as u64, self.builder.rows)?;
+        let total = old_len
+            .checked_add(value.len())
+            .ok_or_else(|| allocation_extent(self.builder.rows, None))?;
+        check_value_extent(
+            self.builder.layout,
+            self.mark.payload as u64,
+            total as u64,
+            self.builder.rows,
+        )?;
         if matches!(self.data, Pending::Shared { .. }) {
             let previous = std::mem::replace(&mut self.data, Pending::Empty);
-            if let Pending::Shared { buffer, offset, len } = previous {
-                self.write_admitted(&buffer.as_slice()[offset..offset+len], growth, work)?;
+            if let Pending::Shared {
+                buffer,
+                offset,
+                len,
+            } = previous
+            {
+                self.write_admitted(&buffer.as_slice()[offset..offset + len], growth, work)?;
             }
         }
         if matches!(self.data, Pending::Empty) {
             if self.builder.layout.is_view() {
-                let reusable = self.builder.current.filter(|&i| match &self.builder.regions[i] {
-                    Region::Owned(bytes) => bytes.len() < BLOCK_TARGET && bytes.len() <= i32::MAX as usize,
-                    Region::Shared(_) => false,
-                });
-                let index = if let Some(index) = reusable { index } else {
-                    if self.builder.regions.len() > i32::MAX as usize { return Err(WriteFailure::Full); }
+                let reusable = self
+                    .builder
+                    .current
+                    .filter(|&i| match &self.builder.regions[i] {
+                        Region::Owned(bytes) => {
+                            bytes.len() < BLOCK_TARGET && bytes.len() <= i32::MAX as usize
+                        }
+                        Region::Shared(_) => false,
+                    });
+                let index = if let Some(index) = reusable {
+                    index
+                } else {
+                    if self.builder.regions.len() > i32::MAX as usize {
+                        return Err(WriteFailure::Full);
+                    }
                     reserve(&mut self.builder.regions, 1, self.builder.rows, growth)?;
                     let index = self.builder.regions.len();
-                    self.builder.regions.push(Region::Owned(AllocVec::new_in(self.builder.allocator.clone())));
+                    self.builder.regions.push(Region::Owned(AllocVec::new_in(
+                        self.builder.allocator.clone(),
+                    )));
                     self.builder.current = Some(index);
                     index
                 };
-                let start = match &self.builder.regions[index] { Region::Owned(bytes) => bytes.len(), _ => unreachable!() };
-                self.data = Pending::Owned { region: Some(index), start, len: 0 };
+                let start = match &self.builder.regions[index] {
+                    Region::Owned(bytes) => bytes.len(),
+                    _ => unreachable!(),
+                };
+                self.data = Pending::Owned {
+                    region: Some(index),
+                    start,
+                    len: 0,
+                };
             } else {
-                self.data = Pending::Owned { region: None, start: self.mark.payload, len: 0 };
+                self.data = Pending::Owned {
+                    region: None,
+                    start: self.mark.payload,
+                    len: 0,
+                };
             }
         }
-        let Pending::Owned { region, len, .. } = &mut self.data else { unreachable!() };
+        let Pending::Owned { region, len, .. } = &mut self.data else {
+            unreachable!()
+        };
         let bytes = match region {
-            Some(index) => match &mut self.builder.regions[*index] { Region::Owned(bytes) => bytes, _ => unreachable!() },
+            Some(index) => match &mut self.builder.regions[*index] {
+                Region::Owned(bytes) => bytes,
+                _ => unreachable!(),
+            },
             None => &mut self.builder.payload,
         };
         reserve(bytes, value.len(), self.builder.rows, growth)?;
@@ -358,78 +552,154 @@ impl<A: Allocator + Clone + 'static> RowWriter<'_, A> {
             bytes.extend_from_slice(part);
         }
         *len += value.len();
-        self.builder.copied_bytes = self.builder.copied_bytes.checked_add(value.len() as u64).ok_or_else(|| allocation_extent(self.builder.rows, None))?;
+        self.builder.copied_bytes = self
+            .builder
+            .copied_bytes
+            .checked_add(value.len() as u64)
+            .ok_or_else(|| allocation_extent(self.builder.rows, None))?;
         Ok(())
     }
 
-    pub fn commit_null<E>(mut self, growth: &mut Growth<'_, E>, work: &mut Work<'_, E>) -> Result<(), WriteFailure<E>> {
+    pub fn commit_null<E>(
+        mut self,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<(), WriteFailure<E>> {
         self.checked(|this| {
-            if !matches!(this.data, Pending::Empty | Pending::Null) { return Err(ValueError::Invariant(ValueViolation::RowTransaction).into()); }
+            if !matches!(this.data, Pending::Empty | Pending::Null) {
+                return Err(ValueError::Invariant(ValueViolation::RowTransaction).into());
+            }
             this.data = Pending::Null;
             this.commit_inner(growth, work)
         })
     }
 
-    pub fn commit<E>(mut self, growth: &mut Growth<'_, E>, work: &mut Work<'_, E>) -> Result<(), WriteFailure<E>> {
+    pub fn commit<E>(
+        mut self,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<(), WriteFailure<E>> {
         self.checked(|this| this.commit_inner(growth, work))
     }
 
-    fn commit_inner<E>(&mut self, growth: &mut Growth<'_, E>, work: &mut Work<'_, E>) -> Result<(), WriteFailure<E>> {
+    fn commit_inner<E>(
+        &mut self,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<(), WriteFailure<E>> {
         let rows = self.builder.rows;
-        let next_rows = rows.checked_add(1).ok_or_else(|| allocation_extent(rows, None))?;
+        let next_rows = rows
+            .checked_add(1)
+            .ok_or_else(|| allocation_extent(rows, None))?;
         let valid = !matches!(self.data, Pending::Null);
         let len = self.data.len();
-        let next_logical = self.builder.logical_bytes.checked_add(len as u64).ok_or_else(|| allocation_extent(rows, None))?;
+        let next_logical = self
+            .builder
+            .logical_bytes
+            .checked_add(len as u64)
+            .ok_or_else(|| allocation_extent(rows, None))?;
         work(1).map_err(ValueFailure::Caller)?;
-        if rows % 8 == 0 { reserve(&mut self.builder.validity, 1, rows, growth)?; }
+        if rows % 8 == 0 {
+            reserve(&mut self.builder.validity, 1, rows, growth)?;
+        }
         if self.builder.layout.is_view() {
             reserve(&mut self.builder.views, 1, rows, growth)?;
         } else if matches!(self.builder.layout, ByteLayout::Utf8 | ByteLayout::Binary) {
-            reserve(&mut self.builder.offsets32, if rows == 0 { 2 } else { 1 }, rows, growth)?;
+            reserve(
+                &mut self.builder.offsets32,
+                if rows == 0 { 2 } else { 1 },
+                rows,
+                growth,
+            )?;
         } else {
-            reserve(&mut self.builder.offsets64, if rows == 0 { 2 } else { 1 }, rows, growth)?;
+            reserve(
+                &mut self.builder.offsets64,
+                if rows == 0 { 2 } else { 1 },
+                rows,
+                growth,
+            )?;
         }
         let descriptor = if self.builder.layout.is_view() {
             match &self.data {
                 Pending::Empty | Pending::Null => arrow_raw::inline_view(&[])?,
-                Pending::Owned { region: Some(index), start, len } => {
-                    let Region::Owned(bytes) = &self.builder.regions[*index] else { unreachable!() };
-                    arrow_raw::external_view(self.builder.layout, &bytes[*start..*start+*len], *index, *start)?
+                Pending::Owned {
+                    region: Some(index),
+                    start,
+                    len,
+                } => {
+                    let Region::Owned(bytes) = &self.builder.regions[*index] else {
+                        unreachable!()
+                    };
+                    arrow_raw::external_view(
+                        self.builder.layout,
+                        &bytes[*start..*start + *len],
+                        *index,
+                        *start,
+                    )?
                 }
-                Pending::Shared { buffer, offset, len } => {
+                Pending::Shared {
+                    buffer,
+                    offset,
+                    len,
+                } => {
                     // Match only the same accessible region. A shared allocation
                     // with a different slice is registered separately.
                     let same = self.builder.regions.iter().position(|region| matches!(region, Region::Shared(other)
                         if other.data_ptr() == buffer.data_ptr() && other.ptr_offset() == buffer.ptr_offset() && other.len() == buffer.len()));
-                    let (index, offset) = if let Some(index) = same.filter(|_| *offset <= i32::MAX as usize) {
-                        (index, *offset)
-                    } else {
-                        if self.builder.regions.len() > i32::MAX as usize { return Err(WriteFailure::Full); }
-                        reserve(&mut self.builder.regions, 1, rows, growth)?;
-                        let index = self.builder.regions.len();
-                        let (region, relative) = if *offset > i32::MAX as usize {
-                            (buffer.slice_with_length(*offset, *len), 0)
-                        } else { (buffer.clone(), *offset) };
-                        self.builder.regions.push(Region::Shared(region));
-                        (index, relative)
-                    };
-                    arrow_raw::external_view(self.builder.layout, &buffer.as_slice()[*self.data_offset()..*self.data_offset()+*len], index, offset)?
+                    let (index, offset) =
+                        if let Some(index) = same.filter(|_| *offset <= i32::MAX as usize) {
+                            (index, *offset)
+                        } else {
+                            if self.builder.regions.len() > i32::MAX as usize {
+                                return Err(WriteFailure::Full);
+                            }
+                            reserve(&mut self.builder.regions, 1, rows, growth)?;
+                            let index = self.builder.regions.len();
+                            let (region, relative) = if *offset > i32::MAX as usize {
+                                (buffer.slice_with_length(*offset, *len), 0)
+                            } else {
+                                (buffer.clone(), *offset)
+                            };
+                            self.builder.regions.push(Region::Shared(region));
+                            (index, relative)
+                        };
+                    arrow_raw::external_view(
+                        self.builder.layout,
+                        &buffer.as_slice()[*self.data_offset()..*self.data_offset() + *len],
+                        index,
+                        offset,
+                    )?
                 }
                 Pending::Owned { region: None, .. } => unreachable!(),
             }
-        } else { 0 };
+        } else {
+            0
+        };
         // All fallible work is complete. Publish the row and bitmap together.
-        if rows % 8 == 0 { self.builder.validity.push(0); }
-        if valid { self.builder.validity[rows / 8] |= 1 << (rows % 8); }
-        else { self.builder.null_count += 1; }
+        if rows % 8 == 0 {
+            self.builder.validity.push(0);
+        }
+        if valid {
+            self.builder.validity[rows / 8] |= 1 << (rows % 8);
+        } else {
+            self.builder.null_count += 1;
+        }
         if self.builder.layout.is_view() {
             self.builder.views.push(descriptor);
         } else if matches!(self.builder.layout, ByteLayout::Utf8 | ByteLayout::Binary) {
-            if rows == 0 { self.builder.offsets32.push(0); }
-            self.builder.offsets32.push(self.builder.payload.len() as i32);
+            if rows == 0 {
+                self.builder.offsets32.push(0);
+            }
+            self.builder
+                .offsets32
+                .push(self.builder.payload.len() as i32);
         } else {
-            if rows == 0 { self.builder.offsets64.push(0); }
-            self.builder.offsets64.push(self.builder.payload.len() as i64);
+            if rows == 0 {
+                self.builder.offsets64.push(0);
+            }
+            self.builder
+                .offsets64
+                .push(self.builder.payload.len() as i64);
         }
         self.builder.rows = next_rows;
         self.builder.logical_bytes = next_logical;
@@ -438,20 +708,36 @@ impl<A: Allocator + Clone + 'static> RowWriter<'_, A> {
     }
 
     fn data_offset(&self) -> &usize {
-        match &self.data { Pending::Shared { offset, .. } => offset, _ => unreachable!() }
+        match &self.data {
+            Pending::Shared { offset, .. } => offset,
+            _ => unreachable!(),
+        }
     }
 }
 
 /// Pure arithmetic, also used by planners to test real limits without allocating
 /// gigabytes. For offsets, used_payload is the committed prefix's payload.
-pub fn check_value_extent<E>(layout: ByteLayout, used_payload: u64, value_bytes: u64, committed_rows: usize) -> Result<(), WriteFailure<E>> {
+pub fn check_value_extent<E>(
+    layout: ByteLayout,
+    used_payload: u64,
+    value_bytes: u64,
+    committed_rows: usize,
+) -> Result<(), WriteFailure<E>> {
     let limit = layout.extent_limit();
     if value_bytes > limit {
         return Err(ValueError::Representation(layout.representation(
-            RepresentationBoundary::MinimumUnit, Some(value_bytes), Some(limit), None,
-        )).into());
+            RepresentationBoundary::MinimumUnit,
+            Some(value_bytes),
+            Some(limit),
+            None,
+        ))
+        .into());
     }
-    if !layout.is_view() && used_payload.checked_add(value_bytes).is_none_or(|total| total > limit) {
+    if !layout.is_view()
+        && used_payload
+            .checked_add(value_bytes)
+            .is_none_or(|total| total > limit)
+    {
         return Err(WriteFailure::Full);
     }
     let _ = committed_rows;
@@ -459,15 +745,69 @@ pub fn check_value_extent<E>(layout: ByteLayout, used_payload: u64, value_bytes:
 }
 
 fn allocation_extent(rows: usize, required: Option<u64>) -> ValueError {
-    ValueError::Representation(field_representation(11, RepresentationBoundary::SingleOutput, required, Some(isize::MAX as u64), u64::try_from(rows).ok()))
+    ValueError::Representation(field_representation(
+        11,
+        RepresentationBoundary::SingleOutput,
+        required,
+        Some(isize::MAX as u64),
+        u64::try_from(rows).ok(),
+    ))
 }
 
-fn reserve<T, A: Allocator, E>(values: &mut AllocVec<T, A>, additional: usize, rows: usize, growth: &mut Growth<'_, E>) -> Result<(), ValueFailure<E>> {
-    let needed = values.len().checked_add(additional).ok_or_else(|| allocation_extent(rows, None))?;
-    if needed <= values.capacity() { return Ok(()); }
-    let layout = Layout::array::<T>(needed).map_err(|_| allocation_extent(rows, needed.checked_mul(std::mem::size_of::<T>()).and_then(|n| u64::try_from(n).ok())))?;
+fn reserve<T, A: Allocator, E>(
+    values: &mut AllocVec<T, A>,
+    additional: usize,
+    rows: usize,
+    growth: &mut Growth<'_, E>,
+) -> Result<(), WriteFailure<E>> {
+    let overflow = |required| {
+        if rows > 0 {
+            WriteFailure::Full
+        } else {
+            ValueError::Representation(field_representation(
+                11,
+                RepresentationBoundary::MinimumUnit,
+                required,
+                Some(isize::MAX as u64),
+                None,
+            ))
+            .into()
+        }
+    };
+    let needed = values
+        .len()
+        .checked_add(additional)
+        .ok_or_else(|| overflow(None))?;
+    if needed <= values.capacity() {
+        return Ok(());
+    }
+    // Doubling affects efficiency only. Near the real Layout limit, fall back
+    // to the exact required extent rather than rejecting a representable row.
+    let preferred = values
+        .capacity()
+        .checked_mul(2)
+        .unwrap_or(needed)
+        .max(needed);
+    let (capacity, layout) = match Layout::array::<T>(preferred) {
+        Ok(layout) => (preferred, layout),
+        Err(_) => (
+            needed,
+            Layout::array::<T>(needed).map_err(|_| {
+                overflow(
+                    needed
+                        .checked_mul(std::mem::size_of::<T>())
+                        .and_then(|bytes| u64::try_from(bytes).ok()),
+                )
+            })?,
+        ),
+    };
     growth(layout).map_err(ValueFailure::Caller)?;
-    values.try_reserve_exact(additional).map_err(|source| ValueError::Allocator { requested: layout.size(), source })?;
+    values
+        .try_reserve_exact(capacity - values.len())
+        .map_err(|source| ValueError::Allocator {
+            requested: layout.size(),
+            source,
+        })?;
     Ok(())
 }
 
