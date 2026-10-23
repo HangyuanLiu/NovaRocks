@@ -361,8 +361,14 @@ impl FrozenAttemptTopology {
         self.revision
     }
 
-    fn into_parts(self) -> (u64, BTreeMap<BackendProcessId, BoundManifestBackend>) {
-        (self.revision, self.backends)
+    fn into_parts(
+        self,
+    ) -> (
+        u64,
+        BTreeMap<BackendProcessId, BoundManifestBackend>,
+        Box<[BackendProcessId]>,
+    ) {
+        (self.revision, self.backends, self.eligible_backends)
     }
 }
 
@@ -376,6 +382,7 @@ impl FrozenAttemptTopology {
 pub(crate) struct TaskManifestBinding {
     execution: QueryExecutionId,
     topology_revision: u64,
+    eligible_backends: Box<[BackendProcessId]>,
     native_template: RequestBoundNativeTemplate,
     tasks: Box<[BoundManifestTask]>,
     contexts: Box<[BoundManifestContext]>,
@@ -409,13 +416,14 @@ impl TaskManifestBinding {
     ) -> Result<Self, DistributedQueryError> {
         let RequestBoundNativeTemplate { execution, .. } = bound_template;
         let facts = ScheduleFacts::from_schedule(schedule);
-        let (topology_revision, backends) = topology.into_parts();
+        let (topology_revision, backends, eligible_backends) = topology.into_parts();
         Self::bind_facts(
             bound_template,
             execution,
             facts,
             topology_revision,
             backends,
+            eligible_backends,
         )
     }
 
@@ -425,6 +433,7 @@ impl TaskManifestBinding {
         schedule: ScheduleFacts,
         topology_revision: u64,
         endpoint_by_process: BTreeMap<BackendProcessId, BoundManifestBackend>,
+        eligible_backends: Box<[BackendProcessId]>,
     ) -> Result<Self, DistributedQueryError> {
         validate_schedule_execution(expected_execution, schedule.execution)?;
         let prepared = PreparedManifestFacts::from_template(&bound_template.template)?;
@@ -638,12 +647,19 @@ impl TaskManifestBinding {
         Ok(Self {
             execution: expected_execution,
             topology_revision,
+            eligible_backends,
             native_template: bound_template,
             tasks: bound_tasks.into_boxed_slice(),
             contexts: bound_contexts.into_boxed_slice(),
             edges: bound_edges.into_boxed_slice(),
             root: schedule.root,
         })
+    }
+
+    /// The original selection survives binding even when only a subset has Tasks.
+    /// This is the same Box from FrozenAttemptTopology, including exclusions.
+    pub(crate) fn eligible_backends(&self) -> &[BackendProcessId] {
+        &self.eligible_backends
     }
 
     pub(crate) const fn execution(&self) -> QueryExecutionId {
@@ -1782,13 +1798,18 @@ mod tests {
                 full_bind_supported(live_target(1, BackendProcessId::new_v7(), 19011));
             let snapshot = BackendTopologySnapshot::try_new(83, vec![legacy, supported_peer])
                 .expect("original snapshot preserves the supported non-root candidate");
-            let (revision, backends) = FrozenAttemptTopology::capture(snapshot)
+            let (revision, backends, eligible_backends) = FrozenAttemptTopology::capture(snapshot)
                 .expect("legacy descriptors are representable before selected-root use")
                 .into_parts();
             let template = full_bind_native_template(execution, purpose);
             let schedule = full_bind_schedule(execution, process, &template);
             let error = super::TaskManifestBinding::bind_facts(
-                template, execution, schedule, revision, backends,
+                template,
+                execution,
+                schedule,
+                revision,
+                backends,
+                eligible_backends,
             )
             .expect_err("the production bind call must refuse the exact unsupported root");
             assert_eq!(
@@ -1815,8 +1836,10 @@ mod tests {
             let snapshot = BackendTopologySnapshot::try_new(84, vec![supported, legacy])
                 .expect("one supported root and one legacy non-root candidate");
             let frozen = FrozenAttemptTopology::capture(snapshot).expect("original snapshot");
+            let original_eligible = frozen.eligible_backends().as_ptr();
+            let expected_eligible = frozen.eligible_backends().to_vec();
             assert!(frozen.eligible_backends().contains(&legacy_process));
-            let (revision, backends) = frozen.into_parts();
+            let (revision, backends, eligible_backends) = frozen.into_parts();
             let template = full_bind_native_template(execution, purpose);
             let schedule = full_bind_schedule(execution, process, &template);
             let root = schedule.root;
@@ -1829,7 +1852,12 @@ mod tests {
             let producer = expected_edge.producers[0].0;
             assert_ne!(producer, root);
             let manifest = super::TaskManifestBinding::bind_facts(
-                template, execution, schedule, revision, backends,
+                template,
+                execution,
+                schedule,
+                revision,
+                backends,
+                eligible_backends,
             )
             .expect("production full binding reaches a valid manifest");
             assert_eq!(manifest.execution(), execution);
@@ -1837,6 +1865,9 @@ mod tests {
             assert_eq!(manifest.topology_revision(), 84);
             assert_eq!(manifest.tasks().len(), 2);
             assert_eq!(manifest.contexts().len(), 1);
+            assert_eq!(manifest.eligible_backends(), expected_eligible);
+            assert_eq!(manifest.eligible_backends().as_ptr(), original_eligible);
+            assert!(manifest.eligible_backends().contains(&legacy_process));
             assert_eq!(manifest.edges().len(), 1);
             assert_eq!(
                 manifest
@@ -1884,12 +1915,58 @@ mod tests {
     }
 
     #[test]
+    fn bound_manifest_keeps_original_eligibility_exclusions_and_unplaced_candidates() {
+        let execution = execution();
+        let selected = full_bind_supported(live_target(0, BackendProcessId::new_v7(), 19010));
+        let process = selected.descriptor().process_id();
+        let excluded = live_target(1, BackendProcessId::new_v7(), 19011);
+        let excluded_process = excluded.descriptor().process_id();
+        let unplaced = live_target(2, BackendProcessId::new_v7(), 19012);
+        let unplaced_process = unplaced.descriptor().process_id();
+        let snapshot =
+            BackendTopologySnapshot::try_new(87, vec![selected, excluded, unplaced]).unwrap();
+        let frozen = FrozenAttemptTopology::capture_for_candidate(
+            snapshot,
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(
+                excluded_process,
+            ),
+        )
+        .unwrap();
+        let original = frozen.eligible_backends().as_ptr();
+        let expected = frozen.eligible_backends().to_vec();
+        let (revision, backends, eligible) = frozen.into_parts();
+        assert!(
+            backends.contains_key(&excluded_process),
+            "membership facts remain complete despite placement exclusion"
+        );
+        let template = full_bind_native_template(execution, FullBindPurpose::ClientRows);
+        let schedule = full_bind_schedule(execution, process, &template);
+        let manifest = super::TaskManifestBinding::bind_facts(
+            template, execution, schedule, revision, backends, eligible,
+        )
+        .unwrap();
+        assert_eq!(manifest.eligible_backends(), expected);
+        assert_eq!(manifest.eligible_backends().as_ptr(), original);
+        assert!(manifest.eligible_backends().contains(&unplaced_process));
+        assert!(!manifest.eligible_backends().contains(&excluded_process));
+        assert_eq!(
+            manifest.contexts().len(),
+            1,
+            "eligible candidates are not participant contexts"
+        );
+        assert_eq!(
+            manifest.contexts()[0].context().backend_process_id(),
+            process
+        );
+    }
+
+    #[test]
     fn full_manifest_bind_cannot_borrow_supported_backend_for_a_foreign_root_identity() {
         let execution = execution();
         let supported = full_bind_supported(live_target(0, BackendProcessId::new_v7(), 19010));
         let process = supported.descriptor().process_id();
         let snapshot = BackendTopologySnapshot::try_new(85, vec![supported]).expect("snapshot");
-        let (revision, backends) = FrozenAttemptTopology::capture(snapshot)
+        let (revision, backends, eligible_backends) = FrozenAttemptTopology::capture(snapshot)
             .unwrap()
             .into_parts();
         let template = full_bind_native_template(execution, FullBindPurpose::ClientRows);
@@ -1906,7 +1983,12 @@ mod tests {
             process,
         );
         let error = super::TaskManifestBinding::bind_facts(
-            template, execution, schedule, revision, backends,
+            template,
+            execution,
+            schedule,
+            revision,
+            backends,
+            eligible_backends,
         )
         .expect_err("same supported backend cannot replace the complete scheduled task identity");
         assert!(
@@ -1933,7 +2015,7 @@ mod tests {
         let (legacy_root, _) = task(execution(), 1, 1, legacy.descriptor().process_id());
         let (supported_root, _) = task(execution(), 1, 2, supported.descriptor().process_id());
         let snapshot = BackendTopologySnapshot::try_new(71, vec![legacy, supported]).unwrap();
-        let (_, backends) = FrozenAttemptTopology::capture(snapshot)
+        let (_, backends, _) = FrozenAttemptTopology::capture(snapshot)
             .unwrap()
             .into_parts();
 
@@ -1962,7 +2044,7 @@ mod tests {
         let present = live_target(0, BackendProcessId::new_v7(), 19010);
         let (foreign_root, _) = task(execution(), 1, 1, BackendProcessId::new_v7());
         let snapshot = BackendTopologySnapshot::try_new(72, vec![present]).unwrap();
-        let (_, backends) = FrozenAttemptTopology::capture(snapshot)
+        let (_, backends, _) = FrozenAttemptTopology::capture(snapshot)
             .unwrap()
             .into_parts();
         let error = validate_root_backend_support(foreign_root, &backends)
@@ -1991,7 +2073,7 @@ mod tests {
         .unwrap();
         assert_eq!(frozen.eligible_backends(), &[remaining]);
         assert_eq!(frozen.revision(), 7);
-        let (_, retained) = frozen.into_parts();
+        let (_, retained, _) = frozen.into_parts();
         assert!(
             retained.contains_key(&failed),
             "failed target remains an exact snapshot fact"
@@ -2019,12 +2101,12 @@ mod tests {
         assert_eq!(frozen.revision(), 41);
         assert_eq!(later.revision(), 42);
 
-        let (_, exact) = frozen.into_parts();
+        let (_, exact, _) = frozen.into_parts();
         assert_eq!(
             exact[&process].admission_epoch_capability().to_bytes(),
             [0x61; 16]
         );
-        let (_, replacement) = later.into_parts();
+        let (_, replacement, _) = later.into_parts();
         assert_eq!(
             replacement[&process]
                 .admission_epoch_capability()
@@ -2412,13 +2494,18 @@ mod tests {
         let supported = full_bind_supported(live_target(0, BackendProcessId::new_v7(), 19010));
         let process = supported.descriptor().process_id();
         let schedule = full_bind_schedule(execution, process, &template);
-        let (revision, backends) = FrozenAttemptTopology::capture(
+        let (revision, backends, eligible_backends) = FrozenAttemptTopology::capture(
             BackendTopologySnapshot::try_new(86, vec![supported]).unwrap(),
         )
         .unwrap()
         .into_parts();
         let manifest = super::TaskManifestBinding::bind_facts(
-            template, execution, schedule, revision, backends,
+            template,
+            execution,
+            schedule,
+            revision,
+            backends,
+            eligible_backends,
         )
         .unwrap();
         manifest

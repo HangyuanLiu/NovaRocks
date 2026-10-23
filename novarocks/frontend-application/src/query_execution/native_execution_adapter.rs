@@ -2112,6 +2112,10 @@ trait RetainedAttemptInputs: std::fmt::Debug + Send + 'static {
 
     fn eligible_backends(&self) -> &[novarocks_types::identity::BackendProcessId];
 
+    fn manifest_eligible_backends(
+        manifest: &Self::Manifest,
+    ) -> &[novarocks_types::identity::BackendProcessId];
+
     fn bind_manifest(
         self,
         schedule: &AttemptSchedule,
@@ -2123,6 +2127,12 @@ impl RetainedAttemptInputs for SnapshotBoundDormantAttemptInputs {
 
     fn eligible_backends(&self) -> &[novarocks_types::identity::BackendProcessId] {
         self.eligible_backends()
+    }
+
+    fn manifest_eligible_backends(
+        manifest: &Self::Manifest,
+    ) -> &[novarocks_types::identity::BackendProcessId] {
+        manifest.eligible_backends()
     }
 
     fn bind_manifest(
@@ -2210,10 +2220,14 @@ where
     }
 
     fn retained_eligible_backends(&self) -> &[novarocks_types::identity::BackendProcessId] {
-        self.dormant_inputs
-            .as_ref()
-            .expect("a dormant Native attempt retains inputs until its sole activation")
-            .eligible_backends()
+        match &self.dormant_inputs {
+            Some(inputs) => inputs.eligible_backends(),
+            None => I::manifest_eligible_backends(
+                self.manifest_inputs
+                    .as_ref()
+                    .expect("dormant owner retains its bound manifest until activation"),
+            ),
+        }
     }
 
     fn bind_manifest(
@@ -3126,11 +3140,16 @@ mod tests {
             &self.eligible_backends
         }
 
+        fn manifest_eligible_backends(manifest: &Self::Manifest) -> &[BackendProcessId] {
+            &manifest.eligible_backends
+        }
+
         fn bind_manifest(
             self,
             _schedule: &AttemptSchedule,
         ) -> Result<Self::Manifest, NativeAttemptActivationFailure> {
             Ok(TestManifest {
+                eligible_backends: self.eligible_backends,
                 marker: 73,
                 identity: Box::new(91),
             })
@@ -3213,8 +3232,31 @@ mod tests {
         assert_eq!(owner.behavior.replacement_backends, vec![replacement]);
     }
 
+    #[test]
+    fn bound_dormant_owner_borrows_original_manifest_eligibility() {
+        let captured = BackendProcessId::new_v7();
+        let replacement = BackendProcessId::new_v7();
+        let eligible_backends = vec![captured];
+        let original = eligible_backends.as_ptr();
+        let owner = SnapshotBoundDormantAttemptOwner::<_, CapturedInputs>::from_manifest(
+            TestManifest {
+                eligible_backends,
+                marker: 73,
+                identity: Box::new(91),
+            },
+            AdversarialBehavior {
+                replacement_backends: vec![replacement],
+            },
+        );
+        assert!(owner.dormant_inputs.is_none());
+        assert_eq!(owner.retained_eligible_backends(), &[captured]);
+        assert_eq!(owner.retained_eligible_backends().as_ptr(), original);
+        assert_eq!(owner.behavior.replacement_backends, vec![replacement]);
+    }
+
     #[derive(Debug, Eq, PartialEq)]
     struct TestManifest {
+        eligible_backends: Vec<BackendProcessId>,
         marker: u8,
         identity: Box<u8>,
     }
@@ -3424,6 +3466,7 @@ mod tests {
         (
             SnapshotBoundDormantAttemptOwner::from_manifest(
                 TestManifest {
+                    eligible_backends: Vec::new(),
                     marker: 73,
                     identity: Box::new(91),
                 },

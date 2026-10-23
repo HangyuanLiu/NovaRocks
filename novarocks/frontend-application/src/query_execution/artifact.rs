@@ -326,6 +326,10 @@ impl std::fmt::Debug for ManifestBoundNativeAttemptInputs {
 }
 
 impl ManifestBoundNativeAttemptInputs {
+    pub(crate) fn eligible_backends(&self) -> &[BackendProcessId] {
+        self.manifest.eligible_backends()
+    }
+
     pub(crate) const fn execution_id(&self) -> QueryExecutionId {
         self.manifest.execution()
     }
