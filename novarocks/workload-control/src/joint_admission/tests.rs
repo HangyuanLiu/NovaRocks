@@ -1342,3 +1342,106 @@ fn closed_before_reply_refuses_new_permission_without_a_driver_turn() {
         assert_eq!(held(&control), (0, 0));
     }
 }
+
+#[test]
+fn request_publication_rechecks_sources_after_outside_lock_construction() {
+    for release_source in [false, true] {
+        let (control, handle, mut driver) = roomy_control();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Management))
+            .unwrap();
+        let scope = root.owner.scope();
+        let a = dependency(&handle, "a");
+        let mut initial = request(&handle, &scope, &[&a], JointLane::Foreground, 10);
+        drive(&mut driver);
+        let mut original = granted(&mut initial).pop().unwrap();
+        let changes = vec![JointClaimChange::grow_by(
+            original.view().unwrap(),
+            bytes(4),
+            vec![],
+        )];
+        let prepared = handle.prepare_request(&scope, &changes).unwrap();
+        if release_source {
+            original.release_part(bytes(3)).unwrap();
+            assert!(matches!(
+                handle.queue_request(prepared),
+                Err(WorkError::Conflict)
+            ));
+            assert_eq!(held(&control), (1, 7));
+        } else {
+            let pending = handle.request(&scope, changes).unwrap();
+            assert!(matches!(
+                handle.queue_request(prepared),
+                Err(WorkError::Conflict)
+            ));
+            assert_eq!(held(&control), (1, 10));
+            assert_eq!(
+                control
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap()
+                    .joint
+                    .as_ref()
+                    .unwrap()
+                    .requests
+                    .len(),
+                1
+            );
+            drop(pending);
+        }
+        drop(original);
+        drive(&mut driver);
+        assert_eq!(held(&control), (0, 0));
+    }
+}
+
+#[test]
+fn request_publication_preserves_original_cancel_and_drop_errors() {
+    for drop_source in [false, true] {
+        let (control, handle, mut driver) = roomy_control();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Management))
+            .unwrap();
+        let scope = root.owner.scope();
+        let a = dependency(&handle, "a");
+        let mut initial = request(&handle, &scope, &[&a], JointLane::Foreground, 10);
+        drive(&mut driver);
+        let original = granted(&mut initial).pop().unwrap();
+        let changes = [JointClaimChange::grow_by(
+            original.view().unwrap(),
+            bytes(4),
+            vec![],
+        )];
+        let prepared = handle.prepare_request(&scope, &changes).unwrap();
+        if drop_source {
+            drop(original);
+            assert!(matches!(
+                handle.queue_request(prepared),
+                Err(WorkError::Released)
+            ));
+        } else {
+            root.owner.cancel(crate::CancellationReason::Requested);
+            assert!(matches!(
+                handle.queue_request(prepared),
+                Err(WorkError::Cancelled(crate::CancellationReason::Requested))
+            ));
+            assert_eq!(original.amounts().unwrap(), bytes(10));
+            drop(original);
+        }
+        drive(&mut driver);
+        assert_eq!(held(&control), (0, 0));
+        assert!(
+            control
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .joint
+                .as_ref()
+                .unwrap()
+                .requests
+                .is_empty()
+        );
+    }
+}

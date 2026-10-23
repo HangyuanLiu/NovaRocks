@@ -240,101 +240,152 @@ impl JointAdmissionHandle {
         scope: &WorkScope,
         changes: Vec<JointClaimChange>,
     ) -> Result<JointAdmission, JointAdmissionFailure> {
+        self.prepare_request(scope, &changes)
+            .and_then(|prepared| self.queue_request(prepared))
+            .map_err(|error| JointAdmissionFailure { error })
+    }
+
+    /// Capture only immutable headers under State. Dependency union, sorting
+    /// and record allocation occur outside the original authority's mutex.
+    pub(super) fn prepare_request(
+        &self,
+        scope: &WorkScope,
+        changes: &[JointClaimChange],
+    ) -> Result<PreparedRequest, WorkError> {
         if !Arc::ptr_eq(&self.inner, &scope.inner) {
-            return Err(JointAdmissionFailure {
-                error: WorkError::ForeignAuthority,
-            });
+            return Err(WorkError::ForeignAuthority);
         }
-        let queued = self.inner.update(|state| {
+        let (config, class) = {
+            let state = self.inner.state.lock().unwrap();
             let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
             let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
-            let config = &ledger.config.config;
             if ledger.driver_closed {
                 return Err(WorkError::Closed);
             }
-            if changes.is_empty() || changes.len() > config.max_changes_per_request {
+            if changes.is_empty() || changes.len() > ledger.config.config.max_changes_per_request {
                 return Err(WorkError::Capacity("joint batch records"));
             }
-            if ledger.requests.len() >= config.max_requests {
+            if ledger.requests.len() >= ledger.config.config.max_requests {
                 return Err(WorkError::Capacity("joint request and reply records"));
             }
-            let mut records: Vec<ChangeRecord> = Vec::with_capacity(changes.len());
-            for change in &changes {
-                let (source, lane, amounts, mut selected, additional) = match change {
-                    JointClaimChange::New {
-                        dependencies,
-                        lane,
-                        amounts,
-                    } => (None, *lane, *amounts, Vec::new(), dependencies),
-                    JointClaimChange::Grow {
-                        source,
-                        delta,
-                        dependencies,
-                    } => {
-                        if !Weak::ptr_eq(&source.inner, &Arc::downgrade(&self.inner)) {
-                            return Err(WorkError::ForeignAuthority);
-                        }
+            (Arc::clone(&ledger.config), node.class)
+        };
+        let config = &config.config;
+        let mut records: Vec<ChangeRecord> = Vec::with_capacity(changes.len());
+        for change in changes {
+            let (source, original, lane, amounts, mut selected, additional) = match change {
+                JointClaimChange::New {
+                    dependencies,
+                    lane,
+                    amounts,
+                } => (None, None, *lane, *amounts, Vec::new(), dependencies),
+                JointClaimChange::Grow {
+                    source,
+                    delta,
+                    dependencies,
+                } => {
+                    if !Weak::ptr_eq(&source.inner, &Arc::downgrade(&self.inner)) {
+                        return Err(WorkError::ForeignAuthority);
+                    }
+                    let (facts, old_amounts) = {
+                        let state = self.inner.state.lock().unwrap();
+                        let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
                         let old = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
                         authenticate(old, source)?;
-                        if old.owner != scope.id
-                            || old.pending.is_some()
-                            || records.iter().any(|record| record.old == Some(source.id))
-                        {
+                        if old.owner != scope.id || old.pending.is_some() {
                             return Err(WorkError::Conflict);
                         }
-                        // Grant and eventual install/rollback each advance structure.
                         old.structure_revision
                             .checked_add(2)
                             .ok_or(WorkError::ArithmeticOverflow)?;
-                        (
-                            Some(source.clone()),
-                            old.active_facts.lane,
-                            old.active_amounts.checked_add(*delta)?,
-                            old.active_facts.dependencies.to_vec(),
-                            dependencies,
-                        )
+                        (Arc::clone(&old.active_facts), old.active_amounts)
+                    };
+                    if records.iter().any(|record| record.old == Some(source.id)) {
+                        return Err(WorkError::Conflict);
                     }
-                };
-                if additional.len() > config.max_dependencies_per_claim {
-                    return Err(WorkError::Capacity("joint dependency fanout"));
+                    let selected = facts.dependencies.to_vec();
+                    (
+                        Some(source.clone()),
+                        Some((Arc::clone(&facts), old_amounts)),
+                        facts.lane,
+                        old_amounts.checked_add(*delta)?,
+                        selected,
+                        dependencies,
+                    )
                 }
-                for dependency in additional {
-                    if !Arc::ptr_eq(&self.inner, &dependency.inner) {
-                        return Err(WorkError::ForeignAuthority);
-                    }
-                    selected.push(Arc::clone(&dependency.record));
+            };
+            if additional.len() > config.max_dependencies_per_claim {
+                return Err(WorkError::Capacity("joint dependency fanout"));
+            }
+            for dependency in additional {
+                if !Arc::ptr_eq(&self.inner, &dependency.inner) {
+                    return Err(WorkError::ForeignAuthority);
                 }
-                selected.sort_unstable_by_key(|record| record.ordinal);
-                // Extension is a set union, including already-present domains.
-                // A New declaration still rejects duplicate original facts.
-                if source.is_none() && selected.windows(2).any(|p| p[0].ordinal == p[1].ordinal) {
+                selected.push(Arc::clone(&dependency.record));
+            }
+            selected.sort_unstable_by_key(|record| record.ordinal);
+            if source.is_none() && selected.windows(2).any(|p| p[0].ordinal == p[1].ordinal) {
+                return Err(WorkError::Conflict);
+            }
+            selected.dedup_by_key(|record| record.ordinal);
+            if selected.len() > config.max_dependencies_per_claim {
+                return Err(WorkError::Capacity("joint dependency union"));
+            }
+            let facts = Arc::new(ProfileFacts {
+                key: Arc::new(ProfileKey {
+                    class: class_index(class),
+                    lane: lane as usize,
+                    dependencies: selected.iter().map(|d| d.ordinal).collect(),
+                }),
+                class,
+                lane,
+                dependencies: selected.into(),
+            });
+            records.push(ChangeRecord {
+                old: source.as_ref().map(|source| source.id),
+                original_amounts: original.as_ref().map(|(_, amounts)| *amounts),
+                original_facts: original.map(|(facts, _)| facts),
+                source,
+                claim: ProposedClaim { facts, amounts },
+            });
+        }
+        Ok(PreparedRequest {
+            scope: scope.clone(),
+            changes: records.into(),
+        })
+    }
+
+    /// Reauthenticate every source after the lock-free construction phase.
+    /// Only this transaction sets pending and publishes the original reply.
+    pub(super) fn queue_request(
+        &self,
+        prepared: PreparedRequest,
+    ) -> Result<JointAdmission, WorkError> {
+        if !Arc::ptr_eq(&self.inner, &prepared.scope.inner) {
+            return Err(WorkError::ForeignAuthority);
+        }
+        let scope = &prepared.scope;
+        let records = &prepared.changes;
+        let id = self.inner.update(|state| {
+            let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
+            let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
+            if ledger.driver_closed {
+                return Err(WorkError::Closed);
+            }
+            if ledger.requests.len() >= ledger.config.config.max_requests {
+                return Err(WorkError::Capacity("joint request and reply records"));
+            }
+            for change in records.iter() {
+                if change.claim.facts.class != node.class {
                     return Err(WorkError::Conflict);
                 }
-                selected.dedup_by_key(|record| record.ordinal);
-                if selected.len() > config.max_dependencies_per_claim {
-                    return Err(WorkError::Capacity("joint dependency union"));
+                if let Some(source) = &change.source {
+                    let old = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
+                    authenticate(old, source)?;
+                    if old.owner != scope.id || old.pending.is_some() {
+                        return Err(WorkError::Conflict);
+                    }
                 }
-                let class = source.as_ref().map_or(node.class, |source| {
-                    ledger.claims[&source.id].active_facts.class
-                });
-                let facts = Arc::new(ProfileFacts {
-                    key: Arc::new(ProfileKey {
-                        class: class_index(class),
-                        lane: lane as usize,
-                        dependencies: selected.iter().map(|d| d.ordinal).collect(),
-                    }),
-                    class,
-                    lane,
-                    dependencies: selected.into(),
-                });
-                let old = source.as_ref().map(|source| source.id);
-                records.push(ChangeRecord {
-                    old,
-                    original_amounts: old.map(|id| ledger.claims[&id].amounts),
-                    original_facts: old.map(|id| Arc::clone(&ledger.claims[&id].facts)),
-                    source,
-                    claim: ProposedClaim { facts, amounts },
-                });
             }
             if records
                 .iter()
@@ -352,7 +403,7 @@ impl JointAdmissionHandle {
             let id = state.next_id()?;
             state.nodes.get_mut(&scope.id).unwrap().resource_waiters = waiters;
             let ledger = state.joint.as_mut().unwrap();
-            for record in &records {
+            for record in records.iter() {
                 if let Some(old) = record.old {
                     ledger.claims.get_mut(&old).unwrap().pending = Some(id);
                 }
@@ -361,22 +412,26 @@ impl JointAdmissionHandle {
                 id,
                 RequestRecord {
                     owner: scope.id,
-                    changes: records.into(),
+                    changes: Arc::clone(records),
                     phase: RequestPhase::Waiting,
                     blocked_at: None,
                     waker: None,
                 },
             );
             Ok(id)
-        });
-        queued
-            .map(|id| JointAdmission {
-                inner: Arc::clone(&self.inner),
-                id: Some(id),
-            })
-            .map_err(|error| JointAdmissionFailure { error })
+        })?;
+        Ok(JointAdmission {
+            inner: Arc::clone(&self.inner),
+            id: Some(id),
+        })
     }
 }
+
+pub(super) struct PreparedRequest {
+    scope: WorkScope,
+    changes: Arc<[ChangeRecord]>,
+}
+
 pub enum JointClaimChange {
     New {
         dependencies: Vec<JointDependency>,
