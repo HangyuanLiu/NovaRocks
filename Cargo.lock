@@ -3994,6 +3994,7 @@ dependencies = [
  "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-query-application",
+ "novarocks-resource-contract",
  "novarocks-result-contract",
  "novarocks-result-render",
  "novarocks-secret",
@@ -4269,6 +4270,7 @@ dependencies = [
  "novarocks-plan-codec",
  "novarocks-proto-codec",
  "novarocks-proto-models",
+ "novarocks-resource-contract",
  "novarocks-result-contract",
  "novarocks-result-render",
  "novarocks-secret",
@@ -4308,6 +4310,7 @@ dependencies = [
  "hmac 0.12.1",
  "http",
  "hyper-util",
+ "novarocks-resource-contract",
  "novarocks-secret",
  "novarocks-transport-io",
  "novarocks-types",
@@ -4321,6 +4324,7 @@ dependencies = [
  "tokio-rustls",
  "tonic",
  "tower 0.5.2",
+ "url",
 ]
 
 [[package]]

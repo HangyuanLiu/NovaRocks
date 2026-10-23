@@ -710,6 +710,30 @@ impl TaskManifestBinding {
         &self.tasks
     }
 
+    /// Finite facts for actual participant contexts, not all eligible members.
+    /// Both original endpoints are projected; the original paid builder performs
+    /// canonical union/dedup. This iterator allocates no second backend list,
+    /// invokes no network/callback, and carries no admission authority.
+    pub(crate) fn selected_network_origins<'a>(
+        &'a self,
+        transport: &'a novarocks_native_adapter::FrontendNativeTransport,
+    ) -> impl Iterator<
+        Item = Result<
+            novarocks_resource_contract::SelectedNetworkOrigin<'a>,
+            novarocks_resource_contract::DependencyFactError,
+        >,
+    > + 'a {
+        self.contexts.iter().flat_map(move |context| {
+            let descriptor = context.backend().target().descriptor();
+            [
+                descriptor.endpoint().native_endpoint(),
+                descriptor.control_endpoint().native_endpoint(),
+            ]
+            .into_iter()
+            .map(move |endpoint| transport.selected_network_origin(endpoint))
+        })
+    }
+
     pub(crate) fn contexts(&self) -> &[BoundManifestContext] {
         &self.contexts
     }
@@ -1958,6 +1982,23 @@ mod tests {
             manifest.contexts()[0].context().backend_process_id(),
             process
         );
+        let transport = novarocks_native_adapter::FrontendNativeTransport::plaintext();
+        let selected = manifest
+            .selected_network_origins(&transport)
+            .map(|origin| origin.unwrap().into_owned().as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected,
+            [
+                "http://127.0.0.1:19010",
+                "http://control-0.test.invalid:19061"
+            ]
+        );
+        assert_eq!(
+            selected.len(),
+            2,
+            "unplaced and excluded candidates create no selected service facts"
+        );
     }
 
     #[test]
@@ -2538,5 +2579,79 @@ mod tests {
             0,
             "ordinary read tasks cannot become writers from statuses"
         );
+    }
+
+    #[test]
+    fn actual_participant_domain_projection_preserves_data_control_and_tls_policy_without_io() {
+        use novarocks_native_adapter::FrontendNativeTransport;
+        use novarocks_native_trust::{
+            AutomaticTlsMaterial, DeploymentId, NativeCallerSubject, NativeTransportMode,
+            NativeTrust, ValidatedSharedSecret,
+        };
+        use novarocks_secret::SecretValue;
+        let execution = execution();
+        let process = BackendProcessId::new_v7();
+        let descriptor = BackendProcessDescriptor::try_new(
+            process,
+            RuntimeEndpoint::new("2001:0DB8::1", 443).unwrap(),
+            RuntimeEndpoint::new("CONTROL.EXAMPLE", 443).unwrap(),
+            "test-deployment",
+            "test-build",
+            NativeCompatibilityId::new([0x71; 32]),
+            4096,
+        )
+        .unwrap();
+        let selected = full_bind_supported(LiveBackendTarget::new(
+            0,
+            descriptor,
+            AdmissionEpochCapability::try_from_bytes([0x61; 16]).unwrap(),
+        ));
+        let unplaced = live_target(1, BackendProcessId::new_v7(), 19012);
+        let frozen = FrozenAttemptTopology::capture(
+            BackendTopologySnapshot::try_new(88, vec![selected, unplaced]).unwrap(),
+        )
+        .unwrap();
+        let (revision, backends, eligible) = frozen.into_parts();
+        let template = full_bind_native_template(execution, FullBindPurpose::ClientRows);
+        let schedule = full_bind_schedule(execution, process, &template);
+        let manifest = super::TaskManifestBinding::bind_facts(
+            template, execution, schedule, revision, backends, eligible,
+        )
+        .unwrap();
+        assert_eq!(manifest.contexts().len(), 1);
+        assert_eq!(
+            manifest.tasks().len(),
+            2,
+            "the original real encoder supplies both fragments on the same participant"
+        );
+        let endpoint = manifest.contexts()[0]
+            .backend()
+            .endpoint()
+            .native_endpoint();
+        let trust = NativeTrust::new(
+            DeploymentId::parse("manifest-domain-pure").unwrap(),
+            ValidatedSharedSecret::new(SecretValue::new("0123456789abcdef0123456789abcdef"))
+                .unwrap(),
+            NativeCallerSubject::parse("fe@localhost:19040").unwrap(),
+            NativeTransportMode::Automatic,
+        );
+        let material = AutomaticTlsMaterial::for_endpoint(trust, endpoint.clone()).unwrap();
+        for (transport, expected) in [
+            (
+                FrontendNativeTransport::plaintext(),
+                ["http://[2001:db8::1]:443", "http://control.example:443"],
+            ),
+            (
+                FrontendNativeTransport::automatic(material),
+                ["https://[2001:db8::1]", "https://control.example"],
+            ),
+        ] {
+            let facts = manifest
+                .selected_network_origins(&transport)
+                .map(|origin| origin.unwrap().into_owned().as_str().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(facts, expected);
+        }
+        // No Native open/activation, split source, client, DNS, socket or task.
     }
 }

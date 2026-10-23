@@ -22,7 +22,13 @@
 use std::num::NonZeroUsize;
 use std::time::Instant;
 
-use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+use crate::query_execution::internal_consumer::domain_state::{
+    InternalDomainFailure, InternalDomainSlot,
+};
+use novarocks_execution_contract::{
+    SafeDetail, failure::FailureProjection, root_result::RootResultEnd,
+};
+use novarocks_query_application::api::RetainedRootReply;
 use novarocks_query_application::cpu::{
     QueryBlockingExecutor, QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
 };
@@ -437,8 +443,60 @@ impl<T> Drop for InternalResultCpuJob<T> {
     }
 }
 
+/// Closed production operations for the original internal result worker.
+/// This limits its call surface; it does not certify Provider codecs, locks,
+/// callbacks or destruction as finite, or grant a host-only protection policy.
+pub(crate) enum InternalResultOperation {
+    Body(Arc<RetainedRootReply>),
+    End(RootResultEnd),
+    FinishStatistics,
+    AcceptWrite(crate::query_execution::write_session::WriteReceivingPort),
+}
+impl InternalResultOperation {
+    fn apply(self, slot: InternalDomainSlot) -> Result<InternalDomainSlot, InternalDomainFailure> {
+        match self {
+            Self::Body(reply) => slot.apply_body(reply),
+            Self::End(end) => slot.finish_eof(end),
+            Self::FinishStatistics => slot.finish_statistics(),
+            Self::AcceptWrite(receiving) => slot.accept_write(receiving),
+        }
+    }
+}
+
 impl InternalResultCpu {
+    pub(crate) fn submit_operation(
+        &self,
+        input: InternalResultValue<InternalDomainSlot>,
+        cancellation: QueryCancellationView,
+        data_runtime: &FrontendDataRuntime,
+        wake: Arc<dyn StatusIntakeWake>,
+        operation: InternalResultOperation,
+    ) -> InternalResultCpuJob<Result<InternalDomainSlot, InternalDomainFailure>> {
+        self.submit_with(input, cancellation, data_runtime, wake, move |slot, _| {
+            operation.apply(slot)
+        })
+    }
+
+    // The original fault-injection tests require arbitrary jobs, including real
+    // blocked and panicking destructors. This is not a production entry point.
+    #[cfg(test)]
     pub(crate) fn submit<I, O, F>(
+        &self,
+        input: InternalResultValue<I>,
+        cancellation: QueryCancellationView,
+        data_runtime: &FrontendDataRuntime,
+        wake: Arc<dyn StatusIntakeWake>,
+        apply: F,
+    ) -> InternalResultCpuJob<O>
+    where
+        I: Send + 'static,
+        O: Send + 'static,
+        F: FnOnce(I, &ResultWindowAlias) -> O + Send + 'static,
+    {
+        self.submit_with(input, cancellation, data_runtime, wake, apply)
+    }
+
+    fn submit_with<I, O, F>(
         &self,
         input: InternalResultValue<I>,
         cancellation: QueryCancellationView,

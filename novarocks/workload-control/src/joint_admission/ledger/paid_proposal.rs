@@ -90,7 +90,14 @@ impl JointAdmissionHandle {
     /// Reserve an original fixed cell before allocating any request backing.
     /// This does not admit execution, I/O, jobs or a physical queue entry.
     pub fn begin_paid_proposal(&self, owner: &WorkOwner) -> Result<JointProposal, WorkError> {
-        let scope = owner.scope();
+        self.begin_paid_proposal_for_scope(owner.scope())
+    }
+
+    // Scope callers can reach this only through the closed control wrapper.
+    pub(super) fn begin_paid_proposal_for_scope(
+        &self,
+        scope: WorkScope,
+    ) -> Result<JointProposal, WorkError> {
         let custody = self.reserve_proposal(&scope)?;
         let Some(custody) = custody else {
             return Err(WorkError::NotReady);
@@ -395,7 +402,21 @@ impl JointProposal {
     ) -> Result<JointAdmission, JointAdmissionFailure> {
         self.submit_with_budget(limit.get())
     }
-    fn submit_with_budget(mut self, limit: u64) -> Result<JointAdmission, JointAdmissionFailure> {
+    fn submit_with_budget(self, limit: u64) -> Result<JointAdmission, JointAdmissionFailure> {
+        self.submit_with_budget_mode(limit, false)
+    }
+    pub(super) fn submit_control_binding(
+        self,
+        limit: Option<std::num::NonZeroU64>,
+    ) -> Result<JointAdmission, JointAdmissionFailure> {
+        let limit = limit.map_or(self.config.config.max_total_proof_work, |n| n.get());
+        self.submit_with_budget_mode(limit, true)
+    }
+    fn submit_with_budget_mode(
+        mut self,
+        limit: u64,
+        control_only: bool,
+    ) -> Result<JointAdmission, JointAdmissionFailure> {
         let limit = limit.min(self.config.config.max_total_proof_work);
         let result = (|| {
             self.healthy()?;
@@ -409,13 +430,16 @@ impl JointProposal {
                 handle.store_proposal(&self.custody, std::mem::take(&mut self.records))?;
             // PreparedRequest owns body before constructor custody can exit.
             // Its queue author installs the original admission before any wake.
-            handle.queue_request(PreparedRequest {
-                budget: RequestBudget::Finite { remaining: limit },
-                changes,
-                custody: self.custody.take(),
-                scope: self.scope.clone(),
-                _exit: ReclaimWakeOnExit::observe(&Arc::downgrade(&self.scope.inner)),
-            })
+            handle.queue_request_mode(
+                PreparedRequest {
+                    budget: RequestBudget::Finite { remaining: limit },
+                    changes,
+                    custody: self.custody.take(),
+                    scope: self.scope.clone(),
+                    _exit: ReclaimWakeOnExit::observe(&Arc::downgrade(&self.scope.inner)),
+                },
+                control_only,
+            )
         })();
         result.map_err(|error| JointAdmissionFailure { error })
     }

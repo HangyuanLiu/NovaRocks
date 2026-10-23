@@ -33,6 +33,9 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+mod control_binding;
+pub use control_binding::ControlBindingProposal;
+use control_binding::{validate_active_control_node, validate_control_binding_shape};
 mod control_storage;
 mod dependency_storage;
 mod metadata_geometry;
@@ -686,7 +689,15 @@ impl JointAdmissionHandle {
     /// Only this transaction sets pending and publishes the original reply.
     pub(super) fn queue_request(
         &self,
+        prepared: PreparedRequest,
+    ) -> Result<JointAdmission, WorkError> {
+        self.queue_request_mode(prepared, false)
+    }
+
+    fn queue_request_mode(
+        &self,
         mut prepared: PreparedRequest,
+        control_only: bool,
     ) -> Result<JointAdmission, WorkError> {
         if !Arc::ptr_eq(&self.inner, &prepared.scope.inner) {
             return Err(WorkError::ForeignAuthority);
@@ -698,6 +709,9 @@ impl JointAdmissionHandle {
             id: None,
         };
         self.inner.update(|state| {
+            if control_only {
+                validate_control_binding_shape(state, scope, records)?;
+            }
             let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
             let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
             if ledger.driver_closed {
@@ -969,23 +983,44 @@ impl WorkOwner {
     /// Observe this exact Node's prepaid control claim. This view cannot keep
     /// the Node alive, complete it, or release its resident storage.
     pub fn control_claim_view(&self) -> Result<JointClaimView, WorkError> {
-        let scope = self.scope();
-        let state = scope.inner.state.lock().unwrap();
-        if !state.cancellations.fixed {
-            return Err(WorkError::NotReady);
-        }
-        let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
-        let slot = &state.cancellations.slots[node.cancellation.0];
-        if slot.phase != SlotPhase::Node(scope.id) {
+        control_claim_view_for_scope(&self.scope(), false).map(|(view, _)| view)
+    }
+}
+
+// The owner path preserves its original observation semantics. Only the
+// delegated control constructor additionally requires a live Active owner.
+fn control_claim_view_for_scope(
+    scope: &WorkScope,
+    active: bool,
+) -> Result<(JointClaimView, bool), WorkError> {
+    let state = scope.inner.state.lock().unwrap();
+    if !state.cancellations.fixed {
+        return Err(WorkError::NotReady);
+    }
+    let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
+    let slot = &state.cancellations.slots[node.cancellation.0];
+    if slot.phase != SlotPhase::Node(scope.id) {
+        return Err(WorkError::Conflict);
+    }
+    let id = slot.claim.ok_or(WorkError::NotReady)?;
+    let record = state
+        .joint
+        .as_ref()
+        .and_then(|ledger| ledger.claims.get(&id))
+        .ok_or(WorkError::Released)?;
+    if active {
+        validate_active_control_node(&state, scope)?;
+        if record.pending.is_some()
+            || record.amounts != slot.base
+            || record.active_amounts != slot.base
+            || record.facts.key != record.active_facts.key
+        {
             return Err(WorkError::Conflict);
         }
-        let id = slot.claim.ok_or(WorkError::NotReady)?;
-        let record = state
-            .joint
-            .as_ref()
-            .and_then(|ledger| ledger.claims.get(&id))
-            .ok_or(WorkError::Released)?;
-        Ok(JointClaimView {
+    }
+    let unbound = record.active_facts.dependencies.is_empty();
+    Ok((
+        JointClaimView {
             inner: Arc::downgrade(&scope.inner),
             id,
             source: ClaimSource::NodeControl {
@@ -995,8 +1030,9 @@ impl WorkOwner {
             },
             structure_revision: record.structure_revision,
             release_revision: record.release_revision,
-        })
-    }
+        },
+        unbound,
+    ))
 }
 
 /// Physical custody remains here throughout any queued/granted adjustment.
@@ -2089,104 +2125,122 @@ impl JointAdjustmentReceipt {
         let control_scope = owner.map(WorkOwner::scope);
         let id = self.id.expect("live adjustment receipt");
         let result = self.inner.update(|state| {
-            let ledger = state.joint.as_ref().unwrap();
-            let request = ledger.requests.get(&id).ok_or(WorkError::Released)?;
-            match &request.phase {
-                RequestPhase::Failed(error) => return Err(error.clone()),
-                RequestPhase::Delivered => {}
-                _ => return Err(WorkError::Conflict),
-            }
-            if ledger.driver_closed {
-                return Err(WorkError::Closed);
-            }
-            let changes = request.changes.clone();
-            if changes
-                .iter()
-                .any(|c| c.claim.facts.lane != JointLane::Settlement)
-            {
-                state
-                    .nodes
-                    .get(&request.owner)
-                    .ok_or(WorkError::Released)?
-                    .check(&state.cancellations)?;
-            }
-            let sources = changes.iter().filter_map(|c| c.source.as_ref());
-            if originals.len()
-                != sources
-                    .clone()
-                    .filter(|source| matches!(source.source, ClaimSource::Physical))
-                    .count()
-                || control_scope.is_some()
-                    != sources
-                        .clone()
-                        .any(|source| matches!(source.source, ClaimSource::NodeControl { .. }))
-            {
-                return Err(WorkError::Conflict);
-            }
-            for source in sources {
-                match source.source {
-                    ClaimSource::Physical => {
-                        let original = originals
-                            .iter()
-                            .find(|original| original.id == Some(source.id))
-                            .ok_or(WorkError::Conflict)?;
-                        if !Arc::ptr_eq(&original.inner, &self.inner) {
-                            return Err(WorkError::ForeignAuthority);
-                        }
-                    }
-                    ClaimSource::NodeControl { work, .. } => {
-                        let original = control_scope.as_ref().ok_or(WorkError::Conflict)?;
-                        if !Arc::ptr_eq(&original.inner, &self.inner) {
-                            return Err(WorkError::ForeignAuthority);
-                        }
-                        if original.id != work || original.id != request.owner {
-                            return Err(WorkError::Conflict);
-                        }
-                    }
-                    ClaimSource::PoolFree { .. } => return Err(WorkError::Conflict),
-                }
-                let record = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
-                if record.pending != Some(id) {
-                    return Err(WorkError::Conflict);
-                }
-                if matches!(source.source, ClaimSource::NodeControl { .. }) {
-                    // The exact pending ticket excludes another control grant,
-                    // and control partial release is not exposed. Its sole
-                    // intervening structural change is this original grant.
-                    let mut committed = source.clone();
-                    committed.structure_revision = committed
-                        .structure_revision
-                        .checked_add(1)
-                        .ok_or(WorkError::ArithmeticOverflow)?;
-                    authenticate_scope(state, record, &committed, request.owner)?;
-                } else if record.owner != ClaimOwner::PhysicalWork(request.owner) {
-                    return Err(WorkError::Conflict);
-                }
-                // Physical holders may report an actual partial release after
-                // grant. Adopt their remaining live amount, never the snapshot.
-                record
-                    .structure_revision
-                    .checked_add(1)
-                    .ok_or(WorkError::ArithmeticOverflow)?;
-            }
-            let ledger = state.joint.as_mut().unwrap();
-            for change in changes.iter() {
-                if let Some(old) = change.old {
-                    let record = ledger.claims.get_mut(&old).unwrap();
-                    record.active_facts = Arc::clone(&record.facts);
-                    record.active_amounts = record.amounts;
-                    record.pending = None;
-                    record.structure_revision += 1;
-                }
-            }
-            remove_request(state, id);
-            Ok(())
+            self.install_originals_state(state, id, originals, control_scope.as_ref(), false)
         });
         if result.is_ok() {
             self.id = None;
         }
         // Error leaves the RAII ticket armed; Drop rolls back only live delta.
         result
+    }
+    // Both public receipt routes use this exact original validation/commit.
+    fn install_originals_state(
+        &self,
+        state: &mut State,
+        id: u64,
+        originals: &[&JointClaim],
+        control_scope: Option<&WorkScope>,
+        control_only: bool,
+    ) -> Result<(), WorkError> {
+        let ledger = state.joint.as_ref().unwrap();
+        let request = ledger.requests.get(&id).ok_or(WorkError::Released)?;
+        match &request.phase {
+            RequestPhase::Failed(error) => return Err(error.clone()),
+            RequestPhase::Delivered => {}
+            _ => return Err(WorkError::Conflict),
+        }
+        if ledger.driver_closed {
+            return Err(WorkError::Closed);
+        }
+        let changes = request.changes.clone();
+        if control_only {
+            let scope = control_scope.ok_or(WorkError::Conflict)?;
+            if request.owner != scope.id {
+                return Err(WorkError::Conflict);
+            }
+            validate_control_binding_shape(state, scope, &changes)?;
+        }
+        if changes
+            .iter()
+            .any(|c| c.claim.facts.lane != JointLane::Settlement)
+        {
+            state
+                .nodes
+                .get(&request.owner)
+                .ok_or(WorkError::Released)?
+                .check(&state.cancellations)?;
+        }
+        let sources = changes.iter().filter_map(|c| c.source.as_ref());
+        if originals.len()
+            != sources
+                .clone()
+                .filter(|source| matches!(source.source, ClaimSource::Physical))
+                .count()
+            || control_scope.is_some()
+                != sources
+                    .clone()
+                    .any(|source| matches!(source.source, ClaimSource::NodeControl { .. }))
+        {
+            return Err(WorkError::Conflict);
+        }
+        for source in sources {
+            match source.source {
+                ClaimSource::Physical => {
+                    let original = originals
+                        .iter()
+                        .find(|original| original.id == Some(source.id))
+                        .ok_or(WorkError::Conflict)?;
+                    if !Arc::ptr_eq(&original.inner, &self.inner) {
+                        return Err(WorkError::ForeignAuthority);
+                    }
+                }
+                ClaimSource::NodeControl { work, .. } => {
+                    let original = control_scope.ok_or(WorkError::Conflict)?;
+                    if !Arc::ptr_eq(&original.inner, &self.inner) {
+                        return Err(WorkError::ForeignAuthority);
+                    }
+                    if original.id != work || original.id != request.owner {
+                        return Err(WorkError::Conflict);
+                    }
+                }
+                ClaimSource::PoolFree { .. } => return Err(WorkError::Conflict),
+            }
+            let record = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
+            if record.pending != Some(id) {
+                return Err(WorkError::Conflict);
+            }
+            if matches!(source.source, ClaimSource::NodeControl { .. }) {
+                // The exact pending ticket excludes another control grant,
+                // and control partial release is not exposed. Its sole
+                // intervening structural change is this original grant.
+                let mut committed = source.clone();
+                committed.structure_revision = committed
+                    .structure_revision
+                    .checked_add(1)
+                    .ok_or(WorkError::ArithmeticOverflow)?;
+                authenticate_scope(state, record, &committed, request.owner)?;
+            } else if record.owner != ClaimOwner::PhysicalWork(request.owner) {
+                return Err(WorkError::Conflict);
+            }
+            // Physical holders may report an actual partial release after
+            // grant. Adopt their remaining live amount, never the snapshot.
+            record
+                .structure_revision
+                .checked_add(1)
+                .ok_or(WorkError::ArithmeticOverflow)?;
+        }
+        let ledger = state.joint.as_mut().unwrap();
+        for change in changes.iter() {
+            if let Some(old) = change.old {
+                let record = ledger.claims.get_mut(&old).unwrap();
+                record.active_facts = Arc::clone(&record.facts);
+                record.active_amounts = record.amounts;
+                record.pending = None;
+                record.structure_revision += 1;
+            }
+        }
+        remove_request(state, id);
+        Ok(())
     }
 }
 impl Drop for JointAdjustmentReceipt {

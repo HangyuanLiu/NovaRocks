@@ -11,6 +11,7 @@ workspace = true
 [features]
 
 [dependencies]
+novarocks-resource-contract.workspace = true
 novarocks-transport-io.workspace = true
 novarocks-result-contract.workspace = true
 novarocks-result-render.workspace = true

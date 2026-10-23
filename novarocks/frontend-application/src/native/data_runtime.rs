@@ -157,7 +157,31 @@ pub(super) struct NativeDialReservation {
     leader: bool,
 }
 
+// A test-only, non-owning observer of the original election. It cannot
+// publish, retire, acquire a lane, or mint another cache/Work identity.
+#[cfg(test)]
+pub(super) struct NativeDialObservationForTest {
+    pub(super) slot: NativeChannelSlot,
+    generation: std::sync::Weak<DialGeneration>,
+}
+
+#[cfg(test)]
+impl NativeDialObservationForTest {
+    pub(super) fn matches(&self, reservation: &NativeDialReservation) -> bool {
+        self.slot == reservation.slot
+            && std::sync::Weak::ptr_eq(&self.generation, &Arc::downgrade(&reservation.generation))
+    }
+}
+
 impl NativeDialReservation {
+    #[cfg(test)]
+    pub(super) fn observe_for_test(&self) -> NativeDialObservationForTest {
+        NativeDialObservationForTest {
+            slot: self.slot.clone(),
+            generation: Arc::downgrade(&self.generation),
+        }
+    }
+
     pub(super) fn data_runtime(&self) -> &FrontendDataRuntime {
         &self.runtime
     }

@@ -33,7 +33,8 @@ use novarocks_query_application::{
 use super::domain_state::{InternalDomainFailure, InternalDomainSlot, InternalDomainState};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::internal_result_cpu::{
-    InternalResultCpu, InternalResultCpuJob, InternalResultValue,
+    InternalResultCpu, InternalResultCpuJob, InternalResultOperation as Operation,
+    InternalResultValue,
 };
 use crate::task_execution::status_intake::NotifyWake;
 
@@ -59,24 +60,6 @@ pub(crate) struct DomainCpuCustody {
     cancellation: QueryCancellationView,
     registration: futures::task::AtomicWaker,
     receipt_wake: futures::task::AtomicWaker,
-}
-
-enum Operation {
-    Body(Arc<RetainedRootReply>),
-    End(RootResultEnd),
-    FinishStatistics,
-    AcceptWrite(crate::query_execution::write_session::WriteReceivingPort),
-}
-
-impl Operation {
-    fn apply(self, slot: InternalDomainSlot) -> Result<InternalDomainSlot, InternalDomainFailure> {
-        match self {
-            Self::Body(reply) => slot.apply_body(reply),
-            Self::End(end) => slot.finish_eof(end),
-            Self::FinishStatistics => slot.finish_statistics(),
-            Self::AcceptWrite(receiving) => slot.accept_write(receiving),
-        }
-    }
 }
 
 impl DomainCpuCustody {
@@ -168,12 +151,12 @@ impl DomainCpuCustody {
                 return Err(error);
             }
         };
-        let job = self.cpu.submit(
+        let job = self.cpu.submit_operation(
             input,
             self.cancellation.clone(),
             &self.runtime,
             Arc::new(NotifyWake::new(Arc::new(tokio::sync::Notify::new()))),
-            move |slot, _| operation.apply(slot),
+            operation,
         );
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.job = Some(job);

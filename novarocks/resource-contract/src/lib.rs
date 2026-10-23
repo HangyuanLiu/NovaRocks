@@ -31,13 +31,54 @@ use std::{
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NetworkServiceOrigin(Arc<str>);
 
+/// The HTTP service protocol already selected by the original transport.
+/// This is a fact, not TLS material, an admission or permission to dial.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetworkServiceScheme {
+    Http,
+    Https,
+}
+impl NetworkServiceScheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+    fn default_port(self) -> u16 {
+        match self {
+            Self::Http => 80,
+            Self::Https => 443,
+        }
+    }
+}
+
+// Existing URL hosts retain their exact original serialization. Typed IPs use
+// that same URL crate's Host Display, including IPv4-mapped IPv6. No new host
+// parser, DNS lookup or Native-specific dependency enters this neutral crate.
+#[derive(Clone, Copy, Debug)]
+enum OriginHost<'a> {
+    Serialized(&'a str),
+    Ipv4(std::net::Ipv4Addr),
+    Ipv6(std::net::Ipv6Addr),
+}
+impl fmt::Display for OriginHost<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Serialized(host) => f.write_str(host),
+            Self::Ipv4(ip) => fmt::Display::fmt(&url::Host::<&str>::Ipv4(*ip), f),
+            Self::Ipv6(ip) => fmt::Display::fmt(&url::Host::<&str>::Ipv6(*ip), f),
+        }
+    }
+}
+
 /// A validated, allocation-free view of an already selected route's origin.
-/// Its host borrows the original URL; parsing and input custody stay with that
-/// route owner. Keeping this view grants no resource or execution authority.
+/// Input parsing, normalization and custody stay with that original route
+/// owner. Keeping this view grants no resource or execution authority.
 #[derive(Clone, Copy, Debug)]
 pub struct SelectedNetworkOrigin<'a> {
     scheme: &'a str,
-    host: &'a str,
+    host: OriginHost<'a>,
     port: Option<u16>,
     bytes: usize,
 }
@@ -51,38 +92,100 @@ impl<'a> SelectedNetworkOrigin<'a> {
             .host_str()
             .filter(|host| !host.is_empty())
             .ok_or(DependencyFactError::InvalidNetworkOrigin)?;
-        let port = selected.port();
-        let suffix = port.map_or(0, |port| {
-            1 + port.checked_ilog10().map_or(1, |log| log as usize + 1)
-        });
-        let bytes = scheme
-            .len()
-            .checked_add(3)
-            .and_then(|len| len.checked_add(host.len()))
-            .and_then(|len| len.checked_add(suffix))
-            .filter(|len| *len <= NetworkServiceOrigin::MAX_BYTES)
-            .ok_or(DependencyFactError::EndpointTooLong)?;
-        Ok(Self {
+        Self::checked(scheme, OriginHost::Serialized(host), selected.port())
+    }
+
+    /// Borrow the typed host and explicit port already selected/normalized by
+    /// the original route owner. Native callers pass their actual canonical
+    /// reference host and actual TLS policy, never a Tonic dummy origin.
+    ///
+    /// Domain input must already be canonical lowercase ASCII (A-labels).
+    /// Reject delimiters, user information, path, percent escapes and whitespace
+    /// rather than interpreting or normalizing a hand-built Domain value.
+    /// This does not authenticate the caller's route choice or grant a dial.
+    pub fn from_selected_host(
+        scheme: NetworkServiceScheme,
+        host: url::Host<&'a str>,
+        port: u16,
+    ) -> Result<Self, DependencyFactError> {
+        let host = match host {
+            url::Host::Domain(host) => {
+                if host.is_empty()
+                    || !host.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'-' | b'.' | b'_')
+                    })
+                {
+                    return Err(DependencyFactError::InvalidNetworkOrigin);
+                }
+                OriginHost::Serialized(host)
+            }
+            url::Host::Ipv4(ip) => OriginHost::Ipv4(ip),
+            url::Host::Ipv6(ip) => OriginHost::Ipv6(ip),
+        };
+        Self::checked(
+            scheme.as_str(),
+            host,
+            (port != scheme.default_port()).then_some(port),
+        )
+    }
+
+    fn checked(
+        scheme: &'a str,
+        host: OriginHost<'a>,
+        port: Option<u16>,
+    ) -> Result<Self, DependencyFactError> {
+        let mut selected = Self {
             scheme,
             host,
             port,
-            bytes,
-        })
+            bytes: 0,
+        };
+        let mut count = OriginCounter(0);
+        selected
+            .write_origin(&mut count)
+            .map_err(|_| DependencyFactError::EndpointTooLong)?;
+        selected.bytes = count.0;
+        Ok(selected)
+    }
+
+    fn write_origin(self, target: &mut impl fmt::Write) -> fmt::Result {
+        write!(target, "{}://{}", self.scheme, self.host)?;
+        if let Some(port) = self.port {
+            write!(target, ":{port}")?;
+        }
+        Ok(())
     }
 
     /// Allocate the canonical output only after its original owner has prepaid
     /// both the String and final Arc that coexist during this conversion.
     pub fn into_owned(self) -> NetworkServiceOrigin {
         let mut origin = String::with_capacity(self.bytes);
-        origin.push_str(self.scheme);
-        origin.push_str("://");
-        origin.push_str(self.host);
-        if let Some(port) = self.port {
-            write!(&mut origin, ":{port}").expect("writing to a bounded String cannot fail");
-        }
+        self.write_origin(&mut origin)
+            .expect("writing to a bounded String cannot fail");
         debug_assert_eq!(origin.len(), self.bytes);
         debug_assert!(origin.is_ascii());
         NetworkServiceOrigin(Arc::from(origin))
+    }
+}
+
+struct OriginCounter(usize);
+impl fmt::Write for OriginCounter {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.0 = self
+            .0
+            .checked_add(value.len())
+            .filter(|bytes| *bytes <= NetworkServiceOrigin::MAX_BYTES)
+            .ok_or(fmt::Error)?;
+        Ok(())
+    }
+}
+struct OriginComparison<'a>(&'a str);
+impl fmt::Write for OriginComparison<'_> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.0 = self.0.strip_prefix(value).ok_or(fmt::Error)?;
+        Ok(())
     }
 }
 impl NetworkServiceOrigin {
@@ -102,25 +205,8 @@ impl NetworkServiceOrigin {
         if self.0.len() != selected.bytes {
             return false;
         }
-        let Some(suffix) = self
-            .0
-            .strip_prefix(selected.scheme)
-            .and_then(|rest| rest.strip_prefix("://"))
-            .and_then(|rest| rest.strip_prefix(selected.host))
-        else {
-            return false;
-        };
-        match selected.port {
-            None => suffix.is_empty(),
-            // This owned value can only be created by the canonical decimal
-            // author above; length equality also preserves its exact width.
-            Some(port) => {
-                suffix
-                    .strip_prefix(':')
-                    .and_then(|port| port.parse::<u16>().ok())
-                    == Some(port)
-            }
-        }
+        let mut comparison = OriginComparison(&self.0);
+        selected.write_origin(&mut comparison).is_ok() && comparison.0.is_empty()
     }
 
     pub fn as_str(&self) -> &str {
@@ -314,5 +400,117 @@ mod tests {
                     .matches_selected(SelectedNetworkOrigin::from_selected_url(&selected).unwrap())
             );
         }
+    }
+
+    #[test]
+    fn typed_selected_hosts_match_the_original_url_origin_without_input_reparsing() {
+        for input in [
+            "http://EXAMPLE.org:80/path?token=private",
+            "https://EXAMPLE.org:443/other#private",
+            "http://127.0.0.1:8080/path",
+            "https://[2001:0DB8::1]:443/path",
+            "http://[::ffff:192.0.2.1]:80/path",
+            "https://[::ffff:192.0.2.1]:8443/path",
+            "https://xn--bcher-kva.example:443/path",
+            "https://example.org:0/path",
+            "https://example.org:65535/path",
+        ] {
+            let selected = url::Url::parse(input).unwrap();
+            let scheme = if selected.scheme() == "https" {
+                NetworkServiceScheme::Https
+            } else {
+                NetworkServiceScheme::Http
+            };
+            let view = SelectedNetworkOrigin::from_selected_host(
+                scheme,
+                selected.host().unwrap(),
+                selected.port_or_known_default().unwrap(),
+            )
+            .unwrap();
+            let fact = view.into_owned();
+            assert_eq!(fact.as_str(), selected.origin().ascii_serialization());
+            assert!(fact.matches_selected(view));
+            assert!(
+                fact.matches_selected(SelectedNetworkOrigin::from_selected_url(&selected).unwrap())
+            );
+            assert_eq!(
+                fact,
+                NetworkServiceOrigin::from_selected_url(&selected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn typed_domain_input_rejects_non_origin_bytes_and_preserves_exact_output_limit() {
+        for host in [
+            "",
+            "UPPER.example",
+            "user@host",
+            "host/path",
+            "host?token=x",
+            "host#token",
+            "host:443",
+            "host%2eexample",
+            " host",
+            "host\n",
+            "[::1]",
+            "bücher.example",
+        ] {
+            assert_eq!(
+                SelectedNetworkOrigin::from_selected_host(
+                    NetworkServiceScheme::Https,
+                    url::Host::Domain(host),
+                    443
+                )
+                .unwrap_err(),
+                DependencyFactError::InvalidNetworkOrigin
+            );
+        }
+        for port in [443, 8443, 0, 65535] {
+            let suffix = if port == 443 {
+                String::new()
+            } else {
+                format!(":{port}")
+            };
+            let host =
+                "a".repeat(NetworkServiceOrigin::MAX_BYTES - "https://".len() - suffix.len());
+            let view = SelectedNetworkOrigin::from_selected_host(
+                NetworkServiceScheme::Https,
+                url::Host::Domain(&host),
+                port,
+            )
+            .unwrap();
+            let selected =
+                url::Url::parse(&format!("https://{host}{suffix}/not-retained")).unwrap();
+            assert_eq!(
+                view.into_owned().as_str(),
+                selected.origin().ascii_serialization()
+            );
+            let too_long = format!("{host}a");
+            assert_eq!(
+                SelectedNetworkOrigin::from_selected_host(
+                    NetworkServiceScheme::Https,
+                    url::Host::Domain(&too_long),
+                    port
+                )
+                .unwrap_err(),
+                DependencyFactError::EndpointTooLong
+            );
+        }
+        let selected = SelectedNetworkOrigin::from_selected_host(
+            NetworkServiceScheme::Https,
+            url::Host::Domain("selected.example"),
+            443,
+        )
+        .unwrap()
+        .into_owned();
+        let alias = SelectedNetworkOrigin::from_selected_host(
+            NetworkServiceScheme::Https,
+            url::Host::Domain("alias.example"),
+            443,
+        )
+        .unwrap()
+        .into_owned();
+        assert_ne!(selected, alias, "DNS alias equivalence is not guessed");
     }
 }

@@ -39,7 +39,8 @@ use crate::query_execution::internal_consumer::domain_state::{
     InternalDomainFailure, InternalDomainSlot, InternalDomainState,
 };
 use crate::query_execution::internal_result_cpu::{
-    InternalResultCpu, InternalResultCpuJob, InternalResultValue, require_internal_result_capacity,
+    InternalResultCpu, InternalResultCpuJob, InternalResultOperation, InternalResultValue,
+    require_internal_result_capacity,
 };
 use crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics;
 use crate::query_execution::lifecycle_plan::{QueryCredentialLeases, QueryInitOptions};
@@ -1778,7 +1779,6 @@ impl FrontendDistributedQueryCoordinator {
                                     })
                                     .and_then(|domain| {
                                         domain
-                                            .transform(|domain, _| (domain, *reply))
                                             .track_actual_exit(
                                                 internal_capacity
                                                     .as_ref()
@@ -1805,12 +1805,12 @@ impl FrontendDistributedQueryCoordinator {
                                     self.internal_result_cpu
                                         .as_ref()
                                         .expect("Internal admission validates its CPU runtime")
-                                        .submit(
+                                        .submit_operation(
                                             input,
                                             cancellation.clone(),
                                             &self.data_runtime,
                                             Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
-                                            |(domain, reply), _| domain.apply_body(Arc::new(reply)),
+                                            InternalResultOperation::Body(Arc::new(*reply)),
                                         ),
                                 );
                                 // The actual CPU completion, never enqueue, owns ACK.
@@ -1825,7 +1825,6 @@ impl FrontendDistributedQueryCoordinator {
                                         })
                                         .and_then(|domain| {
                                             domain
-                                                .transform(|domain, _| (domain, end))
                                                 .track_actual_exit(binding)
                                         });
                                     let input = match input {
@@ -1848,12 +1847,12 @@ impl FrontendDistributedQueryCoordinator {
                                         self.internal_result_cpu
                                             .as_ref()
                                             .expect("Internal admission validates its CPU runtime")
-                                            .submit(
+                                            .submit_operation(
                                                 input,
                                                 cancellation.clone(),
                                                 &self.data_runtime,
                                                 Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
-                                                |(domain, end), _| domain.finish_eof(end),
+                                                InternalResultOperation::End(end),
                                             ),
                                     );
                                     continue;
@@ -2062,12 +2061,12 @@ impl FrontendDistributedQueryCoordinator {
                                         self.internal_result_cpu
                                             .as_ref()
                                             .expect("Internal CPU runtime")
-                                            .submit(
+                                            .submit_operation(
                                                 input,
                                                 cancellation.clone(),
                                                 &self.data_runtime,
                                                 Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
-                                                |domain, _| domain.finish_statistics(),
+                                                InternalResultOperation::FinishStatistics,
                                             ),
                                     );
                                     moved = true;

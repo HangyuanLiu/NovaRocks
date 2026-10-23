@@ -259,3 +259,7 @@ impl ReservedNativeDial {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "cold_dial_tests.rs"]
+mod tests;
