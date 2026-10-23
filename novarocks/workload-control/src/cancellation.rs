@@ -15,7 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod children;
+
+#[cfg(test)]
+mod fixed_children_tests;
+
 use crate::WorkId;
+use children::{Children, SharedChildIndex};
+pub(crate) use children::{new_shared_child_index, shared_child_index_backing_bytes};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::{sync::Notify, time::Instant};
 
@@ -35,7 +42,7 @@ pub enum CancellationReason {
 struct State {
     reason: Option<CancellationReason>,
     success_sealed: bool,
-    children: Vec<ChildLink>,
+    children: Children,
 }
 
 struct ChildLink {
@@ -72,38 +79,35 @@ pub(crate) struct Cancellation {
 }
 
 impl Cancellation {
-    pub(crate) fn preallocated(children: usize) -> Result<Arc<Self>, crate::WorkError> {
+    pub(crate) fn preallocated_fixed(
+        shared: SharedChildIndex,
+        parent_slot: usize,
+        limit: usize,
+    ) -> Arc<Self> {
         let mut cell = Self::root(None);
         Arc::get_mut(&mut cell)
             .unwrap()
             .state
             .get_mut()
             .unwrap()
-            .children
-            .try_reserve_exact(children)
-            .map_err(|_| crate::WorkError::Capacity("control child backing"))?;
+            .children = Children::fixed(shared, parent_slot, limit);
         // Initialize the supported platform's lazy mutexes before publication.
         let _ = cell.check_reason();
         {
             let mut notified = std::pin::pin!(cell.changed.notified());
             notified.as_mut().enable();
         }
-        Ok(cell)
-    }
-
-    pub(crate) fn children_backing_bytes(capacity: usize) -> Result<usize, crate::WorkError> {
-        std::alloc::Layout::array::<ChildLink>(capacity)
-            .map(|layout| layout.size())
-            .map_err(|_| crate::WorkError::ArithmeticOverflow)
+        cell
     }
 
     pub(crate) fn reuse_root(&mut self, deadline: Option<Instant>) {
         assert!(self.parent.is_none(), "Free cell has no previous parent");
         let state = self.state.get_mut().unwrap();
         assert!(
-            state.reason.is_none() && !state.success_sealed && state.children.is_empty(),
+            state.reason.is_none() && !state.success_sealed,
             "Free cell was exclusively reset"
         );
+        state.children.assert_empty_for_reuse();
         self.deadline = deadline;
     }
 
@@ -119,32 +123,21 @@ impl Cancellation {
             (parent, child) => parent.or(child),
         };
         let mut state = parent.state.lock().unwrap();
-        if state.children.len() == state.children.capacity() {
-            return Err(crate::WorkError::Capacity("prepaid parent child backing"));
-        }
+        let Children::Fixed(children) = &mut state.children else {
+            return Err(crate::WorkError::Conflict);
+        };
         let child = Arc::get_mut(cell).ok_or(crate::WorkError::Conflict)?;
+        children.preflight(&child.state.get_mut().unwrap().children, sequence)?;
         child.reuse_root(deadline);
         child.parent = Some(ParentLink {
             parent: Arc::clone(parent),
             sequence,
         });
         child.state.get_mut().unwrap().reason = state.reason.clone().or(inherited);
-        let index = state
-            .children
-            .partition_point(|link| link.sequence < sequence);
-        assert!(
-            state
-                .children
-                .get(index)
-                .is_none_or(|link| link.sequence != sequence)
-        );
-        state.children.insert(
-            index,
-            ChildLink {
-                sequence,
-                child: Arc::downgrade(cell),
-            },
-        );
+        let Children::Fixed(children) = &mut state.children else {
+            unreachable!()
+        };
+        children.insert_preflighted(sequence, Arc::downgrade(cell));
         Ok(())
     }
 
@@ -152,7 +145,7 @@ impl Cancellation {
         let state = self.state.get_mut().unwrap();
         state.reason = None;
         state.success_sealed = false;
-        state.children.clear(); // Keep the same prepaid allocation and capacity.
+        state.children.reset(); // Retain the same original shared index and logical limit.
         self.deadline = None;
         // Only notify_waiters is used here. With no old Notified borrower,
         // the existing Notify can be retained together with its paid mutex.
@@ -178,6 +171,10 @@ impl Cancellation {
         deadline: Option<Instant>,
         sequence: WorkId,
     ) -> Arc<Self> {
+        assert!(
+            matches!(self.state.lock().unwrap().children, Children::Dynamic(_)),
+            "fixed children require the original prepaid child slot"
+        );
         let inherited = self.check_reason();
         let deadline = match (self.deadline, deadline) {
             (Some(parent), Some(child)) => Some(parent.min(child)),
@@ -198,18 +195,18 @@ impl Cancellation {
         // State across checked ID creation and registration. Sorted insertion
         // also supports fixtures whose concurrent registrations arrive out of order.
         let mut state = self.state.lock().unwrap();
-        state.children.retain(|link| link.child.strong_count() != 0);
-        let index = state
-            .children
-            .partition_point(|link| link.sequence < sequence);
+        let Children::Dynamic(children) = &mut state.children else {
+            unreachable!()
+        };
+        children.retain(|link| link.child.strong_count() != 0);
+        let index = children.partition_point(|link| link.sequence < sequence);
         assert!(
-            state
-                .children
+            children
                 .get(index)
                 .is_none_or(|link| link.sequence != sequence),
             "Cancellation child sequences must be unique"
         );
-        state.children.insert(
+        children.insert(
             index,
             ChildLink {
                 sequence,
@@ -240,8 +237,9 @@ impl Cancellation {
     }
 
     #[cfg(test)]
-    pub(crate) fn child_capacity_for_test(&self) -> usize {
-        self.state.lock().unwrap().children.capacity()
+    pub(crate) fn fixed_child_facts_for_test(&self) -> (usize, *const (), usize) {
+        let (limit, shared, edges) = self.state.lock().unwrap().children.fixed_facts();
+        (limit, shared.cast(), edges)
     }
 
     /// Commit one local first-wins decision without walking or waking.
@@ -279,15 +277,7 @@ impl Cancellation {
 
     /// Sequence cursors survive concurrent detach/retain; no Vec index escapes.
     fn next_child_after(&self, after: Option<WorkId>) -> Option<Arc<Self>> {
-        let state = self.state.lock().unwrap();
-        let index = after.map_or(0, |sequence| {
-            state
-                .children
-                .partition_point(|link| link.sequence <= sequence)
-        });
-        state.children[index..]
-            .iter()
-            .find_map(|link| link.child.upgrade())
+        self.state.lock().unwrap().children.next_after(after)
     }
 
     pub(crate) fn request(&self, reason: CancellationReason) -> CancellationRequestOutcome {
@@ -383,9 +373,12 @@ impl Cancellation {
     pub(crate) fn detach(self: &Arc<Self>) {
         if let Some(link) = &self.parent {
             let this = Arc::downgrade(self);
-            link.parent.state.lock().unwrap().children.retain(|child| {
-                child.sequence != link.sequence || !Weak::ptr_eq(&child.child, &this)
-            });
+            link.parent
+                .state
+                .lock()
+                .unwrap()
+                .children
+                .detach_exact(link.sequence, &this);
         }
     }
 
@@ -909,9 +902,11 @@ mod tests {
         });
         {
             let state = root.state.lock().unwrap();
+            let Children::Dynamic(children) = &state.children else {
+                unreachable!()
+            };
             assert!(
-                state
-                    .children
+                children
                     .windows(2)
                     .all(|pair| pair[0].sequence < pair[1].sequence)
             );

@@ -566,10 +566,9 @@ pub(crate) fn btree_peak_bytes<K, V>(entries: usize) -> Result<usize, WorkError>
         .ok_or(WorkError::ArithmeticOverflow)
 }
 
-pub(crate) fn storage_cell_bytes(children: usize) -> Result<usize, WorkError> {
+pub(crate) fn storage_cell_bytes() -> Result<usize, WorkError> {
     arc_bytes::<Cancellation>()?
-        .checked_add(Cancellation::children_backing_bytes(children)?)
-        .and_then(|n| n.checked_add(size_of::<ControlSlot>()))
+        .checked_add(size_of::<ControlSlot>())
         .and_then(|n| n.checked_add(if cfg!(target_os = "macos") { 128 } else { 0 }))
         .ok_or(WorkError::ArithmeticOverflow)
 }

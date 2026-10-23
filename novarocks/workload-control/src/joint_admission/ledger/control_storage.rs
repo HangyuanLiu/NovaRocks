@@ -44,15 +44,17 @@ pub(crate) fn control_storage_base(
         .checked_add(arc_bytes::<proposal_storage::ProposalBody>()?)
         .and_then(|n| n.checked_mul(config.proposals_per_slot))
         .ok_or(WorkError::ArithmeticOverflow)?;
-    let cell = storage_cell_bytes(config.children_per_slot)?
+    let cell = storage_cell_bytes()?
         .checked_add(proposal_bytes)
         .ok_or(WorkError::ArithmeticOverflow)?;
     let proposals = count
         .checked_mul(config.proposals_per_slot)
         .ok_or(WorkError::ArithmeticOverflow)?;
+    let shared_children = crate::cancellation::shared_child_index_backing_bytes(count)?;
     let mut bytes = cell
         .checked_mul(count)
         .and_then(|n| n.checked_add(std::mem::size_of::<CancellationStorage>()))
+        .and_then(|n| n.checked_add(shared_children))
         .ok_or(WorkError::ArithmeticOverflow)?;
     bytes = bytes
         .checked_add(metadata_geometry::backing_bytes(
@@ -196,6 +198,7 @@ impl WorkloadControl {
                 ));
             }
             let dependencies = DependencyRegistry::new(declared.max_registered_dependencies)?;
+            let shared_children = crate::cancellation::new_shared_child_index();
             let mut slots = Vec::new();
             slots
                 .try_reserve_exact(count)
@@ -228,8 +231,11 @@ impl WorkloadControl {
                 empty_facts[class] = Some(Arc::clone(&facts));
                 free_heads[class] = Some(SlotId(slots.len()));
                 for offset in 0..n {
-                    let cell =
-                        crate::cancellation::Cancellation::preallocated(config.children_per_slot)?;
+                    let cell = crate::cancellation::Cancellation::preallocated_fixed(
+                        Arc::clone(&shared_children),
+                        slots.len(),
+                        config.children_per_slot,
+                    );
                     let claim = state.next_id()?;
                     let id = SlotId(slots.len());
                     let mut proposals = Vec::new();

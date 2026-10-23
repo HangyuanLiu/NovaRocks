@@ -1392,7 +1392,7 @@ fn leaf_parent_hint_reclaims_a_retired_chain_in_linear_cell_checks() {
         owners.push(child);
     }
     let view = parent.cancellation().unwrap();
-    let (root_slot, capacity) = {
+    let (root_slot, (limit, shared, edges)) = {
         let state = control.inner.state.lock().unwrap();
         let root_slot = state.nodes[&root_scope.id].cancellation;
         (
@@ -1400,9 +1400,11 @@ fn leaf_parent_hint_reclaims_a_retired_chain_in_linear_cell_checks() {
             state
                 .cancellations
                 .cell(root_slot)
-                .child_capacity_for_test(),
+                .fixed_child_facts_for_test(),
         )
     };
+    assert_eq!(limit, 1);
+    assert_eq!(edges, count - 1);
     work.business.release();
     for owner in owners {
         owner.complete();
@@ -1430,8 +1432,8 @@ fn leaf_parent_hint_reclaims_a_retired_chain_in_linear_cell_checks() {
         state
             .cancellations
             .cell(root_slot)
-            .child_capacity_for_test(),
-        capacity
+            .fixed_child_facts_for_test(),
+        (limit, shared, 0)
     );
 }
 
@@ -1783,7 +1785,10 @@ fn storage_fanout_is_finite_configurable_and_charged_from_actual_layout() {
     };
     let narrow = crate::joint_admission::ledger::control_storage_base(narrow, &geometry).unwrap();
     let wider = crate::joint_admission::ledger::control_storage_base(wider, &geometry).unwrap();
-    assert!(wider.get(JointResource::MetadataBytes) > narrow.get(JointResource::MetadataBytes));
+    assert_eq!(
+        wider, narrow,
+        "fanout uses the same original N-slot edge inventory"
+    );
     assert!(matches!(
         crate::joint_admission::ledger::control_storage_base(impossible, &geometry),
         Err(WorkError::InvalidConfig("fixed control storage geometry"))
