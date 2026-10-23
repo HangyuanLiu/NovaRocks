@@ -2183,6 +2183,31 @@ mod fixed_control_storage_tests {
         count: usize,
         children_per_slot: usize,
     ) -> (WorkloadControl, JointProgressDriver) {
+        let (control, _, driver) = prototype_full(count, children_per_slot);
+        (control, driver)
+    }
+
+    fn prototype_full(
+        count: usize,
+        children_per_slot: usize,
+    ) -> (
+        WorkloadControl,
+        crate::joint_admission::JointAdmissionHandle,
+        JointProgressDriver,
+    ) {
+        prototype_profile(count, children_per_slot, 1, 1)
+    }
+
+    fn prototype_profile(
+        count: usize,
+        children_per_slot: usize,
+        max_dependencies: usize,
+        max_changes: usize,
+    ) -> (
+        WorkloadControl,
+        crate::joint_admission::JointAdmissionHandle,
+        JointProgressDriver,
+    ) {
         let storage = ControlStorageConfig {
             slots_per_class: [count, 0, 0, 0, 0],
             children_per_slot,
@@ -2213,11 +2238,11 @@ mod fixed_control_storage_tests {
             classes,
             lanes,
             class_lanes,
-            max_dependencies_per_claim: 1,
+            max_dependencies_per_claim: max_dependencies,
             max_registered_dependencies: count,
             max_claims: count * 2,
             max_requests: count,
-            max_changes_per_request: 1,
+            max_changes_per_request: max_changes,
             max_snapshot_bytes: 16 * 1024 * 1024,
             max_scratch_bytes: 16 * 1024 * 1024,
             max_residual_arcs: 10000,
@@ -2243,12 +2268,12 @@ mod fixed_control_storage_tests {
         })
         .unwrap()
         .owner;
-        let (_, driver) = control
+        let (handle, driver) = control
             .configure_joint_capacity(config.validate(&required).unwrap())
             .unwrap();
         control.configure_control_storage(storage).unwrap();
         control.mark_ready().unwrap();
-        (control, driver)
+        (control, handle, driver)
     }
 
     fn root(control: &WorkloadControl) -> RootWork {
@@ -2277,6 +2302,324 @@ mod fixed_control_storage_tests {
             .as_ref()
             .unwrap()
             .control_snapshot_for_test()
+    }
+
+    fn selected_dependency(
+        handle: &crate::joint_admission::JointAdmissionHandle,
+        name: &str,
+    ) -> crate::joint_admission::JointDependency {
+        use novarocks_resource_contract::{NetworkServiceOrigin, SharedDependency};
+        handle
+            .register_dependency(SharedDependency::Network(
+                NetworkServiceOrigin::from_selected_url(
+                    &url::Url::parse(&format!("https://{name}.example")).unwrap(),
+                )
+                .unwrap(),
+            ))
+            .unwrap()
+    }
+
+    fn first_bind(
+        handle: &crate::joint_admission::JointAdmissionHandle,
+        owner: &WorkOwner,
+        dependency: &crate::joint_admission::JointDependency,
+    ) -> crate::joint_admission::JointAdmission {
+        handle
+            .request(
+                &owner.scope(),
+                vec![crate::joint_admission::JointClaimChange::FirstBind {
+                    source: owner.control_claim_view().unwrap(),
+                    dependencies: vec![dependency.clone()],
+                }],
+            )
+            .unwrap()
+    }
+
+    fn binding_receipt(
+        request: &mut crate::joint_admission::JointAdmission,
+    ) -> crate::joint_admission::JointAdjustmentReceipt {
+        let Poll::Ready(Ok(batch)) =
+            std::pin::Pin::new(request).poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("the original proof must have granted the binding");
+        };
+        assert!(
+            batch.new_claims.is_empty(),
+            "binding cannot mint a physical guard"
+        );
+        batch.adjustment.unwrap()
+    }
+
+    #[test]
+    fn first_bind_preserves_base_and_requires_the_exact_original_owner_at_install() {
+        let (control, handle, mut driver) = prototype_full(4, 1);
+        let dependency = selected_dependency(&handle, "a");
+        let work = root(&control);
+        let other = root(&control);
+        let original_slot = slot(&control, work.owner.scope().id);
+        let initial = snapshot(&control);
+        let original_claim =
+            control.inner.state.lock().unwrap().cancellations.slots[original_slot.0].claim;
+        let mut request = first_bind(&handle, &work.owner, &dependency);
+        drain(&mut driver);
+        let charged = snapshot(&control);
+        assert_eq!(
+            (charged.0, charged.1, charged.2),
+            (initial.0, initial.1, initial.2)
+        );
+        assert_eq!(charged.3, 1);
+        let receipt = binding_receipt(&mut request);
+        assert!(matches!(
+            receipt.install_control(&other.owner, &[]),
+            Err(WorkError::Conflict)
+        ));
+        assert_eq!(
+            snapshot(&control),
+            initial,
+            "a refused install withdraws only this binding"
+        );
+
+        let mut request = first_bind(&handle, &work.owner, &dependency);
+        drain(&mut driver);
+        assert!(matches!(
+            binding_receipt(&mut request).install(&[]),
+            Err(WorkError::Conflict)
+        ));
+        assert_eq!(
+            snapshot(&control),
+            initial,
+            "ordinary physical install cannot forge control authority"
+        );
+
+        let mut request = first_bind(&handle, &work.owner, &dependency);
+        drain(&mut driver);
+        binding_receipt(&mut request)
+            .install_control(&work.owner, &[])
+            .unwrap();
+        let bound = snapshot(&control);
+        assert_eq!(bound, charged);
+        assert_eq!(
+            control.inner.state.lock().unwrap().cancellations.slots[original_slot.0].claim,
+            original_claim
+        );
+        let view = work.owner.scope().cancellation().unwrap();
+        work.business.release();
+        work.owner.complete();
+        drain(&mut driver);
+        assert_eq!(
+            snapshot(&control),
+            bound,
+            "retained backing keeps the installed domain fee"
+        );
+        drop(view);
+        other.business.release();
+        other.owner.complete();
+        drain(&mut driver);
+        assert_eq!(snapshot(&control), initial);
+    }
+
+    #[test]
+    fn first_bind_is_finite_under_one_bad_domain_and_preserves_healthy_progress() {
+        let (control, handle, mut driver) = prototype_full(3, 1);
+        let bad = selected_dependency(&handle, "bad");
+        let healthy = selected_dependency(&handle, "healthy");
+        let a = root(&control);
+        let b = root(&control);
+        let c = root(&control);
+        for owner in [&a.owner, &b.owner] {
+            let mut request = first_bind(&handle, owner, &bad);
+            drain(&mut driver);
+            binding_receipt(&mut request)
+                .install_control(owner, &[])
+                .unwrap();
+        }
+        let before = snapshot(&control);
+        let mut rejected = first_bind(&handle, &c.owner, &bad);
+        drain(&mut driver);
+        let Poll::Ready(Err(failure)) =
+            std::pin::Pin::new(&mut rejected).poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("a self-held first binding must fail rather than park");
+        };
+        assert!(matches!(failure.error, WorkError::Capacity(_)));
+        assert_eq!(snapshot(&control), before);
+        let mut request = first_bind(&handle, &c.owner, &healthy);
+        drain(&mut driver);
+        binding_receipt(&mut request)
+            .install_control(&c.owner, &[])
+            .unwrap();
+        for work in [a, b, c] {
+            work.business.release();
+            work.owner.complete();
+        }
+        drain(&mut driver);
+        assert_eq!(snapshot(&control).3, 0);
+    }
+
+    #[test]
+    fn first_bind_and_physical_growth_install_atomically_with_both_original_owners() {
+        use crate::joint_admission::{JointClaimChange, JointLane};
+        let (control, handle, mut driver) = prototype_profile(4, 1, 2, 2);
+        let a = selected_dependency(&handle, "a");
+        let b = selected_dependency(&handle, "b");
+        let work = root(&control);
+        let scope = work.owner.scope();
+        let mut request = handle
+            .request(
+                &scope,
+                vec![JointClaimChange::New {
+                    dependencies: vec![a.clone()],
+                    lane: JointLane::Custody,
+                    amounts: JointResources::ZERO
+                        .with(JointResource::ClaimRecords, 1)
+                        .with(JointResource::MetadataBytes, 1),
+                }],
+            )
+            .unwrap();
+        drain(&mut driver);
+        let Poll::Ready(Ok(mut batch)) =
+            std::pin::Pin::new(&mut request).poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("physical base grant");
+        };
+        let physical = batch.new_claims.pop().unwrap();
+        let before = snapshot(&control);
+        // Both source kinds share exact original claim deduplication.
+        let view = work.owner.control_claim_view().unwrap();
+        assert!(
+            handle
+                .request(
+                    &scope,
+                    vec![
+                        JointClaimChange::FirstBind {
+                            source: view.clone(),
+                            dependencies: vec![a.clone()]
+                        },
+                        JointClaimChange::FirstBind {
+                            source: view,
+                            dependencies: vec![b.clone()]
+                        },
+                    ]
+                )
+                .is_err()
+        );
+        for omit_physical in [true, false] {
+            let mut request = handle
+                .request(
+                    &scope,
+                    vec![
+                        JointClaimChange::FirstBind {
+                            source: work.owner.control_claim_view().unwrap(),
+                            dependencies: vec![a.clone(), b.clone()],
+                        },
+                        JointClaimChange::grow_by(
+                            physical.view().unwrap(),
+                            JointResources::ZERO.with(JointResource::MetadataBytes, 1),
+                            vec![b.clone()],
+                        ),
+                    ],
+                )
+                .unwrap();
+            drain(&mut driver);
+            let receipt = binding_receipt(&mut request);
+            assert_eq!(
+                physical
+                    .amounts()
+                    .unwrap()
+                    .get(JointResource::MetadataBytes),
+                1,
+                "charged delta is not installed permission"
+            );
+            if omit_physical {
+                assert!(matches!(
+                    receipt.install_control(&work.owner, &[]),
+                    Err(WorkError::Conflict)
+                ));
+                assert_eq!(
+                    snapshot(&control),
+                    before,
+                    "mixed withdrawal keeps the physical original"
+                );
+            } else {
+                receipt.install_control(&work.owner, &[&physical]).unwrap();
+                assert_eq!(
+                    physical
+                        .amounts()
+                        .unwrap()
+                        .get(JointResource::MetadataBytes),
+                    2
+                );
+                assert_eq!(snapshot(&control).3, 1);
+            }
+        }
+        assert!(matches!(
+            handle.request(
+                &scope,
+                vec![JointClaimChange::FirstBind {
+                    source: physical.view().unwrap(),
+                    dependencies: vec![a],
+                }]
+            ),
+            Err(crate::joint_admission::JointAdmissionFailure {
+                error: WorkError::Conflict
+            })
+        ));
+        drop(physical);
+        work.business.release();
+        work.owner.complete();
+        drain(&mut driver);
+        assert_eq!(snapshot(&control).3, 0);
+    }
+
+    #[test]
+    fn control_source_cannot_escape_through_grow_empty_binding_or_reused_slot() {
+        use crate::joint_admission::JointClaimChange;
+        let (control, handle, mut driver) = prototype_full(3, 1);
+        let dependency = selected_dependency(&handle, "a");
+        let work = root(&control);
+        let old_scope = work.owner.scope();
+        let old_slot = slot(&control, old_scope.id);
+        let old = work.owner.control_claim_view().unwrap();
+        for change in [
+            JointClaimChange::FirstBind {
+                source: old.clone(),
+                dependencies: vec![],
+            },
+            JointClaimChange::grow_by(old.clone(), JointResources::ZERO, vec![dependency.clone()]),
+            JointClaimChange::grow_by(
+                old.clone(),
+                JointResources::ZERO.with(JointResource::MetadataBytes, 1),
+                vec![dependency.clone()],
+            ),
+        ] {
+            assert!(matches!(
+                handle.request(&old_scope, vec![change]),
+                Err(crate::joint_admission::JointAdmissionFailure {
+                    error: WorkError::Conflict
+                })
+            ));
+        }
+        work.business.release();
+        work.owner.complete();
+        drain(&mut driver);
+        let replacement = root(&control);
+        let replacement_scope = replacement.owner.scope();
+        assert_eq!(slot(&control, replacement_scope.id), old_slot);
+        assert!(matches!(
+            handle.request(
+                &replacement_scope,
+                vec![JointClaimChange::FirstBind {
+                    source: old,
+                    dependencies: vec![dependency]
+                }]
+            ),
+            Err(crate::joint_admission::JointAdmissionFailure {
+                error: WorkError::Conflict
+            })
+        ));
+        replacement.business.release();
+        replacement.owner.complete();
+        drain(&mut driver);
     }
 
     #[test]

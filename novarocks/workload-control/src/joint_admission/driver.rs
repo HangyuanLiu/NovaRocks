@@ -339,7 +339,7 @@ impl JointProgressDriver {
                         .ok_or(WorkError::Released)?
                         .check(&state.cancellations)?;
                 }
-                validate_waiting(ledger, turn.id, &turn.changes)?;
+                validate_waiting(&state, turn.id, &turn.changes)?;
                 Ok(ledger.profile_layout_revision == turn.layout_revision)
             })()
         };
@@ -631,7 +631,7 @@ fn validate_turn_stop(
             .check(&state.cancellations)?;
     }
     if waiting {
-        validate_waiting(ledger, turn.id, &turn.changes)?;
+        validate_waiting(state, turn.id, &turn.changes)?;
     }
     Ok(())
 }

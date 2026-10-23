@@ -16,7 +16,7 @@
 // under the License.
 
 //! The original State's backing inventory, not another Work registry.
-//! Fixed storage is an internal substrate only. FirstBind, paid role requests,
+//! Fixed storage is an internal substrate only. Paid role requests,
 //! PoolFree proposals and production composition remain unimplemented.
 
 use crate::{
