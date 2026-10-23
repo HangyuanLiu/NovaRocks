@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Original Node custody for deadline cancellation notifications.
+//! Original Node custody for process-owned cancellation notifications.
 
 use super::*;
 use crate::cancellation::Cancellation;
@@ -61,16 +61,16 @@ impl Drop for DeliveryPin<'_> {
                 .get_mut(&self.work)
                 .expect("original notification pin retains its Node");
             assert!(matches!(
-                node.deadline_notification,
+                node.cancellation_notification,
                 Notification::Delivering
             ));
             if self.completed {
-                node.deadline_notification = Notification::Idle;
+                node.cancellation_notification = Notification::Idle;
                 node.cancellation_signalled = true;
             } else {
                 // Do not roll back another requester's first-wins, success,
                 // terminal-settlement, or already-signalled facts.
-                node.deadline_notification = Notification::Pending(self.reason.take().unwrap());
+                node.cancellation_notification = Notification::Pending(self.reason.take().unwrap());
             }
             state.advance_progress_revision();
             state.collect(self.work);
@@ -80,7 +80,7 @@ impl Drop for DeliveryPin<'_> {
 }
 
 fn candidate(state: &State, node: &Node) -> Option<(CancellationReason, bool)> {
-    match &node.deadline_notification {
+    match &node.cancellation_notification {
         Notification::Pending(reason) => Some((reason.clone(), false)),
         Notification::Delivering => None,
         Notification::Idle if !node.completed && !node.cancellation_signalled => state
@@ -96,6 +96,92 @@ fn has_ready_notifications(state: &State) -> bool {
         .nodes
         .values()
         .any(|node| candidate(state, node).is_some())
+}
+
+// Both process cancellation authors hand their finite original-ID frontier
+// to the same delivery path. Pending/Delivering remain original Node custody.
+fn drain_notifications(inner: &Inner, frontier: WorkId) {
+    let mut after = WorkId(0);
+    loop {
+        let mut delivery = None;
+        inner.update_facts(|state| {
+            let next = state
+                .nodes
+                .range((Excluded(after), Included(frontier)))
+                .find_map(|(&id, node)| match &node.cancellation_notification {
+                    Notification::Pending(reason) => Some((id, reason.clone())),
+                    _ => None,
+                });
+            let Some((id, reason)) = next else {
+                return;
+            };
+            after = id;
+            // Discovery already queued the original intent. A retry must
+            // not recreate an acknowledged or terminal-settled intent.
+            let slot = state.nodes[&id].cancellation;
+            let cell = Arc::clone(state.cancellations.cell(slot));
+            state.nodes.get_mut(&id).unwrap().cancellation_notification = Notification::Delivering;
+            // The real receiving guard exists before update's callbacks.
+            delivery = Some(Delivery {
+                cell,
+                pin: DeliveryPin {
+                    inner,
+                    work: id,
+                    reason: Some(reason),
+                    completed: false,
+                },
+            });
+        });
+        let Some(delivery) = delivery else {
+            return;
+        };
+        delivery.run();
+    }
+}
+
+pub(super) fn cancel_active_roots(inner: &Inner, reason: CancellationReason) -> usize {
+    let (frontier, requested) = inner.update(|state| {
+        let frontier = state.nodes.last_key_value().map(|(&id, _)| id);
+        let mut after = WorkId(0);
+        let mut requested = 0;
+        while let Some((&id, node)) = state
+            .nodes
+            .range((Excluded(after), std::ops::Bound::Unbounded))
+            .find(|(_, node)| node.parent.is_none() && !node.completed)
+        {
+            after = id;
+            let class = node.class;
+            let cancellation = state.cancellations.cell(node.cancellation);
+            let (outcome, effective) = cancellation.record_root_request(reason.clone());
+            if outcome == CancellationRequestOutcome::Requested {
+                requested += 1;
+                if reason == CancellationReason::FrontendDrainDeadlineExceeded {
+                    state
+                        .root_lifecycle
+                        .frontend_drain_deadline_cancelled
+                        .increment(class);
+                }
+            }
+            let Some(effective) = effective else {
+                continue; // Success-sealed roots never acquire cancellation.
+            };
+            let node = state.nodes.get_mut(&id).unwrap();
+            // A real in-flight delivery already owns the same immutable cell
+            // decision. It cannot finish its request without notifying that cell.
+            if node.cancellation_notification.is_idle() {
+                node.cancellation_notification = Notification::Pending(effective);
+            }
+            if !node.cancellation_signalled {
+                crate::observation::queue_control(state, id, crate::ControlIntent::Cancel)
+                    .expect("selected root retains its original Node");
+            }
+        }
+        (frontier, requested)
+    });
+    if let Some(frontier) = frontier {
+        drain_notifications(inner, frontier);
+    }
+    requested
 }
 
 impl DeadlineExpiryHandle {
@@ -122,49 +208,13 @@ impl DeadlineExpiryHandle {
                 after = id;
                 crate::observation::queue_control(state, id, crate::ControlIntent::Cancel)
                     .expect("selected notification retains its original Node");
-                state.nodes.get_mut(&id).unwrap().deadline_notification =
+                state.nodes.get_mut(&id).unwrap().cancellation_notification =
                     Notification::Pending(reason);
             }
             Some(frontier)
         });
-        let Some(frontier) = frontier else {
-            return;
-        };
-        let mut after = WorkId(0);
-        loop {
-            let mut delivery = None;
-            self.inner.update_facts(|state| {
-                let next = state
-                    .nodes
-                    .range((Excluded(after), Included(frontier)))
-                    .find_map(|(&id, node)| match &node.deadline_notification {
-                        Notification::Pending(reason) => Some((id, reason.clone())),
-                        _ => None,
-                    });
-                let Some((id, reason)) = next else {
-                    return;
-                };
-                after = id;
-                // Discovery already queued the original intent. A retry must
-                // not recreate an acknowledged or terminal-settled intent.
-                let slot = state.nodes[&id].cancellation;
-                let cell = Arc::clone(state.cancellations.cell(slot));
-                state.nodes.get_mut(&id).unwrap().deadline_notification = Notification::Delivering;
-                // The real receiving guard exists before update's callbacks.
-                delivery = Some(Delivery {
-                    cell,
-                    pin: DeliveryPin {
-                        inner: &self.inner,
-                        work: id,
-                        reason: Some(reason),
-                        completed: false,
-                    },
-                });
-            });
-            let Some(delivery) = delivery else {
-                return;
-            };
-            delivery.run();
+        if let Some(frontier) = frontier {
+            drain_notifications(&self.inner, frontier);
         }
     }
 
@@ -177,7 +227,7 @@ impl DeadlineExpiryHandle {
             .nodes
             .values()
             .filter_map(|node| {
-                match &node.deadline_notification {
+                match &node.cancellation_notification {
                     Notification::Pending(_) => Some(now),
                     Notification::Delivering => None,
                     Notification::Idle if !node.completed && !node.cancellation_signalled => {
@@ -244,3 +294,6 @@ impl DeadlineExpiryHandle {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod root_tests;

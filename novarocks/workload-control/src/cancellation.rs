@@ -263,6 +263,20 @@ impl Cancellation {
         (outcome, state.reason.clone())
     }
 
+    /// The process batch owner records an original root decision under State.
+    /// This does not walk descendants or invoke a callback; propagation follows
+    /// through the original Node notification custody after releasing State.
+    pub(crate) fn record_root_request(
+        &self,
+        reason: CancellationReason,
+    ) -> (CancellationRequestOutcome, Option<CancellationReason>) {
+        assert!(
+            self.parent.is_none(),
+            "batch cancellation requires an original root"
+        );
+        self.record_request(reason)
+    }
+
     /// Sequence cursors survive concurrent detach/retain; no Vec index escapes.
     fn next_child_after(&self, after: Option<WorkId>) -> Option<Arc<Self>> {
         let state = self.state.lock().unwrap();
@@ -282,9 +296,10 @@ impl Cancellation {
         let Some(effective) = effective else {
             return outcome;
         };
-        if outcome == CancellationRequestOutcome::Requested {
-            self.changed.notify_waiters();
-        }
+        // Idempotent notification also completes a decision already recorded
+        // by the process batch owner. Repeated requests can help a first caller
+        // paused before notification; cached/negative/sealed reads stay silent.
+        self.changed.notify_waiters();
         // Each cursor retains its ancestor path through strong parent links.
         // Children remain weak; this does not retain any Work or completion right.
         // Repeated requests still help a first request paused inside a wake.

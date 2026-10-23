@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod deadline;
+mod cancellation_delivery;
 mod retirement;
 pub use retirement::WorkRetirementObserver;
 
@@ -220,7 +220,7 @@ pub(crate) struct Node {
     pub pending_query_window: Option<crate::ResultWindowClass>,
     pub control_pending: ControlIntents,
     pub cancellation_signalled: bool,
-    deadline_notification: deadline::Notification,
+    cancellation_notification: cancellation_delivery::Notification,
     pub terminal_cancel_settled: bool,
     pub control_queued: bool,
     pub control_inflight: bool,
@@ -253,7 +253,7 @@ impl Node {
             pending_query_window: None,
             control_pending: ControlIntents::empty(),
             cancellation_signalled: false,
-            deadline_notification: deadline::Notification::Idle,
+            cancellation_notification: cancellation_delivery::Notification::Idle,
             terminal_cancel_settled: false,
             control_queued: false,
             control_inflight: false,
@@ -471,7 +471,7 @@ impl State {
                 || !node.control_pending.is_empty()
                 || node.control_queued
                 || node.control_inflight
-                || !node.deadline_notification.is_idle()
+                || !node.cancellation_notification.is_idle()
             {
                 return;
             }
@@ -1059,58 +1059,12 @@ impl WorkloadControl {
         self.inner.update(|state| state.closed = true);
     }
 
-    /// Requests first-wins cancellation for every active root owned by this
-    /// process authority. Closing admission and cancelling existing roots are
-    /// deliberately separate lifecycle facts: callers use this only after a
-    /// bounded drain has elapsed.
+    /// Commit first-wins cancellation for the active roots in one State
+    /// transaction, then propagate outside the lock. Callback reentrancy cannot
+    /// change membership or the already-recorded decisions of this batch.
+    /// Cancellation intent never proves actual exit or releases resources.
     pub fn cancel_active_roots(&self, reason: CancellationReason) -> usize {
-        let _reclaim = ReclaimWakeOnExit::new(&self.inner);
-        let roots = {
-            let state = self.inner.state.lock().unwrap();
-            state
-                .nodes
-                .iter()
-                .filter(|(_, node)| node.parent.is_none() && !node.completed)
-                .map(|(&id, node)| {
-                    (
-                        id,
-                        node.class,
-                        Arc::clone(state.cancellations.cell(node.cancellation)),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-
-        let mut requested = 0;
-        for (id, class, cancellation) in roots {
-            let outcome = cancellation.request(reason.clone());
-            if outcome == CancellationRequestOutcome::Requested {
-                requested += 1;
-                if reason == CancellationReason::FrontendDrainDeadlineExceeded {
-                    self.inner.update(|state| {
-                        state
-                            .root_lifecycle
-                            .frontend_drain_deadline_cancelled
-                            .increment(class);
-                    });
-                }
-            }
-            if outcome != CancellationRequestOutcome::SuccessSealed {
-                self.inner
-                    .update(|state| {
-                        let Some(node) = state.nodes.get_mut(&id) else {
-                            return Ok(());
-                        };
-                        if node.parent.is_some() || node.completed || node.cancellation_signalled {
-                            return Ok(());
-                        }
-                        node.cancellation_signalled = true;
-                        crate::observation::queue_control(state, id, crate::ControlIntent::Cancel)
-                    })
-                    .expect("active root cancellation updates a live local authority");
-            }
-        }
-        requested
+        cancellation_delivery::cancel_active_roots(&self.inner, reason)
     }
 
     /// Role composition opens data admission only after its required services

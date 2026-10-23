@@ -91,7 +91,7 @@ async fn post_state_wake_unwind_restores_the_original_pending_delivery() {
     {
         let state = control.inner.state.lock().unwrap();
         assert!(matches!(
-            state.nodes[&id].deadline_notification,
+            state.nodes[&id].cancellation_notification,
             Notification::Pending(CancellationReason::DeadlineExceeded)
         ));
         assert!(!state.nodes[&id].cancellation_signalled);
@@ -113,7 +113,7 @@ async fn post_state_wake_unwind_restores_the_original_pending_delivery() {
     expiry.expire_deadlines();
     {
         let state = control.inner.state.lock().unwrap();
-        assert!(state.nodes[&id].deadline_notification.is_idle());
+        assert!(state.nodes[&id].cancellation_notification.is_idle());
         assert!(state.nodes[&id].cancellation_signalled);
     }
     acknowledge(&control);
@@ -179,6 +179,11 @@ async fn actual_delivery_retains_completed_nodes_and_excludes_their_old_deadline
             helper.expire_deadlines();
         });
         entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            control.cancel_active_roots(CancellationReason::ServerShutdown),
+            0,
+            "the in-flight delivery already committed its first-wins reason"
+        );
         acknowledge(&control);
         root.business.release();
         root.owner.complete();
@@ -186,7 +191,7 @@ async fn actual_delivery_retains_completed_nodes_and_excludes_their_old_deadline
             let state = control.inner.state.lock().unwrap();
             assert!(state.nodes[&id].completed);
             assert!(matches!(
-                state.nodes[&id].deadline_notification,
+                state.nodes[&id].cancellation_notification,
                 Notification::Delivering
             ));
         }
@@ -263,7 +268,7 @@ async fn propagation_unwind_remains_retryable_after_completion_and_does_not_requ
             let node = &state.nodes[&id];
             assert!(node.completed && node.cancellation_signalled);
             assert!(matches!(
-                node.deadline_notification,
+                node.cancellation_notification,
                 Notification::Pending(_)
             ));
             assert!(
