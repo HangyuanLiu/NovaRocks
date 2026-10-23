@@ -63,6 +63,7 @@ mod internal_supervisor_tests {
     #[derive(Debug, Default)]
     struct CheckedCountConsumer {
         decoded: AtomicBool,
+        local_closed: AtomicBool,
         accepted: std::sync::Mutex<Option<ComputationReadyToken>>,
         ready_observation: std::sync::Mutex<
             Option<watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>>,
@@ -73,6 +74,17 @@ mod internal_supervisor_tests {
     struct ObservedCountConsumer(Arc<CheckedCountConsumer>);
 
     impl InternalComputationConsumer for ObservedCountConsumer {
+        // This CountOnly owner never constructs or submits a local CPU job.
+        fn begin_local_close(&self) {}
+
+        fn poll_local_closed(
+            &self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), crate::api::StatementNativeHealthFailure>> {
+            self.0.local_closed.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(Ok(()))
+        }
+
         fn consume(&self, activation: InternalConsumerActivation) -> InternalConsumerFuture {
             let record = Arc::clone(&self.0);
             *record.ready_observation.lock().unwrap() = Some(activation.ready.clone());
@@ -428,6 +440,49 @@ mod internal_supervisor_tests {
         }
     }
 
+    #[derive(Debug)]
+    struct HeldBeforeActorPreparation(Arc<AtomicBool>);
+    impl NativeAttemptPreparationPort for HeldBeforeActorPreparation {
+        fn prepare_in<'a>(
+            &'a mut self,
+            _: &'a mut crate::api::NativeAttemptPreparationWork,
+        ) -> NativeAttemptPreparationFuture<'a> {
+            self.0.store(true, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_original_prepare_closes_its_same_consumer_before_actor_installation() {
+        let (mut control, root) = governance().await;
+        let entered = Arc::new(AtomicBool::new(false));
+        let consumer = Arc::new(CheckedCountConsumer::default());
+        let requester = root.owner.cancellation_requester();
+        let request = internal_count_request(HeldBeforeActorPreparation(Arc::clone(&entered)))
+            .with_internal_consumer(Arc::new(ObservedCountConsumer(Arc::clone(&consumer))))
+            .unwrap();
+        let (mut supervisor, client) = test_supervisor(
+            &control, Handle::current(), Arc::new(BindingNativePort),
+            QueryProcessNamespace::new(0xae), FrontendProcessId::new_v7(), supervisor_config(),
+        );
+        let started = client.start(request, root.owner);
+        wait_preparation_exit_fact(&entered).await.unwrap();
+        requester.request(CancellationReason::Requested).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), started).await.unwrap();
+        assert!(matches!(result, Err(error) if error.kind() == QueryExecutionErrorKind::Cancelled));
+        wait_preparation_exit_fact(&consumer.local_closed).await.unwrap();
+        assert!(!consumer.decoded.load(Ordering::SeqCst));
+        assert!(consumer.accepted.lock().unwrap().is_none());
+        assert!(consumer.ready_observation.lock().unwrap().is_none(),
+            "a refused original prepare must never activate a consumer");
+        assert_eq!(supervisor.registry.active_native_custody_count(), 0);
+        root.business.release();
+        supervisor.shutdown_until(Instant::now() + Duration::from_secs(5)).await.unwrap();
+        drop(client);
+        acknowledge_all_control(&control);
+        control.finish().await;
+    }
+
     #[tokio::test]
     async fn actual_internal_consumer_returns_ready_before_native_run_and_cleanup() {
         for shutdown_before_ack_exit in [false, true] {
@@ -493,6 +548,7 @@ mod internal_supervisor_tests {
                 );
                 assert_eq!(token.end().output_rows, INTERNAL_ROWS);
                 assert!(consumer.decoded.load(Ordering::SeqCst));
+                wait_preparation_exit_fact(&consumer.local_closed).await.unwrap();
                 assert!(signals.run_entered.load(Ordering::SeqCst));
                 assert!(!signals.run_returned.load(Ordering::SeqCst));
                 assert!(!signals.cleanup_completed.load(Ordering::SeqCst));
@@ -1041,6 +1097,16 @@ mod internal_supervisor_tests {
     }
 
     impl InternalComputationConsumer for FailingRegisteredConsumer {
+        // This CountOnly owner never constructs or submits a local CPU job.
+        fn begin_local_close(&self) {}
+
+        fn poll_local_closed(
+            &self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), crate::api::StatementNativeHealthFailure>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
         fn consume(&self, activation: InternalConsumerActivation) -> InternalConsumerFuture {
             let (mut stream, source) = activation.into_parts();
             let outcome = self.outcome.clone();
@@ -1340,6 +1406,7 @@ mod internal_supervisor_tests {
                 }
                 // A delivered terminal verdict cannot abandon the original future or
                 // turn an observation timeout into actual Native owner exit.
+                wait_preparation_exit_fact(&consumer.local_closed).await.unwrap();
                 assert!(!activation.returned.load(Ordering::SeqCst));
                 assert!(!activation.dormant_dropped.load(Ordering::SeqCst));
                 assert!(!native.cleanup_entered.load(Ordering::SeqCst));

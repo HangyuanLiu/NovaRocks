@@ -34,8 +34,8 @@ use super::{
     EstablishIssueError, InFlightResult, LogicalConclusion, LogicalExecutionActorError,
     LogicalExecutionState, PendingResult, PermitLifetime, ResultRuntime, ResultSlot,
     ResultTransport, conclude_result_failure, identity_of, logical_owner_failure, request,
-    result_actor_failure, result_receipt_failure, root_success_facts_complete,
-    verify_running_activation,
+    result_actor_failure, result_receipt_failure, revoke_all_establish_authority,
+    root_success_facts_complete, verify_running_activation,
 };
 
 /// Concrete QA mailbox capability. Application consumers cannot construct a
@@ -235,6 +235,7 @@ pub(super) fn bind(
 
 pub(super) fn propose(
     state: &mut LogicalExecutionState,
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
     runtime: &mut ResultRuntime,
     proposal: ReadyProposal,
 ) {
@@ -258,15 +259,16 @@ pub(super) fn propose(
         .decoded_end
         .is_some_and(|end| proposal.decoded.matches(&record.source, end))
     {
-        let _ = proposal
-            .reply
-            .send(Err(LogicalExecutionActorError::ResultProtocolViolation));
+        revoke_all_establish_authority(attempts);
         conclude_result_failure(
             state,
             runtime,
             "internal proof has no accepted End receipt",
             result_actor_failure(LogicalExecutionActorError::ResultProtocolViolation),
         );
+        let _ = proposal
+            .reply
+            .send(Err(LogicalExecutionActorError::ResultProtocolViolation));
         return;
     }
     if let Some(token) = record.accepted {
@@ -325,6 +327,7 @@ pub(super) fn try_accept(
             // consumer's original typed verdict with a destructor observation.
             return;
         }
+        revoke_all_establish_authority(attempts);
         conclude_result_failure(
             state,
             runtime,
@@ -344,6 +347,7 @@ pub(super) fn try_accept(
     match readiness {
         Err(EstablishIssueError::EstablishNotSettled) => return,
         Err(error) => {
+            revoke_all_establish_authority(attempts);
             conclude_result_failure(
                 state,
                 runtime,
@@ -358,6 +362,9 @@ pub(super) fn try_accept(
         Ok(capability) if identity_of(&capability) == activation => capability,
         _ => return,
     };
+    // Readiness and the exact running capability have been validated. Close
+    // transport issue authority before the terminal cut or either reply.
+    revoke_all_establish_authority(attempts);
     if let Err(error) = state.accept_computation_ready(&capability) {
         conclude_result_failure(
             state,
@@ -383,6 +390,7 @@ pub(super) fn try_accept(
 
 pub(super) fn fail(
     state: &mut LogicalExecutionState,
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
     runtime: &mut ResultRuntime,
     source: Arc<InternalConsumerSeal>,
     error: QueryExecutionError,
@@ -400,6 +408,7 @@ pub(super) fn fail(
             conclusion,
         )));
     } else {
+        revoke_all_establish_authority(attempts);
         conclude_result_failure(
             state,
             runtime,
@@ -472,6 +481,7 @@ pub(super) async fn wait_for_source_exit(internal: Option<&mut InternalRuntime>)
 
 pub(super) fn source_exited(
     state: &mut LogicalExecutionState,
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
     runtime: Option<&mut ResultRuntime>,
     exit: ConsumerExit,
 ) {
@@ -494,6 +504,7 @@ pub(super) fn source_exited(
                 "the internal consumer exited before readiness",
             ),
         };
+        revoke_all_establish_authority(attempts);
         conclude_result_failure(
             state,
             runtime,
@@ -700,6 +711,7 @@ pub(super) fn queue_end(
 
 pub(super) fn enqueue_end(
     state: &mut LogicalExecutionState,
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
     runtime: &mut ResultRuntime,
     slot: ResultSlot,
     pending: PendingEnd,
@@ -723,9 +735,18 @@ pub(super) fn enqueue_end(
             return;
         }
     };
+    if !matches!(
+        (&runtime.transport, &slot),
+        (ResultTransport::Internal(_), ResultSlot::Internal(_))
+    ) {
+        // The original enqueue will reject this mismatched slot. Close the
+        // source before that by-value refusal drops its delivery/receipt.
+        revoke_all_establish_authority(attempts);
+    }
     let (delivery, receipt, checked) =
         InternalEndDelivery::new(Arc::clone(&pending.source), pending.end);
     if let Err(error) = runtime.transport.enqueue_internal_end(slot, delivery) {
+        revoke_all_establish_authority(attempts);
         let _ = state.fail_result_delivery(permit);
         runtime.accepted_error = Some(error);
         let _ = pending
@@ -745,6 +766,7 @@ pub(super) fn enqueue_end(
 
 pub(super) fn settle_end(
     state: &mut LogicalExecutionState,
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
     runtime: &mut ResultRuntime,
     end: EndInFlight,
     disposition: Result<ResultDeliveryDisposition, ()>,
@@ -769,6 +791,7 @@ pub(super) fn settle_end(
     }
     let failure = result_receipt_failure(disposition);
     if let Some(error) = failure {
+        revoke_all_establish_authority(attempts);
         let _ = state.fail_result_delivery(end.permit);
         runtime.accepted_error = Some(error.clone());
         let _ = end.checked.send(Err(error));
@@ -779,6 +802,7 @@ pub(super) fn settle_end(
     }
     if let Err(error) = state.complete_result_delivery(end.permit) {
         let error = result_actor_failure(ActorStateError::Delivery(error.error()).into());
+        revoke_all_establish_authority(attempts);
         conclude_result_failure(
             state,
             runtime,
@@ -809,6 +833,7 @@ pub(super) fn settle_end(
             runtime.deferred_internal = Some(DeferredInternalDelivery::EndAckLost(end.reply));
             return;
         }
+        revoke_all_establish_authority(attempts);
         conclude_result_failure(
             state,
             runtime,

@@ -3052,6 +3052,16 @@ mod tests {
         #[derive(Debug)]
         struct OriginalConsumer(crate::api::StatementNativeHealthFailure);
         impl crate::api::InternalComputationConsumer for OriginalConsumer {
+            fn begin_local_close(&self) {}
+            fn poll_local_closed(
+                &self,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), crate::api::StatementNativeHealthFailure>> {
+                // This original fixture already represents an unresolved local
+                // source; a close observer cannot turn it into a no-issue exit.
+                std::task::Poll::Ready(Err(self.0.clone()))
+            }
+
             fn consume(
                 &self,
                 _: crate::api::InternalConsumerActivation,

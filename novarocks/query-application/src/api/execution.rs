@@ -143,6 +143,12 @@ impl QueryExecutionRequest {
         Ok(())
     }
 
+    pub(crate) fn original_internal_consumer(
+        &self,
+    ) -> Option<Arc<dyn InternalComputationConsumer>> {
+        self.internal_consumer.as_ref().map(Arc::clone)
+    }
+
     #[cfg(test)]
     pub(crate) fn try_from_parts(
         description: FrozenExecutionDescription,

@@ -2588,7 +2588,12 @@ async fn run_actor(
             let queued = receiver.len();
             for _ in 0..queued {
                 if let Ok(observation) = receiver.try_recv() {
-                    apply_root_terminal_observation(state, result_runtime.as_mut(), observation);
+                    apply_root_terminal_observation(
+                        state,
+                        &mut attempts,
+                        result_runtime.as_mut(),
+                        observation,
+                    );
                 }
             }
         }
@@ -2630,6 +2635,9 @@ async fn run_actor(
             let runtime = result_runtime
                 .as_mut()
                 .expect("a failed root success drive has its result owner");
+            if runtime.internal.is_some() {
+                revoke_all_establish_authority(&mut attempts);
+            }
             conclude_result_failure(
                 state,
                 runtime,
@@ -2637,6 +2645,11 @@ async fn run_actor(
                 result_actor_failure(error),
             );
             fail_result_runtime(state, Some(runtime));
+        }
+        if state.conclusion().is_some() {
+            // Close the original transport-issue fences before publishing a
+            // terminal outcome that authorizes independent local shutdown.
+            revoke_all_establish_authority(&mut attempts);
         }
         internal_ready::publish_outcome(state, result_runtime.as_ref());
         if registry_close_requested
@@ -2735,12 +2748,16 @@ async fn run_actor(
                 match observation {
                     Some(observation) => apply_root_terminal_observation(
                         state,
+                        &mut attempts,
                         result_runtime.as_mut(),
                         observation,
                     ),
                     None => {
                         root_terminal_receiver.take();
                         if !root_success_facts_complete(result_runtime.as_ref()) {
+                            if result_runtime.as_ref().is_some_and(|runtime| runtime.internal.is_some()) {
+                                revoke_all_establish_authority(&mut attempts);
+                            }
                             conclude_or_interrupt_success(
                                 state,
                                 replacement.as_ref(),
@@ -2770,12 +2787,15 @@ async fn run_actor(
             _ = wait_for_replacement_expiry(clock.as_ref(), replacement_expires_at), if replacement_expires_at.is_some() => {}
             _ = wait_for_abort_retry(clock.as_ref(), abort_retry_at), if abort_retry_at.is_some() => {}
             permit = wait_for_result_capacity(result_capacity_transport), if result_capacity_transport.is_some() => {
-                apply_result_capacity(state, result_runtime.as_mut(), permit);
+                apply_result_capacity(state, &mut attempts, result_runtime.as_mut(), permit);
             }
             disposition = wait_for_result_receipt(result_runtime.as_mut()), if result_receipt_pending => {
-                apply_result_receipt(state, replacement.as_ref(), result_runtime.as_mut(), disposition);
+                apply_result_receipt(state, &mut attempts, replacement.as_ref(), result_runtime.as_mut(), disposition);
             }
             _ = wait_for_result_consumer_closed(result_consumer_transport), if result_consumer_transport.is_some() => {
+                if result_runtime.as_ref().is_some_and(|runtime| runtime.internal.is_some()) {
+                    revoke_all_establish_authority(&mut attempts);
+                }
                 conclude_or_interrupt_success(
                     state,
                     replacement.as_ref(),
@@ -3731,6 +3751,7 @@ fn root_success_facts_complete(runtime: Option<&ResultRuntime>) -> bool {
 
 fn apply_root_terminal_observation(
     state: &mut LogicalExecutionState,
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
     runtime: Option<&mut ResultRuntime>,
     observation: RootTerminalObservation,
 ) {
@@ -3742,6 +3763,7 @@ fn apply_root_terminal_observation(
     };
     apply_root_status_observation(
         state,
+        attempts,
         runtime,
         observation.activation,
         observation.root,
@@ -3778,6 +3800,9 @@ fn settle_finish_establish_readiness(
         Ok(()) => true,
         Err(EstablishIssueError::EstablishNotSettled) => false,
         Err(error) => {
+            if runtime.internal.is_some() {
+                revoke_all_establish_authority(attempts);
+            }
             tracing::debug!(error = %error, "Establish settlement failed before success EOF");
             conclude_failed(state, "Establish settlement failed before success EOF");
             if state.conclusion() == Some(LogicalConclusion::Failed) {
@@ -3852,6 +3877,7 @@ fn drive_root_success(
 
 fn apply_result_capacity(
     state: &mut LogicalExecutionState,
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
     runtime: Option<&mut ResultRuntime>,
     reserved: Result<ResultSlot, QueryExecutionError>,
 ) {
@@ -3877,6 +3903,9 @@ fn apply_result_capacity(
             return;
         }
         Err(error) => {
+            if runtime.internal.is_some() {
+                revoke_all_establish_authority(attempts);
+            }
             conclude_result_failure(
                 state,
                 runtime,
@@ -3907,6 +3936,9 @@ fn apply_result_capacity(
             ) {
                 Ok(permit) => permit,
                 Err(error) => {
+                    if runtime.internal.is_some() {
+                        revoke_all_establish_authority(attempts);
+                    }
                     drop(slot);
                     drop(pending.delivery);
                     conclude_result_failure(
@@ -3919,7 +3951,20 @@ fn apply_result_capacity(
                     return;
                 }
             };
+            if runtime.internal.is_some()
+                && !matches!(
+                    (&runtime.transport, &slot),
+                    (ResultTransport::Internal(_), ResultSlot::Internal(_))
+                )
+            {
+                // The original enqueue will reject this mismatched slot.
+                // Revoke before its by-value refusal drops the delivery.
+                revoke_all_establish_authority(attempts);
+            }
             if let Err(error) = runtime.transport.enqueue_segment(slot, pending.delivery) {
+                if runtime.internal.is_some() {
+                    revoke_all_establish_authority(attempts);
+                }
                 let _ = state.fail_result_delivery(permit);
                 runtime.accepted_error = Some(error);
                 reply_result_failure(state, pending.reply);
@@ -3997,13 +4042,14 @@ fn apply_result_capacity(
             runtime.in_flight = Some(InFlightResult::End { receipt });
         }
         PendingResult::InternalEnd(pending) => {
-            internal_ready::enqueue_end(state, runtime, slot, pending)
+            internal_ready::enqueue_end(state, attempts, runtime, slot, pending)
         }
     }
 }
 
 fn apply_result_receipt(
     state: &mut LogicalExecutionState,
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
     replacement: Option<&ReplacementRuntime>,
     runtime: Option<&mut ResultRuntime>,
     outcome: ResultReceiptOutcome,
@@ -4014,12 +4060,15 @@ fn apply_result_receipt(
     let was_unconcluded = state.conclusion().is_none();
     let disposition = match outcome {
         ResultReceiptOutcome::SourceExited(source) => {
-            internal_ready::source_exited(state, Some(runtime), source);
+            internal_ready::source_exited(state, attempts, Some(runtime), source);
             return;
         }
         ResultReceiptOutcome::Schema(disposition) => {
             runtime.schema_receipt.take();
             if let Some(error) = result_receipt_failure(disposition) {
+                if runtime.internal.is_some() {
+                    revoke_all_establish_authority(attempts);
+                }
                 conclude_with(state, replacement, LogicalConclusion::Failed);
                 if was_unconcluded && state.conclusion() == Some(LogicalConclusion::Failed) {
                     runtime.accepted_error = Some(error);
@@ -4060,16 +4109,22 @@ fn apply_result_receipt(
     // replying. A prior cancellation/success still owns its exact conclusion.
     let reply = match in_flight {
         InFlightResult::InternalEnd(end) => {
-            internal_ready::settle_end(state, runtime, end, disposition);
+            internal_ready::settle_end(state, attempts, runtime, end, disposition);
             return;
         }
         InFlightResult::Schema { permit, .. } => {
             if completed {
                 if let Err(error) = state.complete_schema_delivery(permit) {
                     failure = Some(result_actor_failure(error.into()));
+                    if runtime.internal.is_some() {
+                        revoke_all_establish_authority(attempts);
+                    }
                     conclude_failed(state, "schema delivery could not be completed");
                 }
             } else {
+                if runtime.internal.is_some() {
+                    revoke_all_establish_authority(attempts);
+                }
                 if let Err(error) = state.fail_schema_delivery(permit) {
                     failure = Some(result_actor_failure(error.into()));
                 }
@@ -4085,11 +4140,17 @@ fn apply_result_receipt(
                         failure = Some(result_actor_failure(
                             ActorStateError::Delivery(error.error()).into(),
                         ));
+                        if runtime.internal.is_some() {
+                            revoke_all_establish_authority(attempts);
+                        }
                         conclude_failed(state, "result delivery could not be completed");
                         false
                     }
                 }
             } else {
+                if runtime.internal.is_some() {
+                    revoke_all_establish_authority(attempts);
+                }
                 if let Err(error) = state.fail_result_delivery(permit) {
                     failure = Some(result_actor_failure(
                         ActorStateError::Delivery(error.error()).into(),
@@ -4418,7 +4479,7 @@ fn handle_command(
                     .send(Err(LogicalExecutionActorError::WrongPhase));
                 return;
             };
-            internal_ready::propose(state, runtime, proposal);
+            internal_ready::propose(state, attempts, runtime, proposal);
         }
         ActorCommand::FailInternalComputation {
             source,
@@ -4429,7 +4490,7 @@ fn handle_command(
                 let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
                 return;
             };
-            internal_ready::fail(state, runtime, source, error, reply);
+            internal_ready::fail(state, attempts, runtime, source, error, reply);
         }
         ActorCommand::TakeReplacementAdmissionEvidence { activation, reply } => {
             let result = (|| {
@@ -4537,9 +4598,17 @@ fn handle_command(
             reply,
         } => {
             let execution = permit.identity().execution();
+            let parts = permit.into_parts();
+            if result_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.internal.is_some())
+                && validate_attempt_command(state, &parts.0).is_ok()
+            {
+                revoke_all_establish_authority(attempts);
+            }
             settle_terminal(
                 state,
-                permit.into_parts(),
+                parts,
                 LogicalConclusion::Failed,
                 || {
                     if let Some(attempt) = attempts.get_mut(&execution) {
@@ -4584,6 +4653,9 @@ fn handle_command(
                 .as_ref()
                 .is_some_and(|gate| gate.activation == activation && gate.final_eos_ack.is_some())
             {
+                if runtime.internal.is_some() {
+                    revoke_all_establish_authority(attempts);
+                }
                 drop(segment);
                 conclude_result_failure(
                     state,
@@ -4610,6 +4682,9 @@ fn handle_command(
                 return;
             }
             if sequence.next().is_none() {
+                if runtime.internal.is_some() {
+                    revoke_all_establish_authority(attempts);
+                }
                 drop(segment);
                 conclude_result_failure(
                     state,
@@ -4625,6 +4700,9 @@ fn handle_command(
                 client_rows: client_rows.map(|(profile, _)| profile),
             };
             if runtime.carrier != expected {
+                if runtime.internal.is_some() {
+                    revoke_all_establish_authority(attempts);
+                }
                 drop(segment);
                 conclude_result_failure(
                     state,
@@ -4646,6 +4724,9 @@ fn handle_command(
             ) {
                 Ok(delivery) => delivery,
                 Err(error) => {
+                    if runtime.internal.is_some() {
+                        revoke_all_establish_authority(attempts);
+                    }
                     conclude_result_failure(
                         state,
                         runtime,
@@ -4658,6 +4739,9 @@ fn handle_command(
             };
             let delivery = delivery.with_resident_window(resident_window);
             if let Err(error) = start_schema_delivery(state, runtime, activation) {
+                if runtime.internal.is_some() {
+                    revoke_all_establish_authority(attempts);
+                }
                 drop(delivery);
                 conclude_result_failure(
                     state,
@@ -4711,6 +4795,9 @@ fn handle_command(
                     let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
                 }
                 Some(gate) if gate.activation == activation => {
+                    if runtime.internal.is_some() {
+                        revoke_all_establish_authority(attempts);
+                    }
                     conclude_result_failure(
                         state,
                         runtime,
@@ -4766,7 +4853,7 @@ fn handle_command(
                 Some(InFlightResult::Batch { .. } | InFlightResult::End { .. })
             );
             if state.output_visible() || protocol_may_own_rows {
-                fail_result_observation(state, runtime);
+                fail_result_observation(state, attempts, runtime);
                 if state.conclusion().is_none() {
                     conclude_failed(
                         state,
@@ -4796,6 +4883,7 @@ fn handle_command(
             };
             apply_root_status_observation(
                 state,
+                attempts,
                 runtime,
                 activation,
                 root,
@@ -4831,7 +4919,7 @@ fn handle_command(
                 crate::api::ResultRowCarrier::Relayed { .. }
             ) != root_output_rows.is_some()
             {
-                fail_result_observation(state, runtime);
+                fail_result_observation(state, attempts, runtime);
                 reply_result_failure(state, reply);
                 return;
             }
@@ -4840,7 +4928,7 @@ fn handle_command(
                 || (sequence.get() > 0
                     && state.delivered_result_through() != Some(sequence.get().saturating_sub(1)))
             {
-                fail_result_observation(state, runtime);
+                fail_result_observation(state, attempts, runtime);
                 reply_result_failure(state, reply);
                 return;
             }
@@ -4850,6 +4938,9 @@ fn handle_command(
             };
             if gate.activation != activation || gate.root != expected_root || root != expected_root
             {
+                if runtime.internal.is_some() {
+                    revoke_all_establish_authority(attempts);
+                }
                 conclude_failed(
                     state,
                     "a result poll named an activation or root this execution does not own",
@@ -4867,13 +4958,25 @@ fn handle_command(
                     let _ = reply.send(Ok(()));
                 }
                 Some(_) => {
-                    fail_result_observation(state, runtime);
+                    fail_result_observation(state, attempts, runtime);
                     reply_result_failure(state, reply);
                 }
             }
         }
         ActorCommand::FinishResultStream { permit, reply } => {
             let activation = permit.identity();
+            if result_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.internal.is_some())
+                && permit
+                    .capability
+                    .as_ref()
+                    .is_some_and(|capability| validate_attempt_command(state, capability).is_ok())
+            {
+                // This consumed handoff cannot return to an Internal source.
+                // Fence it before any refusal concludes or drops its custody.
+                revoke_all_establish_authority(attempts);
+            }
             let Some(runtime) = result_runtime else {
                 conclude_consumed_handoff_as_failed(state, permit, reply);
                 return;
@@ -4911,6 +5014,12 @@ fn handle_command(
                         &reason,
                     );
                 } else {
+                    if result_runtime
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.internal.is_some())
+                    {
+                        revoke_all_establish_authority(attempts);
+                    }
                     conclude_failed(
                         state,
                         "the attempt terminated without a reason this execution could use",
@@ -4977,6 +5086,12 @@ fn handle_command(
             let (contexts, failed_contexts) = match preparation {
                 Ok(preparation) => preparation,
                 Err(error) => {
+                    if result_runtime
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.internal.is_some())
+                    {
+                        revoke_all_establish_authority(attempts);
+                    }
                     let _ = state.conclude(&capability, LogicalConclusion::Failed);
                     lifetime.settle();
                     let _ = reply.send(Err(error));
@@ -5477,8 +5592,13 @@ fn verify_running_activation(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the original attempt ledgers fence terminal publication without merging actor owners"
+)]
 fn apply_root_status_observation(
     state: &mut LogicalExecutionState,
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
     runtime: &mut ResultRuntime,
     activation: AttemptActivationIdentity,
     root: TaskIdentity,
@@ -5501,6 +5621,9 @@ fn apply_root_status_observation(
         return;
     };
     if gate.activation != activation || gate.root != root || status.identity() != gate.root {
+        if runtime.internal.is_some() {
+            revoke_all_establish_authority(attempts);
+        }
         conclude_or_interrupt_success(state, None, Some(runtime), LogicalConclusion::Failed);
         reply_result_failure(state, reply);
         return;
@@ -5526,7 +5649,7 @@ fn apply_root_status_observation(
                 let _ = reply.send(response);
                 return;
             }
-            fail_result_observation(state, runtime);
+            fail_result_observation(state, attempts, runtime);
             reply_result_failure(state, reply);
             return;
         }
@@ -5550,7 +5673,7 @@ fn apply_root_status_observation(
             });
         }
         if state.output_visible() {
-            fail_result_observation(state, runtime);
+            fail_result_observation(state, attempts, runtime);
             let _ = reply.send(Err(LogicalExecutionActorError::ExecutionConcluded(
                 LogicalConclusion::Failed,
             )));
@@ -5578,7 +5701,7 @@ fn apply_root_status_observation(
         | StatusObservation::TerminalOverwrite
         | StatusObservation::InstallationRegression
         | StatusObservation::ConclusionOverwrite => {
-            fail_result_observation(state, runtime);
+            fail_result_observation(state, attempts, runtime);
             reply_result_failure(state, reply);
             return;
         }
@@ -5590,7 +5713,7 @@ fn apply_root_status_observation(
             ObservedTaskTransition::Advance | ObservedTaskTransition::SameState
         )
     {
-        fail_result_observation(state, runtime);
+        fail_result_observation(state, attempts, runtime);
         reply_result_failure(state, reply);
         return;
     }
@@ -5620,7 +5743,7 @@ fn apply_root_status_observation(
             // Once data crossed the visibility boundary this attempt cannot
             // be replaced without duplicating a prefix. Fail the logical
             // stream and interrupt any protocol delivery immediately.
-            fail_result_observation(state, runtime);
+            fail_result_observation(state, attempts, runtime);
             reply_result_failure(state, reply);
         } else {
             // Freeze all pending and future data in the same actor turn that
@@ -5657,8 +5780,14 @@ fn verify_result_observation_activation(
     Ok(())
 }
 
-fn fail_result_observation(state: &mut LogicalExecutionState, runtime: &mut ResultRuntime) {
-    let _ = runtime;
+fn fail_result_observation(
+    state: &mut LogicalExecutionState,
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
+    runtime: &mut ResultRuntime,
+) {
+    if runtime.internal.is_some() {
+        revoke_all_establish_authority(attempts);
+    }
     if state.conclusion().is_none() {
         conclude_failed(state, "result observation failed");
     }

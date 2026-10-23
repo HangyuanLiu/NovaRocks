@@ -245,6 +245,19 @@ impl OriginalLogicalExit {
         s.role_ended = true;
         s.role_failed |= failed;
     }
+    pub(super) fn retain_local_consumer_failure_silent(
+        &self,
+        failure: crate::api::StatementNativeHealthFailure,
+    ) {
+        let original = Box::new(failure);
+        let mut state = self.lock();
+        assert!(
+            state.native_failure.is_none(),
+            "one original local close failure"
+        );
+        state.native_failure = Some(original);
+        state.role_failed = true;
+    }
     pub(super) fn health_published(&self) -> bool {
         self.lock().health_published
     }

@@ -358,6 +358,17 @@ pub(crate) fn prepare_profile_computation(
 }
 
 impl InternalComputationConsumer for ProfileComputationConsumer {
+    // This CountOnly owner never constructs or submits a local CPU job.
+    fn begin_local_close(&self) {}
+
+    fn poll_local_closed(
+        &self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), novarocks_query_application::api::StatementNativeHealthFailure>>
+    {
+        std::task::Poll::Ready(Ok(()))
+    }
+
     fn consume(&self, activation: InternalConsumerActivation) -> InternalConsumerFuture {
         let (mut stream, source) = activation.into_parts();
         let binding = ProfileBinding::from_source(&source);

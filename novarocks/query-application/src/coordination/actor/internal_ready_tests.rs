@@ -387,15 +387,19 @@ async fn queued_root_failure_in_ready_turn_prevents_the_cut() {
     let activation = fixture.observer.activation;
     let (reply, response) = oneshot::channel();
     clock.arm(move || {
-        terminal.try_send(RootTerminalObservation {
-            activation,
-            root,
-            // The reserved ingress refines the root seal with the exact
-            // attempt's authoritative failure before readiness is accepted.
-            status: root_status(root, 1, TaskState::Finished),
-            terminal_failure: RootTerminalFailure::Authoritative(Box::new(actual_consumer_body_failure())),
-            reply,
-        }).unwrap();
+        terminal
+            .try_send(RootTerminalObservation {
+                activation,
+                root,
+                // The reserved ingress refines the root seal with the exact
+                // attempt's authoritative failure before readiness is accepted.
+                status: root_status(root, 1, TaskState::Finished),
+                terminal_failure: RootTerminalFailure::Authoritative(Box::new(
+                    actual_consumer_body_failure(),
+                )),
+                reply,
+            })
+            .unwrap();
     });
     assert!(response.await.unwrap().is_err());
     fixture.owner.actor().snapshot().await.unwrap();
@@ -1293,4 +1297,221 @@ async fn provisional_end_failure_waiter_receives_the_accepted_governed_cancellat
     } = fixture;
     drop((decoded, running, observer, activation, _output, outcome));
     join_original_internal_actor(owner).await;
+}
+
+// This waker is installed on the original fail request's oneshot receiver.
+// It probes dispatch synchronously inside ActorReply::send, before the actor
+// can return to its central pre-watch fallback. It creates no issue authority.
+struct InternalFailureReplyProbe {
+    permit: Mutex<Option<EstablishIssuePermit>>,
+    transport: HoldingEstablishTransport,
+    observed: Mutex<Option<oneshot::Sender<Result<EstablishIssueSubmit, EstablishIssueError>>>>,
+}
+
+impl std::task::Wake for InternalFailureReplyProbe {
+    fn wake(self: Arc<Self>) {
+        std::task::Wake::wake_by_ref(&self);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let permit = self.permit.lock().unwrap().take();
+        if let Some(permit) = permit {
+            let submitted = permit.try_submit(&self.transport);
+            if let Some(observed) = self.observed.lock().unwrap().take() {
+                let _ = observed.send(submitted);
+            }
+        }
+    }
+}
+
+async fn internal_failure_revokes_original_issue_authority(probe_reply: bool) {
+    use crate::coordination::{EstablishIssueState, EstablishWorkerSettlement};
+
+    let first = execution(if probe_reply { 12_090 } else { 12_091 });
+    let root = root_task(first, 1);
+    let frontend = FrontendProcessId::new_v7();
+    let root_context = QueryContextRef::new(first, frontend, root.backend_process_id());
+    let held_context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+    let mut config = internal_config(first, Arc::new(DelayedQualificationPort::default()));
+    config.required_establish_contexts = vec![root_context, held_context];
+    let (capacity, _) = watch::channel(0);
+    config = config.with_abort_query_context_effect_port(
+        Arc::new(SelectiveAbortPort {
+            blocked: held_context,
+            accepted: Arc::new(Mutex::new(Vec::new())),
+            capacity,
+        }),
+        NonZeroUsize::new(2).unwrap(),
+    );
+    let (owner, initial, output) = spawn_logical_execution_actor(&Handle::current(), config)
+        .unwrap()
+        .into_parts();
+    let actor = owner.actor().clone();
+    let mut outcome = actor.internal_outcome().unwrap();
+    let running = actor.activate(initial.ready()).await.unwrap();
+    let activation = running.bind_internal_consumer(root).await.unwrap();
+
+    // Original actor-issued admission/Establish capabilities: the root settles,
+    // while the other context keeps its exact pre-transport permit.
+    let mut held = None;
+    for (context, tag) in [(root_context, 81), (held_context, 82)] {
+        let ticket = admission_ticket(context, tag);
+        let admission = running
+            .begin_admission_issue(admission_request(context, tag))
+            .await
+            .unwrap();
+        running
+            .settle_admission_issue(
+                admission,
+                AdmissionIssueSettlement::applied(
+                    admission.operation_id(),
+                    OperationOutcome::Accepted,
+                    ticket,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let permit = running
+            .authorize_establish(
+                establish_request(context, ticket, tag),
+                NativeCompatibilityId::new([tag; 32]),
+            )
+            .await
+            .unwrap();
+        if context == held_context {
+            held = Some(permit);
+        } else {
+            let transport = HoldingEstablishTransport::default();
+            assert_eq!(
+                permit.try_submit(&transport).unwrap(),
+                EstablishIssueSubmit::Accepted
+            );
+            transport
+                .take()
+                .worker_settled(OperationOutcome::Accepted)
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        actor
+            .establish_snapshot(root_context)
+            .await
+            .unwrap()
+            .unwrap()
+            .state(),
+        EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::Applied)
+    );
+    assert_eq!(
+        actor
+            .establish_snapshot(held_context)
+            .await
+            .unwrap()
+            .unwrap()
+            .state(),
+        EstablishIssueState::IssueAuthorized
+    );
+    assert!(outcome.borrow().is_none());
+
+    let InternalConsumerActivation {
+        source,
+        ready,
+        stream,
+    } = activation;
+    let original = actual_consumer_body_failure();
+    let mut reply_probe = None;
+    let mut submitted_at_reply = None;
+    if probe_reply {
+        let (observed, response) = oneshot::channel();
+        let probe = Arc::new(InternalFailureReplyProbe {
+            permit: Mutex::new(held.take()),
+            transport: HoldingEstablishTransport::default(),
+            observed: Mutex::new(Some(observed)),
+        });
+        let waker = std::task::Waker::from(Arc::clone(&probe));
+        let mut cx = std::task::Context::from_waker(&waker);
+        // The current-thread fixture cannot run the actor during this poll.
+        // Its mailbox is empty after the preceding snapshot reply. Disabling
+        // cooperative yield leaves only the original oneshot reply pending;
+        // no scheduler-budget wake can masquerade as ActorReply::send.
+        let mut failure = Box::pin(tokio::task::unconstrained(source.fail(original.clone())));
+        assert!(failure.as_mut().poll(&mut cx).is_pending());
+        submitted_at_reply = Some(
+            tokio::time::timeout(Duration::from_secs(5), response)
+                .await
+                .expect("the actual fail reply must wake its original receiver")
+                .unwrap(),
+        );
+        failure.await.unwrap();
+        reply_probe = Some(probe);
+    } else {
+        source.fail(original.clone()).await.unwrap();
+    }
+    let observed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let current = outcome.borrow().clone();
+            if let Some(verdict) = current {
+                break verdict;
+            }
+            outcome.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the original actor must publish its statement verdict");
+    let watch_transport = HoldingEstablishTransport::default();
+    let (submitted, transport) = if let Some(probe) = reply_probe.as_ref() {
+        (submitted_at_reply.take().unwrap(), &probe.transport)
+    } else {
+        (
+            held.take().unwrap().try_submit(&watch_transport),
+            &watch_transport,
+        )
+    };
+    let reached_transport = transport.submission.lock().unwrap().is_some();
+    // On the old source this can be Accepted. Settle that exact controlled
+    // submission before asserting, keeping the original actor join observable.
+    let late_settlement = if reached_transport {
+        Some(transport.take().worker_settled(OperationOutcome::Accepted))
+    } else {
+        None
+    };
+    drop((running, ready, stream, output, outcome));
+    let supervisor = owner.into_residual_stand_down_supervisor();
+    // These separate Worker/context stop facts come from the existing fixture
+    // author. Neither the ACK nor the statement watch is an actual-exit proof.
+    supervisor
+        .observe_worker_stopped_and_context_fenced(root_context)
+        .await
+        .unwrap();
+    supervisor
+        .observe_worker_stopped_and_context_fenced(held_context)
+        .await
+        .unwrap();
+    drop(actor);
+    let ResidualStandDownSupervisor { actor, mut join } = supervisor;
+    drop(actor);
+    let joined = tokio::time::timeout(Duration::from_secs(5), &mut join).await;
+    if !matches!(joined, Ok(Ok(()))) {
+        std::panic::panic_any((join, joined));
+    }
+    assert_eq!(observed.unwrap_err(), original);
+    assert!(late_settlement.is_none_or(|settled| settled.is_ok()));
+    assert!(matches!(
+        submitted,
+        Err(EstablishIssueError::IssueAuthorityRevoked)
+    ));
+    assert!(
+        !reached_transport,
+        "a terminal internal cut left Establish authority open"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn internal_failure_ack_revokes_the_other_contexts_pre_transport_permit() {
+    internal_failure_revokes_original_issue_authority(true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn internal_failure_watch_revokes_the_other_contexts_pre_transport_permit() {
+    internal_failure_revokes_original_issue_authority(false).await;
 }

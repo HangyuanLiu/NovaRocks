@@ -413,6 +413,19 @@ pub type InternalConsumerFuture =
 /// The registered application owner implements actual decoding, domain proof
 /// and custody. It receives no retry, cancellation or finish-policy callback.
 pub trait InternalComputationConsumer: Send + Sync + std::fmt::Debug + 'static {
+    /// Close admission to this original consumer's local computation jobs.
+    /// The execution owner first revokes the activation's production authority.
+    fn begin_local_close(&self);
+
+    /// Observe the same original local jobs and their actual exit. This is
+    /// independent of consumer-task, Native, remote and payload convergence.
+    /// An owner that never issues local jobs supplies its explicit no-issue
+    /// implementation; an empty field or cancellation is not exit evidence.
+    fn poll_local_closed(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), crate::api::StatementNativeHealthFailure>>;
+
     /// Borrow the original abnormal local custody after its actual consumer
     /// join. Ordinary domain errors have no process-health projection.
     fn local_health_failure(&self) -> Option<crate::api::StatementNativeHealthFailure> {

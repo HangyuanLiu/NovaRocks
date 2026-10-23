@@ -1306,6 +1306,45 @@ async fn make_logical_role(
     owner: WorkOwner,
     input: LogicalRoleInput,
 ) -> Result<(), QueryExecutionError> {
+    let original_exit = input.original_exit.clone();
+    let consumer = {
+        let source = original_exit
+            .upgrade()
+            .expect("original role source exists");
+        let body = source
+            .native
+            .try_lock()
+            .expect("unpolled original Native body");
+        body.start
+            .as_ref()
+            .and_then(crate::api::QueryExecutionRequest::original_internal_consumer)
+    };
+    let result = run_logical_role(owner, input).await;
+    if let Some(consumer) = consumer {
+        // The unique role has stopped producing attempts. This also covers
+        // every pre-actor refusal: no actor absence is used as an exit receipt.
+        // Installed executions already start this close at the actor cut below.
+        consumer.begin_local_close();
+        if let Err(original) = std::future::poll_fn(|cx| consumer.poll_local_closed(cx)).await {
+            original_exit
+                .upgrade()
+                .expect("original source retains its role")
+                .retain_local_consumer_failure_silent(original);
+            return first_supervision_error(
+                result,
+                Err(internal_consumer_panicked(
+                    "Original Internal local close remains unresolved",
+                )),
+            );
+        }
+    }
+    result
+}
+
+async fn run_logical_role(
+    owner: WorkOwner,
+    input: LogicalRoleInput,
+) -> Result<(), QueryExecutionError> {
     let LogicalRoleInput {
         original_exit,
         reply,
@@ -1673,6 +1712,7 @@ async fn make_logical_role(
         (reply, None)
     };
     let outcome_requester = requester.clone();
+    let local_consumer = internal_consumer.clone();
     let supervision = async move {
         let dormant = dormant;
         let mut active_custody = match registry.reserve_active_native_owner(
@@ -2056,8 +2096,15 @@ async fn make_logical_role(
     };
     match internal_reply {
         Some((reply, local_result)) => {
-            supervise_internal_outcome(supervision, outcome, outcome_requester, reply, local_result)
-                .await
+            supervise_internal_outcome(
+                supervision,
+                outcome,
+                outcome_requester,
+                reply,
+                local_result,
+                local_consumer.expect("validated internal execution has its original consumer"),
+            )
+            .await
         }
         None => supervision.await,
     }
@@ -2074,32 +2121,81 @@ async fn supervise_internal_outcome(
     requester: novarocks_workload_control::WorkCancellationRequester,
     reply: oneshot::Sender<Result<ExecutionHandle, QueryExecutionError>>,
     mut local_result: oneshot::Receiver<Result<ExecutionHandle, QueryExecutionError>>,
+    consumer: Arc<dyn crate::api::InternalComputationConsumer>,
 ) -> Result<(), QueryExecutionError> {
     tokio::pin!(supervision);
     let mut reply = Some(reply);
+    let mut supervision_result: Option<Result<(), QueryExecutionError>> = None;
+    let mut local_started = false;
+    let mut local_finished = false;
+    let mut local_failure = None;
     loop {
         if let Some(verdict) = outcome
             .as_ref()
             .and_then(|outcome| outcome.borrow().clone())
-            && let Some(reply) = reply.take()
         {
-            let _ = reply.send(
-                verdict.map(|token| ExecutionHandle::computation_ready(requester.clone(), token)),
-            );
+            if !local_started {
+                // This is the statement outcome, published only after the
+                // original actor revoked production/transport issue rights.
+                // Attempt failure or a vanished watch is not this cut.
+                consumer.begin_local_close();
+                local_started = true;
+            }
+            if let Some(reply) = reply.take() {
+                let _ = reply.send(
+                    verdict
+                        .map(|token| ExecutionHandle::computation_ready(requester.clone(), token)),
+                );
+            }
+        }
+        if supervision_result.is_some() && (!local_started || local_finished) {
+            let result = supervision_result.take().unwrap();
+            if let Some(reply) = reply.take() {
+                let verdict = outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome.borrow().clone());
+                let candidate = match verdict {
+                    Some(verdict) => verdict
+                        .map(|token| ExecutionHandle::computation_ready(requester.clone(), token)),
+                    None => local_result.try_recv().unwrap_or_else(|_| {
+                        Err(result.as_ref().err().cloned().unwrap_or_else(|| result_protocol_error(
+                            "internal computation lost its logical outcome owner before readiness",
+                        )))
+                    }),
+                };
+                let _ = reply.send(candidate);
+            }
+            // The original Source still owns the consumer and its raw local
+            // cause. The role's final local-close author retains that failure
+            // before its original completion can be published.
+            return if local_failure.is_some() {
+                first_supervision_error(
+                    result,
+                    Err(internal_consumer_panicked(
+                        "Original Internal local close remains unresolved",
+                    )),
+                )
+            } else {
+                result
+            };
         }
         tokio::select! {
             biased;
-            changed = wait_for_internal_ready(outcome.as_mut()), if outcome.is_some() && reply.is_some() => {
+            changed = wait_for_internal_ready(outcome.as_mut()),
+                if outcome.is_some() && (!local_started || reply.is_some()) => {
                 if changed.is_err() {
-                    // Read the final retained value before treating owner loss
-                    // as unknown. A last send may precede sender destruction.
-                    if let Some(verdict) = outcome.as_ref().and_then(|outcome| outcome.borrow().clone()) {
-                        if let Some(reply) = reply.take() {
-                            let _ = reply.send(verdict.map(|token| ExecutionHandle::computation_ready(requester.clone(), token)));
-                        }
+                    // Preserve a final retained verdict. Losing an undecided
+                    // sender never authorizes a local close.
+                    let final_verdict = outcome.as_ref().and_then(|outcome| outcome.borrow().clone());
+                    if final_verdict.is_none() {
+                        outcome = None;
                     }
-                    outcome = None;
                 }
+            }
+            closed = std::future::poll_fn(|cx| consumer.poll_local_closed(cx)),
+                if local_started && !local_finished => {
+                local_finished = true;
+                local_failure = closed.err();
             }
             candidate = &mut local_result, if outcome.is_none() && reply.is_some() => {
                 if let Some(reply) = reply.take() {
@@ -2108,20 +2204,8 @@ async fn supervise_internal_outcome(
                     ))));
                 }
             }
-            result = &mut supervision => {
-                if let Some(reply) = reply.take() {
-                    let verdict = outcome.as_ref().and_then(|outcome| outcome.borrow().clone());
-                    let candidate = match verdict {
-                        Some(verdict) => verdict.map(|token| ExecutionHandle::computation_ready(requester.clone(), token)),
-                        None => local_result.try_recv().unwrap_or_else(|_| {
-                            Err(result.as_ref().err().cloned().unwrap_or_else(|| result_protocol_error(
-                                "internal computation lost its logical outcome owner before readiness",
-                            )))
-                        }),
-                    };
-                    let _ = reply.send(candidate);
-                }
-                return result;
+            result = &mut supervision, if supervision_result.is_none() => {
+                supervision_result = Some(result);
             }
         }
     }

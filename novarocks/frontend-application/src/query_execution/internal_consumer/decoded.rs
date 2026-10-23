@@ -442,6 +442,25 @@ pub(crate) fn prepare_statistics_computation(
 }
 
 impl InternalComputationConsumer for DecodedComputationConsumer {
+    fn begin_local_close(&self) {
+        self.holder.cpu.begin_close();
+    }
+
+    fn poll_local_closed(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), novarocks_query_application::api::StatementNativeHealthFailure>>
+    {
+        self.holder.cpu.poll_join_closed(cx).map(|result| {
+            result.map_err(|original| {
+                novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
+                    "Original Internal CPU failure remains in custody",
+                    original,
+                )
+            })
+        })
+    }
+
     fn local_health_failure(
         &self,
     ) -> Option<novarocks_query_application::api::StatementNativeHealthFailure> {
