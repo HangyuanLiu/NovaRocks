@@ -38,6 +38,7 @@ pub struct FragmentStructureInput {
     pub nodes: BTreeMap<NodeId, PhysicalNode>,
     pub sink: FragmentSink,
     pub dop_domain: PipelineDopDomain,
+    pub stage_placement: crate::StagePlacementPolicy,
     pub runtime_filters: Box<[RuntimeFilterId]>,
 }
 
@@ -128,6 +129,7 @@ impl Fragment {
             nodes: input.nodes,
             sink: input.sink,
             dop_domain: input.dop_domain,
+            stage_placement: input.stage_placement,
             runtime_filters: input.runtime_filters,
             call_requests: crate::FragmentCallRequests::unpublished_empty(input.id),
         });

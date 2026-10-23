@@ -5468,7 +5468,12 @@ mod tests {
                     .unwrap();
                 let fragment = with_requests(
                     producer
-                        .finish_definition(writer, FragmentSink::Stream { edge }, dop())
+                        .finish_definition(
+                            writer,
+                            FragmentSink::Stream { edge },
+                            dop(),
+                            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+                        )
                         .unwrap(),
                     partial.iter().enumerate().map(|(call, item)| {
                         (
@@ -5525,9 +5530,12 @@ mod tests {
                     })
                     .unwrap();
                 plan.add_edge(Edge {
+                    role: novarocks_physical_plan::OutputRole::Relational,
+                    delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
                     id: edge,
                     kind: EdgeKind::Stream,
                     source: EdgeSource {
+                        port: novarocks_physical_plan::FragmentOutputPort::Root,
                         fragment: fragment_id,
                         projection: fields.iter().map(|field| field.value).collect(),
                     },
@@ -5672,6 +5680,12 @@ mod tests {
                         columns: outputs.iter().map(|field| field.value).collect(),
                     },
                     kind: NodeKind::TableFinish(WriterFinishSpec {
+                        count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
+                        inputs: novarocks_physical_plan::FinishInputs {
+                            writer_results: 0,
+                            logical_summary: None,
+                        },
+                        logical_summary: None,
                         expected_target_ordinals: ordinals.clone(),
                         input_schema: WriterRelationSchema {
                             revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -5703,7 +5717,12 @@ mod tests {
                 .unwrap();
             let consumer = with_requests(
                 consumer
-                    .finish_definition(finish, FragmentSink::Result, dop())
+                    .finish_definition(
+                        finish,
+                        FragmentSink::Result,
+                        dop(),
+                        novarocks_physical_plan::StagePlacementPolicy::Singleton,
+                    )
                     .unwrap(),
                 finals.iter().enumerate().map(|(call, item)| {
                     (

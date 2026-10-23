@@ -115,7 +115,8 @@ pub use logical::{
 };
 pub use partition::{
     BucketLayoutAlgorithm, PartitionCountParameterId, PartitionCountParameterIdentityError,
-    PartitionHashAlgorithm, PartitionSpaceId, PartitionSpaceIdentityError,
+    PartitionHashAlgorithm, PartitionHashDomain, PartitionSpaceId, PartitionSpaceIdentityError,
+    avalanche_hash_u64,
 };
 pub use schema::{
     MAX_ARROW_FIELD_METADATA_BYTES, MAX_ARROW_FIELD_METADATA_ENTRIES,

@@ -302,6 +302,7 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
                 labels.pop();
             }
             RowCountAssertionSpec::PerKeyAtMostOne {
+                applicability: novarocks_physical_plan::AssertionApplicability::AllRows,
                 keys: keys.into_boxed_slice(),
                 labels: labels.into_boxed_slice(),
                 message: if matches!(shape, Shape::EmptyMessage) {
@@ -340,6 +341,7 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
         },
         PlanLimits::FROZEN,
         &Control,
+        novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control)?;
     let domain = EvaluationDomainId::new(u32::MAX);
@@ -484,6 +486,7 @@ fn assert_rows_complete_keyed_preserves_order_duplicate_occurrences_full_source_
         input,
         mode:
             AssertRowsMode::PerKeyAtMostOne {
+                applicability: novarocks_local_program::ProgramAssertionApplicability::AllRows,
                 key_slots,
                 key_labels,
                 message_prefix,

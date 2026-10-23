@@ -57,6 +57,18 @@ fn lower_core(
             "row assertion source kind differs",
         ));
     };
+    if matches!(
+        spec,
+        RowCountAssertionSpec::PerKeyAtMostOne {
+            applicability: novarocks_physical_plan::AssertionApplicability::WhenTrue(_),
+            ..
+        }
+    ) {
+        return Err(FragmentCompileError::Unsupported {
+            node: Some(node.id),
+            feature: "conditional keyed assertion",
+        });
+    }
     let mode = match spec {
         RowCountAssertionSpec::Global {
             subject,
@@ -92,6 +104,7 @@ fn lower_core(
             keys,
             labels,
             message,
+            ..
         } => {
             let valid = !keys.is_empty()
                 && keys.len() == key_slots.len()
@@ -121,6 +134,7 @@ fn lower_core(
                 work.step()?;
             }
             AssertRowsMode::PerKeyAtMostOne {
+                applicability: novarocks_local_program::ProgramAssertionApplicability::AllRows,
                 key_slots: copied_slots,
                 key_labels: copied_labels,
                 message_prefix: copy_text(message, work)?,

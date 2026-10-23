@@ -162,6 +162,7 @@ fn incremental_change_stream_routes(
             write_target_ordinal: write_target.ordinal(),
             accepted_effects: route.accepted_effects().to_vec(),
             input_ordinals: route.input_ordinals().to_vec(),
+            requirements: route.requirements().clone(),
             partition_input_tokens: route.partition_fields().to_vec(),
             sink,
         });
@@ -589,7 +590,10 @@ mod tests {
                     )
                 })
                 .collect(),
-            Vec::new(),
+            novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
+                layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             Vec::new(),
         )
         .expect("route facts")

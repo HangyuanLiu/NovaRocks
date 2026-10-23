@@ -78,7 +78,20 @@ message Fragment {
   repeated uint32 runtime_filter_ids = 8;
   // Required even for a call-free fragment: absent is not an empty table.
   novarocks.call_request.FragmentCallRequests call_requests = 9;
+  StagePlacementPolicy stage_placement = 10;
 }
+
+// Exact placement policy; edge distribution never supplies an implicit width.
+message StagePlacementPolicy {
+  oneof kind {
+    novarocks.physical_control_v2.Empty singleton = 1;
+    novarocks.physical_control_v2.Empty scan_work = 2;
+    SpreadStagePlacement spread = 3;
+    FollowSourcesStagePlacement follow_sources = 4;
+  }
+}
+message SpreadStagePlacement { optional uint32 max_instances = 1; }
+message FollowSourcesStagePlacement { repeated uint32 fragment_ids = 1; }
 
 message PipelineDopDomain {
   uint32 min = 1;
@@ -240,7 +253,37 @@ message ValueOrigin {
     ExchangeImportOrigin exchange_import = 7;
     CteImportOrigin cte_import = 8;
     WriterDerivedOrigin writer_derived = 9;
+    LogicalChangeCountField logical_summary = 10;
   }
+}
+enum LogicalChangeCountField {
+  LOGICAL_CHANGE_COUNT_FIELD_UNSPECIFIED = 0;
+  LOGICAL_CHANGE_COUNT_FIELD_INSERTED = 1;
+  LOGICAL_CHANGE_COUNT_FIELD_REPLACED = 2;
+  LOGICAL_CHANGE_COUNT_FIELD_DELETED = 3;
+}
+message LogicalSummaryColumns {
+  optional uint32 inserted_value_id = 1;
+  optional uint32 replaced_value_id = 2;
+  optional uint32 deleted_value_id = 3;
+}
+message LogicalSummaryOutput {
+  optional uint32 edge_id = 1;
+  LogicalSummaryColumns columns = 2;
+}
+message LogicalSummaryCut {
+  LogicalSummaryColumns source = 1;
+  LogicalSummaryColumns destination = 2;
+}
+enum FragmentOutputPort {
+  FRAGMENT_OUTPUT_PORT_UNSPECIFIED = 0;
+  FRAGMENT_OUTPUT_PORT_ROOT = 1;
+  FRAGMENT_OUTPUT_PORT_LOGICAL_SUMMARY = 2;
+}
+enum DeliveryRequirement {
+  DELIVERY_REQUIREMENT_UNSPECIFIED = 0;
+  DELIVERY_REQUIREMENT_DEMAND_DRIVEN = 1;
+  DELIVERY_REQUIREMENT_MUST_DRAIN = 2;
 }
 message ProviderFieldOrigin {
   optional uint32 scan_node_id = 1;
@@ -480,11 +523,19 @@ message Distribution {
     novarocks.physical_control_v2.Empty broadcast = 4;
     HashDistribution hash = 5;
     BucketDistribution bucket_shuffle = 6;
+    ConditionalKeyDistribution conditional_key = 7;
   }
 }
 message HashDistribution {
   repeated uint32 key_value_ids = 1;
   HashPartitionScheme scheme = 2;
+}
+// TRUE rows use the signed hierarchy; FALSE/NULL bypass it with per-row
+// round-robin at both levels. The mask is not an additional hash key.
+message ConditionalKeyDistribution {
+  optional uint32 applies_value_id = 1;
+  repeated uint32 key_value_ids = 2;
+  HashPartitionScheme scheme = 3;
 }
 message HashPartitionScheme {
   bytes partition_space = 1; // Exact32bytes identity, not a node ID.
@@ -520,6 +571,7 @@ enum PartitionHashAlgorithm {
   PARTITION_HASH_ALGORITHM_UNSPECIFIED = 0;
   PARTITION_HASH_ALGORITHM_NATIVE_EXCHANGE_V1 = 1;
   PARTITION_HASH_ALGORITHM_NATIVE_BUCKET_CRC32_V1 = 2;
+  PARTITION_HASH_ALGORITHM_NATIVE_HIERARCHICAL_V1 = 3;
 }
 enum BucketLayoutAlgorithm {
   BUCKET_LAYOUT_ALGORITHM_UNSPECIFIED = 0;
@@ -792,10 +844,17 @@ enum RowCountComparison {
   ROW_COUNT_COMPARISON_GT = 5;
   ROW_COUNT_COMPARISON_GE = 6;
 }
+message AssertionApplicability {
+  oneof kind {
+    novarocks.physical_control_v2.Empty all_rows = 1;
+    uint32 when_true_value_id = 2;
+  }
+}
 message PerKeyRowCountAssertion {
   repeated uint32 key_value_ids = 1;
   repeated string labels = 2;
   string message = 3;
+  AssertionApplicability applicability = 4;
 }
 message ChangeEventExpandNode {
   repeated ChangeEvent events = 1;
@@ -859,12 +918,23 @@ message WriterAggregateCall {
   optional uint32 aggregate_binding_id = 2;
   optional uint32 output_value_id = 3;
 }
+enum FinishCountMode {
+  FINISH_COUNT_MODE_UNSPECIFIED = 0;
+  FINISH_COUNT_MODE_LOGICAL_CHANGES = 1;
+  FINISH_COUNT_MODE_WRITER_REPORTED = 2;
+  FINISH_COUNT_MODE_EXTERNAL_OWNER = 3;
+}
+
 message WriterFinish {
   repeated uint32 expected_target_ordinals = 1;
   WriterRelationSchema input_schema = 2;
   WriterRelationSchema output_schema = 3;
   repeated WriterAggregateCall final_aggregates = 4;
   WriterGroupedUnpivot grouped_unpivot = 5;
+  FinishCountMode count_mode = 6;
+  optional uint32 writer_results_input = 7;
+  optional uint32 logical_summary_input = 8;
+  LogicalSummaryColumns logical_summary = 9;
 }
 message WriterGroupedUnpivot {
   repeated uint32 statistics_target_ordinals = 1;
@@ -896,15 +966,31 @@ message MulticastSink { repeated uint32 edge_ids = 1; }
 message RouterSink {
   optional uint32 effect_value_id = 1;
   repeated ChangeStreamRoute routes = 2;
+  LogicalSummaryOutput summary = 3;
 }
 message ChangeStreamRoute {
   bytes route_id = 1;
   uint32 write_target_ordinal = 2;
   repeated RowMutationEffect accepted_effects = 3;
   repeated WriteInputMapping input_mapping = 4;
-  repeated uint32 partition_value_ids = 5;
+  reserved 5;
+  reserved "partition_value_ids";
   optional uint32 edge_id = 6;
+  WriteRouteRequirements requirements = 7;
 }
+// Both dimensions are mandatory and independent. Absent never means None.
+message WriteRouteRequirements {
+  oneof colocation {
+    novarocks.physical_control_v2.Empty no_colocation = 1;
+    novarocks.physical_control_v2.Empty singleton = 2;
+    WriteRouteKeyFields by_key = 3;
+  }
+  oneof layout {
+    novarocks.physical_control_v2.Empty no_layout = 4;
+    WriteRouteKeyFields cluster_by = 5;
+  }
+}
+message WriteRouteKeyFields { repeated uint32 value_ids = 1; }
 message WriteInputMapping {
   bytes field_token = 1;
   optional uint32 value_id = 2;
@@ -1021,8 +1107,14 @@ message InboundFragmentCut {
   optional uint32 destination_node_id = 4;
   repeated CutImport imports = 5;
   EdgePartitioning partitioning = 6;
-  ChangeStreamWriterCut change_stream_writer = 7;
-  WriterResultCut writer_result = 8;
+  oneof payload {
+    ChangeStreamWriterCut change_stream_writer = 7;
+    WriterResultCut writer_result = 8;
+    novarocks.physical_control_v2.Empty relational = 10;
+    LogicalSummaryCut logical_summary = 11;
+  }
+  DeliveryRequirement delivery = 12;
+  FragmentOutputPort source_port = 13;
 }
 message OutboundFragmentCut {
   optional uint32 edge_id = 1;
@@ -1031,8 +1123,14 @@ message OutboundFragmentCut {
   repeated CutValue projection = 4;
   repeated CutImport destination_imports = 5;
   EdgePartitioning partitioning = 6;
-  ChangeStreamWriterCut change_stream_writer = 7;
-  WriterResultCut writer_result = 8;
+  oneof payload {
+    ChangeStreamWriterCut change_stream_writer = 7;
+    WriterResultCut writer_result = 8;
+    novarocks.physical_control_v2.Empty relational = 11;
+    LogicalSummaryCut logical_summary = 12;
+  }
+  FragmentOutputPort source_port = 10;
+  DeliveryRequirement delivery = 13;
   // The destination ExchangeSource node of this edge: the sender's routing
   // address. Symmetric with InboundFragmentCut.destination_node_id.
   optional uint32 destination_node_id = 9;

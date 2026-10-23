@@ -460,6 +460,7 @@ mod tests {
             vec![crate::column_id::ColumnId::new_for_test(7)],
             vec!["_row_id".to_string()],
             "MOR UPDATE matched target row",
+            None,
         ));
         assert_eq!(
             format_shared_plan_node_header(

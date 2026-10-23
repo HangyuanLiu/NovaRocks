@@ -258,6 +258,7 @@ fn source(input_type: FunctionValueType, label_bytes: usize) -> Vec<u8> {
                 max: 1,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap()
         .with_call_requests_observed(

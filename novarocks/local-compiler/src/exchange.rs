@@ -85,7 +85,17 @@ fn lower_core_with_creation<H>(
         ))
         .into());
     }
-    if cut.kind != EdgeKind::Stream || cut.change_stream_writer.is_some() {
+    if matches!(
+        cut.payload,
+        novarocks_physical_plan::ExchangePayloadContract::LogicalSummary(_)
+    ) {
+        return Err((FragmentCompileError::Unsupported {
+            node: Some(node.id),
+            feature: "logical-summary exchange input",
+        })
+        .into());
+    }
+    if cut.kind != EdgeKind::Stream || cut.change_stream_writer().is_some() {
         return Err((FragmentCompileError::Unsupported {
             node: Some(node.id),
             feature: "inbound CTE or change-stream edge",
@@ -95,7 +105,7 @@ fn lower_core_with_creation<H>(
     // A writer-result receiver presents the writer relation positionally,
     // named by its frozen relation fields; the finish admission proved that
     // it feeds exactly one finish.
-    let relation = cut.writer_result.as_ref().map(|relation| &relation.fields);
+    let relation = cut.writer_result().map(|relation| &relation.fields);
     if relation.is_some_and(|fields| fields.len() != node.output.columns.len()) {
         return Err((FragmentCompileError::Invalid(
             "writer-result cut width differs from its receiver",
@@ -131,6 +141,16 @@ fn lower_core_with_creation<H>(
     // carry the same sent value, with a fresh channel per output occurrence.
     // Use the first occurrence, as channel planning does, preserving key order.
     let keys = match &cut.partitioning.destination {
+        Distribution::Hash { scheme, .. }
+            if scheme.definition.algorithm
+                == novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1 =>
+        {
+            return Err((FragmentCompileError::Unsupported {
+                node: Some(node.id),
+                feature: "hierarchical exchange input",
+            })
+            .into());
+        }
         Distribution::Hash { keys, .. } | Distribution::BucketShuffle { keys, .. } => {
             if keys.is_empty() {
                 return Err(
@@ -138,6 +158,13 @@ fn lower_core_with_creation<H>(
                 );
             }
             keys.as_ref()
+        }
+        Distribution::ConditionalKey { .. } => {
+            return Err((FragmentCompileError::Unsupported {
+                node: Some(node.id),
+                feature: "conditional-key exchange input",
+            })
+            .into());
         }
         Distribution::Unconstrained
         | Distribution::Singleton
@@ -224,6 +251,31 @@ fn lower_core_with_creation<H>(
         },
         layout,
         input: CompiledExchangeInput {
+            role: crate::stream_sink::cut_role(cut.payload.role()),
+            delivery: crate::stream_sink::cut_delivery(cut.delivery),
+            routing: match &cut.partitioning.destination {
+                Distribution::Hash { scheme, .. } => {
+                    novarocks_local_program::CompiledExchangeRouting::Hash {
+                        algorithm: scheme.definition.algorithm,
+                    }
+                }
+                Distribution::BucketShuffle { scheme, .. } => {
+                    novarocks_local_program::CompiledExchangeRouting::BucketShuffle {
+                        algorithm: scheme.hash,
+                    }
+                }
+                Distribution::ConditionalKey { .. } => {
+                    return Err((FragmentCompileError::Unsupported {
+                        node: Some(node.id),
+                        feature: "conditional-key exchange input",
+                    })
+                    .into());
+                }
+                Distribution::RoundRobin => {
+                    novarocks_local_program::CompiledExchangeRouting::RoundRobin
+                }
+                _ => novarocks_local_program::CompiledExchangeRouting::Unpartitioned,
+            },
             receiver_node: node.id.get(),
             edge: edge.get(),
             source_fragment: cut.source_fragment.get(),

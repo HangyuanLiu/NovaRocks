@@ -375,12 +375,14 @@ impl ExchangeSource {
 pub struct ExchangeInbound {
     node_id: FragmentNodeId,
     sources: Vec<ExchangeSource>,
+    delivery: crate::ExchangeDeliveryRequirement,
 }
 
 impl ExchangeInbound {
     pub fn try_new(
         node_id: FragmentNodeId,
         sources: Vec<ExchangeSource>,
+        delivery: crate::ExchangeDeliveryRequirement,
     ) -> Result<Self, DescriptorError> {
         if sources.is_empty() {
             return Err(DescriptorError::InboundWithoutSources(node_id));
@@ -413,11 +415,19 @@ impl ExchangeInbound {
                 received: ordinals,
             });
         }
-        Ok(Self { node_id, sources })
+        Ok(Self {
+            node_id,
+            sources,
+            delivery,
+        })
     }
 
     pub const fn node_id(&self) -> FragmentNodeId {
         self.node_id
+    }
+
+    pub const fn delivery(&self) -> crate::ExchangeDeliveryRequirement {
+        self.delivery
     }
 
     pub fn sources(&self) -> &[ExchangeSource] {
@@ -875,14 +885,22 @@ mod tests {
     fn an_inbound_nodes_sender_count_is_exactly_its_frozen_source_set() {
         let backend = BackendProcessId::new_v7();
         assert_eq!(
-            ExchangeInbound::try_new(FragmentNodeId::new(10), Vec::new()),
+            ExchangeInbound::try_new(
+                FragmentNodeId::new(10),
+                Vec::new(),
+                crate::ExchangeDeliveryRequirement::DemandDriven
+            ),
             Err(DescriptorError::InboundWithoutSources(FragmentNodeId::new(
                 10
             )))
         );
         let repeated = source(task(1, 1, backend));
         assert_eq!(
-            ExchangeInbound::try_new(FragmentNodeId::new(10), vec![repeated, repeated]),
+            ExchangeInbound::try_new(
+                FragmentNodeId::new(10),
+                vec![repeated, repeated],
+                crate::ExchangeDeliveryRequirement::DemandDriven
+            ),
             Err(DescriptorError::DuplicateInboundSource(
                 FragmentNodeId::new(10)
             ))
@@ -895,7 +913,8 @@ mod tests {
                 vec![
                     ExchangeSource::new(task(1, 1, backend), key(9, 9), 0),
                     ExchangeSource::new(task(1, 2, backend), key(9, 9), 1),
-                ]
+                ],
+                crate::ExchangeDeliveryRequirement::DemandDriven,
             ),
             Err(DescriptorError::DuplicateInboundSource(
                 FragmentNodeId::new(10)
@@ -904,6 +923,7 @@ mod tests {
         let inbound = ExchangeInbound::try_new(
             FragmentNodeId::new(10),
             vec![source(task(1, 1, backend)), source(task(1, 2, backend))],
+            crate::ExchangeDeliveryRequirement::DemandDriven,
         )
         .expect("legal inbound");
         assert_eq!(inbound.expected_sender_count(), count(2));
@@ -932,7 +952,11 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                ExchangeInbound::try_new(FragmentNodeId::new(11), invalid),
+                ExchangeInbound::try_new(
+                    FragmentNodeId::new(11),
+                    invalid,
+                    crate::ExchangeDeliveryRequirement::DemandDriven
+                ),
                 Err(DescriptorError::InvalidInboundSenderOrdinals {
                     node: FragmentNodeId::new(11),
                     expected: vec![0, 1],
@@ -962,8 +986,12 @@ mod tests {
         );
 
         let inbound = || {
-            ExchangeInbound::try_new(FragmentNodeId::new(20), vec![source(task(1, 1, backend))])
-                .expect("legal inbound")
+            ExchangeInbound::try_new(
+                FragmentNodeId::new(20),
+                vec![source(task(1, 1, backend))],
+                crate::ExchangeDeliveryRequirement::DemandDriven,
+            )
+            .expect("legal inbound")
         };
         assert_eq!(
             ExchangeTopology::try_new(Vec::new(), vec![inbound(), inbound()]),
@@ -1055,6 +1083,7 @@ mod tests {
                         ExchangeSource::new(source_a, key(1, 1), first),
                         ExchangeSource::new(source_b, key(1, 2), second),
                     ],
+                    crate::ExchangeDeliveryRequirement::DemandDriven,
                 )
                 .expect("legal inbound"),
             ]

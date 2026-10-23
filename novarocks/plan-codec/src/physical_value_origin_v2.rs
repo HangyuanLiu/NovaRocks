@@ -428,6 +428,22 @@ fn encode_core(
         work,
     )?;
     let (kind, references) = match source {
+        physical::ValueOrigin::LogicalSummary { field } => (
+            wire::value_origin::Kind::LogicalSummary(
+                (match field {
+                    physical::LogicalChangeCountField::Inserted => {
+                        wire::LogicalChangeCountField::Inserted
+                    }
+                    physical::LogicalChangeCountField::Replaced => {
+                        wire::LogicalChangeCountField::Replaced
+                    }
+                    physical::LogicalChangeCountField::Deleted => {
+                        wire::LogicalChangeCountField::Deleted
+                    }
+                }) as i32,
+            ),
+            0,
+        ),
         physical::ValueOrigin::ProviderField { scan_node, field } => {
             let id = payloads.source_id_observed(&field.column_payload, work)?;
             (
@@ -646,6 +662,27 @@ fn decode_decision<'a>(
                 phase_refs(phase),
             )
         }
+        wire::value_origin::Kind::LogicalSummary(field) => (
+            physical::ValueOrigin::LogicalSummary {
+                field: match wire::LogicalChangeCountField::try_from(*field) {
+                    Ok(wire::LogicalChangeCountField::Inserted) => {
+                        physical::LogicalChangeCountField::Inserted
+                    }
+                    Ok(wire::LogicalChangeCountField::Replaced) => {
+                        physical::LogicalChangeCountField::Replaced
+                    }
+                    Ok(wire::LogicalChangeCountField::Deleted) => {
+                        physical::LogicalChangeCountField::Deleted
+                    }
+                    _ => {
+                        return Err(invalid(
+                            "logical summary origin field is unknown or unspecified",
+                        ));
+                    }
+                },
+            },
+            0,
+        ),
         wire::value_origin::Kind::AggregateResultCallId(call) => (
             physical::ValueOrigin::AggregateResult {
                 call: physical::AggregateCallId::new(*call),

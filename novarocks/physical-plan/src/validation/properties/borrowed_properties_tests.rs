@@ -94,6 +94,7 @@ fn fixture() -> (Fragment, PhysicalRootUses, FrozenFragmentCalls) {
                 max: 1,
                 requires_power_of_two: false,
             },
+            crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let setup = SetupControl::default();

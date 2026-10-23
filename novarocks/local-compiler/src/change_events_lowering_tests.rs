@@ -333,6 +333,7 @@ fn try_fixture(
         },
         PlanLimits::FROZEN,
         &Control,
+        novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
     let domain = EvaluationDomainId::new(u32::MAX);

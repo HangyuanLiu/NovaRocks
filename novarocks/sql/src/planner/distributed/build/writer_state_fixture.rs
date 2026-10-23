@@ -221,7 +221,12 @@ pub fn writer_state_source_for_test(
             probe_runtime_filters: Vec::new(),
         };
         let routes = (0..counts.len())
-            .map(|i| ChangeStreamWriteRouteSpec {
+            .map(|i| {
+                ChangeStreamWriteRouteSpec {
+            requirements: novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
+                layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
                 route_id: ConnectorWriteRouteId::from_bytes([u8::try_from(i + 1).unwrap(); 32]),
                 write_target_ordinal: WriteTargetOrdinal::try_new(u32::try_from(i).unwrap())
                     .unwrap(),
@@ -233,6 +238,7 @@ pub fn writer_state_source_for_test(
                 partition_input_positions: Vec::new(),
                 output_partition_ordinals: Vec::new(),
                 sink: declared_inputs[i].clone(),
+            }
             })
             .collect();
         let handles = (0..counts.len()).map(|i| {

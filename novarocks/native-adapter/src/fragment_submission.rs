@@ -54,6 +54,13 @@ pub fn compiled_fragment_sink_assignment(
                 "compiled multicast and router sinks are not executable yet",
             ));
         }
+        StaticSinkProgram::ChangeStreamRouter { .. } => {
+            return Err(error(
+                path,
+                ProtocolErrorKind::Unsupported,
+                "compiled change-stream router runtime is not installed",
+            ));
+        }
     };
     let edges = decode_sink_edges(&expected, sink_edge_ids, topology, path)?;
     let mut groups = edges
@@ -249,6 +256,12 @@ mod tests {
                 Vec::new(),
                 vec![novarocks_types::SlotId::new(0)],
                 None,
+                novarocks_local_program::StaticStreamContract {
+                    role: novarocks_local_program::ProgramOutputRole::Relational,
+                    delivery:
+                        novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                    routing: novarocks_local_program::StaticStreamRouting::Ordinary,
+                },
             )
             .expect("compiled stream branch"),
             arena: std::sync::Arc::new(

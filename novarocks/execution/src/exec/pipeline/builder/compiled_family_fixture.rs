@@ -221,6 +221,7 @@ pub(crate) fn package_with_sink_and_names(
                 max: max_dop,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();

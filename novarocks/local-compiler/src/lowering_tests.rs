@@ -292,6 +292,7 @@ fn package_with_case(
                 },
                 requires_power_of_two: matches!(case, PackageCase::PowerOfTwoDomain),
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap()
         .with_call_requests_observed(original_requests, &FixtureControl)

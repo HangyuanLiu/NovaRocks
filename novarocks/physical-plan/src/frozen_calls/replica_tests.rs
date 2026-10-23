@@ -47,6 +47,7 @@ impl PureCompileControl for ReplicaControl {
 }
 fn edit_fragment(fragment: &Fragment, edit: impl FnOnce(&mut FragmentParts)) -> Fragment {
     let mut parts = FragmentParts {
+        stage_placement: fragment.stage_placement().clone(),
         id: fragment.id(),
         root: fragment.root(),
         values: fragment.values().clone(),
@@ -516,7 +517,12 @@ fn broadcast_table_fixture() -> Fixture {
         },
     );
     let fragment = builder
-        .finish_definition(table, FragmentSink::Noop, dop())
+        .finish_definition(
+            table,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let fragment = edit_fragment(&fragment, |parts| {
         for node in parts.nodes.values_mut() {

@@ -271,6 +271,7 @@ fn global(comparison: p::RowCountAssertion, desired_rows: u64) -> p::PhysicalNod
 }
 fn keyed() -> p::PhysicalNode {
     source(p::RowCountAssertionSpec::PerKeyAtMostOne {
+        applicability: novarocks_physical_plan::AssertionApplicability::AllRows,
         keys: Box::from([
             p::ValueId::new(u32::MAX),
             p::ValueId::new(0),
@@ -302,6 +303,11 @@ fn expected(kind: wire::row_count_assertion_node::Kind) -> wire::PhysicalNode {
 fn expected_keyed() -> wire::PhysicalNode {
     expected(wire::row_count_assertion_node::Kind::PerKeyAtMostOne(
         wire::PerKeyRowCountAssertion {
+            applicability: Some(wire::AssertionApplicability {
+                kind: Some(wire::assertion_applicability::Kind::AllRows(
+                    novarocks_proto_models::physical_control_v2::Empty {},
+                )),
+            }),
             key_value_ids: vec![u32::MAX, 0, u32::MAX],
             labels: vec!["Ω\0".into(), "第二".into(), "Ω\0".into()],
             message: "duplicate\0行".into(),
@@ -481,6 +487,7 @@ fn original_fragment_constructor_remains_the_semantic_owner_after_receiving() {
                     },
                     p::PlanLimits::FROZEN,
                     &control,
+                    novarocks_physical_plan::StagePlacementPolicy::Singleton,
                 )
                 .unwrap();
         }
@@ -520,7 +527,8 @@ fn original_fragment_constructor_remains_the_semantic_owner_after_receiving() {
                         requires_power_of_two: false
                     },
                     p::PlanLimits::FROZEN,
-                    &control
+                    &control,
+                    novarocks_physical_plan::StagePlacementPolicy::Singleton
                 )
                 .is_err()
         );
@@ -784,6 +792,7 @@ fn wide_ordered_keys_and_utf8_copy_reach_actual_quantum_without_after_refusal() 
     with_namespaces(&definitions(), &control, |encoded, decoded| {
         let mut original = keyed();
         if let p::NodeKind::AssertOneRow(p::RowCountAssertionSpec::PerKeyAtMostOne {
+            applicability: novarocks_physical_plan::AssertionApplicability::AllRows,
             keys,
             labels,
             message,
@@ -831,3 +840,65 @@ fn wide_ordered_keys_and_utf8_copy_reach_actual_quantum_without_after_refusal() 
 
 #[path = "owned_tests.rs"]
 mod owned_tests;
+
+#[test]
+fn applicability_is_one_original_reference_without_a_new_buffer() {
+    let control = Control::default();
+    let mut defs = definitions();
+    defs.push(p::ValueDef {
+        id: p::ValueId::new(7),
+        ty: FunctionValueType::new(DataType::Boolean, true),
+        origin: p::ValueOrigin::NodeOutput {
+            node: p::NodeId::new(0),
+            output_ordinal: 7,
+        },
+    });
+    with_namespaces(&defs, &control, |encoded, decoded| {
+        let all = keyed();
+        control.arm(None);
+        let (all_wire, all_facts) =
+            encode_assert_rows_node(&all, encoded, SOURCE, limits()).unwrap();
+        let mut conditional = all.clone();
+        let p::NodeKind::AssertOneRow(p::RowCountAssertionSpec::PerKeyAtMostOne {
+            applicability,
+            ..
+        }) = &mut conditional.kind
+        else {
+            panic!("keyed assertion")
+        };
+        *applicability = p::AssertionApplicability::WhenTrue(p::ValueId::new(7));
+        control.arm(None);
+        let (raw, facts) =
+            encode_assert_rows_node(&conditional, encoded, SOURCE, limits()).unwrap();
+        assert_eq!(
+            facts.value_reference_count,
+            all_facts.value_reference_count + 1
+        );
+        assert_eq!(facts.list_item_count, all_facts.list_item_count + 1);
+        assert_eq!(
+            facts.allocation_requests_upper_bound,
+            all_facts.allocation_requests_upper_bound
+        );
+        assert_eq!(
+            facts.allocation_request_bytes_upper_bound,
+            all_facts.allocation_request_bytes_upper_bound
+        );
+        let mut below = limits();
+        below.max_value_references = all_facts.value_reference_count;
+        control.arm(None);
+        assert!(encode_assert_rows_node(&conditional, encoded, SOURCE, below).is_err());
+        control.arm(None);
+        let (_, all_received) =
+            decode_assert_rows_node(&all_wire, decoded, SOURCE, limits()).unwrap();
+        control.arm(None);
+        let (owned, received) = decode_assert_rows_node(&raw, decoded, SOURCE, limits()).unwrap();
+        assert_eq!(owned, conditional);
+        assert_eq!(
+            received.value_reference_count,
+            all_received.value_reference_count + 1
+        );
+        assert_eq!(received.list_item_count, all_received.list_item_count + 1);
+        control.arm(None);
+        assert!(decode_assert_rows_node(&raw, decoded, SOURCE, below).is_err());
+    });
+}

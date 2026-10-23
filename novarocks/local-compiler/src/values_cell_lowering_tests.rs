@@ -211,6 +211,7 @@ fn cast_package_with_cells(
                 max: 1,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control::good()).unwrap();

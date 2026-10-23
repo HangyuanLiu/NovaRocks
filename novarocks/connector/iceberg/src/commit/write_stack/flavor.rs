@@ -999,7 +999,17 @@ fn route_facts<'a>(
         key.route_id(table),
         accepted_effects,
         input_ordinals,
-        partition_fields,
+        {
+            let keys = partition_fields;
+            novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: if keys.is_empty() {
+                    novarocks_spi::connector::write_stack::ConnectorWriteColocation::None
+                } else {
+                    novarocks_spi::connector::write_stack::ConnectorWriteColocation::ByKey(keys)
+                },
+                layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            }
+        },
         selection_bindings,
     )
 }

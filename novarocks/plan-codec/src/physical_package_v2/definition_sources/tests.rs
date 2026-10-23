@@ -359,6 +359,7 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
     .collect();
     let fragment = p::Fragment::try_from_structure_observed(
         p::FragmentStructureInput {
+            stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
             id: p::FragmentId::new(u32::MAX),
             root: table,
             values,
@@ -657,6 +658,7 @@ pub(in crate::physical_package_v2) fn cv_package() -> p::FragmentPackage {
     let values = [p::ValueId::new(0), p::ValueId::new(u32::MAX)];
     let fragment = p::Fragment::try_from_structure_observed(
         p::FragmentStructureInput {
+            stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
             id: p::FragmentId::new(9),
             root: source,
             values: values
@@ -904,6 +906,7 @@ pub(in crate::physical_package_v2) fn values_package(
         .collect::<Box<[_]>>();
     let fragment = p::Fragment::try_from_structure_observed(
         p::FragmentStructureInput {
+            stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
             id: p::FragmentId::new(5),
             root: source,
             values: values
@@ -1249,8 +1252,8 @@ fn cut_types(cuts: &p::FragmentCuts) -> Vec<&FunctionValueType> {
     for cut in cuts.inbound.iter() {
         out.extend(cut.imports.iter().map(|v| &v.source.ty));
         out.extend(
-            cut.writer_result
-                .iter()
+            cut.writer_result()
+                .into_iter()
                 .flat_map(|r| r.fields.iter().map(|f| &f.ty)),
         );
     }
@@ -1258,8 +1261,8 @@ fn cut_types(cuts: &p::FragmentCuts) -> Vec<&FunctionValueType> {
         out.extend(cut.projection.iter().map(|v| &v.ty));
         out.extend(cut.destination_imports.iter().map(|v| &v.source.ty));
         out.extend(
-            cut.writer_result
-                .iter()
+            cut.writer_result()
+                .into_iter()
                 .flat_map(|r| r.fields.iter().map(|f| &f.ty)),
         );
     }

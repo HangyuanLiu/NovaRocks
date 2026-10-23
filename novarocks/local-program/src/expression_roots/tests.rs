@@ -245,6 +245,11 @@ fn branch(index: usize, keys: usize, columns: usize) -> StaticStreamBranch {
             .map(|column| SlotId::new(column as u32 + 1))
             .collect(),
         None,
+        crate::StaticStreamContract {
+            role: crate::ProgramOutputRole::Relational,
+            delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+            routing: crate::StaticStreamRouting::Ordinary,
+        },
     )
     .unwrap()
 }
@@ -312,10 +317,14 @@ fn scoped_program(shared: bool) -> LocalProgramGraph {
             layout: layout.clone(),
         },
         BindingRequirement::ExchangeOutput {
+            role: crate::ProgramOutputRole::Relational,
+            delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
             branch: 0,
             layout: layout.clone(),
         },
         BindingRequirement::ExchangeOutput {
+            role: crate::ProgramOutputRole::Relational,
+            delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
             branch: 1,
             layout: layout.clone(),
         },
@@ -474,6 +483,12 @@ fn finish_program(constants: Vec<Vec<UnpivotConstant>>) -> LocalProgramGraph {
             ProgramNode::new(
                 1,
                 ProgramNodeKind::TableFinish {
+                    count_mode: novarocks_result_contract::FinishCountMode::WriterReported,
+                    input_roles: novarocks_result_contract::FinishInputs {
+                        writer_results: 0,
+                        logical_summary: None,
+                    },
+                    logical_summary_layout: None,
                     inputs: vec![ProgramNodeId::new(0)],
                     expected_targets: vec![WriteTargetOrdinal::try_new(0).unwrap()],
                     writer_multiplex_layout: layout.clone(),
@@ -558,6 +573,8 @@ fn sink_budget_program(extra_partition: bool, main_root: bool) -> LocalProgramGr
     let requirements = BindingRequirements::try_new(
         (0..branches.len())
             .map(|branch| BindingRequirement::ExchangeOutput {
+                role: crate::ProgramOutputRole::Relational,
+                delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
                 branch,
                 layout: layout.clone(),
             })

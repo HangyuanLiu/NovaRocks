@@ -1117,8 +1117,8 @@ fn render_cut_attachments(
             row_multiplicity(cut.partitioning.source_multiplicity),
             format_distribution_complete(context, fragment_id, &cut.partitioning.destination),
             row_multiplicity(cut.partitioning.destination_multiplicity),
-            ChangeStreamWriterCutDisplay(cut.change_stream_writer.as_ref()),
-            WriterResultCutDisplay(cut.writer_result.as_ref())
+            ChangeStreamWriterCutDisplay(cut.change_stream_writer()),
+            WriterResultCutDisplay(cut.writer_result())
         ))?;
     }
     for cut in &cuts.outbound {
@@ -1133,8 +1133,8 @@ fn render_cut_attachments(
             row_multiplicity(cut.partitioning.source_multiplicity),
             format_distribution_complete(context, cut.destination_fragment, &cut.partitioning.destination),
             row_multiplicity(cut.partitioning.destination_multiplicity),
-            ChangeStreamWriterCutDisplay(cut.change_stream_writer.as_ref()),
-            WriterResultCutDisplay(cut.writer_result.as_ref())
+            ChangeStreamWriterCutDisplay(cut.change_stream_writer()),
+            WriterResultCutDisplay(cut.writer_result())
         ))?;
     }
     Ok(())
@@ -1218,7 +1218,18 @@ fn render_sink(
             "  SINK multicast edges=[{}]",
             format_edge_ids(edges)
         ))?,
-        FragmentSink::Router { effect, routes } => {
+        FragmentSink::Router {
+            effect,
+            routes,
+            summary,
+        } => {
+            lines.push(format_args!(
+                "  SUMMARY edge=edge{} inserted={} replaced={} deleted={}",
+                summary.edge.get(),
+                context.value_name(fragment_id, summary.columns.inserted),
+                context.value_name(fragment_id, summary.columns.replaced),
+                context.value_name(fragment_id, summary.columns.deleted)
+            ))?;
             lines.push(format_args!(
                 "  SINK router effect={} routes={}",
                 context.value_name(fragment_id, *effect),
@@ -1226,12 +1237,22 @@ fn render_sink(
             ))?;
             for route in routes {
                 lines.push(format_args!(
-                    "    route id={} target={} effects=[{}] input=[{}] partition-by=[{}] edge=edge{}",
+                    "    route id={} target={} effects=[{}] input=[{}] colocation={} keys=[{}] layout={} layout-keys=[{}] edge=edge{}",
                     format_hex(&route.route_id.to_bytes()),
                     route.write_target_ordinal.get(),
                     joined(&route.accepted_effects, ",", |effect: &novarocks_spi::connector::ConnectorRowMutationEffect, output: &mut fmt::Formatter<'_>| output.write_str(connector_row_mutation_effect(*effect))),
                     joined(&route.input_mapping, ",", |(token, value): &(novarocks_spi::connector::ConnectorWriteFieldToken, ValueId), output: &mut fmt::Formatter<'_>| write!(output, "{}->{}", format_hex(&token.to_bytes()), context.value_name(fragment_id, *value))),
-                    joined(&route.partition_by, ",", |value: &ValueId, output: &mut fmt::Formatter<'_>| context.value_name(fragment_id, *value).fmt(output)),
+                    match &route.requirements.colocation {
+                        novarocks_physical_plan::WriteColocation::None => "none",
+                        novarocks_physical_plan::WriteColocation::Singleton => "singleton",
+                        novarocks_physical_plan::WriteColocation::ByKey(_) => "by-key",
+                    },
+                    joined(route.requirements.colocation_keys(), ",", |value: &ValueId, output: &mut fmt::Formatter<'_>| context.value_name(fragment_id, *value).fmt(output)),
+                    match &route.requirements.layout {
+                        novarocks_physical_plan::WriteLayoutPreference::None => "none",
+                        novarocks_physical_plan::WriteLayoutPreference::ClusterBy(_) => "cluster-by",
+                    },
+                    joined(route.requirements.layout_keys(), ",", |value: &ValueId, output: &mut fmt::Formatter<'_>| context.value_name(fragment_id, *value).fmt(output)),
                     route.edge.get()
                 ))?;
             }
@@ -1289,6 +1310,9 @@ impl fmt::Display for ValueOriginDisplay<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         use novarocks_physical_plan::ValueOrigin;
         match self.0 {
+            ValueOrigin::LogicalSummary { field } => {
+                write!(formatter, "logical-summary({field:?})")
+            }
             ValueOrigin::ProviderField { scan_node, field } => {
                 let payload = &field.column_payload;
                 let header = payload.header();
@@ -1441,6 +1465,25 @@ impl fmt::Display for DistributionDisplay<'_> {
             Distribution::Singleton => formatter.write_str("singleton"),
             Distribution::RoundRobin => formatter.write_str("round-robin"),
             Distribution::Broadcast => formatter.write_str("broadcast"),
+            Distribution::ConditionalKey {
+                applies,
+                keys,
+                scheme,
+            } => write!(
+                formatter,
+                "conditional-key(applies={}, keys=[{}], bypass=round-robin, space={}, algorithm={})",
+                self.context.value_name(self.fragment, *applies),
+                joined(
+                    keys,
+                    ",",
+                    |value: &ValueId, output: &mut fmt::Formatter<'_>| self
+                        .context
+                        .value_name(self.fragment, *value)
+                        .fmt(output)
+                ),
+                format_hex(&scheme.space.as_bytes()),
+                scheme.definition.algorithm.stable_name(),
+            ),
             Distribution::Hash { keys, scheme } => write!(
                 formatter,
                 "hash(keys=[{}], space={}, count={{id={}, min={}, max={}, power-of-two={}}}, algorithm={})",
@@ -2440,6 +2483,7 @@ impl fmt::Display for RowCountAssertionDisplay<'_> {
                 keys,
                 labels,
                 message,
+                ..
             } => {
                 write!(
                     formatter,
@@ -4759,6 +4803,7 @@ mod tests {
                     max: 1,
                     requires_power_of_two: false,
                 },
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .expect("deep fragment");
         let mut plan = novarocks_physical_plan::PlanBuilder::new(seed.plan().version())

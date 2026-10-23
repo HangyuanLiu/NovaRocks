@@ -1798,6 +1798,7 @@ mod tests {
             execution_anchor_fragment_id: 1,
             fragments: vec![FragmentSchedulingFacts {
                 fragment_id: 1,
+                placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
                 scans: scans
                     .iter()
                     .map(|&(scan, work)| ScanSchedulingFacts { scan, work })

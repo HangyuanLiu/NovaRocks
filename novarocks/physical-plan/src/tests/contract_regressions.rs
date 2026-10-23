@@ -138,7 +138,12 @@ fn finish_largeint_literal(value_type: ValueType) -> Result<Fragment, String> {
         })
         .map_err(|error| error.to_string())?;
     builder
-        .finish_definition(node, FragmentSink::Noop, dop())
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .map_err(|error| error.to_string())
 }
 
@@ -264,7 +269,12 @@ fn null_safe_join_filter(
     let filter_id = RuntimeFilterId::new(100);
     builder.attach_runtime_filter(filter_id).unwrap();
     let fragment = builder
-        .finish_definition(join, FragmentSink::Noop, dop())
+        .finish_definition(
+            join,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let witness = RuntimeFilterWitnessId::new(1);
     let equality = RuntimeFilterEqualityWitnessId::new(1);
@@ -620,7 +630,12 @@ pub(super) fn scan_lineage_filter(
     let filter_id = RuntimeFilterId::new(101);
     builder.attach_runtime_filter(filter_id).unwrap();
     let fragment = builder
-        .finish_definition(join, FragmentSink::Noop, dop())
+        .finish_definition(
+            join,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let witness = RuntimeFilterWitnessId::new(101);
     let equality = RuntimeFilterEqualityWitnessId::new(101);
@@ -820,7 +835,12 @@ fn aggregate_topn_filter() -> (Fragment, RuntimeFilter) {
     let filter_id = RuntimeFilterId::new(105);
     builder.attach_runtime_filter(filter_id).unwrap();
     let fragment = builder
-        .finish_definition(topn, FragmentSink::Noop, dop())
+        .finish_definition(
+            topn,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let witness = RuntimeFilterWitnessId::new(105);
     let filter = RuntimeFilter {
@@ -1118,18 +1138,31 @@ pub(super) fn cross_fragment_scan_lineage_plan() -> (PhysicalPlan, FragmentId, F
     *lineage = steps.into_boxed_slice();
     filter.producers[0].progress.non_build_edges = Box::from([edge_id]);
     let source = source
-        .finish_definition(probe_root, FragmentSink::Stream { edge: edge_id }, dop())
+        .finish_definition(
+            probe_root,
+            FragmentSink::Stream { edge: edge_id },
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let destination = destination
-        .finish_definition(original.root(), original.sink().clone(), dop())
+        .finish_definition(
+            original.root(),
+            original.sink().clone(),
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let mut plan = PlanBuilder::new(version());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     plan.add_edge(Edge {
+        role: crate::OutputRole::Relational,
+        delivery: crate::DeliveryRequirement::DemandDriven,
         id: edge_id,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: crate::FragmentOutputPort::Root,
             fragment: source_id,
             projection: output.clone(),
         },
@@ -1532,7 +1565,12 @@ fn ordered_join_filter() -> (Fragment, RuntimeFilter) {
     let filter_id = RuntimeFilterId::new(104);
     builder.attach_runtime_filter(filter_id).unwrap();
     let fragment = builder
-        .finish_definition(join, FragmentSink::Noop, dop())
+        .finish_definition(
+            join,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let witness = RuntimeFilterWitnessId::new(104);
     let equality = RuntimeFilterEqualityWitnessId::new(104);
@@ -1911,6 +1949,7 @@ fn join_build_frontier_fixture() -> JoinBuildFrontierFixture {
                 edge: nested_build_edges[0],
             },
             dop(),
+            crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let nested_output = nested.nodes()[&nested_root].output.columns[1];
@@ -1936,7 +1975,12 @@ fn join_build_frontier_fixture() -> JoinBuildFrontierFixture {
     let filter_id = RuntimeFilterId::new(210);
     target.attach_runtime_filter(filter_id).unwrap();
     let target = target
-        .finish_definition(root, FragmentSink::Noop, dop())
+        .finish_definition(
+            root,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let witness = RuntimeFilterWitnessId::new(210);
@@ -2021,9 +2065,12 @@ fn join_build_frontier_fixture() -> JoinBuildFrontierFixture {
         let destination_value = destination_node.output.columns[0];
         let is_broadcast = edge == nested_leaf_build_edge || edge == outer_sibling_edge;
         edges.push(Edge {
+            role: crate::OutputRole::Relational,
+            delivery: crate::DeliveryRequirement::DemandDriven,
             id: edge,
             kind: EdgeKind::Stream,
             source: EdgeSource {
+                port: crate::FragmentOutputPort::Root,
                 fragment: source_fragment,
                 projection: Box::from([source_values[ordinal]]),
             },
@@ -2057,9 +2104,12 @@ fn join_build_frontier_fixture() -> JoinBuildFrontierFixture {
         .find(|node| matches!(node.kind, NodeKind::ExchangeSource { edge, .. } if edge == nested_build_edges[0]))
         .unwrap();
     edges.push(Edge {
+        role: crate::OutputRole::Relational,
+        delivery: crate::DeliveryRequirement::DemandDriven,
         id: nested_build_edges[0],
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: crate::FragmentOutputPort::Root,
             fragment: nested_fragment_id,
             projection: Box::from([nested_output]),
         },
@@ -2239,7 +2289,12 @@ fn table_function_fragment(
             },
         })
         .unwrap();
-    builder.finish_definition(node, FragmentSink::Noop, dop())
+    builder.finish_definition(
+        node,
+        FragmentSink::Noop,
+        dop(),
+        crate::StagePlacementPolicy::Singleton,
+    )
 }
 
 #[test]
@@ -2353,7 +2408,12 @@ fn table_function_binding_cannot_be_published_as_a_scalar_call() {
         })
         .unwrap();
     let error = builder
-        .finish_definition(node, FragmentSink::Noop, dop())
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap_err()
         .to_string();
     assert!(error.contains("scalar call has non-scalar binding"));
@@ -2509,7 +2569,12 @@ fn higher_order_function_fragment(
             },
         })
         .unwrap();
-    builder.finish_definition(node, FragmentSink::Noop, dop())
+    builder.finish_definition(
+        node,
+        FragmentSink::Noop,
+        dop(),
+        crate::StagePlacementPolicy::Singleton,
+    )
 }
 
 #[test]
@@ -2668,7 +2733,12 @@ pub(super) fn invalid_table_writer_fragment(
             },
         })
         .unwrap();
-    builder.finish_definition(writer, FragmentSink::Noop, dop())
+    builder.finish_definition(
+        writer,
+        FragmentSink::Noop,
+        dop(),
+        crate::StagePlacementPolicy::Singleton,
+    )
 }
 
 #[test]
@@ -3215,6 +3285,12 @@ fn grouped_writer_fragment_with_sources(
             },
             output,
             kind: NodeKind::TableFinish(WriterFinishSpec {
+                count_mode: crate::FinishCountMode::WriterReported,
+                inputs: crate::FinishInputs {
+                    writer_results: 0,
+                    logical_summary: None,
+                },
+                logical_summary: None,
                 expected_target_ordinals: Box::from([
                     write_target_ordinal(0),
                     write_target_ordinal(1),
@@ -3236,7 +3312,12 @@ fn grouped_writer_fragment_with_sources(
             }),
         })
         .unwrap();
-    let fragment = builder.finish_definition(finish, FragmentSink::Noop, dop())?;
+    let fragment = builder.finish_definition(
+        finish,
+        FragmentSink::Noop,
+        dop(),
+        crate::StagePlacementPolicy::Singleton,
+    )?;
     crate::constants::validate_fragment_constants_observed(
         &fragment,
         &pools,

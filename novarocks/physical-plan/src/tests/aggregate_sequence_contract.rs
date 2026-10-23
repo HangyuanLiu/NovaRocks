@@ -305,6 +305,7 @@ fn add_aggregate_with_grouping(
         | Distribution::RoundRobin
         | Distribution::Broadcast
         | Distribution::Hash { .. }
+        | Distribution::ConditionalKey { .. }
         | Distribution::BucketShuffle { .. } => Distribution::Unconstrained,
     };
     let mut columns = group_inputs.to_vec();
@@ -347,9 +348,12 @@ fn add_edge(
     distribution: Distribution,
 ) {
     plan.add_edge(Edge {
+        role: crate::OutputRole::Relational,
+        delivery: crate::DeliveryRequirement::DemandDriven,
         id: edge,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: crate::FragmentOutputPort::Root,
             fragment: source_fragment,
             projection: source_values.to_vec().into_boxed_slice(),
         },
@@ -414,7 +418,12 @@ fn finish_two_stage_sequence(drift: BindingDrift, final_groups: FinalGroups) -> 
     );
     let source = with_requests(
         source
-            .finish_definition(partial, FragmentSink::Stream { edge }, dop())
+            .finish_definition(
+                partial,
+                FragmentSink::Stream { edge },
+                dop(),
+                crate::StagePlacementPolicy::Singleton,
+            )
             .unwrap(),
     );
 
@@ -448,7 +457,12 @@ fn finish_two_stage_sequence(drift: BindingDrift, final_groups: FinalGroups) -> 
     );
     let destination = with_requests(
         destination
-            .finish_definition(final_node, FragmentSink::Noop, dop())
+            .finish_definition(
+                final_node,
+                FragmentSink::Noop,
+                dop(),
+                crate::StagePlacementPolicy::Singleton,
+            )
             .unwrap(),
     );
 
@@ -515,7 +529,12 @@ fn aggregate_sequence_rejects_an_orphan_partial() {
     );
     let fragment = with_requests(
         fragment
-            .finish_definition(partial, FragmentSink::Noop, dop())
+            .finish_definition(
+                partial,
+                FragmentSink::Noop,
+                dop(),
+                crate::StagePlacementPolicy::Singleton,
+            )
             .unwrap(),
     );
     let mut plan = PlanBuilder::new(version());
@@ -553,7 +572,12 @@ fn aggregate_sequence_rejects_duplicate_finals() {
     );
     let source = with_requests(
         source
-            .finish_definition(partial, FragmentSink::Stream { edge }, dop())
+            .finish_definition(
+                partial,
+                FragmentSink::Stream { edge },
+                dop(),
+                crate::StagePlacementPolicy::Singleton,
+            )
             .unwrap(),
     );
 
@@ -618,7 +642,12 @@ fn aggregate_sequence_rejects_duplicate_finals() {
         .unwrap();
     let destination = with_requests(
         destination
-            .finish_definition(final_node, FragmentSink::Noop, dop())
+            .finish_definition(
+                final_node,
+                FragmentSink::Noop,
+                dop(),
+                crate::StagePlacementPolicy::Singleton,
+            )
             .unwrap(),
     );
 
@@ -692,7 +721,12 @@ fn intermediate_state_chain_reaches_its_partial_and_final() {
     );
     let source = with_requests(
         source
-            .finish_definition(partial, FragmentSink::Stream { edge: first_edge }, dop())
+            .finish_definition(
+                partial,
+                FragmentSink::Stream { edge: first_edge },
+                dop(),
+                crate::StagePlacementPolicy::Singleton,
+            )
             .unwrap(),
     );
 
@@ -721,6 +755,7 @@ fn intermediate_state_chain_reaches_its_partial_and_final() {
                 intermediate,
                 FragmentSink::Stream { edge: second_edge },
                 dop(),
+                crate::StagePlacementPolicy::Singleton,
             )
             .unwrap(),
     );
@@ -746,7 +781,12 @@ fn intermediate_state_chain_reaches_its_partial_and_final() {
     );
     let destination = with_requests(
         destination
-            .finish_definition(final_node, FragmentSink::Noop, dop())
+            .finish_definition(
+                final_node,
+                FragmentSink::Noop,
+                dop(),
+                crate::StagePlacementPolicy::Singleton,
+            )
             .unwrap(),
     );
 
@@ -802,7 +842,12 @@ fn invalid_finalization(
         input_properties,
     );
     builder
-        .finish_definition(aggregate, FragmentSink::Noop, dop())
+        .finish_definition(
+            aggregate,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap_err()
         .to_string()
 }
@@ -893,7 +938,12 @@ fn aggregate_call_identity_is_unique_across_a_fragment() {
     );
 
     let error = builder
-        .finish_definition(second, FragmentSink::Noop, dop())
+        .finish_definition(
+            second,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap_err()
         .to_string();
     assert!(error.contains("aggregate call identity must be unique within its fragment"));
@@ -1265,8 +1315,13 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
     )
     .unwrap();
     let fragment = with_requests(
-        b.finish_definition(final_topn, FragmentSink::Noop, dop())
-            .map_err(|e| e.to_string())?,
+        b.finish_definition(
+            final_topn,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
+        .map_err(|e| e.to_string())?,
     );
     let mut plan = PlanBuilder::new(version());
     plan.add_fragment(fragment).unwrap();

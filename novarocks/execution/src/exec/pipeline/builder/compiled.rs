@@ -1329,6 +1329,7 @@ fn assertion_mode(mode: &AssertRowsMode) -> AssertNumRowsMode {
             key_slots,
             key_labels,
             message_prefix,
+            ..
         } => AssertNumRowsMode::PerKeyAtMostOne {
             key_slots: key_slots.clone(),
             key_labels: key_labels.iter().map(ToString::to_string).collect(),

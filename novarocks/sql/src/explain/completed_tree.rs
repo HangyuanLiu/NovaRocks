@@ -797,6 +797,18 @@ impl TreeContext<'_> {
             Distribution::Singleton | Distribution::Unconstrained => f.write_str("UNPARTITIONED"),
             Distribution::RoundRobin => f.write_str("RANDOM"),
             Distribution::Broadcast => f.write_str("BROADCAST"),
+            Distribution::ConditionalKey { applies, keys, .. } => {
+                write!(
+                    f,
+                    "CONDITIONAL_KEY (WHEN {} IS TRUE HASH (",
+                    self.value_name(fragment, *applies)
+                )?;
+                joined(keys, ", ", |value, f| {
+                    self.value_name(fragment, *value).fmt(f)
+                })
+                .fmt(f)?;
+                f.write_str(") ELSE ROUND_ROBIN)")
+            }
             Distribution::Hash { keys, .. } | Distribution::BucketShuffle { keys, .. } => {
                 f.write_str(if matches!(distribution, Distribution::Hash { .. }) {
                     "HASH_PARTITIONED ("
@@ -1481,6 +1493,7 @@ impl TreeContext<'_> {
                         Distribution::Hash { .. } | Distribution::BucketShuffle { .. } => {
                             "HASH EXCHANGE"
                         }
+                        Distribution::ConditionalKey { .. } => "CONDITIONAL KEY EXCHANGE",
                         Distribution::Broadcast => "BROADCAST EXCHANGE",
                         Distribution::RoundRobin => "RANDOM EXCHANGE",
                         Distribution::Singleton | Distribution::Unconstrained if ordered => {

@@ -94,7 +94,12 @@ fn finish_values(mut builder: FragmentBuilder, node: NodeId, roots: &[ExprId]) -
         })
         .unwrap();
     builder
-        .finish_definition(node, FragmentSink::Noop, dop())
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap()
 }
 fn invocation(
@@ -347,7 +352,12 @@ fn shared_definition_fixture() -> (Fragment, PhysicalRootUses) {
         })
         .unwrap();
     let fragment = builder
-        .finish_definition(node, FragmentSink::Noop, dop())
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let roots = leaf_root_uses(&fragment);
     (fragment, roots)

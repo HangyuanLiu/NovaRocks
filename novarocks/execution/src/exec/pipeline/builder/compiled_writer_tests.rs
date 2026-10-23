@@ -336,7 +336,12 @@ fn plan(rows: &[(Option<i64>, &str)]) -> (PhysicalPlan, NodeId) {
         })
         .unwrap();
     let producer = builder
-        .finish_definition(writer, FragmentSink::Stream { edge: EDGE }, dop())
+        .finish_definition(
+            writer,
+            FragmentSink::Stream { edge: EDGE },
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut builder = FragmentBuilder::new(FragmentId::new(2));
@@ -395,6 +400,12 @@ fn plan(rows: &[(Option<i64>, &str)]) -> (PhysicalPlan, NodeId) {
                 columns: outputs.iter().map(|field| field.value).collect(),
             },
             kind: NodeKind::TableFinish(WriterFinishSpec {
+                count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
+                inputs: novarocks_physical_plan::FinishInputs {
+                    writer_results: 0,
+                    logical_summary: None,
+                },
+                logical_summary: None,
                 expected_target_ordinals: Box::from([ordinal]),
                 input_schema: WriterRelationSchema {
                     revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -410,16 +421,24 @@ fn plan(rows: &[(Option<i64>, &str)]) -> (PhysicalPlan, NodeId) {
         })
         .unwrap();
     let consumer = builder
-        .finish_definition(finish, FragmentSink::Result, dop())
+        .finish_definition(
+            finish,
+            FragmentSink::Result,
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([8; 16]).unwrap());
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(Edge {
+        role: novarocks_physical_plan::OutputRole::Relational,
+        delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
         id: EDGE,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: novarocks_physical_plan::FragmentOutputPort::Root,
             fragment: FragmentId::new(1),
             projection: fields.iter().map(|field| field.value).collect(),
         },
@@ -1528,7 +1547,12 @@ mod statistics {
             .unwrap();
         let producer = with_requests(
             builder
-                .finish_definition(writer, FragmentSink::Stream { edge: EDGE }, dop())
+                .finish_definition(
+                    writer,
+                    FragmentSink::Stream { edge: EDGE },
+                    dop(),
+                    novarocks_physical_plan::StagePlacementPolicy::Singleton,
+                )
                 .unwrap(),
             partial_aggregates.iter().enumerate().map(|(call, item)| {
                 (
@@ -1654,6 +1678,12 @@ mod statistics {
                     columns: outputs.iter().map(|field| field.value).collect(),
                 },
                 kind: NodeKind::TableFinish(WriterFinishSpec {
+                    count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
+                    inputs: novarocks_physical_plan::FinishInputs {
+                        writer_results: 0,
+                        logical_summary: None,
+                    },
+                    logical_summary: None,
                     expected_target_ordinals: Box::from([ordinal]),
                     input_schema: WriterRelationSchema {
                         revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -1684,7 +1714,12 @@ mod statistics {
             .unwrap();
         let consumer = with_requests(
             builder
-                .finish_definition(finish, FragmentSink::Result, dop())
+                .finish_definition(
+                    finish,
+                    FragmentSink::Result,
+                    dop(),
+                    novarocks_physical_plan::StagePlacementPolicy::Singleton,
+                )
                 .unwrap(),
             final_aggregates.iter().enumerate().map(|(call, item)| {
                 (
@@ -1704,9 +1739,12 @@ mod statistics {
         plan.add_fragment(producer).unwrap();
         plan.add_fragment(consumer).unwrap();
         plan.add_edge(Edge {
+            role: novarocks_physical_plan::OutputRole::Relational,
+            delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
             id: EDGE,
             kind: EdgeKind::Stream,
             source: EdgeSource {
+                port: novarocks_physical_plan::FragmentOutputPort::Root,
                 fragment: FragmentId::new(1),
                 projection: fields.iter().map(|field| field.value).collect(),
             },

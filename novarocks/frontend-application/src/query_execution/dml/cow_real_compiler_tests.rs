@@ -70,7 +70,10 @@ fn compile_signed_cow(
                     0,
                 ),
             ],
-            Vec::new(),
+            novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
+                layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             fixture.route_facts.selection_bindings()[..2].to_vec(),
         )
         .expect("original append route")
@@ -227,7 +230,8 @@ fn compile_signed_cow(
         columns,
         ConnectorWriteInputBinding::RootOutputByOrdinal,
     )
-    .unwrap();
+    .unwrap()
+    .with_external_count_owner();
     let scan_columns = crate::query_execution::distributed_rewrite::connector_execution_columns(
         fixture.rewrite_source.scan_execution_schema(),
     )
@@ -467,8 +471,17 @@ fn compile_signed_cow(
         )
         .expect("actual COW compiler must publish the complete signed writer binding");
     let mut seen = 0;
+    let mut finish_seen = 0;
     for fragment in owner.plan().fragments().values() {
         for node in fragment.nodes().values() {
+            if let novarocks_physical_plan::NodeKind::TableFinish(finish) = &node.kind {
+                finish_seen += 1;
+                assert_eq!(
+                    finish.count_mode,
+                    novarocks_physical_plan::FinishCountMode::ExternalOwner
+                );
+                assert!(finish.inputs.logical_summary.is_none());
+            }
             let novarocks_physical_plan::NodeKind::TableWriter { target } = &node.kind else {
                 continue;
             };
@@ -493,6 +506,7 @@ fn compile_signed_cow(
         }
     }
     assert_eq!(seen, 1, "one actual positional writer");
+    assert_eq!(finish_seen, 1, "one external-count-owner finish");
 }
 
 #[test]

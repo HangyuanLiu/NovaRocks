@@ -21,6 +21,26 @@ use novarocks_connector_contract::{
 
 use super::*;
 
+/// These are fragment-owned sink counters, independent of the row root.
+fn add_router_summary(builder: &mut FragmentBuilder, edge: EdgeId) -> crate::LogicalSummaryOutput {
+    let mut add = |field| {
+        builder
+            .add_value(
+                ty(DataType::Int64, false),
+                ValueOrigin::LogicalSummary { field },
+            )
+            .unwrap()
+    };
+    crate::LogicalSummaryOutput {
+        edge,
+        columns: crate::LogicalSummaryColumns {
+            inserted: add(crate::LogicalChangeCountField::Inserted),
+            replaced: add(crate::LogicalChangeCountField::Replaced),
+            deleted: add(crate::LogicalChangeCountField::Deleted),
+        },
+    }
+}
+
 fn literal_root() -> (FragmentBuilder, NodeId, ValueId, ValueId) {
     let mut builder = FragmentBuilder::new(FragmentId::new(721));
     let node = builder.reserve_node_id().unwrap();
@@ -155,7 +175,12 @@ fn change_event_root_with_assignment(
 fn change_event_assignments_reject_the_generated_effect_output() {
     let (builder, root, _, _) = change_event_root_with_assignment(AssignmentShape::EffectTarget);
     let errors = builder
-        .finish_definition(root, FragmentSink::Noop, dop())
+        .finish_definition(
+            root,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .expect_err("the generated effect output cannot be assigned by an event");
     assert!(errors.errors().iter().any(|error| {
         error
@@ -168,7 +193,12 @@ fn change_event_assignments_reject_the_generated_effect_output() {
 fn change_event_assignments_reject_outputs_absent_from_the_node_port() {
     let (builder, root, _, _) = change_event_root_with_assignment(AssignmentShape::OffPortTarget);
     let errors = builder
-        .finish_definition(root, FragmentSink::Noop, dop())
+        .finish_definition(
+            root,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .expect_err("an event assignment must target the node output port");
     assert!(errors.errors().iter().any(|error| {
         error
@@ -181,7 +211,12 @@ fn change_event_assignments_reject_outputs_absent_from_the_node_port() {
 fn change_event_assignments_reject_duplicate_outputs() {
     let (builder, root, _, _) = change_event_root_with_assignment(AssignmentShape::DuplicateTarget);
     let errors = builder
-        .finish_definition(root, FragmentSink::Noop, dop())
+        .finish_definition(
+            root,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .expect_err("one event cannot assign one output twice");
     assert!(errors.errors().iter().any(|error| {
         error
@@ -201,7 +236,10 @@ fn route(
         write_target_ordinal,
         accepted_effects: Box::from([ConnectorRowMutationEffect::Insert]),
         input_mapping: Box::from([(ConnectorWriteFieldToken::from_bytes([3; 32]), input)]),
-        partition_by: Box::from([input]),
+        requirements: crate::WriteRouteRequirements {
+            colocation: crate::WriteColocation::ByKey(Box::from([input])),
+            layout: crate::WriteLayoutPreference::None,
+        },
         edge,
     }
 }
@@ -227,7 +265,9 @@ fn finish_router_writer_fixture(
 ) -> (Fragment, Result<PhysicalPlan, ValidationErrors>) {
     let edge = EdgeId::new(901);
     let finish_edge = EdgeId::new(904);
-    let (source_builder, source_root, effect, source_value) = change_event_root();
+    let summary_edge = EdgeId::new(906);
+    let (mut source_builder, source_root, effect, source_value) = change_event_root();
+    let source_summary = add_router_summary(&mut source_builder, summary_edge);
     let route_token = ConnectorWriteFieldToken::from_bytes([3; 32]);
     let edge_distribution = if matches!(shape, RouterWriterShape::PartitionDrift) {
         Distribution::RoundRobin
@@ -238,17 +278,22 @@ fn finish_router_writer_fixture(
         .finish_definition(
             source_root,
             FragmentSink::Router {
+                summary: source_summary,
                 effect,
                 routes: Box::from([ChangeStreamRoute {
                     route_id: write_route_id(9),
                     write_target_ordinal: write_target_ordinal(0),
                     accepted_effects: Box::from([ConnectorRowMutationEffect::Insert]),
                     input_mapping: Box::from([(route_token, source_value)]),
-                    partition_by: Box::default(),
+                    requirements: crate::WriteRouteRequirements {
+                        colocation: crate::WriteColocation::Singleton,
+                        layout: crate::WriteLayoutPreference::None,
+                    },
                     edge,
                 }]),
             },
             dop(),
+            crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
 
@@ -401,7 +446,12 @@ fn finish_router_writer_fixture(
         })
         .unwrap();
     let destination = destination_builder
-        .finish_definition(writer, FragmentSink::Stream { edge: finish_edge }, dop())
+        .finish_definition(
+            writer,
+            FragmentSink::Stream { edge: finish_edge },
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut finish_builder = FragmentBuilder::new(FragmentId::new(723));
@@ -571,6 +621,7 @@ fn finish_router_writer_fixture(
                 local_writer,
                 FragmentSink::Stream { edge: union_edge },
                 dop(),
+                crate::StagePlacementPolicy::Singleton,
             )
             .unwrap();
         let local_exchange = finish_builder.reserve_node_id().unwrap();
@@ -689,9 +740,12 @@ fn finish_router_writer_fixture(
             .unwrap();
         union_writer_fragment = Some(local_fragment);
         union_writer_edge = Some(Edge {
+            role: crate::OutputRole::WriterResults,
+            delivery: crate::DeliveryRequirement::MustDrain,
             id: union_edge,
             kind: EdgeKind::Stream,
             source: EdgeSource {
+                port: crate::FragmentOutputPort::Root,
                 fragment: FragmentId::new(724),
                 projection: local_writer_values,
             },
@@ -723,6 +777,44 @@ fn finish_router_writer_fixture(
             Box::from([writer_ordinal]),
         )
     };
+    let summary_exchange = finish_builder.reserve_node_id().unwrap();
+    let mut import_summary = |source_value| {
+        finish_builder
+            .add_value(
+                ty(DataType::Int64, false),
+                ValueOrigin::ExchangeImport {
+                    edge: summary_edge,
+                    source_value,
+                },
+            )
+            .unwrap()
+    };
+    let finish_summary = crate::LogicalSummaryColumns {
+        inserted: import_summary(source_summary.columns.inserted),
+        replaced: import_summary(source_summary.columns.replaced),
+        deleted: import_summary(source_summary.columns.deleted),
+    };
+    finish_builder
+        .insert_node_unchecked(PhysicalNode {
+            id: summary_exchange,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties: singleton(),
+            output: OutputPort {
+                node: summary_exchange,
+                columns: Box::from(finish_summary.values()),
+            },
+            kind: NodeKind::ExchangeSource {
+                edge: summary_edge,
+                imports: source_summary
+                    .columns
+                    .values()
+                    .into_iter()
+                    .zip(finish_summary.values())
+                    .collect(),
+            },
+        })
+        .unwrap();
     let finish = finish_builder.reserve_node_id().unwrap();
     let list_type = DataType::List(std::sync::Arc::new(arrow_schema::Field::new(
         "item",
@@ -822,12 +914,8 @@ fn finish_router_writer_fixture(
     finish_builder
         .insert_node_unchecked(PhysicalNode {
             id: finish,
-            inputs: Box::from([finish_input_node]),
-            required_inputs: Box::from([PhysicalProperties {
-                distribution: Distribution::Singleton,
-                row_multiplicity: RowMultiplicity::SingleCopy,
-                ordering: Box::default(),
-            }]),
+            inputs: Box::from([finish_input_node, summary_exchange]),
+            required_inputs: Box::from([singleton(), singleton()]),
             output_properties: PhysicalProperties {
                 distribution: Distribution::Singleton,
                 row_multiplicity: RowMultiplicity::SingleCopy,
@@ -838,6 +926,12 @@ fn finish_router_writer_fixture(
                 columns: root_fields.iter().map(|field| field.value).collect(),
             },
             kind: NodeKind::TableFinish(WriterFinishSpec {
+                count_mode: crate::FinishCountMode::LogicalChanges,
+                inputs: crate::FinishInputs {
+                    writer_results: 0,
+                    logical_summary: Some(1),
+                },
+                logical_summary: Some(finish_summary),
                 expected_target_ordinals,
                 input_schema: WriterRelationSchema {
                     revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -853,7 +947,12 @@ fn finish_router_writer_fixture(
         })
         .unwrap();
     let finish_fragment = finish_builder
-        .finish_definition(finish, FragmentSink::Noop, dop())
+        .finish_definition(
+            finish,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut plan = PlanBuilder::new(version());
@@ -864,9 +963,14 @@ fn finish_router_writer_fixture(
         plan.add_fragment(fragment).unwrap();
     }
     plan.add_edge(Edge {
+        role: crate::OutputRole::ProviderRoute {
+            target: write_target_ordinal(0),
+        },
+        delivery: crate::DeliveryRequirement::MustDrain,
         id: edge,
         kind: EdgeKind::ChangeStreamRouter,
         source: EdgeSource {
+            port: crate::FragmentOutputPort::Root,
             fragment: FragmentId::new(721),
             projection: Box::from([source_value]),
         },
@@ -884,9 +988,12 @@ fn finish_router_writer_fixture(
     })
     .unwrap();
     plan.add_edge(Edge {
+        role: crate::OutputRole::WriterResults,
+        delivery: crate::DeliveryRequirement::MustDrain,
         id: finish_edge,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: crate::FragmentOutputPort::Root,
             fragment: FragmentId::new(722),
             projection: writer_output_values.into_boxed_slice(),
         },
@@ -897,6 +1004,34 @@ fn finish_router_writer_fixture(
                 .iter()
                 .zip(&exchange_input_fields)
                 .map(|(source, destination)| (source.value, destination.value))
+                .collect(),
+        },
+        partitioning: EdgePartitioning {
+            source: Distribution::Singleton,
+            source_multiplicity: RowMultiplicity::SingleCopy,
+            destination: Distribution::Singleton,
+            destination_multiplicity: RowMultiplicity::SingleCopy,
+        },
+    })
+    .unwrap();
+    plan.add_edge(Edge {
+        id: summary_edge,
+        role: crate::OutputRole::LogicalSummary,
+        delivery: crate::DeliveryRequirement::MustDrain,
+        kind: EdgeKind::Stream,
+        source: EdgeSource {
+            fragment: FragmentId::new(721),
+            port: crate::FragmentOutputPort::LogicalSummary,
+            projection: Box::from(source_summary.columns.values()),
+        },
+        destination: EdgeDestination {
+            fragment: FragmentId::new(723),
+            node: summary_exchange,
+            receive_mapping: source_summary
+                .columns
+                .values()
+                .into_iter()
+                .zip(finish_summary.values())
                 .collect(),
         },
         partitioning: EdgePartitioning {
@@ -994,11 +1129,10 @@ fn independent_router_source_rejects_a_drifted_destination_writer_proof() {
     let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
     let source = plan.fragments().get(&FragmentId::new(721)).unwrap();
     let mut cuts = fragment_cuts(&plan, source.id()).unwrap();
-    cuts.outbound[0]
-        .change_stream_writer
-        .as_mut()
-        .unwrap()
-        .write_target_ordinal = write_target_ordinal(1);
+    let crate::ExchangePayloadContract::ProviderRoute(proof) = &mut cuts.outbound[0].payload else {
+        panic!("expected provider route")
+    };
+    proof.write_target_ordinal = write_target_ordinal(1);
     let errors = validate_fragment(source, &cuts)
         .expect_err("the source fragment must recheck its peer writer proof");
     assert!(errors.errors().iter().any(|error| {
@@ -1013,12 +1147,10 @@ fn independent_router_writer_rejects_a_drifted_source_route_proof() {
     let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
     let writer = plan.fragments().get(&FragmentId::new(722)).unwrap();
     let mut cuts = fragment_cuts(&plan, writer.id()).unwrap();
-    cuts.inbound[0]
-        .change_stream_writer
-        .as_mut()
-        .unwrap()
-        .fields[0]
-        .token = ConnectorWriteFieldToken::from_bytes([33; 32]);
+    let crate::ExchangePayloadContract::ProviderRoute(proof) = &mut cuts.inbound[0].payload else {
+        panic!("expected provider route")
+    };
+    proof.fields[0].token = ConnectorWriteFieldToken::from_bytes([33; 32]);
     let errors = validate_fragment(writer, &cuts)
         .expect_err("the writer fragment must recheck its source route proof");
     assert!(errors.errors().iter().any(|error| {
@@ -1033,7 +1165,10 @@ fn independent_writer_rejects_a_drifted_writer_result_proof() {
     let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
     let writer = plan.fragments().get(&FragmentId::new(722)).unwrap();
     let mut cuts = fragment_cuts(&plan, writer.id()).unwrap();
-    cuts.outbound[0].writer_result.as_mut().unwrap().fields[0].name = "wrong_kind".into();
+    let crate::ExchangePayloadContract::WriterResults(proof) = &mut cuts.outbound[0].payload else {
+        panic!("expected writer results")
+    };
+    proof.fields[0].name = "wrong_kind".into();
     let errors = validate_fragment(writer, &cuts)
         .expect_err("the writer fragment must recheck its writer result proof");
     assert!(errors.errors().iter().any(|error| {
@@ -1048,11 +1183,10 @@ fn independent_finish_rejects_a_drifted_writer_result_proof() {
     let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
     let finish = plan.fragments().get(&FragmentId::new(723)).unwrap();
     let mut cuts = fragment_cuts(&plan, finish.id()).unwrap();
-    cuts.inbound[0]
-        .writer_result
-        .as_mut()
-        .unwrap()
-        .write_target_ordinal = write_target_ordinal(1);
+    let crate::ExchangePayloadContract::WriterResults(proof) = &mut cuts.inbound[0].payload else {
+        panic!("expected writer results")
+    };
+    proof.write_target_ordinal = write_target_ordinal(1);
     let errors = validate_fragment(finish, &cuts)
         .expect_err("the finish fragment must recheck the exact upstream writer target");
     assert!(errors.errors().iter().any(|error| {
@@ -1065,11 +1199,13 @@ fn independent_finish_rejects_a_drifted_writer_result_proof() {
 #[test]
 fn router_data_inputs_exclude_the_generated_effect_value() {
     let edge = EdgeId::new(902);
-    let (builder, root, effect, _) = change_event_root();
+    let (mut builder, root, effect, _) = change_event_root();
+    let summary = add_router_summary(&mut builder, EdgeId::new(907));
     let errors = builder
         .finish_definition(
             root,
             FragmentSink::Router {
+                summary,
                 effect,
                 routes: Box::from([route(
                     write_route_id(10),
@@ -1079,6 +1215,7 @@ fn router_data_inputs_exclude_the_generated_effect_value() {
                 )]),
             },
             dop(),
+            crate::StagePlacementPolicy::Singleton,
         )
         .expect_err("the effect discriminator cannot enter provider data fields");
     assert!(errors.errors().iter().any(|error| {
@@ -1091,11 +1228,13 @@ fn router_data_inputs_exclude_the_generated_effect_value() {
 #[test]
 fn router_allows_two_target_fields_to_read_one_value_identity() {
     let edge = EdgeId::new(903);
-    let (builder, root, effect, input) = change_event_root();
+    let (mut builder, root, effect, input) = change_event_root();
+    let summary = add_router_summary(&mut builder, EdgeId::new(907));
     builder
         .finish_definition(
             root,
             FragmentSink::Router {
+                summary,
                 effect,
                 routes: Box::from([ChangeStreamRoute {
                     route_id: write_route_id(11),
@@ -1105,11 +1244,15 @@ fn router_allows_two_target_fields_to_read_one_value_identity() {
                         (ConnectorWriteFieldToken::from_bytes([12; 32]), input),
                         (ConnectorWriteFieldToken::from_bytes([13; 32]), input),
                     ]),
-                    partition_by: Box::default(),
+                    requirements: crate::WriteRouteRequirements {
+                        colocation: crate::WriteColocation::Singleton,
+                        layout: crate::WriteLayoutPreference::None,
+                    },
                     edge,
                 }]),
             },
             dop(),
+            crate::StagePlacementPolicy::Singleton,
         )
         .expect("output occurrences may reuse one semantic value identity");
 }
@@ -1124,6 +1267,7 @@ fn independent_fragment_rejects_duplicate_multicast_destinations() {
                 edges: Box::from([EdgeId::new(721), EdgeId::new(721)]),
             },
             dop(),
+            crate::StagePlacementPolicy::Singleton,
         )
         .expect_err("one edge cannot occur twice in a multicast sink");
     assert!(errors.errors().iter().any(|error| {
@@ -1135,22 +1279,28 @@ fn independent_fragment_rejects_duplicate_multicast_destinations() {
 
 #[test]
 fn independent_fragment_rejects_invalid_router_identity_and_layout() {
-    let (builder, root, _, input) = literal_root();
+    let (mut builder, root, _, input) = literal_root();
+    let summary = add_router_summary(&mut builder, EdgeId::new(907));
     let errors = builder
         .finish_definition(
             root,
             FragmentSink::Router {
+                summary,
                 effect: ValueId::new(999_721),
                 routes: Box::from([ChangeStreamRoute {
                     route_id: write_route_id(0),
                     write_target_ordinal: write_target_ordinal(1),
                     accepted_effects: Box::default(),
                     input_mapping: Box::default(),
-                    partition_by: Box::from([input]),
+                    requirements: crate::WriteRouteRequirements {
+                        colocation: crate::WriteColocation::ByKey(Box::from([input])),
+                        layout: crate::WriteLayoutPreference::None,
+                    },
                     edge: EdgeId::new(721),
                 }]),
             },
             dop(),
+            crate::StagePlacementPolicy::Singleton,
         )
         .expect_err("a router must be complete before fragment publication");
     let messages = errors
@@ -1181,17 +1331,19 @@ fn independent_fragment_rejects_invalid_router_identity_and_layout() {
     assert!(
         messages
             .iter()
-            .any(|message| message.contains("partition values must be unique route inputs"))
+            .any(|message| message.contains("requirements must name nonempty exact route inputs"))
     );
 }
 
 #[test]
 fn independent_fragment_rejects_duplicate_router_identity() {
-    let (builder, root, effect, input) = change_event_root();
+    let (mut builder, root, effect, input) = change_event_root();
+    let summary = add_router_summary(&mut builder, EdgeId::new(907));
     let errors = builder
         .finish_definition(
             root,
             FragmentSink::Router {
+                summary,
                 effect,
                 routes: Box::from([
                     route(
@@ -1209,6 +1361,7 @@ fn independent_fragment_rejects_duplicate_router_identity() {
                 ]),
             },
             dop(),
+            crate::StagePlacementPolicy::Singleton,
         )
         .expect_err("route identities must be unique");
     assert!(errors.errors().iter().any(|error| {
@@ -1220,59 +1373,217 @@ fn independent_fragment_rejects_duplicate_router_identity() {
 
 #[test]
 fn independent_fragment_rejects_router_cut_projection_drift() {
-    let (builder, root, effect, input) = change_event_root();
-    let edge = EdgeId::new(721);
-    let fragment = builder
-        .finish_definition(
-            root,
-            FragmentSink::Router {
-                effect,
-                routes: Box::from([route(
-                    write_route_id(7),
-                    write_target_ordinal(0),
-                    edge,
-                    input,
-                )]),
-            },
-            dop(),
-        )
-        .expect("router fragment is locally complete");
-    let destination = ValueId::new(30_721);
-    let cuts = FragmentCuts {
-        inbound: Box::default(),
-        outbound: Box::from([OutboundFragmentCut {
-            edge,
-            kind: EdgeKind::ChangeStreamRouter,
-            destination_fragment: FragmentId::new(722),
-            destination_node: NodeId::new(722),
-            projection: Box::from([CutValue {
-                value: effect,
-                ty: ty(DataType::Int8, false),
-            }]),
-            destination_imports: Box::from([CutImport {
-                source: CutValue {
-                    value: effect,
-                    ty: ty(DataType::Int8, false),
-                },
-                destination,
-            }]),
-            partitioning: EdgePartitioning {
-                source: Distribution::Unconstrained,
-                source_multiplicity: RowMultiplicity::SingleCopy,
-                destination: Distribution::Unconstrained,
-                destination_multiplicity: RowMultiplicity::SingleCopy,
-            },
-            change_stream_writer: None,
-            writer_result: None,
-        }]),
-        ..FragmentCuts::default()
+    let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
+    let fragment = plan.fragments().get(&FragmentId::new(721)).unwrap();
+    let FragmentSink::Router { effect, .. } = fragment.sink() else {
+        panic!("expected router")
     };
-
-    let errors = validate_fragment(&fragment, &cuts)
+    let effect = *effect;
+    let effect_type = fragment.values().get(&effect).unwrap().ty.clone();
+    let mut cuts = fragment_cuts(&plan, fragment.id()).unwrap();
+    let route = cuts
+        .outbound
+        .iter_mut()
+        .find(|cut| {
+            matches!(
+                cut.payload,
+                crate::ExchangePayloadContract::ProviderRoute(_)
+            )
+        })
+        .unwrap();
+    route.projection[0] = CutValue {
+        value: effect,
+        ty: effect_type.clone(),
+    };
+    route.destination_imports[0].source = CutValue {
+        value: effect,
+        ty: effect_type,
+    };
+    let errors = validate_fragment(fragment, &cuts)
         .expect_err("the edge projection must match the route input sequence");
-    assert!(errors.errors().iter().any(|error| {
-        error
-            .message()
-            .contains("router edge projection differs from its exact route input sequence")
-    }));
+    assert!(
+        errors.errors().iter().any(|error| {
+            error
+                .message()
+                .contains("router edge projection differs from its exact route input sequence")
+        }),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn logical_summary_origin_requires_nonnull_int64_and_its_exact_counter_role() {
+    for (data_type, nullable) in [
+        (DataType::Int64, true),
+        (DataType::UInt64, false),
+        (DataType::Float64, false),
+    ] {
+        let (mut builder, root, effect, input) = change_event_root();
+        let inserted = builder
+            .add_value(
+                ty(data_type, nullable),
+                ValueOrigin::LogicalSummary {
+                    field: crate::LogicalChangeCountField::Inserted,
+                },
+            )
+            .unwrap();
+        let replaced = builder
+            .add_value(
+                ty(DataType::Int64, false),
+                ValueOrigin::LogicalSummary {
+                    field: crate::LogicalChangeCountField::Replaced,
+                },
+            )
+            .unwrap();
+        let deleted = builder
+            .add_value(
+                ty(DataType::Int64, false),
+                ValueOrigin::LogicalSummary {
+                    field: crate::LogicalChangeCountField::Deleted,
+                },
+            )
+            .unwrap();
+        let errors = builder
+            .finish_definition(
+                root,
+                FragmentSink::Router {
+                    effect,
+                    summary: crate::LogicalSummaryOutput {
+                        edge: EdgeId::new(907),
+                        columns: crate::LogicalSummaryColumns {
+                            inserted,
+                            replaced,
+                            deleted,
+                        },
+                    },
+                    routes: Box::from([ChangeStreamRoute {
+                        route_id: write_route_id(9),
+                        write_target_ordinal: write_target_ordinal(0),
+                        accepted_effects: Box::from([ConnectorRowMutationEffect::Insert]),
+                        input_mapping: Box::from([(
+                            ConnectorWriteFieldToken::from_bytes([3; 32]),
+                            input,
+                        )]),
+                        requirements: crate::WriteRouteRequirements {
+                            colocation: crate::WriteColocation::Singleton,
+                            layout: crate::WriteLayoutPreference::None,
+                        },
+                        edge: EdgeId::new(901),
+                    }]),
+                },
+                dop(),
+                crate::StagePlacementPolicy::Singleton,
+            )
+            .unwrap_err();
+        assert!(
+            errors
+                .errors()
+                .iter()
+                .any(|error| error.message().contains("logical summary"))
+        );
+    }
+}
+
+#[test]
+fn placement_rejects_absent_scan_and_ambiguous_source_sets_before_scheduling() {
+    let self_id = FragmentId::new(721);
+    for policy in [
+        crate::StagePlacementPolicy::ScanWork,
+        crate::StagePlacementPolicy::FollowSources {
+            sources: Box::default(),
+        },
+        crate::StagePlacementPolicy::FollowSources {
+            sources: Box::from([self_id]),
+        },
+        crate::StagePlacementPolicy::FollowSources {
+            sources: Box::from([FragmentId::new(2), FragmentId::new(2)]),
+        },
+    ] {
+        let (builder, root, _, _) = literal_root();
+        let errors = builder
+            .finish_definition(root, FragmentSink::Noop, dop(), policy)
+            .unwrap_err();
+        assert!(
+            errors
+                .errors()
+                .iter()
+                .any(|error| error.path().contains("stage_placement"))
+        );
+    }
+}
+
+#[test]
+fn independently_validated_router_cannot_replace_or_downgrade_its_summary_cut() {
+    let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
+    let source = plan.fragments().get(&FragmentId::new(721)).unwrap();
+    let FragmentSink::Router { summary, .. } = source.sink() else {
+        unreachable!()
+    };
+    let data = source.nodes()[&source.root()]
+        .output
+        .columns
+        .iter()
+        .copied()
+        .find(|id| source.values()[id].ty.data_type() == &DataType::Int64)
+        .unwrap();
+    let mut forged = fragment_cuts(&plan, source.id()).unwrap();
+    let cut = forged
+        .outbound
+        .iter_mut()
+        .find(|cut| cut.edge == summary.edge)
+        .unwrap();
+    let crate::ExchangePayloadContract::LogicalSummary(proof) = &mut cut.payload else {
+        unreachable!()
+    };
+    proof.source.inserted = data;
+    cut.projection[0].value = data;
+    cut.destination_imports[0].source.value = data;
+    let errors = validate_fragment(source, &forged).unwrap_err();
+    assert!(
+        errors
+            .errors()
+            .iter()
+            .any(|error| error.message().contains("router summary cut differs"))
+    );
+
+    let mut downgraded = fragment_cuts(&plan, source.id()).unwrap();
+    let cut = downgraded
+        .outbound
+        .iter_mut()
+        .find(|cut| cut.edge == summary.edge)
+        .unwrap();
+    cut.payload = crate::ExchangePayloadContract::Relational;
+    cut.source_port = crate::FragmentOutputPort::Root;
+    cut.delivery = crate::DeliveryRequirement::DemandDriven;
+    let destinations = cut
+        .destination_imports
+        .iter()
+        .map(|import| import.destination)
+        .collect::<Vec<_>>();
+    cut.projection = source.nodes()[&source.root()]
+        .output
+        .columns
+        .iter()
+        .map(|value| CutValue {
+            value: *value,
+            ty: source.values()[value].ty.clone(),
+        })
+        .collect();
+    cut.destination_imports = cut
+        .projection
+        .iter()
+        .cloned()
+        .zip(destinations)
+        .map(|(source, destination)| CutImport {
+            source,
+            destination,
+        })
+        .collect();
+    let errors = validate_fragment(source, &downgraded).unwrap_err();
+    assert!(
+        errors
+            .errors()
+            .iter()
+            .any(|error| error.message().contains("router summary cut differs"))
+    );
 }

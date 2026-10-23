@@ -156,6 +156,7 @@ fn collection_fragment(
             },
             PlanLimits::FROZEN,
             &Control::good(),
+            crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     (fragment, literal)

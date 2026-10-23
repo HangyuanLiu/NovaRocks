@@ -473,9 +473,12 @@ fn edge(
 ) -> Edge {
     let replicated = destination == Distribution::Broadcast;
     Edge {
+        role: novarocks_physical_plan::OutputRole::Relational,
+        delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
         id,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: novarocks_physical_plan::FragmentOutputPort::Root,
             fragment: from.0,
             projection: Box::from(from.1),
         },
@@ -557,7 +560,12 @@ pub(super) fn single_plan(spec: Spec, left: &[Row], right: &[Row]) -> PhysicalPl
         Placement::Single,
     );
     let fragment = builder
-        .finish_definition(join, FragmentSink::Result, dop(1))
+        .finish_definition(
+            join,
+            FragmentSink::Result,
+            dop(1),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let mut plan = PlanBuilder::new(version());
     plan.add_fragment(fragment).unwrap();
@@ -581,7 +589,12 @@ fn exchange_plan(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
             &literal_rows(rows),
         );
         let fragment = builder
-            .finish_definition(node, FragmentSink::Stream { edge }, dop(1))
+            .finish_definition(
+                node,
+                FragmentSink::Stream { edge },
+                dop(1),
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            )
             .unwrap();
         (fragment, columns)
     };
@@ -632,6 +645,7 @@ fn exchange_plan(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
             join,
             FragmentSink::Stream { edge: TO_RESULT },
             dop(u32::try_from(JOIN_DOP).unwrap()),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
 
@@ -646,7 +660,12 @@ fn exchange_plan(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
         RowMultiplicity::SingleCopy,
     );
     let result_fragment = builder
-        .finish_definition(receiver, FragmentSink::Result, dop(1))
+        .finish_definition(
+            receiver,
+            FragmentSink::Result,
+            dop(1),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut plan = PlanBuilder::new(version());
@@ -1258,7 +1277,12 @@ pub(super) fn overflow_plan(at: Overflow) -> PhysicalPlan {
         )
         .unwrap();
     let fragment = builder
-        .finish_definition(join, FragmentSink::Result, dop(1))
+        .finish_definition(
+            join,
+            FragmentSink::Result,
+            dop(1),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let mut plan = PlanBuilder::new(version()).with_semantic_parameters(
         SemanticParameters::try_new([(

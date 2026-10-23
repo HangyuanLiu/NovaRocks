@@ -1727,7 +1727,10 @@ fn a_row_mutation_whose_branches_share_a_route_key_is_refused() {
                     )
                 })
                 .collect(),
-            Vec::new(),
+            novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
+                layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             Vec::new(),
         )
         .expect("route facts")

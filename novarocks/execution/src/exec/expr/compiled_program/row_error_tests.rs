@@ -492,6 +492,7 @@ fn program(shape: Shape) -> Arc<LocalProgram> {
                 max: 1,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let (fragment, constants) = original_request_sources(fragment, &authors);

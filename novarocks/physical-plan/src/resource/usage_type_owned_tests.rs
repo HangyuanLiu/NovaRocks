@@ -259,6 +259,12 @@ fn fragment(width: u32, rich: bool, bad: bool) -> (Fragment, usize) {
             node(
                 3,
                 NodeKind::TableFinish(WriterFinishSpec {
+                    count_mode: crate::FinishCountMode::WriterReported,
+                    inputs: crate::FinishInputs {
+                        writer_results: 0,
+                        logical_summary: None,
+                    },
+                    logical_summary: None,
                     expected_target_ordinals: Box::default(),
                     input_schema: schema(),
                     output_schema: schema(),
@@ -309,6 +315,7 @@ fn fragment(width: u32, rich: bool, bad: bool) -> (Fragment, usize) {
             .unwrap()
             .request_bytes_upper_bound;
     let fragment = Fragment::from(crate::plan::FragmentParts {
+        stage_placement: crate::StagePlacementPolicy::Singleton,
         id: FragmentId::new(7),
         root: NodeId::new(0),
         values,
@@ -473,8 +480,9 @@ fn cuts() -> FragmentCuts {
             destination_node: NodeId::new(0),
             imports: Box::from([import.clone(), import.clone()]),
             partitioning: partitioning(),
-            change_stream_writer: None,
-            writer_result: Some(writer.clone()),
+            source_port: crate::FragmentOutputPort::Root,
+            delivery: crate::DeliveryRequirement::MustDrain,
+            payload: crate::ExchangePayloadContract::WriterResults(writer.clone()),
         }]),
         outbound: Box::from([OutboundFragmentCut {
             edge: EdgeId::new(1),
@@ -484,8 +492,9 @@ fn cuts() -> FragmentCuts {
             projection: Box::from([cut_value.clone(), cut_value]),
             destination_imports: Box::from([import]),
             partitioning: partitioning(),
-            change_stream_writer: None,
-            writer_result: Some(writer),
+            source_port: crate::FragmentOutputPort::Root,
+            delivery: crate::DeliveryRequirement::MustDrain,
+            payload: crate::ExchangePayloadContract::WriterResults(writer),
         }]),
         runtime_filters: Box::from([filter()]),
         runtime_filter_bindings: Box::default(),

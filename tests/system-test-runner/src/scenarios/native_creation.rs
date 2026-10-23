@@ -664,8 +664,9 @@ pub(super) fn compiled_fragment(
                 destination: value,
             }]),
             partitioning: partitioning(),
-            change_stream_writer: None,
-            writer_result: None,
+            source_port: novarocks_physical_plan::FragmentOutputPort::Root,
+            delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
+            payload: novarocks_physical_plan::ExchangePayloadContract::Relational,
         }]);
     } else {
         builder
@@ -736,8 +737,9 @@ pub(super) fn compiled_fragment(
                         destination: value,
                     }]),
                     partitioning: partitioning(),
-                    change_stream_writer: None,
-                    writer_result: None,
+                    source_port: novarocks_physical_plan::FragmentOutputPort::Root,
+                    delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
+                    payload: novarocks_physical_plan::ExchangePayloadContract::Relational,
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
@@ -761,6 +763,7 @@ pub(super) fn compiled_fragment(
                 max: dop,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .expect("checked fragment");
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).expect("expression roots");
@@ -931,6 +934,7 @@ impl RawCreate {
                     inbound: if self.exchange_input {
                         vec![proto::TaskExchangeInbound {
                             destination_node_id: 10,
+                            delivery: proto::ExchangeDeliveryRequirement::DemandDriven as i32,
                             sources: vec![proto::TaskExchangeSource {
                                 task: Some(proto::TaskIdentity {
                                     query_execution_id: Some(execution),
@@ -1808,6 +1812,7 @@ fn exchange_probe(
         "/novarocks.NovaRocksGrpc/ExchangeUnary",
         exchange_authorization,
         proto::ExchangeRequest {
+            stream: None,
             finst_id_hi: 0x5b,
             finst_id_lo: create.kernel_key_low,
             node_id: 10,

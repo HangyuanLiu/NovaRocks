@@ -936,6 +936,7 @@ pub fn root_input_layout(
             (*input, Layout::NodeOutput)
         }
         ProgramExpressionRootSite::SinkPartition { .. }
+        | ProgramExpressionRootSite::SinkApplicability { .. }
         | ProgramExpressionRootSite::SinkSplitPredicate { .. } => {
             (program.root(), Layout::NodeOutput)
         }

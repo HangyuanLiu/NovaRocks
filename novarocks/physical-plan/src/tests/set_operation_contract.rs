@@ -124,7 +124,12 @@ fn finish_duplicate_comparison_intersect(
         })
         .unwrap();
 
-    builder.finish_definition(set_op, FragmentSink::Noop, dop())
+    builder.finish_definition(
+        set_op,
+        FragmentSink::Noop,
+        dop(),
+        crate::StagePlacementPolicy::Singleton,
+    )
 }
 
 #[test]

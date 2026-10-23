@@ -362,6 +362,7 @@ fn package(builder: FragmentBuilder, root: NodeId, scan: NodeId) -> FragmentPack
                 max: 1,
                 requires_power_of_two: false,
             },
+            crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let expression_uses = expression_uses(&fragment);

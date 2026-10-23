@@ -269,7 +269,12 @@ fn table_fixture() -> Fixture {
         },
     );
     let fragment = builder
-        .finish_definition(table, FragmentSink::Noop, dop())
+        .finish_definition(
+            table,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let uses = leaf_roots(&fragment);
     let current = context(1, 0, EvaluationDemand::Value);

@@ -58,6 +58,7 @@ impl PureCompileControl for TraceControl {
 }
 fn with_nodes(fragment: &Fragment, nodes: BTreeMap<NodeId, PhysicalNode>) -> Fragment {
     FragmentParts {
+        stage_placement: fragment.stage_placement().clone(),
         id: fragment.id(),
         root: fragment.root(),
         values: fragment.values().clone(),
@@ -181,6 +182,12 @@ fn all_sites() -> (Fragment, PhysicalRootUses) {
         (
             u32::MAX,
             NodeKind::TableFinish(WriterFinishSpec {
+                count_mode: crate::FinishCountMode::WriterReported,
+                inputs: crate::FinishInputs {
+                    writer_results: 0,
+                    logical_summary: None,
+                },
+                logical_summary: None,
                 expected_target_ordinals: Box::from([WriteTargetOrdinal::try_new(0).unwrap()]),
                 input_schema: schema.clone(),
                 output_schema: schema,
@@ -206,6 +213,7 @@ fn all_sites() -> (Fragment, PhysicalRootUses) {
         );
     }
     let fragment: Fragment = FragmentParts {
+        stage_placement: crate::StagePlacementPolicy::Singleton,
         id: base.fragment.id(),
         root: base.fragment.root(),
         values: base.fragment.values().clone(),
@@ -639,7 +647,12 @@ fn observed_visitor_empty_occurrences_and_plain_window_keep_original_representat
         },
     );
     let fragment = builder
-        .finish_definition(node, FragmentSink::Noop, dop())
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     validate_fragment_definition(&fragment).unwrap();
     let empty = Fixture {

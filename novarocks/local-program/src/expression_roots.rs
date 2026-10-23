@@ -141,6 +141,9 @@ pub enum ProgramExpressionRootSite {
         branch: u32,
         key: u32,
     },
+    SinkApplicability {
+        branch: u32,
+    },
     SinkSplitPredicate {
         branch: u32,
     },
@@ -150,9 +153,9 @@ impl ProgramExpressionRootSite {
         match self {
             Self::Node { .. } => ProgramExpressionArena::Main,
             Self::WriterProjection { node, .. } => ProgramExpressionArena::WriterProjection(node),
-            Self::SinkPartition { .. } | Self::SinkSplitPredicate { .. } => {
-                ProgramExpressionArena::Sink
-            }
+            Self::SinkPartition { .. }
+            | Self::SinkSplitPredicate { .. }
+            | Self::SinkApplicability { .. } => ProgramExpressionArena::Sink,
         }
     }
 }
@@ -290,6 +293,15 @@ impl ProgramExpressionRoots {
             for (branch, value) in sink.branches().iter().enumerate() {
                 builder.step()?;
                 let branch = ordinal(branch)?;
+                if let crate::StaticStreamRouting::ConditionalKeyV1 { applies } =
+                    value.contract().routing
+                {
+                    builder.add(
+                        ProgramExpressionRootSite::SinkApplicability { branch },
+                        applies,
+                        EvaluationDemand::TruthOnly,
+                    )?;
+                }
                 for (key, definition) in value.partition_exprs().iter().enumerate() {
                     builder.add(
                         ProgramExpressionRootSite::SinkPartition {

@@ -50,6 +50,7 @@ pub enum ConnectorWriteInputBinding {
 pub(crate) struct SqlWritePlanInput {
     pub(crate) contract: SqlWriteSinkContract,
     pub(crate) input: ConnectorWriteInputBinding,
+    pub(crate) finish_count_mode: novarocks_physical_plan::FinishCountMode,
     /// A root-only projection supplied by SQL when hidden or state columns
     /// must be materialized immediately before the terminal sink.
     pub(crate) root_output_exprs: Option<Vec<TypedExpr>>,
@@ -244,6 +245,7 @@ pub(crate) mod test_support {
             contract: SqlWriteSinkContract::try_new(SqlWriteSinkMode::Data, target, vec![column])
                 .expect("valid SQL write contract"),
             input,
+            finish_count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
             root_output_exprs: None,
         }
     }

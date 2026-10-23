@@ -330,6 +330,7 @@ impl Fixture {
                 },
                 PlanLimits::FROZEN,
                 &Control::default(),
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .unwrap();
         Self {

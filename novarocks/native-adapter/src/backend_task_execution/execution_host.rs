@@ -3136,7 +3136,14 @@ pub(crate) mod tests {
     fn inbound_topology(node: FragmentNodeId, sources: Vec<ExchangeSource>) -> ExchangeTopology {
         ExchangeTopology::try_new(
             Vec::new(),
-            vec![ExchangeInbound::try_new(node, sources).expect("a legal inbound")],
+            vec![
+                ExchangeInbound::try_new(
+                    node,
+                    sources,
+                    novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                )
+                .expect("a legal inbound"),
+            ],
         )
         .expect("a legal topology")
     }
@@ -3772,6 +3779,7 @@ pub(crate) mod tests {
             ))],
         );
         let request = |destination: UniqueId, source: UniqueId| proto::ExchangeRequest {
+            stream: None,
             finst_id_hi: destination.high(),
             finst_id_lo: destination.low(),
             node_id: node.get(),

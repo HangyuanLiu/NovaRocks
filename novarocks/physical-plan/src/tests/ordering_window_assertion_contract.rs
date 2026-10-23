@@ -176,7 +176,12 @@ fn finish_sort(
             kind: NodeKind::Sort { order_by, mode },
         })
         .unwrap();
-    builder.finish_definition(node, FragmentSink::Noop, dop())
+    builder.finish_definition(
+        node,
+        FragmentSink::Noop,
+        dop(),
+        crate::StagePlacementPolicy::Singleton,
+    )
 }
 
 fn finish_topn(
@@ -213,7 +218,12 @@ fn finish_topn(
             },
         })
         .unwrap();
-    builder.finish_definition(node, FragmentSink::Noop, dop())
+    builder.finish_definition(
+        node,
+        FragmentSink::Noop,
+        dop(),
+        crate::StagePlacementPolicy::Singleton,
+    )
 }
 
 fn finish_topn_reduction(
@@ -312,6 +322,7 @@ fn finish_topn_reduction(
             partial_topn,
             FragmentSink::Stream { edge: final_edge },
             dop(),
+            crate::StagePlacementPolicy::Singleton,
         )
         .map_err(|error| error.to_string())?;
 
@@ -383,7 +394,12 @@ fn finish_topn_reduction(
         })
         .unwrap();
     let final_stage = final_builder
-        .finish_definition(final_topn, FragmentSink::Noop, dop())
+        .finish_definition(
+            final_topn,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .map_err(|error| error.to_string())?;
 
     let mut plan = PlanBuilder::new(version());
@@ -391,9 +407,12 @@ fn finish_topn_reduction(
     plan.add_fragment(partial).unwrap();
     plan.add_fragment(final_stage).unwrap();
     plan.add_edge(Edge {
+        role: crate::OutputRole::Relational,
+        delivery: crate::DeliveryRequirement::DemandDriven,
         id: partial_edge,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: crate::FragmentOutputPort::Root,
             fragment: source_fragment,
             projection: Box::from([source_value]),
         },
@@ -414,9 +433,12 @@ fn finish_topn_reduction(
     })
     .unwrap();
     plan.add_edge(Edge {
+        role: crate::OutputRole::Relational,
+        delivery: crate::DeliveryRequirement::DemandDriven,
         id: final_edge,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: crate::FragmentOutputPort::Root,
             fragment: partial_fragment,
             projection: Box::from([partial_value]),
         },
@@ -599,7 +621,12 @@ fn finish_window(
             }),
         })
         .unwrap();
-    builder.finish_definition(node, FragmentSink::Noop, dop())
+    builder.finish_definition(
+        node,
+        FragmentSink::Noop,
+        dop(),
+        crate::StagePlacementPolicy::Singleton,
+    )
 }
 
 fn finish_assertion(
@@ -623,7 +650,12 @@ fn finish_assertion(
             kind: NodeKind::AssertOneRow(assertion(key, order)),
         })
         .unwrap();
-    builder.finish_definition(node, FragmentSink::Noop, dop())
+    builder.finish_definition(
+        node,
+        FragmentSink::Noop,
+        dop(),
+        crate::StagePlacementPolicy::Singleton,
+    )
 }
 
 fn contains_error(result: Result<Fragment, ValidationErrors>, expected: &str) -> bool {
@@ -845,6 +877,7 @@ fn assertion_modes_require_global_or_colocated_distribution() {
     .unwrap();
     finish_assertion(SourceDistribution::Hash(75), |key, _| {
         RowCountAssertionSpec::PerKeyAtMostOne {
+            applicability: crate::AssertionApplicability::AllRows,
             keys: Box::from([key]),
             labels: Box::from([Box::<str>::from("account_id")]),
             message: "duplicate mutation match".into(),
@@ -854,6 +887,7 @@ fn assertion_modes_require_global_or_colocated_distribution() {
 
     finish_assertion(SourceDistribution::Singleton, |key, _| {
         RowCountAssertionSpec::PerKeyAtMostOne {
+            applicability: crate::AssertionApplicability::AllRows,
             keys: Box::from([key]),
             labels: Box::from([Box::<str>::from("account_id")]),
             message: "duplicate mutation match".into(),
@@ -862,6 +896,7 @@ fn assertion_modes_require_global_or_colocated_distribution() {
     .unwrap();
     finish_assertion(SourceDistribution::Hash(75), |key, order| {
         RowCountAssertionSpec::PerKeyAtMostOne {
+            applicability: crate::AssertionApplicability::AllRows,
             keys: Box::from([key, order]),
             labels: Box::from([Box::<str>::from("account_id"), Box::<str>::from("event_id")]),
             message: "duplicate mutation match".into(),
@@ -881,6 +916,7 @@ fn assertion_modes_require_global_or_colocated_distribution() {
     assert!(contains_error(
         finish_assertion(SourceDistribution::Hash(75), |_, _| {
             RowCountAssertionSpec::PerKeyAtMostOne {
+                applicability: crate::AssertionApplicability::AllRows,
                 keys: Box::default(),
                 labels: Box::default(),
                 message: "duplicate mutation match".into(),
@@ -1026,5 +1062,5 @@ fn finish_table_function_with_sink(
             },
         })
         .unwrap();
-    builder.finish_definition(node, sink, dop())
+    builder.finish_definition(node, sink, dop(), crate::StagePlacementPolicy::Singleton)
 }

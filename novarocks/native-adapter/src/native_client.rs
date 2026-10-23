@@ -214,6 +214,7 @@ impl NativeRpcClient {
         stop: CancellationToken,
     ) -> Result<Option<proto::ExchangeNormalClosed>, String> {
         let request = proto::ExchangeRequest {
+            stream: None,
             finst_id_hi: finst_id.high(),
             finst_id_lo: finst_id.low(),
             node_id,

@@ -393,7 +393,7 @@ fn lower_with_creation<
                 ))
                 .into());
             }
-            if cut.kind != EdgeKind::Stream || cut.change_stream_writer.is_some() {
+            if cut.kind != EdgeKind::Stream || cut.change_stream_writer().is_some() {
                 return Err((FragmentCompileError::Unsupported {
                     node: None,
                     feature: "outbound CTE or change-stream edge",
@@ -406,7 +406,7 @@ fn lower_with_creation<
                 .nodes()
                 .get(&physical.root())
                 .is_some_and(|root| matches!(root.kind, NodeKind::TableWriter { .. }));
-            if cut.writer_result.is_some() || writer_rooted {
+            if cut.writer_result().is_some() || writer_rooted {
                 crate::writer::admit_writer_result_cut(package, cut, work)?;
             }
             if matches!(
@@ -431,7 +431,7 @@ fn lower_with_creation<
     };
     for cut in package.cuts().inbound.iter() {
         work.step()?;
-        if cut.kind != EdgeKind::Stream || cut.change_stream_writer.is_some() {
+        if cut.kind != EdgeKind::Stream || cut.change_stream_writer().is_some() {
             return Err((FragmentCompileError::Unsupported {
                 node: Some(cut.destination_node),
                 feature: "inbound CTE or change-stream edge",
@@ -640,6 +640,26 @@ fn lower_with_creation<
         // local partitioning instead of relying on this. Copied rows and
         // broadcast placement stay refused, except the broadcast receiver a
         // join consumes as its complete build side.
+        // These signed contracts need their dedicated lowering; accepting
+        // ordinary hash slots here would silently erase bypass and level
+        // domains before the execution implementation is installed.
+        if std::iter::once(&node.output_properties.distribution)
+            .chain(node.required_inputs.iter().map(|p| &p.distribution))
+            .any(|distribution| match distribution {
+                Distribution::ConditionalKey { .. } => true,
+                Distribution::Hash { scheme, .. } => {
+                    scheme.definition.algorithm
+                        == novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1
+                }
+                _ => false,
+            })
+        {
+            return Err((FragmentCompileError::Unsupported {
+                node: Some(id),
+                feature: "conditional or hierarchical partition contract",
+            })
+            .into());
+        }
         if !replicated_builds.contains(&id)
             && (!matches!(
                 node.output_properties.distribution,
@@ -1287,6 +1307,8 @@ fn lower_with_creation<
                 )?;
                 source_requirements.push(BindingRequirement::ExchangeInput {
                     node: id,
+                    role: lowered.input.role,
+                    delivery: lowered.input.delivery,
                     layout: lowered.layout.clone(),
                 });
                 exchange_inputs.insert(id, lowered.input);

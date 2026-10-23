@@ -189,6 +189,7 @@ fn checked_empty_requests(count: usize) -> crate::Fragment {
                 max: 1,
                 requires_power_of_two: false,
             },
+            crate::StagePlacementPolicy::Singleton,
         )
         .unwrap()
         .with_call_requests_observed(requests, &Control::default())

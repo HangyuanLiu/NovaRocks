@@ -574,6 +574,7 @@ fn constant_fragment(
                 max: 1,
                 requires_power_of_two: false,
             },
+            crate::StagePlacementPolicy::Singleton,
         )
         .unwrap()
 }

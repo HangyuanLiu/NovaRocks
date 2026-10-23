@@ -101,42 +101,60 @@ fn partition() -> p::EdgePartitioning {
         destination_multiplicity: p::RowMultiplicity::Replicated,
     }
 }
+// Representation-only sparse declarations. Provider-route and writer-result
+// payloads occupy separate cuts. The writer cut has no import type occurrence,
+// so the independent source order remains route import -> writer field -> the
+// two outbound type occurrences. This fixture does not certify a complete graph.
 fn cut() -> p::FragmentCuts {
     p::FragmentCuts {
-        inbound: Box::from([p::InboundFragmentCut {
-            edge: p::EdgeId::new(0),
-            kind: p::EdgeKind::Stream,
-            source_fragment: p::FragmentId::new(u32::MAX),
-            destination_node: p::NodeId::new(0),
-            imports: Box::from([p::CutImport {
-                source: p::CutValue {
-                    value: p::ValueId::new(u32::MAX),
-                    ty: ty(),
-                },
-                destination: p::ValueId::new(0),
-            }]),
-            partitioning: partition(),
-            change_stream_writer: Some(p::ChangeStreamWriterCut {
-                route_id: ConnectorWriteRouteId::from_bytes([7; 32]),
-                write_target_ordinal: WriteTargetOrdinal::try_new(4095).unwrap(),
-                fields: Box::from([p::ChangeStreamWriterCutField {
-                    token: ConnectorWriteFieldToken::from_bytes([9; 32]),
-                    source: p::ValueId::new(0),
-                    destination: p::ValueId::new(u32::MAX),
-                }]),
-            }),
-            writer_result: Some(p::WriterResultCut {
-                write_target_ordinal: WriteTargetOrdinal::try_new(0).unwrap(),
-                schema_revision: u32::MAX,
-                fields: Box::from([p::WriterResultCutField {
-                    source: p::ValueId::new(u32::MAX),
+        inbound: Box::from([
+            p::InboundFragmentCut {
+                edge: p::EdgeId::new(0),
+                kind: p::EdgeKind::Stream,
+                source_fragment: p::FragmentId::new(u32::MAX),
+                destination_node: p::NodeId::new(0),
+                imports: Box::from([p::CutImport {
+                    source: p::CutValue {
+                        value: p::ValueId::new(u32::MAX),
+                        ty: ty(),
+                    },
                     destination: p::ValueId::new(0),
-                    name: "雪\0".into(),
-                    ty: ty(),
-                    role: p::WriterRelationFieldRole::Auxiliary,
                 }]),
-            }),
-        }]),
+                partitioning: partition(),
+                source_port: p::FragmentOutputPort::Root,
+                delivery: p::DeliveryRequirement::MustDrain,
+                payload: p::ExchangePayloadContract::ProviderRoute(p::ChangeStreamWriterCut {
+                    route_id: ConnectorWriteRouteId::from_bytes([7; 32]),
+                    write_target_ordinal: WriteTargetOrdinal::try_new(4095).unwrap(),
+                    fields: Box::from([p::ChangeStreamWriterCutField {
+                        token: ConnectorWriteFieldToken::from_bytes([9; 32]),
+                        source: p::ValueId::new(0),
+                        destination: p::ValueId::new(u32::MAX),
+                    }]),
+                }),
+            },
+            p::InboundFragmentCut {
+                edge: p::EdgeId::new(1),
+                kind: p::EdgeKind::Stream,
+                source_fragment: p::FragmentId::new(2),
+                destination_node: p::NodeId::new(1),
+                imports: Box::default(),
+                partitioning: partition(),
+                source_port: p::FragmentOutputPort::Root,
+                delivery: p::DeliveryRequirement::MustDrain,
+                payload: p::ExchangePayloadContract::WriterResults(p::WriterResultCut {
+                    write_target_ordinal: WriteTargetOrdinal::try_new(0).unwrap(),
+                    schema_revision: u32::MAX,
+                    fields: Box::from([p::WriterResultCutField {
+                        source: p::ValueId::new(u32::MAX),
+                        destination: p::ValueId::new(0),
+                        name: "雪\0".into(),
+                        ty: ty(),
+                        role: p::WriterRelationFieldRole::Auxiliary,
+                    }]),
+                }),
+            },
+        ]),
         outbound: Box::from([p::OutboundFragmentCut {
             edge: p::EdgeId::new(u32::MAX),
             kind: p::EdgeKind::CteMulticast,
@@ -154,11 +172,36 @@ fn cut() -> p::FragmentCuts {
                 destination: p::ValueId::new(u32::MAX),
             }]),
             partitioning: partition(),
-            change_stream_writer: None,
-            writer_result: None,
+            source_port: p::FragmentOutputPort::Root,
+            delivery: p::DeliveryRequirement::DemandDriven,
+            payload: p::ExchangePayloadContract::Relational,
         }]),
         runtime_filters: Box::default(),
         runtime_filter_bindings: Box::default(),
+    }
+}
+fn raw_route(cut: &wire::InboundFragmentCut) -> &wire::ChangeStreamWriterCut {
+    match cut.payload.as_ref().expect("explicit cut payload") {
+        wire::inbound_fragment_cut::Payload::ChangeStreamWriter(route) => route,
+        _ => panic!("expected provider route payload"),
+    }
+}
+fn raw_route_mut(cut: &mut wire::InboundFragmentCut) -> &mut wire::ChangeStreamWriterCut {
+    match cut.payload.as_mut().expect("explicit cut payload") {
+        wire::inbound_fragment_cut::Payload::ChangeStreamWriter(route) => route,
+        _ => panic!("expected provider route payload"),
+    }
+}
+fn raw_writer(cut: &wire::InboundFragmentCut) -> &wire::WriterResultCut {
+    match cut.payload.as_ref().expect("explicit cut payload") {
+        wire::inbound_fragment_cut::Payload::WriterResult(writer) => writer,
+        _ => panic!("expected writer result payload"),
+    }
+}
+fn raw_writer_mut(cut: &mut wire::InboundFragmentCut) -> &mut wire::WriterResultCut {
+    match cut.payload.as_mut().expect("explicit cut payload") {
+        wire::inbound_fragment_cut::Payload::WriterResult(writer) => writer,
+        _ => panic!("expected writer result payload"),
     }
 }
 fn run<T>(
@@ -238,22 +281,13 @@ fn full_cut_fields_have_independent_sparse_wire_oracle() {
             destination_value_id: Some(0)
         }
     );
-    assert_eq!(x.change_stream_writer.as_ref().unwrap().route_id, [7; 32]);
+    assert_eq!(raw_route(x).route_id, [7; 32]);
+    assert_eq!(raw_route(x).fields[0].field_token, [9; 32]);
+    assert_eq!(raw_route(x).write_target_ordinal, 4095);
+    assert_eq!(raw_writer(&raw.inbound[1]).schema_revision, u32::MAX);
+    assert_eq!(raw_writer(&raw.inbound[1]).fields[0].name, "雪\0");
     assert_eq!(
-        x.change_stream_writer.as_ref().unwrap().fields[0].field_token,
-        [9; 32]
-    );
-    assert_eq!(
-        x.change_stream_writer
-            .as_ref()
-            .unwrap()
-            .write_target_ordinal,
-        4095
-    );
-    assert_eq!(x.writer_result.as_ref().unwrap().schema_revision, u32::MAX);
-    assert_eq!(x.writer_result.as_ref().unwrap().fields[0].name, "雪\0");
-    assert_eq!(
-        x.writer_result.as_ref().unwrap().fields[0].role,
+        raw_writer(&raw.inbound[1]).fields[0].role,
         wire::WriterRelationFieldRole::Auxiliary as i32
     );
     assert_eq!(raw.outbound[0].kind, wire::EdgeKind::CteMulticast as i32);
@@ -580,7 +614,7 @@ fn missing_closed_headers_and_remote_reference_presence_refuse_without_local_loo
     let mut src = cut();
     src.runtime_filters = Box::from([filter()]);
     let (raw, _) = encode(&src, &c, limits()).unwrap();
-    for case in 0..17 {
+    for case in 0..23 {
         let mut x = raw.clone();
         match case {
             0 => x.inbound[0].edge_id = None,
@@ -590,25 +624,16 @@ fn missing_closed_headers_and_remote_reference_presence_refuse_without_local_loo
             4 => x.inbound[0].imports[0].destination_value_id = None,
             5 => x.inbound[0].partitioning = None,
             6 => x.inbound[0].kind = 0,
-            7 => x.inbound[0]
-                .change_stream_writer
-                .as_mut()
-                .unwrap()
+            7 => raw_route_mut(&mut x.inbound[0])
                 .route_id
                 .pop()
                 .map(|_| ())
                 .unwrap(),
-            8 => x.inbound[0].change_stream_writer.as_mut().unwrap().fields[0]
+            8 => raw_route_mut(&mut x.inbound[0]).fields[0]
                 .field_token
                 .push(0),
-            9 => {
-                x.inbound[0]
-                    .change_stream_writer
-                    .as_mut()
-                    .unwrap()
-                    .write_target_ordinal = 4096
-            }
-            10 => x.inbound[0].writer_result.as_mut().unwrap().fields[0].role = i32::MAX,
+            9 => raw_route_mut(&mut x.inbound[0]).write_target_ordinal = 4096,
+            10 => raw_writer_mut(&mut x.inbound[1]).fields[0].role = i32::MAX,
             11 => x.runtime_filters[0].domain = None,
             12 => {
                 x.runtime_filters[0]
@@ -626,7 +651,13 @@ fn missing_closed_headers_and_remote_reference_presence_refuse_without_local_loo
                     .kind = None
             }
             15 => x.runtime_filters[0].policy = None,
-            _ => x.runtime_filters[0].consumers[0].capabilities[0] = 0,
+            16 => x.runtime_filters[0].consumers[0].capabilities[0] = 0,
+            17 => x.inbound[0].payload = None,
+            18 => x.inbound[0].source_port = 0,
+            19 => x.inbound[0].source_port = i32::MAX,
+            20 => x.inbound[0].delivery = 0,
+            21 => x.inbound[0].delivery = i32::MAX,
+            _ => x.outbound[0].payload = None,
         }
         assert!(
             matches!(
@@ -664,8 +695,9 @@ fn independent_container_layout_and_all_seven_exact_under_envelopes() {
                 destination: p::ValueId::new(0),
             }]),
             partitioning: partition(),
-            change_stream_writer: None,
-            writer_result: None,
+            source_port: p::FragmentOutputPort::Root,
+            delivery: p::DeliveryRequirement::DemandDriven,
+            payload: p::ExchangePayloadContract::Relational,
         }]),
         ..Default::default()
     };
@@ -748,8 +780,11 @@ fn normalized_occurrence_copies_share_complete_binding_and_count_only_cut_contai
     );
     let mut source = cut();
     source.outbound = Box::default();
-    source.inbound[0].change_stream_writer = None;
-    source.inbound[0].writer_result = None;
+    // This test isolates one relational import owner; the separate writer cut
+    // is outside its source and cannot consume another type occurrence.
+    source.inbound = Box::from([source.inbound[0].clone()]);
+    source.inbound[0].payload = p::ExchangePayloadContract::Relational;
+    source.inbound[0].delivery = p::DeliveryRequirement::DemandDriven;
     source.inbound[0].imports[0].source.ty = full;
     let roots = [(u32::MAX, source.inbound[0].imports[0].source.ty.clone())];
     let encoded = encode_type_table_sources(&roots, &[], tl(), &c).unwrap();
@@ -961,8 +996,11 @@ fn actual_wide_imports_preserve_order_and_sample_real_quantum() {
     let c = Control::default();
     let mut source = cut();
     source.outbound = Box::default();
-    source.inbound[0].change_stream_writer = None;
-    source.inbound[0].writer_result = None;
+    // This test isolates one relational import owner; the separate writer cut
+    // is outside its source and cannot consume another type occurrence.
+    source.inbound = Box::from([source.inbound[0].clone()]);
+    source.inbound[0].payload = p::ExchangePayloadContract::Relational;
+    source.inbound[0].delivery = p::DeliveryRequirement::DemandDriven;
     source.inbound[0].imports = (0..320)
         .map(|i| p::CutImport {
             source: p::CutValue {

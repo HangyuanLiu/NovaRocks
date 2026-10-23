@@ -67,6 +67,7 @@ fn fragment(kind: NodeKind) -> Fragment {
         });
     }
     FragmentParts {
+        stage_placement: crate::StagePlacementPolicy::Singleton,
         id: FragmentId::new(19),
         root: node(),
         values: BTreeMap::new(),
@@ -412,6 +413,7 @@ fn scan_derived_roots_cover_real_value_origins_and_exclude_provider_proofs() {
             derived_values: Box::from([ValueId::new(5)]),
         });
         Fragment::from(FragmentParts {
+            stage_placement: crate::StagePlacementPolicy::Singleton,
             id: source.id(),
             root: source.root(),
             values: BTreeMap::from([(
@@ -546,6 +548,7 @@ fn operator_roots_cannot_escape_from_a_lambda_lexical_scope() {
     nested.lambda_scope = Some(alternate());
     definitions.insert(nested);
     let fragment = Fragment::from(FragmentParts {
+        stage_placement: crate::StagePlacementPolicy::Singleton,
         id: source.id(),
         root: source.root(),
         values: source.values().clone(),
@@ -654,6 +657,7 @@ fn conjunct_fragment() -> Fragment {
         });
     }
     Fragment::from(FragmentParts {
+        stage_placement: crate::StagePlacementPolicy::Singleton,
         id: source.id(),
         root: source.root(),
         values: source.values().clone(),
@@ -827,6 +831,7 @@ fn source_responsibility_rechecks_the_actual_fragment_field_and_boolean_type() {
     let site = site(ExpressionRootRole::FilterPredicate { predicate: 0 });
     let clone = |id, nodes, expressions| {
         Fragment::from(FragmentParts {
+            stage_placement: crate::StagePlacementPolicy::Singleton,
             id,
             root: source.root(),
             values: source.values().clone(),
@@ -890,6 +895,7 @@ fn positive_conjunct_paths_do_not_cross_not_or_null_testing() {
         };
         expressions.insert(parent);
         let fragment = Fragment::from(FragmentParts {
+            stage_placement: crate::StagePlacementPolicy::Singleton,
             id: source.id(),
             root: source.root(),
             values: source.values().clone(),
@@ -970,6 +976,7 @@ fn positive_source_depth_matches_the_checked_invocation_depth_bound() {
         });
     }
     let fragment = Fragment::from(FragmentParts {
+        stage_placement: crate::StagePlacementPolicy::Singleton,
         id: source.id(),
         root: source.root(),
         values: source.values().clone(),

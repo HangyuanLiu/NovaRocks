@@ -52,6 +52,7 @@ pub struct FragmentBuilder {
     values: BTreeMap<ValueId, ValueDef>,
     expressions: ExprArena,
     nodes: BTreeMap<NodeId, PhysicalNode>,
+    contains_scan: bool,
     runtime_filters: BTreeSet<RuntimeFilterId>,
 }
 
@@ -65,8 +66,13 @@ impl FragmentBuilder {
             values: BTreeMap::new(),
             expressions: ExprArena::default(),
             nodes: BTreeMap::new(),
+            contains_scan: false,
             runtime_filters: BTreeSet::new(),
         }
+    }
+
+    pub fn contains_scan(&self) -> bool {
+        self.contains_scan
     }
 
     pub const fn id(&self) -> FragmentId {
@@ -972,6 +978,7 @@ impl FragmentBuilder {
             .and_then(|next| id.get().checked_add(1).map(|after| next.max(after)));
         match self.nodes.entry(id) {
             Entry::Vacant(entry) => {
+                self.contains_scan |= matches!(node.kind, NodeKind::Scan { .. });
                 entry.insert(node);
                 self.next_node = next_node;
             }
@@ -998,8 +1005,10 @@ impl FragmentBuilder {
         root: NodeId,
         sink: FragmentSink,
         dop_domain: PipelineDopDomain,
+        stage_placement: crate::StagePlacementPolicy,
     ) -> Result<Fragment, ValidationErrors> {
-        let (mut parts, runtime_filters) = self.into_fragment_parts(root, sink, dop_domain);
+        let (mut parts, runtime_filters) =
+            self.into_fragment_parts(root, sink, dop_domain, stage_placement);
         parts.runtime_filters = runtime_filters.into_iter().collect();
         let fragment = Fragment::from(parts);
         validate_fragment_definition(&fragment)?;
@@ -1011,6 +1020,7 @@ impl FragmentBuilder {
         root: NodeId,
         sink: FragmentSink,
         dop_domain: PipelineDopDomain,
+        stage_placement: crate::StagePlacementPolicy,
     ) -> (FragmentParts, BTreeSet<RuntimeFilterId>) {
         let parts = FragmentParts {
             id: self.id,
@@ -1020,6 +1030,7 @@ impl FragmentBuilder {
             nodes: self.nodes,
             sink,
             dop_domain,
+            stage_placement,
             // The author installs the exact ordered references before this
             // unpublished construction input reaches any validator.
             runtime_filters: Box::default(),
@@ -1466,6 +1477,7 @@ mod sparse_node_identity_tests {
                     max: 1,
                     requires_power_of_two: false,
                 },
+                crate::StagePlacementPolicy::Singleton,
             )
             .unwrap();
         assert_eq!(fragment.root().get(), u32::MAX);
@@ -1507,6 +1519,7 @@ mod sparse_node_identity_tests {
                     max: 1,
                     requires_power_of_two: false,
                 },
+                crate::StagePlacementPolicy::Singleton,
             )
             .unwrap();
         let NodeKind::Values { rows } = &fragment.nodes()[&fragment.root()].kind else {

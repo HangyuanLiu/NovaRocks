@@ -28,7 +28,36 @@ use novarocks_type_contract::{
 };
 use novarocks_types::SlotId;
 
-use crate::{ImmutableExpressions, ProgramExprId};
+use crate::{ImmutableExpressions, ProgramExprId, StaticLayout};
+
+/// Output semantics survive local compilation independently of destination
+/// addresses and provider execution capabilities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramOutputRole {
+    Relational,
+    ProviderRoute {
+        target: novarocks_connector_contract::WriteTargetOrdinal,
+    },
+    LogicalSummary,
+    WriterResults,
+}
+
+/// Ordinary streams retain their frozen historic hash mapping. The two new
+/// variants use the versioned instance/driver domains at their respective
+/// boundaries; FALSE/NULL applicability uses a per-row round-robin cursor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StaticStreamRouting {
+    Ordinary,
+    HierarchicalHashV1,
+    ConditionalKeyV1 { applies: ProgramExprId },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StaticStreamContract {
+    pub role: ProgramOutputRole,
+    pub delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
+    pub routing: StaticStreamRouting,
+}
 
 pub const MAX_STATIC_SINK_BRANCHES: usize = 4_096;
 pub const MAX_STATIC_SINK_COLUMNS: usize = 4_096;
@@ -45,6 +74,9 @@ pub enum StaticSinkError {
     EmptyBranches,
     TooManyBranches,
     SplitArityMismatch,
+    InvalidRouter,
+    InvalidSummaryLayout,
+    InvalidDeliveryRequirement,
 }
 
 impl fmt::Display for StaticSinkError {
@@ -91,6 +123,7 @@ impl std::error::Error for SinkCompileError {
 
 #[derive(Clone, Debug)]
 pub struct StaticStreamBranch {
+    contract: StaticStreamContract,
     dest_node_id: i32,
     partition_type: DataStreamPartitionType,
     partition_exprs: Arc<[ProgramExprId]>,
@@ -105,6 +138,7 @@ impl StaticStreamBranch {
         partition_exprs: Vec<ProgramExprId>,
         output_columns: Vec<SlotId>,
         limit: Option<i64>,
+        contract: StaticStreamContract,
     ) -> Result<Self, StaticSinkError> {
         if dest_node_id < 0 {
             return Err(StaticSinkError::InvalidDestinationNode);
@@ -118,6 +152,23 @@ impl StaticStreamBranch {
         if !partition_type.requires_exprs() && !partition_exprs.is_empty() {
             return Err(StaticSinkError::InvalidPartitionExpressions);
         }
+        if !matches!(contract.routing, StaticStreamRouting::Ordinary)
+            && (partition_type != DataStreamPartitionType::HashPartitioned
+                || partition_exprs.is_empty())
+        {
+            return Err(StaticSinkError::InvalidPartitionExpressions);
+        }
+        if contract.delivery == novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+            && limit.is_some()
+        {
+            return Err(StaticSinkError::InvalidPartitionExpressions);
+        }
+        if contract.role != ProgramOutputRole::Relational
+            && contract.delivery
+                != novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+        {
+            return Err(StaticSinkError::InvalidDeliveryRequirement);
+        }
         if output_columns
             .iter()
             .copied()
@@ -128,6 +179,7 @@ impl StaticStreamBranch {
             return Err(StaticSinkError::DuplicateOutputColumn);
         }
         Ok(Self {
+            contract,
             dest_node_id,
             partition_type,
             partition_exprs: Arc::from(partition_exprs),
@@ -138,6 +190,9 @@ impl StaticStreamBranch {
 
     pub const fn dest_node_id(&self) -> i32 {
         self.dest_node_id
+    }
+    pub const fn contract(&self) -> StaticStreamContract {
+        self.contract
     }
     pub const fn partition_type(&self) -> DataStreamPartitionType {
         self.partition_type
@@ -156,6 +211,12 @@ impl StaticStreamBranch {
 /// One immutable arena per stream sink. Multicast and split branches share
 /// that arena, preserving exact expression IDs without per-branch duplication.
 #[derive(Clone, Debug)]
+pub struct StaticRouterRoute {
+    pub branch: u32,
+    pub accepted_effects: Arc<[novarocks_connector_contract::ConnectorRowMutationEffect]>,
+}
+
+#[derive(Clone, Debug)]
 pub enum StaticSinkProgram {
     Result,
     RootResult(Arc<novarocks_result_contract::RootOutputContract>),
@@ -167,6 +228,14 @@ pub enum StaticSinkProgram {
     MultiCastDataStream {
         branches: Arc<[StaticStreamBranch]>,
         arena: Arc<ImmutableExpressions>,
+    },
+    ChangeStreamRouter {
+        branches: Arc<[StaticStreamBranch]>,
+        arena: Arc<ImmutableExpressions>,
+        effect_slot: SlotId,
+        routes: Arc<[StaticRouterRoute]>,
+        summary_branch: u32,
+        summary_layout: StaticLayout,
     },
     SplitDataStream {
         branches: Arc<[StaticStreamBranch]>,
@@ -207,6 +276,21 @@ impl StaticSinkProgram {
             Self::MultiCastDataStream { branches, arena } => {
                 validate_branches_core(branches, arena, observe)
             }
+            Self::ChangeStreamRouter {
+                branches,
+                arena,
+                routes,
+                summary_branch,
+                summary_layout,
+                ..
+            } => validate_router_core(
+                branches,
+                arena,
+                routes,
+                *summary_branch,
+                summary_layout,
+                observe,
+            ),
             Self::SplitDataStream {
                 branches,
                 split_exprs,
@@ -252,12 +336,38 @@ impl StaticSinkProgram {
         })
     }
 
+    pub fn try_change_stream_router(
+        branches: Vec<StaticStreamBranch>,
+        arena: Arc<ImmutableExpressions>,
+        effect_slot: SlotId,
+        routes: Vec<StaticRouterRoute>,
+        summary_branch: u32,
+        summary_layout: StaticLayout,
+    ) -> Result<Self, StaticSinkError> {
+        validate_router_core(
+            &branches,
+            &arena,
+            &routes,
+            summary_branch,
+            &summary_layout,
+            &mut || Ok::<(), StaticSinkError>(()),
+        )?;
+        Ok(Self::ChangeStreamRouter {
+            branches: Arc::from(branches),
+            arena,
+            effect_slot,
+            routes: Arc::from(routes),
+            summary_branch,
+            summary_layout,
+        })
+    }
+
     pub fn branches(&self) -> &[StaticStreamBranch] {
         match self {
             Self::DataStream { branch, .. } => std::slice::from_ref(branch),
-            Self::MultiCastDataStream { branches, .. } | Self::SplitDataStream { branches, .. } => {
-                branches
-            }
+            Self::MultiCastDataStream { branches, .. }
+            | Self::SplitDataStream { branches, .. }
+            | Self::ChangeStreamRouter { branches, .. } => branches,
             Self::Result | Self::RootResult(_) | Self::Noop => &[],
         }
     }
@@ -266,7 +376,8 @@ impl StaticSinkProgram {
         match self {
             Self::DataStream { arena, .. }
             | Self::MultiCastDataStream { arena, .. }
-            | Self::SplitDataStream { arena, .. } => Some(arena),
+            | Self::SplitDataStream { arena, .. }
+            | Self::ChangeStreamRouter { arena, .. } => Some(arena),
             Self::Result | Self::RootResult(_) | Self::Noop => None,
         }
     }
@@ -281,6 +392,78 @@ impl StaticSinkProgram {
     pub const fn fanout(&self) -> bool {
         matches!(self, Self::SplitDataStream { fanout: true, .. })
     }
+}
+
+fn validate_router_core<E: From<StaticSinkError>>(
+    branches: &[StaticStreamBranch],
+    arena: &ImmutableExpressions,
+    routes: &[StaticRouterRoute],
+    summary_branch: u32,
+    summary_layout: &StaticLayout,
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    validate_branches_core(branches, arena, observe)?;
+    let summary_index =
+        usize::try_from(summary_branch).map_err(|_| StaticSinkError::InvalidRouter)?;
+    let summary = branches
+        .get(summary_index)
+        .ok_or(StaticSinkError::InvalidRouter)?;
+    observe()?;
+    if routes.is_empty()
+        || routes.len().checked_add(1) != Some(branches.len())
+        || summary.contract.role != ProgramOutputRole::LogicalSummary
+        || summary.contract.delivery
+            != novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+        || summary.partition_type != DataStreamPartitionType::Unpartitioned
+        || !matches!(summary.contract.routing, StaticStreamRouting::Ordinary)
+        || !summary.partition_exprs.is_empty()
+        || summary.limit.is_some()
+        || summary.output_columns() != summary_layout.slots()
+    {
+        return Err(StaticSinkError::InvalidRouter.into());
+    }
+    if summary_layout.slots().len() != 3 || summary_layout.schema().fields().len() != 3 {
+        return Err(StaticSinkError::InvalidSummaryLayout.into());
+    }
+    for field in summary_layout.schema().fields() {
+        let valid = field.data_type() == &arrow_schema::DataType::Int64 && !field.is_nullable();
+        observe()?;
+        if !valid {
+            return Err(StaticSinkError::InvalidSummaryLayout.into());
+        }
+    }
+    let mut covered = BTreeSet::new();
+    let mut targets = BTreeSet::new();
+    covered.insert(summary_index);
+    for route in routes {
+        let index = usize::try_from(route.branch).map_err(|_| StaticSinkError::InvalidRouter)?;
+        let branch = branches.get(index).ok_or(StaticSinkError::InvalidRouter)?;
+        let ProgramOutputRole::ProviderRoute { target } = branch.contract.role else {
+            return Err(StaticSinkError::InvalidRouter.into());
+        };
+        let valid = covered.insert(index)
+            && targets.insert(target)
+            && branch.contract.delivery
+                == novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+            && !route.accepted_effects.is_empty();
+        observe()?;
+        if !valid {
+            return Err(StaticSinkError::InvalidRouter.into());
+        }
+        let mut effects = BTreeSet::new();
+        for effect in route.accepted_effects.iter() {
+            let unique = effects.insert(*effect);
+            observe()?;
+            if !unique {
+                return Err(StaticSinkError::InvalidRouter.into());
+            }
+        }
+    }
+    // Cardinality plus unique in-range occurrences proves complete coverage.
+    if covered.len() != branches.len() {
+        return Err(StaticSinkError::InvalidRouter.into());
+    }
+    Ok(())
 }
 
 fn validate_branches(
@@ -322,8 +505,21 @@ fn validate_branch_core<E: From<StaticSinkError>>(
     arena: &ImmutableExpressions,
     observe: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<(), E> {
+    if let StaticStreamRouting::ConditionalKeyV1 { applies } = branch.contract.routing {
+        let valid = arena
+            .node(applies)
+            .is_some_and(|node| node.data_type() == &arrow_schema::DataType::Boolean);
+        observe()?;
+        if !valid {
+            return Err(StaticSinkError::InvalidExpression.into());
+        }
+    }
     for id in branch.partition_exprs.iter() {
-        let valid = arena.node(*id).is_some();
+        let valid = arena.node(*id).is_some_and(|node| {
+            matches!(branch.contract.routing, StaticStreamRouting::Ordinary)
+                || novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1
+                    .supports_partition_key(node.data_type())
+        });
         observe()?;
         if !valid {
             return Err(StaticSinkError::InvalidExpression.into());
@@ -387,6 +583,11 @@ mod tests {
             vec![ProgramExprId::new(0)],
             vec![SlotId::new(1)],
             Some(7),
+            crate::StaticStreamContract {
+                role: crate::ProgramOutputRole::Relational,
+                delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                routing: crate::StaticStreamRouting::Ordinary,
+            },
         )
         .unwrap();
         let split = StaticSinkProgram::try_split(
@@ -411,6 +612,11 @@ mod tests {
             vec![],
             vec![SlotId::new(1), SlotId::new(1)],
             None,
+            crate::StaticStreamContract {
+                role: crate::ProgramOutputRole::Relational,
+                delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                routing: crate::StaticStreamRouting::Ordinary,
+            },
         );
         assert!(matches!(
             duplicate,
@@ -422,6 +628,11 @@ mod tests {
             vec![ProgramExprId::new(0)],
             vec![SlotId::new(1)],
             None,
+            crate::StaticStreamContract {
+                role: crate::ProgramOutputRole::Relational,
+                delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                routing: crate::StaticStreamRouting::Ordinary,
+            },
         )
         .unwrap();
         assert!(matches!(
@@ -439,7 +650,13 @@ mod tests {
                     DataStreamPartitionType::HashPartitioned,
                     vec![ProgramExprId::new(2)],
                     vec![],
-                    None
+                    None,
+                    crate::StaticStreamContract {
+                        role: crate::ProgramOutputRole::Relational,
+                        delivery:
+                            novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                        routing: crate::StaticStreamRouting::Ordinary
+                    }
                 )
                 .unwrap(),
                 arena
@@ -484,6 +701,11 @@ mod tests {
             expressions,
             Vec::new(),
             None,
+            crate::StaticStreamContract {
+                role: crate::ProgramOutputRole::Relational,
+                delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                routing: crate::StaticStreamRouting::Ordinary,
+            },
         )
         .unwrap()
     }
@@ -616,6 +838,11 @@ mod tests {
             vec![ProgramExprId::new(0)],
             vec![SlotId::new(9), SlotId::new(3)],
             Some(-1),
+            crate::StaticStreamContract {
+                role: crate::ProgramOutputRole::Relational,
+                delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                routing: crate::StaticStreamRouting::Ordinary,
+            },
         )
         .unwrap();
         let sink =
@@ -665,3 +892,132 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod router_contract_tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+    use novarocks_connector_contract::{ConnectorRowMutationEffect, WriteTargetOrdinal};
+    use std::collections::HashMap;
+
+    fn fixture() -> (
+        Vec<StaticStreamBranch>,
+        Arc<ImmutableExpressions>,
+        Vec<StaticRouterRoute>,
+        StaticLayout,
+    ) {
+        let summary = StaticLayout::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("inserted", DataType::Int64, false),
+                Field::new("replaced", DataType::Int64, false),
+                Field::new("deleted", DataType::Int64, false),
+            ])),
+            Arc::from([SlotId::new(10), SlotId::new(11), SlotId::new(12)]),
+        )
+        .unwrap();
+        let branch = |node, columns, role| {
+            StaticStreamBranch::try_new(
+                node,
+                DataStreamPartitionType::Unpartitioned,
+                vec![],
+                columns,
+                None,
+                StaticStreamContract {
+                    role,
+                    delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain,
+                    routing: StaticStreamRouting::Ordinary,
+                },
+            )
+            .unwrap()
+        };
+        let branches = vec![
+            branch(
+                1,
+                vec![SlotId::new(2)],
+                ProgramOutputRole::ProviderRoute {
+                    target: WriteTargetOrdinal::try_new(0).unwrap(),
+                },
+            ),
+            branch(
+                2,
+                summary.slots().to_vec(),
+                ProgramOutputRole::LogicalSummary,
+            ),
+        ];
+        let arena =
+            Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap());
+        let routes = vec![StaticRouterRoute {
+            branch: 0,
+            accepted_effects: Arc::from([ConnectorRowMutationEffect::Insert]),
+        }];
+        (branches, arena, routes, summary)
+    }
+    #[test]
+    fn router_keeps_a_separate_summary_layout_and_covers_branches_once() {
+        let (branches, arena, routes, summary) = fixture();
+        let sink = StaticSinkProgram::try_change_stream_router(
+            branches.clone(),
+            arena.clone(),
+            SlotId::new(1),
+            routes.clone(),
+            1,
+            summary.clone(),
+        )
+        .unwrap();
+        assert_eq!(sink.branches()[1].output_columns(), summary.slots());
+        let mut duplicate = routes;
+        duplicate.push(duplicate[0].clone());
+        assert!(
+            StaticSinkProgram::try_change_stream_router(
+                branches,
+                arena,
+                SlotId::new(1),
+                duplicate,
+                1,
+                summary
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn summary_cannot_claim_a_provider_route_or_nullable_counters() {
+        let (mut branches, arena, routes, summary) = fixture();
+        branches[1].contract.role = ProgramOutputRole::Relational;
+        assert!(
+            StaticSinkProgram::try_change_stream_router(
+                branches,
+                arena,
+                SlotId::new(1),
+                routes,
+                1,
+                summary
+            )
+            .is_err()
+        );
+        let (branches, arena, routes, _) = fixture();
+        let nullable = StaticLayout::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, true),
+                Field::new("b", DataType::Int64, false),
+                Field::new("c", DataType::Int64, false),
+            ])),
+            Arc::from([SlotId::new(10), SlotId::new(11), SlotId::new(12)]),
+        )
+        .unwrap();
+        assert!(
+            StaticSinkProgram::try_change_stream_router(
+                branches,
+                arena,
+                SlotId::new(1),
+                routes,
+                1,
+                nullable
+            )
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "sink/stream_contract_tests.rs"]
+mod stream_contract_tests;

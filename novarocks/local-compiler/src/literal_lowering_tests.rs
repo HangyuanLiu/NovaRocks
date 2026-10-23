@@ -54,6 +54,7 @@ fn literal_package(ty: FunctionValueType, literal: LiteralValue) -> Arc<Fragment
                 max: 1,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();

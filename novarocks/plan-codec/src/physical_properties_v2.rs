@@ -224,10 +224,26 @@ fn copy_bytes(input: &[u8; 32], work: &mut CompileCheckpoints<'_>) -> Result<Vec
     }
     Ok(output)
 }
+fn conditional_physical_reference(input: &physical::Distribution) -> usize {
+    usize::from(matches!(
+        input,
+        physical::Distribution::ConditionalKey { .. }
+    ))
+}
+fn conditional_wire_reference(input: &wire::Distribution) -> usize {
+    usize::from(matches!(
+        input.kind,
+        Some(wire::distribution::Kind::ConditionalKey(_))
+    ))
+}
+
 fn encode_hash(value: PartitionHashAlgorithm) -> i32 {
     match value {
         PartitionHashAlgorithm::NativeExchangeV1 => {
             wire::PartitionHashAlgorithm::NativeExchangeV1 as i32
+        }
+        PartitionHashAlgorithm::NativeHierarchicalV1 => {
+            wire::PartitionHashAlgorithm::NativeHierarchicalV1 as i32
         }
         PartitionHashAlgorithm::NativeBucketCrc32V1 => {
             wire::PartitionHashAlgorithm::NativeBucketCrc32V1 as i32
@@ -238,6 +254,9 @@ fn decode_hash(value: i32) -> Result<PartitionHashAlgorithm, Error> {
     match wire::PartitionHashAlgorithm::try_from(value) {
         Ok(wire::PartitionHashAlgorithm::NativeExchangeV1) => {
             Ok(PartitionHashAlgorithm::NativeExchangeV1)
+        }
+        Ok(wire::PartitionHashAlgorithm::NativeHierarchicalV1) => {
+            Ok(PartitionHashAlgorithm::NativeHierarchicalV1)
         }
         Ok(wire::PartitionHashAlgorithm::NativeBucketCrc32V1) => {
             Ok(PartitionHashAlgorithm::NativeBucketCrc32V1)
@@ -333,6 +352,7 @@ fn properties_encode_numerical_facts_core(
 ) -> Result<PhysicalPropertyProjectionFacts, Error> {
     let keys = match &input.distribution {
         physical::Distribution::Hash { keys, .. }
+        | physical::Distribution::ConditionalKey { keys, .. }
         | physical::Distribution::BucketShuffle { keys, .. } => &**keys,
         physical::Distribution::Unconstrained
         | physical::Distribution::Singleton
@@ -341,9 +361,17 @@ fn properties_encode_numerical_facts_core(
     };
     let keyed = matches!(
         input.distribution,
-        physical::Distribution::Hash { .. } | physical::Distribution::BucketShuffle { .. }
+        physical::Distribution::Hash { .. }
+            | physical::Distribution::ConditionalKey { .. }
+            | physical::Distribution::BucketShuffle { .. }
     );
-    let references = arithmetic.add(keys.len(), input.ordering.len())?;
+    let references = arithmetic.add(
+        arithmetic.add(
+            keys.len(),
+            conditional_physical_reference(&input.distribution),
+        )?,
+        input.ordering.len(),
+    )?;
     floor(
         source,
         arithmetic.add(
@@ -379,6 +407,7 @@ pub(crate) fn emit_distribution_observed(
 ) -> Result<wire::Distribution, Error> {
     let keys = match input {
         physical::Distribution::Hash { keys, .. }
+        | physical::Distribution::ConditionalKey { keys, .. }
         | physical::Distribution::BucketShuffle { keys, .. } => &**keys,
         _ => &[],
     };
@@ -409,6 +438,24 @@ pub(crate) fn emit_distribution_observed(
                 }),
             })
         }
+        physical::Distribution::ConditionalKey {
+            applies, scheme, ..
+        } => wire::distribution::Kind::ConditionalKey(wire::ConditionalKeyDistribution {
+            applies_value_id: Some(applies.get()),
+            key_value_ids: output_keys,
+            scheme: Some(wire::HashPartitionScheme {
+                partition_space: copy_bytes(&scheme.space.as_bytes(), work)?,
+                count: Some(wire::PartitionCountParameter {
+                    id: copy_bytes(&scheme.count.id.as_bytes(), work)?,
+                    admissible: Some(wire::PartitionCountDomain {
+                        min: scheme.count.admissible.min,
+                        max: scheme.count.admissible.max,
+                        requires_power_of_two: scheme.count.admissible.requires_power_of_two,
+                    }),
+                }),
+                algorithm: encode_hash(scheme.definition.algorithm),
+            }),
+        }),
         physical::Distribution::BucketShuffle { scheme, .. } => {
             wire::distribution::Kind::BucketShuffle(wire::BucketDistribution {
                 key_value_ids: output_keys,
@@ -469,6 +516,7 @@ enum DistributionHeader {
     RoundRobin,
     Broadcast,
     Hash(physical::HashPartitionScheme),
+    ConditionalKey(physical::ValueId, physical::HashPartitionScheme),
     Bucket(physical::BucketPartitionScheme),
 }
 fn decode_header(
@@ -510,6 +558,43 @@ fn decode_header(
                     algorithm: decode_hash(scheme.algorithm)?,
                 },
             })
+        }
+        wire::distribution::Kind::ConditionalKey(hash) => {
+            let scheme = hash
+                .scheme
+                .as_ref()
+                .ok_or_else(|| invalid("physical property hash scheme is absent"))?;
+            let count = scheme
+                .count
+                .as_ref()
+                .ok_or_else(|| invalid("physical property count parameter is absent"))?;
+            let domain = count
+                .admissible
+                .as_ref()
+                .ok_or_else(|| invalid("physical property count domain is absent"))?;
+            DistributionHeader::ConditionalKey(
+                physical::ValueId::new(
+                    hash.applies_value_id
+                        .ok_or_else(|| invalid("conditional partition applicability is absent"))?,
+                ),
+                physical::HashPartitionScheme {
+                    space: PartitionSpaceId::try_new(exact32(&scheme.partition_space)?)
+                        .map_err(|_| invalid("physical property partition space is zero"))?,
+                    count: physical::PartitionCountParameter {
+                        id: PartitionCountParameterId::try_new(exact32(&count.id)?).map_err(
+                            |_| invalid("physical property count parameter identity is zero"),
+                        )?,
+                        admissible: physical::PartitionCountDomain {
+                            min: domain.min,
+                            max: domain.max,
+                            requires_power_of_two: domain.requires_power_of_two,
+                        },
+                    },
+                    definition: physical::HashDefinition {
+                        algorithm: decode_hash(scheme.algorithm)?,
+                    },
+                },
+            )
         }
         wire::distribution::Kind::BucketShuffle(bucket) => {
             let scheme = bucket
@@ -562,6 +647,23 @@ fn decode_distribution_source_core(
         .ok_or_else(|| invalid("physical property distribution kind is absent"))?;
     let source = match kind {
         wire::distribution::Kind::Hash(hash) => {
+            let scheme = hash
+                .scheme
+                .as_ref()
+                .ok_or_else(|| invalid("physical property hash scheme is absent"))?;
+            let count = scheme
+                .count
+                .as_ref()
+                .ok_or_else(|| invalid("physical property count parameter is absent"))?;
+            (
+                &hash.key_value_ids[..],
+                arithmetic.add(
+                    arithmetic.bytes::<u32>(hash.key_value_ids.capacity())?,
+                    arithmetic.add(scheme.partition_space.capacity(), count.id.capacity())?,
+                )?,
+            )
+        }
+        wire::distribution::Kind::ConditionalKey(hash) => {
             let scheme = hash
                 .scheme
                 .as_ref()
@@ -679,7 +781,18 @@ fn properties_decode_numerical_facts_core(
         2,
     )?;
     numerical_facts_core(
-        arithmetic.add(keys.len(), input.ordering.len())?,
+        arithmetic.add(
+            arithmetic.add(
+                keys.len(),
+                conditional_wire_reference(
+                    input
+                        .distribution
+                        .as_ref()
+                        .ok_or_else(|| invalid("physical property distribution is absent"))?,
+                ),
+            )?,
+            input.ordering.len(),
+        )?,
         requests,
         requested,
         source,
@@ -707,6 +820,13 @@ fn materialize_distribution_observed(
             keys: output_keys,
             scheme,
         },
+        DistributionHeader::ConditionalKey(applies, scheme) => {
+            physical::Distribution::ConditionalKey {
+                applies,
+                keys: output_keys,
+                scheme,
+            }
+        }
         DistributionHeader::Bucket(scheme) => physical::Distribution::BucketShuffle {
             keys: output_keys,
             scheme,
@@ -812,6 +932,7 @@ pub(crate) fn preflight_distribution_encode_observed(
 fn distribution_encode_source(input: &physical::Distribution) -> (&[physical::ValueId], bool) {
     match input {
         physical::Distribution::Hash { keys, .. }
+        | physical::Distribution::ConditionalKey { keys, .. }
         | physical::Distribution::BucketShuffle { keys, .. } => (&**keys, true),
         physical::Distribution::Unconstrained
         | physical::Distribution::Singleton
@@ -862,7 +983,7 @@ fn distribution_encode_numerical_facts_core(
         )?,
     )?;
     numerical_facts_core(
-        keys.len(),
+        arithmetic.add(keys.len(), conditional_physical_reference(input))?,
         arithmetic.add(usize::from(!keys.is_empty()), if keyed { 2 } else { 0 })?,
         arithmetic.add(
             arithmetic.bytes::<u32>(keys.len())?,
@@ -910,7 +1031,7 @@ fn distribution_decode_numerical_facts_core(
         arithmetic.add(size_of::<wire::Distribution>(), extra_source)?,
     )?;
     numerical_facts_core(
-        keys.len(),
+        arithmetic.add(keys.len(), conditional_wire_reference(input))?,
         arithmetic.mul(usize::from(!keys.is_empty()), 2)?,
         arithmetic.mul(arithmetic.bytes::<physical::ValueId>(keys.len())?, 2)?,
         source,

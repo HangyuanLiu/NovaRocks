@@ -208,9 +208,9 @@ fn individual_relation_floor_in(
 ) -> Result<(usize, usize), Error> {
     let properties = relation.provided_properties();
     let keys = match &properties.distribution {
-        p::Distribution::Hash { keys, .. } | p::Distribution::BucketShuffle { keys, .. } => {
-            keys.len()
-        }
+        p::Distribution::Hash { keys, .. }
+        | p::Distribution::ConditionalKey { keys, .. }
+        | p::Distribution::BucketShuffle { keys, .. } => keys.len(),
         p::Distribution::Unconstrained
         | p::Distribution::Singleton
         | p::Distribution::RoundRobin

@@ -104,12 +104,23 @@ fn route(
                 p::ValueId::new(1),
             ),
         ]),
-        partition_by: Box::from([p::ValueId::new(1)]),
+        requirements: p::WriteRouteRequirements {
+            colocation: p::WriteColocation::ByKey(Box::from([p::ValueId::new(1)])),
+            layout: p::WriteLayoutPreference::None,
+        },
         edge: p::EdgeId::new(edge),
     }
 }
 fn router() -> p::FragmentSink {
     p::FragmentSink::Router {
+        summary: p::LogicalSummaryOutput {
+            edge: p::EdgeId::new(1),
+            columns: p::LogicalSummaryColumns {
+                inserted: p::ValueId::new(2),
+                replaced: p::ValueId::new(3),
+                deleted: p::ValueId::new(4),
+            },
+        },
         effect: p::ValueId::new(0),
         routes: Box::from([
             route(
@@ -177,6 +188,17 @@ fn fragment(sink: p::FragmentSink, wide: bool) -> p::Fragment {
             },
         })
         .unwrap();
+    if let p::FragmentSink::Router { summary, .. } = &sink {
+        for (field, id) in summary.columns.fields() {
+            builder
+                .insert_value(p::ValueDef {
+                    id,
+                    ty: p::ValueType::new(DataType::Int64, false),
+                    origin: p::ValueOrigin::LogicalSummary { field },
+                })
+                .unwrap();
+        }
+    }
     for id in if wide {
         (0..319)
             .chain(std::iter::once(u32::MAX))
@@ -195,6 +217,7 @@ fn fragment(sink: p::FragmentSink, wide: bool) -> p::Fragment {
             dop(),
             p::PlanLimits::FROZEN,
             &Control::default(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap()
 }
@@ -206,6 +229,7 @@ fn raw(output: EncodedFragmentEnvelope) -> wire::Fragment {
         root_node_id: Some(output.root_node_id),
         sink: Some(output.sink),
         dop_domain: Some(output.dop_domain),
+        stage_placement: Some(output.stage_placement),
         runtime_filter_ids: output.runtime_filter_ids,
         ..Default::default()
     }
@@ -290,6 +314,17 @@ fn envelope_all_five_sinks_preserve_hand_authored_headers_and_ordered_routes() {
             raw.sink.as_ref().and_then(|v| v.kind.as_ref())
         {
             assert_eq!(v.effect_value_id, Some(0));
+            assert_eq!(
+                v.summary,
+                Some(wire::LogicalSummaryOutput {
+                    edge_id: Some(1),
+                    columns: Some(wire::LogicalSummaryColumns {
+                        inserted_value_id: Some(2),
+                        replaced_value_id: Some(3),
+                        deleted_value_id: Some(4),
+                    }),
+                })
+            );
             assert_eq!(v.routes.len(), 2);
             assert_eq!(v.routes[0].route_id, [9; 32]);
             assert_eq!(v.routes[1].route_id, [8; 32]);
@@ -328,7 +363,7 @@ fn envelope_all_five_sinks_preserve_hand_authored_headers_and_ordered_routes() {
 #[test]
 fn envelope_presence_unknown_effect_tokens_and_original_ordinal_author_reject() {
     let (source, _) = encoded(&fragment(router(), false));
-    for fault in 0..12 {
+    for fault in 0..18 {
         let mut bad = source.clone();
         match fault {
             0 => bad.root_node_id = None,
@@ -349,6 +384,39 @@ fn envelope_presence_unknown_effect_tokens_and_original_ordinal_author_reject() 
                 .field_token
                 .push(0),
             11 => raw_router(&mut bad).routes[0].write_target_ordinal = 4096,
+            12 => raw_router(&mut bad).summary = None,
+            13 => raw_router(&mut bad).summary.as_mut().unwrap().edge_id = None,
+            14 => raw_router(&mut bad).summary.as_mut().unwrap().columns = None,
+            15 => {
+                raw_router(&mut bad)
+                    .summary
+                    .as_mut()
+                    .unwrap()
+                    .columns
+                    .as_mut()
+                    .unwrap()
+                    .inserted_value_id = None
+            }
+            16 => {
+                raw_router(&mut bad)
+                    .summary
+                    .as_mut()
+                    .unwrap()
+                    .columns
+                    .as_mut()
+                    .unwrap()
+                    .replaced_value_id = None
+            }
+            17 => {
+                raw_router(&mut bad)
+                    .summary
+                    .as_mut()
+                    .unwrap()
+                    .columns
+                    .as_mut()
+                    .unwrap()
+                    .deleted_value_id = None
+            }
             _ => unreachable!(),
         }
         assert!(
@@ -432,10 +500,10 @@ fn envelope_independent_layout_golden_counts_separate_vec_box_requests_and_retai
         + 2 * layout::<p::ValueId>(1);
     assert_eq!(sent.input_node_count, 0);
     assert_eq!(received.input_node_count, 0);
-    assert_eq!(sent.value_reference_count, 7);
-    assert_eq!(received.value_reference_count, 7);
-    assert_eq!(sent.list_item_count, 13);
-    assert_eq!(received.list_item_count, 13);
+    assert_eq!(sent.value_reference_count, 11);
+    assert_eq!(received.value_reference_count, 11);
+    assert_eq!(sent.list_item_count, 17);
+    assert_eq!(received.list_item_count, 17);
     assert_eq!(sent.allocation_requests_upper_bound, 14);
     assert_eq!(received.allocation_requests_upper_bound, 16);
     assert_eq!(sent.allocation_request_bytes_upper_bound, send_bytes);
@@ -547,7 +615,32 @@ fn envelope_all_nonzero_axes_exact_one_under_and_source_floor_precede_emission()
                 route.route_id.capacity()
                     + layout::<i32>(route.accepted_effects.capacity())
                     + layout::<wire::WriteInputMapping>(route.input_mapping.capacity())
-                    + layout::<u32>(route.partition_value_ids.capacity())
+                    + match route
+                        .requirements
+                        .as_ref()
+                        .unwrap()
+                        .colocation
+                        .as_ref()
+                        .unwrap()
+                    {
+                        wire::write_route_requirements::Colocation::ByKey(keys) => {
+                            layout::<u32>(keys.value_ids.capacity())
+                        }
+                        _ => 0,
+                    }
+                    + match route
+                        .requirements
+                        .as_ref()
+                        .unwrap()
+                        .layout
+                        .as_ref()
+                        .unwrap()
+                    {
+                        wire::write_route_requirements::Layout::ClusterBy(keys) => {
+                            layout::<u32>(keys.value_ids.capacity())
+                        }
+                        _ => 0,
+                    }
                     + route
                         .input_mapping
                         .iter()
@@ -705,8 +798,8 @@ fn caller_envelope_all_sinks_use_original_mapper_and_independent_layouts() {
                 received.1.allocation_request_bytes_upper_bound,
                 received_bytes
             );
-            assert_eq!(received.1.value_reference_count, 7);
-            assert_eq!(received.1.list_item_count, 13);
+            assert_eq!(received.1.value_reference_count, 11);
+            assert_eq!(received.1.list_item_count, 17);
         }
     }
 }
@@ -807,8 +900,9 @@ fn caller_envelope_captured_route_requests_are_admitted_before_the_next_callback
         finish(work, result).unwrap();
         let (expected, at) = capture.unwrap();
         assert_eq!(expected.allocation_requests_upper_bound, expected_requests);
-        assert_eq!(expected.value_reference_count, 4);
-        assert_eq!(expected.list_item_count, 9);
+        // The independent summary adds three values and its own edge ID.
+        assert_eq!(expected.value_reference_count, 4 + 4);
+        assert_eq!(expected.list_item_count, 9 + 4);
         let events = baseline.trace();
         for cause in CAUSES {
             let control = Control {
@@ -985,4 +1079,96 @@ fn package_envelope_preserves_the_unbound_scalar_root_declaration() {
         decoded.sink,
         p::FragmentSink::RootResult(Box::new(expected))
     );
+}
+
+#[test]
+fn route_colocation_and_layout_are_independent_closed_original_facts() {
+    for colocation in [
+        p::WriteColocation::None,
+        p::WriteColocation::Singleton,
+        p::WriteColocation::ByKey(Box::from([p::ValueId::new(1)])),
+    ] {
+        for layout in [
+            p::WriteLayoutPreference::None,
+            p::WriteLayoutPreference::ClusterBy(Box::from([p::ValueId::new(1)])),
+        ] {
+            let mut sink = router();
+            let p::FragmentSink::Router { routes, .. } = &mut sink else {
+                panic!("router")
+            };
+            routes[0].requirements = p::WriteRouteRequirements {
+                colocation: colocation.clone(),
+                layout,
+            };
+            let source = fragment(sink.clone(), false);
+            let (raw, _) = encoded(&source);
+            assert_eq!(
+                decode(&raw, limits(), &Control::default()).unwrap().0.sink,
+                sink
+            );
+        }
+    }
+    let (base, sent) = encoded(&fragment(router(), false));
+    let mut sink = router();
+    let p::FragmentSink::Router { routes, .. } = &mut sink else {
+        panic!("router")
+    };
+    routes[0].requirements.layout =
+        p::WriteLayoutPreference::ClusterBy(Box::from([p::ValueId::new(1)]));
+    let (with_layout, layout_sent) = encoded(&fragment(sink, false));
+    assert_eq!(
+        layout_sent.value_reference_count,
+        sent.value_reference_count + 1
+    );
+    assert_eq!(layout_sent.list_item_count, sent.list_item_count + 1);
+    assert_eq!(
+        layout_sent.allocation_requests_upper_bound,
+        sent.allocation_requests_upper_bound + 1
+    );
+    assert_eq!(
+        layout_sent.allocation_request_bytes_upper_bound,
+        sent.allocation_request_bytes_upper_bound + layout::<u32>(1)
+    );
+    let base_recv = decode(&base, limits(), &Control::default()).unwrap().1;
+    let recv = decode(&with_layout, limits(), &Control::default())
+        .unwrap()
+        .1;
+    assert_eq!(
+        recv.value_reference_count,
+        base_recv.value_reference_count + 1
+    );
+    assert_eq!(recv.list_item_count, base_recv.list_item_count + 1);
+    assert_eq!(
+        recv.allocation_requests_upper_bound,
+        base_recv.allocation_requests_upper_bound + 2
+    );
+    assert_eq!(
+        recv.allocation_request_bytes_upper_bound,
+        base_recv.allocation_request_bytes_upper_bound + 2 * layout::<p::ValueId>(1)
+    );
+    for fault in 0..5 {
+        let mut raw = base.clone();
+        let route = &mut raw_router(&mut raw).routes[0];
+        match fault {
+            0 => route.requirements = None,
+            1 => route.requirements.as_mut().unwrap().colocation = None,
+            2 => route.requirements.as_mut().unwrap().layout = None,
+            3 => {
+                route.requirements.as_mut().unwrap().colocation =
+                    Some(wire::write_route_requirements::Colocation::ByKey(
+                        wire::WriteRouteKeyFields { value_ids: vec![] },
+                    ))
+            }
+            _ => {
+                route.requirements.as_mut().unwrap().layout =
+                    Some(wire::write_route_requirements::Layout::ClusterBy(
+                        wire::WriteRouteKeyFields { value_ids: vec![] },
+                    ))
+            }
+        }
+        assert!(
+            decode(&raw, limits(), &Control::default()).is_err(),
+            "fault {fault}"
+        );
+    }
 }

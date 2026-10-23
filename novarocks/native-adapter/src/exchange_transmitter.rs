@@ -211,6 +211,11 @@ mod tests {
             payload: Vec::new(),
         };
         let proof = proto::ExchangeNormalClosed {
+            disposition: Some(
+                novarocks_proto_models::novarocks::exchange_normal_closed::Disposition::Withdrawn(
+                    novarocks_proto_models::novarocks::ExchangeWithdrawn {},
+                ),
+            ),
             destination_task: Some(novarocks_task_codec::identity::encode_task_identity(task)),
             destination_finst_id_hi: 11,
             destination_finst_id_lo: 12,

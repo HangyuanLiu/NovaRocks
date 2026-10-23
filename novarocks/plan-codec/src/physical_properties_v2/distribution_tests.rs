@@ -652,3 +652,40 @@ fn distribution_real_wide_key_copy_quantum_preserves_original_prefix() {
         }
     }
 }
+
+#[test]
+fn conditional_key_roundtrip_accounts_for_mask_and_refuses_missing_mask() {
+    let physical::Distribution::Hash { keys, scheme } =
+        hash(PartitionHashAlgorithm::NativeHierarchicalV1)
+    else {
+        panic!()
+    };
+    let original = physical::Distribution::ConditionalKey {
+        applies: physical::ValueId::new(17),
+        keys,
+        scheme,
+    };
+    let (encoded, encode_facts) =
+        encode_distribution(&original, SOURCE, limits(), &Control::default()).unwrap();
+    assert_eq!(encode_facts.value_reference_count, 4);
+    let (decoded, decode_facts) =
+        decode_distribution(&encoded, SOURCE, limits(), &Control::default()).unwrap();
+    assert_eq!(decoded, original);
+    assert_eq!(decode_facts.value_reference_count, 4);
+    let mut limit = limits();
+    limit.max_value_references = 3;
+    assert!(encode_distribution(&original, SOURCE, limit, &Control::default()).is_err());
+    assert!(decode_distribution(&encoded, SOURCE, limit, &Control::default()).is_err());
+    let Some(wire::distribution::Kind::ConditionalKey(mut conditional)) = encoded.kind else {
+        panic!()
+    };
+    assert_eq!(
+        conditional.scheme.as_ref().unwrap().algorithm,
+        wire::PartitionHashAlgorithm::NativeHierarchicalV1 as i32
+    );
+    conditional.applies_value_id = None;
+    let missing = wire::Distribution {
+        kind: Some(wire::distribution::Kind::ConditionalKey(conditional)),
+    };
+    assert!(decode_distribution(&missing, SOURCE, limits(), &Control::default()).is_err());
+}

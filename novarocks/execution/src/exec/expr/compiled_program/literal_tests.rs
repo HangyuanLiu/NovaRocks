@@ -83,6 +83,7 @@ fn literal_program(cases: &[(FunctionValueType, LiteralValue)]) -> Arc<LocalProg
                 max: 1,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let actual_roots = PhysicalExpressionRoots::try_new(&fragment, &FixtureControl).unwrap();

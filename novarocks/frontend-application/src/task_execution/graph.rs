@@ -106,6 +106,11 @@ fn bind_sink_edges(
                 "static sink target fragment {fragment_id} node {node_id} does not identify exactly one task edge"
             )));
         };
+        if target.delivery() != edge.delivery() {
+            return Err(TaskExecutionError::Schedule(
+                "static sink delivery differs from its frozen task edge".to_owned(),
+            ));
+        }
         if !used.insert(edge.edge_id()) {
             return Err(TaskExecutionError::Schedule(format!(
                 "task edge {} is bound to multiple static sinks",
@@ -234,6 +239,7 @@ pub struct EdgeNode {
     producer_stage: StageId,
     consumer_stage: StageId,
     destination_node_id: FragmentNodeId,
+    delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
     producers: Vec<TaskIdentity>,
     destinations: Vec<TaskIdentity>,
 }
@@ -253,6 +259,10 @@ impl EdgeNode {
 
     pub const fn destination_node_id(&self) -> FragmentNodeId {
         self.destination_node_id
+    }
+
+    pub const fn delivery(&self) -> novarocks_execution_contract::ExchangeDeliveryRequirement {
+        self.delivery
     }
 
     pub fn producers(&self) -> &[TaskIdentity] {
@@ -899,6 +909,7 @@ pub(crate) fn build_task_graph_from_manifest(
             edge.edge_id(),
             node_id,
             manifest_partition_type(edge.partition_kind()),
+            edge.delivery(),
             edge.sender_count(),
             producers,
             destinations,
@@ -911,6 +922,7 @@ pub(crate) fn build_task_graph_from_manifest(
                     producer_stage,
                     consumer_stage,
                     destination_node_id: node_id,
+                    delivery: edge.delivery(),
                     producers: edge.producers().iter().map(|p| p.task()).collect(),
                     destinations: edge.destinations().to_vec(),
                 },
@@ -1148,6 +1160,7 @@ fn build_schedule_edges(
             edge_id,
             node_id,
             senders.partitioning,
+            fragment_edge.delivery,
             senders.count,
             shared_producers,
             shared_destinations,
@@ -1160,6 +1173,7 @@ fn build_schedule_edges(
                 producer_stage,
                 consumer_stage,
                 destination_node_id: node_id,
+                delivery: fragment_edge.delivery,
                 producers: producers
                     .iter()
                     .map(|producer| tasks[producer].identity)

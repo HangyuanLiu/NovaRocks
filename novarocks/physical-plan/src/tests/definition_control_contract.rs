@@ -66,7 +66,12 @@ fn fixture(make: impl FnOnce(&mut FragmentBuilder, NodeId) -> (ExprId, Vec<ExprI
         .unwrap();
     // Every test reaches the control boundary with a checked real definition.
     let fragment = builder
-        .finish_definition(node, FragmentSink::Noop, dop())
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     validate_fragment_definition(&fragment).unwrap();
     Fixture {

@@ -40,8 +40,27 @@ use std::{
 /// Compiled-only receiver address of one actual `ExchangeSource` node. A
 /// compiled node has no legacy native identity, so the program carries the
 /// physical routing facts explicitly instead of deriving them from a node ID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompiledExchangeRouting {
+    Unpartitioned,
+    RoundRobin,
+    Hash {
+        algorithm: novarocks_type_contract::PartitionHashAlgorithm,
+    },
+    ConditionalKey {
+        applies: SlotId,
+        algorithm: novarocks_type_contract::PartitionHashAlgorithm,
+    },
+    BucketShuffle {
+        algorithm: novarocks_type_contract::PartitionHashAlgorithm,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledExchangeInput {
+    pub role: crate::ProgramOutputRole,
+    pub delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
+    pub routing: CompiledExchangeRouting,
     /// Physical NodeId of the receiving ExchangeSource; senders address it.
     pub receiver_node: u32,
     /// Physical EdgeId of the inbound stream edge.
@@ -459,15 +478,99 @@ fn validate_exchange_inputs(
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)
         .map_err(LocalProgramCompileError::Control)?;
     let result = (|| {
+        let mut declarations = BTreeMap::new();
+        for declared in graph.requirements().entries() {
+            if let BindingRequirement::ExchangeInput {
+                node,
+                role,
+                delivery,
+                ..
+            } = declared
+            {
+                declarations.insert(*node, (*role, *delivery));
+            }
+            work.step().map_err(LocalProgramCompileError::Control)?;
+        }
         for (id, input) in exchange_inputs {
-            let slots = graph.nodes()[id.index()].output_layout().slots();
-            for key in &input.hash_partition_slots {
-                let mut occurrences = 0usize;
-                for slot in slots {
-                    occurrences += usize::from(slot == key);
+            let layout = graph.nodes()[id.index()].output_layout();
+            let slots = layout.slots();
+            let requirement = declarations.get(id).copied();
+            if requirement != Some((input.role, input.delivery))
+                || (input.role != crate::ProgramOutputRole::Relational
+                    && input.delivery
+                        != novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain)
+            {
+                return Err(LocalProgramCompileError::ExchangeInputMismatch(*id));
+            }
+            let valid_routing = match input.routing {
+                CompiledExchangeRouting::Unpartitioned | CompiledExchangeRouting::RoundRobin => {
+                    input.hash_partition_slots.is_empty()
+                }
+                CompiledExchangeRouting::Hash { algorithm } => {
+                    !input.hash_partition_slots.is_empty()
+                        && matches!(
+                        algorithm,
+                        novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1
+                            | novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1
+                    )
+                }
+                CompiledExchangeRouting::BucketShuffle { algorithm } => {
+                    !input.hash_partition_slots.is_empty()
+                        && algorithm
+                            == novarocks_type_contract::PartitionHashAlgorithm::NativeBucketCrc32V1
+                }
+                CompiledExchangeRouting::ConditionalKey { applies, algorithm } => {
+                    let mut ordinal = None;
+                    for (index, slot) in slots.iter().enumerate() {
+                        if *slot == applies {
+                            ordinal = Some(index);
+                        }
+                        work.step().map_err(LocalProgramCompileError::Control)?;
+                    }
+                    !input.hash_partition_slots.is_empty()
+                        && algorithm
+                            == novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1
+                        && ordinal.is_some_and(|i| {
+                            layout.schema().field(i).data_type() == &arrow_schema::DataType::Boolean
+                        })
+                }
+            };
+            work.step().map_err(LocalProgramCompileError::Control)?;
+            if !valid_routing {
+                return Err(LocalProgramCompileError::ExchangeInputMismatch(*id));
+            }
+            let algorithm = match input.routing {
+                CompiledExchangeRouting::Hash { algorithm }
+                | CompiledExchangeRouting::ConditionalKey { algorithm, .. }
+                | CompiledExchangeRouting::BucketShuffle { algorithm } => Some(algorithm),
+                _ => None,
+            };
+            if input.role == crate::ProgramOutputRole::LogicalSummary {
+                let mut valid = slots.len() == 3
+                    && matches!(input.routing, CompiledExchangeRouting::Unpartitioned);
+                for field in layout.schema().fields() {
+                    valid &=
+                        field.data_type() == &arrow_schema::DataType::Int64 && !field.is_nullable();
                     work.step().map_err(LocalProgramCompileError::Control)?;
                 }
-                if occurrences != 1 {
+                if !valid {
+                    return Err(LocalProgramCompileError::ExchangeInputMismatch(*id));
+                }
+            }
+            for key in &input.hash_partition_slots {
+                let mut occurrences = 0usize;
+                let mut supported = false;
+                for (ordinal, slot) in slots.iter().enumerate() {
+                    if slot == key {
+                        occurrences += 1;
+                        supported = algorithm.is_some_and(|algorithm| {
+                            algorithm
+                                .supports_partition_key(layout.schema().field(ordinal).data_type())
+                        });
+                    }
+                    work.step().map_err(LocalProgramCompileError::Control)?;
+                }
+                if occurrences != 1 || !supported {
                     return Err(LocalProgramCompileError::ExchangeInputMismatch(*id));
                 }
             }

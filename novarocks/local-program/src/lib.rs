@@ -48,8 +48,8 @@ mod values;
 mod writer_preparation;
 
 pub use compiled::{
-    CompiledAggregate, CompiledAggregateGrouping, CompiledExchangeInput, CompiledProgramFacts,
-    CompiledScanInput, LocalProgram, LocalProgramCompileError,
+    CompiledAggregate, CompiledAggregateGrouping, CompiledExchangeInput, CompiledExchangeRouting,
+    CompiledProgramFacts, CompiledScanInput, LocalProgram, LocalProgramCompileError,
 };
 pub use compiled_origins::CompiledOriginsError;
 pub use contract::{
@@ -73,7 +73,7 @@ pub use novarocks_connector_contract::{
 };
 // The partition vocabulary of `StaticStreamBranch`, re-exported so a compiler
 // can author a stream sink without a second execution-contract dependency.
-pub use novarocks_execution_contract::DataStreamPartitionType;
+pub use novarocks_execution_contract::{DataStreamPartitionType, ExchangeDeliveryRequirement};
 pub use primitives::{
     ProgramComparisonSite, ProgramPrimitiveError, prepare_arithmetic_node, prepare_cast_node,
     prepare_comparison_node, prepare_native_bitnot_node, prepare_native_negate_node,
@@ -87,14 +87,14 @@ pub use program::{
     ChangeEventSpec, FilterConsumerAtExpr, FilterConsumerAtJoinKey, FilterProducerAtExpr,
     JoinDistributionMode, JoinType, LocalProgramError, LocalProgramGraph,
     MAX_PROGRAM_EXPANDED_OCCURRENCES, MAX_PROGRAM_NODE_DEPTH, MAX_PROGRAM_NODES,
-    NestedLoopJoinType, ProgramCompileError, ProgramNode, ProgramNodeKind, ProgramScanSource,
-    ProjectExpressionSlot, ProjectExpressionSlots, RowAssertion, SetOpKind, SortExpression,
-    SortTopNType, StaticAggregateCall, StaticAggregateOrder, StaticAggregateTypeSignature,
-    StaticWindowFunction, StaticWriterProjection, StreamingPreaggregationMode,
-    TableFunctionOutputSlot, UnpivotConstant, UnpivotMapping, UnpivotPassthrough, WindowBoundary,
-    WindowFrame, WindowFunctionKind, WindowType, WriterFinalAggregateCall,
-    WriterFinalAggregatePlan, WriterGroupedUnpivotMapping, WriterGroupedUnpivotPlan,
-    WriterPartialAggregateCall,
+    NestedLoopJoinType, ProgramAssertionApplicability, ProgramCompileError, ProgramNode,
+    ProgramNodeKind, ProgramScanSource, ProjectExpressionSlot, ProjectExpressionSlots,
+    RowAssertion, SetOpKind, SortExpression, SortTopNType, StaticAggregateCall,
+    StaticAggregateOrder, StaticAggregateTypeSignature, StaticWindowFunction,
+    StaticWriterProjection, StreamingPreaggregationMode, TableFunctionOutputSlot, UnpivotConstant,
+    UnpivotMapping, UnpivotPassthrough, WindowBoundary, WindowFrame, WindowFunctionKind,
+    WindowType, WriterFinalAggregateCall, WriterFinalAggregatePlan, WriterGroupedUnpivotMapping,
+    WriterGroupedUnpivotPlan, WriterPartialAggregateCall,
 };
 pub use provenance::*;
 pub use provider_links::ProviderLinkError;
@@ -118,7 +118,8 @@ pub use runtime_filter::{
 };
 pub use sink::{
     MAX_STATIC_SINK_BRANCHES, MAX_STATIC_SINK_COLUMNS, MAX_STATIC_SINK_EXPRESSIONS,
-    SinkCompileError, StaticSinkError, StaticSinkProgram, StaticStreamBranch,
+    ProgramOutputRole, SinkCompileError, StaticRouterRoute, StaticSinkError, StaticSinkProgram,
+    StaticStreamBranch, StaticStreamContract, StaticStreamRouting,
 };
 pub use typed_channels::*;
 pub use typed_expressions::*;
@@ -134,3 +135,5 @@ pub use writer_preparation::{
 pub use novarocks_type_contract::ValueTypeRef;
 #[cfg(test)]
 mod test_value_types;
+
+pub use novarocks_result_contract::{FinishCountMode, FinishInputs, LogicalChangeCounts};

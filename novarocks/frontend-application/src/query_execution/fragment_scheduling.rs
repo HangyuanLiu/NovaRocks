@@ -62,8 +62,9 @@ pub struct SchedulingScanFacts {
 }
 
 /// One fragment, as scheduling sees it.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SchedulingFragmentFacts {
+    pub placement: novarocks_physical_plan::StagePlacementPolicy,
     pub scans: Vec<SchedulingScanFacts>,
 }
 
@@ -131,6 +132,7 @@ impl FragmentSchedulingFacts {
                 .map(|(&fragment_id, fragment)| {
                     Ok(QueryApplicationFragmentSchedulingFacts {
                         fragment_id,
+                        placement: fragment.placement.clone(),
                         scans: fragment
                             .scans
                             .iter()

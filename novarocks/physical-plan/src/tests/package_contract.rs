@@ -452,7 +452,12 @@ fn binary_control_fixture() -> (Fragment, PhysicalRootUses, ExprId, ExprId, Expr
         })
         .unwrap();
     let fragment = builder
-        .finish_definition(node, FragmentSink::Noop, dop())
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let domain = EvaluationDomainId::new(0);
     let invocation = |id, definition, arguments| ExpressionInvocation {
@@ -567,6 +572,7 @@ fn package_rechecks_ordered_children_intrinsic_control_and_roots_with_reused_ids
             }
         };
         let changed = Fragment::from(FragmentParts {
+            stage_placement: crate::StagePlacementPolicy::Singleton,
             id: original.id(),
             root: original.root(),
             values,
@@ -683,6 +689,7 @@ fn package_control_checks_correspondence_without_claiming_literal_content_identi
     literal.kind = ExprKind::Literal(LiteralValue::Int64(22));
     expressions.insert(literal);
     let changed = Fragment::from(FragmentParts {
+        stage_placement: crate::StagePlacementPolicy::Singleton,
         id: original.id(),
         root: original.root(),
         values: original.values().clone(),
@@ -738,6 +745,7 @@ fn package_preserves_actual_case_branch_guards_and_root_occurrences() {
     values.get_mut(&outputs[0]).unwrap().ty = ty(DataType::Int64, true);
     values.get_mut(&outputs[1]).unwrap().ty = ty(DataType::Boolean, false);
     let fragment = Fragment::from(FragmentParts {
+        stage_placement: crate::StagePlacementPolicy::Singleton,
         id: original.id(),
         root: node,
         values,
@@ -1402,6 +1410,7 @@ fn duplicate_scan_payloads_keep_runtime_filter_assignment_occurrences() {
         field: first_field,
     };
     let fragment = Fragment::from(crate::plan::FragmentParts {
+        stage_placement: fragment.stage_placement().clone(),
         id: fragment.id(),
         root: fragment.root(),
         nodes,
@@ -1572,7 +1581,12 @@ fn parameter_occurrences_fragment(reference: SemanticParameterRef, occurrences: 
         })
         .unwrap();
     builder
-        .finish_definition(node, FragmentSink::Noop, dop())
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap()
         // The exact zero-argument fixture's own original request. No selected
         // result or runtime occurrence is used to reconstruct this author.
@@ -2204,6 +2218,7 @@ fn writer_package_separates_declared_value_binding_from_provider_dictionary_fact
     let value = values.get_mut(&input_value).unwrap();
     value.ty = ValueType::new(nested_type(1), value.ty.nullable());
     let fragment = Fragment::from(crate::plan::FragmentParts {
+        stage_placement: crate::StagePlacementPolicy::Singleton,
         id: original.id(),
         root: original.root(),
         values,
@@ -2367,6 +2382,7 @@ fn intrinsic_package_fixture() -> FragmentPackageInput {
                 max: 1,
                 requires_power_of_two: false,
             },
+            crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let domain = EvaluationDomainId::new(0);
@@ -2587,6 +2603,7 @@ fn intrinsic_operator_profiles_refuse_missing_extra_or_foreign_key_refs() {
         assert_eq!(id, expression.id);
         expressions.insert(expression);
         let fragment = Fragment::from(FragmentParts {
+            stage_placement: crate::StagePlacementPolicy::Singleton,
             id: input.fragment.id(),
             root: input.fragment.root(),
             values: input.fragment.values().clone(),
@@ -2651,6 +2668,7 @@ fn parameter_free_actual_definitions_keep_original_control_at_every_package_boun
                 max: 1,
                 requires_power_of_two: false,
             },
+            crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let input = package_input(fragment);

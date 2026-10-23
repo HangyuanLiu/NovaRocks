@@ -18,7 +18,7 @@
 //! Flat, checked local-program graph. Every edge names a prior node, so neither
 //! construction nor Drop recursively owns the plan tree.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -60,6 +60,12 @@ pub enum RowAssertion {
     Ge,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramAssertionApplicability {
+    AllRows,
+    WhenTrue(SlotId),
+}
+
 #[derive(Clone, Debug)]
 pub enum AssertRowsMode {
     Global {
@@ -68,6 +74,7 @@ pub enum AssertRowsMode {
         subquery_string: Option<Arc<str>>,
     },
     PerKeyAtMostOne {
+        applicability: ProgramAssertionApplicability,
         key_slots: Vec<SlotId>,
         key_labels: Vec<Arc<str>>,
         message_prefix: Arc<str>,
@@ -574,6 +581,9 @@ pub enum ProgramNodeKind {
         partial_preparation: Option<crate::PreparedWriterAggregateCalls>,
     },
     TableFinish {
+        count_mode: novarocks_result_contract::FinishCountMode,
+        input_roles: novarocks_result_contract::FinishInputs,
+        logical_summary_layout: Option<StaticLayout>,
         inputs: Vec<ProgramNodeId>,
         expected_targets: Vec<WriteTargetOrdinal>,
         writer_multiplex_layout: StaticLayout,
@@ -1344,6 +1354,7 @@ impl LocalProgramGraph {
         let mut required_writers = BTreeSet::new();
         let mut required_finishes = BTreeSet::new();
         let mut required_filters = BTreeSet::new();
+        let mut summary_consumers = BTreeMap::new();
         for requirement in requirements.entries() {
             // The iterator yielded this exact requirement. Its lookup,
             // comparison and insertion work is observed separately below.
@@ -1379,7 +1390,13 @@ impl LocalProgramGraph {
                     required_filters.insert(*binding_id);
                     work.step()?;
                 }
-                BindingRequirement::ExchangeInput { node, layout } => {
+                BindingRequirement::ExchangeInput {
+                    node,
+                    layout,
+                    role,
+                    delivery,
+                    ..
+                } => {
                     check_node_layout(
                         &nodes,
                         *node,
@@ -1387,6 +1404,15 @@ impl LocalProgramGraph {
                         |kind| matches!(kind, ProgramNodeKind::ExchangeSource { .. }),
                         work,
                     )?;
+                    if *role != crate::ProgramOutputRole::Relational
+                        && *delivery
+                            != novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+                    {
+                        return Err(LocalProgramError::InvalidRequirement.into());
+                    }
+                    if *role == crate::ProgramOutputRole::LogicalSummary {
+                        summary_consumers.insert(*node, false);
+                    }
                     required_exchanges.insert(node.index());
                     work.step()?;
                 }
@@ -1418,6 +1444,24 @@ impl LocalProgramGraph {
             }
         }
         for (index, node) in nodes.iter().enumerate() {
+            if let ProgramNodeKind::TableFinish {
+                input_roles,
+                inputs,
+                ..
+            } = &node.kind
+            {
+                if let Some(port) = input_roles.logical_summary {
+                    let source = inputs
+                        .get(port as usize)
+                        .ok_or(LocalProgramError::InvalidRequirement)?;
+                    let used = summary_consumers
+                        .get_mut(source)
+                        .ok_or(LocalProgramError::InvalidRequirement)?;
+                    if std::mem::replace(used, true) {
+                        return Err(LocalProgramError::InvalidRequirement.into());
+                    }
+                }
+            }
             let required = match &node.kind {
                 ProgramNodeKind::Scan { .. } => required_scans.contains(&index),
                 ProgramNodeKind::ExchangeSource { .. } => required_exchanges.contains(&index),
@@ -1435,6 +1479,12 @@ impl LocalProgramGraph {
                 if !present {
                     return Err(LocalProgramError::InvalidRequirement.into());
                 }
+            }
+        }
+        for used in summary_consumers.values() {
+            work.step()?;
+            if !used {
+                return Err(LocalProgramError::InvalidRequirement.into());
             }
         }
         if let Some(sink) = &sink {
@@ -1464,7 +1514,8 @@ impl LocalProgramGraph {
                 }
                 StaticSinkProgram::DataStream { .. }
                 | StaticSinkProgram::MultiCastDataStream { .. }
-                | StaticSinkProgram::SplitDataStream { .. } => {
+                | StaticSinkProgram::SplitDataStream { .. }
+                | StaticSinkProgram::ChangeStreamRouter { .. } => {
                     if result_count != 0 {
                         return Err(LocalProgramError::InvalidSink.into());
                     }
@@ -1534,18 +1585,86 @@ impl LocalProgramGraph {
                     return Err(LocalProgramError::InvalidSink.into());
                 }
             }
+            if let StaticSinkProgram::ChangeStreamRouter {
+                effect_slot,
+                summary_layout,
+                ..
+            } = sink
+            {
+                let root_layout = &nodes[root.index()].output_layout;
+                let mut ordinal = None;
+                for (index, slot) in root_layout.slots().iter().enumerate() {
+                    if slot == effect_slot {
+                        ordinal = Some(index);
+                    }
+                    work.step()?;
+                }
+                let ordinal = ordinal.ok_or(LocalProgramError::InvalidSink)?;
+                let field = root_layout.schema().field(ordinal);
+                if field.data_type() != &arrow_schema::DataType::Int8 || field.is_nullable() {
+                    return Err(LocalProgramError::InvalidSink.into());
+                }
+                for branch in sink.branches() {
+                    if matches!(
+                        branch.contract().role,
+                        crate::ProgramOutputRole::ProviderRoute { .. }
+                    ) {
+                        let mut includes_effect = branch.output_columns().is_empty();
+                        for slot in branch.output_columns() {
+                            includes_effect |= slot == effect_slot;
+                            work.step()?;
+                        }
+                        if includes_effect {
+                            return Err(LocalProgramError::InvalidSink.into());
+                        }
+                    }
+                    work.step()?;
+                }
+                for slot in summary_layout.slots() {
+                    let mut independent = true;
+                    for root_slot in root_layout.slots() {
+                        independent &= root_slot != slot;
+                        work.step()?;
+                    }
+                    if !independent {
+                        return Err(LocalProgramError::InvalidSink.into());
+                    }
+                }
+            }
             for requirement in requirements.entries() {
                 // Account the completed iteration before optional field work.
                 work.step()?;
-                if let BindingRequirement::ExchangeOutput { branch, layout } = requirement {
-                    let branch = sink.branches().get(*branch);
+                if let BindingRequirement::ExchangeOutput {
+                    branch: branch_index,
+                    layout,
+                    role,
+                    delivery,
+                    ..
+                } = requirement
+                {
+                    let branch = sink.branches().get(*branch_index);
                     work.step()?;
                     let branch = branch.ok_or(LocalProgramError::InvalidSink)?;
-                    if !work.projection_matches(
-                        &nodes[root.index()].output_layout,
-                        branch.output_columns(),
-                        layout,
-                    )? {
+                    if branch.contract().role != *role || branch.contract().delivery != *delivery {
+                        return Err(LocalProgramError::InvalidSink.into());
+                    }
+                    if *role == crate::ProgramOutputRole::LogicalSummary
+                        && !matches!(sink, StaticSinkProgram::ChangeStreamRouter { summary_branch, .. }
+                            if usize::try_from(*summary_branch).ok() == Some(*branch_index))
+                    {
+                        return Err(LocalProgramError::InvalidSink.into());
+                    }
+                    let source_layout = match sink {
+                        StaticSinkProgram::ChangeStreamRouter {
+                            summary_branch,
+                            summary_layout,
+                            ..
+                        } if usize::try_from(*summary_branch).ok() == Some(*branch_index) => {
+                            summary_layout
+                        }
+                        _ => &nodes[root.index()].output_layout,
+                    };
+                    if !work.projection_matches(source_layout, branch.output_columns(), layout)? {
                         return Err(LocalProgramError::InvalidSink.into());
                     }
                 }
@@ -1686,6 +1805,48 @@ fn validate_relationships(
     work: &mut ProgramWork<'_>,
 ) -> Result<(), ProgramCompileError> {
     match &node.kind {
+        ProgramNodeKind::AssertNumRows { input, mode } => {
+            if !layout_matches(nodes, *input, &node.output_layout, work)? {
+                return Err(LocalProgramError::LayoutMismatch.into());
+            }
+            if let AssertRowsMode::PerKeyAtMostOne {
+                applicability,
+                key_slots,
+                key_labels,
+                message_prefix,
+            } = mode
+            {
+                if key_slots.is_empty()
+                    || key_slots.len() != key_labels.len()
+                    || message_prefix.is_empty()
+                    || key_labels.iter().any(|label| label.is_empty())
+                {
+                    return Err(LocalProgramError::InvalidNodeShape.into());
+                }
+                let layout = nodes[input.index()].output_layout();
+                for key in key_slots {
+                    let mut present = false;
+                    for slot in layout.slots() {
+                        present |= key == slot;
+                        work.step()?;
+                    }
+                    if !present {
+                        return Err(LocalProgramError::LayoutMismatch.into());
+                    }
+                }
+                if let ProgramAssertionApplicability::WhenTrue(mask) = applicability {
+                    let mut valid = false;
+                    for (ordinal, slot) in layout.slots().iter().enumerate() {
+                        valid |= slot == mask
+                            && layout.schema().field(ordinal).data_type() == &DataType::Boolean;
+                        work.step()?;
+                    }
+                    if !valid {
+                        return Err(LocalProgramError::LayoutMismatch.into());
+                    }
+                }
+            }
+        }
         ProgramNodeKind::Join {
             left,
             right,
@@ -1728,12 +1889,23 @@ fn validate_relationships(
         }
         ProgramNodeKind::TableFinish {
             inputs,
+            input_roles,
+            logical_summary_layout,
             writer_multiplex_layout,
             root_result_layout,
             ..
         } => {
-            for input in inputs {
-                let matches = layout_matches(nodes, *input, writer_multiplex_layout, work)?;
+            for (ordinal, input) in inputs.iter().enumerate() {
+                let expected = if ordinal == input_roles.writer_results as usize {
+                    writer_multiplex_layout
+                } else if Some(ordinal as u32) == input_roles.logical_summary {
+                    logical_summary_layout
+                        .as_ref()
+                        .ok_or(LocalProgramError::InvalidNodeShape)?
+                } else {
+                    return Err(LocalProgramError::InvalidNodeShape.into());
+                };
+                let matches = layout_matches(nodes, *input, expected, work)?;
                 work.step()?;
                 if !matches {
                     return Err(LocalProgramError::LayoutMismatch.into());
@@ -1981,6 +2153,9 @@ fn validate_shape(
         }
         ProgramNodeKind::TableFinish {
             inputs,
+            count_mode,
+            input_roles,
+            logical_summary_layout,
             expected_targets,
             final_aggregates,
             ..
@@ -1990,7 +2165,26 @@ fn validate_shape(
                 unique_targets.insert(*target);
                 work.step()?;
             }
-            let bad = inputs.is_empty()
+            let logical = *count_mode == novarocks_result_contract::FinishCountMode::LogicalChanges;
+            let roles_valid = input_roles.writer_results < inputs.len() as u32
+                && input_roles.logical_summary.is_some() == logical
+                && logical_summary_layout.is_some() == logical
+                && inputs.len() == if logical { 2 } else { 1 }
+                && input_roles.logical_summary.is_none_or(|port| {
+                    port < inputs.len() as u32 && port != input_roles.writer_results
+                });
+            if let Some(summary) = logical_summary_layout {
+                let valid =
+                    summary.schema().fields().len() == 3
+                        && summary.schema().fields().iter().all(|field| {
+                            !field.is_nullable() && field.data_type() == &DataType::Int64
+                        });
+                work.step()?;
+                if !valid {
+                    return Err(LocalProgramError::InvalidNodeShape.into());
+                }
+            }
+            let bad = !roles_valid
                 || expected_targets.is_empty()
                 || unique_targets.len() != expected_targets.len()
                 || final_aggregates.unpivot.as_ref().is_some_and(|unpivot| {
@@ -2135,6 +2329,12 @@ mod tests {
                     ProgramNode::new(
                         2,
                         ProgramNodeKind::TableFinish {
+                            count_mode: novarocks_result_contract::FinishCountMode::WriterReported,
+                            input_roles: novarocks_result_contract::FinishInputs {
+                                writer_results: 0,
+                                logical_summary: None,
+                            },
+                            logical_summary_layout: None,
                             inputs: vec![ProgramNodeId::new(0)],
                             expected_targets: vec![WriteTargetOrdinal::try_new(0).unwrap()],
                             writer_multiplex_layout: layout.clone(),
@@ -2487,6 +2687,12 @@ mod tests {
                 vec![],
                 vec![SlotId::new(1)],
                 None,
+                crate::StaticStreamContract {
+                    role: crate::ProgramOutputRole::Relational,
+                    delivery:
+                        novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                    routing: crate::StaticStreamRouting::Ordinary,
+                },
             )
             .unwrap(),
             Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap()),
@@ -2612,6 +2818,9 @@ mod tests {
             profile(&layout),
             BindingRequirements::try_new(vec![
                 BindingRequirement::ExchangeInput {
+                    role: crate::ProgramOutputRole::Relational,
+                    delivery:
+                        novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
                     node: ProgramNodeId::new(0),
                     layout: layout.clone(),
                 },
@@ -2843,6 +3052,12 @@ mod tests {
                 vec![],
                 vec![SlotId::new(1)],
                 None,
+                crate::StaticStreamContract {
+                    role: crate::ProgramOutputRole::Relational,
+                    delivery:
+                        novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                    routing: crate::StaticStreamRouting::Ordinary,
+                },
             )
             .unwrap(),
             source.expressions().clone(),
@@ -2850,10 +3065,17 @@ mod tests {
         .unwrap();
         let requirements = BindingRequirements::try_new(vec![
             BindingRequirement::ExchangeInput {
+                role: crate::ProgramOutputRole::Relational,
+                delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
                 node: ProgramNodeId::new(0),
                 layout: layout.clone(),
             },
-            BindingRequirement::ExchangeOutput { branch: 0, layout },
+            BindingRequirement::ExchangeOutput {
+                role: crate::ProgramOutputRole::Relational,
+                delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                branch: 0,
+                layout,
+            },
         ])
         .unwrap();
         let control = OriginalControl::default();
@@ -2887,6 +3109,9 @@ mod tests {
                 source.expressions().clone(),
                 source.profile(),
                 BindingRequirements::try_new(vec![BindingRequirement::ExchangeInput {
+                    role: crate::ProgramOutputRole::Relational,
+                    delivery:
+                        novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
                     node: ProgramNodeId::new(0),
                     layout: source.nodes()[0].output_layout().clone(),
                 }])
@@ -2913,3 +3138,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "program/stream_contract_tests.rs"]
+mod stream_contract_tests;

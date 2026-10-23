@@ -207,6 +207,7 @@ pub(crate) fn lower_final_physical_write_plan(
     visitor.unstatable_runtime_filters = unstatable_runtime_filters(plan, &mut visitor.work)?;
     let source = visitor.lower_node(plan)?;
     let sequences = visitor.allocate_writer_aggregate_sequences(auxiliary)?;
+    let finish_count_mode = write.finish_count_mode;
     let writer = visitor.lower_table_writer(
         source,
         write,
@@ -216,7 +217,13 @@ pub(crate) fn lower_final_physical_write_plan(
         targets.take(write_target_ordinal).map_err(invalid_write)?,
     )?;
     targets.ensure_consumed().map_err(invalid_write)?;
-    visitor.lower_single_writer_finish(writer, write_target_ordinal, auxiliary, &sequences)
+    visitor.lower_single_writer_finish(
+        writer,
+        write_target_ordinal,
+        auxiliary,
+        &sequences,
+        finish_count_mode,
+    )
 }
 
 pub(crate) struct FinalChangeStreamWriteLowering<'a> {
@@ -263,10 +270,17 @@ pub(crate) fn lower_final_change_stream_write_plan(
     visitor.unstatable_runtime_filters = unstatable_runtime_filters(plan, &mut visitor.work)?;
     let source = visitor.lower_node(plan)?;
     let sequences = visitor.allocate_writer_aggregate_sequences(auxiliary)?;
-    let (writers, ordinals) =
+    let (writers, ordinals, summary) =
         visitor.lower_change_stream_writers(source, dag, auxiliary, &sequences, &mut targets)?;
     targets.ensure_consumed().map_err(invalid_write)?;
-    visitor.lower_writer_finish(writers, ordinals, auxiliary, &sequences)
+    visitor.lower_writer_finish(
+        writers,
+        ordinals,
+        auxiliary,
+        &sequences,
+        Some(summary),
+        novarocks_physical_plan::FinishCountMode::LogicalChanges,
+    )
 }
 
 fn lower_final_physical_plan_inner(
@@ -2018,6 +2032,26 @@ impl<'a> ContractLoweringVisitor<'a> {
         let result: Result<Option<SemanticParameters>, ContractLoweringError> = (|| {
             self.plan_builder.set_result_port(result_port)?;
             self.attach_runtime_filter_endpoints()?;
+            // Project incoming placement facts once under the original control.
+            // This temporary index is bounded by the already authored edge set.
+            let mut placement_inputs = BTreeMap::<FragmentId, (bool, BTreeSet<FragmentId>)>::new();
+            self.work.flush()?;
+            for edge in self.edges.values() {
+                self.work.step()?;
+                let input = placement_inputs
+                    .entry(edge.destination.fragment)
+                    .or_default();
+                match edge.partitioning.destination {
+                    Distribution::Singleton => input.0 = true,
+                    Distribution::Hash { .. }
+                    | Distribution::ConditionalKey { .. }
+                    | Distribution::BucketShuffle { .. } => {
+                        input.1.insert(edge.source.fragment);
+                    }
+                    _ => {}
+                }
+            }
+            self.work.flush()?;
             let mut finished_fragments = BTreeMap::new();
             for (fragment_id, builder) in std::mem::take(&mut self.fragments) {
                 self.work.step()?;
@@ -2027,7 +2061,32 @@ impl<'a> ContractLoweringVisitor<'a> {
                     },
                 )?;
                 let dop_domain = self.dop_domain;
-                let fragment = builder.finish_definition(root, sink, dop_domain)?;
+                let (has_gather, hash_sources) =
+                    placement_inputs.remove(&fragment_id).unwrap_or_default();
+                let placement =
+                    if matches!(sink, FragmentSink::Result | FragmentSink::RootResult(_))
+                        || has_gather
+                    {
+                        novarocks_physical_plan::StagePlacementPolicy::Singleton
+                    } else if builder.contains_scan() {
+                        novarocks_physical_plan::StagePlacementPolicy::ScanWork
+                    } else if hash_sources.is_empty() {
+                        novarocks_physical_plan::StagePlacementPolicy::Singleton
+                    } else {
+                        let mut sources = Vec::new();
+                        self.work.flush()?;
+                        sources
+                            .try_reserve_exact(hash_sources.len())
+                            .map_err(|_| CompileControlError::ResourceExhausted)?;
+                        for source in hash_sources {
+                            self.work.step()?;
+                            sources.push(source);
+                        }
+                        novarocks_physical_plan::StagePlacementPolicy::FollowSources {
+                            sources: sources.into_boxed_slice(),
+                        }
+                    };
+                let fragment = builder.finish_definition(root, sink, dop_domain, placement)?;
                 finished_fragments.insert(fragment_id, fragment);
             }
             if let Some((&fragment, _)) = self.completions.first_key_value() {
@@ -2735,9 +2794,12 @@ impl<'a> ContractLoweringVisitor<'a> {
             .expect("the exchange source was just inserted")
             .clone();
         let edge_contract = Edge {
+            role: novarocks_physical_plan::OutputRole::Relational,
+            delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
             id: edge,
             kind: EdgeKind::CteMulticast,
             source: EdgeSource {
+                port: novarocks_physical_plan::FragmentOutputPort::Root,
                 fragment: producer_fragment,
                 projection: projection.into_boxed_slice(),
             },
@@ -3779,7 +3841,14 @@ impl<'a> ContractLoweringVisitor<'a> {
         auxiliary: &WriterAuxiliaryPlan,
         sequences: &BTreeMap<u32, AggregateSequenceId>,
         targets: &mut FinalizedWriteTargetSet,
-    ) -> Result<(Vec<LoweredNode>, Box<[WriteTargetOrdinal]>), ContractLoweringError> {
+    ) -> Result<
+        (
+            Vec<LoweredNode>,
+            Box<[WriteTargetOrdinal]>,
+            (FragmentId, novarocks_physical_plan::LogicalSummaryOutput),
+        ),
+        ContractLoweringError,
+    > {
         let effect = source
             .output
             .get(dag.effect_output_ordinal)
@@ -3857,18 +3926,55 @@ impl<'a> ContractLoweringVisitor<'a> {
                     "change-stream route token order differs from its writer target".into(),
                 ));
             }
-            let partition_sources = route
-                .partition_input_positions
-                .iter()
-                .map(|position| {
-                    projection.get(*position).copied().ok_or_else(|| {
+            route
+                .requirements
+                .validate()
+                .map_err(|error| invalid_write(error.to_string()))?;
+            let map_tokens = |tokens: &[novarocks_spi::connector::ConnectorWriteFieldToken],
+                              work: &mut CompileCheckpoints<'_>|
+             -> Result<Vec<ValueId>, ContractLoweringError> {
+                let mut values = Vec::new();
+                work.flush()?;
+                values
+                    .try_reserve_exact(tokens.len())
+                    .map_err(|_| CompileControlError::ResourceExhausted)?;
+                for token in tokens {
+                    let mut found = None;
+                    for (actual, value) in &route_mapping {
+                        work.step()?;
+                        if actual == token {
+                            found = Some(*value);
+                            break;
+                        }
+                    }
+                    values.push(found.ok_or_else(|| {
                         invalid_write(
-                            "change-stream partition input position is outside the route input"
+                            "write requirement token is absent from the exact route input mapping"
                                 .into(),
                         )
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                    })?);
+                }
+                Ok(values)
+            };
+            let colocation = match &route.requirements.colocation {
+                novarocks_spi::connector::write_stack::ConnectorWriteColocation::None => {
+                    novarocks_physical_plan::WriteColocation::None
+                }
+                novarocks_spi::connector::write_stack::ConnectorWriteColocation::Singleton => {
+                    novarocks_physical_plan::WriteColocation::Singleton
+                }
+                novarocks_spi::connector::write_stack::ConnectorWriteColocation::ByKey(tokens) => {
+                    novarocks_physical_plan::WriteColocation::ByKey(
+                        map_tokens(tokens, &mut self.work)?.into_boxed_slice(),
+                    )
+                }
+            };
+            let layout = match &route.requirements.layout {
+                novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None => novarocks_physical_plan::WriteLayoutPreference::None,
+                novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::ClusterBy(tokens) => novarocks_physical_plan::WriteLayoutPreference::ClusterBy(map_tokens(tokens, &mut self.work)?.into_boxed_slice()),
+            };
+            let requirements =
+                novarocks_physical_plan::WriteRouteRequirements { colocation, layout };
 
             self.current_fragment = writer_fragment;
             let receiver = self.fragment_mut().reserve_node_id()?;
@@ -3896,32 +4002,53 @@ impl<'a> ContractLoweringVisitor<'a> {
                 imports.push((source_value, destination));
                 imported.push(destination);
             }
-            let (source_distribution, destination_distribution) = if partition_sources.is_empty() {
-                (Distribution::Singleton, Distribution::Singleton)
-            } else {
-                let scheme = self.allocate_hash_scheme()?;
-                let destination_keys = route
-                    .partition_input_positions
-                    .iter()
-                    .map(|position| {
-                        imported.get(*position).copied().ok_or_else(|| {
-                            invalid_write(
-                                "change-stream partition import position is outside the route input"
-                                    .into(),
-                            )
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                (
-                    Distribution::Hash {
-                        keys: partition_sources.clone().into_boxed_slice(),
-                        scheme: scheme.clone(),
-                    },
-                    Distribution::Hash {
-                        keys: destination_keys.into_boxed_slice(),
-                        scheme,
-                    },
-                )
+            let (source_distribution, destination_distribution) = match &requirements.colocation {
+                novarocks_physical_plan::WriteColocation::None => {
+                    (Distribution::RoundRobin, Distribution::RoundRobin)
+                }
+                novarocks_physical_plan::WriteColocation::Singleton => {
+                    (Distribution::Singleton, Distribution::Singleton)
+                }
+                novarocks_physical_plan::WriteColocation::ByKey(keys) => {
+                    let mut scheme = self.allocate_hash_scheme()?;
+                    scheme.definition.algorithm =
+                        novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1;
+                    // Writer instance counts are independent of pipeline DOP.
+                    scheme.count.admissible = PartitionCountDomain {
+                        min: 1,
+                        max: novarocks_physical_plan::MAX_PARTITION_COUNT,
+                        requires_power_of_two: false,
+                    };
+                    let writer_bytes = writer_fragment.get().to_be_bytes();
+                    scheme.space = PartitionSpaceId::try_new(partition_identity_digest(
+                        b"novarocks.uea5.partition-space.v1",
+                        self.plan_version,
+                        &[b"sql-write-hierarchical-v1", &writer_bytes],
+                    ))
+                    .map_err(|error| invalid_write(error.to_string()))?;
+                    scheme.count.id =
+                        PartitionCountParameterId::try_new(partition_identity_digest(
+                            b"novarocks.uea5.partition-count.v1",
+                            self.plan_version,
+                            &[b"sql-write-hierarchical-v1", &writer_bytes],
+                        ))
+                        .map_err(|error| invalid_write(error.to_string()))?;
+                    let destination_keys = keys.iter().map(|key| {
+                        self.work.step()?;
+                        source_to_import.get(key).map(|(value, _)| *value)
+                            .ok_or_else(|| invalid_write("write colocation value is absent from the exact exchange mapping".into()))
+                    }).collect::<Result<Vec<_>, _>>()?;
+                    (
+                        Distribution::Hash {
+                            keys: keys.clone(),
+                            scheme: scheme.clone(),
+                        },
+                        Distribution::Hash {
+                            keys: destination_keys.into_boxed_slice(),
+                            scheme,
+                        },
+                    )
+                }
             };
             self.fragment_mut().add_exchange_source(
                 receiver,
@@ -3938,8 +4065,13 @@ impl<'a> ContractLoweringVisitor<'a> {
                 .clone();
             let edge_contract = Edge {
                 id: edge,
+                role: novarocks_physical_plan::OutputRole::ProviderRoute {
+                    target: route.write_target_ordinal,
+                },
+                delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
                 kind: EdgeKind::ChangeStreamRouter,
                 source: EdgeSource {
+                    port: novarocks_physical_plan::FragmentOutputPort::Root,
                     fragment: source_fragment,
                     projection: projection.clone().into_boxed_slice(),
                 },
@@ -3965,7 +4097,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                 write_target_ordinal: route.write_target_ordinal,
                 accepted_effects: route.accepted_effects.into_boxed_slice(),
                 input_mapping: route_mapping.into_boxed_slice(),
-                partition_by: partition_sources.into_boxed_slice(),
+                requirements,
                 edge,
             });
             let ordinal = route.write_target_ordinal;
@@ -4007,15 +4139,36 @@ impl<'a> ContractLoweringVisitor<'a> {
             ordinals.push(ordinal);
         }
         self.current_fragment = source_fragment;
+        let summary_edge = self.plan_builder.reserve_edge_id()?;
+        use novarocks_physical_plan::LogicalChangeCountField as CountField;
+        let mut count_value = |field| {
+            self.fragment_mut().add_value(
+                ValueType::new(DataType::Int64, false),
+                ValueOrigin::LogicalSummary { field },
+            )
+        };
+        let summary = novarocks_physical_plan::LogicalSummaryOutput {
+            edge: summary_edge,
+            columns: novarocks_physical_plan::LogicalSummaryColumns {
+                inserted: count_value(CountField::Inserted)?,
+                replaced: count_value(CountField::Replaced)?,
+                deleted: count_value(CountField::Deleted)?,
+            },
+        };
         self.complete_fragment(
             source_fragment,
             source.node,
             FragmentSink::Router {
+                summary,
                 effect,
                 routes: router_routes.into_boxed_slice(),
             },
         )?;
-        Ok((writers, ordinals.into_boxed_slice()))
+        Ok((
+            writers,
+            ordinals.into_boxed_slice(),
+            (source_fragment, summary),
+        ))
     }
 
     fn lower_single_writer_finish(
@@ -4024,8 +4177,16 @@ impl<'a> ContractLoweringVisitor<'a> {
         ordinal: WriteTargetOrdinal,
         auxiliary: &WriterAuxiliaryPlan,
         sequences: &BTreeMap<u32, AggregateSequenceId>,
+        count_mode: novarocks_physical_plan::FinishCountMode,
     ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
-        self.lower_writer_finish(vec![writer], Box::from([ordinal]), auxiliary, sequences)
+        self.lower_writer_finish(
+            vec![writer],
+            Box::from([ordinal]),
+            auxiliary,
+            sequences,
+            None,
+            count_mode,
+        )
     }
 
     fn lower_writer_finish(
@@ -4034,7 +4195,18 @@ impl<'a> ContractLoweringVisitor<'a> {
         ordinals: Box<[WriteTargetOrdinal]>,
         auxiliary: &WriterAuxiliaryPlan,
         sequences: &BTreeMap<u32, AggregateSequenceId>,
+        summary: Option<(FragmentId, novarocks_physical_plan::LogicalSummaryOutput)>,
+        count_mode: novarocks_physical_plan::FinishCountMode,
     ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
+        if matches!(
+            count_mode,
+            novarocks_physical_plan::FinishCountMode::LogicalChanges
+        ) != summary.is_some()
+        {
+            return Err(invalid_write(
+                "finish count mode and logical-summary input disagree".into(),
+            ));
+        }
         if writers.is_empty() || writers.len() != ordinals.len() {
             return Err(invalid_write(
                 "writer finish has no exact writer set".into(),
@@ -4104,8 +4276,11 @@ impl<'a> ContractLoweringVisitor<'a> {
             }
             let edge_contract = Edge {
                 id: edge,
+                role: novarocks_physical_plan::OutputRole::WriterResults,
+                delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
                 kind: EdgeKind::Stream,
                 source: EdgeSource {
+                    port: novarocks_physical_plan::FragmentOutputPort::Root,
                     fragment: writer.fragment,
                     projection: writer.output,
                 },
@@ -4384,13 +4559,79 @@ impl<'a> ContractLoweringVisitor<'a> {
                 },
             )
             .transpose()?;
+        let mut finish_inputs = vec![finish_input];
+        let logical_summary = if let Some((source_fragment, summary)) = summary {
+            let exchange = self.fragment_mut().reserve_node_id()?;
+            let mut imported = Vec::with_capacity(3);
+            let mut mapping = Vec::with_capacity(3);
+            for source_value in summary.columns.values() {
+                let destination = self.fragment_mut().add_value(
+                    ValueType::new(DataType::Int64, false),
+                    ValueOrigin::ExchangeImport {
+                        edge: summary.edge,
+                        source_value,
+                    },
+                )?;
+                imported.push(destination);
+                mapping.push((source_value, destination));
+                self.work.step()?;
+            }
+            self.fragment_mut().add_exchange_source(
+                exchange,
+                summary.edge,
+                mapping.clone().into_boxed_slice(),
+                imported.clone().into_boxed_slice(),
+                Distribution::Singleton,
+                RowMultiplicity::SingleCopy,
+            )?;
+            let edge = Edge {
+                id: summary.edge,
+                role: novarocks_physical_plan::OutputRole::LogicalSummary,
+                delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
+                kind: EdgeKind::Stream,
+                source: EdgeSource {
+                    fragment: source_fragment,
+                    port: novarocks_physical_plan::FragmentOutputPort::LogicalSummary,
+                    projection: summary.columns.values().into(),
+                },
+                destination: EdgeDestination {
+                    fragment: finish_fragment,
+                    node: exchange,
+                    receive_mapping: mapping.into_boxed_slice(),
+                },
+                partitioning: EdgePartitioning {
+                    source: Distribution::Singleton,
+                    destination: Distribution::Singleton,
+                    source_multiplicity: RowMultiplicity::SingleCopy,
+                    destination_multiplicity: RowMultiplicity::SingleCopy,
+                },
+            };
+            self.work.flush()?;
+            self.plan_builder.add_edge(edge.clone())?;
+            self.edges.insert(edge.id, edge);
+            self.work.step()?;
+            finish_inputs.push(exchange);
+            Some(novarocks_physical_plan::LogicalSummaryColumns {
+                inserted: imported[0],
+                replaced: imported[1],
+                deleted: imported[2],
+            })
+        } else {
+            None
+        };
         self.fragment_mut().add_row_consuming(
             finish,
-            Box::from([finish_input]),
+            finish_inputs.into_boxed_slice(),
             RequiredInputs::Singleton,
             Distribution::Singleton,
             output.clone(),
             NodeKind::TableFinish(WriterFinishSpec {
+                count_mode,
+                inputs: novarocks_physical_plan::FinishInputs {
+                    writer_results: 0,
+                    logical_summary: logical_summary.map(|_| 1),
+                },
+                logical_summary,
                 expected_target_ordinals: ordinals,
                 input_schema,
                 output_schema,
@@ -4666,9 +4907,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                 .map_err(Self::state_source_error)?;
         }
         let edge_contract = Edge {
+            role: novarocks_physical_plan::OutputRole::Relational,
+            delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
             id: edge,
             kind: EdgeKind::Stream,
             source: EdgeSource {
+                port: novarocks_physical_plan::FragmentOutputPort::Root,
                 fragment: source.fragment,
                 projection: source.output.clone(),
             },
@@ -7291,9 +7535,12 @@ impl<'a> ContractLoweringVisitor<'a> {
         require_single_copy_input("AssertOneRow", &child.properties)?;
         let spec = if assertion.group_key_column_ids.is_empty() {
             require_singleton_input("AssertOneRow", &child.properties)?;
-            if !assertion.group_key_labels.is_empty() || assertion.keyed_message_prefix.is_some() {
+            if !assertion.group_key_labels.is_empty()
+                || assertion.keyed_message_prefix.is_some()
+                || assertion.applicability_column_id.is_some()
+            {
                 return Err(ContractLoweringError::InvalidAssertion {
-                    detail: "global assertion carries keyed labels or message",
+                    detail: "global assertion carries keyed labels, message, or applicability",
                 });
             }
             let desired = assertion
@@ -7349,7 +7596,24 @@ impl<'a> ContractLoweringVisitor<'a> {
                 })
                 .collect::<Result<Vec<_>, _>>()?
                 .into_boxed_slice();
+            let applicability = match assertion.applicability_column_id {
+                None => novarocks_physical_plan::AssertionApplicability::AllRows,
+                Some(column) => {
+                    let value = child
+                        .columns
+                        .get(&column)
+                        .copied()
+                        .ok_or(ContractLoweringError::UnknownColumnReference(column))?;
+                    if self.value_declared_type(value)?.data_type() != &DataType::Boolean {
+                        return Err(ContractLoweringError::InvalidAssertion {
+                            detail: "keyed assertion applicability is not Boolean",
+                        });
+                    }
+                    novarocks_physical_plan::AssertionApplicability::WhenTrue(value)
+                }
+            };
             RowCountAssertionSpec::PerKeyAtMostOne {
+                applicability,
                 keys,
                 labels: assertion
                     .group_key_labels
@@ -11298,7 +11562,10 @@ fn distribution_colocates_columns(
             keys: distribution_keys,
             ..
         } => distribution_keys.iter().all(|key| keys.contains(key)),
-        Distribution::Unconstrained | Distribution::RoundRobin | Distribution::Broadcast => false,
+        Distribution::Unconstrained
+        | Distribution::RoundRobin
+        | Distribution::Broadcast
+        | Distribution::ConditionalKey { .. } => false,
     })
 }
 
@@ -11551,7 +11818,10 @@ fn distribution_colocates(distribution: &Distribution, keys: &[ValueId]) -> bool
             keys: distribution_keys,
             ..
         } => distribution_keys.iter().all(|key| keys.contains(key)),
-        Distribution::Unconstrained | Distribution::RoundRobin | Distribution::Broadcast => false,
+        Distribution::Unconstrained
+        | Distribution::RoundRobin
+        | Distribution::Broadcast
+        | Distribution::ConditionalKey { .. } => false,
     }
 }
 
@@ -11567,6 +11837,7 @@ fn aggregate_output_distribution(input: &PhysicalProperties, output: &[ValueId])
         | Distribution::RoundRobin
         | Distribution::Broadcast
         | Distribution::Hash { .. }
+        | Distribution::ConditionalKey { .. }
         | Distribution::BucketShuffle { .. } => Distribution::Unconstrained,
     }
 }
@@ -14088,6 +14359,19 @@ mod tests {
                 .count(),
             1
         );
+        let finish_modes = plan
+            .fragments()
+            .values()
+            .flat_map(|fragment| fragment.nodes().values())
+            .filter_map(|node| match &node.kind {
+                NodeKind::TableFinish(finish) => Some(finish.count_mode),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            finish_modes,
+            vec![novarocks_physical_plan::FinishCountMode::WriterReported]
+        );
         assert_eq!(plan.result_port().unwrap().fields.len(), 8);
     }
 
@@ -14310,7 +14594,12 @@ mod tests {
         let routes = ordinals
             .iter()
             .enumerate()
-            .map(|(index, ordinal)| ChangeStreamWriteRouteSpec {
+            .map(|(index, ordinal)| {
+                ChangeStreamWriteRouteSpec {
+            requirements: novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
+                layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
                 route_id: ConnectorWriteRouteId::from_bytes([index as u8 + 1; 32]),
                 write_target_ordinal: *ordinal,
                 accepted_effects: vec![ConnectorRowMutationEffect::Replace],
@@ -14318,6 +14607,7 @@ mod tests {
                 partition_input_positions: Vec::new(),
                 output_partition_ordinals: Vec::new(),
                 sink: simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal),
+            }
             })
             .collect();
         let auxiliary = WriterAuxiliaryPlan::without_requirements(ordinals).unwrap();
@@ -14410,6 +14700,12 @@ mod tests {
         };
         let ordinal = WriteTargetOrdinal::try_new(0).unwrap();
         let route = ChangeStreamWriteRouteSpec {
+            requirements: novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::ByKey(
+                    vec![ConnectorWriteFieldToken::from_bytes([2; 32])],
+                ),
+                layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             route_id: ConnectorWriteRouteId::from_bytes([1; 32]),
             write_target_ordinal: ordinal,
             accepted_effects: vec![ConnectorRowMutationEffect::Replace],
@@ -17860,6 +18156,7 @@ mod tests {
                 group_key_column_ids: Vec::new(),
                 group_key_labels: Vec::new(),
                 keyed_message_prefix: None,
+                applicability_column_id: None,
             }),
             children: vec![values(vec![input.clone()], vec![vec![literal_int(7)]])],
             output_columns: vec![input.clone()],
@@ -17883,6 +18180,7 @@ mod tests {
                 vec![input.column_id],
                 vec!["account_id".to_string()],
                 "duplicate mutation match",
+                None,
             )),
             children: vec![values(vec![input.clone()], vec![vec![literal_int(7)]])],
             output_columns: vec![input],
