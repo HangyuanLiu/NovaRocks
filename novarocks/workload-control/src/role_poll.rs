@@ -171,7 +171,7 @@ impl Wake for PollWake {
 // Input, frame and result are destroyed before the actual mount footer.
 struct Position<I, F: Future> {
     input: Option<(WorkOwner, I)>,
-    frame: Pin<Box<Option<F>>>,
+    frame: Option<Pin<Box<Option<F>>>>,
     output: Option<F::Output>,
     footer: Option<Footer>,
 }
@@ -313,7 +313,7 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
         for _ in 0..count {
             positions.push(Position {
                 input: None,
-                frame: Box::pin(None),
+                frame: None,
                 output: None,
                 footer: None,
             });
@@ -391,7 +391,10 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
         let position = &mut self.positions[id.0];
         if position.footer.is_some()
             || position.input.is_some()
-            || position.frame.as_ref().get_ref().is_some()
+            || position
+                .frame
+                .as_ref()
+                .is_some_and(|frame| frame.as_ref().get_ref().is_some())
             || position.output.is_some()
         {
             return Err(MountRejected {
@@ -493,7 +496,10 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
             );
             let construction = if let Some((owner, input)) = position.input.take() {
                 catch_unwind(AssertUnwindSafe(|| {
-                    position.frame.as_mut().set(Some((self.make)(owner, input)))
+                    // Materialize this original prepaid slot only on first use.
+                    // Keep the same Box through every later reset and reuse.
+                    let frame = position.frame.get_or_insert_with(|| Box::pin(None));
+                    frame.as_mut().set(Some((self.make)(owner, input)))
                 }))
             } else {
                 Ok(())
@@ -506,6 +512,8 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
                     position
                         .frame
                         .as_mut()
+                        .unwrap()
+                        .as_mut()
                         .as_pin_mut()
                         .unwrap()
                         .poll(&mut context)
@@ -517,7 +525,11 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
                 }
             }
             // All frame/input temporaries and callbacks leave before the footer.
-            let cleared = catch_unwind(AssertUnwindSafe(|| position.frame.as_mut().set(None)));
+            let cleared = catch_unwind(AssertUnwindSafe(|| {
+                if let Some(frame) = &mut position.frame {
+                    frame.as_mut().set(None);
+                }
+            }));
             let mut cleanup = cleared.err();
             if primary.is_none() {
                 primary = cleanup.take();

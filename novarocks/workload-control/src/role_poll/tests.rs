@@ -75,7 +75,6 @@ async fn original_frame_and_anchor_reuse_wait_for_output_and_silent_stale_waker_
     let root = new_root(&control);
     let observer = root.owner.retirement_observer().unwrap();
     let slot = control.inner.state.lock().unwrap().nodes[&root.owner.scope().id()].cancellation;
-    let frame = std::ptr::from_ref(bank.positions[slot.0].frame.as_ref().get_ref()) as usize;
     let anchor =
         Arc::as_ptr(&control.inner.state.lock().unwrap().cancellations.slots[slot.0].polls[0].wake)
             as usize;
@@ -86,6 +85,14 @@ async fn original_frame_and_anchor_reuse_wait_for_output_and_silent_stale_waker_
     bank.mount_owned(root.owner, input)
         .unwrap_or_else(|_| panic!("original mount must fit"));
     assert!(bank.progress_turn(budget()).is_none());
+    let frame = std::ptr::from_ref(
+        bank.positions[slot.0]
+            .frame
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .get_ref(),
+    ) as usize;
     let stale = saved.lock().unwrap().take().unwrap();
     ready.store(true, Ordering::Release);
     stale.wake_by_ref();
@@ -126,7 +133,14 @@ async fn original_frame_and_anchor_reuse_wait_for_output_and_silent_stale_waker_
     drain(&mut driver);
     assert_eq!(observer.is_reclaimed(), Ok(true));
     assert_eq!(
-        std::ptr::from_ref(bank.positions[slot.0].frame.as_ref().get_ref()) as usize,
+        std::ptr::from_ref(
+            bank.positions[slot.0]
+                .frame
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .get_ref(),
+        ) as usize,
         frame
     );
     assert_eq!(
@@ -142,6 +156,18 @@ async fn original_frame_and_anchor_reuse_wait_for_output_and_silent_stale_waker_
     bank.mount_owned(next.owner, new_input(true))
         .unwrap_or_else(|_| panic!("same original frame must be reusable"));
     drop(bank.progress_turn(NonZeroUsize::new(2).unwrap()).unwrap());
+    assert_eq!(
+        std::ptr::from_ref(
+            bank.positions[slot.0]
+                .frame
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .get_ref(),
+        ) as usize,
+        frame,
+        "the next actual Work uses the same original frame allocation"
+    );
     control.close_admission();
     drain(&mut driver);
     assert!(control.inner.state.lock().unwrap().is_drained());
@@ -344,38 +370,59 @@ async fn factory_panic_does_not_destroy_an_owner_already_received_by_its_stable_
     let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
     let mut bank = RolePollBank::install(&mut control, 0, make).unwrap();
     control.mark_ready().unwrap();
-    let root = new_root(&control);
-    let work = root.owner.scope().id();
-    root.business.release();
-    bank.mount_owned(root.owner, ())
-        .unwrap_or_else(|_| panic!("original mount"));
-    let PollCompletion::Panicked(failed) = bank.progress_turn(budget()).unwrap() else {
-        panic!("factory panic must be isolated");
-    };
-    assert_eq!(
-        failed.value().primary().downcast_ref::<&'static str>(),
-        Some(&"intentional role factory panic after original owner handoff")
-    );
-    assert!(failed.value().cleanup().is_none());
-    assert!(failed.value().output().is_none());
-    assert_eq!(held.lock().unwrap().as_ref().unwrap().scope().id(), work);
-    assert_eq!(
-        control.inner.state.lock().unwrap().nodes[&work].owner,
-        crate::OwnerState::Active
-    );
-    let owner = held.lock().unwrap().take().unwrap();
-    owner.complete();
-    assert!(
-        control
-            .inner
-            .state
-            .lock()
+    let mut original_frame = None;
+    for _ in 0..2 {
+        let root = new_root(&control);
+        let work = root.owner.scope().id();
+        let slot = control.inner.state.lock().unwrap().nodes[&work].cancellation;
+        root.business.release();
+        bank.mount_owned(root.owner, ())
+            .unwrap_or_else(|_| panic!("original mount"));
+        let PollCompletion::Panicked(failed) = bank.progress_turn(budget()).unwrap() else {
+            panic!("factory panic must be isolated");
+        };
+        assert_eq!(
+            failed.value().primary().downcast_ref::<&'static str>(),
+            Some(&"intentional role factory panic after original owner handoff")
+        );
+        let frame = bank.positions[slot.0]
+            .frame
+            .as_ref()
             .unwrap()
-            .nodes
-            .contains_key(&work),
-        "original footer is still actual custody"
-    );
-    drop(failed);
+            .as_ref()
+            .get_ref();
+        assert!(frame.is_none());
+        let address = (slot, std::ptr::from_ref(frame) as usize);
+        if let Some(first) = original_frame {
+            assert_eq!(
+                address, first,
+                "factory failure keeps the original empty frame"
+            );
+        } else {
+            original_frame = Some(address);
+        }
+        assert!(failed.value().cleanup().is_none());
+        assert!(failed.value().output().is_none());
+        assert_eq!(held.lock().unwrap().as_ref().unwrap().scope().id(), work);
+        assert_eq!(
+            control.inner.state.lock().unwrap().nodes[&work].owner,
+            crate::OwnerState::Active
+        );
+        let owner = held.lock().unwrap().take().unwrap();
+        owner.complete();
+        assert!(
+            control
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .nodes
+                .contains_key(&work),
+            "original footer is still actual custody"
+        );
+        drop(failed);
+        drain(&mut driver);
+    }
     control.close_admission();
     drain(&mut driver);
     assert!(control.inner.state.lock().unwrap().is_drained());
@@ -492,9 +539,15 @@ async fn startup_bank_exit_revokes_registration_and_allows_only_serial_reinstall
 
 #[tokio::test]
 async fn dropping_a_mounted_bank_preserves_orphaned_work_until_the_original_owner_recovers_it() {
-    let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
+    let called = Arc::new(AtomicBool::new(false));
+    let actual_called = Arc::clone(&called);
+    let make = move |owner, input| {
+        actual_called.store(true, Ordering::Release);
+        run(owner, input)
+    };
+    let roles = [PollRoleGeometry::for_factory(&make).unwrap()];
     let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
-    let mut bank = RolePollBank::install(&mut control, 0, run).unwrap();
+    let mut bank = RolePollBank::install(&mut control, 0, make).unwrap();
     let bank_observer = bank.retirement_observer();
     control.mark_ready().unwrap();
     let root = new_root(&control);
@@ -504,7 +557,16 @@ async fn dropping_a_mounted_bank_preserves_orphaned_work_until_the_original_owne
     bank.mount_owned(root.owner, new_input(true))
         .unwrap_or_else(|_| panic!("original mount"));
     // Leave the actual owner in the unpolled input cell, then destroy the bank.
+    assert!(
+        bank.positions
+            .iter()
+            .all(|position| position.frame.is_none())
+    );
     drop(bank);
+    assert!(
+        !called.load(Ordering::Acquire),
+        "unpolled teardown never constructs F"
+    );
     drain(&mut driver);
     {
         let state = control.inner.state.lock().unwrap();
@@ -1106,4 +1168,71 @@ async fn backing_exit_does_not_claim_the_registration_notification_tail_has_join
     drop(progress);
     control.close_admission();
     drain(&mut driver);
+}
+
+#[tokio::test]
+async fn prepaid_frame_materializes_only_at_first_real_use_and_stays_for_reuse() {
+    let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
+    let (mut control, _, mut driver) = prototype_profile_with_roles(8, 1, 1, 1, &roles);
+    let mut bank = RolePollBank::install(&mut control, 0, run).unwrap();
+    assert!(
+        bank.positions
+            .iter()
+            .all(|position| position.frame.is_none())
+    );
+    control.mark_ready().unwrap();
+    let root = new_root(&control);
+    let slot = control.inner.state.lock().unwrap().nodes[&root.owner.scope().id()].cancellation;
+    root.business.release();
+    bank.mount_owned(root.owner, new_input(true))
+        .unwrap_or_else(|_| panic!("original mount"));
+    assert!(
+        bank.positions
+            .iter()
+            .all(|position| position.frame.is_none())
+    );
+    let PollCompletion::Ready(output) = bank.progress_turn(budget()).unwrap() else {
+        panic!("actual ready role");
+    };
+    assert_eq!(*output.value(), 7);
+    for (index, position) in bank.positions.iter().enumerate() {
+        assert_eq!(position.frame.is_some(), index == slot.0);
+    }
+    let frame = std::ptr::from_ref(
+        bank.positions[slot.0]
+            .frame
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .get_ref(),
+    );
+    drop(output);
+    drain(&mut driver);
+    let next = new_root(&control);
+    assert_eq!(
+        control.inner.state.lock().unwrap().nodes[&next.owner.scope().id()].cancellation,
+        slot
+    );
+    next.business.release();
+    bank.mount_owned(next.owner, new_input(true))
+        .unwrap_or_else(|_| panic!("same original frame"));
+    let PollCompletion::Ready(output) = bank.progress_turn(budget()).unwrap() else {
+        panic!("actual reused role");
+    };
+    assert_eq!(*output.value(), 7);
+    assert_eq!(
+        std::ptr::from_ref(
+            bank.positions[slot.0]
+                .frame
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .get_ref(),
+        ),
+        frame
+    );
+    drop(output);
+    control.close_admission();
+    drain(&mut driver);
+    assert!(control.inner.state.lock().unwrap().is_drained());
 }
