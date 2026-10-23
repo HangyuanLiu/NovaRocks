@@ -30,6 +30,17 @@ impl RecordRef {
         index: u32::MAX,
         generation: u32::MAX,
     };
+    // Never serialized as an allocation token or resolved as a record.
+    pub(crate) const SHADOW: Self = Self {
+        index: u32::MAX - 1,
+        generation: u32::MAX,
+    };
+    pub(crate) const fn is_shadow(self) -> bool {
+        self.index == Self::SHADOW.index
+    }
+    pub(crate) const fn is_record(self) -> bool {
+        !self.is_none() && !self.is_shadow()
+    }
     pub const fn is_none(self) -> bool {
         self.index == u32::MAX
     }

@@ -88,8 +88,8 @@ impl AccountHandle {
         if self.0.control.load(crate::sync::Ordering::Acquire) != 0 {
             return Err(TeardownError::ProtectedControlOwner);
         }
-        let members = self.close_members();
         evidence.validate()?;
+        let members = self.close_members();
         // Closed membership cannot admit a new producer. Preflight every
         // captured issuing lane before any responsibility or funding handoff.
         for lane in &members.lanes {

@@ -26,16 +26,20 @@ use crate::{
 #[derive(Debug)]
 pub(crate) struct ObservationRegistry {
     pub records: Vec<Option<LaneHandle>>,
+    pub start: usize,
     pub upper: usize,
     pub cursor: usize,
     pub occupied: usize,
 }
 impl ObservationRegistry {
     pub fn new(capacity: usize) -> Self {
+        let start = super::UNATTRIBUTED_RECORDS as usize
+            + super::store::funding_record_capacity(capacity as u32) as usize;
         Self {
             records: (0..capacity).map(|_| None).collect(),
-            upper: 0,
-            cursor: 0,
+            start,
+            upper: start,
+            cursor: start,
             occupied: 0,
         }
     }
@@ -55,12 +59,15 @@ impl Shared {
         registry.upper = registry.upper.max(index + 1);
     }
     pub(crate) fn prune_observations(&self, budget: usize) {
-        let visits = budget.min(self.observation_lanes.lock().unwrap().upper);
+        let visits = {
+            let registry = self.observation_lanes.lock().unwrap();
+            budget.min(registry.upper - registry.start)
+        };
         for _ in 0..visits {
             let (index, lane) = {
                 let mut registry = self.observation_lanes.lock().unwrap();
                 if registry.cursor >= registry.upper {
-                    registry.cursor = 0;
+                    registry.cursor = registry.start;
                 }
                 let index = registry.cursor;
                 registry.cursor += 1;

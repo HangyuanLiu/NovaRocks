@@ -50,12 +50,7 @@ impl<A: GlobalAlloc> AttributingAllocator<A> {
     }
     #[inline]
     fn owner() -> RecordRef {
-        let owner = tls::effective_owner();
-        if owner.is_none() {
-            global_store().unattributed_ref(crate::lane::faults::stack_shard())
-        } else {
-            owner
-        }
+        tls::effective_owner()
     }
     #[inline]
     unsafe fn allocate(&self, layout: Layout, zeroed: bool) -> *mut u8 {

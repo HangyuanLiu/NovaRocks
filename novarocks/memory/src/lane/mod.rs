@@ -35,23 +35,53 @@ pub use slot::{SLOT_QUANTUM_BYTES, SlotCore};
 pub use store::global_store;
 pub use store::{CoverageError, MAX_RECORDS, RecordStore, StoreHandle, UNATTRIBUTED_SHARDS};
 pub use token::RecordRef;
+pub const LANE_SHARDS: usize = if cfg!(loom) { 2 } else { 16 };
+pub use store::{
+    REGION_LABELS, RecordRegion, RegionSnapshot, THREAD_ROLE_CAPACITY, UNATTRIBUTED_RECORDS,
+};
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     #[test]
     fn bounded_store_and_generation_reuse() {
-        let store = StoreHandle::owned(18);
-        let first = store.acquire(1, ResponsibilityClass::Service).unwrap();
-        let second = store.acquire(2, ResponsibilityClass::Query).unwrap();
+        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 4);
+        let first = store
+            .acquire(
+                1,
+                ResponsibilityClass::Service,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
+        let second = store
+            .acquire(
+                2,
+                ResponsibilityClass::Query,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
         assert_eq!(
-            store.acquire(3, ResponsibilityClass::Query).unwrap_err(),
-            CoverageError::RecordStoreExhausted
+            store
+                .acquire(
+                    3,
+                    ResponsibilityClass::Query,
+                    crate::lane::RecordRegion::Observation
+                )
+                .unwrap_err(),
+            CoverageError::RecordStoreExhausted {
+                region: crate::lane::RecordRegion::Observation
+            }
         );
         let old = first.reference();
         drop(first);
         assert_eq!(store.store().reclaim(1), 1);
         assert!(store.store().resolve(old).is_none());
-        let replacement = store.acquire(3, ResponsibilityClass::Query).unwrap();
+        let replacement = store
+            .acquire(
+                3,
+                ResponsibilityClass::Query,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
         let next = replacement.reference();
         assert_eq!(old.index, next.index);
         assert_eq!(old.generation + 1, next.generation);
@@ -65,8 +95,14 @@ mod tests {
     }
     #[test]
     fn draining_waits_for_negative_count_and_slot_pin_to_converge() {
-        let store = StoreHandle::owned(17);
-        let owner = store.acquire(42, ResponsibilityClass::Query).unwrap();
+        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
+        let owner = store
+            .acquire(
+                42,
+                ResponsibilityClass::Query,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
         let reference = owner.reference();
         let mut slot = SlotCore::new();
         // SAFETY: live owner pins positive publication and the store is retained.
@@ -88,8 +124,14 @@ mod tests {
     }
     #[test]
     fn quantum_flush_and_direct_path_publish_real_counts() {
-        let store = StoreHandle::owned(17);
-        let owner = store.acquire(1, ResponsibilityClass::Service).unwrap();
+        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
+        let owner = store
+            .acquire(
+                1,
+                ResponsibilityClass::Service,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
         let reference = owner.reference();
         let mut slot = SlotCore::new();
         let half = (SLOT_QUANTUM_BYTES / 2) as i64;
@@ -127,8 +169,14 @@ mod tests {
     }
     #[test]
     fn owned_store_outlives_owner_and_last_allocation() {
-        let store = StoreHandle::owned(17);
-        let owner = store.acquire(7, ResponsibilityClass::Service).unwrap();
+        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
+        let owner = store
+            .acquire(
+                7,
+                ResponsibilityClass::Service,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
         let reference = owner.reference();
         // SAFETY: owner protects publication; retained store protects backing.
         unsafe { SlotCore::direct(store.store(), reference, 600, 0, 1) };

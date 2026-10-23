@@ -34,8 +34,14 @@ fn model(f: impl Fn() + Send + Sync + 'static) {
 #[test]
 fn l1_remote_free_before_flush_never_reclaims_a_pinned_record() {
     model(|| {
-        let store = StoreHandle::owned(17);
-        let owner = store.acquire(1, ResponsibilityClass::Query).unwrap();
+        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
+        let owner = store
+            .acquire(
+                1,
+                ResponsibilityClass::Query,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
         let reference = owner.reference();
         let producer_store = store.clone();
         let remote_store = store.clone();
@@ -77,8 +83,14 @@ fn l1_remote_free_before_flush_never_reclaims_a_pinned_record() {
 #[test]
 fn l2_resize_keeps_its_allocation_count_while_another_allocation_frees() {
     model(|| {
-        let store = StoreHandle::owned(17);
-        let owner = store.acquire(1, ResponsibilityClass::Service).unwrap();
+        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
+        let owner = store
+            .acquire(
+                1,
+                ResponsibilityClass::Service,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
         let reference = owner.reference();
         // SAFETY: owner protects publication of two independent allocations.
         unsafe { SlotCore::direct(store.store(), reference, 1200, 0, 2) };
@@ -108,8 +120,14 @@ fn l2_resize_keeps_its_allocation_count_while_another_allocation_frees() {
 #[test]
 fn l5_true_token_access_prevents_reuse_then_old_generation_is_rejected() {
     model(|| {
-        let store = StoreHandle::owned(17);
-        let owner = store.acquire(1, ResponsibilityClass::Service).unwrap();
+        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
+        let owner = store
+            .acquire(
+                1,
+                ResponsibilityClass::Service,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
         let old = owner.reference();
         // SAFETY: owner protects publication of the allocation handed to reader.
         unsafe { SlotCore::direct(store.store(), old, 600, 0, 1) };
@@ -144,7 +162,13 @@ fn l5_true_token_access_prevents_reuse_then_old_generation_is_rejected() {
         reader.join().unwrap();
         collector.join().unwrap();
         assert_eq!(store.store().reclaim(1), 1);
-        let new_owner = store.acquire(2, ResponsibilityClass::Query).unwrap();
+        let new_owner = store
+            .acquire(
+                2,
+                ResponsibilityClass::Query,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
         let new = new_owner.reference();
         assert_eq!((new.index, new.generation), (old.index, old.generation + 1));
         observer.join().unwrap();
@@ -244,8 +268,14 @@ fn l4_query_handoff_late_free_flush_and_control_reclaim_keep_one_record() {
 #[test]
 fn l3_r1_cross_band_publication_remote_free_and_last_owner_preserve_lifetime() {
     model(|| {
-        let store = StoreHandle::owned(17);
-        let owner = store.acquire(3, ResponsibilityClass::Query).unwrap();
+        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
+        let owner = store
+            .acquire(
+                3,
+                ResponsibilityClass::Query,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
         let reference = owner.reference();
         // Two proven R1 small blocks: one will resize, the other releases remotely.
         unsafe { SlotCore::direct(store.store(), reference, 0, 72, 2) };
@@ -294,5 +324,42 @@ fn l3_r1_cross_band_publication_remote_free_and_last_owner_preserve_lifetime() {
             ),
             (0, 0, 0)
         );
+    });
+}
+
+#[test]
+fn l6_regions_publish_one_boundary_segment_and_never_replace_addresses() {
+    use crate::lane::{RecordRegion, UNATTRIBUTED_RECORDS};
+    model(|| {
+        // Both first dynamic positions are in segment 4, with distinct region
+        // locks. There is no backing yet when the two threads start.
+        let store = StoreHandle::owned(UNATTRIBUTED_RECORDS + 4);
+        let funding = store.clone();
+        let observation = store.clone();
+        let f = thread::spawn(move || {
+            let owner = funding
+                .acquire(1, ResponsibilityClass::Query, RecordRegion::Funding)
+                .unwrap();
+            let address = std::ptr::from_ref(owner.record()).addr();
+            (owner, address)
+        });
+        let o = thread::spawn(move || {
+            let owner = observation
+                .acquire(2, ResponsibilityClass::Service, RecordRegion::Observation)
+                .unwrap();
+            let address = std::ptr::from_ref(owner.record()).addr();
+            (owner, address)
+        });
+        let f = f.join().unwrap();
+        let o = o.join().unwrap();
+        assert_eq!(store.store().published_segment_count(), 1);
+        for (owner, address) in [&f, &o] {
+            assert_eq!(
+                *address,
+                std::ptr::from_ref(store.store().resolve(owner.reference()).unwrap()).addr()
+            );
+        }
+        assert_eq!(f.0.record().snapshot().origin, 1);
+        assert_eq!(o.0.record().snapshot().origin, 2);
     });
 }

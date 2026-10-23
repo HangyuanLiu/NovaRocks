@@ -46,7 +46,11 @@ static GLOBAL: MetadataProbe = MetadataProbe;
 fn hooks_make_no_nested_metadata_allocations_including_first_tls_access() {
     let a = AttributingAllocator::new(System);
     let o = StoreHandle::global()
-        .acquire(7, ResponsibilityClass::Query)
+        .acquire(
+            7,
+            ResponsibilityClass::Query,
+            novarocks_memory::lane::RecordRegion::Observation,
+        )
         .unwrap();
     let l = Layout::from_size_align(512, 8).unwrap();
     let before = UNEXPECTED.load(Ordering::Relaxed);

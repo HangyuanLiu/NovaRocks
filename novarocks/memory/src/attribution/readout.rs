@@ -23,9 +23,7 @@ use super::{
 use crate::lane::faults::FaultSnapshot;
 use crate::lane::record::{CLASS_MASK, CLASS_SHIFT, PRODUCTION_MASK};
 use crate::lane::store::SEGMENT_RECORDS;
-use crate::lane::{
-    LaneRecord, RecordSnapshot, RecordStore, SLOT_QUANTUM_BYTES, UNATTRIBUTED_SHARDS,
-};
+use crate::lane::{LaneRecord, RecordSnapshot, RecordStore, SLOT_QUANTUM_BYTES};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CLASS_LABELS: [&str; 4] = ["query", "residual", "service", "unattributed"];
@@ -108,9 +106,6 @@ impl AttributionSnapshot {
             ..Self::default()
         };
         for (reference, _) in store.records() {
-            if reference.index >= result.record_high_water {
-                break;
-            }
             if let Some(snapshot) = store.snapshot_ref(reference) {
                 result.add_record(snapshot);
             }
@@ -132,11 +127,7 @@ impl AttributionSnapshot {
             .faults
             .pinned_slots
             .saturating_mul(SLOT_QUANTUM_BYTES);
-        let segments = if result.record_high_water <= UNATTRIBUTED_SHARDS {
-            0
-        } else {
-            (result.record_high_water as usize).div_ceil(SEGMENT_RECORDS)
-        };
+        let segments = store.published_segment_count();
         result.record_segment_requested_bytes =
             (segments * SEGMENT_RECORDS * std::mem::size_of::<LaneRecord>()) as u64;
         result
@@ -163,14 +154,32 @@ impl AttributionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lane::{ResponsibilityClass, StoreHandle};
+    use crate::lane::{ResponsibilityClass, StoreHandle, UNATTRIBUTED_RECORDS};
     use crate::sync::Ordering;
     #[test]
     fn classified_facts_blind_spot_and_reconciliation_are_sampled_separately() {
-        let store = StoreHandle::owned(20);
-        let query = store.acquire(1, ResponsibilityClass::Query).unwrap();
-        let residual = store.acquire(2, ResponsibilityClass::Residual).unwrap();
-        let service = store.acquire(3, ResponsibilityClass::Service).unwrap();
+        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 8);
+        let query = store
+            .acquire(
+                1,
+                ResponsibilityClass::Query,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
+        let residual = store
+            .acquire(
+                2,
+                ResponsibilityClass::Residual,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
+        let service = store
+            .acquire(
+                3,
+                ResponsibilityClass::Service,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
         // Fixture fields remain protected by live owners; these are readout
         // samples, not lifetime publications or simulated allocation counts.
         for (owner, tagged, small, state) in [
@@ -185,7 +194,7 @@ mod tests {
         }
         store
             .store()
-            .resolve(store.store().unattributed_ref(0))
+            .resolve(store.store().unattributed_ref(0, 0))
             .unwrap()
             .tagged
             .store(100, Ordering::Release);
@@ -209,9 +218,9 @@ mod tests {
         assert_eq!(sample.records[0], [1, 0, 0]);
         assert_eq!(sample.records[1], [0, 1, 0]);
         assert_eq!(sample.records[2], [0, 0, 1]);
-        assert_eq!(sample.records[3], [16, 0, 0]);
-        assert_eq!(sample.record_capacity, 20);
-        assert_eq!(sample.record_high_water, 19);
+        assert_eq!(sample.records[3], [u64::from(UNATTRIBUTED_RECORDS), 0, 0]);
+        assert_eq!(sample.record_capacity, UNATTRIBUTED_RECORDS + 8);
+        assert_eq!(sample.record_high_water, UNATTRIBUTED_RECORDS + 3);
         assert_eq!(sample.sequence_sum, 21);
         assert_eq!(sample.observation_metadata_bytes, Some(1234));
         assert!(sample.sampled_at_unix_millis.is_some());
@@ -227,8 +236,14 @@ mod tests {
     }
     #[test]
     fn signed_samples_faults_and_pin_estimates_do_not_claim_settlement() {
-        let store = StoreHandle::owned(17);
-        let query = store.acquire(1, ResponsibilityClass::Query).unwrap();
+        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
+        let query = store
+            .acquire(
+                1,
+                ResponsibilityClass::Query,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
         query.record().tagged.store(-520, Ordering::Release);
         query.record().r1_small.store(10, Ordering::Release);
         store.store().faults.binding_failed();
@@ -253,13 +268,25 @@ mod tests {
     }
     #[test]
     fn reclaimed_generation_is_not_observed_as_the_previous_record() {
-        let store = StoreHandle::owned(17);
-        let first = store.acquire(1, ResponsibilityClass::Query).unwrap();
+        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
+        let first = store
+            .acquire(
+                1,
+                ResponsibilityClass::Query,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
         let old = first.reference();
         drop(first);
         assert_eq!(store.store().draining_len(), 1);
         assert_eq!(store.store().reclaim(1), 1);
-        let second = store.acquire(2, ResponsibilityClass::Service).unwrap();
+        let second = store
+            .acquire(
+                2,
+                ResponsibilityClass::Service,
+                crate::lane::RecordRegion::Observation,
+            )
+            .unwrap();
         assert_ne!(old, second.reference());
         assert!(store.store().snapshot_ref(old).is_none());
         let sample = AttributionSnapshot::sample(store.store(), BandSnapshot::default());

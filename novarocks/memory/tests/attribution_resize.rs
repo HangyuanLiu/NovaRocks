@@ -25,7 +25,11 @@ fn layout(size: usize) -> Layout {
 }
 fn owner() -> novarocks_memory::lane::RecordOwner {
     StoreHandle::global()
-        .acquire(7, ResponsibilityClass::Query)
+        .acquire(
+            7,
+            ResponsibilityClass::Query,
+            novarocks_memory::lane::RecordRegion::Observation,
+        )
         .unwrap()
 }
 fn bytes(r: novarocks_memory::lane::RecordRef) -> i64 {

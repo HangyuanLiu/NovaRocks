@@ -26,15 +26,23 @@ fn real_process_record_exhaustion_is_a_coverage_error_without_funding_change() {
     let before = a.pressure_projection();
     let mut held = Vec::new();
     loop {
-        match StoreHandle::Global.acquire(1, ResponsibilityClass::Service) {
+        match StoreHandle::Global.acquire(
+            1,
+            ResponsibilityClass::Service,
+            novarocks_memory::lane::RecordRegion::Observation,
+        ) {
             Ok(owner) => held.push(owner),
-            Err(CoverageError::RecordStoreExhausted) => break,
+            Err(CoverageError::RecordStoreExhausted {
+                region: novarocks_memory::lane::RecordRegion::Observation,
+            }) => break,
             Err(error) => panic!("unexpected coverage failure: {error:?}"),
         }
     }
     assert_eq!(
         query.create_lane().unwrap_err(),
-        CoverageError::RecordStoreExhausted
+        CoverageError::RecordStoreExhausted {
+            region: novarocks_memory::lane::RecordRegion::Observation
+        }
     );
     assert_eq!(a.pressure_projection(), before);
     drop(held);

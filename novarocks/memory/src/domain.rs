@@ -82,8 +82,10 @@ impl AccountHandle {
         let shared = &self.0.shared;
         let record = Arc::new(Domain {
             id: shared.next_identity()?,
-            lane: LaneHandle::new(self).map_err(|_| CapacityError::Invalid {
-                detail: "lane record storage unavailable",
+            lane: LaneHandle::new(self, crate::lane::RecordRegion::Funding).map_err(|_| {
+                CapacityError::Invalid {
+                    detail: "lane record storage unavailable",
+                }
             })?,
             covered_sequence: AtomicU64::new(0),
             covered_epoch: AtomicU64::new(0),

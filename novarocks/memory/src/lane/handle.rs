@@ -33,7 +33,10 @@ pub(crate) struct LaneShared {
 #[derive(Clone, Debug)]
 pub struct LaneHandle(pub(crate) Arc<LaneShared>);
 impl LaneHandle {
-    pub(crate) fn new(account: &AccountHandle) -> Result<Self, CoverageError> {
+    pub(crate) fn new(
+        account: &AccountHandle,
+        region: super::RecordRegion,
+    ) -> Result<Self, CoverageError> {
         let query = crate::account::Path::new(account)
             .nodes
             .iter()
@@ -49,6 +52,7 @@ impl LaneHandle {
             } else {
                 ResponsibilityClass::Service
             },
+            region,
         )?;
         Ok(Self(Arc::new(LaneShared {
             record,
@@ -240,7 +244,7 @@ impl AccountHandle {
     /// stock consumption or funding-ledger commitment.
     pub fn create_lane(&self) -> Result<LaneHandle, CoverageError> {
         self.0.shared.prune_observations(16);
-        let lane = LaneHandle::new(self)?;
+        let lane = LaneHandle::new(self, super::RecordRegion::Observation)?;
         let member = crate::membership::MemberNode::lane(&lane.0, None);
         let path = crate::account::Path::new(self);
         let _gates = path.shared_gates();

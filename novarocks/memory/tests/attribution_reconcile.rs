@@ -23,7 +23,11 @@ fn attribution_reconcile() {
     use std::alloc::{GlobalAlloc, Layout, System};
     let a = std::sync::Arc::new(AttributingAllocator::new(System));
     let o = StoreHandle::global()
-        .acquire(7, ResponsibilityClass::Query)
+        .acquire(
+            7,
+            ResponsibilityClass::Query,
+            novarocks_memory::lane::RecordRegion::Observation,
+        )
         .unwrap();
     let r = o.reference();
     let l = Layout::from_size_align(512, 8).unwrap();
