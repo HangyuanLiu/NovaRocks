@@ -16,7 +16,6 @@
 // under the License.
 
 //! Locked Arrow representation adapter. No SQL semantics or capacity authority.
-#![allow(dead_code)] // Shared operations are wired by subsequent value modules.
 use crate::{ByteLayout, ValueError, ValueViolation};
 use allocator_api2::{
     alloc::{Allocator, Global},
@@ -601,10 +600,11 @@ mod structural_tests {
 
 /// Descriptor-only fast path. External payload is never touched for length or
 /// prefix; inline bytes borrow the admitted descriptor through Arrow's value API.
+type InlinePrefix<'a> = (usize, [u8; 4], Option<&'a [u8]>);
 pub(crate) fn view_inline_prefix(
     array: &dyn Array,
     row: usize,
-) -> Result<(usize, [u8; 4], Option<&[u8]>), ValueError> {
+) -> Result<InlinePrefix<'_>, ValueError> {
     if row >= array.len() {
         return Err(ValueError::Invariant(ValueViolation::Bounds));
     }
@@ -845,6 +845,22 @@ pub(crate) fn rebuild_structural(
 ) -> Result<ArrayRef, ValueError> {
     use arrow_array::{MapArray, make_array};
     use arrow_schema::DataType;
+    let same_shape = match (source.data_type(), target) {
+        (arrow_schema::DataType::Struct(a), arrow_schema::DataType::Struct(b)) => {
+            a.len() == b.len()
+        }
+        (arrow_schema::DataType::List(_), arrow_schema::DataType::List(_))
+        | (arrow_schema::DataType::LargeList(_), arrow_schema::DataType::LargeList(_)) => true,
+        (arrow_schema::DataType::Map(_, a), arrow_schema::DataType::Map(_, b)) => a == b,
+        (
+            arrow_schema::DataType::FixedSizeList(_, a),
+            arrow_schema::DataType::FixedSizeList(_, b),
+        ) => a == b,
+        _ => false,
+    };
+    if !same_shape {
+        return Err(ValueError::Invariant(ValueViolation::Structure));
+    }
     let child_data = match target {
         DataType::Struct(fields) if fields.len() == children.len() => {
             children.iter().map(|c| c.to_data()).collect()
@@ -886,48 +902,81 @@ pub(crate) fn source_dictionary(
 
 /// Project actual child encodings into the frozen parent layout. Field names
 /// and NULL declarations come exclusively from the frozen layout author.
+#[expect(
+    deprecated,
+    reason = "Arrow 58 exposes retained IPC dictionary IDs only through these field APIs."
+)]
 pub(crate) fn metadata_free_type_rebuild(
+    source: &arrow_schema::DataType,
     target: &arrow_schema::DataType,
     children: &[arrow_schema::DataType],
 ) -> Result<arrow_schema::DataType, ValueError> {
     use arrow_schema::{DataType, Field};
-    let field = |original: &Field, data_type: &DataType| {
-        Arc::new(Field::new(
-            original.name(),
-            data_type.clone(),
-            original.is_nullable(),
-        ))
-    };
-    Ok(match target {
-        DataType::Struct(fields) if fields.len() == children.len() => DataType::Struct(
-            fields
-                .iter()
-                .zip(children)
-                .map(|(f, t)| field(f, t))
-                .collect(),
-        ),
-        DataType::List(f) if children.len() == 1 => DataType::List(field(f, &children[0])),
-        DataType::LargeList(f) if children.len() == 1 => {
-            DataType::LargeList(field(f, &children[0]))
-        }
-        DataType::FixedSizeList(f, width) if children.len() == 1 => {
-            DataType::FixedSizeList(field(f, &children[0]), *width)
-        }
-        DataType::Map(entries, sorted) if children.len() == 2 => {
-            let DataType::Struct(fields) = entries.data_type() else {
-                return Err(ValueError::Invariant(ValueViolation::Structure));
-            };
-            if fields.len() != 2 {
-                return Err(ValueError::Invariant(ValueViolation::Structure));
+    let invalid = || ValueError::Invariant(ValueViolation::Structure);
+    let field = |actual: &Field, frozen: &Field, data_type: &DataType| {
+        let result = if matches!(data_type, DataType::Dictionary(..)) {
+            // IPC dictionary descriptors belong to the actual retained
+            // encoding; names and NULL declarations still belong to the
+            // frozen layout. No source annotations author semantic meaning.
+            if !matches!(actual.data_type(), DataType::Dictionary(..)) {
+                return Err(invalid());
             }
-            let fields = fields
-                .iter()
-                .zip(children)
-                .map(|(f, t)| field(f, t))
-                .collect();
-            DataType::Map(field(entries, &DataType::Struct(fields)), *sorted)
+            Field::new_dict(
+                frozen.name(),
+                data_type.clone(),
+                frozen.is_nullable(),
+                actual.dict_id().ok_or_else(invalid)?,
+                actual.dict_is_ordered().ok_or_else(invalid)?,
+            )
+        } else {
+            Field::new(frozen.name(), data_type.clone(), frozen.is_nullable())
+        };
+        Ok(Arc::new(result))
+    };
+    Ok(match (source, target) {
+        (DataType::Struct(actual), DataType::Struct(fields))
+            if actual.len() == fields.len() && fields.len() == children.len() =>
+        {
+            DataType::Struct(
+                actual
+                    .iter()
+                    .zip(fields)
+                    .zip(children)
+                    .map(|((a, f), t)| field(a, f, t))
+                    .collect::<Result<_, _>>()?,
+            )
         }
-        _ => return Err(ValueError::Invariant(ValueViolation::Structure)),
+        (DataType::List(a), DataType::List(f)) if children.len() == 1 => {
+            DataType::List(field(a, f, &children[0])?)
+        }
+        (DataType::LargeList(a), DataType::LargeList(f)) if children.len() == 1 => {
+            DataType::LargeList(field(a, f, &children[0])?)
+        }
+        (DataType::FixedSizeList(a, aw), DataType::FixedSizeList(f, width))
+            if aw == width && children.len() == 1 =>
+        {
+            DataType::FixedSizeList(field(a, f, &children[0])?, *width)
+        }
+        (DataType::Map(a, asort), DataType::Map(entries, sorted))
+            if asort == sorted && children.len() == 2 =>
+        {
+            let (DataType::Struct(actual), DataType::Struct(fields)) =
+                (a.data_type(), entries.data_type())
+            else {
+                return Err(invalid());
+            };
+            if actual.len() != 2 || fields.len() != 2 {
+                return Err(invalid());
+            }
+            let fields = actual
+                .iter()
+                .zip(fields)
+                .zip(children)
+                .map(|((a, f), t)| field(a, f, t))
+                .collect::<Result<_, _>>()?;
+            DataType::Map(field(a, entries, &DataType::Struct(fields))?, *sorted)
+        }
+        _ => return Err(invalid()),
     })
 }
 
@@ -984,4 +1033,89 @@ pub(crate) fn byte_declared_backing_capacity(array: &dyn Array) -> Result<usize,
         capacity = capacity.saturating_add(nulls.inner().inner().capacity());
     }
     Ok(capacity)
+}
+
+/// Explicit publication copy for foreign allocators. Global keeps standard
+/// zero-copy Arrow ownership; the return count describes actual copied bytes.
+pub(crate) fn into_arrow_buffer_observed<T: ArrowNativeType, A: Allocator + 'static, E>(
+    values: AllocVec<T, A>,
+    growth: &mut crate::control::Growth<'_, E>,
+    work: &mut crate::control::Work<'_, E>,
+) -> Result<(Buffer, usize), crate::ValueFailure<E>> {
+    if TypeId::of::<A>() == TypeId::of::<Global>() {
+        return Ok((into_arrow_buffer(values), 0));
+    }
+    let layout = std::alloc::Layout::array::<T>(values.len()).map_err(|_| {
+        ValueError::Representation(crate::error::field_representation(
+            11,
+            RepresentationBoundary::SingleOutput,
+            None,
+            Some(isize::MAX as u64),
+            None,
+        ))
+    })?;
+    if layout.size() != 0 {
+        growth(layout).map_err(crate::ValueFailure::Caller)?;
+    }
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(values.len())
+        .map_err(|source| ValueError::Allocation {
+            requested: layout.size(),
+            source,
+        })?;
+    let turn = (64 * 1024 / std::mem::size_of::<T>().max(1)).max(1);
+    for chunk in values.chunks(turn) {
+        work(std::mem::size_of_val(chunk)).map_err(crate::ValueFailure::Caller)?;
+        output.extend_from_slice(chunk);
+    }
+    Ok((Buffer::from_vec(output), layout.size()))
+}
+
+pub(crate) fn byte_payload_capacity(array: &dyn Array) -> Result<u128, ValueError> {
+    match ByteLayout::from_data_type(array.data_type())
+        .ok_or(ValueError::Invariant(ValueViolation::Layout))?
+    {
+        ByteLayout::Utf8View | ByteLayout::BinaryView => Ok(view_parts(array)?
+            .1
+            .iter()
+            .map(|b| b.capacity() as u128)
+            .sum()),
+        _ => Ok(borrowed_buffer(array, 1)?.capacity() as u128),
+    }
+}
+
+pub(crate) fn view_external_location(
+    array: &dyn Array,
+    row: usize,
+) -> Result<Option<(usize, usize, usize)>, ValueError> {
+    if row >= array.len() {
+        return Err(ValueError::Invariant(ValueViolation::Bounds));
+    }
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    let (views, buffers) = view_parts(array)?;
+    let descriptor = ByteView::from(views[row]);
+    if descriptor.length <= 12 {
+        return Ok(None);
+    }
+    let index = descriptor.buffer_index as usize;
+    let offset = descriptor.offset as usize;
+    let len = descriptor.length as usize;
+    let buffer = buffers
+        .get(index)
+        .ok_or(ValueError::Invariant(ValueViolation::Bounds))?;
+    if offset.checked_add(len).is_none_or(|end| end > buffer.len()) {
+        return Err(ValueError::Invariant(ValueViolation::Bounds));
+    }
+    Ok(Some((index, offset, len)))
+}
+
+/// The binding owner has proved every physical NULL unreachable beneath an
+/// inactive ancestor. Rebuild safely over the same storage; removing a bitmap
+/// never changes a descendant's separately computed logical reachability.
+pub(crate) fn without_nulls(source: &ArrayRef) -> Result<ArrayRef, ValueError> {
+    let data = source.to_data().into_builder().nulls(None).build()?;
+    Ok(arrow_array::make_array(data))
 }

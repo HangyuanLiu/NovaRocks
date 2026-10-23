@@ -32,6 +32,47 @@ use std::ops::Range;
 const BLOCK_TARGET: usize = 64 * 1024;
 const COPY_CHECKPOINT: usize = 64 * 1024;
 
+/// A bounded inline plan for the builder's own storage. It includes the view
+/// publication-region table: reserve_planned_observed allocates and holds that
+/// table before appending, and finish_observed consumes it without another
+/// growth request. Arrow's private wrapping metadata remains outside this plan.
+#[derive(Clone, Debug, Default)]
+pub struct PlannedLayouts {
+    layouts: [Option<Layout>; 5],
+    len: usize,
+}
+
+impl PlannedLayouts {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Layout> {
+        self.layouts.iter().flatten()
+    }
+
+    fn push<T>(&mut self, count: usize) -> Result<(), ValueError> {
+        if count != 0 {
+            self.layouts[self.len] = Some(planned_layout::<T>(count)?);
+            self.len += 1;
+        }
+        Ok(())
+    }
+}
+
+impl IntoIterator for PlannedLayouts {
+    type Item = Layout;
+    type IntoIter = std::iter::Flatten<std::array::IntoIter<Option<Layout>, 5>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.layouts.into_iter().flatten()
+    }
+}
+
 #[derive(Debug)]
 pub enum WriteFailure<E> {
     /// The current row fits an empty output, but not this output's real fields.
@@ -52,11 +93,19 @@ impl<E> From<ValueFailure<E>> for WriteFailure<E> {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BuildFacts {
     pub rows: usize,
-    pub logical_bytes: u64,
+    /// Logical volume includes repeated adopted values and can exceed the
+    /// volume of all addressable payload storage.
+    pub logical_bytes: u128,
     /// Actual bytes copied by writes, excluding rolled-back rows.
-    pub copied_bytes: u64,
+    pub copied_bytes: u128,
+    /// Bytes copied from foreign-allocator buffers into standard Arrow
+    /// buffers during publication, including offsets/descriptors/validity.
+    pub publication_copied_bytes: u128,
     pub adopted_regions: usize,
-    pub declared_payload_capacity: usize,
+    /// Sum of the mounted payload regions' declared capacities. Shared
+    /// allocations may appear more than once; unknown owner capacity stays
+    /// unknown and this is never a physical-retention ledger.
+    pub declared_payload_capacity: u128,
 }
 
 pub struct BuiltArray {
@@ -83,8 +132,10 @@ pub struct ValueBuilder<A: Allocator + Clone + 'static = Global> {
     current: Option<usize>,
     rows: usize,
     null_count: usize,
-    logical_bytes: u64,
-    copied_bytes: u64,
+    logical_bytes: u128,
+    copied_bytes: u128,
+    planned_payload_region: Option<usize>,
+    publication_regions: Option<Vec<Buffer>>,
 }
 
 impl ValueBuilder<Global> {
@@ -109,6 +160,8 @@ impl<A: Allocator + Clone + 'static> ValueBuilder<A> {
             null_count: 0,
             logical_bytes: 0,
             copied_bytes: 0,
+            planned_payload_region: None,
+            publication_regions: None,
         }
     }
 
@@ -120,6 +173,104 @@ impl<A: Allocator + Clone + 'static> ValueBuilder<A> {
     }
     pub fn is_empty(&self) -> bool {
         self.rows == 0
+    }
+
+    /// Plan exact initial capacity requests for append_array_value conversion.
+    /// Offsets use the sum of output bytes. Views adopt long source regions;
+    /// payload_bytes is the sum of copied inline bytes and region_bound bounds
+    /// distinct adopted regions. One additional owned inline region is included
+    /// automatically. The plan itself has no heap storage. Foreign-allocator
+    /// publication copies remain separate finalization growth observations;
+    /// their ordinary destination storage is not held by this mutable plan.
+    pub fn planned_layouts(
+        layout: ByteLayout,
+        rows: usize,
+        payload_bytes: usize,
+        adopted_region_bound: usize,
+    ) -> Result<PlannedLayouts, ValueError> {
+        let counts = planned_counts(layout, rows, payload_bytes, adopted_region_bound)?;
+        let mut plan = PlannedLayouts::default();
+        if layout.is_view() {
+            plan.push::<u128>(rows)?;
+        } else if matches!(layout, ByteLayout::Utf8 | ByteLayout::Binary) {
+            plan.push::<i32>(counts.offsets)?;
+        } else {
+            plan.push::<i64>(counts.offsets)?;
+        }
+        plan.push::<u8>(counts.validity)?;
+        plan.push::<u8>(payload_bytes)?;
+        if layout.is_view() {
+            plan.push::<Region<A>>(counts.regions)?;
+            plan.push::<Buffer>(counts.regions)?;
+        }
+        Ok(plan)
+    }
+
+    /// Prepare a pristine builder using the checked plan above. Allocation or
+    /// control refusal leaves self pristine, so the same request can be retried
+    /// without re-requesting retained storage. Only after every reservation
+    /// succeeds does this builder take custody of the prepared vectors.
+    ///
+    /// The capacity guarantee covers append_array_value, NULLs and empty values
+    /// within the supplied row/byte/region counts. General fragment writes may
+    /// request additional storage through their ordinary growth callback.
+    pub fn reserve_planned_observed<E>(
+        &mut self,
+        rows: usize,
+        payload_bytes: usize,
+        adopted_region_bound: usize,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<(), ValueFailure<E>> {
+        work(0).map_err(ValueFailure::Caller)?;
+        if self.rows != 0
+            || self.payload.capacity() != 0
+            || self.offsets32.capacity() != 0
+            || self.offsets64.capacity() != 0
+            || self.views.capacity() != 0
+            || self.validity.capacity() != 0
+            || self.regions.capacity() != 0
+            || self.current.is_some()
+            || self.planned_payload_region.is_some()
+            || self.publication_regions.is_some()
+        {
+            return Err(ValueError::Invariant(ValueViolation::RowTransaction).into());
+        }
+        let counts = planned_counts(self.layout, rows, payload_bytes, adopted_region_bound)?;
+        // Check the entire plan before the first allocation or growth request.
+        Self::planned_layouts(self.layout, rows, payload_bytes, adopted_region_bound)?;
+        let mut prepared = Self::new_in(self.layout, self.allocator.clone());
+        if self.layout.is_view() {
+            reserve_initial(&mut prepared.views, rows, growth, work)?;
+        } else if matches!(self.layout, ByteLayout::Utf8 | ByteLayout::Binary) {
+            reserve_initial(&mut prepared.offsets32, counts.offsets, growth, work)?;
+        } else {
+            reserve_initial(&mut prepared.offsets64, counts.offsets, growth, work)?;
+        }
+        reserve_initial(&mut prepared.validity, counts.validity, growth, work)?;
+        if self.layout.is_view() && rows != 0 {
+            let mut inline = AllocVec::new_in(self.allocator.clone());
+            reserve_initial(&mut inline, payload_bytes, growth, work)?;
+            reserve_initial(&mut prepared.regions, counts.regions, growth, work)?;
+            prepared.regions.push(Region::Owned(inline));
+            prepared.current = Some(0);
+            prepared.planned_payload_region = Some(0);
+            let table_layout = planned_layout::<Buffer>(counts.regions)?;
+            work(1).map_err(ValueFailure::Caller)?;
+            growth(table_layout).map_err(ValueFailure::Caller)?;
+            let mut publication = Vec::new();
+            publication
+                .try_reserve_exact(counts.regions)
+                .map_err(|source| ValueError::Allocation {
+                    requested: table_layout.size(),
+                    source,
+                })?;
+            prepared.publication_regions = Some(publication);
+        } else {
+            reserve_initial(&mut prepared.payload, payload_bytes, growth, work)?;
+        }
+        *self = prepared;
+        Ok(())
     }
 
     pub fn begin_row(&mut self) -> RowWriter<'_, A> {
@@ -186,29 +337,125 @@ impl<A: Allocator + Clone + 'static> ValueBuilder<A> {
         row.commit(growth, work)
     }
 
+    /// Publish with ordinary global allocation and no caller control policy.
+    /// Foreign allocator buffers are copied; their original allocator releases
+    /// the mutable storage. Owners requiring growth/cancellation observation
+    /// use finish_observed instead.
     pub fn finish(self) -> Result<BuiltArray, ValueError> {
-        let facts = self.facts();
+        self.finish_observed(
+            &mut crate::control::global_growth,
+            &mut crate::control::uncontrolled,
+        )
+        .map_err(ValueFailure::into_error)
+    }
+
+    /// Publish the committed prefix. Global buffers transfer to standard Arrow
+    /// without recopying or a new payload-growth observation. Foreign buffers
+    /// first observe the exact standard destination Layout and bounded copying;
+    /// refusal drops all unpublished storage with its original allocator.
+    /// Arrow's additional private headers remain a public-library boundary.
+    pub fn finish_observed<E>(
+        mut self,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<BuiltArray, ValueFailure<E>> {
+        work(0).map_err(ValueFailure::Caller)?;
+        let mut facts = self.facts();
         if self.rows == 0 {
-            return Ok(BuiltArray {
-                array: arrow_array::new_empty_array(&self.layout.data_type()),
-                facts,
-            });
+            let array = if self.layout.is_view() {
+                // The view empty constructor has no offsets sentinel or data
+                // allocation. Do not transfer any aborted mutable capacity.
+                arrow_array::new_empty_array(&self.layout.data_type())
+            } else {
+                // An offsets array still owns one zero sentinel. Construct it
+                // through our observed allocator rather than Arrow's rounded
+                // internal empty-offset allocation, reusing an existing plan.
+                let offsets = if matches!(self.layout, ByteLayout::Utf8 | ByteLayout::Binary) {
+                    if self.offsets32.capacity() == 0 {
+                        reserve_initial(&mut self.offsets32, 1, growth, work)?;
+                    }
+                    self.offsets32.push(0);
+                    publish_buffer(
+                        self.offsets32,
+                        &mut facts.publication_copied_bytes,
+                        growth,
+                        work,
+                    )?
+                } else {
+                    if self.offsets64.capacity() == 0 {
+                        reserve_initial(&mut self.offsets64, 1, growth, work)?;
+                    }
+                    self.offsets64.push(0);
+                    publish_buffer(
+                        self.offsets64,
+                        &mut facts.publication_copied_bytes,
+                        growth,
+                        work,
+                    )?
+                };
+                arrow_raw::make_offsets(
+                    self.layout,
+                    offsets,
+                    Buffer::from_vec(Vec::<u8>::new()),
+                    None,
+                )?
+            };
+            facts.declared_payload_capacity = arrow_raw::byte_payload_capacity(array.as_ref())?;
+            debug_assert!(array.to_data().validate_full().is_ok());
+            return Ok(BuiltArray { array, facts });
         }
-        let nulls = arrow_raw::make_nulls(
-            arrow_raw::into_arrow_buffer(self.validity),
-            self.rows,
-            self.null_count,
-        );
+        let nulls = if self.null_count == 0 {
+            None
+        } else {
+            arrow_raw::make_nulls(
+                publish_buffer(
+                    self.validity,
+                    &mut facts.publication_copied_bytes,
+                    growth,
+                    work,
+                )?,
+                self.rows,
+                self.null_count,
+            )
+        };
         let array = if self.layout.is_view() {
-            let buffers = self
-                .regions
-                .into_iter()
-                .map(|r| match r {
-                    Region::Owned(bytes) => arrow_raw::into_arrow_buffer(bytes),
+            // This is our output-region table, distinct from the mutable Region
+            // enum table and from Arrow's opaque internal header allocation.
+            let table_layout = Layout::array::<Buffer>(self.regions.len()).map_err(|_| {
+                allocation_extent(
+                    self.rows,
+                    self.regions
+                        .len()
+                        .checked_mul(std::mem::size_of::<Buffer>())
+                        .and_then(|n| u64::try_from(n).ok()),
+                )
+            })?;
+            let mut buffers = self.publication_regions.unwrap_or_default();
+            if self.regions.len() > buffers.capacity() {
+                growth(table_layout).map_err(ValueFailure::Caller)?;
+                buffers
+                    .try_reserve_exact(self.regions.len())
+                    .map_err(|source| ValueError::Allocation {
+                        requested: table_layout.size(),
+                        source,
+                    })?;
+            }
+            for region in self.regions {
+                work(1).map_err(ValueFailure::Caller)?;
+                buffers.push(match region {
+                    Region::Owned(bytes) => {
+                        publish_buffer(bytes, &mut facts.publication_copied_bytes, growth, work)?
+                    }
                     Region::Shared(buffer) => buffer,
-                })
-                .collect();
-            let views = arrow_raw::into_arrow_buffer(self.views).into();
+                });
+            }
+            let views = publish_buffer(
+                self.views,
+                &mut facts.publication_copied_bytes,
+                growth,
+                work,
+            )?
+            .into();
             // SAFETY: commits create only checked descriptors into retained
             // regions; strings originate from str or admitted Arrow strings.
             // NULL slots use a valid empty inline descriptor, and bitmap length
@@ -216,17 +463,33 @@ impl<A: Allocator + Clone + 'static> ValueBuilder<A> {
             unsafe { arrow_raw::make_view_unchecked(self.layout, views, buffers, nulls)? }
         } else {
             let offsets = if matches!(self.layout, ByteLayout::Utf8 | ByteLayout::Binary) {
-                arrow_raw::into_arrow_buffer(self.offsets32)
+                publish_buffer(
+                    self.offsets32,
+                    &mut facts.publication_copied_bytes,
+                    growth,
+                    work,
+                )?
             } else {
-                arrow_raw::into_arrow_buffer(self.offsets64)
+                publish_buffer(
+                    self.offsets64,
+                    &mut facts.publication_copied_bytes,
+                    growth,
+                    work,
+                )?
             };
             arrow_raw::make_offsets(
                 self.layout,
                 offsets,
-                arrow_raw::into_arrow_buffer(self.payload),
+                publish_buffer(
+                    self.payload,
+                    &mut facts.publication_copied_bytes,
+                    growth,
+                    work,
+                )?,
                 nulls,
             )?
         };
+        facts.declared_payload_capacity = arrow_raw::byte_payload_capacity(array.as_ref())?;
         debug_assert!(array.to_data().validate_full().is_ok());
         Ok(BuiltArray { array, facts })
     }
@@ -236,8 +499,9 @@ impl<A: Allocator + Clone + 'static> ValueBuilder<A> {
             rows: self.rows,
             logical_bytes: self.logical_bytes,
             copied_bytes: self.copied_bytes,
+            publication_copied_bytes: 0,
             adopted_regions: 0,
-            declared_payload_capacity: self.payload.capacity(),
+            declared_payload_capacity: self.payload.capacity() as u128,
         };
         for region in &self.regions {
             let capacity = match region {
@@ -247,11 +511,23 @@ impl<A: Allocator + Clone + 'static> ValueBuilder<A> {
                     bytes.capacity()
                 }
             };
-            facts.declared_payload_capacity =
-                facts.declared_payload_capacity.saturating_add(capacity);
+            facts.declared_payload_capacity += capacity as u128;
         }
         facts
     }
+}
+
+/// The helper returns its actual copy count, so the builder does not guess
+/// allocator identity or conflate standard zero-copy transfer with publication.
+fn publish_buffer<T: arrow_buffer::ArrowNativeType, A: Allocator + 'static, E>(
+    values: AllocVec<T, A>,
+    copied: &mut u128,
+    growth: &mut Growth<'_, E>,
+    work: &mut Work<'_, E>,
+) -> Result<Buffer, ValueFailure<E>> {
+    let (buffer, bytes) = arrow_raw::into_arrow_buffer_observed(values, growth, work)?;
+    *copied += bytes as u128;
+    Ok(buffer)
 }
 
 struct RowMark {
@@ -259,7 +535,7 @@ struct RowMark {
     region_count: usize,
     current: Option<usize>,
     current_len: Option<usize>,
-    copied_bytes: u64,
+    copied_bytes: u128,
 }
 
 enum Pending {
@@ -483,6 +759,30 @@ impl<A: Allocator + Clone + 'static> RowWriter<'_, A> {
             total as u64,
             self.builder.rows,
         )?;
+        // A planned conversion can keep all copied inline bytes in one region:
+        // inline descriptors have no offset field. If a general fragment writer
+        // later extends such a draft into an external value, move its at-most
+        // twelve bytes into a fresh addressable block before appending.
+        if let Pending::Owned {
+            region: Some(index),
+            start,
+            len,
+        } = &self.data
+            && *start > i32::MAX as usize
+            && total > 12
+        {
+            let mut inline = [0u8; 12];
+            let Region::Owned(bytes) = &self.builder.regions[*index] else {
+                unreachable!()
+            };
+            inline[..*len].copy_from_slice(&bytes[*start..*start + *len]);
+            let len = *len;
+            self.data = Pending::Empty;
+            self.builder.current = None;
+            if len != 0 {
+                self.write_admitted(&inline[..len], growth, work)?;
+            }
+        }
         if matches!(self.data, Pending::Shared { .. }) {
             let previous = std::mem::replace(&mut self.data, Pending::Empty);
             if let Pending::Shared {
@@ -496,12 +796,14 @@ impl<A: Allocator + Clone + 'static> RowWriter<'_, A> {
         }
         if matches!(self.data, Pending::Empty) {
             if self.builder.layout.is_view() {
+                let planned = self.builder.planned_payload_region;
                 let reusable = self
                     .builder
                     .current
                     .filter(|&i| match &self.builder.regions[i] {
                         Region::Owned(bytes) => {
-                            bytes.len() < BLOCK_TARGET && bytes.len() <= i32::MAX as usize
+                            (planned == Some(i) && total <= 12)
+                                || (bytes.len() < BLOCK_TARGET && bytes.len() <= i32::MAX as usize)
                         }
                         Region::Shared(_) => false,
                     });
@@ -552,11 +854,7 @@ impl<A: Allocator + Clone + 'static> RowWriter<'_, A> {
             bytes.extend_from_slice(part);
         }
         *len += value.len();
-        self.builder.copied_bytes = self
-            .builder
-            .copied_bytes
-            .checked_add(value.len() as u64)
-            .ok_or_else(|| allocation_extent(self.builder.rows, None))?;
+        self.builder.copied_bytes = add_byte_volume(self.builder.copied_bytes, value.len());
         Ok(())
     }
 
@@ -593,13 +891,9 @@ impl<A: Allocator + Clone + 'static> RowWriter<'_, A> {
             .ok_or_else(|| allocation_extent(rows, None))?;
         let valid = !matches!(self.data, Pending::Null);
         let len = self.data.len();
-        let next_logical = self
-            .builder
-            .logical_bytes
-            .checked_add(len as u64)
-            .ok_or_else(|| allocation_extent(rows, None))?;
+        let next_logical = add_byte_volume(self.builder.logical_bytes, len);
         work(1).map_err(ValueFailure::Caller)?;
-        if rows % 8 == 0 {
+        if rows.is_multiple_of(8) {
             reserve(&mut self.builder.validity, 1, rows, growth)?;
         }
         if self.builder.layout.is_view() {
@@ -676,7 +970,7 @@ impl<A: Allocator + Clone + 'static> RowWriter<'_, A> {
             0
         };
         // All fallible work is complete. Publish the row and bitmap together.
-        if rows % 8 == 0 {
+        if rows.is_multiple_of(8) {
             self.builder.validity.push(0);
         }
         if valid {
@@ -713,6 +1007,108 @@ impl<A: Allocator + Clone + 'static> RowWriter<'_, A> {
             _ => unreachable!(),
         }
     }
+}
+
+/// A committed row has at most i64::MAX bytes, and there are at most usize::MAX
+/// rows. Even on a 64-bit host, their product fits u128. A pending row is checked
+/// against its layout first. Relocating an inline draft can add at most twelve
+/// copied bytes per row; that larger product still fits u128. Statistics
+/// therefore add no input rejection.
+fn add_byte_volume(volume: u128, bytes: usize) -> u128 {
+    volume + bytes as u128
+}
+
+struct PlannedCounts {
+    offsets: usize,
+    validity: usize,
+    regions: usize,
+}
+
+fn planned_counts(
+    layout: ByteLayout,
+    rows: usize,
+    payload_bytes: usize,
+    adopted_region_bound: usize,
+) -> Result<PlannedCounts, ValueError> {
+    if rows == 0 {
+        if payload_bytes != 0 {
+            return Err(ValueError::Invariant(ValueViolation::Bounds));
+        }
+        return Ok(PlannedCounts {
+            offsets: usize::from(!layout.is_view()),
+            validity: 0,
+            regions: 0,
+        });
+    }
+    if !layout.is_view() && payload_bytes as u128 > layout.extent_limit() as u128 {
+        return Err(ValueError::Representation(layout.representation(
+            if rows == 1 {
+                RepresentationBoundary::MinimumUnit
+            } else {
+                RepresentationBoundary::SingleOutput
+            },
+            u64::try_from(payload_bytes).ok(),
+            Some(layout.extent_limit()),
+            None,
+        )));
+    }
+    let overflow = || planned_extent(None);
+    Ok(PlannedCounts {
+        offsets: if layout.is_view() {
+            0
+        } else {
+            rows.checked_add(1).ok_or_else(overflow)?
+        },
+        // Dividing first avoids overflowing rows + 7 for a valid usize count.
+        validity: rows / 8 + usize::from(!rows.is_multiple_of(8)),
+        regions: if layout.is_view() {
+            adopted_region_bound.checked_add(1).ok_or_else(overflow)?
+        } else {
+            0
+        },
+    })
+}
+
+fn planned_layout<T>(count: usize) -> Result<Layout, ValueError> {
+    Layout::array::<T>(count).map_err(|_| {
+        planned_extent(
+            count
+                .checked_mul(std::mem::size_of::<T>())
+                .and_then(|n| u64::try_from(n).ok()),
+        )
+    })
+}
+
+fn planned_extent(required: Option<u64>) -> ValueError {
+    ValueError::Representation(field_representation(
+        11,
+        RepresentationBoundary::SingleOutput,
+        required,
+        Some(isize::MAX as u64),
+        None,
+    ))
+}
+
+fn reserve_initial<T, A: Allocator, E>(
+    values: &mut AllocVec<T, A>,
+    count: usize,
+    growth: &mut Growth<'_, E>,
+    work: &mut Work<'_, E>,
+) -> Result<(), ValueFailure<E>> {
+    if count == 0 {
+        return Ok(());
+    }
+    debug_assert_eq!(values.capacity(), 0);
+    let layout = planned_layout::<T>(count)?;
+    work(1).map_err(ValueFailure::Caller)?;
+    growth(layout).map_err(ValueFailure::Caller)?;
+    values
+        .try_reserve_exact(count)
+        .map_err(|source| ValueError::Allocator {
+            requested: layout.size(),
+            source,
+        })?;
+    Ok(())
 }
 
 /// Pure arithmetic, also used by planners to test real limits without allocating

@@ -54,7 +54,7 @@ fn region_slice_geometry_preserves_accessibility_and_unknown_owner() {
         Err(ValueError::Invariant(ValueViolation::Bounds))
     ));
     assert!(matches!(
-        region.slice(9..8),
+        region.slice(std::ops::Range { start: 9, end: 8 }),
         Err(ValueError::Invariant(ValueViolation::Bounds))
     ));
     assert_eq!(region.slice(16..16).unwrap().len(), 0);

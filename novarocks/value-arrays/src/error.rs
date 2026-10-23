@@ -219,6 +219,15 @@ impl<E: FailureProjection> FailureProjection for ValueFailure<E> {
 }
 impl<E: OuterFailureProjection> OuterFailureProjection for ValueFailure<E> {}
 
+impl ValueFailure<std::convert::Infallible> {
+    pub fn into_error(self) -> ValueError {
+        match self {
+            Self::Value(error) => error,
+            Self::Caller(impossible) => match impossible {},
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,14 +288,5 @@ mod tests {
             ValueFailure::Caller(Stopped).failure_fact(),
             Stopped.failure_fact()
         );
-    }
-}
-
-impl ValueFailure<std::convert::Infallible> {
-    pub fn into_error(self) -> ValueError {
-        match self {
-            Self::Value(error) => error,
-            Self::Caller(impossible) => match impossible {},
-        }
     }
 }

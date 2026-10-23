@@ -32,6 +32,8 @@ fn bounds() -> ValueError {
 /// visiting this domain allocates neither a row object nor a tree bitmap.
 #[derive(Clone, Copy)]
 pub enum ReachableRows<'a> {
+    /// Membership-only domain, borrowed without materializing an index vector.
+    Selection(&'a SelectionSet),
     All {
         len: usize,
     },
@@ -92,6 +94,7 @@ impl<'a> ReachableRows<'a> {
     }
     pub const fn len(&self) -> usize {
         match self {
+            Self::Selection(set) => set.len(),
             Self::All { len } | Self::Range { len, .. } | Self::Indices { len, .. } => *len,
             Self::Mask { parent, .. } => parent.len(),
             Self::List32 { child_len, .. }
@@ -123,10 +126,22 @@ impl<'a> ReachableRows<'a> {
         depth: usize,
         visit: &mut dyn FnMut(usize) -> Result<(), ValueFailure<E>>,
     ) -> Result<(), ValueFailure<E>> {
-        if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+        // Binding navigation composes at most one parent-validity mask and
+        // one structural mapping per accepted type level. Count those author
+        // wrappers without charging a type twice; this is a composition bound,
+        // not an additional value-size or admitted type-depth limit.
+        let composition_bound = novarocks_type_contract::MAX_VALUE_TYPE_DEPTH
+            .saturating_mul(2)
+            .saturating_add(1);
+        if depth > composition_bound {
             return Err(ValueError::Invariant(ValueViolation::Depth).into());
         }
         match self {
+            Self::Selection(set) => {
+                for row in set.iter() {
+                    visit(row)?;
+                }
+            }
             Self::All { len } => {
                 for row in 0..*len {
                     visit(row)?;
@@ -286,7 +301,7 @@ impl<'a> ReachableRows<'a> {
         growth: &mut Growth<'_, E>,
         work: &mut Work<'_, E>,
     ) -> Result<SelectionSet, ValueFailure<E>> {
-        let mut set = SelectionSet::try_new_observed(self.len(), growth)?;
+        let mut set = SelectionSet::try_new_with_control_observed(self.len(), growth, work)?;
         self.visit(0, &mut |row| {
             work(1).map_err(ValueFailure::Caller)?;
             set.insert(row).map_err(ValueFailure::Value)
@@ -310,7 +325,14 @@ impl SelectionSet {
         len: usize,
         growth: &mut Growth<'_, E>,
     ) -> Result<Self, ValueFailure<E>> {
-        let count = len / 64 + usize::from(len % 64 != 0);
+        Self::try_new_with_control_observed(len, growth, &mut |_| Ok(()))
+    }
+    pub fn try_new_with_control_observed<E>(
+        len: usize,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<Self, ValueFailure<E>> {
+        let count = len.div_ceil(64);
         let layout = Layout::array::<u64>(count)
             .map_err(|_| ValueError::Invariant(ValueViolation::Bounds))?;
         if count != 0 {
@@ -323,7 +345,11 @@ impl SelectionSet {
                 requested: layout.size(),
                 source,
             })?;
-        words.resize(count, 0);
+        while words.len() < count {
+            let chunk = (count - words.len()).min(8192);
+            work(chunk * std::mem::size_of::<u64>()).map_err(ValueFailure::Caller)?;
+            words.resize(words.len() + chunk, 0);
+        }
         Ok(Self { len, words })
     }
     pub const fn len(&self) -> usize {
@@ -377,9 +403,34 @@ impl SelectionSet {
         &self,
         growth: &mut Growth<'_, E>,
     ) -> Result<Self, ValueFailure<E>> {
-        let mut out = Self::try_new_observed(self.len, growth)?;
-        out.words.copy_from_slice(&self.words);
-        Ok(out)
+        self.try_clone_with_control_observed(growth, &mut |_| Ok(()))
+    }
+    pub fn try_clone_with_control_observed<E>(
+        &self,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<Self, ValueFailure<E>> {
+        let count = self.words.len();
+        let layout = Layout::array::<u64>(count)
+            .map_err(|_| ValueError::Invariant(ValueViolation::Bounds))?;
+        if count != 0 {
+            growth(layout).map_err(ValueFailure::Caller)?;
+        }
+        let mut words = Vec::new();
+        words
+            .try_reserve_exact(count)
+            .map_err(|source| ValueError::Allocation {
+                requested: layout.size(),
+                source,
+            })?;
+        for chunk in self.words.chunks(8192) {
+            work(std::mem::size_of_val(chunk)).map_err(ValueFailure::Caller)?;
+            words.extend_from_slice(chunk);
+        }
+        Ok(Self {
+            len: self.len,
+            words,
+        })
     }
     pub fn is_subset(&self, other: &Self) -> bool {
         self.len == other.len
@@ -422,11 +473,11 @@ impl SelectionSet {
     pub fn intervals(&self) -> Vec<Range<usize>> {
         let mut out: Vec<Range<usize>> = Vec::new();
         for row in self.iter() {
-            if let Some(last) = out.last_mut() {
-                if last.end == row {
-                    last.end = row + 1;
-                    continue;
-                }
+            if let Some(last) = out.last_mut()
+                && last.end == row
+            {
+                last.end = row + 1;
+                continue;
             }
             out.push(row..row + 1);
         }
@@ -516,5 +567,54 @@ mod tests {
         assert_eq!(b.difference(&a).unwrap(), b);
         a.union_with(&b).unwrap();
         assert_eq!(a.iter().collect::<Vec<_>>(), vec![0, 1]);
+    }
+    #[test]
+    fn accepted_type_depth_is_not_double_charged_for_masks_and_navigation() {
+        fn descend(remaining: usize, parent: &ReachableRows<'_>) {
+            if remaining == 0 {
+                let mut seen = Vec::new();
+                parent
+                    .for_each(&mut |row| {
+                        seen.push(row);
+                        Ok::<_, std::convert::Infallible>(())
+                    })
+                    .unwrap();
+                assert_eq!(seen, vec![0]);
+                return;
+            }
+            let validity = NullBuffer::from(vec![true]);
+            let masked = ReachableRows::Mask {
+                parent,
+                validity: &validity,
+            };
+            let offsets = [0, 1];
+            let list = ReachableRows::List32 {
+                parent: &masked,
+                offsets: &offsets,
+                validity: None,
+                child_len: 1,
+            };
+            descend(remaining - 1, &list);
+        }
+        descend(
+            novarocks_type_contract::MAX_VALUE_TYPE_DEPTH,
+            &ReachableRows::all(1),
+        );
+    }
+    #[test]
+    fn borrowed_selection_visits_members_without_changing_coordinate_domain() {
+        let mut selected = SelectionSet::try_new(130).unwrap();
+        selected.insert(0).unwrap();
+        selected.insert(64).unwrap();
+        selected.insert(129).unwrap();
+        let rows = ReachableRows::Selection(&selected);
+        assert_eq!(rows.len(), 130);
+        let mut seen = Vec::new();
+        rows.for_each(&mut |row| {
+            seen.push(row);
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec![0, 64, 129]);
     }
 }

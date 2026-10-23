@@ -37,3 +37,7 @@ pub mod storage;
 pub mod decode;
 
 pub mod hash_eq;
+
+pub mod compact;
+
+pub mod hydrate;

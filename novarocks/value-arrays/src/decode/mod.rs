@@ -50,6 +50,35 @@ fn reserve<T, E>(
     Ok(())
 }
 
+/// A pre-reserved vector is initialized or copied in bounded synchronous
+/// turns. No continuation or byte position escapes the current operation.
+fn resize_observed<T: Clone, E>(
+    values: &mut Vec<T>,
+    count: usize,
+    value: T,
+    work: &mut Work<'_, E>,
+) -> Result<(), ValueFailure<E>> {
+    let per_turn = (64 * 1024 / std::mem::size_of::<T>().max(1)).max(1);
+    while values.len() < count {
+        let chunk = (count - values.len()).min(per_turn);
+        work(chunk.saturating_mul(std::mem::size_of::<T>())).map_err(ValueFailure::Caller)?;
+        values.resize(values.len() + chunk, value.clone());
+    }
+    Ok(())
+}
+fn extend_observed<T: Clone, E>(
+    values: &mut Vec<T>,
+    input: &[T],
+    work: &mut Work<'_, E>,
+) -> Result<(), ValueFailure<E>> {
+    let per_turn = (64 * 1024 / std::mem::size_of::<T>().max(1)).max(1);
+    for chunk in input.chunks(per_turn) {
+        work(chunk.len().saturating_mul(std::mem::size_of::<T>())).map_err(ValueFailure::Caller)?;
+        values.extend_from_slice(chunk);
+    }
+    Ok(())
+}
+
 /// Mapping validity is distinct from bottom validity. A valid key pointing at
 /// NULL remains a valid key, and a NULL key's physical integer is never read.
 #[derive(Clone, Debug)]
@@ -275,7 +304,8 @@ impl DecodedBytes {
         if !self.dictionary || self.flattened {
             return Ok(None);
         };
-        let mut required = SelectionSet::try_new_observed(self.bottom.array.len(), growth)?;
+        let mut required =
+            SelectionSet::try_new_with_control_observed(self.bottom.array.len(), growth, work)?;
         for row in selection.iter() {
             work(1).map_err(ValueFailure::Caller)?;
             if let Some(bottom) = self.checked_mapping(row)? {
@@ -284,7 +314,7 @@ impl DecodedBytes {
         }
         Ok(Some(PeelInput {
             input: self.clone(),
-            selected: Arc::new(selection.try_clone_observed(growth)?),
+            selected: Arc::new(selection.try_clone_with_control_observed(growth, work)?),
             required,
         }))
     }
@@ -333,9 +363,9 @@ impl PeelInput {
         // Unselected rows are not published as meaningful results. Keys keep
         // their own validity and do not inherit the old bottom's NULL mask.
         let mut validity = Vec::<u8>::new();
-        let bytes = keys.len() / 8 + usize::from(keys.len() % 8 != 0);
+        let bytes = keys.len().div_ceil(8);
         reserve(&mut validity, bytes, growth)?;
-        validity.resize(bytes, 0);
+        resize_observed(&mut validity, bytes, 0, work)?;
         let mut valid = 0;
         for row in self.selected.iter() {
             work(1).map_err(ValueFailure::Caller)?;
@@ -390,6 +420,53 @@ impl PeelResult {
     }
 }
 
+/// A frozen computation view prepared with the real caller-owned context.
+/// Descriptor conversion has already acquired storage through the planning
+/// Growth callback. Execution publishes only an Arrow alias of this snapshot;
+/// it does not allocate another descriptor bottom or choose another strategy.
+#[derive(Debug)]
+pub struct DecodePlan {
+    _source: ArrayRef,
+    decoded: DecodedBytes,
+    held_storage_bytes: usize,
+    new_storage_bytes: usize,
+    shared_cached_storage_bytes: usize,
+    planning_growth_requested_bytes: u128,
+}
+impl DecodePlan {
+    /// Existing and newly created descriptor/coverage storage held by this
+    /// plan. This is retention information, not a future allocation request.
+    /// Arrow wrapper/Arc metadata remains at its public R4 boundary.
+    pub fn held_plan_storage_bytes(&self) -> usize {
+        self.held_storage_bytes
+    }
+    /// Actual owned descriptor/coverage capacities first created in this plan.
+    /// This is already held and must not be charged again during execution.
+    pub fn new_plan_storage_bytes(&self) -> usize {
+        self.new_storage_bytes
+    }
+    /// Cached bottom storage merely aliased by planning, not newly allocated.
+    pub fn shared_cached_storage_bytes(&self) -> usize {
+        self.shared_cached_storage_bytes
+    }
+    /// Sum of successful planning Growth request sizes, including transient
+    /// scratch and replacements. This is neither peak retention nor a full
+    /// physical-memory estimate; new requests were admitted when they occurred.
+    pub fn planning_growth_requested_bytes(&self) -> u128 {
+        self.planning_growth_requested_bytes
+    }
+    /// Conversion already acquired its self-owned storage during planning.
+    pub fn output_layouts(&self) -> &[Layout] {
+        &[]
+    }
+    pub fn execution_scratch_layouts(&self) -> &[Layout] {
+        &[]
+    }
+    pub fn decoded(&self) -> &DecodedBytes {
+        &self.decoded
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ConversionStats {
     pub cache_hits: u64,
@@ -402,8 +479,8 @@ pub struct ConversionStats {
 /// These are separate observations, not an extra physical-retention ledger.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ConversionStorageFacts {
-    pub owned_descriptor_bytes: usize,
-    pub declared_backing_bytes: usize,
+    pub owned_descriptor_bytes: u128,
+    pub declared_backing_bytes: u128,
     pub known_owner_capacity: Option<usize>,
 }
 #[derive(Debug)]
@@ -453,11 +530,70 @@ impl ValueConversionContext {
             owned_descriptor_bytes: self
                 .entries
                 .iter()
-                .map(|e| e.bottom.owned_descriptor_bytes)
+                .map(|e| e.bottom.owned_descriptor_bytes as u128)
                 .sum(),
-            declared_backing_bytes: self.entries.iter().map(|e| e.declared_backing_bytes).sum(),
+            declared_backing_bytes: self
+                .entries
+                .iter()
+                .map(|e| e.declared_backing_bytes as u128)
+                .sum(),
             known_owner_capacity: None,
         }
+    }
+    /// Prepare using the context's actual reuse state and efficiency strategy.
+    /// Only the supplied reachable logical rows are converted. Filling a
+    /// sparse bottom may create legal placeholders at unreferenced coordinates,
+    /// but never reads those values or imposes their representation limits.
+    pub fn plan_decode_observed<E>(
+        &mut self,
+        source: &ByteSource<'_>,
+        rows: &ReachableRows<'_>,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+    ) -> Result<DecodePlan, ValueFailure<E>> {
+        let previous = if source.is_dictionary() && !source.value_layout().is_view() {
+            let identity = arrow_raw::byte_storage_identity(source.values().as_ref())?;
+            self.entries
+                .iter()
+                .find(|entry| entry.identity == identity)
+                .map(|entry| entry.bottom.clone())
+        } else {
+            None
+        };
+        let mut planning_growth_requested_bytes = 0u128;
+        let decoded = self.decode_observed(
+            source,
+            rows,
+            &mut |layout| {
+                growth(layout)?;
+                planning_growth_requested_bytes =
+                    planning_growth_requested_bytes.saturating_add(layout.size() as u128);
+                Ok(())
+            },
+            work,
+        )?;
+        let shared_cached_storage_bytes = previous
+            .filter(|bottom| Arc::ptr_eq(bottom, &decoded.bottom))
+            .map_or(0, |bottom| bottom.owned_descriptor_bytes);
+        let held_storage_bytes = decoded
+            .bottom
+            .owned_descriptor_bytes
+            .checked_add(decoded.readable.descriptor_bytes())
+            .ok_or_else(|| violation(ValueViolation::Bounds))?;
+        let new_storage_bytes = held_storage_bytes - shared_cached_storage_bytes;
+        Ok(DecodePlan {
+            _source: source.input().clone(),
+            decoded,
+            held_storage_bytes,
+            new_storage_bytes,
+            shared_cached_storage_bytes,
+            planning_growth_requested_bytes,
+        })
+    }
+    /// Publication performs no self-owned value allocation. A plan remains
+    /// valid after cache eviction, clear, replacement, or a context handoff.
+    pub fn decode_planned(&mut self, plan: &DecodePlan) -> DecodedBytes {
+        plan.decoded.clone()
     }
     pub fn decode(
         &mut self,
@@ -494,7 +630,8 @@ impl ValueConversionContext {
         let utf8 = source.value_layout().is_utf8();
         if !source.is_dictionary() && !source.value_layout().is_view() {
             self.clear();
-            let mut required = SelectionSet::try_new_observed(source.values().len(), growth)?;
+            let mut required =
+                SelectionSet::try_new_with_control_observed(source.values().len(), growth, work)?;
             for row in readable.iter() {
                 work(1).map_err(ValueFailure::Caller)?;
                 if let Some(index) = source.mapped_row(row)? {
@@ -524,7 +661,7 @@ impl ValueConversionContext {
             arrow_raw::byte_storage_identity(source.values().as_ref())?
         };
         let descriptor_bytes = source.values().len().saturating_mul(16);
-        let bitmap_bytes = source.values().len() / 8 + usize::from(source.values().len() % 8 != 0);
+        let bitmap_bytes = source.values().len().div_ceil(8);
         let charge = descriptor_bytes
             .saturating_add(bitmap_bytes)
             .saturating_add(identity[5]);
@@ -544,7 +681,8 @@ impl ValueConversionContext {
             self.stats.cache_skips = self.stats.cache_skips.saturating_add(1);
             return self.flatten(source, readable, growth, work);
         }
-        let mut required = SelectionSet::try_new_observed(source.values().len(), growth)?;
+        let mut required =
+            SelectionSet::try_new_with_control_observed(source.values().len(), growth, work)?;
         for row in readable.iter() {
             work(1).map_err(ValueFailure::Caller)?;
             if let Some(index) = source.mapped_row(row)? {
@@ -556,8 +694,8 @@ impl ValueConversionContext {
             return Ok(DecodedBytes {
                 bottom: Arc::new(DecodedBottom {
                     array: source.values().clone(),
+                    owned_descriptor_bytes: required.descriptor_bytes(),
                     covered: required,
-                    owned_descriptor_bytes: 0,
                 }),
                 mapping,
                 readable,
@@ -654,13 +792,13 @@ impl ValueConversionContext {
         };
         let mut views = Vec::new();
         reserve(&mut views, count, growth)?;
-        views.resize(count, 0);
+        resize_observed(&mut views, count, 0, work)?;
         let mut regions = Vec::new();
         reserve(&mut regions, readable.count(), growth)?;
         let mut validity = Vec::<u8>::new();
-        let validity_bytes = count / 8 + usize::from(count % 8 != 0);
+        let validity_bytes = count.div_ceil(8);
         reserve(&mut validity, validity_bytes, growth)?;
-        validity.resize(validity_bytes, 0);
+        resize_observed(&mut validity, validity_bytes, 0, work)?;
         let mut valid_count = 0;
         for row in readable.iter() {
             work(1).map_err(ValueFailure::Caller)?;
@@ -689,7 +827,7 @@ impl ValueConversionContext {
                 arrow_raw::make_nulls(Buffer::from_vec(validity), count, count - valid_count),
             )
         }?;
-        let covered = readable.try_clone_observed(growth)?;
+        let covered = readable.try_clone_with_control_observed(growth, work)?;
         Ok(DecodedBytes {
             bottom: Arc::new(DecodedBottom {
                 array,
@@ -726,18 +864,20 @@ fn convert_original<E>(
     let mut regions = Vec::new();
     let mut covered = if let Some(previous) = previous {
         let (existing, backing) = arrow_raw::view_parts(previous.array.as_ref())?;
-        views.extend_from_slice(existing.as_ref());
+        extend_observed(&mut views, existing.as_ref(), work)?;
         reserve(
             &mut regions,
             backing.len().saturating_add(required.count()),
             growth,
         )?;
-        regions.extend_from_slice(backing);
-        previous.covered.try_clone_observed(growth)?
+        extend_observed(&mut regions, backing, work)?;
+        previous
+            .covered
+            .try_clone_with_control_observed(growth, work)?
     } else {
-        views.resize(source.len(), 0);
+        resize_observed(&mut views, source.len(), 0, work)?;
         reserve(&mut regions, required.count(), growth)?;
-        SelectionSet::try_new_observed(source.len(), growth)?
+        SelectionSet::try_new_with_control_observed(source.len(), growth, work)?
     };
     for row in required.iter() {
         if covered.contains(row) {
@@ -1186,5 +1326,107 @@ mod tests {
         );
         assert_eq!(context.stats().cache_hits, 0);
         assert_eq!(context.stats().converted_values, 4);
+    }
+    #[test]
+    fn decode_plan_freezes_real_context_reuse_and_never_reallocates_on_publication() {
+        let values: ArrayRef = Arc::new(StringArray::from(vec![
+            "first long external value",
+            "second long external value",
+        ]));
+        let first_input = dictionary(values.clone(), vec![Some(0)]);
+        let second_input = dictionary(values, vec![Some(1)]);
+        let mut context = ValueConversionContext::new(4096);
+        let mut requested = 0u128;
+        let first = context
+            .plan_decode_observed(
+                &source(&first_input, ByteLayout::Utf8),
+                &ReachableRows::all(1),
+                &mut |layout| {
+                    requested += layout.size() as u128;
+                    Ok::<_, Infallible>(())
+                },
+                &mut |_| Ok::<_, Infallible>(()),
+            )
+            .unwrap();
+        assert_eq!(first.planning_growth_requested_bytes(), requested);
+        assert_eq!(first.shared_cached_storage_bytes(), 0);
+        assert_eq!(
+            first.new_plan_storage_bytes(),
+            first.held_plan_storage_bytes()
+        );
+        assert!(first.output_layouts().is_empty());
+        assert!(first.execution_scratch_layouts().is_empty());
+        let hit = context
+            .plan_decode_observed(
+                &source(&first_input, ByteLayout::Utf8),
+                &ReachableRows::all(1),
+                &mut |_| Ok::<_, Infallible>(()),
+                &mut |_| Ok::<_, Infallible>(()),
+            )
+            .unwrap();
+        assert!(hit.shared_cached_storage_bytes() > 0);
+        assert_eq!(
+            hit.new_plan_storage_bytes() + hit.shared_cached_storage_bytes(),
+            hit.held_plan_storage_bytes()
+        );
+        assert_eq!(context.stats().converted_values, 1);
+        let second = context
+            .plan_decode_observed(
+                &source(&second_input, ByteLayout::Utf8),
+                &ReachableRows::all(1),
+                &mut |_| Ok::<_, Infallible>(()),
+                &mut |_| Ok::<_, Infallible>(()),
+            )
+            .unwrap();
+        assert_eq!(context.stats().converted_values, 2);
+        assert_eq!(context.stats().cache_extensions, 1);
+        assert_eq!(second.shared_cached_storage_bytes(), 0);
+        assert!(!first.decoded().bottom_coverage().contains(1));
+        context.clear();
+        let after_clear = context.stats();
+        let published = context.decode_planned(&first);
+        oracle(&published, &[Some("first long external value")]);
+        assert_eq!(context.stats(), after_clear);
+        oracle(
+            &context.decode_planned(&second),
+            &[Some("second long external value")],
+        );
+    }
+    #[test]
+    fn decode_plan_preserves_caller_refusals_and_flattening_choice() {
+        let values: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let input = dictionary(values, vec![Some(1)]);
+        let mut context = ValueConversionContext::new(0);
+        assert!(matches!(
+            context.plan_decode_observed(
+                &source(&input, ByteLayout::Utf8),
+                &ReachableRows::all(1),
+                &mut |_| Err(81),
+                &mut |_| Ok(())
+            ),
+            Err(ValueFailure::Caller(81))
+        ));
+        assert!(matches!(
+            context.plan_decode_observed(
+                &source(&input, ByteLayout::Utf8),
+                &ReachableRows::all(1),
+                &mut |_| Ok(()),
+                &mut |_| Err(82)
+            ),
+            Err(ValueFailure::Caller(82))
+        ));
+        let plan = context
+            .plan_decode_observed(
+                &source(&input, ByteLayout::Utf8),
+                &ReachableRows::all(1),
+                &mut |_| Ok::<_, Infallible>(()),
+                &mut |_| Ok::<_, Infallible>(()),
+            )
+            .unwrap();
+        assert!(plan.decoded().is_flattened());
+        context.budget = 4096;
+        let published = context.decode_planned(&plan);
+        assert!(published.is_flattened());
+        assert_eq!(published.value(0).unwrap(), Some(b"b".as_slice()));
     }
 }
