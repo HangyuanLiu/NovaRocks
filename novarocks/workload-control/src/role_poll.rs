@@ -20,7 +20,9 @@
 //! This private substrate quotes its frame/container storage only. It does not
 //! provide a complete role profile, reserve input pointees, or activate Server.
 
+mod ingress;
 mod ready_queue;
+use ingress::{MountedInput, SharedIngress};
 use ready_queue::ReadyQueue;
 
 use crate::{
@@ -32,7 +34,6 @@ use std::{
     alloc::Layout,
     any::Any,
     future::Future,
-    marker::PhantomData,
     mem::size_of,
     num::NonZeroUsize,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -60,18 +61,21 @@ impl PollRoleGeometry {
     /// Derive facts from the same concrete factory used by the real bank.
     /// This does not invoke the factory or construct its input or owner.
     pub fn for_factory<I, F: Future, M: Fn(WorkOwner, I) -> F>(_: &M) -> Result<Self, WorkError> {
-        let per_slot = size_of::<Position<I, F>>()
+        let per_slot = size_of::<Position<F>>()
+            .checked_add(size_of::<Option<MountedInput<I>>>())
+            .ok_or(WorkError::ArithmeticOverflow)?
             .checked_add(size_of::<Option<F>>())
             .and_then(|n| n.checked_add(size_of::<PollBacking>()))
             .and_then(|n| n.checked_add(size_of::<Option<Arc<PollWake>>>()))
             .and_then(|n| n.checked_add(arc_bytes::<PollWake>().ok()?))
             .ok_or(WorkError::ArithmeticOverflow)?;
         let shared = size_of::<RolePollBank<I, F, M>>()
-            .checked_add(arc_bytes::<Notify>()?)
+            .checked_add(arc_bytes::<SharedIngress<I>>()?)
+            .and_then(|n| n.checked_add(arc_bytes::<Notify>().ok()?))
             .and_then(|n| n.checked_add(arc_bytes::<ReadyQueue>().ok()?))
             .and_then(|n| n.checked_add(size_of::<OwnedNotified>()))
-            // Pinned macOS mutex backing: ready ring and Notify wait list.
-            .and_then(|n| n.checked_add(if cfg!(target_os = "macos") { 128 } else { 0 }))
+            // Pinned macOS mutex backing: input cells, ready ring and Notify wait list.
+            .and_then(|n| n.checked_add(if cfg!(target_os = "macos") { 192 } else { 0 }))
             .ok_or(WorkError::ArithmeticOverflow)?;
         Ok(Self {
             per_slot,
@@ -117,6 +121,7 @@ pub(crate) struct PollBacking {
     pub(crate) phase: PollPhase,
     registration: RegistrationPhase,
     registration_generation: u64,
+    ingress_exported: bool,
 }
 impl PollBacking {
     pub(crate) fn is_installed(&self) -> bool {
@@ -147,6 +152,7 @@ impl PollBacking {
             phase: PollPhase::Free,
             registration: RegistrationPhase::Absent,
             registration_generation: 0,
+            ingress_exported: false,
         }
     }
 }
@@ -168,9 +174,8 @@ impl Wake for PollWake {
     }
 }
 
-// Input, frame and result are destroyed before the actual mount footer.
-struct Position<I, F: Future> {
-    input: Option<(WorkOwner, I)>,
+// Root-owned frame and result are destroyed before the actual mount footer.
+struct Position<F: Future> {
     frame: Option<Pin<Box<Option<F>>>>,
     output: Option<F::Output>,
     footer: Option<Footer>,
@@ -253,10 +258,9 @@ pub(crate) struct RolePollBank<I, F: Future, M> {
     changed: Arc<Notify>,
     ready: Arc<ReadyQueue>,
     waiter: Pin<Box<OwnedNotified>>,
-    positions: Vec<Position<I, F>>,
-    marker: PhantomData<fn(I)>,
-    // Registration leaves after make, positions and all other actual bank fields.
-    _registration: BankRegistration,
+    positions: Vec<Position<F>>,
+    // The original receiving cells/registration leave after every root field.
+    shared: Arc<SharedIngress<I>>,
 }
 impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
     pub(crate) fn install(
@@ -288,6 +292,7 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
                 if slot.phase != SlotPhase::Free
                     || backing.registration != RegistrationPhase::Absent
                     || backing.registration_generation != generation
+                    || backing.ingress_exported
                     || backing.phase != PollPhase::Free
                     || backing.geometry != geometry
                     || Arc::get_mut(&mut backing.wake).is_none()
@@ -312,12 +317,19 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
             .map_err(|_| WorkError::Capacity("fixed role positions"))?;
         for _ in 0..count {
             positions.push(Position {
-                input: None,
                 frame: None,
                 output: None,
                 footer: None,
             });
         }
+        let mut inputs = Vec::new();
+        inputs
+            .try_reserve_exact(count)
+            .map_err(|_| WorkError::Capacity("fixed role input cells"))?;
+        inputs.resize_with(count, || None);
+        let inputs = std::sync::Mutex::new(inputs);
+        // Materialize the original platform mutex before publishing registration.
+        drop(inputs.lock().unwrap());
         // This is startup registration, with all backing already funded by
         // the original fixed base. It executes no runtime notification callback.
         inner.update_facts_silent(|state| {
@@ -331,6 +343,18 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
             }
             Ok::<(), WorkError>(())
         })?;
+        let shared = Arc::new(SharedIngress {
+            inner: Arc::clone(inner),
+            role,
+            generation,
+            ready: Arc::clone(&ready),
+            inputs,
+            _registration: BankRegistration {
+                inner: Arc::clone(inner),
+                role,
+                generation,
+            },
+        });
         Ok(Self {
             inner: Arc::clone(inner),
             role,
@@ -339,12 +363,7 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
             ready,
             waiter,
             positions,
-            marker: PhantomData,
-            _registration: BankRegistration {
-                inner: Arc::clone(inner),
-                role,
-                generation,
-            },
+            shared,
         })
     }
 
@@ -352,8 +371,15 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
         RoleBackingRetirementObserver {
             inner: Arc::downgrade(&self.inner),
             role: self.role,
-            generation: self._registration.generation,
+            generation: self.shared.generation,
         }
+    }
+
+    /// Exporting an ingress permanently forbids pre-ready reinstallation of
+    /// this role on the same authority. The original process/client owner keeps
+    /// its weak header until clients actually exit; this is not hot restart.
+    pub(crate) fn ingress(&self) -> Result<ingress::RoleIngress<I>, WorkError> {
+        self.shared.export()
     }
 
     pub(crate) fn mount_owned(
@@ -361,98 +387,23 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
         owner: WorkOwner,
         input: I,
     ) -> Result<(), MountRejected<I>> {
-        let scope = owner.scope();
-        if !Arc::ptr_eq(&scope.inner, &self.inner) {
-            return Err(MountRejected {
-                owner,
-                input,
-                error: WorkError::Conflict,
-            });
-        }
-        let work = scope.id();
-        let selected = {
-            let state = self.inner.state.lock().unwrap();
-            state.nodes.get(&work).map(|node| {
-                (
-                    node.cancellation,
-                    state.cancellations.slots[node.cancellation.0].generation,
-                )
-            })
-        };
-        let Some((id, generation)) = selected else {
-            return Err(MountRejected {
-                owner,
-                input,
-                error: WorkError::Released,
-            });
-        };
-        // The real owner and input are already in their stable receiving cell
-        // before any transaction callback; rejected values are returned intact.
-        let position = &mut self.positions[id.0];
-        if position.footer.is_some()
-            || position.input.is_some()
-            || position
-                .frame
-                .as_ref()
-                .is_some_and(|frame| frame.as_ref().get_ref().is_some())
-            || position.output.is_some()
-        {
-            return Err(MountRejected {
-                owner,
-                input,
-                error: WorkError::Conflict,
-            });
-        }
-        position.input = Some((owner, input));
-        let result = self.inner.update_facts_silent(|state| {
-            if state.closed {
-                return Err(WorkError::Closed);
-            }
-            if !state.ready {
-                return Err(WorkError::NotReady);
-            }
-            let slot = &mut state.cancellations.slots[id.0];
-            if slot.phase != SlotPhase::Node(work) || slot.generation != generation {
-                return Err(WorkError::Conflict);
-            }
-            let backing = &mut slot.polls[self.role];
-            if !backing.is_installed() {
-                return Err(WorkError::NotReady);
-            }
-            if backing.phase != PollPhase::Free || Arc::get_mut(&mut backing.wake).is_none() {
-                return Err(WorkError::Capacity("role backing has not actually exited"));
-            }
-            backing.phase = PollPhase::Mounted;
-            position.footer = Some(Footer {
-                wake: Arc::clone(&backing.wake),
-                _pin: MountPin {
-                    inner: Arc::clone(&self.inner),
-                    slot: id,
-                    generation,
-                    work,
-                    role: self.role,
-                },
-            });
-            assert!(
-                self.ready.publish(&backing.wake),
-                "unique mount has no old ready hint"
-            );
-            Ok(())
-        });
-        if let Err(error) = result {
-            let (owner, input) = position.input.take().unwrap();
-            return Err(MountRejected {
-                owner,
-                input,
+        let mut owner = Some(owner);
+        let mut input = Some(input);
+        // This exclusive bank borrow keeps the original shared value alive.
+        // A refused sender cannot be its last Arc and run registration cleanup.
+        let result = self.shared.attempt(&mut owner, &mut input).finish();
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(MountRejected {
+                owner: owner.take().unwrap(),
+                input: input.take().unwrap(),
                 error,
-            });
+            }),
         }
-        // Unpublished refusals return their original values before callbacks.
-        // Successful facts precede both notifications; queue notification comes
-        // first, so a WC waiter panic cannot hide the actual mounted input.
-        self.ready.notify();
-        self.inner.changed.notify_waiters();
-        Ok(())
+    }
+
+    pub(crate) fn stop_ingress(&self) {
+        self.shared.stop();
     }
 
     /// Level-triggered readiness. Register before reading the real queue;
@@ -484,7 +435,20 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
             let Some(wake) = self.ready.pop() else {
                 break;
             };
+            let mounted = self.shared.take_input(wake.slot);
             let position = &mut self.positions[wake.slot.0];
+            let input = mounted.map(
+                |MountedInput {
+                     owner,
+                     input,
+                     footer,
+                 }| {
+                    assert!(position.footer.is_none());
+                    assert!(position.output.is_none());
+                    position.footer = Some(footer);
+                    (owner, input)
+                },
+            );
             let Some(footer) = position.footer.as_ref() else {
                 // A completed role can still have a queued stale wake. Its
                 // actual Arc exits here, outside the queue and State locks.
@@ -494,7 +458,7 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
                 Arc::ptr_eq(&footer.wake, &wake),
                 "ready hint retains its original anchor"
             );
-            let construction = if let Some((owner, input)) = position.input.take() {
+            let construction = if let Some((owner, input)) = input {
                 catch_unwind(AssertUnwindSafe(|| {
                     // Materialize this original prepaid slot only on first use.
                     // Keep the same Box through every later reset and reuse.
@@ -556,20 +520,9 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
 
 impl<I, F: Future, M> Drop for RolePollBank<I, F, M> {
     fn drop(&mut self) {
-        // A ready process loses a required service. Stop new admission before
-        // destroying any frame; do not manufacture terminal facts for its Work.
-        let mut state = self.inner.state.lock().unwrap();
-        for slot in &mut state.cancellations.slots {
-            let role = &mut slot.polls[self.role];
-            assert_eq!(role.registration, RegistrationPhase::Installed);
-            assert_eq!(role.registration_generation, self._registration.generation);
-            role.registration = RegistrationPhase::Stopping;
-        }
-        if state.ready {
-            state.ready = false;
-            state.closed = true;
-        }
-        state.advance_progress_revision();
+        // Stop before any make/frame/input destruction. Shared registration
+        // remains until root fields and every original sender tail truly exit.
+        self.shared.stop();
     }
 }
 
@@ -604,6 +557,8 @@ impl Drop for BankRegistration {
 /// Non-owning proof for one original role bank's backing only. The caller must
 /// separately retain and join its actual root task: this proof does not cover
 /// the registration notification tail or the root future that contained it.
+/// Exported ingress Weak headers remain with their process/client owner. They
+/// forbid reinstallation, and this observer does not prove those headers free.
 /// This finite, allocation-free scan is intended for shutdown observation.
 pub(crate) struct RoleBackingRetirementObserver {
     inner: Weak<Inner>,

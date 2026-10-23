@@ -890,11 +890,10 @@ async fn closed_mount_refusal_never_calls_unrelated_waiter_wakes() {
             rejected.owner
         }
         Err(_) => {
-            bank.positions[slot.0]
-                .input
+            bank.shared.inputs.lock().unwrap()[slot.0]
                 .take()
                 .expect("stranded original owner")
-                .0
+                .owner
         }
         Ok(Ok(())) => panic!("closed mount must refuse"),
     };
@@ -1235,4 +1234,332 @@ async fn prepaid_frame_materializes_only_at_first_real_use_and_stays_for_reuse()
     control.close_admission();
     drain(&mut driver);
     assert!(control.inner.state.lock().unwrap().is_drained());
+}
+
+struct IngressSources {
+    owner: Option<WorkOwner>,
+    input: Option<Input>,
+}
+struct IngressCallbackWake {
+    sources: Weak<Mutex<IngressSources>>,
+    shared: Weak<SharedIngress<Input>>,
+    inner: Weak<Inner>,
+    calls: std::sync::atomic::AtomicUsize,
+    panic_once: AtomicBool,
+}
+impl Wake for IngressCallbackWake {
+    fn wake(self: Arc<Self>) {
+        assert!(self.sources.upgrade().unwrap().try_lock().is_ok());
+        assert!(self.inner.upgrade().unwrap().state.try_lock().is_ok());
+        if let Some(shared) = self.shared.upgrade() {
+            assert!(shared.inputs.try_lock().is_ok());
+            assert!(shared.ready.lock_is_available());
+        }
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        if self.panic_once.swap(false, Ordering::AcqRel) {
+            panic!("intentional original ingress sender-tail callback failure");
+        }
+    }
+}
+
+#[tokio::test]
+async fn synchronous_ingress_moves_original_sources_before_unlocked_notifications() {
+    use std::future::Future;
+    let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
+    let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
+    let mut bank = RolePollBank::install(&mut control, 0, run).unwrap();
+    let port = bank.ingress().unwrap();
+    let producer = port.clone();
+    control.mark_ready().unwrap();
+    let root = new_root(&control);
+    let work = root.owner.scope().id();
+    let input = new_input(true);
+    let original = Arc::clone(&input.ready);
+    root.business.release();
+    let sources = Arc::new(Mutex::new(IngressSources {
+        owner: Some(root.owner),
+        input: Some(input),
+    }));
+    let wake = Arc::new(IngressCallbackWake {
+        sources: Arc::downgrade(&sources),
+        shared: Arc::downgrade(&bank.shared),
+        inner: Arc::downgrade(&control.inner),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        panic_once: AtomicBool::new(false),
+    });
+    let waker = Waker::from(Arc::clone(&wake));
+    let mut progress = Box::pin(control.wait_progress(control.progress_revision()));
+    assert!(
+        progress
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    let attempt = {
+        let mut sources = sources.lock().unwrap();
+        let IngressSources { owner, input } = &mut *sources;
+        let attempt = producer.try_mount_in(owner, input);
+        assert_eq!(attempt.result(), &Ok(()));
+        assert!(owner.is_none() && input.is_none());
+        assert_eq!(wake.calls.load(Ordering::Acquire), 0);
+        attempt
+    };
+    let slot = control.inner.state.lock().unwrap().nodes[&work].cancellation;
+    {
+        let inputs = bank.shared.inputs.lock().unwrap();
+        let mounted = inputs[slot.0].as_ref().unwrap();
+        assert_eq!(mounted.owner.scope().id(), work);
+        assert!(Arc::ptr_eq(&mounted.input.ready, &original));
+    }
+    drop(producer);
+    attempt.finish().unwrap();
+    assert!(wake.calls.load(Ordering::Acquire) > 0);
+    drop(progress);
+    assert!(
+        bank.positions
+            .iter()
+            .all(|position| position.frame.is_none())
+    );
+    let PollCompletion::Ready(output) = bank.progress_turn(budget()).unwrap() else {
+        panic!("original factory must run");
+    };
+    assert_eq!(*output.value(), 7);
+    drop(output);
+    drain(&mut driver);
+    assert!(
+        !control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .nodes
+            .contains_key(&work)
+    );
+}
+
+#[tokio::test]
+async fn dropping_a_successful_sender_wakes_the_waiting_root_and_preserves_input_on_panic() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    for panic_callback in [false, true] {
+        let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
+        let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
+        let mut bank = RolePollBank::install(&mut control, 0, run).unwrap();
+        let port = bank.ingress().unwrap();
+        control.mark_ready().unwrap();
+        let root = new_root(&control);
+        let work = root.owner.scope().id();
+        let input = new_input(true);
+        let original = Arc::clone(&input.ready);
+        root.business.release();
+        let sources = Arc::new(Mutex::new(IngressSources {
+            owner: Some(root.owner),
+            input: Some(input),
+        }));
+        let wake = Arc::new(IngressCallbackWake {
+            sources: Arc::downgrade(&sources),
+            shared: Arc::downgrade(&bank.shared),
+            inner: Arc::downgrade(&control.inner),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            panic_once: AtomicBool::new(panic_callback),
+        });
+        let waker = Waker::from(Arc::clone(&wake));
+        assert!(
+            bank.poll_ready(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let attempt = {
+            let mut sources = sources.lock().unwrap();
+            let IngressSources { owner, input } = &mut *sources;
+            let attempt = port.try_mount_in(owner, input);
+            assert_eq!(attempt.result(), &Ok(()));
+            assert!(owner.is_none() && input.is_none());
+            assert_eq!(wake.calls.load(Ordering::Acquire), 0);
+            attempt
+        };
+        // No finish or bank teardown supplies the missing notification.
+        assert_eq!(
+            catch_unwind(AssertUnwindSafe(|| drop(attempt))).is_err(),
+            panic_callback
+        );
+        assert_eq!(wake.calls.load(Ordering::Acquire), 1);
+        let slot = control.inner.state.lock().unwrap().nodes[&work].cancellation;
+        {
+            let inputs = bank.shared.inputs.lock().unwrap();
+            let mounted = inputs[slot.0].as_ref().unwrap();
+            assert_eq!(mounted.owner.scope().id(), work);
+            assert!(Arc::ptr_eq(&mounted.input.ready, &original));
+        }
+        assert!(bank.poll_ready(&mut Context::from_waker(&waker)).is_ready());
+        let PollCompletion::Ready(output) = bank.progress_turn(budget()).unwrap() else {
+            panic!("accepted input must run through its original factory");
+        };
+        assert_eq!(*output.value(), 7);
+        drop(output);
+        drain(&mut driver);
+        assert!(control.inner.state.lock().unwrap().nodes.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn refused_sender_tail_exits_after_external_source_unlock_even_if_it_panics() {
+    use std::{
+        future::Future,
+        panic::{AssertUnwindSafe, catch_unwind},
+    };
+    let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
+    let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
+    let bank = RolePollBank::install(&mut control, 0, run).unwrap();
+    let port = bank.ingress().unwrap();
+    let observer = bank.retirement_observer();
+    control.mark_ready().unwrap();
+    let root = new_root(&control);
+    let work = root.owner.scope().id();
+    let input = new_input(true);
+    let original = Arc::clone(&input.ready);
+    root.business.release();
+    let sources = Arc::new(Mutex::new(IngressSources {
+        owner: Some(root.owner),
+        input: Some(input),
+    }));
+    bank.stop_ingress();
+    let wake = Arc::new(IngressCallbackWake {
+        sources: Arc::downgrade(&sources),
+        shared: Arc::downgrade(&bank.shared),
+        inner: Arc::downgrade(&control.inner),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        panic_once: AtomicBool::new(true),
+    });
+    let waker = Waker::from(Arc::clone(&wake));
+    let mut progress = Box::pin(control.wait_progress(control.progress_revision()));
+    assert!(
+        progress
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    let attempt = {
+        let mut sources = sources.lock().unwrap();
+        let IngressSources { owner, input } = &mut *sources;
+        let attempt = port.try_mount_in(owner, input);
+        assert_eq!(attempt.result(), &Err(WorkError::Closed));
+        assert!(owner.is_some() && input.is_some());
+        drop(bank);
+        assert_eq!(
+            observer.is_reclaimed(),
+            Ok(false),
+            "the original sender still retains late registration"
+        );
+        assert_eq!(wake.calls.load(Ordering::Acquire), 0);
+        attempt
+    };
+    assert!(catch_unwind(AssertUnwindSafe(|| attempt.finish())).is_err());
+    drop(progress);
+    let mut sources = sources.lock().unwrap();
+    assert_eq!(sources.owner.as_ref().unwrap().scope().id(), work);
+    assert!(Arc::ptr_eq(
+        &sources.input.as_ref().unwrap().ready,
+        &original
+    ));
+    sources.owner.take().unwrap().complete();
+    drop(sources);
+    drain(&mut driver);
+    assert_eq!(observer.is_reclaimed(), Ok(true));
+}
+
+#[tokio::test]
+async fn accepted_unpolled_input_survives_root_exit_until_original_sender_exits() {
+    let called = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&called);
+    let make = move |owner: WorkOwner, input: Input| {
+        seen.store(true, Ordering::Release);
+        run(owner, input)
+    };
+    let roles = [PollRoleGeometry::for_factory(&make).unwrap()];
+    let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
+    let bank = RolePollBank::install(&mut control, 0, make).unwrap();
+    let port = bank.ingress().unwrap();
+    let observer = bank.retirement_observer();
+    control.mark_ready().unwrap();
+    let root = new_root(&control);
+    let work = root.owner.scope().id();
+    root.business.release();
+    let mut owner = Some(root.owner);
+    let mut input = Some(new_input(true));
+    let attempt = port.try_mount_in(&mut owner, &mut input);
+    assert_eq!(attempt.result(), &Ok(()));
+    drop(bank);
+    assert_eq!(observer.is_reclaimed(), Ok(false));
+    assert!(!called.load(Ordering::Acquire));
+    assert_eq!(
+        control.inner.state.lock().unwrap().nodes[&work].owner,
+        crate::OwnerState::Active
+    );
+    attempt.finish().unwrap();
+    drain(&mut driver);
+    assert!(!called.load(Ordering::Acquire));
+    assert_eq!(observer.is_reclaimed(), Ok(true));
+    assert_eq!(
+        control.inner.state.lock().unwrap().nodes[&work].owner,
+        crate::OwnerState::Orphaned
+    );
+    control
+        .adopt(work)
+        .unwrap()
+        .complete_after_terminal_cancel_settled();
+    drain(&mut driver);
+}
+
+#[tokio::test]
+async fn stopping_is_idempotent_and_drains_only_previously_accepted_inputs() {
+    let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
+    let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
+    let mut bank = RolePollBank::install(&mut control, 0, run).unwrap();
+    let port = bank.ingress().unwrap();
+    control.mark_ready().unwrap();
+    let root = new_root(&control);
+    root.business.release();
+    let mut owner = Some(root.owner);
+    let mut input = Some(new_input(true));
+    port.try_mount_in(&mut owner, &mut input).finish().unwrap();
+    bank.stop_ingress();
+    let revision = control.progress_revision();
+    bank.stop_ingress();
+    assert_eq!(control.progress_revision(), revision);
+    let PollCompletion::Ready(output) = bank.progress_turn(budget()).unwrap() else {
+        panic!("accepted input must drain after stop");
+    };
+    assert_eq!(*output.value(), 7);
+    drop(output);
+    drain(&mut driver);
+    assert!(control.inner.state.lock().unwrap().nodes.is_empty());
+    drop(bank);
+}
+
+#[tokio::test]
+async fn exporting_a_weak_ingress_permanently_refuses_same_authority_reinstallation() {
+    let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
+    let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
+    let bank = RolePollBank::install(&mut control, 0, run).unwrap();
+    let port = bank.ingress().unwrap();
+    let observer = bank.retirement_observer();
+    drop(bank);
+    drain(&mut driver);
+    assert_eq!(
+        observer.is_reclaimed(),
+        Ok(true),
+        "this observer covers value backing, not exported weak headers"
+    );
+    assert!(matches!(
+        RolePollBank::install(&mut control, 0, run),
+        Err(WorkError::Conflict)
+    ));
+    drop(port);
+    assert!(matches!(
+        RolePollBank::install(&mut control, 0, run),
+        Err(WorkError::Conflict)
+    ));
+    assert_eq!(
+        control.inner.state.lock().unwrap().cancellations.slots[0].polls[0].registration_generation,
+        1
+    );
 }

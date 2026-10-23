@@ -35,6 +35,11 @@ pub(super) struct ReadyQueue {
 }
 
 impl ReadyQueue {
+    #[cfg(test)]
+    pub(super) fn lock_is_available(&self) -> bool {
+        self.ring.try_lock().is_ok()
+    }
+
     pub(super) fn new(count: usize, changed: Arc<Notify>) -> Result<Arc<Self>, WorkError> {
         let mut entries = Vec::new();
         entries
