@@ -33,10 +33,12 @@ use std::{
 };
 
 mod control_storage;
+mod dependency_storage;
 mod metadata_geometry;
 pub(crate) mod proposal_storage;
 #[cfg(test)]
 pub(crate) use control_storage::control_storage_base;
+use dependency_storage::{DependencyRef, DependencyRegistry};
 pub use proposal_storage::JointGrantedClaims;
 use proposal_storage::{
     ChangeBody, ProposalConstruction, ProposalKey, queue_proposal, retire_proposal,
@@ -48,10 +50,19 @@ pub(super) struct DependencyRecord {
 }
 
 /// A registry identity for an actual selected dependency, not an I/O permit.
-#[derive(Clone)]
 pub struct JointDependency {
     inner: Arc<Inner>,
-    pub(super) record: Arc<DependencyRecord>,
+    pub(super) record: DependencyRef,
+    _exit: crate::scope::ReclaimWakeOnExit,
+}
+impl Clone for JointDependency {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            record: self.record.clone(),
+            _exit: crate::scope::ReclaimWakeOnExit::observe(&Arc::downgrade(&self.inner)),
+        }
+    }
 }
 impl JointDependency {
     pub fn fact(&self) -> &SharedDependency {
@@ -74,7 +85,7 @@ pub(super) struct ProfileFacts {
     pub(super) key: Arc<ProfileKey>,
     pub(super) class: WorkClass,
     pub(super) lane: JointLane,
-    pub(super) dependencies: Arc<[Arc<DependencyRecord>]>,
+    pub(super) dependencies: Arc<[DependencyRef]>,
 }
 #[derive(Clone)]
 pub(super) struct ProfileRecord {
@@ -195,7 +206,7 @@ pub(super) struct RequestRecord {
 }
 pub(crate) struct JointLedger {
     pub(super) config: Arc<ValidatedJointCapacityConfig>,
-    dependencies: BTreeMap<SharedDependency, Weak<DependencyRecord>>,
+    dependencies: Option<DependencyRegistry>,
     pub(super) claims: BTreeMap<u64, ClaimRecord>,
     pub(super) profiles: BTreeMap<Arc<ProfileKey>, ProfileRecord>,
     pub(super) requests: BTreeMap<u64, RequestRecord>,
@@ -208,8 +219,24 @@ pub(crate) struct JointLedger {
     control_empty_facts: [Option<Arc<ProfileFacts>>; 5],
 }
 impl JointLedger {
+    pub(super) fn has_reclaimable_dependencies(&self) -> bool {
+        self.dependencies
+            .as_ref()
+            .is_some_and(|rows| rows.has_zero())
+    }
+    pub(super) fn reap_dependency(&mut self) -> bool {
+        self.dependencies
+            .as_mut()
+            .is_some_and(|rows| rows.reap_one())
+    }
     pub(crate) fn is_drained(&self, storage: &CancellationStorage) -> bool {
-        if !self.requests.is_empty() || self.active.is_some() {
+        if !self.requests.is_empty()
+            || self.active.is_some()
+            || self
+                .dependencies
+                .as_ref()
+                .is_some_and(|rows| !rows.is_empty())
+        {
             return false;
         }
         if !storage.fixed {
@@ -289,7 +316,7 @@ impl WorkloadControl {
             }
             state.joint = Some(JointLedger {
                 config: Arc::clone(&config),
-                dependencies: BTreeMap::new(),
+                dependencies: None,
                 claims: BTreeMap::new(),
                 profiles: BTreeMap::new(),
                 requests: BTreeMap::new(),
@@ -318,37 +345,44 @@ impl JointAdmissionHandle {
             if state.closed || ledger.driver_closed {
                 return Err(WorkError::Closed);
             }
-            if let Some(record) = ledger.dependencies.get(&fact).and_then(Weak::upgrade) {
+            // Only the legacy kernel fixture can initialize an unpaid service.
+            // Production composition creates this inventory after fee validation.
+            #[cfg(test)]
+            if state.joint.as_ref().unwrap().dependencies.is_none() {
+                let count = state
+                    .joint
+                    .as_ref()
+                    .unwrap()
+                    .config
+                    .config
+                    .max_registered_dependencies;
+                state.joint.as_mut().unwrap().dependencies = Some(DependencyRegistry::new(count)?);
+            }
+            let ledger = state.joint.as_mut().unwrap();
+            let registry = ledger.dependencies.as_mut().ok_or(WorkError::NotReady)?;
+            if let Some(record) = registry.lookup(&fact) {
                 return Ok(JointDependency {
                     inner: Arc::clone(&self.inner),
                     record,
+                    _exit: crate::scope::ReclaimWakeOnExit::observe(&Arc::downgrade(&self.inner)),
                 });
             }
-            // New positive metadata cannot invalidate an in-flight snapshot.
             if ledger.active.is_some() {
                 return Err(WorkError::Capacity("joint proof fence"));
             }
-            let ledger = state.joint.as_mut().unwrap();
-            ledger
-                .dependencies
-                .retain(|_, record| record.strong_count() != 0);
-            if ledger.dependencies.len() >= ledger.config.config.max_registered_dependencies {
-                return Err(WorkError::Capacity("joint dependency registry"));
-            }
             let ordinal = state.next_id()?;
-            let record = Arc::new(DependencyRecord {
-                ordinal,
-                fact: fact.clone(),
-            });
-            state
+            let record = state
                 .joint
                 .as_mut()
                 .unwrap()
                 .dependencies
-                .insert(fact, Arc::downgrade(&record));
+                .as_mut()
+                .unwrap()
+                .insert(fact, ordinal)?;
             Ok(JointDependency {
                 inner: Arc::clone(&self.inner),
                 record,
+                _exit: crate::scope::ReclaimWakeOnExit::observe(&Arc::downgrade(&self.inner)),
             })
         })
     }
@@ -595,7 +629,7 @@ impl JointAdmissionHandle {
                 if !Arc::ptr_eq(&self.inner, &dependency.inner) {
                     return Err(WorkError::ForeignAuthority);
                 }
-                selected.push(Arc::clone(&dependency.record));
+                selected.push(dependency.record.clone());
             }
             selected.sort_unstable_by_key(|record| record.ordinal);
             if source.is_none() && selected.windows(2).any(|p| p[0].ordinal == p[1].ordinal) {
@@ -1313,6 +1347,15 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
             ledger.profiles.remove(&key);
         } else {
             ledger.profiles.insert(key, profile);
+        }
+    }
+    for change in changes.iter() {
+        for dependency in change.claim.facts.dependencies.iter() {
+            ledger
+                .dependencies
+                .as_mut()
+                .unwrap()
+                .mark_published(dependency);
         }
     }
     ledger.requests.get_mut(&id).unwrap().phase = RequestPhase::Granted { new_ids };

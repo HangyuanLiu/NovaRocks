@@ -177,6 +177,20 @@ impl WorkloadControl {
                 .next_id
                 .checked_add(total_scopes)
                 .ok_or(WorkError::ArithmeticOverflow)?;
+            let rows = metadata_geometry::maximum_fact_roots(
+                declared,
+                count
+                    .checked_mul(config.proposals_per_slot)
+                    .ok_or(WorkError::ArithmeticOverflow)?,
+            )?
+            .checked_mul(declared.max_dependencies_per_claim)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+            if declared.max_registered_dependencies < rows {
+                return Err(WorkError::InvalidConfig(
+                    "fixed dependency membership inventory",
+                ));
+            }
+            let dependencies = DependencyRegistry::new(declared.max_registered_dependencies)?;
             let mut slots = Vec::new();
             slots
                 .try_reserve_exact(count)
@@ -204,7 +218,7 @@ impl WorkloadControl {
                     }),
                     class: classes[class],
                     lane: JointLane::Custody,
-                    dependencies: Arc::from(Vec::<Arc<DependencyRecord>>::new()),
+                    dependencies: Arc::from(Vec::<DependencyRef>::new()),
                 });
                 empty_facts[class] = Some(Arc::clone(&facts));
                 free_heads[class] = Some(SlotId(slots.len()));
@@ -256,6 +270,7 @@ impl WorkloadControl {
                 }
             }
             let ledger = state.joint.as_mut().unwrap();
+            ledger.dependencies = Some(dependencies);
             ledger.claims = claims;
             ledger.profiles = profiles;
             ledger.control_empty_facts = empty_facts;
@@ -387,10 +402,15 @@ impl JointLedger {
         assert!(record.facts.dependencies.is_empty());
         let from = Arc::clone(&record.facts);
         let amount = record.amounts;
-        let dependency = Arc::new(DependencyRecord {
-            ordinal,
-            fact: SharedDependency::LocalHost,
-        });
+        let registry = self.dependencies.as_mut().unwrap();
+        let dependency = registry
+            .lookup(&SharedDependency::LocalHost)
+            .unwrap_or_else(|| {
+                registry
+                    .insert(SharedDependency::LocalHost, ordinal)
+                    .unwrap()
+            });
+        let ordinal = dependency.ordinal;
         let to = Arc::new(ProfileFacts {
             key: Arc::new(ProfileKey {
                 class: class_index(from.class),
@@ -408,5 +428,43 @@ impl JointLedger {
         record.active_facts = to;
         record.structure_revision += 1;
         self.layout_changed();
+    }
+}
+
+#[cfg(test)]
+mod canonical_fixture_tests {
+    use super::*;
+
+    #[test]
+    fn fixture_reuses_the_actual_canonical_ordinal_in_its_profile_key() {
+        let (control, handle, mut driver) =
+            crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 1, 1);
+        let canonical = handle
+            .register_dependency(SharedDependency::LocalHost)
+            .unwrap();
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        {
+            let mut state = control.inner.state.lock().unwrap();
+            let slot = state.nodes[&work.owner.scope().id()].cancellation;
+            let claim = state.cancellations.slots[slot.0].claim.unwrap();
+            let later = state.next_id().unwrap();
+            assert_ne!(canonical.record.ordinal, later);
+            let ledger = state.joint.as_mut().unwrap();
+            ledger.bind_control_fixture(slot, claim, later);
+            let facts = &ledger.claims[&claim].facts;
+            assert_eq!(facts.key.dependencies, vec![canonical.record.ordinal]);
+            assert_eq!(facts.dependencies[0].ordinal, facts.key.dependencies[0]);
+        }
+        drop(canonical);
+        work.business.release();
+        work.owner.complete();
+        for _ in 0..1000 {
+            if matches!(driver.step(), JointProgress::Idle(_)) {
+                return;
+            }
+        }
+        panic!("actual fixture graph exit must reach idle");
     }
 }

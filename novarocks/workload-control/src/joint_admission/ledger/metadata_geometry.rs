@@ -22,43 +22,49 @@
 //! graphs and complete roles remain with their separate original authors.
 
 use super::*;
-use crate::control_storage::{
-    arc_bytes, arc_slice_bytes, array_bytes, btree_peak_bytes, sum_bytes,
-};
+use crate::control_storage::{arc_bytes, arc_slice_bytes, array_bytes, sum_bytes};
 use std::mem::size_of;
+
+pub(super) fn maximum_fact_roots(
+    config: &JointCapacityConfig,
+    proposals: usize,
+) -> Result<usize, WorkError> {
+    config
+        .max_claims
+        .checked_mul(4)
+        .and_then(|n| {
+            n.checked_add(
+                proposals
+                    .checked_mul(config.max_changes_per_request)?
+                    .checked_mul(2)?,
+            )
+        })
+        .and_then(|n| n.checked_add(config.max_changes_per_request.checked_mul(2)?))
+        .and_then(|n| n.checked_add(1))
+        .ok_or(WorkError::ArithmeticOverflow)
+}
 
 pub(super) fn backing_bytes(
     config: &JointCapacityConfig,
     proposals: usize,
     empty_classes: usize,
 ) -> Result<usize, WorkError> {
-    let n = config.max_claims;
     let k = config.max_dependencies_per_claim;
     let c = config.max_changes_per_request;
     let m = config.max_registered_dependencies;
-    let qc = proposals
-        .checked_mul(c)
-        .ok_or(WorkError::ArithmeticOverflow)?;
-    // Charged + active claims, historical map-owned aggregate facts, old driver
-    // snapshots, and all original/proposed Q bodies. The transaction may retain
-    // 2C historical temporary profile values; one fetched snapshot candidate
-    // can precede its capacity rejection. No alias credit is assumed.
-    let facts_count = n
-        .checked_mul(4)
-        .and_then(|n| n.checked_add(qc.checked_mul(2)?))
-        .and_then(|n| n.checked_add(c.checked_mul(2)?))
-        .and_then(|n| n.checked_add(1))
-        .ok_or(WorkError::ArithmeticOverflow)?;
+    // Charged/active claims, retained aggregate and driver graphs, old/new
+    // Q bodies and transaction-local facts all keep canonical memberships.
+    let facts_count = maximum_fact_roots(config, proposals)?;
     let facts = sum_bytes([
         arc_bytes::<ProfileFacts>()?,
         arc_bytes::<ProfileKey>()?,
         array_bytes::<u64>(k)?,
-        arc_slice_bytes::<Arc<DependencyRecord>>(k)?,
+        arc_slice_bytes::<DependencyRef>(k)?,
     ])?;
     let empty_facts = sum_bytes([
         arc_bytes::<ProfileFacts>()?,
         arc_bytes::<ProfileKey>()?,
-        arc_slice_bytes::<Arc<DependencyRecord>>(0)?,
+        arc_slice_bytes::<DependencyRef>(0)?,
     ])?
     .checked_mul(empty_classes)
     .ok_or(WorkError::ArithmeticOverflow)?;
@@ -69,17 +75,10 @@ pub(super) fn backing_bytes(
     // The old cursor can retain a key after its original ProfileFacts exits.
     let cursor = sum_bytes([arc_bytes::<ProfileKey>()?, array_bytes::<u64>(k)?])?;
     let origin = novarocks_resource_contract::NetworkServiceOrigin::MAX_BYTES;
-    let row = sum_bytes([
-        arc_bytes::<DependencyRecord>()?,
-        arc_slice_bytes::<u8>(origin)?,
-    ])?;
-    let registry = sum_bytes([
-        btree_peak_bytes::<SharedDependency, Weak<DependencyRecord>>(m)?,
-        m.checked_mul(row).ok_or(WorkError::ArithmeticOverflow)?,
-    ])?;
+    let registry = dependency_storage::backing_bytes(m)?;
     // Current append/dedup authors can temporarily retain old+grown selected
     // buffers. Do not use the smaller future bounded-builder geometry yet.
-    let selected = array_bytes::<Arc<DependencyRecord>>(
+    let selected = array_bytes::<DependencyRef>(
         k.checked_mul(6)
             .ok_or(WorkError::ArithmeticOverflow)?
             .max(4),

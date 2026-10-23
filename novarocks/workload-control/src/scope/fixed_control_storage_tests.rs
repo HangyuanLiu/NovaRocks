@@ -83,6 +83,11 @@ pub(crate) fn prototype_profile(
         max_total_proof_work: 10000000,
         work_per_turn: NonZeroUsize::new(7).unwrap(),
     };
+    config.max_registered_dependencies = (4 * config.max_claims
+        + 2 * count * storage.proposals_per_slot * max_changes
+        + 2 * max_changes
+        + 1)
+        * max_dependencies;
     let base = crate::joint_admission::ledger::control_storage_base(storage, &config).unwrap();
     let metadata = base.get(JointResource::MetadataBytes);
     let global = JointResources::ZERO
@@ -2060,7 +2065,7 @@ fn metadata_reservation_tracks_actual_service_geometry_and_rejects_overflow_befo
     let baseline = quote(&geometry).unwrap().get(JointResource::MetadataBytes);
     for larger in [
         JointCapacityConfig {
-            max_registered_dependencies: 8,
+            max_registered_dependencies: geometry.max_registered_dependencies * 2,
             ..geometry.clone()
         },
         JointCapacityConfig {

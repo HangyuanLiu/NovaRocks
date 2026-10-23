@@ -230,6 +230,28 @@ impl JointProgressDriver {
     pub fn step(&mut self) -> JointProgress {
         let proposal_more = self.reclaim_proposal_one();
         let reclaim_more = self.reclaim_one();
+        // One canonical zero row per fair turn. Final graph exit is published
+        // by the original builder/Turn/reaper/State exit guards, never here.
+        let dependency_more = {
+            let mut state = self.inner.state.lock().unwrap();
+            let reclaimed = state
+                .joint
+                .as_mut()
+                .is_some_and(|ledger| ledger.reap_dependency());
+            if reclaimed {
+                state.advance_progress_revision();
+            }
+            reclaimed
+        };
+        self.step_after_reclaim(proposal_more, reclaim_more, dependency_more)
+    }
+
+    fn step_after_reclaim(
+        &mut self,
+        proposal_more: bool,
+        reclaim_more: bool,
+        dependency_more: bool,
+    ) -> JointProgress {
         let proof = self.step_proof();
         if let JointProgress::Idle(marker) = proof {
             let state = self.inner.state.lock().unwrap();
@@ -237,6 +259,11 @@ impl JointProgressDriver {
             // Do not swallow that generation by returning the later marker.
             if proposal_more
                 || reclaim_more
+                || dependency_more
+                || state
+                    .joint
+                    .as_ref()
+                    .is_some_and(|ledger| ledger.has_reclaimable_dependencies())
                 || (state.cancellations.retired_proposals != 0
                     && self.proposal_idle != Some(marker))
                 || (state.cancellations.fixed
@@ -1039,5 +1066,71 @@ impl Drop for JointProgressDriver {
         for waker in wakers {
             waker.wake();
         }
+    }
+}
+
+#[cfg(test)]
+mod dependency_exit_tests {
+    use super::*;
+    use crate::joint_admission::ledger::JointAdmissionHandle;
+    use novarocks_resource_contract::SharedDependency;
+    use std::{
+        future::Future,
+        task::{Context, Waker},
+    };
+
+    fn fixture() -> (
+        crate::WorkloadControl,
+        JointAdmissionHandle,
+        JointProgressDriver,
+    ) {
+        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 1, 1)
+    }
+
+    #[test]
+    fn last_external_dependency_exit_wakes_the_original_idle_driver() {
+        let (control, handle, mut driver) = fixture();
+        let reference = handle
+            .register_dependency(SharedDependency::LocalHost)
+            .unwrap();
+        let JointProgress::Idle(marker) = driver.step() else {
+            panic!("idle live identity")
+        };
+        let mut waiter = Box::pin(control.wait_progress(marker));
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(reference);
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready(),
+            "actual final graph exit must wake the same original progress wait"
+        );
+        assert!(matches!(driver.step(), JointProgress::More));
+    }
+
+    #[test]
+    fn zero_published_between_reclaim_and_proof_idle_is_not_swallowed() {
+        let (control, handle, mut driver) = fixture();
+        let reference = handle
+            .register_dependency(SharedDependency::LocalHost)
+            .unwrap();
+        assert!(matches!(driver.step(), JointProgress::Idle(_)));
+        // The first half saw no zero. Last exit now happens before the proof
+        // half captures its newer idle revision, exactly the lost-wake window.
+        drop(reference);
+        control.inner.notify_reclaim_progress();
+        assert!(
+            matches!(
+                driver.step_after_reclaim(false, false, false),
+                JointProgress::More
+            ),
+            "Idle must not capture a later wake while a zero row is queued"
+        );
     }
 }
