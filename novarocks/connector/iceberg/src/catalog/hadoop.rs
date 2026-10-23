@@ -38,8 +38,8 @@ use super::{
 /// A Hadoop filesystem Iceberg catalog.
 ///
 /// Its create is not a catalog call: the linearization point is a conditional
-/// write of the canonical `v1.metadata.json` in storage, followed by an
-/// authoritative reread (ADR-0077). That gives atomic empty-table creation, and
+/// install of the canonical complete `v1.metadata.json` in storage. A lost
+/// response needs exact positive readback (ADR-0195). That gives atomic empty-table creation, and
 /// it is why this catalog accepts one create intent while refusing the other.
 ///
 /// CTAS is refused before any side effect. There is no staged-create protocol
@@ -90,28 +90,26 @@ const OVERSIZED_READ_DIAGNOSTIC: &str = "Hadoop catalog read diagnostic exceeds 
 /// copying only an admitted borrowed message. The SDK's source/context display
 /// can retain an arbitrary remote response and must never be rendered here.
 fn map_bounded_read_error(error: &crate::iceberg::Error) -> ConnectorError {
-    use novarocks_spi::connector::ConnectorErrorKind;
-    let (kind, message) = match std::error::Error::source(error)
-        .and_then(|source| source.downcast_ref::<ConnectorError>())
-    {
-        Some(source)
-            if matches!(
-                source.kind(),
-                ConnectorErrorKind::ResourceExhausted
-                    | ConnectorErrorKind::Cancelled
-                    | ConnectorErrorKind::DeadlineExceeded
-            ) =>
-        {
-            (source.kind(), source.message())
+    use std::error::Error as _;
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if let Some(error) = cause.downcast_ref::<ConnectorError>() {
+            return error.clone().map_message(|message| {
+                if message.len() <= MAX_BOUNDED_READ_DIAGNOSTIC_BYTES {
+                    message
+                } else {
+                    OVERSIZED_READ_DIAGNOSTIC.into()
+                }
+            });
         }
-        _ => (super::error::read_error_kind(error.kind()), error.message()),
-    };
-    let message = if message.len() <= MAX_BOUNDED_READ_DIAGNOSTIC_BYTES {
-        message
+        source = cause.source();
+    }
+    let message = if error.message().len() <= MAX_BOUNDED_READ_DIAGNOSTIC_BYTES {
+        error.message()
     } else {
         OVERSIZED_READ_DIAGNOSTIC
     };
-    ConnectorError::new(kind, message)
+    ConnectorError::new(super::error::read_error_kind(error.kind()), message)
 }
 
 #[async_trait]
@@ -153,11 +151,6 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
                     novarocks_spi::connector::ConnectorMutationFailure::new(
                         match failure.kind {
                             crate::hadoop_catalog::HadoopCreateFailureKind::Invalid => novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
-                            #[cfg(test)]
-                            crate::hadoop_catalog::HadoopCreateFailureKind::Unsupported => novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
-                            #[cfg(test)]
-                            crate::hadoop_catalog::HadoopCreateFailureKind::Uncommitted
-                            | crate::hadoop_catalog::HadoopCreateFailureKind::Unknown => novarocks_spi::connector::ConnectorMutationFailureKind::Internal,
                         },
                         failure.message,
                     ),
@@ -200,14 +193,12 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
             == CatalogOperation::CreateTable(super::CatalogCreateIntent::EmptyTable)
         {
             let (attempt, no_op_if_exists) = request.into_hadoop_create()?;
-            return Arc::clone(&self.client).prepare_conditional_create(
-                attempt,
-                no_op_if_exists,
-                &preparation,
-            );
+            return Arc::clone(&self.client)
+                .prepare_conditional_create(attempt, no_op_if_exists, &preparation)
+                .await;
         }
         if request.operation == CatalogOperation::DropTable {
-            request.table_drop_policy()?;
+            let (no_op_if_missing, _) = request.table_drop_policy()?;
             let CatalogAdmissionTarget::Table(table) = &request.target else {
                 return Err(crate::iceberg::Error::new(
                     crate::iceberg::ErrorKind::DataInvalid,
@@ -216,9 +207,13 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
                 .into());
             };
             preparation.check_active()?;
-            return Ok(
-                Arc::clone(&self.client).prepare_table_drop(super::delegate::table_ident(table)?)
-            );
+            return Arc::clone(&self.client)
+                .prepare_table_drop(
+                    super::delegate::table_ident(table)?,
+                    no_op_if_missing,
+                    preparation,
+                )
+                .await;
         }
         if !matches!(
             request.operation,
@@ -485,7 +480,7 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         self.client
             .namespace_exists_for_read(&ident, binding)
             .await
-            .map_err(|error| super::error::map_read_error(&error))
+            .map_err(|error| map_bounded_read_error(&error))
     }
 
     async fn list_tables(
@@ -539,7 +534,7 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         self.client
             .table_exists_for_read(&ident, binding)
             .await
-            .map_err(|error| super::error::map_read_error(&error))
+            .map_err(|error| map_bounded_read_error(&error))
     }
 
     async fn load_table(
@@ -569,20 +564,27 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
                     crate::loaded_table::IcebergAccessDelegation::static_binding(),
                 )
             })
-            .map_err(|error| super::error::map_read_error(&error))
+            .map_err(|error| map_bounded_read_error(&error))
     }
 
-    async fn load_commit_base(
+    async fn load_commit_base_for_request(
         &self,
         table: CatalogTableName,
         file_io: crate::iceberg::io::FileIO,
+        _snapshots: super::SnapshotLoading,
+        binding: crate::access_binding::IcebergReadBinding,
     ) -> crate::iceberg::Result<super::CatalogCommitBase> {
         let ident = super::delegate::table_ident(&table).map_err(|error| {
-            crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, error.to_string())
-                .with_source(error)
+            crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::DataInvalid,
+                "Invalid Hadoop commit table",
+            )
+            .with_source(error)
         })?;
         super::CatalogCommitBase::from_table(
-            self.client.load_table_for_commit(&ident, file_io).await?,
+            self.client
+                .load_table_for_commit(&ident, file_io, binding)
+                .await?,
         )
     }
 

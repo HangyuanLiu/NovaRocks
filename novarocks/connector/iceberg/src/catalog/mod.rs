@@ -611,6 +611,19 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         self.load_commit_base(table, file_io).await
     }
 
+    /// Filesystem catalogs need the original request binding for bounded
+    /// directory discovery in addition to the operation's metadata FileIO.
+    async fn load_commit_base_for_request(
+        &self,
+        table: CatalogTableName,
+        file_io: crate::iceberg::io::FileIO,
+        snapshots: SnapshotLoading,
+        _binding: crate::access_binding::IcebergReadBinding,
+    ) -> crate::iceberg::Result<CatalogCommitBase> {
+        self.load_commit_base_with_snapshots(table, file_io, snapshots)
+            .await
+    }
+
     /// Whether the view exists.
     ///
     /// An implementation whose catalog format cannot hold views returns

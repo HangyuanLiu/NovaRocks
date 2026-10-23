@@ -49,6 +49,7 @@ reqsign = { version = "0.16.5", default-features = false, features = ["services-
 reqwest = { workspace = true, features = ["rustls-tls"] }
 sha2.workspace = true
 tracing.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 url.workspace = true
 novarocks-secret.workspace = true
@@ -57,7 +58,6 @@ novarocks-spi.workspace = true
 [dev-dependencies]
 novarocks-failpoint = { workspace = true, features = ["typed"] }
 serde_json.workspace = true
-tempfile.workspace = true
 
 [features]
 

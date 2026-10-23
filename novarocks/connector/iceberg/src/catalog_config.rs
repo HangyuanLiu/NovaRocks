@@ -651,6 +651,9 @@ fn normalize_warehouse_location(raw: &str) -> Result<(String, PathBuf), String> 
         let path = canonicalize_or_join(Path::new(stripped))?;
         return Ok((format!("file://{}", path.display()), path));
     }
+    if raw.starts_with("hdfs://") {
+        return Err("Hadoop test catalogs do not support HDFS: complete native conditional installation is unavailable".into());
+    }
     if raw.contains("://") {
         return Err(format!(
             "standalone iceberg hadoop catalog warehouse only supports local paths or file:// URIs, got {raw}"

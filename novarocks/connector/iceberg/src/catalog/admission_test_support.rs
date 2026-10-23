@@ -415,6 +415,19 @@ impl NovaRocksCatalog for AdmittedCatalog {
             .await
     }
 
+    async fn load_commit_base_for_request(
+        &self,
+        table: CatalogTableName,
+        file_io: crate::iceberg::io::FileIO,
+        snapshots: super::SnapshotLoading,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> crate::iceberg::Result<super::CatalogCommitBase> {
+        self.trace_snapshot_loading(snapshots);
+        self.inner
+            .load_commit_base_for_request(table, file_io, snapshots, binding)
+            .await
+    }
+
     async fn load_commit_base_with_snapshots(
         &self,
         table: CatalogTableName,

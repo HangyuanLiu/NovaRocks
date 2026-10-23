@@ -26,11 +26,14 @@ repo_root=$(cd "$fixture_dir/../.." && pwd)
 publication="$("$fixture_dir/up.sh" | python3 -c 'import json, sys; print(json.load(sys.stdin)["published_dir"])')"
 source "$publication/env.sh"
 
+# Preserve the original run owner and cumulative deadline across every helper.
+owns_fixture_run=false
+[[ "${NOVA_FIXTURE_RUN_CONTEXT:-null}" == null ]] && owns_fixture_run=true
 NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$fixture_dir/fixture_run.py" context --env-file "$publication/env.sh")"
 export NOVA_FIXTURE_RUN_CONTEXT
 NOVA_FIXTURE_RUN_STORAGE="$(python3 "$fixture_dir/fixture_run.py" storage --env-file "$publication/env.sh")"
 export NOVA_FIXTURE_RUN_STORAGE
-python3 "$fixture_dir/fixture_run.py" sweep-start --env-file "$publication/env.sh" >&2
+export NOVA_ENV_REST_ENV_FILE="$publication/env.sh"
 run_token="$(date +%s)_$$"
 warehouse_base="${NOVAROCKS_ICEBERG_TEST_WAREHOUSE%/}"
 warehouse="${warehouse_base}/hadoop-spark-interop-${run_token}"
@@ -42,19 +45,66 @@ catalog="nr_hadoop_interop_${run_token}"
 namespace="interop_${run_token}"
 spark_table="spark_created"
 novarocks_table="novarocks_created"
-artifact="$NOVA_ENV_RUNTIME_DIR/hadoop-catalog-spark-interop-${run_token}.log"
-tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/novarocks-hadoop-spark-interop.XXXXXX")
+# Keep all inputs, process receipts, failure logs, and cleanup outcomes. Local
+# evidence is never removed by EXIT, including when fixture cleanup succeeds.
+tmp_dir=$(mktemp -d "$NOVA_ENV_RUNTIME_DIR/hadoop-catalog-spark-interop.XXXXXX")
+artifact="$tmp_dir/interop.log"
 server_log="$tmp_dir/novarocks.log"
-server_pid=""
+server_pid_file="$tmp_dir/server.pid"
+server_receipt="$tmp_dir/server.process.json"
+server_owner_pid=""
+process_owner="$script_dir/hadoop-catalog-spark-interop-owner.py"
+printf '%s\n' "$NOVA_FIXTURE_RUN_CONTEXT" > "$tmp_dir/run-context.json"
+printf '%s\n' "$NOVA_FIXTURE_RUN_STORAGE" > "$tmp_dir/run-storage.json"
 
 cleanup() {
-    if [[ -n "$server_pid" ]] && kill -0 "$server_pid" >/dev/null 2>&1; then
-        kill "$server_pid" >/dev/null 2>&1 || true
-        wait "$server_pid" >/dev/null 2>&1 || true
+    local primary=$? settle=0 cleanup_status=0 owner_status=0
+    trap - EXIT INT TERM
+    if [[ -n "$server_owner_pid" ]]; then
+        if [[ ! -s "$server_receipt" ]] || ! python3 - "$server_receipt" <<'PYWAITED'
+import json,sys
+raise SystemExit(0 if json.load(open(sys.argv[1])).get("child_waited") is True else 1)
+PYWAITED
+        then
+            if [[ -f "$server_pid_file" ]] && kill -0 "$server_owner_pid" >/dev/null 2>&1; then
+                local child_pid
+                child_pid=$(cat "$server_pid_file")
+                if [[ "$child_pid" =~ ^[1-9][0-9]*$ ]]; then
+                    kill -TERM -- "-$child_pid" >/dev/null 2>&1 || true
+                else
+                    settle=1
+                fi
+            else
+                settle=1
+                kill -TERM "$server_owner_pid" >/dev/null 2>&1 || true
+            fi
+        fi
+        wait "$server_owner_pid" || owner_status=$?
+        printf '%s\n' "$owner_status" > "$tmp_dir/server-owner.exit"
     fi
-    rm -rf "$tmp_dir"
+    python3 "$process_owner" check --directory "$tmp_dir" > "$tmp_dir/writer-exit.log" 2>&1 || settle=$?
+    if (( settle != 0 )); then
+        printf '%s\n' 'WriterExitUnknown: run retained; cleanup was not dispatched' > "$tmp_dir/cleanup.log"
+        cleanup_status=1
+    elif [[ "$owns_fixture_run" != true ]]; then
+        printf '%s\n' 'cleanup=deferred owner=inherited-original-run' > "$tmp_dir/cleanup.log"
+    elif [[ "$NOVA_FIXTURE_RUN_CONTEXT" == null ]]; then
+        printf '%s\n' 'cleanup=skipped reason=private-publication' > "$tmp_dir/cleanup.log"
+    else
+        NOVA_FIXTURE_CLEANUP_MODE=true python3 "$fixture_dir/fixture_run.py" cleanup-run \
+            --env-file "$publication/env.sh" > "$tmp_dir/cleanup.log" 2>&1 || cleanup_status=$?
+    fi
+    printf '%s\n' "$primary" > "$tmp_dir/primary.exit"
+    printf '%s\n' "$cleanup_status" > "$tmp_dir/cleanup.exit"
+    printf 'primary_exit=%s cleanup_exit=%s artifact_dir=%s\n' "$primary" "$cleanup_status" "$tmp_dir" >&2
+    (( primary == 0 )) || exit "$primary"
+    exit "$cleanup_status"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+python3 "$fixture_dir/fixture_run.py" sweep-start --env-file "$publication/env.sh" \
+    > "$tmp_dir/startup-sweep.json" 2> "$tmp_dir/startup-sweep.stderr"
 
 compose=(
     python3 "$fixture_dir/fixture_run.py" compose --env-file "$publication/env.sh" --
@@ -113,21 +163,24 @@ metadata_digest() {
     shasum -a 256 | awk '{print $1}'
 }
 
-spark_sql() {
-    local sql_file=$1
+run_spark() {
+    local helper=$1 input=$2 invocation output status=0
+    invocation=$(mktemp "$tmp_dir/spark-invocation.XXXXXX")
+    output="$invocation.log"
     NOVAROCKS_SPARK_EXTRA_DEFAULTS="$tmp_dir/spark-hadoop-defaults.conf" \
-        "$fixture_dir/spark-sql.sh" "$sql_file"
+        python3 "$process_owner" run --kind spark --env-file "$publication/env.sh" \
+        --receipt "$invocation.process.json" --log "$output" -- \
+        "$fixture_dir/$helper" "$input" > "$output" 2>&1 || status=$?
+    cat "$output"
+    return "$status"
 }
 
-spark_shell() {
-    local scala_file=$1
-    NOVAROCKS_SPARK_EXTRA_DEFAULTS="$tmp_dir/spark-hadoop-defaults.conf" \
-        "$fixture_dir/spark-shell.sh" "$scala_file"
-}
+spark_sql() { run_spark spark-sql.sh "$1"; }
+spark_shell() { run_spark spark-shell.sh "$1"; }
 
 mysql_exec() {
     local sql=$1
-    "$mysql_bin" \
+    python3 "$fixture_dir/fixture_run.py" command --env-file "$publication/env.sh" -- "$mysql_bin" \
         --protocol=TCP \
         --host=127.0.0.1 \
         --port="$NOVA_ENV_MYSQL_PORT" \
@@ -176,20 +229,34 @@ mysql_bin=$(command -v mysql || true)
 
 log "phase=novarocks-start"
 cd "$repo_root"
-cargo build -p novarocks-server 2>&1 | tee -a "$artifact"
-NO_PROXY=127.0.0.1,localhost target/debug/novarocks standalone \
-    --role all-in-one \
-    --fe-config "$NOVAROCKS_FE_CONFIG" \
-    --be-config "$NOVAROCKS_BE_CONFIG" >"$server_log" 2>&1 &
-server_pid=$!
+receipt="${NOVA_CI_ARTIFACT_RECEIPT:-$tmp_dir/artifacts.json}"
+if [[ -z "${NOVA_CI_ARTIFACT_RECEIPT:-}" ]]; then
+    python3 "$fixture_dir/fixture_run.py" command --env-file "$publication/env.sh" -- \
+        "$repo_root/tools/ci/dev-test.sh" prepare "$receipt" > "$tmp_dir/build.log" 2>&1 || {
+            cat "$tmp_dir/build.log" | tee -a "$artifact"
+            fail "canonical workspace preparation failed"
+        }
+fi
+NOVAROCKS_BIN="$(python3 "$repo_root/tools/ci/cargo-artifacts.py" verify "$receipt" novarocks)"
+export NOVAROCKS_BIN
+printf '%s\n' "$receipt" > "$tmp_dir/artifact-receipt.path"
+cp "$receipt" "$tmp_dir/artifacts-used.json"
+python3 "$fixture_dir/fixture_run.py" command --env-file "$publication/env.sh" -- \
+    "$NOVAROCKS_BIN" --build-info > "$tmp_dir/server-build-info.json"
+NO_PROXY=127.0.0.1,localhost python3 "$process_owner" run --kind server \
+    --env-file "$publication/env.sh" --receipt "$server_receipt" --pid-file "$server_pid_file" -- \
+    "$NOVAROCKS_BIN" standalone --role all-in-one \
+    --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG" > "$server_log" 2>&1 &
+server_owner_pid=$!
 for _ in $(seq 1 60); do
     if grep -q '^NOVAROCKS_READY ' "$server_log"; then
         break
     fi
-    if ! kill -0 "$server_pid" >/dev/null 2>&1; then
+    if ! kill -0 "$server_owner_pid" >/dev/null 2>&1; then
         tail -40 "$server_log" | tee -a "$artifact"
         fail "NovaRocks exited before readiness"
     fi
+    python3 "$fixture_dir/fixture_run.py" remaining --env-file "$publication/env.sh" >/dev/null
     sleep 1
 done
 grep -q '^NOVAROCKS_READY ' "$server_log" || fail "timed out waiting for NovaRocks readiness"
@@ -290,5 +357,5 @@ novarocks_uuid_after_spark=$(printf '%s' "$novarocks_metadata_after_spark" | met
 
 log "spark_no_hint_strict_outcome=failed_without_overwrite"
 log "spark_no_hint_v1_sha256=$novarocks_digest_after_spark"
-log "PASS: Spark and NovaRocks loaded the same UUID/location in both directions"
+log "interop_assertions=passed; writer exit and run cleanup are recorded by the original owner"
 log "artifact=$artifact"

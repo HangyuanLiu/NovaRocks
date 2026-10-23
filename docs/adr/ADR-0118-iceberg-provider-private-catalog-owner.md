@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0195
+    scope: "Hadoop physical existence and full-chain DROP; catalog ownership and admission remain active"
+    link: "ADR-0195-hadoop-test-catalog-complete-version-installation.md"
   - id: ADR-0179
     scope: "Unified Transaction and late SDK TableCommit carrier; private catalog ownership and operation admission remain active"
     link: "ADR-0179-iceberg-publication-lifecycle-and-evidence.md"

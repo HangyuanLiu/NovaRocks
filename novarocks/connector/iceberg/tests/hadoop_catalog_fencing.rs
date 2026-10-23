@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::Output;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -47,7 +47,12 @@ use novarocks_spi::connector::{
     CreatePolicy, CredentialConsumerRole, ExternalMutationEffect, ExternalMutationFinalization,
     ExternalMutationOutcome, StaticCredentialReference,
 };
+use novarocks_test_support::ManagedCommand;
 use sha2::{Digest, Sha256};
+
+#[path = "support/hadoop_fencing_run.rs"]
+mod hadoop_fencing_run;
+use hadoop_fencing_run::{RunOwner, child_work_deadline};
 
 const CHILD_ENV: &str = "NR_HADOOP_FENCE_CHILD";
 const WAREHOUSE_ENV: &str = "NR_HADOOP_FENCE_WAREHOUSE";
@@ -99,32 +104,40 @@ struct PrefixAudit {
 }
 
 #[test]
-fn local_strict_two_process_fencing() {
+fn local_strict_two_process_fencing() -> anyhow::Result<()> {
     let warehouse = tempfile::tempdir().expect("local warehouse");
-    run_race(
-        &warehouse.path().to_string_lossy(),
-        "local_strict",
-        Policy::Strict,
-    );
+    RunOwner::local()?.run(|owner| {
+        run_race(
+            owner,
+            &warehouse.path().to_string_lossy(),
+            "local_strict",
+            Policy::Strict,
+        )
+    })
 }
 
 #[test]
-fn local_noop_two_process_fencing() {
+fn local_noop_two_process_fencing() -> anyhow::Result<()> {
     let warehouse = tempfile::tempdir().expect("local warehouse");
-    run_race(
-        &warehouse.path().to_string_lossy(),
-        "local_noop",
-        Policy::NoOp,
-    );
+    RunOwner::local()?.run(|owner| {
+        run_race(
+            owner,
+            &warehouse.path().to_string_lossy(),
+            "local_noop",
+            Policy::NoOp,
+        )
+    })
 }
 
 #[test]
 #[ignore = "requires the shared MinIO fixture"]
-fn minio_strict_and_noop_two_process_fencing() {
-    let warehouse = std::env::var("NR_HADOOP_FENCE_MINIO_WAREHOUSE")
-        .expect("MinIO runner must set NR_HADOOP_FENCE_MINIO_WAREHOUSE");
-    run_race(&warehouse, "minio_strict", Policy::Strict);
-    run_race(&warehouse, "minio_noop", Policy::NoOp);
+fn minio_strict_and_noop_two_process_fencing() -> anyhow::Result<()> {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    RunOwner::minio(&repo)?.run(|owner| {
+        let warehouse = owner.warehouse()?.to_owned();
+        run_race(owner, &warehouse, "minio_strict", Policy::Strict)?;
+        run_race(owner, &warehouse, "minio_noop", Policy::NoOp)
+    })
 }
 
 /// The parent process invokes this exact libtest entry in two independent
@@ -142,7 +155,7 @@ fn hadoop_fencing_child_process_entry() {
     let barrier = PathBuf::from(required_env(BARRIER_ENV));
     let child_index = required_env(CHILD_INDEX_ENV);
 
-    let config = catalog_configuration(&warehouse);
+    let config = catalog_configuration(&warehouse, object_store_config(&warehouse));
     let runtime = tokio::runtime::Runtime::new().expect("child runtime");
     // Each child constructs its own production control generation. The
     // mutation capability freezes and publishes through that owner's journal.
@@ -250,16 +263,22 @@ fn hadoop_fencing_child_process_entry() {
         "{}/{namespace}/{table_name}/metadata/v1.metadata.json",
         config.warehouse_uri.trim_end_matches('/')
     );
-    let read_binding = catalog_binding(&config);
+    let deadline = child_work_deadline().expect("parent work deadline");
+    let read_binding = catalog_binding(&config).for_request(read_request_context(deadline));
     let access =
         novarocks_connector_iceberg::fs_io::resolve_access_for_location(&location, &read_binding)
             .expect("resolve child v1 access");
     let bytes = runtime
-        .block_on(
-            access
-                .operator()
-                .read(access.single_relative_path().expect("v1 path")),
-        )
+        .block_on(async {
+            tokio::time::timeout_at(deadline.into(), async {
+                access
+                    .operator()
+                    .read(access.single_relative_path().expect("v1 path"))
+                    .await
+            })
+            .await
+        })
+        .expect("child metadata read exceeded original work deadline")
         .expect("read authoritative v1 after child create")
         .to_bytes();
     let metadata: TableMetadata = serde_json::from_slice(&bytes).expect("decode child v1");
@@ -279,11 +298,17 @@ fn hadoop_fencing_child_process_entry() {
     );
 }
 
-fn run_race(warehouse: &str, table_name: &str, policy: Policy) {
+fn run_race(
+    owner: &mut RunOwner,
+    warehouse: &str,
+    table_name: &str,
+    policy: Policy,
+) -> anyhow::Result<()> {
+    owner.check_work()?;
     let namespace = "fencing";
     // Configuration parsing canonicalizes local paths to file:// URIs. Use
     // that same identity for child inputs, receipts and the independent audit.
-    let config = catalog_configuration(warehouse);
+    let config = catalog_configuration(warehouse, owner.object_store_config());
     let warehouse = config.warehouse_uri.as_str();
     let metadata_location = format!(
         "{}/{}/{}/metadata/v1.metadata.json",
@@ -291,7 +316,7 @@ fn run_race(warehouse: &str, table_name: &str, policy: Policy) {
         namespace,
         table_name
     );
-    let binding = catalog_binding(&config);
+    let binding = catalog_binding(&config).for_request(read_request_context(owner.work_deadline()));
     let access = novarocks_connector_iceberg::fs_io::resolve_access_for_location(
         &metadata_location,
         &binding,
@@ -303,9 +328,10 @@ fn run_race(warehouse: &str, table_name: &str, policy: Policy) {
     );
 
     let barrier = tempfile::tempdir().expect("process barrier");
-    let mut children = Vec::new();
-    for index in 0..2 {
-        let child = Command::new(std::env::current_exe().expect("current test executable"))
+    let commands = std::array::from_fn(|index| {
+        let mut command =
+            ManagedCommand::new(std::env::current_exe().expect("current test executable"));
+        command
             .args([
                 "--ignored",
                 "--exact",
@@ -319,19 +345,14 @@ fn run_race(warehouse: &str, table_name: &str, policy: Policy) {
             .env(TABLE_ENV, table_name)
             .env(POLICY_ENV, policy.as_str())
             .env(BARRIER_ENV, barrier.path())
-            .env(CHILD_INDEX_ENV, index.to_string())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn independent catalog child");
-        children.push(child);
-    }
-
-    let outputs = children
-        .into_iter()
-        .map(|child| child.wait_with_output().expect("wait for catalog child"))
+            .env(CHILD_INDEX_ENV, index.to_string());
+        command
+    });
+    let captures = owner.capture_pair(commands)?;
+    let results = captures
+        .iter()
+        .map(|capture| parse_child_result(&capture.output))
         .collect::<Vec<_>>();
-    let results = outputs.iter().map(parse_child_result).collect::<Vec<_>>();
     assert_ne!(results[0].pid, results[1].pid, "children must be processes");
     assert_eq!(
         results
@@ -357,7 +378,8 @@ fn run_race(warehouse: &str, table_name: &str, policy: Policy) {
     assert_eq!(results[0].location, results[1].location);
     assert_eq!(results[0].digest, results[1].digest);
 
-    let audit = audit_prefix(&config, namespace, table_name);
+    owner.check_work()?;
+    let audit = audit_prefix(&config, namespace, table_name, owner.work_deadline());
     assert_eq!(audit.uuid, results[0].uuid);
     assert_eq!(audit.location, results[0].location);
     assert_eq!(audit.digest, results[0].digest);
@@ -384,29 +406,38 @@ fn run_race(warehouse: &str, table_name: &str, policy: Policy) {
         audit.digest,
         audit.entries.join(",")
     );
+    owner.check_work()?;
+    for capture in captures {
+        capture.release_diagnostics()?;
+    }
+    Ok(())
 }
 
 fn audit_prefix(
     config: &IcebergCatalogConfiguration,
     namespace: &str,
     table_name: &str,
+    deadline: Instant,
 ) -> PrefixAudit {
     let runtime = tokio::runtime::Runtime::new().expect("audit runtime");
     let catalog = build_hadoop_catalog(
         config,
-        catalog_binding(config),
+        catalog_binding(config).for_request(read_request_context(deadline)),
         novarocks_connector_iceberg::iceberg::Runtime::new(&runtime),
     )
     .expect("build audit Hadoop catalog");
     let ident = TableIdent::from_strs([namespace, table_name]).expect("audit table identity");
     let table = runtime
-        .block_on(catalog.load_table(&ident))
+        .block_on(async {
+            tokio::time::timeout_at(deadline.into(), catalog.load_table(&ident)).await
+        })
+        .expect("audit table load exceeded original work deadline")
         .expect("load authoritative table for audit");
     let location = table
         .metadata_location()
         .expect("audit table metadata location")
         .to_string();
-    let binding = catalog_binding(config);
+    let binding = catalog_binding(config).for_request(read_request_context(deadline));
     let access =
         novarocks_connector_iceberg::fs_io::resolve_access_for_location(&location, &binding)
             .expect("resolve audit metadata access");
@@ -422,13 +453,25 @@ fn audit_prefix(
     let metadata_dir = format!("{}/", metadata_dir.trim_end_matches('/'));
     let operator = access.operator();
     let bytes = runtime
-        .block_on(operator.read(&relative_path))
+        .block_on(async {
+            tokio::time::timeout_at(deadline.into(), async {
+                operator.read(&relative_path).await
+            })
+            .await
+        })
+        .expect("audit metadata read exceeded original work deadline")
         .expect("read authoritative v1")
         .to_bytes();
     let decoded: TableMetadata =
         serde_json::from_slice(&bytes).expect("decode authoritative v1 metadata");
     let mut entries = runtime
-        .block_on(operator.list(&metadata_dir))
+        .block_on(async {
+            tokio::time::timeout_at(deadline.into(), async {
+                operator.list(&metadata_dir).await
+            })
+            .await
+        })
+        .expect("audit listing exceeded original work deadline")
         .expect("list metadata prefix")
         .into_iter()
         .filter(|entry| entry.metadata().mode().is_file())
@@ -483,7 +526,9 @@ fn parse_child_result(output: &Output) -> ChildResult {
 }
 
 fn wait_for_both_children(barrier: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = child_work_deadline()
+        .expect("parent work deadline")
+        .min(Instant::now() + Duration::from_secs(30));
     while !(barrier.join("ready-0").exists() && barrier.join("ready-1").exists()) {
         assert!(
             Instant::now() < deadline,
@@ -496,7 +541,10 @@ fn wait_for_both_children(barrier: &Path) {
     }
 }
 
-fn catalog_configuration(warehouse: &str) -> IcebergCatalogConfiguration {
+fn catalog_configuration(
+    warehouse: &str,
+    object_store_config: Option<ObjectStoreConfig>,
+) -> IcebergCatalogConfiguration {
     let properties = vec![
         ("type".to_string(), "iceberg".to_string()),
         ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
@@ -505,7 +553,6 @@ fn catalog_configuration(warehouse: &str) -> IcebergCatalogConfiguration {
             warehouse.to_string(),
         ),
     ];
-    let object_store_config = object_store_config(warehouse);
     parse_catalog_configuration_with_object_store_binding(
         "hadoop_fencing",
         &properties,
@@ -550,8 +597,16 @@ fn object_store_config(warehouse: &str) -> Option<ObjectStoreConfig> {
 }
 
 fn request_context() -> ConnectorRequestContext {
+    read_request_context(
+        child_work_deadline()
+            .expect("parent work deadline")
+            .min(Instant::now() + Duration::from_secs(30)),
+    )
+}
+
+fn read_request_context(deadline: Instant) -> ConnectorRequestContext {
     ConnectorRequestContext::try_new(
-        Instant::now() + Duration::from_secs(30),
+        deadline,
         ConnectorStopOwner::new().view(),
         64 * 1024,
         256 * 1024,
@@ -577,7 +632,7 @@ impl IcebergStaticCredentialResolver for ChildCredentials {
         reference: &StaticCredentialReference,
     ) -> Result<ObjectStoreSecretMaterial, ConnectorError> {
         assert_eq!(reference.name(), "fencing-metadata");
-        assert_eq!(reference.generation(), "1");
+        assert_eq!(reference.generation(), "v1");
         self.0.clone().ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
@@ -614,7 +669,7 @@ fn child_control(
                 CatalogCredentialPurpose::ObjectStoreMetadata,
                 CredentialConsumerRole::Frontend,
                 CatalogCredentialMode::Static(
-                    StaticCredentialReference::try_new("fencing-metadata", "1")
+                    StaticCredentialReference::try_new("fencing-metadata", "v1")
                         .expect("metadata credential reference"),
                 ),
             )

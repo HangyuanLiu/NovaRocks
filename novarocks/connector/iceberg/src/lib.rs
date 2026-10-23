@@ -50,6 +50,7 @@ pub(crate) mod catalog;
 pub mod catalog_cache;
 pub mod catalog_config;
 pub mod catalog_control;
+mod catalog_metadata_root;
 pub mod catalog_runtime;
 pub mod change_planning;
 pub mod commit;

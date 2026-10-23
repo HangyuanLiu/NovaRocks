@@ -1016,7 +1016,10 @@ async fn reclaim_round_using(
             context.check_active()?;
             protect_half_references(&candidates, &mut protected);
             let before = pending.len();
-            pending.retain(|path| !protected.paths.contains(path));
+            pending.retain(|path| {
+                !protected.paths.contains(path)
+                    && !crate::catalog_metadata_root::is_catalog_metadata_root(path)
+            });
             report.protected += before - pending.len();
             report.pending = pending.len();
             if pending.is_empty() {

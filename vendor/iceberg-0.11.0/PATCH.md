@@ -57,11 +57,9 @@ No patches applied in the initial source commit.
 - Exit: IRU-8 replaces the external semantic-identity compatibility boundary and removes this patch.
 - Coverage: migrated `test_table_metadata_v3_missing_next_row_id_defaults_to_initial`; existing v3 metadata serde tests.
 
-## U4 — direct child directory listing
+## Retired patches
 
-- Purpose: preserve the 0.9 directory-listing capability on Storage and FileIO, with local-filesystem and in-memory implementations.
-- Files: `src/io/storage/{mod,local_fs,memory}.rs`, `src/io/file_io.rs`.
-- Upstream status: no tracked upstream issue; rc.2 has no directory-listing method.
-- Production dependency: Hadoop catalog namespace/table discovery; unsupported storage backends return FeatureUnsupported.
-- Exit: IRU-6c migrates the Hadoop storage discovery protocol and removes this patch when its consumer no longer needs the SDK directory extension. IRU-6a retains the existing Hadoop protocol.
-- Coverage: existing connector Hadoop catalog discovery tests; V2 standalone core check. Old core has no dedicated directory-listing tests.
+U4 (direct child directory listing) has been removed. Hadoop discovery now
+uses NovaRocks' own bounded filesystem helpers; the four former U4 source files
+match upstream commit `859048563bc71a3167d0545cb66756d26c64e4ca` byte for byte.
+The SDK Storage/FileIO interfaces no longer carry a directory extension.

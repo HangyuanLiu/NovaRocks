@@ -870,9 +870,7 @@ mod tests {
         async fn exists(&self, path: &str) -> crate::iceberg::Result<bool> {
             self.inner()?.exists(path).await
         }
-        async fn list_directories(&self, path: &str) -> crate::iceberg::Result<Vec<String>> {
-            self.inner()?.list_directories(path).await
-        }
+
         async fn metadata(
             &self,
             path: &str,

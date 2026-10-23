@@ -18,6 +18,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Formatter};
 use std::future::IntoFuture;
+use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
@@ -818,6 +819,10 @@ impl FsAccessHandle {
     ///
     /// Design: ADR-0077 makes native conditional storage creation the publication
     /// fence; this method must never emulate it with an existence check plus write.
+    /// Local installation performs synchronous filesystem calls on the calling
+    /// thread. Its caller must retain that thread until the operation returns
+    /// (catalog callers use their joining runtime bridge), rather than run it
+    /// directly on a Tokio worker. This layer does not schedule another task.
     pub async fn create_if_absent(
         &self,
         path_index: usize,
@@ -839,12 +844,28 @@ impl FsAccessHandle {
             ));
         }
 
+        if self.scheme == FsScheme::Local {
+            let root = self.root.as_deref().ok_or_else(|| {
+                FileError::new(FileErrorKind::Internal, "local access handle has no root")
+            })?;
+            let relative = normalize_bound_relative_path(
+                Path::new(path.operator_relative_path()),
+                path.location().original(),
+            )?;
+            return install_local_file(&Path::new(root).join(relative), cancellation, |file| {
+                file.write_all(&payload).map_err(|error| {
+                    map_local_install_error("write conditional temporary file", error)
+                })
+            });
+        }
+
         let result = self
             .operator
             .write_with(path.operator_relative_path(), payload)
             .if_not_exists(true)
             .await;
-        cancellation.check()?;
+        // The completed operation owns its result. A later stop cannot erase
+        // its ACK (or replace its original failure with a cancellation error).
         match result {
             Ok(_) => Ok(ConditionalCreateOutcome::Created),
             Err(error) => {
@@ -857,6 +878,62 @@ impl FsAccessHandle {
             }
         }
     }
+}
+
+/// Write and close a private file before exposing its name at the target slot.
+/// No future or detached work survives this synchronous call, including stop
+/// and deadline paths. The write callback is the one whole-payload writer.
+fn install_local_file(
+    target: &Path,
+    cancellation: &FileCancellation,
+    write: impl FnOnce(&mut std::fs::File) -> FileResult<()>,
+) -> FileResult<ConditionalCreateOutcome> {
+    cancellation.check()?;
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    // Preserve the local operator's existing parent-directory creation policy.
+    std::fs::create_dir_all(parent)
+        .map_err(|error| map_local_install_error("create conditional file parent", error))?;
+    cancellation.check()?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".novarocks-create-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|error| map_local_install_error("create conditional temporary file", error))?;
+    let written = cancellation
+        .check()
+        .and_then(|()| write(temporary.as_file_mut()));
+    // into_temp_path closes the file before hard_link. We promise complete
+    // runtime visibility, not persistence across power loss, so do not fsync.
+    let temporary = temporary.into_temp_path();
+    let result = written.and_then(|()| {
+        cancellation.check()?;
+        match std::fs::hard_link(&temporary, target) {
+            Ok(()) => Ok(ConditionalCreateOutcome::Created),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok(ConditionalCreateOutcome::AlreadyExists)
+            }
+            Err(error) => Err(map_local_install_error("install conditional file", error)),
+        }
+    });
+    if let Err(error) = temporary.close() {
+        // Removing the private name never retracts a successful installation.
+        tracing::warn!(%error, "failed to remove conditional temporary file");
+    }
+    result
+}
+
+fn map_local_install_error(operation: &str, error: std::io::Error) -> FileError {
+    let kind = match error.kind() {
+        std::io::ErrorKind::AlreadyExists => FileErrorKind::AlreadyExists,
+        std::io::ErrorKind::NotFound => FileErrorKind::NotFound,
+        std::io::ErrorKind::PermissionDenied => FileErrorKind::Permission,
+        _ => FileErrorKind::Transient,
+    };
+    let cause = authority_cause_in(&error);
+    carry_authority_cause(FileError::with_source(kind, operation, error), cause)
 }
 
 fn normalize_bound_relative_path(path: &Path, original: &str) -> FileResult<String> {
@@ -3037,6 +3114,283 @@ fn ensure_non_empty_path(original: &str, scheme: &str, path: &str) -> FileResult
 
 #[cfg(test)]
 mod tests {
+    // FS owns complete installation visibility; these tests use isolated local
+    // directories and join every writer. They supplement conformance's public
+    // API checks with pauses/failures inside the private whole-file writer.
+    #[test]
+    fn conditional_local_install_exposes_only_complete_payload_and_excludes_temporary_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("v1.metadata.json");
+        let outcome = install_local_file(&target, &FileCancellation::new(), |file| {
+            file.write_all(b"first-").unwrap();
+            assert!(!target.exists(), "a partial write must have no target name");
+            let names = std::fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(names.len(), 1);
+            assert!(!names[0].starts_with('v'));
+            assert!(!names[0].ends_with(".metadata.json"));
+            file.write_all(b"payload").unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(outcome, ConditionalCreateOutcome::Created);
+        assert_eq!(std::fs::read(&target).unwrap(), b"first-payload");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(
+            install_local_file(&target, &FileCancellation::new(), |file| {
+                file.write_all(b"replacement").unwrap();
+                Ok(())
+            })
+            .unwrap(),
+            ConditionalCreateOutcome::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"first-payload");
+    }
+
+    #[test]
+    fn conditional_local_install_preserves_write_failure_and_removes_partial_file() {
+        use crate::storage_authority::failure::AuthorityFailureReason;
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("v1.metadata.json");
+        let original = FileError::authority(
+            FileErrorKind::Permission,
+            AuthorityFailureReason::AcquisitionDenied,
+            "original conditional write failure",
+        );
+        let cause = original.authority_cause().unwrap().clone();
+        let error = install_local_file(&target, &FileCancellation::new(), |file| {
+            file.write_all(b"partial").unwrap();
+            Err(original)
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), FileErrorKind::Permission);
+        assert_eq!(error.authority_cause(), Some(&cause));
+        assert_authority_fact(&error, 2);
+        assert!(
+            error
+                .to_string()
+                .contains("original conditional write failure")
+        );
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn conditional_local_install_stop_waits_for_actual_writer_exit_before_returning() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("v1.metadata.json");
+        let cancellation = FileCancellation::new();
+        let (entered_send, entered) = std::sync::mpsc::channel();
+        let (resume, resume_receive) = std::sync::mpsc::channel();
+        let (finished_send, finished) = std::sync::mpsc::channel();
+        let writer_target = target.clone();
+        let writer_cancellation = cancellation.clone();
+        let writer = std::thread::spawn(move || {
+            let result = install_local_file(&writer_target, &writer_cancellation, |file| {
+                file.write_all(b"partial").unwrap();
+                entered_send.send(()).unwrap();
+                resume_receive.recv_timeout(Duration::from_secs(5)).unwrap();
+                file.write_all(b"-complete").unwrap();
+                Ok(())
+            });
+            finished_send.send(result).unwrap();
+        });
+        let entered_result = entered.recv_timeout(Duration::from_secs(5));
+        cancellation.cancel();
+        let target_was_absent = !target.exists();
+        let pending = matches!(
+            finished.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        let writer_was_running = !writer.is_finished();
+        // Release and join even when an earlier observation failed, so a test
+        // assertion cannot abandon the writer or its private temporary file.
+        let resumed = resume.send(());
+        let result = finished.recv_timeout(Duration::from_secs(5));
+        let joined = writer.join();
+        entered_result.unwrap();
+        resumed.unwrap();
+        joined.unwrap();
+        assert!(target_was_absent);
+        assert!(pending);
+        assert!(
+            writer_was_running,
+            "stop cannot release an in-flight synchronous writer"
+        );
+        let error = result.unwrap().unwrap_err();
+        assert_eq!(error.kind(), FileErrorKind::Cancelled);
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn conditional_local_install_expired_deadline_never_opens_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("v1.metadata.json");
+        let cancellation = FileCancellation::new().with_deadline(Some(Instant::now()));
+        let error = install_local_file(&target, &cancellation, |_| {
+            panic!("an expired installation must never invoke the writer")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), FileErrorKind::DeadlineExceeded);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[derive(Clone, Debug)]
+    struct ConditionalCompletion {
+        cancellation: FileCancellation,
+        failure: Option<opendal::ErrorKind>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl<A: Access> Layer<A> for ConditionalCompletion {
+        type LayeredAccess = ConditionalCompletionAccess<A>;
+        fn layer(&self, inner: A) -> Self::LayeredAccess {
+            ConditionalCompletionAccess {
+                inner,
+                completion: self.clone(),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct ConditionalCompletionAccess<A> {
+        inner: A,
+        completion: ConditionalCompletion,
+    }
+
+    struct ConditionalCompletionWriter<W> {
+        inner: W,
+        completion: ConditionalCompletion,
+    }
+
+    impl<W: oio::Write> oio::Write for ConditionalCompletionWriter<W> {
+        async fn write(&mut self, buffer: Buffer) -> opendal::Result<()> {
+            self.inner.write(buffer).await
+        }
+        async fn close(&mut self) -> opendal::Result<Metadata> {
+            let ack = self.inner.close().await?;
+            self.completion.calls.fetch_add(1, Ordering::SeqCst);
+            // The operation completes and stop becomes visible in the same poll.
+            self.completion.cancellation.cancel();
+            if let Some(kind) = self.completion.failure {
+                let error = FileError::authority(
+                    FileErrorKind::Permission,
+                    crate::storage_authority::failure::AuthorityFailureReason::AcquisitionDenied,
+                    "original conditional object failure",
+                );
+                return Err(opendal::Error::new(kind, "conditional write failed").set_source(error));
+            }
+            Ok(ack)
+        }
+        async fn abort(&mut self) -> opendal::Result<()> {
+            self.inner.abort().await
+        }
+    }
+
+    impl<A: Access> LayeredAccess for ConditionalCompletionAccess<A> {
+        type Inner = A;
+        type Reader = A::Reader;
+        type Writer = ConditionalCompletionWriter<A::Writer>;
+        type Lister = A::Lister;
+        type Deleter = A::Deleter;
+        fn inner(&self) -> &A {
+            &self.inner
+        }
+        fn info(&self) -> Arc<opendal::raw::AccessorInfo> {
+            let info = self.inner.info();
+            // This layer models a condition-capable store's terminal ACK/error.
+            info.update_full_capability(|mut capability| {
+                capability.write_with_if_not_exists = true;
+                capability
+            });
+            info
+        }
+        async fn read(&self, path: &str, args: OpRead) -> opendal::Result<(RpRead, Self::Reader)> {
+            self.inner.read(path, args).await
+        }
+        async fn write(
+            &self,
+            path: &str,
+            args: OpWrite,
+        ) -> opendal::Result<(RpWrite, Self::Writer)> {
+            assert!(args.if_not_exists());
+            self.inner.write(path, args).await.map(|(reply, inner)| {
+                (
+                    reply,
+                    ConditionalCompletionWriter {
+                        inner,
+                        completion: self.completion.clone(),
+                    },
+                )
+            })
+        }
+        async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
+            self.inner.delete().await
+        }
+        async fn list(&self, path: &str, args: OpList) -> opendal::Result<(RpList, Self::Lister)> {
+            self.inner.list(path, args).await
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_object_completion_keeps_ack_condition_and_typed_error_after_stop() {
+        for failure in [
+            None,
+            Some(opendal::ErrorKind::AlreadyExists),
+            Some(opendal::ErrorKind::PermissionDenied),
+        ] {
+            let cancellation = FileCancellation::new();
+            let completion = ConditionalCompletion {
+                cancellation: cancellation.clone(),
+                failure,
+                calls: Arc::new(AtomicUsize::new(0)),
+            };
+            let operator = memory_operator().unwrap().layer(completion.clone());
+            let access = FsAccessHandle::new(
+                domain(86),
+                FsScheme::ObjectStore,
+                operator,
+                Some("bucket".into()),
+                None,
+                vec![
+                    ResolvedFsPath::new(
+                        FsLocation::parse("s3://bucket/v1.metadata.json").unwrap(),
+                        "v1.metadata.json",
+                    )
+                    .unwrap(),
+                ],
+            );
+            let result = access
+                .create_if_absent(0, Bytes::from_static(b"complete-payload"), &cancellation)
+                .await;
+            assert_eq!(
+                completion.calls.load(Ordering::SeqCst),
+                1,
+                "terminal operation seam was reached"
+            );
+            assert!(cancellation.is_cancelled());
+            match failure {
+                None => assert_eq!(result.unwrap(), ConditionalCreateOutcome::Created),
+                Some(opendal::ErrorKind::AlreadyExists) => {
+                    assert_eq!(result.unwrap(), ConditionalCreateOutcome::AlreadyExists)
+                }
+                _ => {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.kind(), FileErrorKind::Permission);
+                    assert_authority_fact(&error, 2);
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("original conditional object failure")
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn list_body_limit_error_remains_resource_exhausted_in_all_fs_mappings() {
         fn overflow() -> opendal::Error {
@@ -4766,7 +5120,7 @@ mod tests {
         // These are independent producer inputs. The FS does not own the
         // provider's HTTP-to-AcquisitionFailure classification. Each input
         // crosses the real authority, reqsign loader and OpenDAL operation.
-        for bridge in 0..3 {
+        for bridge in 0..4 {
             for (failure, code, kind) in [
                 (
                     AcquisitionFailure::Transient("provider timeout PRIVATE".into()),
@@ -4803,6 +5157,7 @@ mod tests {
                     0 => map_opendal_error("stat file", error),
                     1 => map_stream_error("stream file", std::io::Error::from(error)),
                     2 => map_bounded_listing_opendal_error("list files", error),
+                    3 => map_conditional_create_error("conditionally create file", error),
                     _ => unreachable!(),
                 };
                 assert_eq!(mapped.kind(), kind);
