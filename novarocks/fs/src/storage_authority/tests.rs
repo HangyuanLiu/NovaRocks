@@ -1798,3 +1798,79 @@ fn authority_controls_reject_missing_or_conflicting_predeclared_intent_before_ac
         role.close_and_join().unwrap();
     }
 }
+
+#[test]
+fn acquisition_reasons_survive_borrowed_and_owned_file_conversion() {
+    use novarocks_failure_contract::{
+        FailureClass, FailureEvidence, FailureProjection, SharedFailureCause,
+    };
+    use novarocks_spi::connector::ConnectorError;
+    use std::error::Error;
+
+    fn originating_cause(error: &ConnectorError) -> &SharedFailureCause {
+        error
+            .source()
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap()
+    }
+
+    let id = identity("http://catalog.invalid/v1/credentials");
+    for (failure, kind, code) in [
+        (
+            AcquisitionFailure::Transient("private-provider-detail".into()),
+            FileErrorKind::Transient,
+            1,
+        ),
+        (
+            AcquisitionFailure::Denied("private-provider-detail".into()),
+            FileErrorKind::Permission,
+            2,
+        ),
+        (
+            AcquisitionFailure::CatalogUnreachable("private-provider-detail".into()),
+            FileErrorKind::Transient,
+            3,
+        ),
+        (
+            AcquisitionFailure::NoRenewalCapability,
+            FileErrorKind::Permission,
+            4,
+        ),
+    ] {
+        let error = failure.into_file_error(&id);
+        assert_eq!(error.kind(), kind);
+        let origin = error.authority_cause().unwrap().clone();
+        let borrowed = ConnectorError::from(&error);
+        let owned = ConnectorError::from(error);
+        for mapped in [&borrowed, &owned] {
+            let fact = mapped.failure_fact();
+            assert_eq!(fact.class(), FailureClass::Dependency);
+            assert_eq!(fact.evidence(), FailureEvidence::Originating);
+            assert_eq!((fact.reason().domain(), fact.reason().code()), (23, code));
+            assert_eq!(fact.resource(), None);
+            assert_eq!(fact.representation(), None);
+            assert_eq!(originating_cause(mapped), &origin);
+        }
+    }
+}
+
+#[test]
+fn ordinary_file_failures_do_not_acquire_an_authority_reason() {
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_spi::connector::ConnectorError;
+
+    for (kind, code) in [
+        (FileErrorKind::Permission, 3),
+        (FileErrorKind::Transient, 8),
+        (FileErrorKind::DeadlineExceeded, 6),
+        (FileErrorKind::Cancelled, 5),
+    ] {
+        let error = FileError::new(kind, "ordinary file operation");
+        assert!(error.authority_cause().is_none());
+        let fact = ConnectorError::from(error).failure_fact();
+        assert_eq!((fact.reason().domain(), fact.reason().code()), (4, code));
+    }
+}

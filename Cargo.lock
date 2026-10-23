@@ -3942,6 +3942,7 @@ dependencies = [
  "http",
  "libc",
  "novarocks-failpoint",
+ "novarocks-failure-contract",
  "novarocks-secret",
  "novarocks-spi",
  "opendal",

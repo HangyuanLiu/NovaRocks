@@ -176,7 +176,19 @@ mod tests {
                 "70100",
                 "query.execution.deadline_exceeded",
             ),
-        ];
+        ]
+        .into_iter()
+        .chain((1..=4).map(|code| {
+            (
+                FailureFact::new(
+                    FailureClass::Dependency,
+                    FailureReason::new(domain::STORAGE_AUTHORITY, NonZeroU16::new(code).unwrap()),
+                ),
+                1105,
+                "HY000",
+                "query.execution.dependency",
+            )
+        }));
         for (fact, errno, sqlstate, code) in cases {
             let input = ExecutionFailureInput::new(
                 fact,

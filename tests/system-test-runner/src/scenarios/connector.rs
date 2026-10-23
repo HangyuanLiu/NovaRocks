@@ -2943,27 +2943,28 @@ impl Scenario for VendedCredentialFaultPem {
                 "target catalog announces an unavailable loopback endpoint {endpoint}"
             ));
             let before = self.with_fixture(|fixture| Ok(fixture.proxy.audit()))?;
-            let error = storage_control_plan::outcome::<i64>(
+            let observed = storage_control_plan::observed_outcome::<i64>(
                 context,
                 &storage_inputs,
                 &mut control,
                 storage_control_plan::FAULT_READ_TOKEN,
                 &read_sql,
-            )?
-            .err()
-            .context("target BE cannot connect to its advertised endpoint")?;
+            )?;
+            let error = observed
+                .result
+                .err()
+                .context("target BE cannot connect to its advertised endpoint")?;
+            storage_control_plan::assert_acquisition_failure(
+                context,
+                &observed.snapshot,
+                3,
+                &error,
+            )?;
             let identity = storage_control_plan::identity(context, &storage_inputs)?;
             context.action(format!(
                 "BE[0] authority {} uses the target catalog generation {}",
                 identity.key, identity.version
             ));
-            let message = error.to_string().to_lowercase();
-            ensure!(
-                message.contains("could not reach its catalog")
-                    && !message.contains("was denied")
-                    && !message.contains("exchange idle"),
-                "native read lost the target BE connect-refusal cause: {error}"
-            );
             let after = self.with_fixture(|fixture| Ok(fixture.proxy.audit()))?;
             ensure!(
                 after.refreshes == before.refreshes,
@@ -3073,16 +3074,15 @@ impl Scenario for VendedCredentialFaultPem {
                         .context("held acquisition did not return within scenario budget")?
                         .err()
                         .context("held acquisition must fail its own deadline")?;
-                    let message = error.to_string().to_lowercase();
+                    let original_read_elapsed = started.elapsed();
                     ensure!(
-                        (message.contains("credential") || message.contains("storage authority"))
-                            && !message.contains("exchange idle"),
-                        "targeted acquisition failed without its catalog/credential cause: {error}"
-                    );
-                    ensure!(
-                        started.elapsed() < Duration::from_secs(50),
+                        original_read_elapsed < Duration::from_secs(50),
                         "targeted acquisition exceeded its D5 combined bound"
                     );
+                    let terminal = read.terminal_snapshot(context, &error)?;
+                    storage_control_plan::assert_acquisition_failure(
+                        context, &terminal, 1, &error,
+                    )?;
                     self.with_fixture(|fixture| fixture.proxy.release_targeted_refresh())?;
                     context.record_phase_observation(
                         "targeted_provider_deadline",
@@ -3119,23 +3119,27 @@ impl Scenario for VendedCredentialFaultPem {
                         .context("closed authority waiter did not return")?
                         .err()
                         .context("closed authority waiter must not use late success")?;
-                    ensure!(
-                        error.to_string().to_lowercase().contains("denied"),
-                        "closed authority waiter lost its denial reason: {error}"
-                    );
-                    let subsequent = storage_control_plan::outcome::<i64>(
+                    let terminal = read.terminal_snapshot(context, &error)?;
+                    storage_control_plan::assert_acquisition_failure(
+                        context, &terminal, 2, &error,
+                    )?;
+                    let subsequent = storage_control_plan::observed_outcome::<i64>(
                         context,
                         &storage_inputs,
                         &mut control,
                         storage_control_plan::FAULT_FOLLOWUP_TOKEN,
                         &read_sql,
-                    )?
-                    .err()
-                    .context("closed authority must reject a later read")?;
-                    ensure!(
-                        subsequent.to_string().to_lowercase().contains("denied"),
-                        "later request lost the closed authority cause: {subsequent}"
-                    );
+                    )?;
+                    let subsequent_error = subsequent
+                        .result
+                        .err()
+                        .context("closed authority must reject a later read")?;
+                    storage_control_plan::assert_acquisition_failure(
+                        context,
+                        &subsequent.snapshot,
+                        2,
+                        &subsequent_error,
+                    )?;
                     context.record_phase_observation(
                         "late_success_after_close",
                         1,
