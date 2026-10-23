@@ -650,7 +650,7 @@ fn check_mysql(
             && match case {
                 Case::Profile | Case::Kind =>
                     err.message == "[query.execution.invariant] root response violates its contract",
-                Case::Prefix | Case::PrefixSuffix => err.message.contains(&freeze.contract_reason),
+                Case::Prefix | Case::PrefixSuffix => err.message == freeze.contract_reason,
             }
             && err.payload_hex.starts_with("ff5104234859303030"),
         "real FE did not report the exact semantic contract refusal with complete metadata and zero rows"

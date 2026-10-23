@@ -92,7 +92,7 @@ impl Scenario for ResponseDeadline {
             "sql": PRODUCER_SQL,
             "query_timeout_seconds": timeout_seconds,
             "expected_success_rows": [1],
-            "expected_query_deadline_error": {"code": 1317, "messages": ["query timed out", "query timed out after 2000 ms"]},
+            "expected_query_deadline_error": {"code": 1317, "sqlstate": "70100", "public_error_code": "query.execution.deadline_exceeded"},
             "same_socket_reentry": false,
         });
         let mut cleanup = Vec::new();
@@ -116,9 +116,11 @@ impl Scenario for ResponseDeadline {
                 (Mode::QueryDeadline, Err(mysql::Error::MySqlError(error))) => {
                     evidence["actual_server_error"] = json!({"code":error.code,"sqlstate":error.state,"message":error.message});
                     ensure!(error.code == 1317, "query deadline returned a different MySQL error code");
-                    // The existing owner exposes either the typed execution
-                    // deadline or its exact admission cancellation reason.
-                    ensure!(matches!(error.message.as_str(), "query timed out" | "query timed out after 2000 ms"), "ERR 1317 was not an original query-deadline projection: {}", error.message);
+                    // KILL QUERY shares errno 1317. Require the public typed
+                    // deadline identity instead of an obsolete display string.
+                    ensure!(error.state == "70100"
+                        && error.message.starts_with("[query.execution.deadline_exceeded] "),
+                        "ERR 1317 was not an original query-deadline projection: {}", error.message);
                     context.action("received native ERR 1317 with an original typed query-deadline projection; owner exit is not inferred from this response");
                 }
                 (_, Err(error)) => {
