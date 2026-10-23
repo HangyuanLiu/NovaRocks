@@ -2796,13 +2796,6 @@
   ],
   "quarantine": [
     {
-      "unit": "rust-test:novarocks-frontend-application::dml::insert::shaping::tests::literal_target_casts_keep_original_bitmap_and_hll_declarations",
-      "owner": "B7",
-      "review_by": "2026-12-15",
-      "reason": "D0-5(a), K12: the actual first refusal is sql.analyze.unavailable_implementation for builtin.scalar/to_bitmap/(any<T>...)->binary;strict;legacy. Object/bitmap scalar belongs to UEA-5E B7 under the current umbrella capability boundary. The later HLL assertion has not been reached; preserve every original declaration/domain assertion and do not expand the capability scope from the test name.",
-      "exit_condition": "B7 delivers the exact installed pure to_bitmap scalar implementation used by this original first failure; rerun this exact unchanged complete test and remove quarantine only when all original declaration/domain assertions pass. Any later HLL or other newly exposed first failure requires separate ownership review, not assumed delivery."
-    },
-    {
       "unit": "rust-test:novarocks-sql::analyzer::logical_output::scalar_domain_tests::m07_container_final_compiler_scalar_proof_matches_exact_domains",
       "owner": "B7",
       "review_by": "2026-12-15",
