@@ -2079,7 +2079,21 @@ mod tests {
             let (_executor, warehouse, runtime, _listener) = admission_runtime("hadoop");
             // Model a table authored by another engine. Product CREATE/ALTER
             // admission remains closed to new Variant and uuid columns.
-            let table_root = warehouse.path().join("db/t");
+            // Match the configured catalog root, which canonicalizes local
+            // warehouse aliases (for example /var to /private/var on macOS).
+            let table_location = format!(
+                "{}/db/t",
+                runtime
+                    .control_state()
+                    .configuration()
+                    .warehouse_uri
+                    .trim_end_matches('/')
+            );
+            let table_root = runtime
+                .control_state()
+                .configuration()
+                .warehouse_path
+                .join("db/t");
             let metadata_root = table_root.join("metadata");
             std::fs::create_dir_all(&metadata_root).unwrap();
             let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
@@ -2089,7 +2103,7 @@ mod tests {
                     .unwrap(),
                 crate::iceberg::spec::PartitionSpec::unpartition_spec(),
                 crate::iceberg::spec::SortOrder::unsorted_order(),
-                format!("file://{}", table_root.display()),
+                table_location,
                 FormatVersion::V3,
                 std::collections::HashMap::new(),
             )
@@ -2120,6 +2134,11 @@ mod tests {
             let mut context = admission_context("hadoop");
             context = context
                 .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::Statement);
+            let observed = adapter
+                .runtime
+                .observe_table_for_request("db", "t", &context)
+                .expect("externally authored fixed-root table must load before rewrite admission");
+            assert_eq!(observed.table.metadata().uuid(), metadata.uuid());
             let request = ConnectorDistributedRewritePlanningRequest::try_new(
                 ConnectorWriteOperationId::new(),
                 adapter.key.clone(),

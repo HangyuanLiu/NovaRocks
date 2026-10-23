@@ -292,7 +292,8 @@ fn collect_candidate(
     selected: &mut Vec<ScannedFile>,
 ) -> Result<(), ConnectorError> {
     let normalized = normalize_scanned_path(&file.path);
-    if file.last_modified_ms >= older_than_ms
+    if crate::catalog_metadata_root::is_catalog_metadata_root(&file.path)
+        || file.last_modified_ms >= older_than_ms
         || live.contains(&file.path)
         || live.contains(&normalized)
     {
@@ -409,6 +410,57 @@ mod tests {
                 "warehouse/table/metadata/scratch/nested/object.bin",
             ]
         );
+    }
+
+    #[test]
+    fn catalog_version_roots_outside_metadata_log_are_not_orphan_candidates() {
+        let mut selected = Vec::new();
+        for name in [
+            "v1.metadata.json",
+            "v22.gz.metadata.json",
+            "v9.metadata.json.gz",
+            "version-hint.text",
+        ] {
+            collect_candidate(
+                ScannedFile {
+                    path: format!("s3://bucket/other/metadata/{name}"),
+                    last_modified_ms: 0,
+                    size: Some(1),
+                    etag: None,
+                    version: None,
+                },
+                &FileSet::new(),
+                10,
+                1,
+                &mut selected,
+            )
+            .unwrap();
+        }
+        assert!(
+            selected.is_empty(),
+            "catalog roots need no metadata-log entry"
+        );
+        for (path, mtime) in [
+            ("s3://bucket/t/metadata/install-temp.tmp", 10),
+            ("s3://bucket/t/data/v1.metadata.json", 0),
+        ] {
+            collect_candidate(
+                ScannedFile {
+                    path: path.into(),
+                    last_modified_ms: mtime,
+                    size: Some(1),
+                    etag: None,
+                    version: None,
+                },
+                &FileSet::new(),
+                10,
+                1,
+                &mut selected,
+            )
+            .unwrap();
+        }
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].path, "s3://bucket/t/data/v1.metadata.json");
     }
 
     #[test]

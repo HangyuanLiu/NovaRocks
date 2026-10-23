@@ -360,6 +360,15 @@ impl IcebergCommitOperation {
         let mut deleted = 0;
         let mut remaining = Vec::new();
         for (index, record) in records.iter().enumerate() {
+            if crate::catalog_metadata_root::is_catalog_metadata_root(record.object.path()) {
+                remaining.push(RemainingArtifact {
+                    object: record.object.clone(),
+                    reason: CleanupRemainingReason::DeleteFailed(
+                        "catalog metadata discovery root is protected from artifact cleanup".into(),
+                    ),
+                });
+                continue;
+            }
             let exit_failure = match self.inner.exit_failures.lock() {
                 Ok(failures) => failures.get(&record.object).cloned(),
                 Err(_) => Some(StreamExitFailure::Unconfirmed),
@@ -453,6 +462,13 @@ pub(crate) struct IcebergCommitAttempt {
 }
 
 impl IcebergCommitAttempt {
+    pub(crate) fn read_binding(&self) -> IcebergReadBinding {
+        self.operation
+            .inner
+            .binding
+            .for_request(self.operation.request_context().clone())
+    }
+
     pub(crate) fn operation_artifacts(&self) -> Result<Vec<ArtifactRecord>> {
         self.operation.artifacts()
     }

@@ -683,6 +683,16 @@ fn execute_frozen_batch(
                 context,
             ),
             ManifestCandidate::Object { location, identity } => {
+                if crate::catalog_metadata_root::is_catalog_metadata_root(location) {
+                    return receipt(
+                        record.ordinal,
+                        ObjectOutcome::Failed,
+                        Some(
+                            "catalog metadata discovery root is protected from object cleanup"
+                                .into(),
+                        ),
+                    );
+                }
                 let local_mtime = novarocks_fs::FsLocation::parse(location)
                     .map_err(|error| invalid(format!("parse frozen cleanup location: {error}")))?
                     .scheme()
@@ -719,7 +729,12 @@ fn execute_frozen_batch(
                         let deleted = runtime
                             .resources()
                             .catalog_runtime()
-                            .block_on(delete_exact(operator, path, identity.clone()))
+                            .block_on(delete_exact(
+                                operator,
+                                path,
+                                location.clone(),
+                                identity.clone(),
+                            ))
                             .map_err(unavailable)?;
                         match deleted {
                             Ok(()) => receipt(record.ordinal, ObjectOutcome::Deleted, None),
@@ -946,8 +961,17 @@ async fn stat_matches(
 async fn delete_exact(
     operator: crate::opendal::Operator,
     path: String,
+    location: String,
     identity: ObjectIdentity,
 ) -> Result<(), crate::opendal::Error> {
+    // Operator-relative paths can be only a basename for local bindings.
+    // Preserve the complete location at the final destructive boundary.
+    if crate::catalog_metadata_root::is_catalog_metadata_root(&location) {
+        return Err(crate::opendal::Error::new(
+            crate::opendal::ErrorKind::PermissionDenied,
+            "catalog metadata discovery root is protected from object cleanup",
+        ));
+    }
     match identity {
         ObjectIdentity::Version { version, .. } => {
             operator.delete_with(&path).version(&version).await
@@ -1717,6 +1741,73 @@ mod tests {
             .finalize_terminal(ConnectorCleanupFinalizeRequest::try_new(plan, context()).unwrap())
             .unwrap();
         assert!(!root.join("_novarocks").exists());
+    }
+
+    #[test]
+    fn already_frozen_catalog_roots_are_refused_at_the_final_delete_gate() {
+        let (executor, _warehouse, runtime) = local_runtime();
+        let (adapter, plan, _table, root) =
+            real_cleanup_plan(&executor, Arc::clone(&runtime), false);
+        let payload = adapter.plan_payload(&plan).unwrap();
+        for name in [
+            "v1.metadata.json",
+            "v7.gz.metadata.json",
+            "v8.metadata.json.gz",
+            "version-hint.text",
+        ] {
+            let path = root.join("metadata").join(name);
+            fs::write(&path, b"retained root").unwrap();
+            let batch = [object_record(
+                0,
+                path.to_string_lossy(),
+                ObjectIdentity::SizeMtime {
+                    size: 13,
+                    mtime_ms: 0,
+                },
+            )];
+            let result = execute_frozen_batch(
+                &runtime,
+                plan.owner(),
+                plan.operation_id(),
+                &payload,
+                &batch,
+                &context(),
+            )
+            .unwrap();
+            assert!(matches!(result[0].outcome, ObjectOutcome::Failed));
+            assert_eq!(fs::read(&path).unwrap(), b"retained root");
+        }
+        // The low-level exact-delete entry is equally protected, without LIST.
+        executor.block_on(async {
+            let operator =
+                crate::opendal::Operator::new(crate::opendal::services::Memory::default())
+                    .unwrap()
+                    .finish();
+            operator
+                .write("other/metadata/v1.metadata.json", "retained")
+                .await
+                .unwrap();
+            let error = delete_exact(
+                operator.clone(),
+                "other/metadata/v1.metadata.json".into(),
+                "s3://test/other/metadata/v1.metadata.json".into(),
+                ObjectIdentity::SizeMtime {
+                    size: 8,
+                    mtime_ms: 0,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), crate::opendal::ErrorKind::PermissionDenied);
+            assert_eq!(
+                operator
+                    .read("other/metadata/v1.metadata.json")
+                    .await
+                    .unwrap()
+                    .to_bytes(),
+                Bytes::from_static(b"retained")
+            );
+        });
     }
 
     #[test]

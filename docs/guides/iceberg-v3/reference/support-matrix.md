@@ -30,7 +30,7 @@ under the License.
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
-| Hadoop catalog（`metadata.json` + commit lock） | ✅ | `src/connector/iceberg/catalog/hadoop_catalog.rs` |
+| Hadoop catalog（仅单写者测试；完整版本安装） | ✅ | [边界与限制](../catalog.md#hadoop-与-hive)、[ADR-0196](../../../adr/ADR-0196-hadoop-test-catalog-complete-version-installation.md) |
 | In-memory catalog（仅测试） | ✅ | |
 | REST catalog（spec 主推） | ✅ | 上游 REST 客户端负责会话，NovaRocks 发出全部变更请求并给出证据；鉴权只经角色本地身份（FE 用 `CatalogControl`，BE 用 `DataCredentialVending`，OAuth2 client credentials 或 Bearer）；SigV4、API key 等其他方式不支持。见 [Catalog 接入](../catalog.md) 与 ADR-0175 |
 | AWS Glue catalog | ❌ | |

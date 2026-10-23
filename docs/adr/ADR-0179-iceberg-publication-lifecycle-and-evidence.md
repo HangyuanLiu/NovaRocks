@@ -5,7 +5,7 @@ domain: [provider-spi, distributed-query-lifecycle, crate-boundary, table-mainte
 status: active
 supersedes: []
 superseded-by: null
-partially-superseded-by: [ADR-0190]
+partially-superseded-by: [ADR-0190, ADR-0196]
 partially-supersedes:
   - id: ADR-0118
     scope: "Unified Transaction and late SDK TableCommit carrier; provider-private catalog ownership and operation admission remain active"

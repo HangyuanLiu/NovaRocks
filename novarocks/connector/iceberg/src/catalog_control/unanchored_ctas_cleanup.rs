@@ -668,6 +668,11 @@ async fn delete_prefix_bounded_tracking(
             provenance = Some(entry.path().to_owned());
             continue;
         }
+        if crate::catalog_metadata_root::is_catalog_metadata_root(entry.path()) {
+            return Err(unsupported(
+                "unanchored CTAS cleanup encountered a protected catalog metadata root",
+            ));
+        }
         batch.push(entry.path().to_owned());
         if batch.len() == bound.page_entries {
             delete_started.store(true, Ordering::Release);

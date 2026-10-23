@@ -5,6 +5,10 @@ domain: [provider-spi]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0196
+    scope: "Complete installation and physical discovery; conditional creation and exact attribution remain active"
+    link: "ADR-0196-hadoop-test-catalog-complete-version-installation.md"
 date: 2026-08-13
 provenance:
   - "discussion: 2026-07-30 / 2026-08-13, Hadoop catalog atomic table creation"

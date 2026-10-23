@@ -37,6 +37,16 @@ use novarocks_spi::connector::{
 
 use crate::access_binding::IcebergReadBinding;
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static HADOOP_TEST_LIST_CALLS: std::cell::Cell<usize>;
+}
+
+#[cfg(test)]
+fn note_hadoop_test_list() {
+    let _ = HADOOP_TEST_LIST_CALLS.try_with(|calls| calls.set(calls.get() + 1));
+}
+
 /// The output capability belongs to one logical commit operation, never to the process.
 #[async_trait]
 pub(crate) trait IcebergWriteAdmission: Send + Sync + std::fmt::Debug {
@@ -313,8 +323,6 @@ pub struct IcebergFileSystemFactory {
     #[serde(skip, default)]
     binding: Option<IcebergReadBinding>,
     #[serde(skip, default)]
-    listing: Option<(ConnectorListingBound, usize)>,
-    #[serde(skip, default)]
     admission: Option<Arc<dyn IcebergWriteAdmission>>,
 }
 
@@ -322,7 +330,6 @@ impl IcebergFileSystemFactory {
     pub fn new(binding: IcebergReadBinding) -> Self {
         Self {
             binding: Some(binding),
-            listing: None,
             admission: None,
         }
     }
@@ -339,7 +346,7 @@ impl StorageFactory for IcebergFileSystemFactory {
         })?;
         Ok(Arc::new(IcebergFsStorage {
             binding: Some(binding),
-            listing: self.listing,
+            listing: None,
             admission: self.admission.clone(),
         }))
     }
@@ -417,26 +424,7 @@ impl IcebergFsStorage {
         })
     }
 
-    fn storage_arc(&self) -> Arc<dyn Storage> {
-        Arc::new(self.clone())
-    }
-}
-
-#[typetag::serde]
-#[async_trait]
-impl Storage for IcebergFsStorage {
-    async fn exists(&self, path: &str) -> Result<bool> {
-        self.check_read_active("exists")?;
-        let _io = optional_io_permit(self.admission.as_ref()).await?;
-        let (access, relative_path) = self.resolve_path("exists", path)?;
-        let result = access.operator().exists(&relative_path).await;
-        self.check_read_active("exists")?;
-        result.map_err(|error| {
-            Error::new(ErrorKind::Unexpected, "fs existence probe failed").with_source(error)
-        })
-    }
-
-    async fn list_directories(&self, path: &str) -> Result<Vec<String>> {
+    pub(crate) async fn list_directories(&self, path: &str) -> Result<Vec<String>> {
         self.check_read_active("list_directories")?;
         let _io = optional_io_permit(self.admission.as_ref()).await?;
         let (bound, workspace_bytes) = self
@@ -450,6 +438,8 @@ impl Storage for IcebergFsStorage {
         }
         // The public page limit bounds the requested page size; it does not
         // prove a hard bound on the remote response body or SDK decoding.
+        #[cfg(test)]
+        note_hadoop_test_list();
         let result = access
             .operator()
             .lister_with(&relative_path)
@@ -492,6 +482,25 @@ impl Storage for IcebergFsStorage {
         Ok(directories.finish())
     }
 
+    fn storage_arc(&self) -> Arc<dyn Storage> {
+        Arc::new(self.clone())
+    }
+}
+
+#[typetag::serde]
+#[async_trait]
+impl Storage for IcebergFsStorage {
+    async fn exists(&self, path: &str) -> Result<bool> {
+        self.check_read_active("exists")?;
+        let _io = optional_io_permit(self.admission.as_ref()).await?;
+        let (access, relative_path) = self.resolve_path("exists", path)?;
+        let result = access.operator().exists(&relative_path).await;
+        self.check_read_active("exists")?;
+        result.map_err(|error| {
+            Error::new(ErrorKind::Unexpected, "fs existence probe failed").with_source(error)
+        })
+    }
+
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
         self.check_read_active("metadata")?;
         let _io = optional_io_permit(self.admission.as_ref()).await?;
@@ -515,10 +524,9 @@ impl Storage for IcebergFsStorage {
         let (access, relative_path) = self.resolve_path("read", path)?;
         let result = access.operator().read(&relative_path).await;
         self.check_read_active("read")?;
-        let data = result.map_err(|e| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("fs read({path}) through {relative_path}: {e}"),
+        let data = result.map_err(|error| {
+            Error::new(ErrorKind::DataInvalid, "fs metadata read failed").with_source(
+                ConnectorError::from(novarocks_fs::map_object_store_listing_error(error)),
             )
         })?;
         Ok(data.to_bytes())
@@ -882,7 +890,6 @@ pub(crate) fn build_admitted_file_io_for_location(
     let _ = location;
     FileIOBuilder::new(Arc::new(IcebergFileSystemFactory {
         binding: Some(binding),
-        listing: None,
         admission: Some(admission),
     }))
     .build()
@@ -936,22 +943,112 @@ async fn write_finalization_document_to_operator(
     finalization_active(context)
 }
 
-/// A request-local factory with the caller's exact listing and remaining
-/// workspace bounds. Only this provider can construct its owned directory Vec.
-pub(crate) fn build_bounded_file_io_for_location(
+/// Enumerate child directories directly through the provider-owned capability.
+pub(crate) async fn list_directories(
     location: &str,
     binding: IcebergReadBinding,
     bound: ConnectorListingBound,
     workspace_bytes: usize,
-) -> Result<FileIO> {
-    let _ = DirectoryListing::new(bound, workspace_bytes)?;
-    check_listing_path_size(location.len())?;
-    let factory = IcebergFileSystemFactory {
+) -> Result<Vec<String>> {
+    let storage = IcebergFsStorage {
         binding: Some(binding),
         listing: Some((bound, workspace_bytes)),
         admission: None,
     };
-    Ok(FileIOBuilder::new(Arc::new(factory)).build())
+    storage.list_directories(location).await
+}
+
+/// Reads may stop at the original request's absolute deadline without leaving
+/// writes or cleanup work in flight. Preserve the request's typed stop fact.
+pub(crate) async fn catalog_read<T>(
+    binding: &IcebergReadBinding,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T> {
+    let cancellation = binding
+        .request_context()
+        .map(novarocks_fs::FileCancellation::from_connector_request)
+        .unwrap_or_default();
+    cancellation.check().map_err(|error| {
+        Error::new(ErrorKind::Unexpected, "Hadoop catalog read stopped")
+            .with_source(ConnectorError::from(error))
+    })?;
+    match futures::future::select(Box::pin(future), Box::pin(cancellation.ended())).await {
+        futures::future::Either::Left((value, _)) => Ok(value),
+        futures::future::Either::Right((error, _)) => Err(Error::new(
+            ErrorKind::Unexpected,
+            "Hadoop catalog read stopped",
+        )
+        .with_source(ConnectorError::from(error))),
+    }
+}
+
+/// Visit one bounded, nonrecursive stream. Every raw entry spends an entry,
+/// including directories and unrelated files; an early stop is not an inventory.
+pub(crate) async fn visit_direct_files<F>(
+    location: &str,
+    binding: IcebergReadBinding,
+    bound: ConnectorListingBound,
+    mut visit: F,
+) -> Result<bool>
+where
+    F: FnMut(&str) -> Result<bool>,
+{
+    let storage = IcebergFsStorage::new(binding.clone());
+    storage.check_read_active("list version files")?;
+    bound.validate().map_err(|error| {
+        Error::new(ErrorKind::DataInvalid, "Invalid Hadoop listing bound").with_source(error)
+    })?;
+    check_listing_path_size(location.len())?;
+    let (access, mut relative) = storage.resolve_path("list version files", location)?;
+    if !relative.ends_with('/') {
+        relative.push('/');
+    }
+    let operator = access.operator();
+    #[cfg(test)]
+    note_hadoop_test_list();
+    let result = catalog_read(&binding, async {
+        operator
+            .lister_with(&relative)
+            .limit(bound.page_entries)
+            .await
+    })
+    .await?;
+    storage.check_read_active("list version files")?;
+    let mut entries = result.map_err(listing_storage_error)?;
+    let prefix = relative.trim_start_matches('/');
+    let mut count = 0usize;
+    while let Some(entry) = catalog_read(&binding, entries.next()).await? {
+        storage.check_read_active("list version files")?;
+        let entry = entry.map_err(listing_storage_error)?;
+        let path = entry.path().trim_start_matches('/');
+        check_listing_path_size(path.len())?;
+        let name = path.strip_prefix(prefix).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Hadoop listing escaped its metadata root",
+            )
+        })?;
+        // OpenDAL's local lister emits the requested directory itself before
+        // its children. It is not a raw child entry and cannot spend their bound.
+        if name.is_empty() {
+            continue;
+        }
+        count += 1;
+        if count > bound.entries {
+            return Err(listing_refusal());
+        }
+        if entry.metadata().is_file() && !name.contains('/') && !visit(name)? {
+            return Ok(false);
+        }
+    }
+    storage.check_read_active("list version files")?;
+    Ok(true)
+}
+
+fn listing_storage_error(error: crate::opendal::Error) -> Error {
+    Error::new(ErrorKind::Unexpected, "Hadoop filesystem traversal failed").with_source(
+        ConnectorError::from(novarocks_fs::map_object_store_listing_error(error)),
+    )
 }
 
 pub fn build_storage_factory_for_location(
@@ -1048,7 +1145,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use crate::iceberg::io::Storage;
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::{
         ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
@@ -1056,9 +1152,8 @@ mod tests {
     };
 
     use super::{
-        DirectoryListing, IcebergFsStorage, build_bounded_file_io_for_location,
-        build_file_io_for_location, format_resolved_location, resolve_access_for_location,
-        resolve_access_for_locations,
+        DirectoryListing, IcebergFsStorage, build_file_io_for_location, format_resolved_location,
+        resolve_access_for_location, resolve_access_for_locations,
     };
 
     #[derive(Debug)]
@@ -1466,8 +1561,11 @@ mod tests {
             ..novarocks_spi::connector::ConnectorListingBound::V1
         };
         let binding = local_test_binding(None, tokio::runtime::Handle::current());
-        let complete = build_bounded_file_io_for_location(&location, binding.clone(), bound, 4096)
-            .expect("bounded FileIO");
+        let complete = IcebergFsStorage {
+            binding: Some(binding.clone()),
+            listing: Some((bound, 4096)),
+            admission: None,
+        };
         assert_eq!(
             complete
                 .list_directories(&location)
@@ -1475,16 +1573,17 @@ mod tests {
                 .expect("complete enumeration"),
             [".hidden", "a", "z"]
         );
-        let refused = build_bounded_file_io_for_location(
-            &location,
-            binding,
-            novarocks_spi::connector::ConnectorListingBound {
-                entries: 2,
-                ..bound
-            },
-            4096,
-        )
-        .expect("bounded FileIO");
+        let refused = IcebergFsStorage {
+            binding: Some(binding),
+            listing: Some((
+                novarocks_spi::connector::ConnectorListingBound {
+                    entries: 2,
+                    ..bound
+                },
+                4096,
+            )),
+            admission: None,
+        };
         assert_eq!(
             stopped_kind(
                 &refused
@@ -1493,6 +1592,50 @@ mod tests {
                     .expect_err("whole listing refusal")
             ),
             ConnectorErrorKind::ResourceExhausted
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_version_stream_refuses_partial_inventory_and_preserves_stop_fact() {
+        use novarocks_failure_contract::FailureProjection;
+        let directory = tempfile::tempdir().expect("directory");
+        for name in ["v1.metadata.json", "v2.metadata.json"] {
+            std::fs::write(
+                directory.path().join(name),
+                b"JSON is not needed for listing",
+            )
+            .expect("file");
+        }
+        let stop = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
+        let request = request(Instant::now() + Duration::from_secs(30), stop.clone());
+        let binding = local_test_binding(None, tokio::runtime::Handle::current())
+            .for_request(request.clone());
+        let mut visited = 0;
+        let error = super::visit_direct_files(
+            directory.path().to_str().expect("directory path"),
+            binding,
+            novarocks_spi::connector::ConnectorListingBound::V1,
+            |_| {
+                visited += 1;
+                stop.request_stop();
+                Ok(true)
+            },
+        )
+        .await
+        .expect_err("partial stream must fail");
+        assert_eq!(visited, 1);
+        let actual = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<ConnectorError>())
+            .expect("typed connector stop");
+        assert_eq!(actual.kind(), ConnectorErrorKind::Cancelled);
+        assert_eq!(
+            actual.failure_fact(),
+            ConnectorError::from(
+                novarocks_fs::FileCancellation::from_connector_request(&request)
+                    .check()
+                    .expect_err("same file stop")
+            )
+            .failure_fact()
         );
     }
 

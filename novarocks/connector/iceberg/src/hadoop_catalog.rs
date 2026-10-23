@@ -24,13 +24,14 @@ mod drop_publication;
 /// - Metadata files are written as `v{N}.metadata.json` (Hadoop convention).
 /// - `version-hint.text` is maintained alongside each metadata directory so
 ///   that StarRocks FE, Spark, and Trino can discover the current version.
-/// - `update_table` manually applies requirements/updates instead of delegating
-///   to `TableCommit::apply()`, which calls `MetadataLocation::from_str()` and
-///   only accepts the `{version}-{uuid}.metadata.json` format.
+/// - Prepared publication applies frozen requirements/updates and installs a
+///   complete new version without replacing an existing slot.
 mod publication;
+pub(crate) mod versions;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::Duration;
 
 use crate::iceberg::io::FileIO;
@@ -48,13 +49,6 @@ use novarocks_fs::FileError;
 use novarocks_fs::FileErrorKind;
 use novarocks_fs::{ConditionalCreateOutcome, FileCancellation};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
-
-// A native local conditional create can expose the newly reserved path before
-// its payload is fully visible to a competing reader. Retry only the
-// authoritative reread; never replay the create request after its fence point.
-const AUTHORITATIVE_V1_READ_ATTEMPTS: usize = 3;
-const AUTHORITATIVE_V1_READ_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HadoopCreateAttemptFacts {
@@ -65,38 +59,8 @@ pub(crate) struct HadoopCreateAttemptFacts {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(test)]
-pub(crate) enum HadoopCreateDisposition {
-    Created,
-    Existing,
-}
-
-#[derive(Debug)]
-#[cfg(test)]
-pub(crate) struct HadoopCreateResult {
-    pub(crate) disposition: HadoopCreateDisposition,
-    /// Kept for the fault tests, which assert the published attempt's identity
-    /// straight off the client result rather than through the catalog owner.
-    #[allow(dead_code)]
-    pub(crate) facts: HadoopCreateAttemptFacts,
-    pub(crate) authoritative_table_uuid: String,
-    pub(crate) authoritative_metadata_digest: String,
-    pub(crate) table: Table,
-    /// Read by the fault tests only. A finalization failure never downgrades a
-    /// commit the client already proved, so no production caller consults it.
-    #[allow(dead_code)]
-    pub(crate) finalization_failure: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HadoopCreateFailureKind {
     Invalid,
-    #[cfg(test)]
-    Unsupported,
-    #[cfg(test)]
-    Uncommitted,
-    #[cfg(test)]
-    Unknown,
 }
 
 #[derive(Debug)]
@@ -153,17 +117,18 @@ pub(crate) enum HadoopCreateReconciliation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HadoopCatalogTestFault {
     BeforeConditionalRequest,
+    BeforeConditionalUnsupported,
     AfterConditionalResponseLoss,
     AfterConditionalUnsupported,
     AfterExistingConditionalResponseLoss,
     BeforeConditionalReadEvidenceExpiry,
+    BeforeConditionalReadDelete,
     BeforeCanonicalDrop,
     AfterCanonicalDropResponseLoss,
     AfterDropHintEvidenceExpiry,
     BeforeDropHintDelete,
     AfterDropHintResponseLoss,
     BeforeHintWrite,
-    AfterMetadataWriteEvidenceExpiry,
     AfterHintWriteResponseLoss,
     AuthoritativeV1Read,
 }
@@ -176,8 +141,6 @@ pub struct HadoopFileSystemCatalog {
     /// The exact provider-owned storage capability admitted for this catalog.
     /// It is process local and never serialized with the catalog client.
     binding: Option<crate::access_binding::IcebergReadBinding>,
-    /// Maps `"namespace/table"` to the current metadata file location.
-    tables: Mutex<HashMap<String, String>>,
     #[cfg(test)]
     test_faults: std::sync::Mutex<Vec<HadoopCatalogTestFault>>,
 }
@@ -196,7 +159,6 @@ impl HadoopFileSystemCatalog {
             runtime,
             warehouse_location: warehouse_location.trim_end_matches('/').to_string(),
             binding: None,
-            tables: Mutex::new(HashMap::new()),
             #[cfg(test)]
             test_faults: std::sync::Mutex::new(Vec::new()),
         }
@@ -215,7 +177,6 @@ impl HadoopFileSystemCatalog {
             runtime,
             warehouse_location: warehouse_location.trim_end_matches('/').to_string(),
             binding: Some(binding),
-            tables: Mutex::new(HashMap::new()),
             #[cfg(test)]
             test_faults: std::sync::Mutex::new(Vec::new()),
         }
@@ -314,13 +275,13 @@ impl HadoopFileSystemCatalog {
         let control = binding.operation_control();
         check_catalog_read_control(&control)?;
         let namespace_location = self.namespace_location(namespace);
-        let file_io = crate::fs_io::build_bounded_file_io_for_location(
+        let children = crate::fs_io::list_directories(
             &namespace_location,
-            binding,
+            binding.clone(),
             bound,
             workspace_bytes,
-        )?;
-        let children = file_io.list_directories(&namespace_location).await?;
+        )
+        .await?;
         check_directory_listing_bound(&children, bound)?;
         let source_bytes = directory_heap_bytes(&children)?;
         let qualifier_bytes = namespace_clone_heap_bytes(namespace)?;
@@ -335,10 +296,7 @@ impl HadoopFileSystemCatalog {
                 .and_then(|bytes| bytes.checked_add(32))
                 .ok_or_else(crate::fs_io::listing_refusal)?;
             crate::fs_io::check_listing_path_size(path_bytes)?;
-            if file_io
-                .exists(Self::version_hint_path(&format!(
-                    "{namespace_location}/{table}"
-                )))
+            if versions::physical_exists(&format!("{namespace_location}/{table}"), binding.clone())
                 .await?
             {
                 check_catalog_read_control(&control)?;
@@ -380,13 +338,9 @@ impl HadoopFileSystemCatalog {
         let location = parent
             .map(|parent| self.namespace_location(parent))
             .unwrap_or_else(|| self.warehouse_location.clone());
-        let file_io = crate::fs_io::build_bounded_file_io_for_location(
-            &location,
-            binding.clone(),
-            bound,
-            workspace_bytes,
-        )?;
-        let children = file_io.list_directories(&location).await?;
+        let children =
+            crate::fs_io::list_directories(&location, binding.clone(), bound, workspace_bytes)
+                .await?;
         check_directory_listing_bound(&children, bound)?;
         let source_bytes = directory_heap_bytes(&children)?;
         let parent_bytes = parent
@@ -460,18 +414,14 @@ impl HadoopFileSystemCatalog {
         &self,
         namespace: &NamespaceIdent,
         binding: crate::access_binding::IcebergReadBinding,
-        bound: novarocks_spi::connector::ConnectorListingBound,
+        _bound: novarocks_spi::connector::ConnectorListingBound,
         workspace_bytes: usize,
     ) -> Result<bool> {
         self.check_listing_location(Some(namespace))?;
         let control = binding.operation_control();
         check_catalog_read_control(&control)?;
-        let file_io = crate::fs_io::build_bounded_file_io_for_location(
-            &self.warehouse_location,
-            binding.clone(),
-            bound,
-            workspace_bytes,
-        )?;
+        let file_io =
+            crate::fs_io::build_file_io_for_location(&self.warehouse_location, binding.clone());
         let exists = file_io
             .exists(self.namespace_marker_location(namespace))
             .await?;
@@ -523,11 +473,11 @@ impl HadoopFileSystemCatalog {
         table: &TableIdent,
         binding: crate::access_binding::IcebergReadBinding,
     ) -> Result<bool> {
-        match self.load_table_for_read(table, binding).await {
-            Ok(_) => Ok(true),
-            Err(error) if error.kind() == ErrorKind::TableNotFound => Ok(false),
-            Err(error) => Err(error),
-        }
+        Ok(!self
+            .version_inventory(table, binding)
+            .await?
+            .files
+            .is_empty())
     }
 
     /// Returns the path to the `vN.metadata.json` file for a given table location
@@ -543,66 +493,7 @@ impl HadoopFileSystemCatalog {
         format!("{}/metadata/version-hint.text", base)
     }
 
-    /// Read the current version stored in `version-hint.text`. Returns `0` if
-    /// the file does not exist or cannot be parsed.
-    async fn read_version_hint(&self, table_location: &str) -> u32 {
-        Self::read_version_hint_with_io(&self.file_io, table_location).await
-    }
-
-    async fn read_version_hint_with_io(file_io: &FileIO, table_location: &str) -> u32 {
-        let path = Self::version_hint_path(table_location);
-        let Ok(input) = file_io.new_input(&path) else {
-            return 0;
-        };
-        let Ok(bytes) = input.read().await else {
-            return 0;
-        };
-        let s = String::from_utf8_lossy(&bytes);
-        s.trim().parse::<u32>().unwrap_or(0)
-    }
-
-    /// Write `version-hint.text` with the given version number.
-    async fn write_version_hint(&self, table_location: &str, version: u32) -> Result<()> {
-        #[cfg(test)]
-        if self.take_test_fault(HadoopCatalogTestFault::BeforeHintWrite) {
-            return Err(Error::new(
-                ErrorKind::Unexpected,
-                "injected failure before Hadoop version-hint write",
-            ));
-        }
-        let path = Self::version_hint_path(table_location);
-        let output = self.file_io.new_output(&path)?;
-        let result = output.write(format!("{}\n", version).into()).await;
-        #[cfg(test)]
-        if result.is_ok()
-            && self.take_test_fault(HadoopCatalogTestFault::AfterHintWriteResponseLoss)
-        {
-            return Err(Error::new(
-                ErrorKind::Unexpected,
-                "injected response loss after Hadoop version-hint write",
-            ));
-        }
-        result
-    }
-
-    /// Build a `Table` value from metadata and a metadata location.
-    fn build_table(
-        &self,
-        ident: TableIdent,
-        metadata: TableMetadata,
-        metadata_location: String,
-    ) -> Result<Table> {
-        Table::builder()
-            .runtime(self.runtime.clone())
-            .file_io(self.file_io.clone())
-            .metadata(Arc::new(metadata))
-            .identifier(ident)
-            .metadata_location(metadata_location)
-            .build()
-    }
-
-    // The optional grant only bounds starting the existing protocol's steps.
-    // Catalog FileIO, hint recovery and numbering remain unchanged until IRU-6c.
+    // A phase grant bounds starting each step, never discards its result.
     fn check_publication_budget(
         budget: Option<crate::catalog::publication::EvidenceContext>,
     ) -> Result<()> {
@@ -619,241 +510,43 @@ impl HadoopFileSystemCatalog {
         Ok(())
     }
 
-    async fn table_cache_with_budget(
-        &self,
-        budget: Option<crate::catalog::publication::EvidenceContext>,
-    ) -> Result<tokio::sync::MutexGuard<'_, HashMap<String, String>>> {
-        let guard = match budget {
-            Some(budget) => tokio::time::timeout_at(budget.deadline().into(), self.tables.lock())
-                .await
-                .map_err(|_| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        "Hadoop publication cache wait deadline elapsed",
-                    )
-                    .with_source(
-                        novarocks_spi::connector::ConnectorError::new(
-                            novarocks_spi::connector::ConnectorErrorKind::DeadlineExceeded,
-                            "Hadoop publication cache wait deadline elapsed",
-                        ),
-                    )
-                })?,
-            None => self.tables.lock().await,
-        };
-        Self::check_publication_budget(budget)?;
-        Ok(guard)
-    }
-
-    async fn load_existing_table_with_budget(
-        &self,
-        table: &TableIdent,
-        budget: Option<crate::catalog::publication::EvidenceContext>,
-    ) -> Result<Table> {
-        Self::check_publication_budget(budget)?;
-        let key = Self::table_key(table);
-        let metadata_location = match self
-            .try_cache_existing_table_with_budget(table, budget)
-            .await?
-        {
-            Some(location) => location,
-            None => {
-                self.table_cache_with_budget(budget).await?.remove(&key);
-                return Err(Error::new(
-                    ErrorKind::TableNotFound,
-                    format!("table not found: {}", key),
-                ));
-            }
-        };
-
-        Self::check_publication_budget(budget)?;
-        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location)
-            .await
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("read metadata from {}: {}", metadata_location, e),
-                )
-            })?;
-
-        Self::check_publication_budget(budget)?;
-        self.build_table(table.clone(), metadata, metadata_location)
-    }
-
-    /// Use one request-bound FileIO for every read needed to resolve the
-    /// catalog pointer and metadata. The generation's FileIO remains reusable
-    /// by later requests and by mutation recovery.
+    /// All read callers share physical version discovery without repairing hints.
     pub(crate) async fn load_table_for_read(
         &self,
         table: &TableIdent,
         binding: crate::access_binding::IcebergReadBinding,
     ) -> Result<Table> {
-        let control = binding.operation_control();
-        let check_active = || -> Result<()> {
-            if let Some(control) = &control {
-                control.check_active().map_err(|error| {
-                    Error::new(ErrorKind::Unexpected, "Hadoop catalog read stopped")
-                        .with_source(error)
-                })?;
-            }
-            Ok(())
-        };
-        check_active()?;
-        let table_location = self.table_location(table);
-        let file_io = crate::fs_io::build_file_io_for_location(&table_location, binding);
-        self.load_table_using_io(table, file_io, check_active, false)
-            .await
+        self.load_discovered_table(table, binding).await
     }
 
     pub(crate) async fn load_table_for_commit(
         &self,
         table: &TableIdent,
         file_io: FileIO,
+        binding: crate::access_binding::IcebergReadBinding,
     ) -> Result<Table> {
-        self.load_table_using_io(table, file_io, || Ok(()), true)
-            .await
-    }
-
-    async fn load_table_using_io<F>(
-        &self,
-        table: &TableIdent,
-        file_io: FileIO,
-        check_active: F,
-        strict_hint_read: bool,
-    ) -> Result<Table>
-    where
-        F: Fn() -> Result<()> + Send + Sync,
-    {
-        check_active()?;
-        let table_location = self.table_location(table);
-        let version = if strict_hint_read {
-            let path = Self::version_hint_path(&table_location);
-            if file_io.exists(&path).await? {
-                let bytes = file_io.new_input(&path)?.read().await?;
-                String::from_utf8_lossy(&bytes)
-                    .trim()
-                    .parse::<u32>()
-                    .unwrap_or(0)
-            } else {
-                0
-            }
-        } else {
-            Self::read_version_hint_with_io(&file_io, &table_location).await
-        };
-        check_active()?;
-        let metadata_location = if version == 0 {
-            let v1 = Self::metadata_path(&table_location, 1);
-            if !file_io.exists(&v1).await? {
-                check_active()?;
-                return Err(Error::new(
-                    ErrorKind::TableNotFound,
-                    format!("table not found: {}", Self::table_key(table)),
-                ));
-            }
-            v1
-        } else {
-            let hinted = Self::metadata_path(&table_location, version);
-            if !file_io.exists(&hinted).await? {
-                check_active()?;
-                return Err(Error::new(
-                    ErrorKind::Unexpected,
-                    format!("Hadoop catalog version hint points to missing metadata: {hinted}"),
-                ));
-            }
-            hinted
-        };
-        check_active()?;
-        let metadata = TableMetadata::read_from(&file_io, &metadata_location)
-            .await
-            .map_err(|error| {
+        let current = self
+            .discover_current_version(table, binding, None)
+            .await?
+            .ok_or_else(|| {
                 Error::new(
-                    ErrorKind::Unexpected,
-                    format!("read metadata from {metadata_location}: {error}"),
+                    ErrorKind::TableNotFound,
+                    "Hadoop commit target does not exist",
                 )
-                .with_source(error)
             })?;
-        check_active()?;
         Table::builder()
             .runtime(self.runtime.clone())
             .file_io(file_io)
-            .metadata(Arc::new(metadata))
+            .metadata(Arc::new(current.metadata))
             .identifier(table.clone())
-            .metadata_location(metadata_location)
+            .metadata_location(current.file.path)
             .build()
     }
 
-    /// Return the table key used as the key in the `tables` map.
+    /// Canonical table name for diagnostics.
     fn table_key(ident: &TableIdent) -> String {
         let namespace = ident.namespace().join("/");
         format!("{}/{}", namespace, ident.name())
-    }
-
-    /// Read the current version hint from the filesystem and, if valid, insert
-    /// the resolved metadata location into the in-memory cache.
-    ///
-    /// Returns `Some(metadata_location)` when the table exists on disk, or
-    /// `None` when `version-hint.text` is absent or unparseable.  Both
-    /// `load_table` and `table_exists` delegate to this helper so that every
-    /// filesystem probe also populates the cache, making subsequent calls
-    /// cache-hit fast.
-    async fn try_cache_existing_table(&self, table: &TableIdent) -> Result<Option<String>> {
-        self.try_cache_existing_table_with_budget(table, None).await
-    }
-
-    async fn try_cache_existing_table_with_budget(
-        &self,
-        table: &TableIdent,
-        budget: Option<crate::catalog::publication::EvidenceContext>,
-    ) -> Result<Option<String>> {
-        Self::check_publication_budget(budget)?;
-        let table_location = self.table_location(table);
-        let version = self.read_version_hint(&table_location).await;
-        Self::check_publication_budget(budget)?;
-        let metadata_location = if version == 0 {
-            let v1 = Self::metadata_path(&table_location, 1);
-            if !self.file_io.exists(&v1).await? {
-                return Ok(None);
-            }
-            Self::check_publication_budget(budget)?;
-            TableMetadata::read_from(&self.file_io, &v1)
-                .await
-                .map_err(|error| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("read canonical Hadoop table metadata {v1}: {error}"),
-                    )
-                })?;
-            Self::check_publication_budget(budget)?;
-            if let Err(error) = self.write_version_hint(&table_location, 1).await {
-                tracing::warn!(
-                    "failed to repair Hadoop catalog version hint from canonical v1 metadata: {error}"
-                );
-            }
-            v1
-        } else {
-            Self::check_publication_budget(budget)?;
-            let hinted = Self::metadata_path(&table_location, version);
-            if !self.file_io.exists(&hinted).await? {
-                return Err(Error::new(
-                    ErrorKind::Unexpected,
-                    format!("Hadoop catalog version hint points to missing metadata: {hinted}"),
-                ));
-            }
-            Self::check_publication_budget(budget)?;
-            TableMetadata::read_from(&self.file_io, &hinted)
-                .await
-                .map_err(|error| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("read hinted Hadoop table metadata {hinted}: {error}"),
-                    )
-                })?;
-            hinted
-        };
-        let key = Self::table_key(table);
-        self.table_cache_with_budget(budget)
-            .await?
-            .insert(key, metadata_location.clone());
-        Ok(Some(metadata_location))
     }
 
     pub(crate) fn prepare_create_attempt(
@@ -867,6 +560,17 @@ impl HadoopFileSystemCatalog {
             .location
             .clone()
             .unwrap_or_else(|| self.table_location(&ident));
+        self.validate_table_root(&ident, &table_location)
+            .map_err(|error| HadoopCreateFailure {
+                kind: HadoopCreateFailureKind::Invalid,
+                message: error.to_string(),
+            })?;
+        if creation.properties.contains_key("write.metadata.path") {
+            return Err(HadoopCreateFailure {
+                kind: HadoopCreateFailureKind::Invalid,
+                message: "Hadoop catalog does not support write.metadata.path".into(),
+            });
+        }
         let creation_with_location = TableCreation {
             location: Some(table_location.clone()),
             ..creation
@@ -953,187 +657,6 @@ impl HadoopFileSystemCatalog {
             request,
         )
         .await
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn create_table_fenced(
-        &self,
-        namespace: &NamespaceIdent,
-        creation: TableCreation,
-        operation_id: String,
-    ) -> std::result::Result<HadoopCreateResult, HadoopCreateFailure> {
-        let attempt = self.prepare_create_attempt(namespace, creation, operation_id)?;
-        self.publish_create_attempt(attempt).await
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn publish_create_attempt(
-        &self,
-        attempt: HadoopCreateAttempt,
-    ) -> std::result::Result<HadoopCreateResult, HadoopCreateFailure> {
-        let binding = self.binding.as_ref().ok_or_else(|| HadoopCreateFailure {
-            kind: HadoopCreateFailureKind::Invalid,
-            message: "Hadoop catalog has no admitted filesystem capability".to_string(),
-        })?;
-        let access =
-            crate::fs_io::resolve_access_for_location(&attempt.facts.metadata_location, binding)
-                .map_err(|message| HadoopCreateFailure {
-                    kind: HadoopCreateFailureKind::Invalid,
-                    message: format!("resolve Hadoop metadata fence: {message}"),
-                })?;
-
-        // Capability validation precedes directory creation so an unsupported
-        // binding fails before any metadata-side storage mutation.
-        if !access.supports_conditional_create() {
-            return Err(HadoopCreateFailure {
-                kind: HadoopCreateFailureKind::Unsupported,
-                message: "Hadoop catalog storage does not support native conditional create"
-                    .to_string(),
-            });
-        }
-        access
-            .ensure_parent_directory()
-            .await
-            .map_err(|message| HadoopCreateFailure {
-                kind: HadoopCreateFailureKind::Uncommitted,
-                message: format!("create Hadoop metadata directory: {message}"),
-            })?;
-
-        #[cfg(test)]
-        if self.take_test_fault(HadoopCatalogTestFault::BeforeConditionalRequest) {
-            return Err(HadoopCreateFailure {
-                kind: HadoopCreateFailureKind::Uncommitted,
-                message: "injected failure before Hadoop conditional create request".to_string(),
-            });
-        }
-
-        let cancellation = FileCancellation::new();
-        let conditional = access
-            .handle()
-            .create_if_absent(0, attempt.metadata_bytes.clone(), &cancellation)
-            .await;
-        #[cfg(test)]
-        let conditional = match conditional {
-            Ok(ConditionalCreateOutcome::Created)
-                if self.take_test_fault(HadoopCatalogTestFault::AfterConditionalResponseLoss) =>
-            {
-                Err(FileError::new(
-                    FileErrorKind::Transient,
-                    "injected response loss after Hadoop conditional create",
-                ))
-            }
-            result => result,
-        };
-        let (disposition, metadata, authoritative_metadata_digest) = match conditional {
-            Ok(ConditionalCreateOutcome::Created) => (
-                HadoopCreateDisposition::Created,
-                attempt.metadata.clone(),
-                attempt.facts.metadata_digest.clone(),
-            ),
-            Ok(ConditionalCreateOutcome::AlreadyExists) => {
-                self.classify_existing_v1(&attempt).await?
-            }
-            Err(error) if error.kind() == FileErrorKind::Unsupported => {
-                return Err(HadoopCreateFailure {
-                    kind: HadoopCreateFailureKind::Unsupported,
-                    message: error.to_string(),
-                });
-            }
-            Err(error) => match self.classify_existing_v1(&attempt).await {
-                Ok(classified) => classified,
-                Err(_) => {
-                    return Err(HadoopCreateFailure {
-                        kind: HadoopCreateFailureKind::Unknown,
-                        message: format!(
-                            "conditionally create Hadoop v1 metadata and authoritative reread failed: {error}"
-                        ),
-                    });
-                }
-            },
-        };
-
-        let mut finalization_failure = None;
-        if disposition == HadoopCreateDisposition::Created
-            && let Err(error) = self.write_version_hint(&attempt.table_location, 1).await
-        {
-            finalization_failure = Some(format!(
-                "publish Hadoop catalog version hint after committed v1 metadata: {error}"
-            ));
-        }
-
-        let key = Self::table_key(&attempt.ident);
-        self.tables
-            .lock()
-            .await
-            .insert(key, attempt.facts.metadata_location.clone());
-        let table = self
-            .build_table(
-                attempt.ident,
-                metadata,
-                attempt.facts.metadata_location.clone(),
-            )
-            .map_err(|error| HadoopCreateFailure {
-                kind: HadoopCreateFailureKind::Unknown,
-                message: format!("build committed Hadoop table: {error}"),
-            })?;
-        Ok(HadoopCreateResult {
-            disposition,
-            facts: attempt.facts,
-            authoritative_table_uuid: table.metadata().uuid().to_string(),
-            authoritative_metadata_digest,
-            table,
-            finalization_failure,
-        })
-    }
-
-    #[cfg(test)]
-    async fn classify_existing_v1(
-        &self,
-        attempt: &HadoopCreateAttempt,
-    ) -> std::result::Result<(HadoopCreateDisposition, TableMetadata, String), HadoopCreateFailure>
-    {
-        #[cfg(test)]
-        if self.take_test_fault(HadoopCatalogTestFault::AuthoritativeV1Read) {
-            return Err(HadoopCreateFailure {
-                kind: HadoopCreateFailureKind::Unknown,
-                message: "injected authoritative Hadoop v1 reread failure".to_string(),
-            });
-        }
-        for read_attempt in 0..AUTHORITATIVE_V1_READ_ATTEMPTS {
-            let read_result = async {
-                let input = self.file_io.new_input(&attempt.facts.metadata_location)?;
-                let bytes = input.read().await?;
-                let metadata = serde_json::from_slice::<TableMetadata>(&bytes)?;
-                Ok::<_, Error>((metadata, hex_digest(&bytes)))
-            }
-            .await;
-            match read_result {
-                Ok((metadata, authoritative_digest)) => {
-                    let same_owner = metadata.uuid().to_string() == attempt.facts.table_uuid
-                        && authoritative_digest == attempt.facts.metadata_digest;
-                    return Ok((
-                        if same_owner {
-                            HadoopCreateDisposition::Created
-                        } else {
-                            HadoopCreateDisposition::Existing
-                        },
-                        metadata,
-                        authoritative_digest,
-                    ));
-                }
-                Err(error) if read_attempt + 1 < AUTHORITATIVE_V1_READ_ATTEMPTS => {
-                    tokio::time::sleep(AUTHORITATIVE_V1_READ_RETRY_DELAY).await;
-                    let _ = error;
-                }
-                Err(error) => {
-                    return Err(HadoopCreateFailure {
-                        kind: HadoopCreateFailureKind::Unknown,
-                        message: format!("read authoritative Hadoop v1 metadata: {error}"),
-                    });
-                }
-            }
-        }
-        unreachable!("authoritative reread either succeeds or returns its final failure")
     }
 
     pub(crate) async fn reconcile_create_attempt_for_read(
@@ -1392,14 +915,10 @@ impl Catalog for HadoopFileSystemCatalog {
         ))
     }
 
-    /// Load a table through the filesystem-owned catalog pointer.
-    ///
-    /// The in-memory registry is an accelerator only. A different Hadoop
-    /// catalog client can replace or drop the table, so serving its cached
-    /// location without first resolving `version-hint.text` would make this
-    /// client observe a stale table identity.
+    /// Resolve the authoritative physical version before loading its metadata.
     async fn load_table(&self, table: &TableIdent) -> Result<Table> {
-        self.load_existing_table_with_budget(table, None).await
+        self.load_discovered_table(table, self.listing_binding()?)
+            .await
     }
     /// SDK mutations cannot enter catalog publication.
     async fn drop_table(&self, _table: &TableIdent) -> Result<()> {
@@ -1417,14 +936,11 @@ impl Catalog for HadoopFileSystemCatalog {
     }
 
     async fn table_exists(&self, table: &TableIdent) -> Result<bool> {
-        let key = Self::table_key(table);
-        // The filesystem pointer is the catalog authority. Do not let a local
-        // cache hide an external drop or replacement made by another client.
-        let exists = self.try_cache_existing_table(table).await?.is_some();
-        if !exists {
-            self.tables.lock().await.remove(&key);
-        }
-        Ok(exists)
+        Ok(!self
+            .version_inventory(table, self.listing_binding()?)
+            .await?
+            .files
+            .is_empty())
     }
     /// SDK mutations cannot enter catalog publication.
     async fn rename_table(&self, _src: &TableIdent, _dest: &TableIdent) -> Result<()> {
@@ -1467,6 +983,16 @@ mod tests {
 
     use super::*;
 
+    /// Test calls retain the same joining bridge as production publication.
+    pub(super) fn on_bridge<F: std::future::Future + Send + 'static>(future: F) -> F::Output
+    where
+        F::Output: Send + 'static,
+    {
+        let runtime = local_test_runtime();
+        let bridge = crate::resources::IcebergCatalogRuntime::new(runtime.handle().clone());
+        bridge.block_on(future).expect("catalog bridge exits")
+    }
+
     fn local_test_runtime() -> &'static tokio::runtime::Runtime {
         static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
         RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("build local test runtime"))
@@ -1502,196 +1028,220 @@ mod tests {
             .kind()
     }
 
-    #[tokio::test]
-    async fn bounded_hadoop_listing_preserves_marker_fallback_and_hierarchical_names() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        for path in [
-            "external/table/metadata",
-            "external/not-a-table",
-            "marked",
-            ".hidden",
-        ] {
-            std::fs::create_dir_all(warehouse.path().join(path)).expect("directory");
-        }
-        std::fs::write(
-            warehouse
-                .path()
-                .join("external/table/metadata/version-hint.text"),
-            b"1",
-        )
-        .expect("external table hint");
-        std::fs::write(warehouse.path().join("marked/.novarocks_namespace"), b"")
-            .expect("namespace marker");
-        std::fs::create_dir_all(warehouse.path().join("parent/child")).expect("child");
-        std::fs::write(
-            warehouse.path().join("parent/child/.novarocks_namespace"),
-            b"",
-        )
-        .expect("child marker");
-        let location = warehouse.path().to_string_lossy().to_string();
-        let catalog = test_catalog(&location);
-        let namespaces = catalog
-            .list_namespaces(None)
-            .await
-            .expect("plain bounded namespaces");
-        assert_eq!(
-            namespaces,
-            [
-                NamespaceIdent::new("external".into()),
-                NamespaceIdent::new("marked".into())
-            ]
-        );
-        let parent = NamespaceIdent::new("parent".into());
-        assert_eq!(
-            catalog
-                .list_namespaces(Some(&parent))
-                .await
-                .expect("hierarchical listing"),
-            [NamespaceIdent::from_vec(vec!["parent".into(), "child".into()]).expect("namespace")]
-        );
-        assert!(
-            catalog
-                .namespace_exists(&NamespaceIdent::new("external".into()))
-                .await
-                .expect("fallback")
-        );
-        let bound = novarocks_spi::connector::ConnectorListingBound {
-            entries: 2,
-            page_entries: 1,
-            ..novarocks_spi::connector::ConnectorListingBound::V1
-        };
-        let tables = catalog
-            .list_tables_for_read(
-                &NamespaceIdent::new("external".into()),
-                local_test_binding(),
-                bound,
+    #[test]
+    fn bounded_hadoop_listing_preserves_marker_fallback_and_hierarchical_names() {
+        crate::hadoop_catalog::tests::on_bridge(async move {
+            let warehouse = tempfile::tempdir().expect("warehouse");
+            for path in [
+                "external/table/metadata",
+                "external/not-a-table",
+                "marked",
+                ".hidden",
+            ] {
+                std::fs::create_dir_all(warehouse.path().join(path)).expect("directory");
+            }
+            std::fs::write(
+                warehouse
+                    .path()
+                    .join("external/table/metadata/v1.metadata.json"),
+                b"1",
             )
-            .await
-            .expect("actual caller bound");
-        assert_eq!(tables.len(), 1);
-        assert_eq!(tables[0].name(), "table");
-        assert_eq!(
-            listing_error_kind(
-                &catalog
-                    .list_tables_for_read(
-                        &NamespaceIdent::new("external".into()),
-                        local_test_binding(),
-                        novarocks_spi::connector::ConnectorListingBound {
-                            entries: 1,
-                            ..bound
-                        },
-                    )
+            .expect("external table hint");
+            std::fs::write(warehouse.path().join("marked/.novarocks_namespace"), b"")
+                .expect("namespace marker");
+            std::fs::create_dir_all(warehouse.path().join("parent/child")).expect("child");
+            std::fs::write(
+                warehouse.path().join("parent/child/.novarocks_namespace"),
+                b"",
+            )
+            .expect("child marker");
+            let location = warehouse.path().to_string_lossy().to_string();
+            let catalog = Arc::new(test_catalog(&location));
+            let namespaces = catalog
+                .list_namespaces(None)
+                .await
+                .expect("plain bounded namespaces");
+            assert_eq!(
+                namespaces,
+                [
+                    NamespaceIdent::new("external".into()),
+                    NamespaceIdent::new("marked".into())
+                ]
+            );
+            let parent = NamespaceIdent::new("parent".into());
+            assert_eq!(
+                catalog
+                    .list_namespaces(Some(&parent))
                     .await
-                    .expect_err("whole source exceeds caller bound")
-            ),
-            ConnectorErrorKind::ResourceExhausted
-        );
+                    .expect("hierarchical listing"),
+                [
+                    NamespaceIdent::from_vec(vec!["parent".into(), "child".into()])
+                        .expect("namespace")
+                ]
+            );
+            assert!(
+                catalog
+                    .namespace_exists(&NamespaceIdent::new("external".into()))
+                    .await
+                    .expect("fallback")
+            );
+            let bound = novarocks_spi::connector::ConnectorListingBound {
+                entries: 2,
+                page_entries: 1,
+                ..novarocks_spi::connector::ConnectorListingBound::V1
+            };
+            let tables = catalog
+                .list_tables_for_read(
+                    &NamespaceIdent::new("external".into()),
+                    local_test_binding(),
+                    bound,
+                )
+                .await
+                .expect("actual caller bound");
+            assert_eq!(tables.len(), 1);
+            assert_eq!(tables[0].name(), "table");
+            assert_eq!(
+                listing_error_kind(
+                    &catalog
+                        .list_tables_for_read(
+                            &NamespaceIdent::new("external".into()),
+                            local_test_binding(),
+                            novarocks_spi::connector::ConnectorListingBound {
+                                entries: 1,
+                                ..bound
+                            },
+                        )
+                        .await
+                        .expect_err("whole source exceeds caller bound")
+                ),
+                ConnectorErrorKind::ResourceExhausted
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn bounded_hadoop_scan_precharges_qualifier_and_result_backing() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        std::fs::create_dir_all(warehouse.path().join("n/t/metadata")).expect("table");
-        std::fs::write(
-            warehouse.path().join("n/t/metadata/version-hint.text"),
-            b"1",
-        )
-        .expect("hint");
-        let location = warehouse.path().to_string_lossy().to_string();
-        let catalog = test_catalog(&location);
-        let namespace = NamespaceIdent::new("n".into());
-        let bound = novarocks_spi::connector::ConnectorListingBound {
-            entries: 1,
-            ..novarocks_spi::connector::ConnectorListingBound::V1
-        };
-        let source_bytes = std::mem::size_of::<String>() + 1;
-        let result_bytes = source_bytes
-            + namespace_clone_heap_bytes(&namespace).expect("qualifier")
-            + std::mem::size_of::<TableIdent>();
-        assert_eq!(
-            listing_error_kind(
-                &catalog
+    #[test]
+    fn bounded_hadoop_scan_precharges_qualifier_and_result_backing() {
+        crate::hadoop_catalog::tests::on_bridge(async move {
+            let warehouse = tempfile::tempdir().expect("warehouse");
+            std::fs::create_dir_all(warehouse.path().join("n/t/metadata")).expect("table");
+            std::fs::write(warehouse.path().join("n/t/metadata/v1.metadata.json"), b"1")
+                .expect("hint");
+            let location = warehouse.path().to_string_lossy().to_string();
+            let catalog = Arc::new(test_catalog(&location));
+            let namespace = NamespaceIdent::new("n".into());
+            let bound = novarocks_spi::connector::ConnectorListingBound {
+                entries: 1,
+                ..novarocks_spi::connector::ConnectorListingBound::V1
+            };
+            let source_bytes = std::mem::size_of::<String>() + 1;
+            let result_bytes = source_bytes
+                + namespace_clone_heap_bytes(&namespace).expect("qualifier")
+                + std::mem::size_of::<TableIdent>();
+            assert_eq!(
+                listing_error_kind(
+                    &catalog
+                        .scan_external_tables(
+                            &namespace,
+                            local_test_binding(),
+                            bound,
+                            result_bytes - 1,
+                            true,
+                        )
+                        .await
+                        .expect_err("clone/result before allocation")
+                ),
+                ConnectorErrorKind::ResourceExhausted
+            );
+            assert_eq!(
+                catalog
                     .scan_external_tables(
                         &namespace,
                         local_test_binding(),
                         bound,
-                        result_bytes - 1,
-                        true,
+                        result_bytes,
+                        true
                     )
                     .await
-                    .expect_err("clone/result before allocation")
-            ),
-            ConnectorErrorKind::ResourceExhausted
-        );
-        assert_eq!(
-            catalog
-                .scan_external_tables(&namespace, local_test_binding(), bound, result_bytes, true)
-                .await
-                .expect("exact result boundary")
-                .0
-                .len(),
-            1
-        );
-        // The existence fallback walks the same complete source and all probes
-        // while retaining no TableIdent namespace clones.
-        assert!(
-            catalog
-                .scan_external_tables(&namespace, local_test_binding(), bound, source_bytes, false)
-                .await
-                .expect("existence under remaining workspace")
-                .1
-        );
+                    .expect("exact result boundary")
+                    .0
+                    .len(),
+                1
+            );
+            // The existence fallback walks the same complete source and all probes
+            // while retaining no TableIdent namespace clones.
+            assert!(
+                catalog
+                    .scan_external_tables(
+                        &namespace,
+                        local_test_binding(),
+                        bound,
+                        source_bytes,
+                        false
+                    )
+                    .await
+                    .expect("existence under remaining workspace")
+                    .1
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn bounded_hadoop_namespace_output_does_not_limit_fallback_table_source() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        for table in ["first", "second"] {
-            let metadata = warehouse.path().join("n").join(table).join("metadata");
-            std::fs::create_dir_all(&metadata).expect("table directory");
-            std::fs::write(metadata.join("version-hint.text"), b"1").expect("table hint");
-        }
-        let location = warehouse.path().to_string_lossy().to_string();
-        let catalog = test_catalog(&location);
-        let bound = novarocks_spi::connector::ConnectorListingBound {
-            entries: 1,
-            name_bytes: 1,
-            total_name_bytes: 1,
-            ..novarocks_spi::connector::ConnectorListingBound::V1
-        };
-        assert_eq!(
-            catalog
-                .list_namespaces_for_read(local_test_binding(), bound)
-                .await
-                .expect("one namespace with two longer table names"),
-            [NamespaceIdent::new("n".into())]
-        );
+    #[test]
+    fn bounded_hadoop_namespace_output_does_not_limit_fallback_table_source() {
+        crate::hadoop_catalog::tests::on_bridge(async move {
+            let warehouse = tempfile::tempdir().expect("warehouse");
+            for table in ["first", "second"] {
+                let metadata = warehouse.path().join("n").join(table).join("metadata");
+                std::fs::create_dir_all(&metadata).expect("table directory");
+                std::fs::write(
+                    metadata.join("v1.metadata.json"),
+                    b"invalid JSON still establishes presence",
+                )
+                .expect("version file");
+            }
+            let location = warehouse.path().to_string_lossy().to_string();
+            let catalog = Arc::new(test_catalog(&location));
+            let bound = novarocks_spi::connector::ConnectorListingBound {
+                entries: 1,
+                name_bytes: 1,
+                total_name_bytes: 1,
+                ..novarocks_spi::connector::ConnectorListingBound::V1
+            };
+            assert_eq!(
+                catalog
+                    .list_namespaces_for_read(local_test_binding(), bound)
+                    .await
+                    .expect("one namespace with two longer table names"),
+                [NamespaceIdent::new("n".into())]
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn bounded_hadoop_listing_refuses_custom_storage_without_owner_binding() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        let catalog = HadoopFileSystemCatalog::new(
-            FileIO::new_with_fs(),
-            warehouse.path().to_string_lossy().to_string(),
-            crate::iceberg::Runtime::try_current().expect("test runtime"),
-        );
-        assert_eq!(
-            catalog
-                .list_namespaces(None)
-                .await
-                .expect_err("no owner proof")
-                .kind(),
-            ErrorKind::FeatureUnsupported
-        );
-        assert_eq!(
-            catalog
-                .list_tables(&NamespaceIdent::new("n".into()))
-                .await
-                .expect_err("no owner proof")
-                .kind(),
-            ErrorKind::FeatureUnsupported
-        );
+    #[test]
+    fn bounded_hadoop_listing_refuses_custom_storage_without_owner_binding() {
+        crate::hadoop_catalog::tests::on_bridge(async move {
+            let warehouse = tempfile::tempdir().expect("warehouse");
+            let catalog = HadoopFileSystemCatalog::new(
+                FileIO::new_with_fs(),
+                warehouse.path().to_string_lossy().to_string(),
+                crate::iceberg::Runtime::try_current().expect("test runtime"),
+            );
+            assert_eq!(
+                catalog
+                    .list_namespaces(None)
+                    .await
+                    .expect_err("no owner proof")
+                    .kind(),
+                ErrorKind::FeatureUnsupported
+            );
+            assert_eq!(
+                catalog
+                    .list_tables(&NamespaceIdent::new("n".into()))
+                    .await
+                    .expect_err("no owner proof")
+                    .kind(),
+                ErrorKind::FeatureUnsupported
+            );
+        });
     }
 
     fn read_request(
@@ -1707,192 +1257,192 @@ mod tests {
         .expect("request")
     }
 
-    #[tokio::test]
-    async fn request_bound_hadoop_load_does_not_poison_the_catalog_generation() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        let location = warehouse.path().to_string_lossy().to_string();
-        let namespace = NamespaceIdent::new("analytics".to_string());
-        let ident = TableIdent::new(namespace.clone(), "events".to_string());
-        let catalog = test_catalog(&location);
-        catalog
-            .create_table_fenced(
-                &namespace,
-                test_creation("events"),
-                "read-control".to_string(),
-            )
-            .await
-            .expect("create table");
+    #[test]
+    fn request_bound_hadoop_load_does_not_poison_the_catalog_generation() {
+        crate::hadoop_catalog::tests::on_bridge(async move {
+            let warehouse = tempfile::tempdir().expect("warehouse");
+            let location = warehouse.path().to_string_lossy().to_string();
+            let namespace = NamespaceIdent::new("analytics".to_string());
+            let ident = TableIdent::new(namespace.clone(), "events".to_string());
+            let catalog = Arc::new(test_catalog(&location));
+            catalog
+                .create_fixture_table(&namespace, test_creation("events"))
+                .await
+                .expect("create table");
 
-        let cancelled = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
-        let first = catalog
-            .load_table_for_read(
-                &ident,
-                local_test_binding().for_request(read_request(
-                    cancelled.clone(),
-                    Instant::now() + Duration::from_secs(30),
-                )),
-            )
-            .await
-            .expect("first load");
-        cancelled.request_stop();
-        let metadata_path = first.metadata_location().expect("metadata path");
-        let stopped = first
-            .file_io()
-            .new_input(metadata_path)
-            .expect("input")
-            .read()
-            .await
-            .expect_err("old request must stop");
-        let source = std::error::Error::source(&stopped)
-            .and_then(|source| source.downcast_ref::<ConnectorError>())
-            .expect("typed cancellation");
-        assert_eq!(source.kind(), ConnectorErrorKind::Cancelled);
-
-        let cancelled_binding = local_test_binding().for_request(read_request(
-            cancelled,
-            Instant::now() + Duration::from_secs(30),
-        ));
-        let stopped_kind = |error: &Error| {
-            std::error::Error::source(error)
+            let cancelled = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
+            let first = catalog
+                .load_table_for_read(
+                    &ident,
+                    local_test_binding().for_request(read_request(
+                        cancelled.clone(),
+                        Instant::now() + Duration::from_secs(30),
+                    )),
+                )
+                .await
+                .expect("first load");
+            cancelled.request_stop();
+            let metadata_path = first.metadata_location().expect("metadata path");
+            let stopped = first
+                .file_io()
+                .new_input(metadata_path)
+                .expect("input")
+                .read()
+                .await
+                .expect_err("old request must stop");
+            let source = std::error::Error::source(&stopped)
                 .and_then(|source| source.downcast_ref::<ConnectorError>())
-                .expect("typed catalog read stop")
-                .kind()
-        };
-        assert_eq!(
-            stopped_kind(
-                &catalog
-                    .list_namespaces_for_read(
-                        cancelled_binding.clone(),
-                        novarocks_spi::connector::ConnectorListingBound::V1,
-                    )
-                    .await
-                    .expect_err("cancelled namespace list"),
-            ),
-            ConnectorErrorKind::Cancelled,
-        );
-        assert_eq!(
-            stopped_kind(
-                &catalog
-                    .namespace_exists_for_read(&namespace, cancelled_binding.clone())
-                    .await
-                    .expect_err("cancelled namespace existence"),
-            ),
-            ConnectorErrorKind::Cancelled,
-        );
-        assert_eq!(
-            stopped_kind(
-                &catalog
-                    .list_tables_for_read(
-                        &namespace,
-                        cancelled_binding.clone(),
-                        novarocks_spi::connector::ConnectorListingBound::V1,
-                    )
-                    .await
-                    .expect_err("cancelled table list"),
-            ),
-            ConnectorErrorKind::Cancelled,
-        );
-        assert_eq!(
-            stopped_kind(
-                &catalog
-                    .table_exists_for_read(&ident, cancelled_binding)
-                    .await
-                    .expect_err("cancelled table existence"),
-            ),
-            ConnectorErrorKind::Cancelled,
-        );
+                .expect("typed cancellation");
+            assert_eq!(source.kind(), ConnectorErrorKind::Cancelled);
 
-        catalog
-            .load_table_for_read(
-                &ident,
-                local_test_binding().for_request(read_request(
-                    Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
-                    Instant::now() + Duration::from_secs(30),
-                )),
-            )
-            .await
-            .expect("later request can load");
-        catalog
-            .load_table(&ident)
-            .await
-            .expect("generation client remains usable");
+            let cancelled_binding = local_test_binding().for_request(read_request(
+                cancelled,
+                Instant::now() + Duration::from_secs(30),
+            ));
+            let stopped_kind = |error: &Error| {
+                std::error::Error::source(error)
+                    .and_then(|source| source.downcast_ref::<ConnectorError>())
+                    .expect("typed catalog read stop")
+                    .kind()
+            };
+            assert_eq!(
+                stopped_kind(
+                    &catalog
+                        .list_namespaces_for_read(
+                            cancelled_binding.clone(),
+                            novarocks_spi::connector::ConnectorListingBound::V1,
+                        )
+                        .await
+                        .expect_err("cancelled namespace list"),
+                ),
+                ConnectorErrorKind::Cancelled,
+            );
+            assert_eq!(
+                stopped_kind(
+                    &catalog
+                        .namespace_exists_for_read(&namespace, cancelled_binding.clone())
+                        .await
+                        .expect_err("cancelled namespace existence"),
+                ),
+                ConnectorErrorKind::Cancelled,
+            );
+            assert_eq!(
+                stopped_kind(
+                    &catalog
+                        .list_tables_for_read(
+                            &namespace,
+                            cancelled_binding.clone(),
+                            novarocks_spi::connector::ConnectorListingBound::V1,
+                        )
+                        .await
+                        .expect_err("cancelled table list"),
+                ),
+                ConnectorErrorKind::Cancelled,
+            );
+            assert_eq!(
+                stopped_kind(
+                    &catalog
+                        .table_exists_for_read(&ident, cancelled_binding)
+                        .await
+                        .expect_err("cancelled table existence"),
+                ),
+                ConnectorErrorKind::Cancelled,
+            );
+
+            catalog
+                .load_table_for_read(
+                    &ident,
+                    local_test_binding().for_request(read_request(
+                        Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+                        Instant::now() + Duration::from_secs(30),
+                    )),
+                )
+                .await
+                .expect("later request can load");
+            catalog
+                .load_table(&ident)
+                .await
+                .expect("generation client remains usable");
+        });
     }
 
-    #[tokio::test]
-    async fn commit_reload_uses_operation_io_and_fresh_hint_without_replacing_catalog_io() {
-        use crate::commit::model::ArtifactWriter;
-        let directory = tempfile::tempdir().unwrap();
-        let warehouse = directory.path().to_string_lossy().to_string();
-        let catalog = test_catalog(&warehouse);
-        let stop = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
-        let operation = crate::commit::operation::IcebergCommitOperation::new(
-            crate::commit::model::OperationToken::from_write(
-                novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([7; 16]),
-            ),
-            warehouse.clone(),
-            local_test_binding(),
-            read_request(stop.clone(), Instant::now() + Duration::from_secs(30)),
-            crate::resources::IcebergCatalogRuntime::new(tokio::runtime::Handle::current()),
-            crate::commit::operation::OperationLimits::default(),
-        )
-        .unwrap();
-        let namespace = NamespaceIdent::new("analytics".into());
-        let ident = TableIdent::new(namespace.clone(), "events".into());
-        catalog
-            .create_table_fenced(&namespace, test_creation("events"), "commit-reload".into())
-            .await
+    #[test]
+    fn commit_reload_uses_operation_io_and_fresh_hint_without_replacing_catalog_io() {
+        crate::hadoop_catalog::tests::on_bridge(async move {
+            use crate::commit::model::ArtifactWriter;
+            let directory = tempfile::tempdir().unwrap();
+            let warehouse = directory.path().to_string_lossy().to_string();
+            let catalog = Arc::new(test_catalog(&warehouse));
+            let stop = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
+            let operation = crate::commit::operation::IcebergCommitOperation::new(
+                crate::commit::model::OperationToken::from_write(
+                    novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([7; 16]),
+                ),
+                warehouse.clone(),
+                local_test_binding(),
+                read_request(stop.clone(), Instant::now() + Duration::from_secs(30)),
+                crate::resources::IcebergCatalogRuntime::new(tokio::runtime::Handle::current()),
+                crate::commit::operation::OperationLimits::default(),
+            )
             .unwrap();
-        let original = catalog.load_table(&ident).await.unwrap();
-        let mut json = serde_json::to_value(original.metadata()).unwrap();
-        json["properties"]["external-change"] = "visible-on-reload".into();
-        let table_location = catalog.table_location(&ident);
-        let v2 = HadoopFileSystemCatalog::metadata_path(&table_location, 2);
-        std::fs::write(&v2, serde_json::to_vec(&json).unwrap()).unwrap();
-        std::fs::write(
-            HadoopFileSystemCatalog::version_hint_path(&table_location),
-            b"2\n",
-        )
-        .unwrap();
-        let attempt = operation.begin_attempt().unwrap();
-        let reloaded = catalog
-            .load_table_for_commit(&ident, attempt.file_io().clone())
-            .await
+            let namespace = NamespaceIdent::new("analytics".into());
+            let ident = TableIdent::new(namespace.clone(), "events".into());
+            catalog
+                .create_fixture_table(&namespace, test_creation("events"))
+                .await
+                .unwrap();
+            let original = catalog.load_table(&ident).await.unwrap();
+            let mut json = serde_json::to_value(original.metadata()).unwrap();
+            json["properties"]["external-change"] = "visible-on-reload".into();
+            let table_location = catalog.table_location(&ident);
+            let v2 = HadoopFileSystemCatalog::metadata_path(&table_location, 2);
+            std::fs::write(&v2, serde_json::to_vec(&json).unwrap()).unwrap();
+            std::fs::write(
+                HadoopFileSystemCatalog::version_hint_path(&table_location),
+                b"2\n",
+            )
             .unwrap();
-        assert_eq!(reloaded.metadata_location(), Some(v2.as_str()));
-        assert_eq!(
-            reloaded
-                .metadata()
-                .properties()
-                .get("external-change")
-                .unwrap(),
-            "visible-on-reload"
-        );
-        assert!(
-            original
-                .metadata()
-                .properties()
-                .get("external-change")
-                .is_none()
-        );
-        stop.request_stop();
-        let error = catalog
-            .load_table_for_commit(&ident, attempt.file_io().clone())
-            .await
-            .unwrap_err();
-        let mut source: &dyn std::error::Error = &error;
-        loop {
-            if let Some(stop) = source.downcast_ref::<ConnectorError>() {
-                assert_eq!(stop.kind(), ConnectorErrorKind::Cancelled);
-                break;
+            let attempt = operation.begin_attempt().unwrap();
+            let reloaded = catalog
+                .load_table_for_commit(&ident, attempt.file_io().clone(), attempt.read_binding())
+                .await
+                .unwrap();
+            assert_eq!(reloaded.metadata_location(), Some(v2.as_str()));
+            assert_eq!(
+                reloaded
+                    .metadata()
+                    .properties()
+                    .get("external-change")
+                    .unwrap(),
+                "visible-on-reload"
+            );
+            assert!(
+                original
+                    .metadata()
+                    .properties()
+                    .get("external-change")
+                    .is_none()
+            );
+            stop.request_stop();
+            let error = catalog
+                .load_table_for_commit(&ident, attempt.file_io().clone(), attempt.read_binding())
+                .await
+                .unwrap_err();
+            let mut source: &dyn std::error::Error = &error;
+            loop {
+                if let Some(stop) = source.downcast_ref::<ConnectorError>() {
+                    assert_eq!(stop.kind(), ConnectorErrorKind::Cancelled);
+                    break;
+                }
+                source = source
+                    .source()
+                    .expect("typed operation cancellation is preserved");
             }
-            source = source
-                .source()
-                .expect("typed operation cancellation is preserved");
-        }
-        catalog
-            .load_table(&ident)
-            .await
-            .expect("catalog generation remains usable");
+            catalog
+                .load_table(&ident)
+                .await
+                .expect("catalog generation remains usable");
+        });
     }
 
     pub(super) fn test_creation(name: &str) -> TableCreation {
@@ -1933,7 +1483,7 @@ mod tests {
 
     #[test]
     fn test_table_location() {
-        let catalog = test_catalog("oss://bucket/warehouse");
+        let catalog = Arc::new(test_catalog("oss://bucket/warehouse"));
         let ident = TableIdent::from_strs(["ns1", "my_table"]).unwrap();
         assert_eq!(
             catalog.table_location(&ident),
@@ -1941,128 +1491,91 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn namespace_marker_survives_catalog_reconstruction() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        let location = warehouse.path().to_string_lossy().to_string();
-        let namespace = NamespaceIdent::new("analytics".to_string());
+    #[test]
+    fn namespace_marker_survives_catalog_reconstruction() {
+        crate::hadoop_catalog::tests::on_bridge(async move {
+            let warehouse = tempfile::tempdir().expect("warehouse");
+            let location = warehouse.path().to_string_lossy().to_string();
+            let namespace = NamespaceIdent::new("analytics".to_string());
 
-        let catalog = Arc::new(test_catalog(&location));
-        assert!(!catalog.namespace_exists(&namespace).await.unwrap());
-        let outcome = catalog
-            .publish_fixture_catalog(
-                crate::catalog::catalog_request::CatalogPublicationRequest::CreateNamespace {
-                    namespace: crate::catalog::CatalogNamespaceName::new("analytics"),
-                    properties: HashMap::new(),
-                    no_op_if_exists: false,
-                },
-            )
-            .await;
-        assert!(
-            matches!(
-                outcome,
-                crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
-            ),
-            "{outcome:?}"
-        );
-        assert!(catalog.namespace_exists(&namespace).await.unwrap());
-        assert_eq!(
-            catalog.list_namespaces(None).await.unwrap(),
-            vec![namespace.clone()]
-        );
+            let catalog = Arc::new(test_catalog(&location));
+            assert!(!catalog.namespace_exists(&namespace).await.unwrap());
+            let outcome = catalog
+                .publish_fixture_catalog(
+                    crate::catalog::catalog_request::CatalogPublicationRequest::CreateNamespace {
+                        namespace: crate::catalog::CatalogNamespaceName::new("analytics"),
+                        properties: HashMap::new(),
+                        no_op_if_exists: false,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(
+                    outcome,
+                    crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
+                ),
+                "{outcome:?}"
+            );
+            assert!(catalog.namespace_exists(&namespace).await.unwrap());
+            assert_eq!(
+                catalog.list_namespaces(None).await.unwrap(),
+                vec![namespace.clone()]
+            );
 
-        let restored = Arc::new(test_catalog(&location));
-        assert!(restored.namespace_exists(&namespace).await.unwrap());
-        assert_eq!(
-            restored.list_namespaces(None).await.unwrap(),
-            vec![namespace.clone()]
-        );
-        let outcome = restored
-            .publish_fixture_catalog(
-                crate::catalog::catalog_request::CatalogPublicationRequest::DropNamespace {
-                    namespace: crate::catalog::CatalogNamespaceName::new("analytics"),
-                    no_op_if_missing: false,
-                },
-            )
-            .await;
-        assert!(
-            matches!(
-                outcome,
-                crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
-            ),
-            "{outcome:?}"
-        );
-        assert!(!restored.namespace_exists(&namespace).await.unwrap());
+            let restored = Arc::new(test_catalog(&location));
+            assert!(restored.namespace_exists(&namespace).await.unwrap());
+            assert_eq!(
+                restored.list_namespaces(None).await.unwrap(),
+                vec![namespace.clone()]
+            );
+            let outcome = restored
+                .publish_fixture_catalog(
+                    crate::catalog::catalog_request::CatalogPublicationRequest::DropNamespace {
+                        namespace: crate::catalog::CatalogNamespaceName::new("analytics"),
+                        no_op_if_missing: false,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(
+                    outcome,
+                    crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
+                ),
+                "{outcome:?}"
+            );
+            assert!(!restored.namespace_exists(&namespace).await.unwrap());
+        });
     }
 
-    #[tokio::test]
-    async fn external_table_directory_establishes_namespace_without_private_marker() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        let location = warehouse.path().to_string_lossy().to_string();
-        let namespace = NamespaceIdent::new("spark_created".to_string());
-        let metadata_dir = warehouse
-            .path()
-            .join("spark_created")
-            .join("orders")
-            .join("metadata");
-        std::fs::create_dir_all(&metadata_dir).expect("create Spark-style metadata directory");
-        std::fs::write(metadata_dir.join("version-hint.text"), b"1\n")
+    #[test]
+    fn external_table_directory_establishes_namespace_without_private_marker() {
+        crate::hadoop_catalog::tests::on_bridge(async move {
+            let warehouse = tempfile::tempdir().expect("warehouse");
+            let location = warehouse.path().to_string_lossy().to_string();
+            let namespace = NamespaceIdent::new("spark_created".to_string());
+            let metadata_dir = warehouse
+                .path()
+                .join("spark_created")
+                .join("orders")
+                .join("metadata");
+            std::fs::create_dir_all(&metadata_dir).expect("create Spark-style metadata directory");
+            std::fs::write(
+                metadata_dir.join("v1.metadata.json"),
+                b"not needed for physical existence",
+            )
             .expect("write Spark-style version hint");
 
-        let catalog = test_catalog(&location);
-        assert!(catalog.namespace_exists(&namespace).await.unwrap());
-        assert_eq!(
-            catalog.list_namespaces(None).await.unwrap(),
-            vec![namespace.clone()]
-        );
-        assert_eq!(
-            catalog.list_tables(&namespace).await.unwrap(),
-            vec![TableIdent::new(namespace, "orders".to_string())]
-        );
-    }
-
-    #[tokio::test]
-    async fn independent_catalog_clients_share_one_v1_owner() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        let location = warehouse.path().to_string_lossy().to_string();
-        let namespace = NamespaceIdent::new("analytics".to_string());
-        let first = test_catalog(&location);
-        let second = test_catalog(&location);
-
-        let (left, right) = tokio::join!(
-            first.create_table_fenced(
-                &namespace,
-                test_creation("events"),
-                "operation-left".to_string(),
-            ),
-            second.create_table_fenced(
-                &namespace,
-                test_creation("events"),
-                "operation-right".to_string(),
-            ),
-        );
-        let left = left.expect("left create result");
-        let right = right.expect("right create result");
-
-        assert_eq!(
-            [left.disposition, right.disposition]
-                .into_iter()
-                .filter(|disposition| *disposition == HadoopCreateDisposition::Created)
-                .count(),
-            1
-        );
-        assert_eq!(
-            [left.disposition, right.disposition]
-                .into_iter()
-                .filter(|disposition| *disposition == HadoopCreateDisposition::Existing)
-                .count(),
-            1
-        );
-        assert_eq!(left.table.metadata().uuid(), right.table.metadata().uuid());
-        assert_eq!(
-            left.table.metadata_location(),
-            right.table.metadata_location()
-        );
+            let catalog = Arc::new(test_catalog(&location));
+            assert!(catalog.namespace_exists(&namespace).await.unwrap());
+            assert_eq!(
+                catalog.list_namespaces(None).await.unwrap(),
+                vec![namespace.clone()]
+            );
+            assert_eq!(
+                catalog.list_tables(&namespace).await.unwrap(),
+                vec![TableIdent::new(namespace, "orders".to_string())]
+            );
+        });
     }
 
     /// A drop removes the catalog entry and nothing else.
@@ -2070,359 +1583,141 @@ mod tests {
     /// Data files outlive it deliberately: they are objects, and objects are
     /// reclaimed by the age-gated, identity-checked cleanup handoff, never by
     /// the catalog deleting a path prefix out from under a live reader.
-    #[tokio::test]
-    async fn drop_removes_the_catalog_pointer_and_leaves_objects_for_collection() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        let location = warehouse.path().to_string_lossy().to_string();
-        let namespace = NamespaceIdent::new("analytics".to_string());
-        let ident = TableIdent::new(namespace.clone(), "events".to_string());
-        let catalog = Arc::new(test_catalog(&location));
-        catalog
-            .create_table_fenced(
-                &namespace,
-                test_creation("events"),
-                "operation-create".to_string(),
-            )
-            .await
-            .expect("create table");
+    #[test]
+    fn drop_removes_the_catalog_pointer_and_leaves_objects_for_collection() {
+        crate::hadoop_catalog::tests::on_bridge(async move {
+            let warehouse = tempfile::tempdir().expect("warehouse");
+            let location = warehouse.path().to_string_lossy().to_string();
+            let namespace = NamespaceIdent::new("analytics".to_string());
+            let ident = TableIdent::new(namespace.clone(), "events".to_string());
+            let catalog = Arc::new(test_catalog(&location));
+            catalog
+                .create_fixture_table(&namespace, test_creation("events"))
+                .await
+                .expect("create table");
 
-        let table_location = catalog.table_location(&ident);
-        // Stand in for a data file the table owns.
-        let data_file = format!("{table_location}/data/part-0.parquet");
-        catalog
-            .file_io
-            .new_output(&data_file)
-            .expect("output")
-            .write(bytes::Bytes::from_static(b"rows"))
-            .await
-            .expect("write data file");
+            let table_location = catalog.table_location(&ident);
+            // Stand in for a data file the table owns.
+            let data_file = format!("{table_location}/data/part-0.parquet");
+            catalog
+                .file_io
+                .new_output(&data_file)
+                .expect("output")
+                .write(bytes::Bytes::from_static(b"rows"))
+                .await
+                .expect("write data file");
 
-        let outcome = catalog
-            .publish_fixture_catalog(
-                crate::catalog::catalog_request::CatalogPublicationRequest::DropTable {
-                    table: crate::catalog::CatalogTableName::from_identifier(&ident),
-                    no_op_if_missing: false,
-                    purge: false,
-                    capture: None,
-                },
-            )
-            .await;
-        assert!(
-            matches!(
-                outcome,
-                crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
-            ),
-            "{outcome:?}"
-        );
+            let outcome = catalog
+                .publish_fixture_catalog(
+                    crate::catalog::catalog_request::CatalogPublicationRequest::DropTable {
+                        table: crate::catalog::CatalogTableName::from_identifier(&ident),
+                        no_op_if_missing: false,
+                        purge: false,
+                        capture: None,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(
+                    outcome,
+                    crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
+                ),
+                "{outcome:?}"
+            );
 
-        assert!(
-            !catalog.table_exists(&ident).await.expect("existence"),
-            "the catalog entry is gone"
-        );
-        // A fresh client must agree: the pointer, not just the cache, was removed.
-        let restored = test_catalog(&location);
-        assert!(!restored.table_exists(&ident).await.expect("existence"));
+            assert!(
+                !catalog.table_exists(&ident).await.expect("existence"),
+                "the catalog entry is gone"
+            );
+            // A fresh client must agree: the pointer, not just the cache, was removed.
+            let restored = test_catalog(&location);
+            assert!(!restored.table_exists(&ident).await.expect("existence"));
 
-        assert!(
-            catalog.file_io.exists(&data_file).await.expect("stat"),
-            "objects survive the drop and are left to identity-aware collection"
-        );
+            assert!(
+                catalog.file_io.exists(&data_file).await.expect("stat"),
+                "objects survive the drop and are left to identity-aware collection"
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn external_drop_invalidates_a_cached_table_existence() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        let location = warehouse.path().to_string_lossy().to_string();
-        let namespace = NamespaceIdent::new("analytics".to_string());
-        let ident = TableIdent::new(namespace.clone(), "events".to_string());
-        let server_catalog = test_catalog(&location);
-        let external_catalog = Arc::new(test_catalog(&location));
+    #[test]
+    fn external_drop_invalidates_a_cached_table_existence() {
+        crate::hadoop_catalog::tests::on_bridge(async move {
+            let warehouse = tempfile::tempdir().expect("warehouse");
+            let location = warehouse.path().to_string_lossy().to_string();
+            let namespace = NamespaceIdent::new("analytics".to_string());
+            let ident = TableIdent::new(namespace.clone(), "events".to_string());
+            let server_catalog = Arc::new(test_catalog(&location));
+            let external_catalog = Arc::new(test_catalog(&location));
 
-        server_catalog
-            .create_table_fenced(
-                &namespace,
-                test_creation("events"),
-                "operation-create".to_string(),
-            )
-            .await
-            .expect("create table");
-        assert!(
             server_catalog
-                .table_exists(&ident)
+                .create_fixture_table(&namespace, test_creation("events"))
                 .await
-                .expect("cache table existence")
-        );
+                .expect("create table");
+            assert!(
+                server_catalog
+                    .table_exists(&ident)
+                    .await
+                    .expect("cache table existence")
+            );
 
-        let outcome = external_catalog
-            .publish_fixture_catalog(
-                crate::catalog::catalog_request::CatalogPublicationRequest::DropTable {
-                    table: crate::catalog::CatalogTableName::from_identifier(&ident),
-                    no_op_if_missing: false,
-                    purge: false,
-                    capture: None,
-                },
-            )
-            .await;
-        assert!(
-            matches!(
-                outcome,
-                crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
-            ),
-            "{outcome:?}"
-        );
+            let outcome = external_catalog
+                .publish_fixture_catalog(
+                    crate::catalog::catalog_request::CatalogPublicationRequest::DropTable {
+                        table: crate::catalog::CatalogTableName::from_identifier(&ident),
+                        no_op_if_missing: false,
+                        purge: false,
+                        capture: None,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(
+                    outcome,
+                    crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
+                ),
+                "{outcome:?}"
+            );
 
-        assert!(
-            !server_catalog
-                .table_exists(&ident)
+            assert!(
+                !server_catalog
+                    .table_exists(&ident)
+                    .await
+                    .expect("observe external drop")
+            );
+            assert!(matches!(
+                server_catalog.load_table(&ident).await,
+                Err(error) if error.kind() == ErrorKind::TableNotFound
+            ));
+        });
+    }
+
+    #[test]
+    fn canonical_v1_recovers_table_when_hint_is_missing() {
+        crate::hadoop_catalog::tests::on_bridge(async move {
+            let warehouse = tempfile::tempdir().expect("warehouse");
+            let location = warehouse.path().to_string_lossy().to_string();
+            let namespace = NamespaceIdent::new("analytics".to_string());
+            let ident = TableIdent::new(namespace.clone(), "events".to_string());
+            let catalog = Arc::new(test_catalog(&location));
+            let created = catalog
+                .create_fixture_table(&namespace, test_creation("events"))
                 .await
-                .expect("observe external drop")
-        );
-        assert!(matches!(
-            server_catalog.load_table(&ident).await,
-            Err(error) if error.kind() == ErrorKind::TableNotFound
-        ));
-    }
+                .expect("create table");
+            let hint = HadoopFileSystemCatalog::version_hint_path(&catalog.table_location(&ident));
+            catalog.file_io.delete(&hint).await.expect("remove hint");
 
-    #[tokio::test]
-    async fn canonical_v1_recovers_table_when_hint_is_missing() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        let location = warehouse.path().to_string_lossy().to_string();
-        let namespace = NamespaceIdent::new("analytics".to_string());
-        let ident = TableIdent::new(namespace.clone(), "events".to_string());
-        let catalog = test_catalog(&location);
-        let created = catalog
-            .create_table_fenced(
-                &namespace,
-                test_creation("events"),
-                "operation-create".to_string(),
-            )
-            .await
-            .expect("create table");
-        let hint = HadoopFileSystemCatalog::version_hint_path(&catalog.table_location(&ident));
-        catalog.file_io.delete(&hint).await.expect("remove hint");
-
-        let restored = test_catalog(&location);
-        assert!(restored.table_exists(&ident).await.expect("table exists"));
-        let loaded = restored.load_table(&ident).await.expect("load from v1");
-        assert_eq!(created.table.metadata().uuid(), loaded.metadata().uuid());
-        assert!(restored.file_io.exists(&hint).await.expect("repaired hint"));
-    }
-
-    #[tokio::test]
-    async fn fault_before_conditional_request_leaves_no_v1() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        let location = warehouse.path().to_string_lossy().to_string();
-        let namespace = NamespaceIdent::new("analytics".to_string());
-        let ident = TableIdent::new(namespace.clone(), "events".to_string());
-        let catalog = test_catalog(&location);
-        let v1 = HadoopFileSystemCatalog::metadata_path(&catalog.table_location(&ident), 1);
-        let hint = HadoopFileSystemCatalog::version_hint_path(&catalog.table_location(&ident));
-        catalog.inject_test_fault(HadoopCatalogTestFault::BeforeConditionalRequest);
-
-        let failure = catalog
-            .create_table_fenced(
-                &namespace,
-                test_creation("events"),
-                "operation-before-request".to_string(),
-            )
-            .await
-            .expect_err("injected pre-request failure");
-
-        assert_eq!(failure.kind, HadoopCreateFailureKind::Uncommitted);
-        assert!(!catalog.file_io.exists(&v1).await.expect("probe v1"));
-        assert!(!catalog.file_io.exists(&hint).await.expect("probe hint"));
-    }
-
-    #[tokio::test]
-    async fn lost_conditional_response_is_attributed_by_authoritative_v1() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        let location = warehouse.path().to_string_lossy().to_string();
-        let namespace = NamespaceIdent::new("analytics".to_string());
-        let catalog = test_catalog(&location);
-        catalog.inject_test_fault(HadoopCatalogTestFault::AfterConditionalResponseLoss);
-
-        let created = catalog
-            .create_table_fenced(
-                &namespace,
-                test_creation("events"),
-                "operation-response-loss".to_string(),
-            )
-            .await
-            .expect("authoritative reread attributes committed v1");
-
-        assert_eq!(created.disposition, HadoopCreateDisposition::Created);
-        assert_eq!(created.facts.table_uuid, created.authoritative_table_uuid);
-        assert_eq!(
-            created.facts.metadata_digest,
-            created.authoritative_metadata_digest
-        );
-        assert!(created.finalization_failure.is_none());
-        assert!(
-            catalog
-                .file_io
-                .exists(&created.facts.metadata_location)
-                .await
-                .expect("probe committed v1")
-        );
-    }
-
-    #[tokio::test]
-    async fn failure_before_hint_write_is_committed_and_v1_recovers() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        let location = warehouse.path().to_string_lossy().to_string();
-        let namespace = NamespaceIdent::new("analytics".to_string());
-        let ident = TableIdent::new(namespace.clone(), "events".to_string());
-        let catalog = test_catalog(&location);
-        catalog.inject_test_fault(HadoopCatalogTestFault::BeforeHintWrite);
-
-        let created = catalog
-            .create_table_fenced(
-                &namespace,
-                test_creation("events"),
-                "operation-hint-before".to_string(),
-            )
-            .await
-            .expect("v1 commit survives hint failure");
-        let hint = HadoopFileSystemCatalog::version_hint_path(&catalog.table_location(&ident));
-        assert_eq!(created.disposition, HadoopCreateDisposition::Created);
-        assert!(created.finalization_failure.is_some());
-        assert!(
-            catalog
-                .file_io
-                .exists(&created.facts.metadata_location)
-                .await
-                .expect("probe committed v1")
-        );
-        assert!(!catalog.file_io.exists(&hint).await.expect("probe hint"));
-
-        let restored = test_catalog(&location);
-        let loaded = restored
-            .load_table(&ident)
-            .await
-            .expect("recover table from canonical v1");
-        assert_eq!(
-            loaded.metadata().uuid().to_string(),
-            created.facts.table_uuid
-        );
-        assert!(restored.file_io.exists(&hint).await.expect("repaired hint"));
-    }
-
-    #[tokio::test]
-    async fn lost_hint_response_remains_committed_with_durable_hint() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        let location = warehouse.path().to_string_lossy().to_string();
-        let namespace = NamespaceIdent::new("analytics".to_string());
-        let ident = TableIdent::new(namespace.clone(), "events".to_string());
-        let catalog = test_catalog(&location);
-        catalog.inject_test_fault(HadoopCatalogTestFault::AfterHintWriteResponseLoss);
-
-        let created = catalog
-            .create_table_fenced(
-                &namespace,
-                test_creation("events"),
-                "operation-hint-response-loss".to_string(),
-            )
-            .await
-            .expect("v1 commit survives lost hint response");
-        let hint = HadoopFileSystemCatalog::version_hint_path(&catalog.table_location(&ident));
-        assert_eq!(created.disposition, HadoopCreateDisposition::Created);
-        assert!(created.finalization_failure.is_some());
-        assert!(catalog.file_io.exists(&hint).await.expect("durable hint"));
-
-        let restored = test_catalog(&location);
-        let loaded = restored
-            .load_table(&ident)
-            .await
-            .expect("load through durable hint");
-        assert_eq!(
-            loaded.metadata().uuid().to_string(),
-            created.facts.table_uuid
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_authoritative_reread_after_response_loss_stays_unknown() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        let location = warehouse.path().to_string_lossy().to_string();
-        let namespace = NamespaceIdent::new("analytics".to_string());
-        let ident = TableIdent::new(namespace.clone(), "events".to_string());
-        let catalog = test_catalog(&location);
-        let attempt = catalog
-            .prepare_create_attempt(
-                &namespace,
-                test_creation("events"),
-                "operation-reread-failure".to_string(),
-            )
-            .expect("prepare create attempt");
-        let facts = attempt.facts.clone();
-        catalog.inject_test_fault(HadoopCatalogTestFault::AfterConditionalResponseLoss);
-        catalog.inject_test_fault(HadoopCatalogTestFault::AuthoritativeV1Read);
-
-        let failure = catalog
-            .publish_create_attempt(attempt)
-            .await
-            .expect_err("unreadable authoritative v1 cannot be guessed committed");
-        let hint = HadoopFileSystemCatalog::version_hint_path(&catalog.table_location(&ident));
-        assert_eq!(failure.kind, HadoopCreateFailureKind::Unknown);
-        assert!(
-            catalog
-                .file_io
-                .exists(&facts.metadata_location)
-                .await
-                .expect("v1 was durably created")
-        );
-        assert!(!catalog.file_io.exists(&hint).await.expect("probe hint"));
-    }
-
-    #[tokio::test]
-    async fn failed_hint_repair_never_deletes_committed_v1() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        let location = warehouse.path().to_string_lossy().to_string();
-        let namespace = NamespaceIdent::new("analytics".to_string());
-        let ident = TableIdent::new(namespace.clone(), "events".to_string());
-        let creator = test_catalog(&location);
-        creator.inject_test_fault(HadoopCatalogTestFault::BeforeHintWrite);
-        let created = creator
-            .create_table_fenced(
-                &namespace,
-                test_creation("events"),
-                "operation-repair".to_string(),
-            )
-            .await
-            .expect("commit v1 without hint");
-        let original_v1 = creator
-            .file_io
-            .new_input(&created.facts.metadata_location)
-            .expect("open committed v1")
-            .read()
-            .await
-            .expect("read committed v1");
-
-        let restored = test_catalog(&location);
-        restored.inject_test_fault(HadoopCatalogTestFault::BeforeHintWrite);
-        assert!(
-            restored
-                .table_exists(&ident)
-                .await
-                .expect("v1 remains authoritative when hint repair fails")
-        );
-        let after_repair = restored
-            .file_io
-            .new_input(&created.facts.metadata_location)
-            .expect("open v1 after failed repair")
-            .read()
-            .await
-            .expect("read v1 after failed repair");
-        let hint = HadoopFileSystemCatalog::version_hint_path(&restored.table_location(&ident));
-        assert_eq!(after_repair, original_v1);
-        assert!(!restored.file_io.exists(&hint).await.expect("probe hint"));
-        let loaded = restored
-            .load_table(&ident)
-            .await
-            .expect("cache populated from v1 despite failed hint repair");
-        assert_eq!(
-            loaded.metadata().uuid().to_string(),
-            created.facts.table_uuid
-        );
+            let restored = test_catalog(&location);
+            assert!(restored.table_exists(&ident).await.expect("table exists"));
+            let loaded = restored.load_table(&ident).await.expect("load from v1");
+            assert_eq!(created.metadata().uuid(), loaded.metadata().uuid());
+            assert!(
+                !restored
+                    .file_io
+                    .exists(&hint)
+                    .await
+                    .expect("reads do not repair hint")
+            );
+        });
     }
 }

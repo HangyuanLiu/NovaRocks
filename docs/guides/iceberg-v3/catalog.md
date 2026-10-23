@@ -143,7 +143,7 @@ FE 无法核对 BE 本地配置：BE 缺少 `DataCredentialVending` 所引用的
 
 ## Hadoop 与 Hive
 
-Hadoop 实现入口为 `novarocks/connector/iceberg/src/hadoop_catalog.rs`；使用 `iceberg.catalog.type=hadoop` 和明确 warehouse。它的 metadata/commit 约定由该实现管理，不应把 warehouse 当作可以绕过原 catalog 协调直接写入的路径。
+Hadoop 仅用于单写者测试，入口为 `novarocks/connector/iceberg/src/hadoop_catalog.rs`；使用 `iceberg.catalog.type=hadoop` 和明确 warehouse。CREATE/UPDATE 安装完整且不替换的版本文件，hint 仅作收尾；读路径按 hint 前探，缺失/非法时完整列举，损坏内容可显式 DROP。metadata 根固定，不支持其他 CREATE location、SetLocation、write.metadata.path 或 HDFS。它不提供生产并发、跨引擎 CAS、断电恢复或 Unknown 后安全继续；生产写入使用 REST catalog。详见 [ADR-0196](../../adr/ADR-0196-hadoop-test-catalog-complete-version-installation.md)。
 
 **Hive Metastore（HMS）是永久只读兼容入口。** NovaRocks 可以读取由 Spark 等外部引擎写入的表，查询元数据表并进行 branch 或 snapshot ID 时间旅行。HMS 上的建库、建表、ALTER、ref/view 变更、CTAS、DML、TRUNCATE、ADD FILES、维护、ANALYZE、OPTIMIZE 与 MV 管理均在第一次外部副作用之前拒绝；不会因为这些请求写出数据或规划文件，也不会建立统计或 OPTIMIZE 作业。`CREATE / DROP CATALOG` 只管理 NovaRocks 自身配置，不属于 HMS 湖侧 mutation。
 

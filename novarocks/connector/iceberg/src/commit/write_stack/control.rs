@@ -4010,10 +4010,6 @@ mod eager_attempt_io_tests {
             self.inner.exists(path).await
         }
 
-        async fn list_directories(&self, path: &str) -> crate::iceberg::Result<Vec<String>> {
-            self.inner.list_directories(path).await
-        }
-
         async fn metadata(&self, path: &str) -> crate::iceberg::Result<FileMetadata> {
             if self.trace.is_data(path) {
                 self.trace

@@ -102,10 +102,11 @@ impl PublicationPreparer for CatalogPublisher {
             .map_err(|failure| Error::new(ErrorKind::FeatureUnsupported, failure.0.message()))?;
         let loaded = self
             .catalog
-            .load_commit_base_with_snapshots(
+            .load_commit_base_for_request(
                 crate::catalog::CatalogTableName::from_identifier(&self.ident),
                 attempt.file_io().clone(),
                 mode,
+                attempt.read_binding(),
             )
             .await;
         attempt.check_active()?;
