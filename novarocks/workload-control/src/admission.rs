@@ -131,7 +131,7 @@ pub(crate) fn dispatch(state: &mut State, config: &WorkloadConfig) -> Vec<Waker>
                 return None;
             }
             state.nodes[&request.work]
-                .check()
+                .check(&state.cancellations)
                 .err()
                 .or_else(|| {
                     (Instant::now() >= request.wait_deadline)
@@ -263,7 +263,7 @@ impl WorkScope {
     pub fn track_stage(&self, stage: Stage) -> Result<StagePermit, WorkError> {
         let root = self.inner.update(|state| {
             let node = state.nodes.get(&self.id).ok_or(WorkError::Released)?;
-            node.check()?;
+            node.check(&state.cancellations)?;
             Ok(node.root)
         })?;
         Ok(StagePermit {
@@ -284,7 +284,7 @@ impl WorkScope {
             .ok_or(WorkError::ArithmeticOverflow)?;
         let id = self.inner.update(|state| {
             let node = state.nodes.get(&self.id).ok_or(WorkError::Released)?;
-            node.check()?;
+            node.check(&state.cancellations)?;
             if node.stages.contains(&request.stage) {
                 return Err(WorkError::AlreadyAdmitted);
             }
@@ -341,7 +341,7 @@ impl WorkScope {
     pub fn try_acquire(&self, stage: Stage) -> Result<StagePermit, WorkError> {
         self.inner.update(|state| {
             let node = state.nodes.get(&self.id).ok_or(WorkError::Released)?;
-            node.check()?;
+            node.check(&state.cancellations)?;
             if node.stages.contains(&stage) {
                 return Err(WorkError::AlreadyAdmitted);
             }
@@ -416,7 +416,7 @@ impl Future for StageAdmission {
                 AdmissionState::Rejected(error) => Err(error.clone()),
             }
             .and_then(|grant| {
-                state.nodes[&self.scope.id].check()?;
+                state.nodes[&self.scope.id].check(&state.cancellations)?;
                 if Instant::now() >= state.requests[&id].wait_deadline {
                     return Err(WorkError::CapacityWaitTimeout);
                 }
@@ -470,7 +470,7 @@ impl WorkScope {
             .ok_or(WorkError::ArithmeticOverflow)?;
         let id = self.inner.update(|state| {
             let node = state.nodes.get(&self.id).ok_or(WorkError::Released)?;
-            node.check()?;
+            node.check(&state.cancellations)?;
             if node.parent.is_some()
                 || node.root != self.id
                 || !node.class.uses_warehouse_concurrency()
@@ -612,7 +612,7 @@ impl QueryAdmission {
                 AdmissionState::Rejected(error) => Err(error.clone()),
             }
             .and_then(|grant| {
-                state.nodes[&self.scope.id].check()?;
+                state.nodes[&self.scope.id].check(&state.cancellations)?;
                 if Instant::now() >= state.requests[&id].wait_deadline {
                     return Err(WorkError::CapacityWaitTimeout);
                 }

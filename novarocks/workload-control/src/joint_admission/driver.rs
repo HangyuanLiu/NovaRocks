@@ -28,7 +28,11 @@ use super::{
     },
     *,
 };
-use crate::{WorkId, WorkloadProgressRevision, scope::Inner};
+use crate::{
+    WorkId, WorkloadProgressRevision,
+    control_storage::{SlotId, SlotPhase},
+    scope::Inner,
+};
 use std::{
     collections::BTreeMap,
     ops::Bound::{Excluded, Included, Unbounded},
@@ -53,6 +57,14 @@ pub struct JointProgressDriver {
     scan_left: usize,
     scan_end: Option<u64>,
     scan_revision: Option<WorkloadProgressRevision>,
+    reclaim_cursor: usize,
+    reclaim_left: usize,
+    reclaim_revision: Option<WorkloadProgressRevision>,
+    reclaim_idle: Option<WorkloadProgressRevision>,
+    reclaim_parent: Option<SlotId>,
+    last_reclaim_was_hint: bool,
+    #[cfg(test)]
+    pub(crate) reclaim_checks: usize,
 }
 #[derive(Clone, Copy)]
 enum Preparation {
@@ -93,12 +105,124 @@ impl JointProgressDriver {
             scan_left: 0,
             scan_end: None,
             scan_revision: None,
+            reclaim_cursor: 0,
+            reclaim_left: 0,
+            reclaim_revision: None,
+            reclaim_idle: None,
+            reclaim_parent: None,
+            last_reclaim_was_hint: false,
+            #[cfg(test)]
+            reclaim_checks: 0,
         }
     }
 
     /// At most one snapshot record or one configured solver budget is processed
     /// per call. Never call repeatedly without yielding the role's executor.
     pub fn step(&mut self) -> JointProgress {
+        let reclaim_more = self.reclaim_one();
+        let proof = self.step_proof();
+        if let JointProgress::Idle(marker) = proof {
+            let state = self.inner.state.lock().unwrap();
+            // A last alias may exit between the reaper's check and proof Idle.
+            // Do not swallow that generation by returning the later marker.
+            if reclaim_more
+                || (state.cancellations.fixed
+                    && state.cancellations.retired != 0
+                    && self.reclaim_idle != Some(marker))
+            {
+                return JointProgress::More;
+            }
+        }
+        proof
+    }
+
+    /// One cell at most, alongside the original proof step. A successful leaf
+    /// gives one parent hint, alternating with the finite fair storage scan.
+    fn reclaim_one(&mut self) -> bool {
+        let prepared = {
+            let mut state = self.inner.state.lock().unwrap();
+            let marker = self.inner.capture_progress(&state);
+            if !state.cancellations.fixed || state.cancellations.retired == 0 {
+                self.reclaim_left = 0;
+                self.reclaim_parent = None;
+                self.reclaim_idle = Some(marker);
+                return false;
+            }
+            if self.reclaim_left == 0 {
+                if self.reclaim_idle == Some(marker) {
+                    return false;
+                }
+                self.reclaim_left = state.cancellations.slots.len();
+                self.reclaim_revision = Some(marker);
+                self.reclaim_idle = None;
+            }
+            let hint = if self.last_reclaim_was_hint {
+                None
+            } else {
+                self.reclaim_parent.take()
+            };
+            let slot = match hint {
+                Some(slot) => {
+                    self.last_reclaim_was_hint = true;
+                    slot
+                }
+                None => {
+                    let count = state.cancellations.slots.len();
+                    let slot = SlotId(self.reclaim_cursor % count);
+                    self.reclaim_cursor = (self.reclaim_cursor + 1) % count;
+                    self.reclaim_left -= 1;
+                    self.last_reclaim_was_hint = false;
+                    slot
+                }
+            };
+            #[cfg(test)]
+            {
+                self.reclaim_checks += 1;
+            }
+            state
+                .cancellations
+                .prepare_reap(slot)
+                .map(|(reset, parent, generation)| (slot, reset, parent, generation))
+        };
+        if let Some((id, reset, parent, generation)) = prepared {
+            // Parent strong references and obsolete values actually leave here,
+            // outside State. Only then may the exact original claim be rekeyed.
+            drop(reset);
+            {
+                let mut state = self.inner.state.lock().unwrap();
+                let slot = &state.cancellations.slots[id.0];
+                assert_eq!(slot.phase, SlotPhase::Retired);
+                assert_eq!(slot.generation, generation);
+                let claim = slot.claim.unwrap();
+                let base = slot.base;
+                state
+                    .joint
+                    .as_mut()
+                    .unwrap()
+                    .reset_control_slot(id, claim, base);
+                if !state.cancellations.finish_reaped(id) {
+                    state.joint.as_mut().unwrap().driver_closed = true;
+                }
+                state.advance_progress_revision();
+            }
+            self.reclaim_parent = parent;
+            self.reclaim_idle = None;
+            self.inner.notify_reclaim_progress();
+            return true;
+        }
+        let state = self.inner.state.lock().unwrap();
+        let marker = self.inner.capture_progress(&state);
+        if self.reclaim_left != 0 || self.reclaim_parent.is_some() {
+            return true;
+        }
+        if self.reclaim_revision != Some(marker) {
+            return true;
+        }
+        self.reclaim_idle = Some(marker);
+        false
+    }
+
+    fn step_proof(&mut self) -> JointProgress {
         if self.active.is_none() {
             let (start, idle_revision) = {
                 let mut guard = self.inner.state.lock().unwrap();
@@ -144,7 +268,7 @@ impl JointProgressDriver {
                             && state
                                 .nodes
                                 .get(&request.owner)
-                                .is_none_or(|node| node.check().is_err());
+                                .is_none_or(|node| node.check(&state.cancellations).is_err());
                     if matches!(request.phase, RequestPhase::Failed(_))
                         || (!matches!(request.phase, RequestPhase::Waiting) && !cancelled)
                         || (request.blocked_at == Some(ledger.release_epoch) && !cancelled)
@@ -213,7 +337,7 @@ impl JointProgressDriver {
                         .nodes
                         .get(&turn.owner)
                         .ok_or(WorkError::Released)?
-                        .check()?;
+                        .check(&state.cancellations)?;
                 }
                 validate_waiting(ledger, turn.id, &turn.changes)?;
                 Ok(ledger.profile_layout_revision == turn.layout_revision)
@@ -504,7 +628,7 @@ fn validate_turn_stop(
             .nodes
             .get(&turn.owner)
             .ok_or(WorkError::Released)?
-            .check()?;
+            .check(&state.cancellations)?;
     }
     if waiting {
         validate_waiting(ledger, turn.id, &turn.changes)?;

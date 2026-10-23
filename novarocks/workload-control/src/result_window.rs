@@ -181,7 +181,12 @@ impl ResultCapacityHandle {
         }
         self.inner.update(|state| {
             let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
-            if cut == ResultClosingCut::AcceptedCancellation && node.cancellation.reason().is_none()
+            if cut == ResultClosingCut::AcceptedCancellation
+                && state
+                    .cancellations
+                    .cell(node.cancellation)
+                    .check_reason()
+                    .is_none()
             {
                 return Err(WorkError::Conflict);
             }
@@ -219,7 +224,7 @@ pub(crate) fn reserve_window(
     // Closing keeps the original responsibility after cancellation. It does
     // not admit new computation and must not clear its cancellation reason.
     if class != ResultWindowClass::Closing {
-        node.check()?;
+        node.check(&state.cancellations)?;
     }
     let all_objects_bytes = count_window(state, scope.id, class)?;
     Ok(adopt_window(scope, class, all_objects_bytes))
@@ -403,9 +408,9 @@ impl ResultWindowAlias {
                 .nodes
                 .get(&parent.id)
                 .ok_or(WorkError::Released)?
-                .check()?;
+                .check(&state.cancellations)?;
             let node = state.nodes.get_mut(&child.id).ok_or(WorkError::Released)?;
-            node.check()?;
+            node.check(&state.cancellations)?;
             if node.parent != Some(parent.id) {
                 return Err(WorkError::Conflict);
             }

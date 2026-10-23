@@ -72,6 +72,95 @@ pub(crate) struct Cancellation {
 }
 
 impl Cancellation {
+    pub(crate) fn preallocated(children: usize) -> Result<Arc<Self>, crate::WorkError> {
+        let mut cell = Self::root(None);
+        Arc::get_mut(&mut cell)
+            .unwrap()
+            .state
+            .get_mut()
+            .unwrap()
+            .children
+            .try_reserve_exact(children)
+            .map_err(|_| crate::WorkError::Capacity("control child backing"))?;
+        // Initialize the supported platform's lazy mutexes before publication.
+        let _ = cell.check_reason();
+        {
+            let mut notified = std::pin::pin!(cell.changed.notified());
+            notified.as_mut().enable();
+        }
+        Ok(cell)
+    }
+
+    pub(crate) fn children_backing_bytes(capacity: usize) -> Result<usize, crate::WorkError> {
+        std::alloc::Layout::array::<ChildLink>(capacity)
+            .map(|layout| layout.size())
+            .map_err(|_| crate::WorkError::ArithmeticOverflow)
+    }
+
+    pub(crate) fn reuse_root(&mut self, deadline: Option<Instant>) {
+        assert!(self.parent.is_none(), "Free cell has no previous parent");
+        let state = self.state.get_mut().unwrap();
+        assert!(
+            state.reason.is_none() && !state.success_sealed && state.children.is_empty(),
+            "Free cell was exclusively reset"
+        );
+        self.deadline = deadline;
+    }
+
+    pub(crate) fn reuse_child(
+        cell: &mut Arc<Self>,
+        parent: &Arc<Self>,
+        deadline: Option<Instant>,
+        sequence: WorkId,
+    ) -> Result<(), crate::WorkError> {
+        let inherited = parent.check_reason();
+        let deadline = match (parent.deadline, deadline) {
+            (Some(parent), Some(child)) => Some(parent.min(child)),
+            (parent, child) => parent.or(child),
+        };
+        let mut state = parent.state.lock().unwrap();
+        if state.children.len() == state.children.capacity() {
+            return Err(crate::WorkError::Capacity("prepaid parent child backing"));
+        }
+        let child = Arc::get_mut(cell).ok_or(crate::WorkError::Conflict)?;
+        child.reuse_root(deadline);
+        child.parent = Some(ParentLink {
+            parent: Arc::clone(parent),
+            sequence,
+        });
+        child.state.get_mut().unwrap().reason = state.reason.clone().or(inherited);
+        let index = state
+            .children
+            .partition_point(|link| link.sequence < sequence);
+        assert!(
+            state
+                .children
+                .get(index)
+                .is_none_or(|link| link.sequence != sequence)
+        );
+        state.children.insert(
+            index,
+            ChildLink {
+                sequence,
+                child: Arc::downgrade(cell),
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn reset_for_reuse(&mut self) -> CancellationReset {
+        let state = self.state.get_mut().unwrap();
+        state.reason = None;
+        state.success_sealed = false;
+        state.children.clear(); // Keep the same prepaid allocation and capacity.
+        self.deadline = None;
+        // Only notify_waiters is used here. With no old Notified borrower,
+        // the existing Notify can be retained together with its paid mutex.
+        CancellationReset {
+            _parent: self.parent.take().map(|link| link.parent),
+        }
+    }
+
     pub(crate) fn root(deadline: Option<Instant>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State::default()),
@@ -148,6 +237,11 @@ impl Cancellation {
     #[cfg(test)]
     pub(crate) fn linked_children_for_test(&self) -> usize {
         self.state.lock().unwrap().children.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn child_capacity_for_test(&self) -> usize {
+        self.state.lock().unwrap().children.capacity()
     }
 
     /// Commit one local first-wins decision without walking or waking.
@@ -331,6 +425,12 @@ impl Cancellation {
     }
 }
 
+/// One fixed deferred position returned from the locked reset. Its actual
+/// values must be dropped outside State before the slot is published Free.
+pub(crate) struct CancellationReset {
+    _parent: Option<Arc<Cancellation>>,
+}
+
 impl Drop for Cancellation {
     fn drop(&mut self) {
         let mut parent = self.parent.take().map(|link| link.parent);
@@ -381,6 +481,10 @@ impl CancellationView {
     }
 
     pub fn reason(&self) -> Option<CancellationReason> {
+        // Deadline/inherited propagation may retain descendant Arcs even when
+        // this view survives the call. Notify after those actual aliases exit,
+        // including unwind, without retaining the original process authority.
+        let _reclaim = crate::scope::ReclaimWakeOnExit::observe(&self.reclaim);
         self.cancellation().reason()
     }
     pub fn deadline(&self) -> Option<Instant> {

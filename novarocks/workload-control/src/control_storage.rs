@@ -1,0 +1,449 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! The original State's backing inventory, not another Work registry.
+//! Fixed storage is an internal substrate only. FirstBind, paid role requests,
+//! PoolFree proposals and production composition remain unimplemented.
+
+use crate::{
+    WorkClass, WorkError, WorkId,
+    cancellation::{Cancellation, CancellationReset},
+    joint_admission::{JointResource, JointResources},
+};
+use std::{
+    alloc::Layout,
+    mem::size_of,
+    sync::{Arc, atomic::AtomicUsize},
+};
+use tokio::time::Instant;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SlotId(pub(crate) usize);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SlotPhase {
+    /// Only the migration's nonprepaid, on-demand mode has vacant entries.
+    Vacant,
+    Free,
+    Node(WorkId),
+    Retired,
+}
+
+pub(crate) struct ControlSlot {
+    pub(crate) cell: Option<Arc<Cancellation>>,
+    pub(crate) class: WorkClass,
+    pub(crate) phase: SlotPhase,
+    pub(crate) generation: u64,
+    pub(crate) claim: Option<u64>,
+    pub(crate) base: JointResources,
+    pub(crate) parent: Option<SlotId>,
+    pub(crate) next_free: Option<SlotId>,
+}
+
+#[derive(Default)]
+pub(crate) struct CancellationStorage {
+    pub(crate) slots: Vec<ControlSlot>,
+    pub(crate) fixed: bool,
+    pub(crate) retired: usize,
+    pub(crate) free_heads: [Option<SlotId>; 5],
+    pub(crate) legacy_vacant: Option<SlotId>,
+}
+
+/// Crate-private: this is not a public partial-safe admission profile.
+#[derive(Clone, Copy)]
+pub(crate) struct ControlStorageConfig {
+    pub(crate) slots_per_class: [usize; 5],
+    pub(crate) children_per_slot: usize,
+}
+
+impl ControlStorageConfig {
+    pub(crate) fn count(self) -> Result<usize, WorkError> {
+        self.slots_per_class.into_iter().try_fold(0usize, |sum, n| {
+            sum.checked_add(n).ok_or(WorkError::ArithmeticOverflow)
+        })
+    }
+}
+
+impl CancellationStorage {
+    pub(crate) fn cell(&self, id: SlotId) -> &Arc<Cancellation> {
+        self.slots[id.0]
+            .cell
+            .as_ref()
+            .expect("live cancellation backing")
+    }
+
+    pub(crate) fn drained(&self) -> bool {
+        self.free_inventory_valid()
+            && self.slots.iter().all(|slot| {
+                slot.phase
+                    == if self.fixed {
+                        SlotPhase::Free
+                    } else {
+                        SlotPhase::Vacant
+                    }
+            })
+    }
+
+    /// Validate every reachable free entry with a total visit budget. One
+    /// same-class head plus unique next links makes a repeated entry a cycle;
+    /// distinct class chains cannot share a correctly classified entry. Thus
+    /// count equality proves full coverage without a bitmap or allocation.
+    pub(crate) fn free_inventory_valid(&self) -> bool {
+        let mut expected = 0usize;
+        let mut retired = 0usize;
+        for slot in &self.slots {
+            if self.fixed {
+                if slot.phase == SlotPhase::Vacant || slot.cell.is_none() || slot.claim.is_none() {
+                    return false;
+                }
+                if slot.phase == SlotPhase::Free {
+                    if slot.parent.is_some() {
+                        return false;
+                    }
+                    expected += 1;
+                }
+                if slot.phase == SlotPhase::Retired {
+                    retired += 1;
+                }
+                if slot.phase != SlotPhase::Free && slot.next_free.is_some() {
+                    return false;
+                }
+            } else {
+                match slot.phase {
+                    SlotPhase::Vacant => {
+                        if slot.cell.is_some() || slot.claim.is_some() || slot.parent.is_some() {
+                            return false;
+                        }
+                        expected += 1;
+                    }
+                    SlotPhase::Node(_) => {
+                        if slot.cell.is_none() || slot.claim.is_some() || slot.next_free.is_some() {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+        }
+        if retired != self.retired {
+            return false;
+        }
+        if self.fixed {
+            if self.legacy_vacant.is_some() {
+                return false;
+            }
+        } else if self.free_heads.iter().any(Option::is_some) {
+            return false;
+        }
+        let mut visited = 0usize;
+        if self.fixed {
+            for (class, head) in self.free_heads.iter().copied().enumerate() {
+                let mut next = head;
+                while let Some(id) = next {
+                    if visited >= self.slots.len() {
+                        return false;
+                    }
+                    let Some(slot) = self.slots.get(id.0) else {
+                        return false;
+                    };
+                    if slot.phase != SlotPhase::Free || free_class_index(slot.class) != class {
+                        return false;
+                    }
+                    visited += 1;
+                    next = slot.next_free;
+                }
+            }
+        } else {
+            let mut next = self.legacy_vacant;
+            while let Some(id) = next {
+                if visited >= self.slots.len() {
+                    return false;
+                }
+                let Some(slot) = self.slots.get(id.0) else {
+                    return false;
+                };
+                if slot.phase != SlotPhase::Vacant {
+                    return false;
+                }
+                visited += 1;
+                next = slot.next_free;
+            }
+        }
+        visited == expected
+    }
+
+    fn insert_legacy(
+        &mut self,
+        cell: Arc<Cancellation>,
+        class: WorkClass,
+        id: WorkId,
+        parent: Option<SlotId>,
+    ) -> Result<SlotId, WorkError> {
+        if let Some(free) = self.legacy_vacant {
+            let slot = &mut self.slots[free.0];
+            assert_eq!(slot.phase, SlotPhase::Vacant);
+            let generation = slot
+                .generation
+                .checked_add(1)
+                .ok_or(WorkError::ArithmeticOverflow)?;
+            // Every fallible preflight above leaves the free chain untouched.
+            self.legacy_vacant = slot.next_free.take();
+            slot.cell = Some(cell);
+            slot.class = class;
+            slot.phase = SlotPhase::Node(id);
+            slot.generation = generation;
+            slot.parent = parent;
+            return Ok(free);
+        }
+        self.slots.push(ControlSlot {
+            cell: Some(cell),
+            class,
+            phase: SlotPhase::Node(id),
+            generation: 1,
+            claim: None,
+            base: JointResources::ZERO,
+            parent,
+            next_free: None,
+        });
+        Ok(SlotId(self.slots.len() - 1))
+    }
+
+    pub(crate) fn take_root(
+        &mut self,
+        class: WorkClass,
+        id: WorkId,
+        deadline: Option<Instant>,
+    ) -> Result<SlotId, WorkError> {
+        if !self.fixed {
+            let cell = Cancellation::root(deadline);
+            if let Some(reason) = cell.check_reason() {
+                return Err(WorkError::Cancelled(reason));
+            }
+            return self.insert_legacy(cell, class, id, None);
+        }
+        let class_index = free_class_index(class);
+        let free =
+            self.free_heads[class_index].ok_or(WorkError::Capacity("fixed control slots"))?;
+        let slot = &mut self.slots[free.0];
+        assert_eq!(slot.phase, SlotPhase::Free);
+        assert_eq!(slot.class, class);
+        let generation = slot
+            .generation
+            .checked_add(1)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        let cell = Arc::get_mut(slot.cell.as_mut().unwrap()).ok_or(WorkError::Conflict)?;
+        cell.reuse_root(deadline);
+        if let Some(reason) = cell.check_reason() {
+            cell.reuse_root(None);
+            return Err(WorkError::Cancelled(reason));
+        }
+        self.free_heads[class_index] = slot.next_free.take();
+        slot.generation = generation;
+        slot.parent = None;
+        slot.phase = SlotPhase::Node(id);
+        Ok(free)
+    }
+
+    /// Fixed mode supports only same-key empty-D child storage here. The State
+    /// author rejects bound parents until the original PoolFree proof is wired.
+    pub(crate) fn take_child(
+        &mut self,
+        parent: SlotId,
+        class: WorkClass,
+        id: WorkId,
+        deadline: Option<Instant>,
+    ) -> Result<SlotId, WorkError> {
+        if !self.fixed {
+            let cell = self.cell(parent).child_with_sequence(deadline, id);
+            if let Some(reason) = cell.check_reason() {
+                cell.detach();
+                return Err(WorkError::Cancelled(reason));
+            }
+            let result = self.insert_legacy(Arc::clone(&cell), class, id, Some(parent));
+            if result.is_err() {
+                cell.detach();
+            }
+            return result;
+        }
+        let class_index = free_class_index(class);
+        let free =
+            self.free_heads[class_index].ok_or(WorkError::Capacity("fixed control slots"))?;
+        let index = free.0;
+        assert_eq!(self.slots[index].phase, SlotPhase::Free);
+        assert_eq!(self.slots[index].class, class);
+        let generation = self.slots[index]
+            .generation
+            .checked_add(1)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        let parent_cell = Arc::clone(self.cell(parent));
+        Cancellation::reuse_child(
+            self.slots[index].cell.as_mut().unwrap(),
+            &parent_cell,
+            deadline,
+            id,
+        )?;
+        // A failed capacity/uniqueness preflight must not consume the head.
+        self.free_heads[class_index] = self.slots[index].next_free.take();
+        self.slots[index].generation = generation;
+        self.slots[index].parent = Some(parent);
+        self.slots[index].phase = SlotPhase::Node(id);
+        let slot = SlotId(index);
+        if let Some(reason) = self.cell(slot).check_reason() {
+            self.retire(slot);
+            return Err(WorkError::Cancelled(reason));
+        }
+        Ok(slot)
+    }
+
+    pub(crate) fn retire(&mut self, id: SlotId) {
+        self.cell(id).detach();
+        let slot = &mut self.slots[id.0];
+        assert!(
+            matches!(slot.phase, SlotPhase::Node(_)),
+            "retire exactly one bound slot"
+        );
+        assert!(
+            slot.next_free.is_none(),
+            "assigned backing is absent from all free chains"
+        );
+        if self.fixed {
+            slot.phase = SlotPhase::Retired;
+            self.retired += 1;
+        } else {
+            // Preserve the original migration behavior: retained observers own
+            // their old Arc, while the State drops its nonprepaid anchor now.
+            slot.phase = SlotPhase::Vacant;
+            slot.parent = None;
+            drop(slot.cell.take());
+            slot.next_free = self.legacy_vacant;
+            self.legacy_vacant = Some(id);
+        }
+    }
+
+    /// Called only by the original reaper after exclusive reset, actual
+    /// deferred-value exit and original claim rekey. Release cannot fail even
+    /// when generation exhaustion closes all later positive operations.
+    pub(crate) fn finish_reaped(&mut self, id: SlotId) -> bool {
+        assert!(self.fixed);
+        let slot = &mut self.slots[id.0];
+        assert_eq!(slot.phase, SlotPhase::Retired);
+        assert!(slot.next_free.is_none());
+        let advanced = if let Some(next) = slot.generation.checked_add(1) {
+            slot.generation = next;
+            true
+        } else {
+            false
+        };
+        slot.parent = None;
+        slot.phase = SlotPhase::Free;
+        let class = free_class_index(slot.class);
+        slot.next_free = self.free_heads[class];
+        self.free_heads[class] = Some(id);
+        self.retired -= 1;
+        advanced
+    }
+
+    pub(crate) fn prepare_reap(
+        &mut self,
+        id: SlotId,
+    ) -> Option<(CancellationReset, Option<SlotId>, u64)> {
+        let slot = self.slots.get_mut(id.0)?;
+        if slot.phase != SlotPhase::Retired {
+            return None;
+        }
+        let cell = Arc::get_mut(slot.cell.as_mut()?)?;
+        Some((cell.reset_for_reuse(), slot.parent, slot.generation))
+    }
+}
+
+fn free_class_index(class: WorkClass) -> usize {
+    match class {
+        WorkClass::Query => 0,
+        WorkClass::MaterializedView => 1,
+        WorkClass::Statistics => 2,
+        WorkClass::TableMaintenance => 3,
+        WorkClass::Management => 4,
+    }
+}
+
+pub(crate) fn arc_bytes<T>() -> Result<usize, WorkError> {
+    Layout::new::<[AtomicUsize; 2]>()
+        .extend(Layout::new::<T>())
+        .map(|(layout, _)| layout.pad_to_align().size())
+        .map_err(|_| WorkError::ArithmeticOverflow)
+}
+
+/// Source-pinned Rust 1.98.1 BTree upper layout: eleven key/value slots,
+/// parent pointer/index/length, and twelve internal child pointers. Every
+/// retained node is conservatively charged as an internal allocation.
+pub(crate) fn btree_peak_bytes<K, V>(entries: usize) -> Result<usize, WorkError> {
+    let fields = [
+        Layout::new::<Option<std::ptr::NonNull<()>>>(),
+        Layout::new::<u16>(),
+        Layout::new::<u16>(),
+        Layout::array::<K>(11).map_err(|_| WorkError::ArithmeticOverflow)?,
+        Layout::array::<V>(11).map_err(|_| WorkError::ArithmeticOverflow)?,
+    ];
+    let alignment = fields.iter().map(Layout::align).max().unwrap();
+    let mut leaf = 0usize;
+    for field in fields {
+        let rounded = field
+            .size()
+            .checked_add(alignment - 1)
+            .ok_or(WorkError::ArithmeticOverflow)?
+            & !(alignment - 1);
+        leaf = leaf
+            .checked_add(rounded)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+    }
+    let leaf =
+        Layout::from_size_align(leaf, alignment).map_err(|_| WorkError::ArithmeticOverflow)?;
+    let node = leaf
+        .extend(
+            Layout::array::<std::ptr::NonNull<()>>(12)
+                .map_err(|_| WorkError::ArithmeticOverflow)?,
+        )
+        .map_err(|_| WorkError::ArithmeticOverflow)?
+        .0
+        .pad_to_align()
+        .size();
+    let retained = entries.max(1);
+    let levels = (usize::BITS - retained.leading_zeros()) as usize;
+    retained
+        .checked_add(levels)
+        .and_then(|n| n.checked_add(1))
+        .and_then(|n| n.checked_mul(node))
+        .ok_or(WorkError::ArithmeticOverflow)
+}
+
+pub(crate) fn storage_cell_bytes(children: usize) -> Result<usize, WorkError> {
+    arc_bytes::<Cancellation>()?
+        .checked_add(Cancellation::children_backing_bytes(children)?)
+        .and_then(|n| n.checked_add(size_of::<ControlSlot>()))
+        .and_then(|n| n.checked_add(if cfg!(target_os = "macos") { 128 } else { 0 }))
+        .ok_or(WorkError::ArithmeticOverflow)
+}
+
+pub(crate) fn resources_for_bytes(bytes: usize) -> Result<JointResources, WorkError> {
+    Ok(JointResources::ZERO
+        .with(JointResource::ScopeRecords, 1)
+        .with(JointResource::ClaimRecords, 1)
+        .with(
+            JointResource::MetadataBytes,
+            u64::try_from(bytes).map_err(|_| WorkError::ArithmeticOverflow)?,
+        ))
+}

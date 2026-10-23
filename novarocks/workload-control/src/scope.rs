@@ -15,11 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
+use crate::cancellation::Cancellation;
+use crate::control_storage::{CancellationStorage, SlotId};
 use crate::{
     CancellationReason, CancellationView, LocalResourceAuthority, ResourceClass, ResourceConfig,
     WorkError, WorkloadObservationHandle,
     admission::{PendingAdmission, Stage},
-    cancellation::{Cancellation, CancellationRequestOutcome, CancellationSuccessSealOutcome},
+    cancellation::{CancellationRequestOutcome, CancellationSuccessSealOutcome},
     observation::{
         ControlIntents, ObligationKey, ObligationRecord, OwnerState, RootLifecycleSnapshot,
     },
@@ -188,7 +191,7 @@ pub(crate) struct Node {
     pub parent: Option<WorkId>,
     pub root: WorkId,
     pub class: WorkClass,
-    pub cancellation: Arc<Cancellation>,
+    pub cancellation: SlotId,
     pub children: usize,
     pub completed: bool,
     pub owner: OwnerState,
@@ -219,12 +222,7 @@ pub(crate) struct Node {
 }
 
 impl Node {
-    fn new(
-        parent: Option<WorkId>,
-        root: WorkId,
-        class: WorkClass,
-        cancellation: Arc<Cancellation>,
-    ) -> Self {
+    fn new(parent: Option<WorkId>, root: WorkId, class: WorkClass, cancellation: SlotId) -> Self {
         Self {
             parent,
             root,
@@ -256,11 +254,11 @@ impl Node {
         }
     }
 
-    pub(crate) fn check(&self) -> Result<(), WorkError> {
+    pub(crate) fn check(&self, storage: &CancellationStorage) -> Result<(), WorkError> {
         if self.completed {
             return Err(WorkError::Released);
         }
-        if let Some(reason) = self.cancellation.check_reason() {
+        if let Some(reason) = storage.cell(self.cancellation).check_reason() {
             return Err(WorkError::Cancelled(reason));
         }
         Ok(())
@@ -270,6 +268,7 @@ impl Node {
 #[derive(Default)]
 pub(crate) struct State {
     pub(crate) joint: Option<crate::joint_admission::ledger::JointLedger>,
+    pub(crate) cancellations: CancellationStorage,
     pub closed: bool,
     pub ready: bool,
     pub next_id: u64,
@@ -308,6 +307,64 @@ pub(crate) struct State {
 }
 
 impl State {
+    fn take_root_cancellation(
+        &mut self,
+        class: WorkClass,
+        id: WorkId,
+        deadline: Option<Instant>,
+    ) -> Result<SlotId, WorkError> {
+        let slot = self.cancellations.take_root(class, id, deadline)?;
+        if let Some(claim) = self.cancellations.slots[slot.0].claim {
+            if let Err(error) = self
+                .joint
+                .as_mut()
+                .unwrap()
+                .activate_control_slot(slot, claim)
+            {
+                self.cancellations.retire(slot);
+                return Err(error);
+            }
+        }
+        Ok(slot)
+    }
+
+    fn take_child_cancellation(
+        &mut self,
+        parent: SlotId,
+        class: WorkClass,
+        id: WorkId,
+        deadline: Option<Instant>,
+    ) -> Result<SlotId, WorkError> {
+        if self.cancellations.fixed {
+            let original = &self.cancellations.slots[parent.0];
+            if original.class != class {
+                return Err(WorkError::Conflict);
+            }
+            if !self
+                .joint
+                .as_ref()
+                .unwrap()
+                .control_is_empty(original.claim.unwrap())
+            {
+                // PoolFree -> parent-D admission is deliberately still OPEN.
+                return Err(WorkError::NotReady);
+            }
+        }
+        let slot = self.cancellations.take_child(parent, class, id, deadline)?;
+        if let Some(claim) = self.cancellations.slots[slot.0].claim {
+            if let Err(error) = self
+                .joint
+                .as_mut()
+                .unwrap()
+                .activate_control_slot(slot, claim)
+            {
+                self.cancellations.retire(slot);
+                return Err(error);
+            }
+        }
+        Ok(slot)
+    }
+
     pub(crate) fn waiting_records(&self) -> usize {
         self.requests.len() + self.resource_waiters.len()
     }
@@ -322,7 +379,11 @@ impl State {
 
     pub(crate) fn is_drained(&self) -> bool {
         self.closed
-            && self.joint.as_ref().is_none_or(|ledger| ledger.is_drained())
+            && self
+                .joint
+                .as_ref()
+                .is_none_or(|ledger| ledger.is_drained(&self.cancellations))
+            && self.cancellations.drained()
             && self.nodes.is_empty()
             && self.roots == 0
             && self.businesses == 0
@@ -373,7 +434,7 @@ impl State {
                 return;
             }
             let node = self.nodes.remove(&id).unwrap();
-            node.cancellation.detach();
+            self.cancellations.retire(node.cancellation);
             if let Some(parent) = node.parent {
                 self.nodes.get_mut(&parent).unwrap().children -= 1;
                 id = parent;
@@ -396,11 +457,17 @@ pub(crate) struct Inner {
 /// A raw cancellation alias may outlive the State transaction that cloned it.
 /// Declare this before every escaping alias so unwind drops those aliases first.
 /// This weak observer cannot keep a Work node or the process authority alive.
-struct ReclaimWakeOnExit {
+pub(crate) struct ReclaimWakeOnExit {
     inner: Weak<Inner>,
 }
 
 impl ReclaimWakeOnExit {
+    pub(crate) fn observe(inner: &Weak<Inner>) -> Self {
+        Self {
+            inner: inner.clone(),
+        }
+    }
+
     fn new(inner: &Arc<Inner>) -> Self {
         Self {
             inner: Arc::downgrade(inner),
@@ -619,11 +686,8 @@ fn try_begin_root_window(
             if state.nodes.len() >= inner.config.scope_records_limit {
                 return Err(WorkError::Capacity("scope records"));
             }
-            let cancellation = Cancellation::root(request.deadline);
-            if let Some(reason) = cancellation.reason() {
-                return Err(WorkError::Cancelled(reason));
-            }
             let id = WorkId(state.next_id()?);
+            let cancellation = state.take_root_cancellation(class, id, request.deadline)?;
             let mut node = Node::new(None, id, class, cancellation);
             node.business = true;
             state.nodes.insert(id, node);
@@ -639,7 +703,8 @@ fn try_begin_root_window(
                     Ok(grant) => Some(grant),
                     Err(error) => {
                         // No owner or permit has escaped this transaction.
-                        state.nodes.remove(&id);
+                        let node = state.nodes.remove(&id).unwrap();
+                        state.cancellations.retire(node.cancellation);
                         state.roots -= 1;
                         state.businesses -= 1;
                         return Err(error);
@@ -682,11 +747,8 @@ fn begin_warehouse_root(
             // A warehouse query enters the one fair query queue below. Root
             // and scope-record accounting must not become a second Frontend
             // admission decision before that queue can observe the request.
-            let cancellation = Cancellation::root(request.deadline);
-            if let Some(reason) = cancellation.reason() {
-                return Err(WorkError::Cancelled(reason));
-            }
             let id = WorkId(state.next_id()?);
+            let cancellation = state.take_root_cancellation(class, id, request.deadline)?;
             state
                 .nodes
                 .insert(id, Node::new(None, id, class, cancellation));
@@ -857,7 +919,13 @@ impl WorkloadControl {
                 .nodes
                 .iter()
                 .filter(|(_, node)| node.parent.is_none() && !node.completed)
-                .map(|(&id, node)| (id, node.class, Arc::clone(&node.cancellation)))
+                .map(|(&id, node)| {
+                    (
+                        id,
+                        node.class,
+                        Arc::clone(state.cancellations.cell(node.cancellation)),
+                    )
+                })
                 .collect::<Vec<_>>()
         };
 
@@ -1020,13 +1088,18 @@ impl DeadlineExpiryHandle {
                 .filter_map(|(&id, node)| {
                     (!node.completed
                         && !node.cancellation_signalled
-                        && node.cancellation.check_reason().is_some())
+                        && state
+                            .cancellations
+                            .cell(node.cancellation)
+                            .check_reason()
+                            .is_some())
                     .then_some(id)
                 })
                 .collect::<Vec<_>>();
             let mut notifications = Vec::new();
             for id in cancelled {
-                let cancellation = Arc::clone(&state.nodes[&id].cancellation);
+                let cancellation =
+                    Arc::clone(state.cancellations.cell(state.nodes[&id].cancellation));
                 let reason = cancellation.check_reason().unwrap();
                 notifications.push((cancellation, reason));
                 state.nodes.get_mut(&id).unwrap().cancellation_signalled = true;
@@ -1045,7 +1118,7 @@ impl DeadlineExpiryHandle {
             .nodes
             .values()
             .filter(|node| !node.completed && !node.cancellation_signalled)
-            .filter_map(|node| node.cancellation.deadline())
+            .filter_map(|node| state.cancellations.cell(node.cancellation).deadline())
             .chain(
                 state
                     .requests
@@ -1118,26 +1191,20 @@ impl WorkScope {
     }
 
     pub fn check(&self) -> Result<(), WorkError> {
-        self.inner
-            .state
-            .lock()
-            .unwrap()
+        let state = self.inner.state.lock().unwrap();
+        state
             .nodes
             .get(&self.id)
             .ok_or(WorkError::Released)?
-            .check()
+            .check(&state.cancellations)
     }
 
     pub fn cancellation(&self) -> Result<CancellationView, WorkError> {
-        Ok(self
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .nodes
-            .get(&self.id)
-            .ok_or(WorkError::Released)?
-            .cancellation
+        let state = self.inner.state.lock().unwrap();
+        let node = state.nodes.get(&self.id).ok_or(WorkError::Released)?;
+        Ok(state
+            .cancellations
+            .cell(node.cancellation)
             .view(&self.inner))
     }
 
@@ -1147,7 +1214,7 @@ impl WorkScope {
         self.inner.update(|state| {
             let root = {
                 let parent = state.nodes.get(&self.id).ok_or(WorkError::Released)?;
-                parent.check()?;
+                parent.check(&state.cancellations)?;
                 parent.root
             };
             if state.nodes.len() >= self.inner.config.scope_records_limit {
@@ -1156,14 +1223,9 @@ impl WorkScope {
             // Mint the original identity before registering any cancellation
             // edge. State serializes this sequence with child publication.
             let id = WorkId(state.next_id()?);
-            let cancellation = state.nodes[&self.id]
-                .cancellation
-                .child_with_sequence(request.deadline, id);
-            if let Some(reason) = cancellation.check_reason() {
-                // No Node was published; collect cannot own this rollback.
-                cancellation.detach();
-                return Err(WorkError::Cancelled(reason));
-            }
+            let parent_slot = state.nodes[&self.id].cancellation;
+            let cancellation =
+                state.take_child_cancellation(parent_slot, request.class, id, request.deadline)?;
             state.nodes.insert(
                 id,
                 Node::new(Some(self.id), root, request.class, cancellation),
@@ -1345,7 +1407,7 @@ impl WorkSuccessSealer {
             if node.parent.is_some() {
                 return Err(WorkError::Conflict);
             }
-            Arc::clone(&node.cancellation)
+            Arc::clone(state.cancellations.cell(node.cancellation))
         };
         Ok(match cancellation.seal_success() {
             CancellationSuccessSealOutcome::Sealed => WorkSuccessSealOutcome::Sealed,
@@ -1374,13 +1436,8 @@ impl WorkCancellationRequester {
         let _reclaim = ReclaimWakeOnExit::new(&self.inner);
         let cancellation = {
             let state = self.inner.state.lock().unwrap();
-            Arc::clone(
-                &state
-                    .nodes
-                    .get(&self.id)
-                    .ok_or(WorkError::Released)?
-                    .cancellation,
-            )
+            let node = state.nodes.get(&self.id).ok_or(WorkError::Released)?;
+            Arc::clone(state.cancellations.cell(node.cancellation))
         };
         let outcome = cancellation.request(reason);
         if outcome != CancellationRequestOutcome::SuccessSealed {
@@ -1407,8 +1464,14 @@ impl Drop for WorkOwner {
     fn drop(&mut self) {
         if let Some(scope) = self.scope.take() {
             let _reclaim = ReclaimWakeOnExit::new(&scope.inner);
-            let cancellation =
-                Arc::clone(&scope.inner.state.lock().unwrap().nodes[&scope.id].cancellation);
+            let cancellation = {
+                let state = scope.inner.state.lock().unwrap();
+                Arc::clone(
+                    state
+                        .cancellations
+                        .cell(state.nodes[&scope.id].cancellation),
+                )
+            };
             let cancellation_outcome = cancellation.request(CancellationReason::OwnerDropped);
             scope.inner.update(|state| {
                 if let Some(node) = state.nodes.get_mut(&scope.id) {
@@ -1733,7 +1796,11 @@ mod tests {
         let cancellation = {
             let mut state = control.inner.state.lock().unwrap();
             state.next_id = u64::MAX;
-            Arc::clone(&state.nodes[&scope.id].cancellation)
+            Arc::clone(
+                state
+                    .cancellations
+                    .cell(state.nodes[&scope.id].cancellation),
+            )
         };
         assert!(matches!(
             scope.child(WorkRequest::new(WorkClass::Query)),
@@ -1757,7 +1824,11 @@ mod tests {
         let scope = work.owner.scope();
         let cancellation = {
             let state = control.inner.state.lock().unwrap();
-            Arc::clone(&state.nodes[&scope.id].cancellation)
+            Arc::clone(
+                state
+                    .cancellations
+                    .cell(state.nodes[&scope.id].cancellation),
+            )
         };
         assert!(matches!(
             scope.child(WorkRequest {
@@ -1806,8 +1877,14 @@ mod tests {
         let first = scope.cancellation().unwrap();
         let before_clone_drop = control.progress_revision();
         let view = first.clone();
-        let cell =
-            Arc::downgrade(&control.inner.state.lock().unwrap().nodes[&scope.id].cancellation);
+        let cell = {
+            let state = control.inner.state.lock().unwrap();
+            Arc::downgrade(
+                state
+                    .cancellations
+                    .cell(state.nodes[&scope.id].cancellation),
+            )
+        };
         assert_eq!(
             control.progress_revision(),
             before_clone_drop,
@@ -1922,8 +1999,14 @@ mod tests {
                 .unwrap();
             let scope = work.owner.scope();
             let view = scope.cancellation().unwrap();
-            let cell =
-                Arc::downgrade(&control.inner.state.lock().unwrap().nodes[&scope.id].cancellation);
+            let cell = {
+                let state = control.inner.state.lock().unwrap();
+                Arc::downgrade(
+                    state
+                        .cancellations
+                        .cell(state.nodes[&scope.id].cancellation),
+                )
+            };
             let mut owner = Some(work.owner);
             let before = control.progress_revision();
             assert_eq!(control.next_deadline(), Some(deadline));
@@ -1999,8 +2082,14 @@ mod tests {
             .unwrap();
         let scope = work.owner.scope();
         let view = scope.cancellation().unwrap();
-        let cell =
-            Arc::downgrade(&control.inner.state.lock().unwrap().nodes[&scope.id].cancellation);
+        let cell = {
+            let state = control.inner.state.lock().unwrap();
+            Arc::downgrade(
+                state
+                    .cancellations
+                    .cell(state.nodes[&scope.id].cancellation),
+            )
+        };
         let requester = work.owner.cancellation_requester();
         let mut observer = Box::pin(view.cancelled());
         let waker = Waker::from(Arc::new(PanicOnceCancellationWake(
@@ -2069,5 +2158,806 @@ mod tests {
         child.complete();
         work.business.release();
         work.owner.complete();
+    }
+}
+
+#[cfg(test)]
+mod fixed_control_storage_tests {
+    use super::*;
+    use crate::control_storage::{ControlStorageConfig, SlotPhase};
+    use crate::joint_admission::{
+        JointCapacityConfig, JointProgress, JointProgressDriver, JointResource,
+        JointResourceLimits, JointResources, RequiredJointProgress,
+    };
+    use std::{
+        future::Future,
+        num::NonZeroUsize,
+        task::{Context, Poll, Waker},
+    };
+
+    fn prototype(count: usize) -> (WorkloadControl, JointProgressDriver) {
+        prototype_with_fanout(count, 1)
+    }
+
+    fn prototype_with_fanout(
+        count: usize,
+        children_per_slot: usize,
+    ) -> (WorkloadControl, JointProgressDriver) {
+        let storage = ControlStorageConfig {
+            slots_per_class: [count, 0, 0, 0, 0],
+            children_per_slot,
+        };
+        let base = crate::joint_admission::ledger::control_storage_base(storage).unwrap();
+        let metadata = base.get(JointResource::MetadataBytes);
+        let global = JointResources::ZERO
+            .with(JointResource::ScopeRecords, count as u64)
+            .with(JointResource::ClaimRecords, (count * 2) as u64)
+            .with(JointResource::MetadataBytes, metadata * count as u64 * 4);
+        let domain = JointResources::ZERO
+            .with(JointResource::ScopeRecords, (count - 1) as u64)
+            .with(JointResource::ClaimRecords, count as u64)
+            .with(JointResource::MetadataBytes, metadata * count as u64 * 2);
+        let limit = JointResourceLimits {
+            global,
+            per_dependency: domain,
+            protected_progress: base,
+        };
+        let mut classes = [JointResourceLimits::default(); 5];
+        classes[0] = limit;
+        let mut lanes = [JointResourceLimits::default(); 3];
+        lanes[0] = limit;
+        let mut class_lanes = [[JointResourceLimits::default(); 3]; 5];
+        class_lanes[0][0] = limit;
+        let config = JointCapacityConfig {
+            global: limit,
+            classes,
+            lanes,
+            class_lanes,
+            max_dependencies_per_claim: 1,
+            max_registered_dependencies: count,
+            max_claims: count * 2,
+            max_requests: count,
+            max_changes_per_request: 1,
+            max_snapshot_bytes: 16 * 1024 * 1024,
+            max_scratch_bytes: 16 * 1024 * 1024,
+            max_residual_arcs: 10000,
+            max_total_proof_work: 10000000,
+            work_per_turn: NonZeroUsize::new(7).unwrap(),
+        };
+        // This minimum is only the storage substrate, never a complete role.
+        let mut required = RequiredJointProgress {
+            global: base,
+            classes: [JointResources::ZERO; 5],
+            lanes: [JointResources::ZERO; 3],
+            class_lanes: [[JointResources::ZERO; 3]; 5],
+        };
+        required.classes[0] = base;
+        required.lanes[0] = base;
+        required.class_lanes[0][0] = base;
+        let control = WorkloadControl::try_new_counted(WorkloadConfig {
+            root_limit: count,
+            business_limit: count,
+            query_concurrency_limit: count,
+            scope_records_limit: count,
+            ..WorkloadConfig::default()
+        })
+        .unwrap()
+        .owner;
+        let (_, driver) = control
+            .configure_joint_capacity(config.validate(&required).unwrap())
+            .unwrap();
+        control.configure_control_storage(storage).unwrap();
+        control.mark_ready().unwrap();
+        (control, driver)
+    }
+
+    fn root(control: &WorkloadControl) -> RootWork {
+        control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap()
+    }
+    fn drain(driver: &mut JointProgressDriver) -> WorkloadProgressRevision {
+        for _ in 0..10000 {
+            if let JointProgress::Idle(marker) = driver.step() {
+                return marker;
+            }
+        }
+        panic!("storage driver did not reach a finite idle pass");
+    }
+    fn slot(control: &WorkloadControl, id: WorkId) -> SlotId {
+        control.inner.state.lock().unwrap().nodes[&id].cancellation
+    }
+    fn snapshot(control: &WorkloadControl) -> (usize, usize, JointResources, usize) {
+        control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .joint
+            .as_ref()
+            .unwrap()
+            .control_snapshot_for_test()
+    }
+
+    #[test]
+    fn retained_view_collects_work_but_preserves_original_bound_claim_until_reset() {
+        let (control, mut driver) = prototype(4);
+        let prepaid = snapshot(&control);
+        let work = root(&control);
+        let scope = work.owner.scope();
+        let original = slot(&control, scope.id);
+        assert_eq!(
+            snapshot(&control),
+            prepaid,
+            "same-key take preserves members and all coordinates"
+        );
+        let view = scope.cancellation().unwrap();
+        let claim = {
+            let mut state = control.inner.state.lock().unwrap();
+            let claim = state.cancellations.slots[original.0].claim.unwrap();
+            let ordinal = state.next_id().unwrap();
+            state
+                .joint
+                .as_mut()
+                .unwrap()
+                .bind_control_fixture(original, claim, ordinal);
+            claim
+        };
+        let bound = snapshot(&control);
+        assert_eq!(bound.3, 1);
+        work.business.release();
+        work.owner.complete();
+        assert!(matches!(scope.check(), Err(WorkError::Released)));
+        drain(&mut driver);
+        {
+            let state = control.inner.state.lock().unwrap();
+            assert_eq!(
+                state.cancellations.slots[original.0].phase,
+                SlotPhase::Retired
+            );
+            assert_eq!(state.cancellations.slots[original.0].claim, Some(claim));
+        }
+        assert_eq!(
+            snapshot(&control),
+            bound,
+            "logical collect never washes the original D"
+        );
+        drop(view);
+        drain(&mut driver);
+        let freed = snapshot(&control);
+        assert_eq!(
+            (freed.0, freed.1, freed.2),
+            (prepaid.0, prepaid.1, prepaid.2)
+        );
+        assert_eq!(freed.3, 0);
+    }
+
+    #[tokio::test]
+    async fn last_view_exit_wakes_the_original_idle_driver_without_a_business_event() {
+        let (control, mut driver) = prototype(2);
+        let work = root(&control);
+        let scope = work.owner.scope();
+        let original = slot(&control, scope.id);
+        let view = scope.cancellation().unwrap();
+        work.business.release();
+        work.owner.complete();
+        let marker = drain(&mut driver);
+        let mut waiter = Box::pin(control.wait_progress(marker));
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(view);
+        assert!(matches!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(WorkloadProgress::StateChanged(_))
+        ));
+        drain(&mut driver);
+        assert_eq!(
+            control.inner.state.lock().unwrap().cancellations.slots[original.0].phase,
+            SlotPhase::Free
+        );
+    }
+
+    #[test]
+    fn an_actual_raw_alias_prevents_free_until_its_exit_guard_notifies() {
+        let (control, mut driver) = prototype(2);
+        let work = root(&control);
+        let scope = work.owner.scope();
+        let original = slot(&control, scope.id);
+        let wake_on_exit = ReclaimWakeOnExit::new(&control.inner);
+        let raw = {
+            let state = control.inner.state.lock().unwrap();
+            Arc::clone(state.cancellations.cell(original))
+        };
+        work.business.release();
+        work.owner.complete();
+        let marker = drain(&mut driver);
+        assert_eq!(
+            control.inner.state.lock().unwrap().cancellations.slots[original.0].phase,
+            SlotPhase::Retired
+        );
+        drop(raw);
+        drop(wake_on_exit);
+        assert_ne!(control.progress_revision(), marker);
+        drain(&mut driver);
+        assert_eq!(
+            control.inner.state.lock().unwrap().cancellations.slots[original.0].phase,
+            SlotPhase::Free
+        );
+    }
+
+    struct PausedCancellationWake {
+        armed: std::sync::atomic::AtomicBool,
+        entered: std::sync::mpsc::SyncSender<()>,
+        resume: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl std::task::Wake for PausedCancellationWake {
+        fn wake(self: Arc<Self>) {
+            if !self.armed.swap(false, Ordering::AcqRel) {
+                return;
+            }
+            self.entered.send(()).unwrap();
+            self.resume
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the test must release the actual cancellation wake");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retained_root_reason_reports_descendant_alias_exit_to_idle_reaper() {
+        let (control, mut driver) = prototype(3);
+        let work = control
+            .try_begin_root(WorkRequest {
+                class: WorkClass::Query,
+                deadline: Some(Instant::now() + Duration::from_secs(1)),
+            })
+            .unwrap();
+        let scope = work.owner.scope();
+        let root_slot = slot(&control, scope.id);
+        let root_view = scope.cancellation().unwrap();
+        let child = scope.child(WorkRequest::new(WorkClass::Query)).unwrap();
+        let child_scope = child.scope();
+        let child_slot = slot(&control, child_scope.id);
+        let original_claim =
+            control.inner.state.lock().unwrap().cancellations.slots[child_slot.0].claim;
+        let child_view = child_scope.cancellation().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let paused = Arc::new(PausedCancellationWake {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            entered: entered_tx,
+            resume: Mutex::new(resume_rx),
+        });
+        let waker = Waker::from(Arc::clone(&paused));
+        let mut observer = Box::pin(async move { child_view.cancelled().await });
+        assert!(
+            observer
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        // Advancing the timer is not the DFS notification being inspected.
+        paused.armed.store(true, Ordering::Release);
+        let runtime = tokio::runtime::Handle::current();
+        let (before, after, waiting, phase, aliases, claim, reason) =
+            std::thread::scope(|threads| {
+                let request = threads.spawn(|| {
+                    let _runtime = runtime.enter();
+                    root_view.reason()
+                });
+                entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                // Tokio has released its waiter lock before invoking this Waker.
+                // The real observer can exit while the DFS still holds its child Arc.
+                drop(observer);
+                child.complete_after_terminal_cancel_settled();
+                let before = drain(&mut driver);
+                let (phase, aliases, claim) = {
+                    let state = control.inner.state.lock().unwrap();
+                    let slot = &state.cancellations.slots[child_slot.0];
+                    (
+                        slot.phase,
+                        Arc::strong_count(state.cancellations.cell(child_slot)),
+                        slot.claim,
+                    )
+                };
+                let mut waiter = Box::pin(control.wait_progress(before));
+                let waiting = waiter
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()));
+                resume_tx.send(()).unwrap();
+                let reason = request.join().unwrap();
+                let after = control.progress_revision();
+                let notified = waiter
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()));
+                (
+                    before,
+                    after,
+                    (waiting, notified),
+                    phase,
+                    aliases,
+                    claim,
+                    reason,
+                )
+            });
+        assert_eq!(reason, Some(CancellationReason::DeadlineExceeded));
+        assert_eq!(phase, SlotPhase::Retired);
+        assert_eq!(aliases, 2, "only the pool and actual DFS retain the child");
+        assert_eq!(claim, original_claim);
+        assert!(waiting.0.is_pending());
+        assert_ne!(
+            after, before,
+            "temporary descendant exit must publish its own wake"
+        );
+        assert!(waiting.1.is_ready());
+        drain(&mut driver);
+        {
+            let state = control.inner.state.lock().unwrap();
+            assert_eq!(
+                state.cancellations.slots[child_slot.0].phase,
+                SlotPhase::Free
+            );
+            assert_eq!(
+                state.cancellations.slots[child_slot.0].claim,
+                original_claim
+            );
+            assert_ne!(
+                state.cancellations.slots[root_slot.0].phase,
+                SlotPhase::Free
+            );
+        }
+        // Keep this original view alive through every assertion above: its Drop
+        // must not stand in for the already exited descendant traversal alias.
+        drop(root_view);
+        work.business.release();
+        work.owner.complete_after_terminal_cancel_settled();
+        drain(&mut driver);
+    }
+
+    #[test]
+    fn weak_observation_is_not_mistaken_for_exclusive_reuse() {
+        let (control, mut driver) = prototype(2);
+        let work = root(&control);
+        let scope = work.owner.scope();
+        let original = slot(&control, scope.id);
+        let weak = {
+            let state = control.inner.state.lock().unwrap();
+            Arc::downgrade(state.cancellations.cell(original))
+        };
+        work.business.release();
+        work.owner.complete();
+        drain(&mut driver);
+        assert_eq!(
+            weak.strong_count(),
+            1,
+            "the pool anchor alone does not imply get_mut succeeds"
+        );
+        assert_eq!(
+            control.inner.state.lock().unwrap().cancellations.slots[original.0].phase,
+            SlotPhase::Retired
+        );
+        drop(weak);
+        // There is no public production Weak escape; publish the fixture's
+        // private-edge drop just as the real detach/reset author does.
+        control.inner.notify_reclaim_progress();
+        drain(&mut driver);
+        assert_eq!(
+            control.inner.state.lock().unwrap().cancellations.slots[original.0].phase,
+            SlotPhase::Free
+        );
+    }
+
+    #[test]
+    fn leaf_parent_hint_reclaims_a_retired_chain_in_linear_cell_checks() {
+        let count = 32;
+        let (control, mut driver) = prototype(count);
+        let work = root(&control);
+        let root_scope = work.owner.scope();
+        let mut parent = root_scope.clone();
+        let mut owners = vec![work.owner];
+        for _ in 1..count {
+            let child = parent.child(WorkRequest::new(WorkClass::Query)).unwrap();
+            parent = child.scope();
+            owners.push(child);
+        }
+        let view = parent.cancellation().unwrap();
+        let (root_slot, capacity) = {
+            let state = control.inner.state.lock().unwrap();
+            let root_slot = state.nodes[&root_scope.id].cancellation;
+            (
+                root_slot,
+                state
+                    .cancellations
+                    .cell(root_slot)
+                    .child_capacity_for_test(),
+            )
+        };
+        work.business.release();
+        for owner in owners {
+            owner.complete();
+        }
+        assert_eq!(control.snapshot().root_responsibilities, 0);
+        drain(&mut driver);
+        assert_eq!(
+            control.inner.state.lock().unwrap().cancellations.retired,
+            count
+        );
+        let before = driver.reclaim_checks;
+        drop(view);
+        drain(&mut driver);
+        assert!(driver.reclaim_checks - before <= count * 4);
+        let state = control.inner.state.lock().unwrap();
+        assert_eq!(state.cancellations.retired, 0);
+        assert!(
+            state
+                .cancellations
+                .slots
+                .iter()
+                .all(|slot| slot.phase == SlotPhase::Free)
+        );
+        assert_eq!(
+            state
+                .cancellations
+                .cell(root_slot)
+                .child_capacity_for_test(),
+            capacity
+        );
+    }
+
+    #[test]
+    fn unpublished_child_failure_detaches_and_retires_its_real_fixed_slot() {
+        let (control, mut driver) = prototype(2);
+        let work = root(&control);
+        let scope = work.owner.scope();
+        let original = slot(&control, scope.id);
+        assert!(matches!(
+            scope.child(WorkRequest {
+                class: WorkClass::Query,
+                deadline: Some(Instant::now())
+            }),
+            Err(WorkError::Cancelled(CancellationReason::DeadlineExceeded))
+        ));
+        {
+            let state = control.inner.state.lock().unwrap();
+            assert_eq!(state.nodes[&scope.id].children, 0);
+            assert_eq!(
+                state
+                    .cancellations
+                    .cell(original)
+                    .linked_children_for_test(),
+                0
+            );
+            assert_eq!(state.cancellations.retired, 1);
+        }
+        drain(&mut driver);
+        assert_eq!(control.inner.state.lock().unwrap().cancellations.retired, 0);
+        work.business.release();
+        work.owner.complete();
+        drain(&mut driver);
+    }
+
+    #[test]
+    fn same_cell_reuse_changes_original_work_and_claim_generation_without_refunding_base() {
+        let (control, mut driver) = prototype(2);
+        let prepaid = snapshot(&control);
+        let first = root(&control);
+        let scope = first.owner.scope();
+        let requester = first.owner.cancellation_requester();
+        let original = slot(&control, scope.id);
+        let (address, generation, revision, claim) = {
+            let state = control.inner.state.lock().unwrap();
+            let cell = &state.cancellations.slots[original.0];
+            (
+                Arc::as_ptr(cell.cell.as_ref().unwrap()),
+                cell.generation,
+                state
+                    .joint
+                    .as_ref()
+                    .unwrap()
+                    .control_revision_for_test(cell.claim.unwrap()),
+                cell.claim.unwrap(),
+            )
+        };
+        first.business.release();
+        first.owner.complete();
+        drain(&mut driver);
+        let second = root(&control);
+        let second_scope = second.owner.scope();
+        assert_ne!(scope.id, second_scope.id);
+        assert_eq!(slot(&control, second_scope.id), original);
+        assert!(matches!(
+            requester.request(CancellationReason::Requested),
+            Err(WorkError::Released)
+        ));
+        assert!(second_scope.cancellation().unwrap().reason().is_none());
+        {
+            let state = control.inner.state.lock().unwrap();
+            let cell = &state.cancellations.slots[original.0];
+            assert_eq!(Arc::as_ptr(cell.cell.as_ref().unwrap()), address);
+            assert!(cell.generation > generation);
+            assert_eq!(cell.claim, Some(claim));
+            assert!(
+                state
+                    .joint
+                    .as_ref()
+                    .unwrap()
+                    .control_revision_for_test(claim)
+                    > revision
+            );
+        }
+        assert_eq!(snapshot(&control), prepaid);
+        second.business.release();
+        second.owner.complete();
+        drain(&mut driver);
+    }
+
+    #[test]
+    fn shutdown_requires_exact_free_inventory_but_keeps_its_prepaid_profiles() {
+        let (mut control, mut driver) = prototype(2);
+        let prepaid = snapshot(&control);
+        let work = root(&control);
+        let view = work.owner.scope().cancellation().unwrap();
+        work.business.release();
+        work.owner.complete();
+        control.close_admission();
+        drain(&mut driver);
+        let failure = control
+            .shutdown()
+            .err()
+            .expect("retained backing is not drained");
+        assert_eq!(failure.error(), WorkloadShutdownError::NotDrained);
+        control = failure.into_parts().1;
+        drop(view);
+        drain(&mut driver);
+        assert_eq!(snapshot(&control), prepaid);
+        assert!(
+            control.shutdown().is_ok(),
+            "Free process claims remain charged through real teardown"
+        );
+    }
+
+    #[test]
+    fn bounded_fanout_failure_preserves_the_free_head_and_later_reuses_returned_storage() {
+        let (control, mut driver) = prototype_with_fanout(4, 1);
+        let work = root(&control);
+        let scope = work.owner.scope();
+        let first = scope.child(WorkRequest::new(WorkClass::Query)).unwrap();
+        let first_slot = slot(&control, first.scope().id);
+        let (heads, prepaid) = {
+            let state = control.inner.state.lock().unwrap();
+            assert!(state.cancellations.free_inventory_valid());
+            (
+                state.cancellations.free_heads,
+                state.joint.as_ref().unwrap().control_snapshot_for_test(),
+            )
+        };
+        assert!(matches!(
+            scope.child(WorkRequest::new(WorkClass::Query)),
+            Err(WorkError::Capacity("prepaid parent child backing"))
+        ));
+        {
+            let state = control.inner.state.lock().unwrap();
+            assert_eq!(state.cancellations.free_heads, heads);
+            assert!(state.cancellations.free_inventory_valid());
+            assert_eq!(state.nodes[&scope.id].children, 1);
+        }
+        assert_eq!(snapshot(&control), prepaid);
+        first.complete();
+        {
+            let state = control.inner.state.lock().unwrap();
+            assert_eq!(
+                state.cancellations.slots[first_slot.0].phase,
+                SlotPhase::Retired
+            );
+            assert_eq!(
+                state.cancellations.free_heads, heads,
+                "Retired is never free inventory"
+            );
+            assert!(state.cancellations.free_inventory_valid());
+        }
+        drain(&mut driver);
+        assert_eq!(
+            control.inner.state.lock().unwrap().cancellations.free_heads[0],
+            Some(first_slot)
+        );
+        let second = scope.child(WorkRequest::new(WorkClass::Query)).unwrap();
+        assert_eq!(slot(&control, second.scope().id), first_slot);
+        second.complete();
+        work.business.release();
+        work.owner.complete();
+        drain(&mut driver);
+        assert!(control.inner.state.lock().unwrap().cancellations.drained());
+    }
+
+    #[test]
+    fn rejected_fixed_root_deadline_leaves_its_head_and_original_claim_untouched() {
+        let (control, mut driver) = prototype(2);
+        let heads = control.inner.state.lock().unwrap().cancellations.free_heads;
+        let prepaid = snapshot(&control);
+        assert!(matches!(
+            control.try_begin_root(WorkRequest {
+                class: WorkClass::Query,
+                deadline: Some(Instant::now())
+            }),
+            Err(WorkError::Cancelled(CancellationReason::DeadlineExceeded))
+        ));
+        {
+            let state = control.inner.state.lock().unwrap();
+            assert_eq!(state.cancellations.free_heads, heads);
+            assert!(state.cancellations.drained());
+            assert!(state.nodes.is_empty());
+        }
+        assert_eq!(snapshot(&control), prepaid);
+        let work = root(&control);
+        assert_eq!(slot(&control, work.owner.scope().id), heads[0].unwrap());
+        work.business.release();
+        work.owner.complete();
+        drain(&mut driver);
+    }
+
+    #[test]
+    fn drained_requires_complete_acyclic_class_correct_free_chains() {
+        let (control, _driver) = prototype(4);
+        control.close_admission();
+        {
+            let mut state = control.inner.state.lock().unwrap();
+            assert!(state.is_drained());
+            let heads = state.cancellations.free_heads;
+            let head = heads[0].unwrap();
+            let next = state.cancellations.slots[head.0].next_free;
+            state.cancellations.free_heads[0] = None;
+            assert!(
+                !state.is_drained(),
+                "unreachable Free entries cannot certify drain"
+            );
+            state.cancellations.free_heads = heads;
+            state.cancellations.slots[head.0].next_free = Some(head);
+            assert!(
+                !state.is_drained(),
+                "a cycle must be rejected within the visit budget"
+            );
+            state.cancellations.slots[head.0].next_free = None;
+            assert!(
+                !state.is_drained(),
+                "a disconnected suffix cannot certify drain"
+            );
+            state.cancellations.slots[head.0].next_free = next;
+            state.cancellations.free_heads[1] = Some(head);
+            assert!(
+                !state.is_drained(),
+                "one slot cannot appear in a foreign class chain"
+            );
+            state.cancellations.free_heads = heads;
+            state.cancellations.free_heads[0] = Some(SlotId(state.cancellations.slots.len()));
+            assert!(
+                !state.is_drained(),
+                "out-of-inventory links are not followed"
+            );
+            state.cancellations.free_heads = heads;
+            state.cancellations.slots[head.0].phase = SlotPhase::Retired;
+            assert!(!state.is_drained(), "a linked Retired entry is never Free");
+            state.cancellations.slots[head.0].phase = SlotPhase::Free;
+            assert!(state.is_drained());
+        }
+        assert!(control.shutdown().is_ok());
+    }
+
+    fn legacy_control() -> WorkloadControl {
+        let control = WorkloadControl::try_new_counted(WorkloadConfig::default())
+            .unwrap()
+            .owner;
+        control.mark_ready().unwrap();
+        control
+    }
+
+    #[test]
+    fn legacy_vacant_head_reuses_the_slot_without_reusing_retained_observer_backing() {
+        let control = legacy_control();
+        let first = root(&control);
+        let first_scope = first.owner.scope();
+        let first_slot = slot(&control, first_scope.id);
+        let view = first_scope.cancellation().unwrap();
+        let first_address = {
+            let state = control.inner.state.lock().unwrap();
+            Arc::as_ptr(state.cancellations.cell(first_slot))
+        };
+        first.business.release();
+        first.owner.complete();
+        {
+            let state = control.inner.state.lock().unwrap();
+            assert_eq!(state.cancellations.legacy_vacant, Some(first_slot));
+            assert!(state.cancellations.drained());
+        }
+        let second = root(&control);
+        let second_scope = second.owner.scope();
+        assert_eq!(slot(&control, second_scope.id), first_slot);
+        assert_ne!(first_scope.id, second_scope.id);
+        {
+            let state = control.inner.state.lock().unwrap();
+            assert_eq!(state.cancellations.slots.len(), 1);
+            assert_eq!(state.cancellations.legacy_vacant, None);
+            assert!(state.cancellations.free_inventory_valid());
+            assert_ne!(
+                Arc::as_ptr(state.cancellations.cell(first_slot)),
+                first_address
+            );
+            assert_eq!(
+                state.cancellations.slots[first_slot.0].phase,
+                SlotPhase::Node(second_scope.id)
+            );
+        }
+        assert!(
+            view.reason().is_none(),
+            "the old observer still sees its original cell"
+        );
+        second.business.release();
+        second.owner.complete();
+        {
+            let mut state = control.inner.state.lock().unwrap();
+            assert!(state.cancellations.drained());
+            let next = state.cancellations.slots[first_slot.0].next_free;
+            state.cancellations.slots[first_slot.0].next_free = Some(first_slot);
+            assert!(
+                !state.cancellations.drained(),
+                "legacy cycles also have a finite visit budget"
+            );
+            state.cancellations.slots[first_slot.0].next_free = next;
+            assert!(state.cancellations.drained());
+        }
+        drop(view);
+    }
+
+    #[test]
+    fn legacy_generation_exhaustion_does_not_pop_or_lose_the_vacant_head() {
+        let control = legacy_control();
+        let work = root(&control);
+        let original = slot(&control, work.owner.scope().id);
+        work.business.release();
+        work.owner.complete();
+        {
+            let mut state = control.inner.state.lock().unwrap();
+            state.cancellations.slots[original.0].generation = u64::MAX;
+        }
+        assert!(matches!(
+            control.try_begin_root(WorkRequest::new(WorkClass::Query)),
+            Err(WorkError::ArithmeticOverflow)
+        ));
+        let state = control.inner.state.lock().unwrap();
+        assert_eq!(state.cancellations.legacy_vacant, Some(original));
+        assert_eq!(state.cancellations.slots.len(), 1);
+        assert!(state.cancellations.drained());
+        assert!(state.nodes.is_empty());
+    }
+
+    #[test]
+    fn storage_fanout_is_finite_configurable_and_charged_from_actual_layout() {
+        let narrow = ControlStorageConfig {
+            slots_per_class: [4, 0, 0, 0, 0],
+            children_per_slot: 1,
+        };
+        let wider = ControlStorageConfig {
+            children_per_slot: 2,
+            ..narrow
+        };
+        let impossible = ControlStorageConfig {
+            children_per_slot: 4,
+            ..narrow
+        };
+        let narrow = crate::joint_admission::ledger::control_storage_base(narrow).unwrap();
+        let wider = crate::joint_admission::ledger::control_storage_base(wider).unwrap();
+        assert!(wider.get(JointResource::MetadataBytes) > narrow.get(JointResource::MetadataBytes));
+        assert!(matches!(
+            crate::joint_admission::ledger::control_storage_base(impossible),
+            Err(WorkError::InvalidConfig("fixed control storage geometry"))
+        ));
     }
 }
