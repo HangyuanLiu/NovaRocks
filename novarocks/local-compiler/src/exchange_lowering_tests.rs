@@ -71,6 +71,8 @@ enum Shape {
     Gather,
     /// Stream edge hashed on both produced columns; consumer is a Noop sink.
     Hash,
+    /// Hash keys `[a, b]` with the received value `b` published twice.
+    RepeatedHash,
     /// Stream edge without a partitioning contract; consumer is a Noop sink.
     Unconstrained,
     /// CTE multicast producer; consumer is a Noop sink.
@@ -140,6 +142,26 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
             outputs.into_boxed_slice(),
         )
         .unwrap();
+    let root = if shape == Shape::RepeatedHash {
+        let project = NodeId::new(11);
+        let read_a = producer
+            .add_expression(project, ty.clone(), ExprKind::Value(a))
+            .unwrap();
+        let read_b = producer
+            .add_expression(project, ty.clone(), ExprKind::Value(b))
+            .unwrap();
+        producer
+            .add_project(
+                project,
+                VALUES,
+                Box::from([(read_b, b), (read_a, a), (read_b, b)]),
+                Box::from([b, a, b]),
+            )
+            .unwrap();
+        project
+    } else {
+        VALUES
+    };
     let multicast = shape == Shape::Multicast;
     let sink = if multicast {
         FragmentSink::Multicast {
@@ -148,7 +170,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
     } else {
         FragmentSink::Stream { edge: EDGE }
     };
-    let producer = producer.finish_definition(VALUES, sink, dop()).unwrap();
+    let producer = producer.finish_definition(root, sink, dop()).unwrap();
 
     let mut consumer = FragmentBuilder::new(CONSUMER);
     let import = |builder: &mut FragmentBuilder, source_value| {
@@ -168,9 +190,26 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
     };
     let ib = import(&mut consumer, b);
     let ia = import(&mut consumer, a);
+    let repeated = shape == Shape::RepeatedHash;
+    let mapping: Box<[_]> = if repeated {
+        Box::from([(b, ib), (a, ia), (b, ib)])
+    } else {
+        Box::from([(b, ib), (a, ia)])
+    };
+    let received: Box<[_]> = if repeated {
+        Box::from([ib, ia, ib])
+    } else {
+        Box::from([ib, ia])
+    };
+    let projected: Box<[_]> = if repeated {
+        Box::from([b, a, b])
+    } else {
+        Box::from([b, a])
+    };
     let (source, destination) = match shape {
         Shape::Gather => (Distribution::Singleton, Distribution::Singleton),
         Shape::Hash => (hash([b, a]), hash([ib, ia])),
+        Shape::RepeatedHash => (hash([a, b]), hash([ia, ib])),
         Shape::Unconstrained | Shape::Multicast => {
             (Distribution::Unconstrained, Distribution::Unconstrained)
         }
@@ -179,13 +218,13 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
         .add_exchange_source(
             RECEIVER,
             EDGE,
-            Box::from([(b, ib), (a, ia)]),
-            Box::from([ib, ia]),
+            mapping.clone(),
+            received.clone(),
             destination.clone(),
             RowMultiplicity::SingleCopy,
         )
         .unwrap();
-    let gather = shape == Shape::Gather;
+    let gather = matches!(shape, Shape::Gather | Shape::RepeatedHash);
     let consumer_sink = if gather {
         FragmentSink::Result
     } else {
@@ -207,12 +246,12 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
         },
         source: EdgeSource {
             fragment: PRODUCER,
-            projection: Box::from([b, a]),
+            projection: projected,
         },
         destination: EdgeDestination {
             fragment: CONSUMER,
             node: RECEIVER,
-            receive_mapping: Box::from([(b, ib), (a, ia)]),
+            receive_mapping: mapping,
         },
         partitioning: EdgePartitioning {
             source,
@@ -223,29 +262,39 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
     })
     .unwrap();
     if gather {
+        let mut fields = vec![
+            ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
+                name: "b".into(),
+                alias: Some("bee".into()),
+                value: ib,
+                ty: ty.clone(),
+            },
+            ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
+                name: "a".into(),
+                alias: None,
+                value: ia,
+                ty: ty.clone(),
+            },
+        ];
+        if repeated {
+            fields.push(ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
+                name: "b".into(),
+                alias: Some("bee_again".into()),
+                value: ib,
+                ty: ty.clone(),
+            });
+        }
         plan.set_result_port(ResultPort {
             scalar_schema: None,
             fragment: CONSUMER,
             output: OutputPort {
                 node: RECEIVER,
-                columns: Box::from([ib, ia]),
+                columns: received,
             },
-            fields: Box::from([
-                ResultField {
-                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
-                    name: "b".into(),
-                    alias: Some("bee".into()),
-                    value: ib,
-                    ty: ty.clone(),
-                },
-                ResultField {
-                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
-                    name: "a".into(),
-                    alias: None,
-                    value: ia,
-                    ty: ty.clone(),
-                },
-            ]),
+            fields: fields.into_boxed_slice(),
         })
         .unwrap();
     }
@@ -566,6 +615,30 @@ fn hash_producer_authors_one_sink_partition_root_per_key() {
             expected
         );
     }
+}
+
+#[test]
+fn repeated_hash_imports_keep_each_channel_and_the_ordered_key_representative() {
+    let mut packages = packages(Shape::RepeatedHash);
+    let producer = compile(packages.remove(&PRODUCER).unwrap(), None).unwrap();
+    let source_slots = producer.graph().nodes()[producer.graph().root().index()]
+        .output_layout()
+        .slots();
+    let Some(StaticSinkProgram::DataStream { branch, .. }) = producer.graph().sink() else {
+        panic!("stream sink");
+    };
+    assert_eq!(source_slots.len(), 3);
+    assert_ne!(source_slots[0], source_slots[2]);
+    assert_eq!(branch.output_columns(), source_slots);
+
+    let consumer = compile(packages.remove(&CONSUMER).unwrap(), Some(1)).unwrap();
+    let (id, input) = consumer.exchange_inputs().iter().next().unwrap();
+    let layout = consumer.graph().nodes()[id.index()].output_layout();
+    let slots = layout.slots();
+    assert_eq!(slots.len(), 3);
+    assert_ne!(slots[0], slots[2], "wire occurrences keep fresh channels");
+    assert_eq!(input.hash_partition_slots.as_ref(), &[slots[1], slots[0]]);
+    assert_eq!(layout.schema().field(2).name(), "bee_again");
 }
 
 #[test]

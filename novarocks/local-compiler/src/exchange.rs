@@ -127,8 +127,9 @@ fn lower_core_with_creation<H>(
             .into());
         }
     }
-    // The edge names keys in the destination value domain. Project each
-    // actual imported occurrence onto its exact channel, preserving key order.
+    // The edge names keys in the destination value domain. Repeated imports
+    // carry the same sent value, with a fresh channel per output occurrence.
+    // Use the first occurrence, as channel planning does, preserving key order.
     let keys = match &cut.partitioning.destination {
         Distribution::Hash { keys, .. } | Distribution::BucketShuffle { keys, .. } => {
             if keys.is_empty() {
@@ -149,11 +150,8 @@ fn lower_core_with_creation<H>(
         let mut found = None;
         for (ordinal, value) in node.output.columns.iter().enumerate() {
             work.step()?;
-            if value == key && found.replace(slots[ordinal]).is_some() {
-                return Err((FragmentCompileError::Invalid(
-                    "ExchangeSource hash key has more than one output occurrence",
-                ))
-                .into());
+            if value == key && found.is_none() {
+                found = Some(slots[ordinal]);
             }
         }
         hash_partition_slots.push(found.ok_or(FragmentCompileError::Invalid(
