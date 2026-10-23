@@ -273,6 +273,8 @@ impl Node {
 
 #[derive(Default)]
 pub(crate) struct State {
+    pub(crate) internal_cpu_factory:
+        Option<crate::joint_admission::InternalResultClosedFactoryDescriptor>,
     pub(crate) joint: Option<crate::joint_admission::ledger::JointLedger>,
     pub(crate) cancellations: CancellationStorage,
     pub closed: bool,

@@ -258,6 +258,9 @@ fn validate_adoption(
     {
         return Err(WorkError::Conflict);
     }
+    if !record.active_facts.key.causal.is_empty() {
+        return Err(WorkError::Conflict);
+    }
     let capacity = record.active_amounts.get(kind.resource());
     let valid = match kind {
         Kind::Payload => capacity != 0 && record.active_facts.lane == JointLane::Custody,

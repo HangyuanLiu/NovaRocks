@@ -24,7 +24,10 @@ use crate::scope::ReclaimWakeOnExit;
 use novarocks_resource_contract::SelectedNetworkOrigin;
 mod cpu_action;
 pub(super) use cpu_action::{CpuActionFence, capture as capture_cpu_action, validate_cpu_action};
-pub use cpu_action::{InternalCpuActionAdmission, InternalCpuActionSource};
+pub use cpu_action::{
+    InternalCpuActionAdmission, InternalCpuActionSource, InternalCpuFactoryBinding,
+    InternalResultClosedFactoryDescriptor,
+};
 mod root_stage;
 pub(super) use root_stage::validate_root_stage;
 pub use root_stage::{RootStageAdmission, RootStageProposal, RootStageReady, RootStageSource};
@@ -153,7 +156,7 @@ impl JointAdmissionHandle {
         let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
         let old = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
         authenticate_scope(&state, old, source, scope.id)?;
-        if old.pending.is_some() {
+        if old.pending.is_some() || !old.active_facts.key.causal.is_empty() {
             return Err(WorkError::Conflict);
         }
         match (source.source, first_bind) {
@@ -246,6 +249,9 @@ impl JointProposal {
         } else {
             (lane, amounts)
         };
+        if amounts.get(JointResource::InternalCpuJobs) != 0 && self.cpu_action.is_none() {
+            return Err(WorkError::Conflict);
+        }
         self.current = Some(PendingChange {
             source,
             original,
@@ -393,6 +399,14 @@ impl JointProposal {
                 class: class_index(self.class),
                 lane: change.lane as usize,
                 dependencies: change.selected.iter().map(|d| d.ordinal).collect(),
+                causal: if self
+                    .cpu_action
+                    .is_some_and(CpuActionFence::has_closed_factory)
+                {
+                    CausalMask::INTERNAL_CPU_ACTION
+                } else {
+                    CausalMask::NONE
+                },
             }),
             class: self.class,
             lane: change.lane,

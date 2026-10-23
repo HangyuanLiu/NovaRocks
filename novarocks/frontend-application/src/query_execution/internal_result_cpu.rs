@@ -46,7 +46,8 @@ use tokio::sync::oneshot;
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::task_execution::status_intake::StatusIntakeWake;
 use novarocks_workload_control::joint_admission::{
-    InternalCpuActionAdmission, InternalCpuActionSource, JointLocalGrant,
+    InternalComputationGrant, InternalCpuActionAdmission, InternalCpuActionSource,
+    InternalCpuFactoryBinding, JointLocalGrant,
 };
 use std::sync::{Arc, Weak};
 
@@ -183,23 +184,56 @@ pub(crate) struct InternalResultCpuOwner {
 #[derive(Clone)]
 pub(crate) struct InternalResultCpu {
     executor: QueryBlockingExecutor,
+    factory: Option<InternalCpuFactoryBinding>,
 }
 
 impl InternalResultCpuOwner {
-    pub(crate) fn try_new(profile: FrontendResultCapacityProfile) -> Result<Self, String> {
+    pub(crate) fn try_new(
+        profile: FrontendResultCapacityProfile,
+        workload: &mut novarocks_workload_control::WorkloadControl,
+    ) -> Result<Self, String> {
+        let mut owner = Self::new_workers(profile)?;
+        owner.bind_for_composition(workload)?;
+        Ok(owner)
+    }
+    fn new_workers(profile: FrontendResultCapacityProfile) -> Result<Self, String> {
         let positions = profile.internal_positions;
         let workers = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
             positions, positions,
         ))?;
         let runtime = InternalResultCpu {
             executor: workers.executor(),
+            factory: None,
         };
         Ok(Self { workers, runtime })
     }
-
+    fn bind_for_composition(
+        &mut self,
+        workload: &mut novarocks_workload_control::WorkloadControl,
+    ) -> Result<(), String> {
+        let descriptor = self
+            .workers
+            .bind_internal_result_closed_factory_for_composition(make_cpu_work)
+            .map_err(|error| format!("bind original internal CPU factory: {error}"))?;
+        let binding = workload
+            .bind_internal_result_closed_factory_for_composition(descriptor)
+            .map_err(|error| format!("bind original internal CPU workload owner: {error}"))?;
+        self.runtime.factory = Some(binding);
+        Ok(())
+    }
+    // Generic fault injection stays on the original unbound physical pool.
+    // Root fixtures must explicitly bind this owner to their real before-Ready
+    // WC owner; this constructor never grants a finite source qualification.
     #[cfg(test)]
     pub(crate) fn try_new_for_test() -> Result<Self, String> {
-        Self::try_new(FrontendResultCapacityProfile::for_test())
+        Self::new_workers(FrontendResultCapacityProfile::for_test())
+    }
+    #[cfg(test)]
+    pub(crate) fn bind_for_test_before_ready(
+        &mut self,
+        workload: &mut novarocks_workload_control::WorkloadControl,
+    ) -> Result<(), String> {
+        self.bind_for_composition(workload)
     }
 
     pub(crate) fn runtime(&self) -> InternalResultCpu {
@@ -705,6 +739,16 @@ impl InternalResultOperation {
 }
 
 impl InternalResultCpu {
+    pub(crate) fn capture_action_source(
+        &self,
+        grant: &InternalComputationGrant,
+        scope: &WorkScope,
+    ) -> Result<InternalCpuActionSource, WorkError> {
+        self.factory
+            .as_ref()
+            .ok_or(WorkError::NotReady)?
+            .bind_source(grant.cpu_action_source(scope)?)
+    }
     pub(crate) fn configured_capacity(&self) -> QueryBlockingExecutorConfig {
         self.executor.configured_capacity()
     }
@@ -720,14 +764,7 @@ impl InternalResultCpu {
         wake: Arc<dyn StatusIntakeWake>,
         operation: InternalResultOperation,
     ) -> InternalResultCpuJob<Result<InternalDomainSlot, InternalDomainFailure>> {
-        self.submit_with(
-            input,
-            cancellation,
-            data_runtime,
-            wake,
-            operation,
-            make_legacy_operation_forwarder,
-        )
+        self.submit_closed_operation(input, None, cancellation, data_runtime, wake, operation)
     }
 
     /// Root-backed production only. The original positive computation source
@@ -735,8 +772,26 @@ impl InternalResultCpu {
     /// happens in this same original forwarder, outside that lock.
     pub(crate) fn submit_root_operation(
         &self,
-        mut input: InternalResultValue<InternalDomainSlot>,
+        input: InternalResultValue<InternalDomainSlot>,
         source: InternalCpuActionSource,
+        cancellation: QueryCancellationView,
+        data_runtime: &FrontendDataRuntime,
+        wake: Arc<dyn StatusIntakeWake>,
+        operation: InternalResultOperation,
+    ) -> InternalResultCpuJob<OperationOutput> {
+        self.submit_closed_operation(
+            input,
+            Some(source),
+            cancellation,
+            data_runtime,
+            wake,
+            operation,
+        )
+    }
+    fn submit_closed_operation(
+        &self,
+        mut input: InternalResultValue<InternalDomainSlot>,
+        source: Option<InternalCpuActionSource>,
         cancellation: QueryCancellationView,
         data_runtime: &FrontendDataRuntime,
         wake: Arc<dyn StatusIntakeWake>,
@@ -755,6 +810,7 @@ impl InternalResultCpu {
         }
         let forwarder = data_runtime.spawn(make_operation_forwarder(
             self.executor.clone(),
+            self.factory.clone(),
             source,
             cancellation,
             wake,
@@ -797,6 +853,7 @@ impl InternalResultCpu {
         )
     }
 
+    #[cfg(test)]
     fn submit_with<I, O, A, M, F>(
         &self,
         input: InternalResultValue<I>,
@@ -846,33 +903,6 @@ impl InternalResultCpu {
             closed: None,
         }
     }
-}
-
-// Both execution and geometry use this same closed production factory. Merely
-// naming it for its output layout does not construct an input or poll a job.
-fn make_legacy_operation_forwarder(
-    executor: QueryBlockingExecutor,
-    input: InternalResultValue<InternalDomainSlot>,
-    cancellation: QueryCancellationView,
-    wake: Arc<dyn StatusIntakeWake>,
-    retirement: Arc<InternalCpuRetirement<Result<InternalDomainSlot, InternalDomainFailure>>>,
-    completed: oneshot::Sender<
-        Result<
-            InternalResultValue<Result<InternalDomainSlot, InternalDomainFailure>>,
-            ExecutionFailureInput,
-        >,
-    >,
-    operation: InternalResultOperation,
-) -> impl std::future::Future<Output = ()> + Send {
-    make_forwarder(
-        executor,
-        input,
-        cancellation,
-        wake,
-        retirement,
-        completed,
-        move |slot, _| operation.apply(slot),
-    )
 }
 
 // Only this original forwarder borrows its action fields. A short poll lease
@@ -953,6 +983,7 @@ fn make_cpu_work(
 fn poll_cpu_offer(
     packet: &InternalCpuRetirement<OperationOutput>,
     executor: &QueryBlockingExecutor,
+    factory: &InternalCpuFactoryBinding,
     cx: &mut std::task::Context<'_>,
 ) -> std::task::Poll<Result<(), ExecutionFailureInput>> {
     use std::task::Poll;
@@ -974,7 +1005,7 @@ fn poll_cpu_offer(
             Poll::Ready(Err(failure)) => return Poll::Ready(Err(failure.error)),
             Poll::Ready(Ok(offer)) => offer,
         };
-        let mut original = match executor.try_reserve() {
+        let mut original = match executor.try_reserve_internal_result_closed_factory(factory) {
             Ok(original) => Some(original),
             Err(reason) => {
                 reserve_refusal = Some(reason);
@@ -985,6 +1016,7 @@ fn poll_cpu_offer(
                         WorkError::Capacity("original CPU physical queue")
                     }
                     QueryBlockingReserveRefusal::Closed => WorkError::Closed,
+                    QueryBlockingReserveRefusal::FactoryMismatch => WorkError::Conflict,
                 }));
             }
         };
@@ -1173,13 +1205,20 @@ fn poll_cpu_actual_exit(
 // packet already owns input/Operation before the forwarder can first poll.
 fn make_operation_forwarder(
     executor: QueryBlockingExecutor,
-    source: InternalCpuActionSource,
+    factory: Option<InternalCpuFactoryBinding>,
+    source: Option<InternalCpuActionSource>,
     cancellation: QueryCancellationView,
     wake: Arc<dyn StatusIntakeWake>,
     packet: Arc<InternalCpuRetirement<OperationOutput>>,
     mut completed: oneshot::Sender<OperationResult>,
 ) -> impl std::future::Future<Output = ()> + Send {
     async move {
+        let Some(source) = source else {
+            // Ordinary non-Root work consumes the exact same registered closed
+            // factory but receives no joint claim or finite proof exemption.
+            make_closed_legacy_forwarder(executor, cancellation, wake, packet, completed).await;
+            return;
+        };
         let setup = (|| {
             let quote = metadata_geometry::operation_action_quote(&executor)?;
             let admission = source
@@ -1208,11 +1247,14 @@ fn make_operation_forwarder(
             packet.notify(0, wake.as_ref());
             return;
         }
+        let factory = factory
+            .as_ref()
+            .expect("Root source captured from the same bound CPU owner");
         let admission = tokio::select! {
             biased;
             reason = cancellation.cancelled() => Err(cpu_cancellation_failure(reason)),
             _ = completed.closed() => Err(cpu_execution_failure("internal CPU consumer closed before publication")),
-            result = std::future::poll_fn(|cx| poll_cpu_offer(&packet, &executor, cx)) => result,
+            result = std::future::poll_fn(|cx| poll_cpu_offer(&packet, &executor, factory, cx)) => result,
         };
         let admission =
             admission.and_then(|()| publish_cpu_work(&packet, &executor, &cancellation));
@@ -1266,6 +1308,54 @@ fn make_operation_forwarder(
         std::future::poll_fn(|cx| poll_cpu_actual_exit(&packet, cx)).await;
     }
 }
+
+fn make_closed_legacy_forwarder(
+    executor: QueryBlockingExecutor,
+    cancellation: QueryCancellationView,
+    wake: Arc<dyn StatusIntakeWake>,
+    packet: Arc<InternalCpuRetirement<OperationOutput>>,
+    mut completed: oneshot::Sender<OperationResult>,
+) -> impl std::future::Future<Output = ()> + Send {
+    async move {
+        let work = executor
+            .execute_preserving(make_cpu_work(Arc::downgrade(&packet), cancellation.clone()));
+        tokio::pin!(work);
+        let early = tokio::select! {
+            biased;
+            reason = cancellation.cancelled() => Err(cpu_cancellation_failure(reason)),
+            _ = completed.closed() => Err(cpu_execution_failure("internal result CPU consumer closed")),
+            result = &mut work => Ok(result),
+        };
+        match early {
+            Ok(result) => {
+                let result = packet.receive_work(result);
+                if let Err(original) = completed.send(result) {
+                    packet
+                        .state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .outcome = Some(original);
+                }
+                packet.notify(0, wake.as_ref());
+            }
+            Err(error) => {
+                if let Err(Err(original)) = completed.send(Err(error)) {
+                    packet.state.lock().unwrap_or_else(|e| e.into_inner()).early = Some(original);
+                }
+                packet.notify(0, wake.as_ref());
+                let result = packet.receive_work(work.await);
+                packet
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .outcome = Some(result);
+                packet.notify(1, wake.as_ref());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 
 fn make_forwarder<I, O, F>(
     executor: QueryBlockingExecutor,
@@ -1454,7 +1544,7 @@ mod tests {
                 .check_backing_total(INTERNAL_PEAK_BYTES + 1)
                 .is_err()
         );
-        let mut owner = InternalResultCpuOwner::try_new(profile).unwrap();
+        let mut owner = InternalResultCpuOwner::new_workers(profile).unwrap();
         let installed = owner.runtime().executor.configured_capacity();
         assert_eq!(installed.worker_threads().get(), 1);
         assert_eq!(installed.queue_capacity().get(), 1);

@@ -766,6 +766,7 @@ impl JointProgressDriver {
             };
             let input = turn.input.as_mut().unwrap();
             input.affected_dependencies = profile.dependencies.clone();
+            input.affected_causal = profile.causal;
             input.checked_coordinates = checked;
             input.profiles.push(profile);
             turn.next_change += 1;
@@ -1055,6 +1056,7 @@ impl Turn {
                     self.input = Some(ProofInput {
                         profiles,
                         affected_dependencies: Vec::new(),
+                        affected_causal: super::CausalMask::NONE,
                         checked_coordinates: Vec::new(),
                         limits,
                     });
@@ -1117,6 +1119,7 @@ impl Turn {
             }
         }
         ExactProfile {
+            causal: facts.key.causal,
             dependencies: facts
                 .dependencies
                 .iter()

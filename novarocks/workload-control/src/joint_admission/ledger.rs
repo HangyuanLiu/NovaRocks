@@ -47,7 +47,10 @@ mod metadata_geometry;
 mod paid_proposal;
 pub(crate) mod retained_claim;
 use paid_proposal::{CpuActionFence, validate_cpu_action, validate_root_stage};
-pub use paid_proposal::{InternalCpuActionAdmission, InternalCpuActionSource};
+pub use paid_proposal::{
+    InternalCpuActionAdmission, InternalCpuActionSource, InternalCpuFactoryBinding,
+    InternalResultClosedFactoryDescriptor,
+};
 pub use paid_proposal::{
     JointProposal, RootStageAdmission, RootStageProposal, RootStageReady, RootStageSource,
 };
@@ -98,6 +101,7 @@ pub(super) struct ProfileKey {
     class: usize,
     lane: usize,
     dependencies: Vec<u64>,
+    pub(super) causal: CausalMask,
 }
 pub(super) struct ProfileFacts {
     pub(super) key: Arc<ProfileKey>,
@@ -674,6 +678,7 @@ impl JointAdmissionHandle {
                     class: class_index(class),
                     lane: lane as usize,
                     dependencies: selected.iter().map(|d| d.ordinal).collect(),
+                    causal: CausalMask::NONE,
                 }),
                 class,
                 lane,
@@ -740,6 +745,13 @@ impl JointAdmissionHandle {
             }
             if let Some(fence) = prepared.cpu_action {
                 validate_cpu_action(state, scope.id, fence, records)?;
+            } else if records
+                .iter()
+                .any(|change| !change.claim.facts.key.causal.is_empty())
+            {
+                // Only the authenticated CPU action can publish this causal
+                // exemption. The paid builder rejects ordinary CPU amounts.
+                return Err(WorkError::Conflict);
             }
             if let Some(fence) = prepared.root_stage {
                 validate_root_stage(state, scope.id, fence, records)?;
@@ -897,6 +909,7 @@ fn authenticate(record: &ClaimRecord, source: &JointClaimView) -> Result<(), Wor
         _ => false,
     };
     if !custody
+        || !record.active_facts.key.causal.is_empty()
         || record.structure_revision != source.structure_revision
         || record.release_revision != source.release_revision
     {
@@ -1140,7 +1153,10 @@ impl JointClaim {
             .as_ref()
             .and_then(|l| l.claims.get(&id))
             .ok_or(WorkError::Released)?;
-        if !record.custody.is_raw() || !matches!(record.owner, ClaimOwner::PhysicalWork(_)) {
+        if !record.custody.is_raw()
+            || !record.active_facts.key.causal.is_empty()
+            || !matches!(record.owner, ClaimOwner::PhysicalWork(_))
+        {
             return Err(WorkError::Conflict);
         }
         Ok(JointClaimView {
@@ -1175,7 +1191,10 @@ impl JointClaim {
         self.inner.update(|state| {
             let ledger = state.joint.as_mut().ok_or(WorkError::NotReady)?;
             let record = ledger.claims.get_mut(&id).ok_or(WorkError::Released)?;
-            if !record.custody.is_raw() || !matches!(record.owner, ClaimOwner::PhysicalWork(_)) {
+            if !record.custody.is_raw()
+                || !record.active_facts.key.causal.is_empty()
+                || !matches!(record.owner, ClaimOwner::PhysicalWork(_))
+            {
                 return Err(WorkError::Conflict);
             }
             let active = record.active_amounts.checked_sub(released)?;
@@ -1725,10 +1744,24 @@ pub struct JointLocalOffer<'a> {
 /// Actual service/response/body ownership must continue this same custody.
 #[must_use = "Retain the original physical holder through its actual exit"]
 pub struct JointLocalGrant<P> {
+    cpu_factory: Option<InternalResultClosedFactoryDescriptor>,
     physical: ManuallyDrop<P>,
     claims: ManuallyDrop<JointGrantedClaims>,
 }
 impl<P> JointLocalGrant<P> {
+    /// A finite CPU grant may enter only the exact original registered pool and
+    /// call factory. An ordinary E grant returns false for this closed seam.
+    pub fn matches_internal_result_closed_factory(
+        &self,
+        descriptor: &InternalResultClosedFactoryDescriptor,
+    ) -> bool {
+        self.cpu_factory
+            .as_ref()
+            .is_some_and(|original| original.matches(descriptor))
+    }
+    pub fn is_internal_result_closed_factory(&self) -> bool {
+        self.cpu_factory.is_some()
+    }
     pub fn physical_mut(&mut self) -> &mut P {
         &mut self.physical
     }
@@ -1756,6 +1789,7 @@ impl<P> JointLocalGrant<P> {
         // code, and the suppressed source destructor cannot read either field.
         *physical = Some(unsafe { ManuallyDrop::take(&mut original.physical) });
         *claims = Some(unsafe { ManuallyDrop::take(&mut original.claims) });
+        drop(original.cpu_factory.take());
         Ok(())
     }
 }
@@ -2027,6 +2061,7 @@ impl JointLocalOffer<'_> {
                 });
             }
             let body = request.changes.clone();
+            let cpu_factory = request.cpu_action.and_then(|fence| fence.descriptor(state));
             let request = state
                 .joint
                 .as_mut()
@@ -2037,6 +2072,7 @@ impl JointLocalOffer<'_> {
             outgoing = request.waker.take();
             request.phase = RequestPhase::Delivered;
             *destination = Some(JointLocalGrant {
+                cpu_factory,
                 physical: ManuallyDrop::new(physical.take().unwrap()),
                 claims: ManuallyDrop::new(JointGrantedClaims::new(
                     std::mem::take(&mut claims),

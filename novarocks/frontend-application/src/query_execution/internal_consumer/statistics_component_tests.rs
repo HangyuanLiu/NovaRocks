@@ -244,7 +244,7 @@ fn typed_statistics_batch(
 }
 
 fn typed_statistics_custody(
-    cpu: &crate::query_execution::internal_result_cpu::InternalResultCpu,
+    cpu_owner: &mut InternalResultCpuOwner,
 ) -> (
     TypedStatisticsCustody,
     (
@@ -257,6 +257,7 @@ fn typed_statistics_custody(
     use novarocks_workload_control::{
         ControlStorageConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
     };
+    let cpu = cpu_owner.runtime();
     let count = 8;
     let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 1, 2, &[]);
     let mut config = joint::JointCapacityConfig {
@@ -387,7 +388,7 @@ fn typed_statistics_custody(
     required.class_lanes[0][0] = base;
     required.lanes[1] = cpu_step;
     required.class_lanes[0][1] = cpu_step;
-    let control = WorkloadControl::try_new_counted(WorkloadConfig {
+    let mut control = WorkloadControl::try_new_counted(WorkloadConfig {
         root_limit: count,
         business_limit: count,
         query_concurrency_limit: count,
@@ -403,6 +404,7 @@ fn typed_statistics_custody(
         .configure_joint_capacity(config.validate(&required).unwrap())
         .unwrap();
     control.configure_control_storage(storage).unwrap();
+    cpu_owner.bind_for_test_before_ready(&mut control).unwrap();
     control.mark_ready().unwrap();
     let root = control
         .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -480,13 +482,13 @@ fn typed_statistics_custody(
 async fn run_case(case: Case) {
     let (description, plan) = internal_statistics_description();
     let mut cpu_owner = InternalResultCpuOwner::try_new_for_test().unwrap();
-    let cpu_runtime = cpu_owner.runtime();
     let (mut typed, original_work) = if matches!(case, Case::TypedRootSuccess) {
-        let (typed, original) = typed_statistics_custody(&cpu_runtime);
+        let (typed, original) = typed_statistics_custody(&mut cpu_owner);
         (Some(typed), Some(original))
     } else {
         (None, None)
     };
+    let cpu_runtime = cpu_owner.runtime();
     let (mut attempt, resources, activation) =
         watchdog_joint(typed.as_mut(), "original admission and Establish", async {
             if let Some(original) = original_work {

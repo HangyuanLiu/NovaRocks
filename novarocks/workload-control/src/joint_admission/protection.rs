@@ -23,6 +23,7 @@
 //! graph work runs outside that authority's mutex. Allocation calls have finite
 //! byte bounds; work units are not a hard real-time or allocator/RSS guarantee.
 
+use super::CausalMask;
 use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::task::Poll;
@@ -33,6 +34,16 @@ pub(super) struct ExactProfile {
     // are mathematically valid; the production ledger should aggregate them.
     pub(super) dependencies: Vec<usize>,
     pub(super) amounts: Vec<u128>,
+    pub(super) causal: CausalMask,
+}
+impl ExactProfile {
+    fn protected_amount(&self, coordinate: usize) -> u128 {
+        if self.causal.finite(coordinate) {
+            0
+        } else {
+            self.amounts[coordinate]
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +57,7 @@ pub(super) struct CoordinateLimit {
 pub(super) struct ProofInput {
     pub(super) profiles: Vec<ExactProfile>,
     pub(super) affected_dependencies: Vec<usize>,
+    pub(super) affected_causal: CausalMask,
     // Exact coordinates whose constraints may increase; authenticated by WC's
     // original-to-post change analysis. Purely decreasing coordinates stay out.
     pub(super) checked_coordinates: Vec<usize>,
@@ -139,6 +151,20 @@ enum Phase {
         profile: usize,
     },
     BeginCoordinate,
+    HardGlobal {
+        profile: usize,
+        total: u128,
+    },
+    HardDomainTotal {
+        profile: usize,
+        total: u128,
+    },
+    HardDomainMembership {
+        profile: usize,
+        low: usize,
+        high: usize,
+        total: u128,
+    },
     SumGlobal {
         profile: usize,
         total: u128,
@@ -362,6 +388,23 @@ impl ProtectionProof {
         }));
     }
 
+    fn begin_protected_coordinate(&mut self) {
+        self.required_domain = None;
+        // A finite incoming coordinate changes no nonempty causal intersection.
+        // Its complete charged-D hard caps have ALREADY been checked above.
+        if self.input.affected_causal.finite(self.coordinate)
+            || self.input.affected_dependencies.is_empty()
+        {
+            self.coordinate_cursor += 1;
+            self.phase = Phase::BeginCoordinate;
+        } else {
+            self.phase = Phase::SumGlobal {
+                profile: 0,
+                total: 0,
+            };
+        }
+    }
+
     fn next_constraint(&mut self) {
         let count = self.input.affected_dependencies.len();
         match self.required_domain {
@@ -559,7 +602,7 @@ impl ProtectionProof {
         let phase = std::mem::replace(&mut self.phase, Phase::Poisoned);
         match phase {
             Phase::Header => {
-                if self.input.limits.is_empty() {
+                if self.input.limits.is_empty() || !self.input.affected_causal.valid() {
                     return Err(CheckError::MalformedSnapshot);
                 }
                 // Actual Vec capacities count, not just lengths of live entries.
@@ -671,7 +714,7 @@ impl ProtectionProof {
                     self.phase = Phase::ReserveEligibility;
                 } else {
                     let row = &self.input.profiles[profile];
-                    if row.amounts.len() != self.input.limits.len() {
+                    if row.amounts.len() != self.input.limits.len() || !row.causal.valid() {
                         return Err(CheckError::MalformedSnapshot);
                     }
                     bounded(
@@ -736,10 +779,105 @@ impl ProtectionProof {
                     self.done = Some(Ok(Feasibility::Feasible));
                 } else {
                     self.coordinate = self.input.checked_coordinates[self.coordinate_cursor];
-                    self.phase = Phase::SumGlobal {
+                    self.required_domain = None;
+                    self.phase = Phase::HardGlobal {
                         profile: 0,
                         total: 0,
                     };
+                }
+            }
+            Phase::HardGlobal { profile, total } => {
+                if profile == self.input.profiles.len() {
+                    if total > self.input.limits[self.coordinate].global {
+                        self.fail_capacity();
+                    } else if self.input.affected_dependencies.is_empty() {
+                        self.begin_protected_coordinate();
+                    } else {
+                        self.required_domain = Some(0);
+                        self.phase = Phase::HardDomainTotal {
+                            profile: 0,
+                            total: 0,
+                        };
+                    }
+                } else {
+                    let total = total
+                        .checked_add(self.input.profiles[profile].amounts[self.coordinate])
+                        .ok_or(CheckError::ArithmeticOverflow)?;
+                    self.phase = Phase::HardGlobal {
+                        profile: profile + 1,
+                        total,
+                    };
+                }
+            }
+            Phase::HardDomainTotal { profile, total } => {
+                if profile == self.input.profiles.len() {
+                    if total > self.constraint_limit() {
+                        self.fail_capacity();
+                    } else {
+                        let domain = self.required_domain.ok_or(CheckError::MalformedSnapshot)?;
+                        if domain + 1 < self.input.affected_dependencies.len() {
+                            self.required_domain = Some(domain + 1);
+                            self.phase = Phase::HardDomainTotal {
+                                profile: 0,
+                                total: 0,
+                            };
+                        } else {
+                            self.begin_protected_coordinate();
+                        }
+                    }
+                } else if self.input.profiles[profile].amounts[self.coordinate] == 0 {
+                    self.phase = Phase::HardDomainTotal {
+                        profile: profile + 1,
+                        total,
+                    };
+                } else {
+                    self.phase = Phase::HardDomainMembership {
+                        profile,
+                        low: 0,
+                        high: self.input.profiles[profile].dependencies.len(),
+                        total,
+                    };
+                }
+            }
+            Phase::HardDomainMembership {
+                profile,
+                low,
+                high,
+                total,
+            } => {
+                if low == high {
+                    self.phase = Phase::HardDomainTotal {
+                        profile: profile + 1,
+                        total,
+                    };
+                } else {
+                    let domain = self.required_domain.ok_or(CheckError::MalformedSnapshot)?;
+                    let required = self.input.affected_dependencies[domain];
+                    let middle = low + (high - low) / 2;
+                    let observed = self.input.profiles[profile].dependencies[middle];
+                    if observed < required {
+                        self.phase = Phase::HardDomainMembership {
+                            profile,
+                            low: middle + 1,
+                            high,
+                            total,
+                        };
+                    } else if observed > required {
+                        self.phase = Phase::HardDomainMembership {
+                            profile,
+                            low,
+                            high: middle,
+                            total,
+                        };
+                    } else {
+                        let total = total
+                            .checked_add(self.input.profiles[profile].amounts[self.coordinate])
+                            .ok_or(CheckError::ArithmeticOverflow)?;
+                        self.phase = Phase::HardDomainTotal {
+                            profile: profile + 1,
+                            total,
+                        };
+                    }
                 }
             }
             Phase::SumGlobal { profile, total } => {
@@ -749,7 +887,7 @@ impl ProtectionProof {
                     self.phase = Phase::BeginConstraint;
                 } else {
                     let total = total
-                        .checked_add(self.input.profiles[profile].amounts[self.coordinate])
+                        .checked_add(self.input.profiles[profile].protected_amount(self.coordinate))
                         .ok_or(CheckError::ArithmeticOverflow)?;
                     self.phase = Phase::SumGlobal {
                         profile: profile + 1,
@@ -798,7 +936,7 @@ impl ProtectionProof {
                     self.phase = Phase::FinishTotal { total };
                 } else {
                     self.eligible[profile] = 0;
-                    if self.input.profiles[profile].amounts[self.coordinate] == 0 {
+                    if self.input.profiles[profile].protected_amount(self.coordinate) == 0 {
                         self.phase = Phase::DomainTotal {
                             profile: profile + 1,
                             total,
@@ -847,7 +985,9 @@ impl ProtectionProof {
                     } else {
                         self.eligible[profile] = 1;
                         let total = total
-                            .checked_add(self.input.profiles[profile].amounts[self.coordinate])
+                            .checked_add(
+                                self.input.profiles[profile].protected_amount(self.coordinate),
+                            )
                             .ok_or(CheckError::ArithmeticOverflow)?;
                         self.phase = Phase::DomainTotal {
                             profile: profile + 1,
@@ -923,7 +1063,7 @@ impl ProtectionProof {
                 if profile == self.input.profiles.len() {
                     self.phase = Phase::GraphDomain { pass, domain: 0 };
                 } else {
-                    let amount = self.input.profiles[profile].amounts[self.coordinate];
+                    let amount = self.input.profiles[profile].protected_amount(self.coordinate);
                     if amount == 0
                         || (self.required_domain.is_some() && self.eligible[profile] == 0)
                     {
@@ -1195,6 +1335,7 @@ mod tests {
         ExactProfile {
             dependencies: dependencies.to_vec(),
             amounts: amounts.to_vec(),
+            causal: CausalMask::NONE,
         }
     }
 
@@ -1214,6 +1355,7 @@ mod tests {
         ProofInput {
             profiles,
             affected_dependencies: affected.to_vec(),
+            affected_causal: CausalMask::NONE,
             checked_coordinates: (0..limits.len()).collect(),
             limits,
         }
@@ -1223,7 +1365,25 @@ mod tests {
     // continuation states, caches, and any original-change projection helper.
     fn oracle(input: &ProofInput, constraints: &[usize]) -> bool {
         assert!(constraints.len() <= 8);
-        for mask in 0usize..(1usize << constraints.len()) {
+        // Hard caps include ALL charged rows, independently of causal shape.
+        for (coordinate, limit) in input.limits.iter().enumerate() {
+            let hard: u128 = input.profiles.iter().map(|p| p.amounts[coordinate]).sum();
+            if hard > limit.global {
+                return false;
+            }
+            for domain in 0..limit.domains.len() {
+                let hard: u128 = input
+                    .profiles
+                    .iter()
+                    .filter(|p| p.dependencies.contains(&domain))
+                    .map(|p| p.amounts[coordinate])
+                    .sum();
+                if hard > limit.domains[domain] {
+                    return false;
+                }
+            }
+        }
+        for mask in 1usize..(1usize << constraints.len()) {
             let selected: Vec<_> = constraints
                 .iter()
                 .enumerate()
@@ -1234,9 +1394,12 @@ mod tests {
                     .profiles
                     .iter()
                     .filter(|profile| {
-                        selected
-                            .iter()
-                            .all(|domain| profile.dependencies.contains(domain))
+                        (profile.causal.0
+                            & (1u16 << (coordinate % crate::joint_admission::RESOURCE_COUNT)))
+                            == 0
+                            && selected
+                                .iter()
+                                .all(|domain| profile.dependencies.contains(domain))
                     })
                     .map(|profile| profile.amounts[coordinate])
                     .sum();
@@ -1326,6 +1489,69 @@ mod tests {
             }
         }
         assert!(checked > 100);
+    }
+
+    #[test]
+    fn mixed_rows_keep_identical_hard_totals_but_only_stallable_high_order_membership() {
+        for finite in [false, true] {
+            let mut shadow = row(&[0, 1], &[1]);
+            if finite {
+                shadow.causal = CausalMask(1);
+            }
+            let post = input(
+                vec![
+                    row(&[0, 1], &[1]),
+                    row(&[2], &[1]),
+                    shadow,
+                    row(&[0, 1], &[1]),
+                ],
+                &[0, 1],
+                vec![limit(3, 4, 3, 1)],
+            );
+            // Both cases charge global=4 and d0=d1=3. The unrelated E row
+            // prevents the protected-global fast path from proving the pair.
+            let expected = oracle(&post, &[0, 1]);
+            assert_eq!(expected, finite);
+            for budget in [1, 7, 1000] {
+                assert_eq!(is_feasible(run(post.clone(), bounds(), budget)), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn finite_incoming_keeps_every_charged_cap_without_inventing_causal_fanout() {
+        let mut finite = row(&[0, 1, 2], &[1]);
+        finite.causal = CausalMask(1);
+        let mut post = input(
+            vec![row(&[0], &[1]), finite],
+            &[0, 1, 2],
+            vec![limit(3, 3, 3, 1)],
+        );
+        post.affected_causal = CausalMask(1);
+        // The sole supported nonempty E witness is d0. Incoming finite D is
+        // still charged to all three domains, but creates no new causal set.
+        assert!(oracle(&post, &[0]));
+        assert!(is_feasible(run(post.clone(), bounds(), 1)));
+        let mut hard_global = post.clone();
+        hard_global.limits[0].global = 1;
+        assert!(!oracle(&hard_global, &[0]));
+        assert!(matches!(
+            run(hard_global, bounds(), 1).unwrap(),
+            Feasibility::Infeasible {
+                constraint: ConstraintKind::Global,
+                ..
+            }
+        ));
+        let mut collateral = post;
+        collateral.limits[0].domains[0] = 1;
+        assert!(!oracle(&collateral, &[0]));
+        assert!(matches!(
+            run(collateral, bounds(), 1).unwrap(),
+            Feasibility::Infeasible {
+                constraint: ConstraintKind::Domain,
+                ..
+            }
+        ));
     }
 
     #[test]

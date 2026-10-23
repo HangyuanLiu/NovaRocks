@@ -131,7 +131,8 @@ impl InternalCpuMetadataGeometry {
 fn forwarder_layout<F: std::future::Future<Output = ()>>(
     _: fn(
         QueryBlockingExecutor,
-        InternalCpuActionSource,
+        Option<super::InternalCpuFactoryBinding>,
+        Option<InternalCpuActionSource>,
         QueryCancellationView,
         Arc<dyn StatusIntakeWake>,
         Arc<InternalCpuRetirement<Output>>,

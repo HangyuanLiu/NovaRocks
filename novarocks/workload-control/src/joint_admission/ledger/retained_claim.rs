@@ -70,6 +70,7 @@ pub(crate) fn retain_claim_in(
             .get_mut(&claim)
             .ok_or(WorkError::Released)?;
         if !record.custody.is_raw()
+            || !record.active_facts.key.causal.is_empty()
             || record.owner != ClaimOwner::PhysicalWork(scope.id)
             || record.pending.is_some()
             || record.amounts != record.active_amounts
@@ -121,6 +122,7 @@ pub(crate) fn settle_retained_claim_in(
             .get(&receipt.claim)
             .ok_or(WorkError::Released)?;
         if !record.custody.is_raw()
+            || !record.active_facts.key.causal.is_empty()
             || record.owner != ClaimOwner::OwnerRetained(receipt.work)
             || record.structure_revision != receipt.structure_revision
             || record.release_revision != receipt.release_revision

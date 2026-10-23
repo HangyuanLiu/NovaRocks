@@ -29,7 +29,8 @@ mod protection;
 pub use driver::{JointProgress, JointProgressDriver};
 pub use ledger::{
     ControlBindingProposal, InternalComputationAlias, InternalComputationGrant,
-    InternalCpuActionAdmission, InternalCpuActionSource, JointAdjustmentReceipt, JointAdmission,
+    InternalCpuActionAdmission, InternalCpuActionSource, InternalCpuFactoryBinding,
+    InternalResultClosedFactoryDescriptor, JointAdjustmentReceipt, JointAdmission,
     JointAdmissionFailure, JointAdmissionHandle, JointClaim, JointClaimView, JointGrantedBatch,
     JointGrantedClaims, JointLocalGrant, JointLocalOffer, JointProposal, RetainedPayloadAlias,
     RetainedPayloadGrant, RootStageAdmission, RootStageProposal, RootStageReady, RootStageSource,
@@ -62,6 +63,29 @@ pub enum JointResource {
     PhysicalQueueBytes,
 }
 const RESOURCE_COUNT: usize = 15;
+
+// A closed source may exclude only these actual per-resource lifetimes from
+// nonempty causal intersections. Charged dependencies and amounts never change.
+// This private mask is not source certification or a public request parameter.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+struct CausalMask(u16);
+impl CausalMask {
+    const NONE: Self = Self(0);
+    const INTERNAL_CPU_ACTION: Self = Self(
+        (1u16 << JointResource::InternalCpuJobs as usize)
+            | (1u16 << JointResource::PhysicalQueueRecords as usize)
+            | (1u16 << JointResource::PhysicalQueueBytes as usize),
+    );
+    fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+    fn finite(self, coordinate: usize) -> bool {
+        self.0 & (1u16 << (coordinate % RESOURCE_COUNT)) != 0
+    }
+    fn valid(self) -> bool {
+        self.0 & !((1u16 << RESOURCE_COUNT) - 1) == 0
+    }
+}
 const CLASS_COUNT: usize = 5;
 const LANE_COUNT: usize = 3;
 const PROJECTION_COUNT: usize = 1 + CLASS_COUNT + LANE_COUNT + CLASS_COUNT * LANE_COUNT;

@@ -814,6 +814,25 @@ impl QueryBlockingExecutorOwner {
         Ok(Self { owner, executor })
     }
 
+    /// Trusted first-party composition only. The one supported kind is the
+    /// reviewed FA InternalResultClosedFactory, never a generic FnOnce claim
+    /// of finite behavior. The original queue author fences all old raw views.
+    pub fn bind_internal_result_closed_factory_for_composition<I, C, T, F>(
+        &mut self,
+        _factory: fn(I, C) -> F,
+    ) -> Result<
+        novarocks_workload_control::joint_admission::InternalResultClosedFactoryDescriptor,
+        novarocks_workload_control::WorkError,
+    >
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        self.executor
+            .handle
+            .bind_internal_result_closed_factory_for_composition(preserving_call_type::<T, F>())
+    }
+
     pub fn executor(&self) -> QueryBlockingExecutor {
         self.executor.clone()
     }
@@ -846,6 +865,17 @@ where
     move || Box::new(work()) as CpuResult
 }
 
+fn preserving_call_type<T, F>() -> std::any::TypeId
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    fn output_type<I, O: 'static>(_: fn(I) -> O) -> std::any::TypeId {
+        std::any::TypeId::of::<O>()
+    }
+    output_type(preserving_call::<T, F>)
+}
+
 impl QueryBlockingExecutor {
     /// The real same call factory's return layout, before allocating a job,
     /// channel, observer header or constructing any F. No single-capture ABI
@@ -865,6 +895,26 @@ impl QueryBlockingExecutor {
     /// Internal CPU composition must enforce all jobs jointly charged, L<=P
     /// and Q>=P. This transport seam does not certify arbitrary FnOnce jobs.
     pub fn try_reserve(&self) -> Result<QueryBlockingReservation, QueryBlockingReserveRefusal> {
+        if self.handle.closed_factory_descriptor().is_some() {
+            return Err(QueryBlockingReserveRefusal::FactoryMismatch);
+        }
+        self.handle
+            .try_reserve()
+            .map(|inner| QueryBlockingReservation { inner })
+    }
+
+    /// Nonwaiting original reservation, bound to both the WC composition
+    /// decision and this exact physical pool allocation epoch.
+    pub fn try_reserve_internal_result_closed_factory(
+        &self,
+        binding: &novarocks_workload_control::joint_admission::InternalCpuFactoryBinding,
+    ) -> Result<QueryBlockingReservation, QueryBlockingReserveRefusal> {
+        let Some(descriptor) = self.handle.closed_factory_descriptor() else {
+            return Err(QueryBlockingReserveRefusal::FactoryMismatch);
+        };
+        if !binding.matches_descriptor(&descriptor) {
+            return Err(QueryBlockingReserveRefusal::FactoryMismatch);
+        }
         self.handle
             .try_reserve()
             .map(|inner| QueryBlockingReservation { inner })
@@ -885,7 +935,17 @@ impl QueryBlockingExecutor {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        let reason = if receipt.is_some() {
+        let factory_matches = match self.handle.closed_factory_descriptor() {
+            Some(descriptor) => physical.matches_internal_result_closed_factory(&descriptor),
+            None => !physical.is_internal_result_closed_factory(),
+        };
+        let reason = if !factory_matches
+            || !self
+                .handle
+                .accepts_call_type(preserving_call_type::<T, F>())
+        {
+            Some(QueryBlockingPublishRefusal::FactoryMismatch)
+        } else if receipt.is_some() {
             Some(QueryBlockingPublishRefusal::Empty)
         } else if !self.handle.same_pool(&physical.physical_mut().inner) {
             Some(QueryBlockingPublishRefusal::ForeignPool)
@@ -1478,6 +1538,13 @@ mod joint_queue_tests {
     };
 
     fn joint_fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+        let fixture = joint_fixture_before_ready(JointResource::BlockingJobs);
+        fixture.0.mark_ready().unwrap();
+        fixture
+    }
+    fn joint_fixture_before_ready(
+        source: JointResource,
+    ) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
         let count = 8;
         let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 1, 2, &[]);
         let mut config = JointCapacityConfig {
@@ -1503,7 +1570,7 @@ mod joint_queue_tests {
         // original row's known inline envelope, not a complete Native source/frame.
         let step = JointResources::ZERO
             .with(JointResource::ClaimRecords, 1)
-            .with(JointResource::InternalCpuJobs, 1)
+            .with(source, 1)
             .with(JointResource::PhysicalQueueRecords, 1)
             .with(JointResource::PhysicalQueueBytes, b);
         let progress = base
@@ -1511,7 +1578,7 @@ mod joint_queue_tests {
                 JointResource::ClaimRecords,
                 base.get(JointResource::ClaimRecords) + 1,
             )
-            .with(JointResource::InternalCpuJobs, 1)
+            .with(source, 1)
             .with(JointResource::PhysicalQueueRecords, 1)
             .with(JointResource::PhysicalQueueBytes, b);
         let custody = JointResourceLimits {
@@ -1535,7 +1602,7 @@ mod joint_queue_tests {
                 .with(JointResource::MetadataBytes, m * 16)
                 .with(JointResource::PayloadBytes, 32)
                 .with(JointResource::Computations, 1)
-                .with(JointResource::InternalCpuJobs, 3)
+                .with(source, 3)
                 .with(JointResource::PhysicalQueueRecords, 3)
                 .with(JointResource::PhysicalQueueBytes, b * 3),
             per_dependency: JointResources::ZERO
@@ -1544,7 +1611,7 @@ mod joint_queue_tests {
                 .with(JointResource::PayloadBytes, 32)
                 .with(JointResource::Computations, 1)
                 .with(JointResource::PhysicalQueueBytes, b * 2)
-                .with(JointResource::InternalCpuJobs, 2)
+                .with(source, 2)
                 .with(JointResource::PhysicalQueueRecords, 2),
             protected_progress: step,
         };
@@ -1556,7 +1623,7 @@ mod joint_queue_tests {
                 .with(JointResource::PayloadBytes, 96)
                 .with(JointResource::UnreceivedProductions, 1)
                 .with(JointResource::Computations, 1)
-                .with(JointResource::InternalCpuJobs, 3)
+                .with(source, 3)
                 .with(JointResource::PhysicalQueueRecords, 3)
                 .with(JointResource::PhysicalQueueBytes, b * 3),
             per_dependency: JointResources::ZERO
@@ -1567,7 +1634,7 @@ mod joint_queue_tests {
                 .with(JointResource::UnreceivedProductions, 1)
                 .with(JointResource::Computations, 1)
                 .with(JointResource::PhysicalQueueBytes, b * 2)
-                .with(JointResource::InternalCpuJobs, 2)
+                .with(source, 2)
                 .with(JointResource::PhysicalQueueRecords, 2),
             protected_progress: progress,
         };
@@ -1603,7 +1670,6 @@ mod joint_queue_tests {
             .configure_joint_capacity(config.validate(&required).unwrap())
             .unwrap();
         control.configure_control_storage(storage).unwrap();
-        control.mark_ready().unwrap();
         (control, handle, driver)
     }
 
@@ -1654,7 +1720,7 @@ mod joint_queue_tests {
                 JointLane::Foreground,
                 JointResources::ZERO
                     .with(JointResource::ClaimRecords, 1)
-                    .with(JointResource::InternalCpuJobs, 1)
+                    .with(JointResource::BlockingJobs, 1)
                     .with(JointResource::PhysicalQueueRecords, 1)
                     .with(JointResource::PhysicalQueueBytes, b),
             )
@@ -2337,5 +2403,291 @@ mod joint_queue_tests {
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
         drop(receipt);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    // A real finite test factory; production registers only FA's private
+    // make_cpu_work after reviewing its four closed operation paths.
+    fn fixture_closed_work(
+        runs: Arc<AtomicUsize>,
+        value: usize,
+    ) -> impl FnOnce() -> usize + Send + 'static {
+        move || {
+            runs.fetch_add(1, Ordering::SeqCst);
+            value
+        }
+    }
+    fn positive_computation(
+        handle: &JointAdmissionHandle,
+        owner: &WorkOwner,
+        driver: &mut JointProgressDriver,
+    ) -> InternalComputationGrant {
+        let mut proposal = handle.begin_paid_proposal(owner).unwrap();
+        proposal
+            .begin_new(
+                JointLane::Foreground,
+                JointResources::ZERO
+                    .with(JointResource::ClaimRecords, 1)
+                    .with(JointResource::Computations, 1),
+            )
+            .unwrap();
+        proposal
+            .push_dependency(&SharedDependency::LocalHost)
+            .unwrap();
+        proposal.end_change().unwrap();
+        let mut admission = proposal.submit().unwrap();
+        drive(driver);
+        let mut batch = match Pin::new(&mut admission).poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(Ok(batch)) => batch,
+            _ => panic!("original positive computation"),
+        };
+        let mut raw = batch.new_claims.pop();
+        let mut grant = None;
+        InternalComputationGrant::adopt_in(&owner.scope(), &mut raw, &mut grant)
+            .unwrap()
+            .notify();
+        drop(batch);
+        drop(admission);
+        grant.unwrap()
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_factory_binds_original_wc_pool_and_call_through_real_worker_exit() {
+        use novarocks_workload_control::WorkError;
+        let (mut control, handle, mut driver) =
+            joint_fixture_before_ready(JointResource::InternalCpuJobs);
+        let (mut owner, executor) = worker();
+        let old_raw_view = executor.clone();
+        let descriptor = owner
+            .bind_internal_result_closed_factory_for_composition(fixture_closed_work)
+            .unwrap();
+        let binding = control
+            .bind_internal_result_closed_factory_for_composition(descriptor)
+            .unwrap();
+        control.mark_ready().unwrap();
+        let root = root(&control, &mut driver);
+        let computation = positive_computation(&handle, &root.owner, &mut driver);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let wrong_drops = Arc::new(AtomicUsize::new(0));
+        let wrong = DropCount(Arc::clone(&wrong_drops));
+        assert!(matches!(
+            old_raw_view
+                .execute_preserving(move || -> usize {
+                    drop(wrong);
+                    panic!("an old raw view cannot execute an unregistered factory");
+                })
+                .await,
+            Err(QueryBlockingFailure::SubmissionClosed)
+        ));
+        assert_eq!(wrong_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(executor.handle.snapshot().queued, 0);
+        assert_eq!(executor.handle.snapshot().running, 0);
+        assert!(matches!(
+            executor.try_reserve(),
+            Err(QueryBlockingReserveRefusal::FactoryMismatch)
+        ));
+
+        let (mut foreign_owner, foreign_executor) = worker();
+        let foreign_descriptor = foreign_owner
+            .bind_internal_result_closed_factory_for_composition(fixture_closed_work)
+            .unwrap();
+        let mut foreign_control = WorkloadControl::try_new_counted(WorkloadConfig::default())
+            .unwrap()
+            .owner;
+        let foreign_binding = foreign_control
+            .bind_internal_result_closed_factory_for_composition(foreign_descriptor)
+            .unwrap();
+        assert!(matches!(
+            foreign_binding
+                .bind_source(computation.cpu_action_source(&root.owner.scope()).unwrap()),
+            Err(WorkError::ForeignAuthority)
+        ));
+        assert!(matches!(
+            foreign_executor.try_reserve_internal_result_closed_factory(&binding),
+            Err(QueryBlockingReserveRefusal::FactoryMismatch)
+        ));
+        assert!(matches!(
+            executor.try_reserve_internal_result_closed_factory(&foreign_binding),
+            Err(QueryBlockingReserveRefusal::FactoryMismatch)
+        ));
+
+        fn call_layout<I, C, F: FnOnce() -> usize + Send + 'static>(
+            _: fn(I, C) -> F,
+        ) -> std::alloc::Layout {
+            QueryBlockingExecutor::preserving_call_layout::<usize, F>()
+        }
+        let bytes = bounded_worker::queue_record_layout::<CpuResult>()
+            .size()
+            .checked_add(call_layout(fixture_closed_work).size())
+            .unwrap() as u64;
+        let source = binding
+            .bind_source(computation.cpu_action_source(&root.owner.scope()).unwrap())
+            .unwrap();
+        let mut action = source
+            .begin(
+                std::num::NonZeroU64::new(1).unwrap(),
+                std::num::NonZeroU64::new(bytes).unwrap(),
+            )
+            .unwrap();
+        drive(&mut driver);
+        let mut physical = None;
+        let mut offer = match action.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(offer)) => offer,
+            _ => panic!("same paid closed action"),
+        };
+        let mut original = Some(
+            executor
+                .try_reserve_internal_result_closed_factory(&binding)
+                .unwrap(),
+        );
+        offer
+            .accept_in(&mut original, &mut physical)
+            .unwrap()
+            .notify();
+        drop(offer);
+        assert!(
+            physical
+                .as_ref()
+                .unwrap()
+                .is_internal_result_closed_factory()
+        );
+        assert!(matches!(
+            physical.as_ref().unwrap().claims()[0].view(),
+            Err(WorkError::Conflict)
+        ));
+        let wrong = DropCount(Arc::clone(&wrong_drops));
+        let mut receipt = None;
+        let refused = executor
+            .prepare_preserving_in(
+                physical.as_mut().unwrap(),
+                move || {
+                    drop(wrong);
+                    0usize
+                },
+                &mut receipt,
+            )
+            .unwrap_err();
+        assert_eq!(
+            refused.reason(),
+            QueryBlockingPublishRefusal::FactoryMismatch
+        );
+        assert_eq!(wrong_drops.load(Ordering::SeqCst), 1);
+        assert!(receipt.is_none() && physical.is_some());
+        drop(refused.into_work());
+        assert_eq!(wrong_drops.load(Ordering::SeqCst), 2);
+        let mut prepared = Some(
+            executor
+                .prepare_preserving_in(
+                    physical.as_mut().unwrap(),
+                    fixture_closed_work(Arc::clone(&runs), 42),
+                    &mut receipt,
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            prepared.as_ref().unwrap().call_layout(),
+            call_layout(fixture_closed_work)
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            foreign_executor
+                .publish_joint_in(&mut physical, &mut prepared)
+                .err()
+                .unwrap(),
+            QueryBlockingPublishRefusal::ForeignPool
+        );
+        assert!(physical.is_some() && prepared.is_some() && receipt.is_some());
+        executor
+            .publish_joint_in(&mut physical, &mut prepared)
+            .unwrap()
+            .notify();
+        let mut receipt = receipt.unwrap();
+        assert_eq!(result(&mut receipt).await.unwrap(), 42);
+        exited(&receipt).await.unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        // Same registered call on the old non-Root path remains ordinary E:
+        // no joint grant is minted by the generic execute API.
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                old_raw_view.execute_preserving(fixture_closed_work(Arc::clone(&runs), 43))
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            43
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        drop(receipt);
+        drop(action);
+        // A real unpublished original reservation can also be disposed by its
+        // original caller. Extracting its raw claim cannot turn this finite
+        // action into generic growth, a payload grant or an early refund.
+        let source = binding
+            .bind_source(computation.cpu_action_source(&root.owner.scope()).unwrap())
+            .unwrap();
+        let mut action = source
+            .begin(
+                std::num::NonZeroU64::new(1).unwrap(),
+                std::num::NonZeroU64::new(bytes).unwrap(),
+            )
+            .unwrap();
+        drive(&mut driver);
+        let mut offer = match action.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(offer)) => offer,
+            _ => panic!("same original physical reservation for explicit refusal cleanup"),
+        };
+        let mut original = Some(
+            executor
+                .try_reserve_internal_result_closed_factory(&binding)
+                .unwrap(),
+        );
+        let mut physical = None;
+        offer
+            .accept_in(&mut original, &mut physical)
+            .unwrap()
+            .notify();
+        drop(offer);
+        let mut original_physical = None;
+        let mut original_claims = None;
+        assert!(
+            physical
+                .take()
+                .unwrap()
+                .transfer_in(&mut original_physical, &mut original_claims)
+                .is_ok()
+        );
+        let mut claims = original_claims.take().unwrap().into_iter();
+        let mut raw = Some(claims.next().unwrap());
+        assert!(claims.next().is_none());
+        drop(claims);
+        assert!(matches!(
+            raw.as_ref().unwrap().view(),
+            Err(WorkError::Conflict)
+        ));
+        assert!(matches!(
+            raw.as_mut()
+                .unwrap()
+                .release_part(JointResources::ZERO.with(JointResource::InternalCpuJobs, 1)),
+            Err(WorkError::Conflict)
+        ));
+        let mut payload = None;
+        assert!(matches!(
+            RetainedPayloadGrant::adopt_in(&root.owner.scope(), &mut raw, &mut payload),
+            Err(WorkError::Conflict)
+        ));
+        assert!(raw.is_some() && payload.is_none());
+        drop(original_physical.take());
+        drop(raw);
+        drop(action);
+        drop(computation);
+        let novarocks_workload_control::RootWork {
+            owner: work_owner,
+            business,
+        } = root;
+        drop(business);
+        work_owner.complete();
+        drive(&mut driver);
+        shutdown(&mut owner).await;
+        shutdown(&mut foreign_owner).await;
     }
 }

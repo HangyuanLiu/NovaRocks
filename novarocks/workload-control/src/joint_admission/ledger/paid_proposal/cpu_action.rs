@@ -18,13 +18,113 @@
 //! Closed action construction from the original positive computation grant.
 //! This is permission to seek one joint action, never a physical reservation.
 use super::*;
-use std::num::NonZeroU64;
+use std::{any::TypeId, num::NonZeroU64};
+
+/// Identity of the existing physical pool allocation and its one closed call
+/// factory. Only trusted first-party composition may describe this kind.
+/// A descriptor is not a source-finiteness proof or a workload grant.
+pub struct InternalResultClosedFactoryDescriptor {
+    pool: Weak<dyn Send + Sync>,
+    call: TypeId,
+}
+impl InternalResultClosedFactoryDescriptor {
+    fn duplicate(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            call: self.call,
+        }
+    }
+    /// Composition-only seam used by the original QA physical owner after it
+    /// installs the exact first-party factory in that same pool. Arbitrary
+    /// generic blocking work is not authorized by choosing this descriptor.
+    pub fn for_composition(pool: Weak<dyn Send + Sync>, call: TypeId) -> Self {
+        Self { pool, call }
+    }
+    pub fn matches(&self, other: &Self) -> bool {
+        self.call == other.call && Weak::ptr_eq(&self.pool, &other.pool)
+    }
+    fn stamp(&self) -> CpuFactoryStamp {
+        CpuFactoryStamp {
+            // The original State keeps this Weak allocation identity alive.
+            pool: self.pool.as_ptr() as *const () as usize,
+            call: self.call,
+        }
+    }
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct CpuFactoryStamp {
+    pool: usize,
+    call: TypeId,
+}
+/// Narrow view of the original WC owner's before-Ready composition decision.
+/// Weak identities retain neither a Work nor a physical pool or new budget.
+pub struct InternalCpuFactoryBinding {
+    inner: Weak<Inner>,
+    descriptor: InternalResultClosedFactoryDescriptor,
+}
+impl Clone for InternalCpuFactoryBinding {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            descriptor: self.descriptor.duplicate(),
+        }
+    }
+}
+impl InternalCpuFactoryBinding {
+    pub fn matches_descriptor(&self, descriptor: &InternalResultClosedFactoryDescriptor) -> bool {
+        self.descriptor.matches(descriptor)
+    }
+    pub fn bind_source(
+        &self,
+        mut source: InternalCpuActionSource,
+    ) -> Result<InternalCpuActionSource, WorkError> {
+        if !Weak::ptr_eq(&self.inner, &source.inner) {
+            return Err(WorkError::ForeignAuthority);
+        }
+        let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
+        let state = inner.state.lock().unwrap();
+        let registered = state
+            .internal_cpu_factory
+            .as_ref()
+            .ok_or(WorkError::NotReady)?;
+        if !registered.matches(&self.descriptor) || registered.pool.strong_count() == 0 {
+            return Err(WorkError::Released);
+        }
+        source.fence.factory = Some(registered.stamp());
+        computation_facts(&state, source.owner, source.fence)?;
+        Ok(source)
+    }
+}
+impl WorkloadControl {
+    /// Installs the one InternalResultClosedFactory on this original authority.
+    /// Only first-party role composition owns both this unique owner and the
+    /// physical CPU owner. The reviewed closed implementation, not its TypeId,
+    /// establishes finite source semantics. No ordinary builder has this API.
+    pub fn bind_internal_result_closed_factory_for_composition(
+        &mut self,
+        descriptor: InternalResultClosedFactoryDescriptor,
+    ) -> Result<InternalCpuFactoryBinding, WorkError> {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.ready || state.closed || state.internal_cpu_factory.is_some() {
+            return Err(WorkError::Conflict);
+        }
+        if descriptor.pool.strong_count() == 0 {
+            return Err(WorkError::Released);
+        }
+        state.internal_cpu_factory = Some(descriptor.duplicate());
+        Ok(InternalCpuFactoryBinding {
+            inner: Arc::downgrade(&self.inner),
+            descriptor,
+        })
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(in crate::joint_admission::ledger) struct CpuActionFence {
     computation: u64,
     epoch: u64,
     structure_revision: u64,
+    factory: Option<CpuFactoryStamp>,
 }
 
 /// The same finite request and paid proposal cell. Its only receiving path
@@ -33,6 +133,23 @@ pub(in crate::joint_admission::ledger) struct CpuActionFence {
 #[must_use = "Keep the original admission in the stable CPU job owner"]
 pub struct InternalCpuActionAdmission {
     admission: JointAdmission,
+}
+impl CpuActionFence {
+    pub(super) fn has_closed_factory(self) -> bool {
+        self.factory.is_some()
+    }
+    pub(in crate::joint_admission::ledger) fn descriptor(
+        self,
+        state: &State,
+    ) -> Option<InternalResultClosedFactoryDescriptor> {
+        self.factory.and_then(|stamp| {
+            state
+                .internal_cpu_factory
+                .as_ref()
+                .filter(|descriptor| descriptor.stamp() == stamp)
+                .map(InternalResultClosedFactoryDescriptor::duplicate)
+        })
+    }
 }
 impl InternalCpuActionAdmission {
     pub fn poll_local_offer(
@@ -48,6 +165,15 @@ fn computation_facts(
     owner: WorkId,
     fence: CpuActionFence,
 ) -> Result<&Arc<ProfileFacts>, WorkError> {
+    if let Some(factory) = fence.factory {
+        let registered = state
+            .internal_cpu_factory
+            .as_ref()
+            .ok_or(WorkError::NotReady)?;
+        if registered.stamp() != factory || registered.pool.strong_count() == 0 {
+            return Err(WorkError::Released);
+        }
+    }
     let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
     if ledger.driver_closed {
         return Err(WorkError::Closed);
@@ -115,7 +241,16 @@ pub(in crate::joint_admission::ledger) fn validate_cpu_action(
         || amounts != expected
         || amounts.get(JointResource::MetadataBytes) == 0
         || amounts.get(JointResource::PhysicalQueueBytes) == 0
-        || change.claim.facts.key != original.key
+        || change.claim.facts.key.class != original.key.class
+        || change.claim.facts.key.lane != original.key.lane
+        || change.claim.facts.key.dependencies != original.key.dependencies
+        || change.claim.facts.key.causal
+            != if fence.factory.is_some() {
+                CausalMask::INTERNAL_CPU_ACTION
+            } else {
+                CausalMask::NONE
+            }
+        || !original.key.causal.is_empty()
     {
         return Err(WorkError::Conflict);
     }
@@ -152,6 +287,7 @@ pub(in crate::joint_admission::ledger) fn capture(
         computation: id,
         epoch,
         structure_revision: row.structure_revision,
+        factory: None,
     };
     computation_facts(&state, scope.id, fence)?;
     Ok(InternalCpuActionSource {
@@ -201,6 +337,9 @@ impl InternalCpuActionSource {
                 JointResource::PhysicalQueueBytes,
                 physical_queue_bytes.get(),
             );
+        // Arm the same private source before its one body is constructed.
+        // No generic builder can choose this per-resource causal shape.
+        proposal.cpu_action = Some(self.fence);
         proposal.begin_new(facts.lane, amounts)?;
         let current = proposal.current.as_mut().expect("same closed CPU proposal");
         if facts.dependencies.len() > current.selected.capacity() {
@@ -208,7 +347,6 @@ impl InternalCpuActionSource {
         }
         current.selected.extend(facts.dependencies.iter().cloned());
         proposal.end_change()?;
-        proposal.cpu_action = Some(self.fence);
         let admission = proposal.submit().map_err(|failure| failure.error)?;
         Ok(InternalCpuActionAdmission { admission })
     }

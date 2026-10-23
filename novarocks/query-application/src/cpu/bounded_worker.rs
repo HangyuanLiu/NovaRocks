@@ -22,6 +22,7 @@
 //! ownership together from admission through synchronous execution.
 
 use std::{
+    any::TypeId,
     collections::VecDeque,
     fmt,
     mem::ManuallyDrop,
@@ -46,6 +47,7 @@ type WorkerCall<R> = Box<dyn FnOnce() -> R + Send + 'static>;
 pub(crate) struct BoundedWorkerJob<R> {
     call: Option<WorkerCall<R>>,
     call_layout: std::alloc::Layout,
+    call_type: TypeId,
 }
 
 impl<R> BoundedWorkerJob<R> {
@@ -53,6 +55,7 @@ impl<R> BoundedWorkerJob<R> {
         Self {
             call: Some(Box::new(call)),
             call_layout: std::alloc::Layout::new::<F>(),
+            call_type: TypeId::of::<F>(),
         }
     }
 
@@ -180,6 +183,7 @@ impl fmt::Debug for BoundedWorkerReservation {
 pub enum QueueReserveRefusal {
     Full,
     Closed,
+    FactoryMismatch,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueuePublishRefusal {
@@ -187,6 +191,7 @@ pub enum QueuePublishRefusal {
     ForeignPool,
     Closed,
     ReceiptClosed,
+    FactoryMismatch,
 }
 
 /// One fixed observer header for a new joint job, not another completion queue.
@@ -336,6 +341,12 @@ enum PendingRecord<'a, R> {
     },
 }
 impl<R> PendingRecord<'_, R> {
+    fn call_type(&self) -> TypeId {
+        match self {
+            Self::Legacy(row) => row.as_ref().unwrap().job.call_type,
+            Self::Joint { prepared, .. } => prepared.as_ref().unwrap().job.call_type,
+        }
+    }
     fn take(&mut self) -> QueuedJob<R> {
         match self {
             Self::Legacy(row) => QueuedJob::Legacy(row.take().unwrap()),
@@ -386,6 +397,7 @@ pub(crate) fn worker_entry_layout() -> std::alloc::Layout {
 }
 
 struct QueueState<R> {
+    closed_factory: Option<TypeId>,
     closed: bool,
     jobs: VecDeque<QueuedJob<R>>,
     running: usize,
@@ -443,6 +455,7 @@ impl<R: Send + 'static> BoundedWorkerOwner<R> {
         let queue_capacity = config.queue_capacity().get();
         let shared = Arc::new(Shared {
             state: Mutex::new(QueueState {
+                closed_factory: None,
                 closed: false,
                 jobs: VecDeque::with_capacity(queue_capacity),
                 running: 0,
@@ -616,6 +629,9 @@ impl<R: Send + 'static> BoundedWorkerHandle<R> {
         &self,
         job: BoundedWorkerJob<R>,
     ) -> Result<BoundedWorkerReceipt<R>, BoundedWorkerSubmitError<R>> {
+        if !self.accepts_call_type(job.call_type) {
+            return Err(BoundedWorkerSubmitError::rejected(job));
+        }
         let queue_slot = match Arc::clone(&self.shared.queue_slots).acquire_owned().await {
             Ok(slot) => slot,
             Err(_) => return Err(BoundedWorkerSubmitError::rejected(job)),
@@ -630,6 +646,9 @@ impl<R: Send + 'static> BoundedWorkerHandle<R> {
         &self,
         job: BoundedWorkerJob<R>,
     ) -> Result<BoundedWorkerReceipt<R>, BoundedWorkerSubmitError<R>> {
+        if !self.accepts_call_type(job.call_type) {
+            return Err(BoundedWorkerSubmitError::rejected(job));
+        }
         let queue_slot = match Arc::clone(&self.shared.queue_slots).try_acquire_owned() {
             Ok(slot) => slot,
             Err(_) => return Err(BoundedWorkerSubmitError { job }),
@@ -637,6 +656,45 @@ impl<R: Send + 'static> BoundedWorkerHandle<R> {
         self.enqueue(job, queue_slot)
     }
 
+    pub(crate) fn bind_internal_result_closed_factory_for_composition(
+        &self,
+        call: TypeId,
+    ) -> Result<
+        novarocks_workload_control::joint_admission::InternalResultClosedFactoryDescriptor,
+        novarocks_workload_control::WorkError,
+    > {
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed
+            || state.closed_factory.is_some()
+            || state.running != 0
+            || !state.jobs.is_empty()
+            || self.shared.queue_slots.available_permits() != self.shared.queue_capacity
+        {
+            return Err(novarocks_workload_control::WorkError::Conflict);
+        }
+        state.closed_factory = Some(call);
+        Ok(novarocks_workload_control::joint_admission::InternalResultClosedFactoryDescriptor::for_composition(self.source(), call))
+    }
+    pub(crate) fn closed_factory_descriptor(
+        &self,
+    ) -> Option<novarocks_workload_control::joint_admission::InternalResultClosedFactoryDescriptor>
+    {
+        let call = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .closed_factory?;
+        Some(novarocks_workload_control::joint_admission::InternalResultClosedFactoryDescriptor::for_composition(self.source(), call))
+    }
+    pub(crate) fn accepts_call_type(&self, call: TypeId) -> bool {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .closed_factory
+            .is_none_or(|registered| registered == call)
+    }
     fn source(&self) -> Weak<dyn Send + Sync> {
         let source: Arc<dyn Send + Sync> = self.shared.clone();
         Arc::downgrade(&source)
@@ -703,6 +761,15 @@ impl<R: Send + 'static> BoundedWorkerHandle<R> {
         {
             return Err(QueuePublishRefusal::ForeignPool);
         }
+        match self.closed_factory_descriptor() {
+            Some(descriptor) if !guard.matches_internal_result_closed_factory(&descriptor) => {
+                return Err(QueuePublishRefusal::FactoryMismatch);
+            }
+            None if guard.is_internal_result_closed_factory() => {
+                return Err(QueuePublishRefusal::FactoryMismatch);
+            }
+            _ => {}
+        }
         if job.completion.is_closed() {
             return Err(QueuePublishRefusal::ReceiptClosed);
         }
@@ -717,6 +784,12 @@ impl<R: Send + 'static> BoundedWorkerHandle<R> {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.closed {
             return Err(QueuePublishRefusal::Closed);
+        }
+        if state
+            .closed_factory
+            .is_some_and(|call| call != pending.call_type())
+        {
+            return Err(QueuePublishRefusal::FactoryMismatch);
         }
         debug_assert!(state.jobs.len() < self.shared.queue_capacity);
         state.jobs.push_back(pending.take());

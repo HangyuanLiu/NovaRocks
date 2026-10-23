@@ -1102,3 +1102,71 @@ fn failed_cpu_action_keeps_original_refusal_after_the_producer_source_exits() {
     drop(action);
     finish(work, &mut driver);
 }
+
+#[test]
+fn ordinary_positive_grant_does_not_certify_a_closed_cpu_factory() {
+    let (control, handle, mut driver) = fixture_with_cpu_jobs(2);
+    let work = root(&control);
+    let scope = work.owner.scope();
+    let facts = [fact("shape-a"), fact("shape-b")];
+    let computation = cpu_stage(&handle, &work.owner, &facts, &mut driver);
+    let external = claim(
+        &handle,
+        &work.owner,
+        &facts,
+        JointLane::Foreground,
+        amounts(JointResource::PhysicalQueueRecords, 1).with(JointResource::PhysicalQueueBytes, 23),
+        &mut driver,
+    );
+    let mut forged = handle.begin_paid_proposal(&work.owner).unwrap();
+    assert!(matches!(
+        forged.begin_new(
+            JointLane::Foreground,
+            amounts(JointResource::InternalCpuJobs, 1)
+        ),
+        Err(WorkError::Conflict)
+    ));
+    drop(forged);
+    // The original progress service retires the rejected constructor's cell
+    // before this same work constructs another independently rejected action.
+    drive(&mut driver);
+    let mut growth = handle.begin_paid_proposal(&work.owner).unwrap();
+    assert!(matches!(
+        growth.begin_grow(
+            external.view().unwrap(),
+            JointResources::ZERO.with(JointResource::InternalCpuJobs, 1)
+        ),
+        Err(WorkError::Conflict)
+    ));
+    drop(growth);
+    drive(&mut driver);
+    let mut action = computation
+        .cpu_action_source(&scope)
+        .unwrap()
+        .begin(
+            std::num::NonZeroU64::new(17).unwrap(),
+            std::num::NonZeroU64::new(23).unwrap(),
+        )
+        .unwrap();
+    drive(&mut driver);
+    assert!(matches!(
+        action.poll_local_offer(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Ok(_))
+    ));
+    {
+        let state = control.inner.state.lock().unwrap();
+        assert!(
+            state
+                .joint
+                .as_ref()
+                .unwrap()
+                .profiles
+                .values()
+                .all(|profile| profile.facts.key.causal.is_empty())
+        );
+    }
+    // No invented physical value is accepted. The actual queue/factory
+    // integration regression lives with the original QA worker author.
+    drop((action, external, computation));
+    finish(work, &mut driver);
+}

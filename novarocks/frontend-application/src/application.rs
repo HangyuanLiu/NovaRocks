@@ -430,7 +430,7 @@ impl FrontendExecutionRuntimeOwner {
         query_cpu_config: QueryCpuExecutorConfig,
         query_blocking_config: QueryBlockingExecutorConfig,
     ) -> Result<Self, FrontendApplicationError> {
-        let workload = WorkloadControl::try_new_counted(workload_config).map_err(|error| {
+        let mut workload = WorkloadControl::try_new_counted(workload_config).map_err(|error| {
             FrontendApplicationError::new(FrontendApplicationErrorKind::WorkloadControlOpen, error)
         })?;
         // The frozen result profile must cover computation admission; a
@@ -457,12 +457,14 @@ impl FrontendExecutionRuntimeOwner {
             })?;
         let query_blocking_executor = query_blocking.executor();
         let internal_result_cpu =
-            InternalResultCpuOwner::try_new(result_profile).map_err(|error| {
-                FrontendApplicationError::new(
-                    FrontendApplicationErrorKind::InternalResultCpuOpen,
-                    error,
-                )
-            })?;
+            InternalResultCpuOwner::try_new(result_profile, &mut workload.owner).map_err(
+                |error| {
+                    FrontendApplicationError::new(
+                        FrontendApplicationErrorKind::InternalResultCpuOpen,
+                        error,
+                    )
+                },
+            )?;
         let internal_result_cpu_runtime = internal_result_cpu.runtime();
         let process_bytes = frontend_process_id.to_bytes();
         let namespace = QueryProcessNamespace::new(

@@ -185,7 +185,7 @@ impl DomainCpuCustody {
             let source = match state
                 .computation
                 .as_ref()
-                .map(|grant| grant.cpu_action_source(self.binding.scope()))
+                .map(|grant| self.cpu.capture_action_source(grant, self.binding.scope()))
                 .transpose()
             {
                 Ok(source) => source,
@@ -727,8 +727,9 @@ mod root_action_tests {
         time::{Duration, Instant},
     };
     fn root_control(
-        cpu: &InternalResultCpu,
+        cpu_owner: &mut InternalResultCpuOwner,
     ) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+        let cpu = cpu_owner.runtime();
         let lane = JointLane::Foreground;
         let cpu_jobs = cpu.configured_capacity().worker_threads().get() as u64;
         assert!(cpu.configured_capacity().queue_capacity().get() >= cpu_jobs as usize);
@@ -870,7 +871,7 @@ mod root_action_tests {
         required.classes[0] = base;
         required.lanes[0] = base;
         required.class_lanes[0][0] = base;
-        let control = WorkloadControl::try_new_counted(WorkloadConfig {
+        let mut control = WorkloadControl::try_new_counted(WorkloadConfig {
             root_limit: count,
             business_limit: count,
             query_concurrency_limit: count,
@@ -883,6 +884,7 @@ mod root_action_tests {
             .configure_joint_capacity(config.validate(&required).unwrap())
             .unwrap();
         control.configure_control_storage(storage).unwrap();
+        cpu_owner.bind_for_test_before_ready(&mut control).unwrap();
         control.mark_ready().unwrap();
         (control, handle, driver)
     }
@@ -992,10 +994,10 @@ mod root_action_tests {
     }
     async fn root_case(cancel_before_proof: bool) {
         let mut cpu_owner = InternalResultCpuOwner::try_new_for_test().unwrap();
+        let (control, handle, mut driver) = root_control(&mut cpu_owner);
         let cpu = cpu_owner.runtime();
         let quote = cpu.operation_action_quote().unwrap();
         assert!(quote.metadata_bytes.get() > 0 && quote.physical_queue_bytes.get() > 0);
-        let (control, handle, mut driver) = root_control(&cpu);
         let work = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
