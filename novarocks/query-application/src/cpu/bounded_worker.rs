@@ -406,6 +406,30 @@ impl<R: Send + 'static> BoundedWorkerHandle<R> {
             Ok(slot) => slot,
             Err(_) => return Err(BoundedWorkerSubmitError::rejected(job)),
         };
+        self.enqueue(job, queue_slot)
+    }
+
+    /// Attempts bounded queue admission without waiting for a queue position.
+    /// A full or closed executor returns the same unexecuted move-only job.
+    /// This is only the physical queue seam; it grants no workload capacity.
+    pub(crate) fn try_submit(
+        &self,
+        job: BoundedWorkerJob<R>,
+    ) -> Result<BoundedWorkerReceipt<R>, BoundedWorkerSubmitError<R>> {
+        let queue_slot = match Arc::clone(&self.shared.queue_slots).try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(_) => return Err(BoundedWorkerSubmitError { job }),
+        };
+        self.enqueue(job, queue_slot)
+    }
+
+    /// One queue author for both admission modes. Close and publication share
+    /// this lock, so even a position acquired before close cannot enter later.
+    fn enqueue(
+        &self,
+        job: BoundedWorkerJob<R>,
+        queue_slot: OwnedSemaphorePermit,
+    ) -> Result<BoundedWorkerReceipt<R>, BoundedWorkerSubmitError<R>> {
         let (completion, receiver) = oneshot::channel();
         let queued = QueuedJob {
             job,
@@ -1021,5 +1045,176 @@ mod tests {
         drop_returned.store(1, Ordering::Release);
         releaser.join().unwrap();
         assert_eq!(finished.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn try_submit_full_returns_the_original_job_without_running_or_dropping_it() {
+        let (mut owner, handle) = executor::<usize>(1, 1);
+        let (release, released) = mpsc::channel();
+        let (started, observed_start) = mpsc::channel();
+        let running = handle
+            .try_submit(BoundedWorkerJob::new(move || {
+                started.send(()).unwrap();
+                released.recv().unwrap();
+                1
+            }))
+            .unwrap();
+        receive(&observed_start).await;
+        // The asynchronous entry must consume the very same physical queue.
+        let queued = handle.submit(BoundedWorkerJob::new(|| 2)).await.unwrap();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let job_runs = Arc::clone(&runs);
+        let (dropped, observed_drop) = mpsc::channel();
+        let notice = DropNotice {
+            dropped: Some(dropped),
+        };
+        let payload = String::from("same move-only application input");
+        let refused = handle
+            .try_submit(BoundedWorkerJob::new(move || {
+                assert_eq!(payload, "same move-only application input");
+                job_runs.fetch_add(1, Ordering::SeqCst);
+                drop(notice);
+                3
+            }))
+            .unwrap_err();
+        // This call returned synchronously while both existing jobs remain
+        // gated. No timeout or scheduler turn creates room for the refusal.
+        assert_eq!(
+            (handle.snapshot().queued, handle.snapshot().running),
+            (1, 1)
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert_eq!(observed_drop.try_recv(), Err(mpsc::TryRecvError::Empty));
+        let original = refused.into_job();
+        release.send(()).unwrap();
+        assert_eq!(running.complete().await.unwrap(), 1);
+        assert_eq!(queued.complete().await.unwrap(), 2);
+        let retried = handle.try_submit(original).unwrap();
+        assert_eq!(retried.complete().await.unwrap(), 3);
+        receive(&observed_drop).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        owner
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn try_submit_closed_returns_untouched_job_and_drop_stays_with_the_caller() {
+        let (mut owner, handle) = executor::<usize>(1, 1);
+        owner.request_close();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let job_runs = Arc::clone(&runs);
+        let (dropped, observed_drop) = mpsc::channel();
+        let notice = DropNotice {
+            dropped: Some(dropped),
+        };
+        let error = handle
+            .try_submit(BoundedWorkerJob::new(move || {
+                job_runs.fetch_add(1, Ordering::SeqCst);
+                drop(notice);
+                7
+            }))
+            .unwrap_err();
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert_eq!(observed_drop.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert_eq!(handle.snapshot().queued, 0);
+        drop(error.into_job());
+        assert_eq!(receive(&observed_drop).await, thread::current().id());
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        owner
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_between_original_position_acquisition_and_enqueue_returns_the_job() {
+        let (mut owner, handle) = executor::<usize>(1, 1);
+        // This is the actual semaphore position used by both public entry
+        // bodies, not a second queue or an injected queue-state flag.
+        let slot = Arc::clone(&handle.shared.queue_slots)
+            .try_acquire_owned()
+            .unwrap();
+        owner.request_close();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let job_runs = Arc::clone(&runs);
+        let (dropped, observed_drop) = mpsc::channel();
+        let notice = DropNotice {
+            dropped: Some(dropped),
+        };
+        let error = handle
+            .enqueue(
+                BoundedWorkerJob::new(move || {
+                    job_runs.fetch_add(1, Ordering::SeqCst);
+                    drop(notice);
+                    7
+                }),
+                slot,
+            )
+            .unwrap_err();
+        assert_eq!(handle.snapshot().queued, 0);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert_eq!(observed_drop.try_recv(), Err(mpsc::TryRecvError::Empty));
+        drop(error.into_job());
+        assert_eq!(receive(&observed_drop).await, thread::current().id());
+        owner
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(owner.shared.state.lock().unwrap().live_workers, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn original_try_submit_and_close_race_have_one_job_owner_and_one_execution_verdict() {
+        for _ in 0..16 {
+            let (mut owner, handle) = executor::<usize>(1, 1);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let submit_barrier = Arc::clone(&barrier);
+            let runs = Arc::new(AtomicUsize::new(0));
+            let job_runs = Arc::clone(&runs);
+            let (dropped, observed_drop) = mpsc::channel();
+            let notice = DropNotice {
+                dropped: Some(dropped),
+            };
+            let submitter = thread::spawn(move || {
+                submit_barrier.wait();
+                handle.try_submit(BoundedWorkerJob::new(move || {
+                    job_runs.fetch_add(1, Ordering::SeqCst);
+                    drop(notice);
+                    7
+                }))
+            });
+            barrier.wait();
+            owner.request_close();
+            match submitter.join().unwrap() {
+                Ok(receipt) => match receipt.complete().await {
+                    Ok(value) => {
+                        assert_eq!(value, 7);
+                        assert_eq!(runs.load(Ordering::SeqCst), 1);
+                    }
+                    Err(BoundedWorkerError::ExecutorClosed) => {
+                        assert_eq!(runs.load(Ordering::SeqCst), 0);
+                    }
+                    Err(other) => panic!("unexpected worker verdict: {other}"),
+                },
+                Err(error) => {
+                    assert_eq!(runs.load(Ordering::SeqCst), 0);
+                    assert_eq!(observed_drop.try_recv(), Err(mpsc::TryRecvError::Empty));
+                    drop(error.into_job());
+                }
+            }
+            receive(&observed_drop).await;
+            assert_eq!(
+                observed_drop.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            );
+            owner
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert_eq!(owner.shared.state.lock().unwrap().live_workers, 0);
+            assert!(owner.workers.lock().unwrap().is_empty());
+        }
     }
 }
