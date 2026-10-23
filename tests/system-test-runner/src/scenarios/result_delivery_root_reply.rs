@@ -577,7 +577,7 @@ fn validate_suffix_freeze(freeze: &Freeze, case: Case) -> Result<()> {
                 && freeze.expected_mutated_body_sha256.as_deref()
                     == Some("112eb22b8f4cb517da83112c0bcc142bfbb7c37e4d09dfe5b2e0b1f0df53fbd7")
                 && freeze.contract_reason
-                    == "malformed root client rows: client-row prefix has no payload in the same body",
+                    == "[query.execution.invalid_data] client-row prefix has no payload in the same body",
             "unsupported frozen valid-row prefix-only suffix"
         );
     } else {
@@ -650,7 +650,7 @@ fn check_mysql(
             && match case {
                 Case::Profile | Case::Kind =>
                     err.message == "[query.execution.invariant] root response violates its contract",
-                Case::Prefix | Case::PrefixSuffix => err.message.contains(&freeze.contract_reason),
+                Case::Prefix | Case::PrefixSuffix => err.message == freeze.contract_reason,
             }
             && err.payload_hex.starts_with("ff5104234859303030"),
         "real FE did not report the exact semantic contract refusal with complete metadata and zero rows"

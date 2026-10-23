@@ -5,7 +5,7 @@
   "topology": "1FE+3BE",
   "sql": "SELECT REPEAT('x',64) AS payload",
   "mutation": "FourBytePrefixOnly",
-  "contract_reason": "malformed root client rows: client-row prefix has no payload in the same body",
+  "contract_reason": "[query.execution.invalid_data] client-row prefix has no payload in the same body",
   "capture_millis": 5000,
   "maximum_target_attempts": 32,
   "forward_millis": 20000,
