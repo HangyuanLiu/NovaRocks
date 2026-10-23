@@ -374,11 +374,22 @@ impl Cancellation {
         }
     }
 
-    pub(crate) fn reason(&self) -> Option<CancellationReason> {
-        if let Some(reason) = self.state.lock().unwrap().reason.clone() {
-            return Some(reason);
+    fn reason(&self, reclaim: &Weak<crate::scope::Inner>) -> Option<CancellationReason> {
+        {
+            let state = self.state.lock().unwrap();
+            if let Some(reason) = state.reason.clone() {
+                return Some(reason);
+            }
+            if state.success_sealed {
+                return None;
+            }
         }
         let reason = self.check_reason()?;
+        // The view already retains this cell's entire ancestor chain. Only
+        // propagation below can temporarily retain other descendant cells.
+        // Publish after those aliases exit, including unwind, and keep plain
+        // negative/cached/sealed observations silent.
+        let _reclaim = crate::scope::ReclaimWakeOnExit::observe(reclaim);
         let _ = self.request(reason);
         self.state.lock().unwrap().reason.clone()
     }
@@ -481,11 +492,7 @@ impl CancellationView {
     }
 
     pub fn reason(&self) -> Option<CancellationReason> {
-        // Deadline/inherited propagation may retain descendant Arcs even when
-        // this view survives the call. Notify after those actual aliases exit,
-        // including unwind, without retaining the original process authority.
-        let _reclaim = crate::scope::ReclaimWakeOnExit::observe(&self.reclaim);
-        self.cancellation().reason()
+        self.cancellation().reason(&self.reclaim)
     }
     pub fn deadline(&self) -> Option<Instant> {
         self.cancellation().deadline()

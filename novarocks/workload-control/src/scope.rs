@@ -3081,6 +3081,66 @@ mod fixed_control_storage_tests {
         );
     }
 
+    #[test]
+    fn observing_unset_cached_and_sealed_reasons_does_not_wake_the_reaper() {
+        let (control, mut driver) = prototype(3);
+        let work = root(&control);
+        let scope = work.owner.scope();
+        let root_view = scope.cancellation().unwrap();
+        let child = scope.child(WorkRequest::new(WorkClass::Query)).unwrap();
+        let child_view = child.scope().cancellation().unwrap();
+        let sealed = root(&control);
+        let sealed_view = sealed.owner.scope().cancellation().unwrap();
+        let before = drain(&mut driver);
+        assert_eq!(root_view.reason(), None);
+        assert_eq!(child_view.reason(), None);
+        assert_eq!(
+            control.progress_revision(),
+            before,
+            "a negative read has no alias exit to publish"
+        );
+        assert_eq!(
+            sealed.owner.success_sealer().seal().unwrap(),
+            WorkSuccessSealOutcome::Sealed
+        );
+        work.owner.cancel(CancellationReason::Requested);
+        let after = drain(&mut driver);
+        for _ in 0..3 {
+            assert_eq!(root_view.reason(), Some(CancellationReason::Requested));
+            assert_eq!(child_view.reason(), Some(CancellationReason::Requested));
+            assert_eq!(
+                sealed_view.reason(),
+                None,
+                "sealed success remains immutable"
+            );
+        }
+        assert_eq!(
+            control.progress_revision(),
+            after,
+            "cached and sealed reads cannot manufacture progress"
+        );
+        // The real cancellation intent is still ready for its dispatcher.
+        // Observe the revision-only waiter, not that independent ready queue.
+        let deadlines = control.deadline_expiry_handle();
+        let mut progress = Box::pin(deadlines.wait_state_change(after));
+        assert!(
+            progress
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(progress);
+        child.complete_after_terminal_cancel_settled();
+        work.business.release();
+        work.owner.complete_after_terminal_cancel_settled();
+        sealed.business.release();
+        sealed.owner.complete();
+        drop(sealed_view);
+        drop(child_view);
+        drop(root_view);
+        drain(&mut driver);
+    }
+
     struct PausedCancellationWake {
         armed: std::sync::atomic::AtomicBool,
         entered: std::sync::mpsc::SyncSender<()>,
