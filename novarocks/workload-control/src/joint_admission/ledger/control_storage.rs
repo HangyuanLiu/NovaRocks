@@ -250,7 +250,10 @@ impl WorkloadControl {
                         .try_reserve_exact(config.poll_roles.len())
                         .map_err(|_| WorkError::Capacity("fixed poll backing inventory"))?;
                     for &role in config.poll_roles {
-                        polls.push(crate::role_poll::PollBacking::new(role));
+                        polls.push(crate::role_poll::PollBacking::new(
+                            role,
+                            SlotId(slots.len()),
+                        ));
                     }
                     slots.push(ControlSlot {
                         cell: Some(cell),

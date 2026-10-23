@@ -20,6 +20,9 @@
 //! This private substrate quotes its frame/container storage only. It does not
 //! provide a complete role profile, reserve input pointees, or activate Server.
 
+mod ready_queue;
+use ready_queue::ReadyQueue;
+
 use crate::{
     WorkError, WorkId, WorkOwner, WorkloadControl,
     control_storage::{SlotId, SlotPhase, arc_bytes},
@@ -38,7 +41,7 @@ use std::{
     },
     task::{Context, Poll, Wake, Waker},
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, futures::OwnedNotified};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PollRoleGeometry {
@@ -52,12 +55,15 @@ impl PollRoleGeometry {
         let per_slot = size_of::<Position<I, F>>()
             .checked_add(size_of::<Option<F>>())
             .and_then(|n| n.checked_add(size_of::<PollBacking>()))
+            .and_then(|n| n.checked_add(size_of::<Option<Arc<PollWake>>>()))
             .and_then(|n| n.checked_add(arc_bytes::<PollWake>().ok()?))
             .ok_or(WorkError::ArithmeticOverflow)?;
         let shared = size_of::<RolePollBank<I, F, M>>()
             .checked_add(arc_bytes::<Notify>()?)
-            // Pinned macOS std mutex backing for Notify's one wait-list mutex.
-            .and_then(|n| n.checked_add(if cfg!(target_os = "macos") { 64 } else { 0 }))
+            .and_then(|n| n.checked_add(arc_bytes::<ReadyQueue>().ok()?))
+            .and_then(|n| n.checked_add(size_of::<OwnedNotified>()))
+            // Pinned macOS mutex backing: ready ring and Notify wait list.
+            .and_then(|n| n.checked_add(if cfg!(target_os = "macos") { 128 } else { 0 }))
             .ok_or(WorkError::ArithmeticOverflow)?;
         Ok(Self { per_slot, shared })
     }
@@ -100,18 +106,19 @@ impl PollBacking {
         let Some(wake) = Arc::get_mut(&mut self.wake) else {
             return false;
         };
-        wake.ready.store(false, Ordering::Relaxed);
+        wake.queued.store(false, Ordering::Relaxed);
         if self.registration != RegistrationPhase::Installed {
             wake.changed = Weak::new();
         }
         self.phase = PollPhase::Free;
         true
     }
-    pub(crate) fn new(geometry: PollRoleGeometry) -> Self {
+    pub(crate) fn new(geometry: PollRoleGeometry, slot: SlotId) -> Self {
         Self {
             geometry,
             wake: Arc::new(PollWake {
-                ready: AtomicBool::new(false),
+                queued: AtomicBool::new(false),
+                slot,
                 changed: Weak::new(),
             }),
             phase: PollPhase::Free,
@@ -120,17 +127,19 @@ impl PollBacking {
     }
 }
 struct PollWake {
-    ready: AtomicBool,
-    changed: Weak<Notify>,
+    queued: AtomicBool,
+    slot: SlotId,
+    changed: Weak<ReadyQueue>,
 }
 impl Wake for PollWake {
     fn wake(self: Arc<Self>) {
         self.wake_by_ref();
     }
     fn wake_by_ref(self: &Arc<Self>) {
-        self.ready.store(true, Ordering::Release);
-        if let Some(changed) = self.changed.upgrade() {
-            changed.notify_one();
+        if let Some(queue) = self.changed.upgrade()
+            && queue.publish(self)
+        {
+            queue.notify();
         }
     }
 }
@@ -199,8 +208,9 @@ pub(crate) struct RolePollBank<I, F: Future, M> {
     role: usize,
     make: M,
     changed: Arc<Notify>,
+    ready: Arc<ReadyQueue>,
+    waiter: Pin<Box<OwnedNotified>>,
     positions: Vec<Position<I, F>>,
-    poll_cursor: usize,
     marker: PhantomData<fn(I)>,
     // Registration leaves after make, positions and all other actual bank fields.
     _registration: BankRegistration,
@@ -239,6 +249,9 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
             let mut notified = std::pin::pin!(changed.notified());
             notified.as_mut().enable();
         }
+        let ready = ReadyQueue::new(count, Arc::clone(&changed))?;
+        let mut waiter = Box::pin(Arc::clone(&changed).notified_owned());
+        waiter.as_mut().enable();
         let mut positions = Vec::new();
         positions
             .try_reserve_exact(count)
@@ -257,7 +270,7 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
             validate(state)?;
             for slot in &mut state.cancellations.slots {
                 let backing = &mut slot.polls[role];
-                Arc::get_mut(&mut backing.wake).unwrap().changed = Arc::downgrade(&changed);
+                Arc::get_mut(&mut backing.wake).unwrap().changed = Arc::downgrade(&ready);
                 backing.registration = RegistrationPhase::Installed;
             }
             Ok::<(), WorkError>(())
@@ -267,8 +280,9 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
             role,
             make,
             changed,
+            ready,
+            waiter,
             positions,
-            poll_cursor: 0,
             marker: PhantomData,
             _registration: BankRegistration {
                 inner: Arc::clone(inner),
@@ -322,17 +336,25 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
             });
         }
         position.input = Some((owner, input));
-        let result = self.inner.update_facts(|state| {
+        let result = self.inner.update_facts_silent(|state| {
+            if state.closed {
+                return Err(WorkError::Closed);
+            }
+            if !state.ready {
+                return Err(WorkError::NotReady);
+            }
             let slot = &mut state.cancellations.slots[id.0];
             if slot.phase != SlotPhase::Node(work) || slot.generation != generation {
                 return Err(WorkError::Conflict);
             }
             let backing = &mut slot.polls[self.role];
+            if !backing.is_installed() {
+                return Err(WorkError::NotReady);
+            }
             if backing.phase != PollPhase::Free || Arc::get_mut(&mut backing.wake).is_none() {
                 return Err(WorkError::Capacity("role backing has not actually exited"));
             }
             backing.phase = PollPhase::Mounted;
-            backing.wake.ready.store(true, Ordering::Release);
             position.footer = Some(Footer {
                 wake: Arc::clone(&backing.wake),
                 _pin: MountPin {
@@ -343,6 +365,10 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
                     role: self.role,
                 },
             });
+            assert!(
+                self.ready.publish(&backing.wake),
+                "unique mount has no old ready hint"
+            );
             Ok(())
         });
         if let Err(error) = result {
@@ -353,25 +379,53 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
                 error,
             });
         }
-        self.changed.notify_one();
+        // Unpublished refusals return their original values before callbacks.
+        // Successful facts precede both notifications; queue notification comes
+        // first, so a WC waiter panic cannot hide the actual mounted input.
+        self.ready.notify();
+        self.inner.changed.notify_waiters();
         Ok(())
     }
 
+    /// Level-triggered readiness. Register before reading the real queue;
+    /// a consumed Notify permit never stands in for the queue's contents.
+    pub(crate) fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        self.waiter.as_mut().enable();
+        if !self.ready.is_empty() {
+            return Poll::Ready(());
+        }
+        match self.waiter.as_mut().poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(()) => {
+                self.waiter
+                    .as_mut()
+                    .set(Arc::clone(&self.changed).notified_owned());
+                // A stale signal can cause one finite empty service turn.
+                Poll::Ready(())
+            }
+        }
+    }
+
+    /// Poll at most the given number of actual ready hints. None means no
+    /// completion in this turn; poll_ready still checks any remaining items.
     pub(crate) fn progress_turn(
         &mut self,
         budget: NonZeroUsize,
     ) -> Option<PollCompletion<F::Output>> {
-        let count = self.positions.len();
-        for _ in 0..budget.get().min(count) {
-            let index = self.poll_cursor;
-            self.poll_cursor = (index + 1) % count;
-            let position = &mut self.positions[index];
+        for _ in 0..budget.get() {
+            let Some(wake) = self.ready.pop() else {
+                break;
+            };
+            let position = &mut self.positions[wake.slot.0];
             let Some(footer) = position.footer.as_ref() else {
+                // A completed role can still have a queued stale wake. Its
+                // actual Arc exits here, outside the queue and State locks.
                 continue;
             };
-            if !footer.wake.ready.swap(false, Ordering::AcqRel) {
-                continue;
-            }
+            assert!(
+                Arc::ptr_eq(&footer.wake, &wake),
+                "ready hint retains its original anchor"
+            );
             let construction = if let Some((owner, input)) = position.input.take() {
                 catch_unwind(AssertUnwindSafe(|| {
                     position.frame.as_mut().set(Some((self.make)(owner, input)))

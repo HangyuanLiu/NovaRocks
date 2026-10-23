@@ -448,7 +448,7 @@ async fn startup_bank_exit_revokes_registration_and_allows_only_serial_reinstall
         RolePollBank::install(&mut control, 0, run),
         Err(WorkError::Conflict)
     ));
-    let old_notify = Arc::as_ptr(&bank.changed);
+    let old_notify = Arc::as_ptr(&bank.ready);
     drop(bank);
     assert!(
         control
@@ -571,4 +571,253 @@ async fn startup_teardown_refuses_readiness_while_actual_factory_destructor_is_p
     control.close_admission();
     drain(&mut driver);
     assert!(control.inner.state.lock().unwrap().is_drained());
+}
+
+#[tokio::test]
+async fn one_high_slot_wake_is_ready_without_scanning_the_empty_prefix() {
+    let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
+    let (mut control, _, mut driver) = prototype_profile_with_roles(512, 1, 1, 1, &roles);
+    let mut bank = RolePollBank::install(&mut control, 0, run).unwrap();
+    control.mark_ready().unwrap();
+    let mut roots: Vec<_> = (0..501).map(|_| new_root(&control)).collect();
+    let root = roots.pop().unwrap();
+    let slot = control.inner.state.lock().unwrap().nodes[&root.owner.scope().id()].cancellation;
+    assert_eq!(slot.0, 500);
+    root.business.release();
+    bank.mount_owned(root.owner, new_input(true))
+        .unwrap_or_else(|_| panic!("original mount"));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(bank.poll_ready(&mut cx).is_ready());
+    let output = bank
+        .progress_turn(NonZeroUsize::new(7).unwrap())
+        .expect("one real hint reaches slot 500");
+    drop(output);
+    for root in roots {
+        root.business.release();
+        root.owner.complete();
+    }
+    drain(&mut driver);
+}
+
+#[tokio::test]
+async fn coalesced_burst_remains_ready_after_the_notification_is_consumed() {
+    let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
+    let (mut control, _, mut driver) = prototype_profile_with_roles(4, 1, 1, 1, &roles);
+    let mut bank = RolePollBank::install(&mut control, 0, run).unwrap();
+    control.mark_ready().unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(bank.poll_ready(&mut cx).is_pending());
+    for _ in 0..3 {
+        let root = new_root(&control);
+        root.business.release();
+        bank.mount_owned(root.owner, new_input(true))
+            .unwrap_or_else(|_| panic!("original mount"));
+    }
+    // Consume the actual coalesced event and replace its one owned wait frame.
+    // Queue readiness must remain independently visible without another wake.
+    assert!(bank.waiter.as_mut().poll(&mut cx).is_ready());
+    bank.waiter
+        .as_mut()
+        .set(Arc::clone(&bank.changed).notified_owned());
+    for _ in 0..3 {
+        assert!(bank.poll_ready(&mut cx).is_ready());
+        drop(
+            bank.progress_turn(budget())
+                .expect("remaining original queued role"),
+        );
+    }
+    assert!(bank.ready.is_empty());
+    drain(&mut driver);
+}
+
+struct SelfWakeInput {
+    pending_polls: usize,
+    wake_on_ready: bool,
+    order: Arc<Mutex<Vec<WorkId>>>,
+}
+struct SelfWakeRole {
+    owner: Option<WorkOwner>,
+    input: SelfWakeInput,
+}
+fn make_self_wake(owner: WorkOwner, input: SelfWakeInput) -> SelfWakeRole {
+    SelfWakeRole {
+        owner: Some(owner),
+        input,
+    }
+}
+impl Future for SelfWakeRole {
+    type Output = WorkId;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<WorkId> {
+        let work = self.owner.as_ref().unwrap().scope().id();
+        self.input.order.lock().unwrap().push(work);
+        if self.input.pending_polls > 0 {
+            self.input.pending_polls -= 1;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        if self.input.wake_on_ready {
+            cx.waker().wake_by_ref();
+        }
+        self.owner.take().unwrap().complete();
+        Poll::Ready(work)
+    }
+}
+
+#[tokio::test]
+async fn self_wake_requeues_at_the_tail_before_pending_and_preserves_peer_turns() {
+    let roles = [PollRoleGeometry::for_factory(&make_self_wake).unwrap()];
+    let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
+    let mut bank = RolePollBank::install(&mut control, 0, make_self_wake).unwrap();
+    control.mark_ready().unwrap();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let hot = new_root(&control);
+    let peer = new_root(&control);
+    let hot_id = hot.owner.scope().id();
+    let peer_id = peer.owner.scope().id();
+    hot.business.release();
+    peer.business.release();
+    bank.mount_owned(
+        hot.owner,
+        SelfWakeInput {
+            pending_polls: 2,
+            wake_on_ready: false,
+            order: Arc::clone(&order),
+        },
+    )
+    .unwrap_or_else(|_| panic!("original hot mount"));
+    bank.mount_owned(
+        peer.owner,
+        SelfWakeInput {
+            pending_polls: 0,
+            wake_on_ready: false,
+            order: Arc::clone(&order),
+        },
+    )
+    .unwrap_or_else(|_| panic!("original peer mount"));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(bank.progress_turn(budget()).is_none());
+    assert!(bank.poll_ready(&mut cx).is_ready());
+    let PollCompletion::Ready(peer) = bank.progress_turn(budget()).unwrap() else {
+        panic!("peer completion")
+    };
+    assert_eq!(*peer.value(), peer_id);
+    drop(peer);
+    assert_eq!(*order.lock().unwrap(), [hot_id, peer_id]);
+    assert!(bank.progress_turn(budget()).is_none());
+    assert!(bank.poll_ready(&mut cx).is_ready());
+    drop(bank.progress_turn(budget()).unwrap());
+    assert_eq!(*order.lock().unwrap(), [hot_id, peer_id, hot_id, hot_id]);
+    drain(&mut driver);
+}
+
+#[tokio::test]
+async fn queued_completion_wake_keeps_the_original_anchor_retired_until_consumed() {
+    let roles = [PollRoleGeometry::for_factory(&make_self_wake).unwrap()];
+    let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
+    let mut bank = RolePollBank::install(&mut control, 0, make_self_wake).unwrap();
+    control.mark_ready().unwrap();
+    let root = new_root(&control);
+    let observer = root.owner.retirement_observer().unwrap();
+    let slot = control.inner.state.lock().unwrap().nodes[&root.owner.scope().id()].cancellation;
+    root.business.release();
+    bank.mount_owned(
+        root.owner,
+        SelfWakeInput {
+            pending_polls: 0,
+            wake_on_ready: true,
+            order: Arc::new(Mutex::new(Vec::new())),
+        },
+    )
+    .unwrap_or_else(|_| panic!("original mount"));
+    drop(bank.progress_turn(budget()).unwrap());
+    drain(&mut driver);
+    assert_eq!(observer.is_reclaimed(), Ok(false));
+    assert_eq!(
+        control.inner.state.lock().unwrap().cancellations.slots[slot.0].polls[0].phase,
+        PollPhase::Retired
+    );
+    assert!(
+        bank.poll_ready(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+    );
+    assert!(
+        bank.progress_turn(budget()).is_none(),
+        "stale item does not repoll the completed future"
+    );
+    driver.recheck_retired_backing();
+    drain(&mut driver);
+    assert_eq!(observer.is_reclaimed(), Ok(true));
+}
+
+#[tokio::test]
+async fn closed_bank_mount_returns_the_original_owner_and_input_without_queueing() {
+    let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
+    let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
+    let mut bank = RolePollBank::install(&mut control, 0, run).unwrap();
+    control.mark_ready().unwrap();
+    let root = new_root(&control);
+    let work = root.owner.scope().id();
+    let input = new_input(true);
+    let original = Arc::clone(&input.ready);
+    control.close_admission();
+    let rejected = bank
+        .mount_owned(root.owner, input)
+        .err()
+        .expect("closed mount refusal");
+    assert_eq!(rejected.error, WorkError::Closed);
+    assert_eq!(rejected.owner.scope().id(), work);
+    assert!(Arc::ptr_eq(&rejected.input.ready, &original));
+    assert!(bank.ready.is_empty());
+    rejected.owner.complete();
+    root.business.release();
+    drain(&mut driver);
+}
+
+#[tokio::test]
+async fn closed_mount_refusal_never_calls_unrelated_waiter_wakes() {
+    let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
+    let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
+    let mut bank = RolePollBank::install(&mut control, 0, run).unwrap();
+    control.mark_ready().unwrap();
+    let root = new_root(&control);
+    let work = root.owner.scope().id();
+    let slot = control.inner.state.lock().unwrap().nodes[&work].cancellation;
+    control.close_admission();
+    let panic = Arc::new(PanicOnce(AtomicBool::new(true)));
+    let waker = Waker::from(Arc::clone(&panic));
+    let mut cx = Context::from_waker(&waker);
+    assert!(bank.poll_ready(&mut cx).is_pending());
+    let mut progress = Box::pin(control.wait_progress(control.progress_revision()));
+    assert!(progress.as_mut().poll(&mut cx).is_pending());
+    let attempt = catch_unwind(AssertUnwindSafe(|| {
+        bank.mount_owned(root.owner, new_input(true))
+    }));
+    let panicked = attempt.is_err();
+    // Failure cleanup uses the real retained owner if this regression fires.
+    // It does not hide the final assertion or reconstruct authority from an ID.
+    panic.0.store(false, Ordering::Release);
+    drop(progress);
+    let owner = match attempt {
+        Ok(Err(rejected)) => {
+            assert_eq!(rejected.error, WorkError::Closed);
+            assert_eq!(rejected.owner.scope().id(), work);
+            rejected.owner
+        }
+        Err(_) => {
+            bank.positions[slot.0]
+                .input
+                .take()
+                .expect("stranded original owner")
+                .0
+        }
+        Ok(Ok(())) => panic!("closed mount must refuse"),
+    };
+    owner.complete();
+    root.business.release();
+    drain(&mut driver);
+    assert!(
+        !panicked,
+        "an unpublished refusal must return before any notification callback"
+    );
+    assert!(bank.ready.is_empty());
 }
