@@ -52,7 +52,7 @@ fn prototype_full(
     prototype_profile(count, children_per_slot, 1, 1)
 }
 
-fn prototype_profile(
+pub(crate) fn prototype_profile(
     count: usize,
     children_per_slot: usize,
     max_dependencies: usize,
@@ -65,6 +65,7 @@ fn prototype_profile(
     let storage = ControlStorageConfig {
         slots_per_class: [count, 0, 0, 0, 0],
         children_per_slot,
+        proposals_per_slot: 2,
     };
     let base = crate::joint_admission::ledger::control_storage_base(storage).unwrap();
     let metadata = base.get(JointResource::MetadataBytes);
@@ -95,7 +96,7 @@ fn prototype_profile(
         max_dependencies_per_claim: max_dependencies,
         max_registered_dependencies: count,
         max_claims: count * 2,
-        max_requests: count,
+        max_requests: count * 2,
         max_changes_per_request: max_changes,
         max_snapshot_bytes: 16 * 1024 * 1024,
         max_scratch_bytes: 16 * 1024 * 1024,
@@ -337,6 +338,8 @@ fn first_bind_and_physical_growth_install_atomically_with_both_original_owners()
         panic!("physical base grant");
     };
     let physical = batch.new_claims.pop().unwrap();
+    drop(batch);
+    drain(&mut driver);
     let before = snapshot(&control);
     // Both source kinds share exact original claim deduplication.
     let view = work.owner.control_claim_view().unwrap();
@@ -358,6 +361,7 @@ fn first_bind_and_physical_growth_install_atomically_with_both_original_owners()
             .is_err()
     );
     for omit_physical in [true, false] {
+        drain(&mut driver);
         let mut request = handle
             .request(
                 &scope,
@@ -446,6 +450,7 @@ fn control_source_cannot_escape_through_grow_empty_binding_or_reused_slot() {
             vec![dependency.clone()],
         ),
     ] {
+        drain(&mut driver);
         assert!(matches!(
             handle.request(&old_scope, vec![change]),
             Err(crate::joint_admission::JointAdmissionFailure {
@@ -555,6 +560,7 @@ fn control_domain_extension_preserves_the_union_and_invalidates_an_old_child_rec
             )
             .is_err()
     );
+    drain(&mut driver);
     assert!(matches!(
         handle.request(
             &scope,
@@ -696,6 +702,7 @@ fn waiting_pool_proposals_do_not_reserve_a_slot_or_block_a_new_root_binding() {
     binding_receipt(&mut binding)
         .install_control(&parent.owner, &[])
         .unwrap();
+    drain(&mut driver);
     let mut first = handle
         .request_child(&parent.owner, WorkRequest::new(WorkClass::Query))
         .unwrap();
@@ -747,6 +754,7 @@ fn pool_grant_publishes_one_child_with_the_full_parent_domain_and_same_claim() {
     binding_receipt(&mut binding)
         .install_control(&parent.owner, &[])
         .unwrap();
+    drain(&mut driver);
     let before = snapshot(&control);
     let candidate = control.inner.state.lock().unwrap().cancellations.free_heads[0].unwrap();
     let claim = control.inner.state.lock().unwrap().cancellations.slots[candidate.0].claim;
@@ -1720,6 +1728,7 @@ fn storage_fanout_is_finite_configurable_and_charged_from_actual_layout() {
     let narrow = ControlStorageConfig {
         slots_per_class: [4, 0, 0, 0, 0],
         children_per_slot: 1,
+        proposals_per_slot: 2,
     };
     let wider = ControlStorageConfig {
         children_per_slot: 2,
@@ -1736,4 +1745,290 @@ fn storage_fanout_is_finite_configurable_and_charged_from_actual_layout() {
         crate::joint_admission::ledger::control_storage_base(impossible),
         Err(WorkError::InvalidConfig("fixed control storage geometry"))
     ));
+}
+
+#[test]
+fn constructor_cells_are_reserved_before_build_and_reaped_while_the_work_is_live() {
+    let (control, handle, mut driver) = prototype_full(3, 1);
+    let work = root(&control);
+    let scope = work.owner.scope();
+    let first = handle.reserve_proposal(&scope).unwrap();
+    let second = handle.reserve_proposal(&scope).unwrap();
+    assert!(matches!(
+        handle.reserve_proposal(&scope),
+        Err(WorkError::Capacity("fixed proposal and reply cells"))
+    ));
+    let own_slot = slot(&control, scope.id());
+    drop(first);
+    drain(&mut driver);
+    assert!(
+        control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .nodes
+            .contains_key(&scope.id())
+    );
+    let reused = handle.reserve_proposal(&scope).unwrap();
+    {
+        let state = control.inner.state.lock().unwrap();
+        let cells = &state.cancellations.slots[own_slot.0].proposals;
+        assert_eq!(cells[0].generation, 2);
+        assert_eq!(cells[1].generation, 1);
+    }
+    drop((second, reused));
+    work.business.release();
+    work.owner.complete();
+    drain(&mut driver);
+    assert_eq!(snapshot(&control).3, 0);
+}
+
+#[test]
+fn aborted_constructor_keeps_the_original_node_until_its_actual_exit() {
+    let (control, handle, mut driver) = prototype_full(3, 1);
+    let work = root(&control);
+    let scope = work.owner.scope();
+    let building = handle.reserve_proposal(&scope).unwrap();
+    work.business.release();
+    work.owner.complete();
+    drain(&mut driver);
+    assert_eq!(control.inner.state.lock().unwrap().nodes.len(), 1);
+    drop(building);
+    drain(&mut driver);
+    assert_eq!(snapshot(&control).3, 0);
+}
+
+#[test]
+fn withdrawn_request_cannot_reuse_a_body_still_held_by_the_original_driver() {
+    use crate::joint_admission::{JointClaimChange, JointLane};
+    let (control, handle, mut driver) = prototype_full(3, 1);
+    let work = root(&control);
+    let scope = work.owner.scope();
+    let request = || {
+        handle.request(
+            &scope,
+            vec![JointClaimChange::New {
+                dependencies: Vec::new(),
+                lane: JointLane::Custody,
+                amounts: JointResources::ZERO,
+            }],
+        )
+    };
+    let first = request().unwrap();
+    assert_eq!(driver.step(), JointProgress::More); // Original Turn takes the body.
+    drop(first);
+    let second = request().unwrap();
+    assert!(matches!(
+        request(),
+        Err(crate::joint_admission::JointAdmissionFailure {
+            error: WorkError::Capacity("fixed proposal and reply cells")
+        })
+    ));
+    drain(&mut driver);
+    let third = request().unwrap();
+    drop((second, third));
+    work.business.release();
+    work.owner.complete();
+    drain(&mut driver);
+    assert_eq!(snapshot(&control).3, 0);
+}
+
+#[test]
+fn empty_delivered_container_and_its_iterator_retain_the_original_body_fee() {
+    use crate::joint_admission::{JointClaimChange, JointLane};
+    let (control, handle, mut driver) = prototype_full(3, 1);
+    let dependency = selected_dependency(&handle, "reply");
+    let work = root(&control);
+    let mut binding = first_bind(&handle, &work.owner, &dependency);
+    drain(&mut driver);
+    binding_receipt(&mut binding)
+        .install_control(&work.owner, &[])
+        .unwrap();
+    drain(&mut driver);
+    let mut request = handle
+        .request(
+            &work.owner.scope(),
+            vec![JointClaimChange::New {
+                dependencies: vec![dependency.clone()],
+                lane: JointLane::Custody,
+                amounts: JointResources::ZERO.with(JointResource::ClaimRecords, 1),
+            }],
+        )
+        .unwrap();
+    drain(&mut driver);
+    let Poll::Ready(Ok(mut batch)) =
+        std::pin::Pin::new(&mut request).poll(&mut Context::from_waker(Waker::noop()))
+    else {
+        panic!("original reply")
+    };
+    assert!(batch.adjustment.is_none());
+    drop(batch.new_claims.pop().unwrap());
+    work.business.release();
+    work.owner.complete();
+    drain(&mut driver);
+    assert!(
+        control.inner.state.lock().unwrap().nodes.is_empty(),
+        "logical Node has exited"
+    );
+    assert_eq!(snapshot(&control).3, 1, "old bound control fee remains");
+    let mut iter = batch.new_claims.into_iter();
+    assert!(iter.next().is_none());
+    let marker = drain(&mut driver);
+    assert_eq!(snapshot(&control).3, 1, "empty iterator still owns backing");
+    drop(iter);
+    assert_ne!(marker, control.progress_revision());
+    drain(&mut driver);
+    assert_eq!(snapshot(&control).3, 0);
+}
+
+struct WithdrawAndPanicReplyWake {
+    request: Mutex<Option<crate::joint_admission::JointAdmission>>,
+    entered: std::sync::mpsc::SyncSender<()>,
+    resume: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl std::task::Wake for WithdrawAndPanicReplyWake {
+    fn wake(self: Arc<Self>) {
+        drop(self.request.lock().unwrap().take());
+        self.entered.send(()).unwrap();
+        self.resume
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        panic!("intentional reply callback unwind after actual withdrawal");
+    }
+}
+
+#[test]
+fn driver_turn_exit_notifies_after_a_reply_callback_withdraws_and_panics() {
+    use crate::joint_admission::{JointClaimChange, JointLane};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let (control, handle, mut driver) = prototype_full(3, 1);
+    let work = root(&control);
+    let own_slot = slot(&control, work.owner.scope().id());
+    let mut request = handle
+        .request(
+            &work.owner.scope(),
+            vec![JointClaimChange::New {
+                dependencies: Vec::new(),
+                lane: JointLane::Custody,
+                amounts: JointResources::ZERO,
+            }],
+        )
+        .unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let wake = Arc::new(WithdrawAndPanicReplyWake {
+        request: Mutex::new(None),
+        entered: entered_tx,
+        resume: Mutex::new(resume_rx),
+    });
+    let waker = Waker::from(Arc::clone(&wake));
+    assert!(
+        std::pin::Pin::new(&mut request)
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    *wake.request.lock().unwrap() = Some(request);
+    let worker = std::thread::spawn(move || {
+        let panic = catch_unwind(AssertUnwindSafe(|| drain(&mut driver)));
+        assert!(panic.is_err(), "the real reply callback must unwind");
+        driver
+    });
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    work.business.release();
+    work.owner.complete();
+    {
+        let state = control.inner.state.lock().unwrap();
+        assert!(state.nodes.is_empty());
+        assert_eq!(state.cancellations.retired_proposals, 1);
+        assert_eq!(
+            state.cancellations.slots[own_slot.0].phase,
+            SlotPhase::Retired
+        );
+        assert_eq!(
+            Arc::strong_count(&state.cancellations.slots[own_slot.0].proposals[0].body),
+            2,
+            "only the fixed anchor and paused original Turn remain"
+        );
+    }
+    let before_exit = control.progress_revision();
+    resume_tx.send(()).unwrap();
+    let mut driver = worker.join().unwrap();
+    assert_ne!(
+        before_exit,
+        control.progress_revision(),
+        "actual Turn exit must publish a later generation"
+    );
+    drain(&mut driver);
+    assert!(control.inner.state.lock().unwrap().cancellations.drained());
+}
+
+struct PanicOnceProgressWake(std::sync::atomic::AtomicBool);
+impl std::task::Wake for PanicOnceProgressWake {
+    fn wake(self: Arc<Self>) {
+        if self.0.swap(false, Ordering::AcqRel) {
+            panic!("intentional progress wake panic during reply handoff");
+        }
+    }
+}
+
+#[test]
+fn reply_handoff_panic_releases_undelivered_claims_for_new_and_mixed_batches() {
+    use crate::joint_admission::{JointClaimChange, JointLane};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    for mixed in [false, true] {
+        let (control, handle, mut driver) = prototype_profile(3, 1, 1, 2);
+        let dependency = selected_dependency(&handle, "handoff");
+        let work = root(&control);
+        let scope = work.owner.scope();
+        let mut changes = vec![JointClaimChange::New {
+            dependencies: vec![dependency.clone()],
+            lane: JointLane::Custody,
+            amounts: JointResources::ZERO.with(JointResource::ClaimRecords, 1),
+        }];
+        if mixed {
+            changes.push(JointClaimChange::FirstBind {
+                source: work.owner.control_claim_view().unwrap(),
+                dependencies: vec![dependency],
+            });
+        }
+        let mut request = handle.request(&scope, changes).unwrap();
+        drain(&mut driver);
+        let wake = Waker::from(Arc::new(PanicOnceProgressWake(
+            std::sync::atomic::AtomicBool::new(true),
+        )));
+        let mut waiter = Box::pin(control.wait_progress(control.progress_revision()));
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&wake))
+                .is_pending()
+        );
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            std::pin::Pin::new(&mut request).poll(&mut Context::from_waker(Waker::noop()))
+        }));
+        assert!(
+            panic.is_err(),
+            "the actual progress notification must unwind"
+        );
+        drop((waiter, request));
+        let (members, holders, waiters) = {
+            let state = control.inner.state.lock().unwrap();
+            let node = &state.nodes[&scope.id()];
+            (
+                state.joint.as_ref().unwrap().control_snapshot_for_test().1,
+                node.resource_holders,
+                node.resource_waiters,
+            )
+        };
+        assert_eq!(members, 3, "no undelivered physical claim may escape");
+        assert_eq!(holders, 0);
+        assert_eq!(waiters, 0);
+        work.business.release();
+        work.owner.complete();
+        drain(&mut driver);
+        assert!(control.inner.state.lock().unwrap().cancellations.drained());
+    }
 }

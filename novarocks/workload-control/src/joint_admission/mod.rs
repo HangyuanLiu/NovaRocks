@@ -30,6 +30,7 @@ pub use driver::{JointProgress, JointProgressDriver};
 pub use ledger::{
     JointAdjustmentReceipt, JointAdmission, JointAdmissionFailure, JointAdmissionHandle,
     JointClaim, JointClaimChange, JointClaimView, JointDependency, JointGrantedBatch,
+    JointGrantedClaims,
 };
 
 use crate::{WorkClass, WorkError};

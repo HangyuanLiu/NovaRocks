@@ -2197,4 +2197,4 @@ mod tests {
 }
 
 #[cfg(test)]
-mod fixed_control_storage_tests;
+pub(crate) mod fixed_control_storage_tests;

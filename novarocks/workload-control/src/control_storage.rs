@@ -50,6 +50,7 @@ pub(crate) enum SlotPhase {
 
 pub(crate) struct ControlSlot {
     pub(crate) cell: Option<Arc<Cancellation>>,
+    pub(crate) proposals: Vec<crate::joint_admission::ledger::proposal_storage::ProposalCell>,
     pub(crate) class: WorkClass,
     pub(crate) phase: SlotPhase,
     pub(crate) generation: u64,
@@ -64,6 +65,7 @@ pub(crate) struct CancellationStorage {
     pub(crate) slots: Vec<ControlSlot>,
     pub(crate) fixed: bool,
     pub(crate) retired: usize,
+    pub(crate) retired_proposals: usize,
     pub(crate) free_heads: [Option<SlotId>; 5],
     pub(crate) legacy_vacant: Option<SlotId>,
 }
@@ -73,6 +75,7 @@ pub(crate) struct CancellationStorage {
 pub(crate) struct ControlStorageConfig {
     pub(crate) slots_per_class: [usize; 5],
     pub(crate) children_per_slot: usize,
+    pub(crate) proposals_per_slot: usize,
 }
 
 impl ControlStorageConfig {
@@ -93,8 +96,12 @@ impl CancellationStorage {
 
     pub(crate) fn drained(&self) -> bool {
         self.free_inventory_valid()
+            && self.retired_proposals == 0
             && self.slots.iter().all(|slot| {
-                slot.phase
+                slot.proposals.iter().all(|cell| {
+                    cell.phase
+                        == crate::joint_admission::ledger::proposal_storage::ProposalPhase::Free
+                }) && slot.phase
                     == if self.fixed {
                         SlotPhase::Free
                     } else {
@@ -110,8 +117,21 @@ impl CancellationStorage {
     pub(crate) fn free_inventory_valid(&self) -> bool {
         let mut expected = 0usize;
         let mut retired = 0usize;
+        let mut retired_proposals = 0usize;
         for slot in &self.slots {
             if self.fixed {
+                for cell in &slot.proposals {
+                    use crate::joint_admission::ledger::proposal_storage::ProposalPhase;
+                    if matches!(
+                        cell.phase,
+                        ProposalPhase::Retired | ProposalPhase::Resetting
+                    ) {
+                        retired_proposals += 1;
+                    }
+                    if slot.phase == SlotPhase::Free && cell.phase != ProposalPhase::Free {
+                        return false;
+                    }
+                }
                 if slot.phase == SlotPhase::Vacant || slot.cell.is_none() || slot.claim.is_none() {
                     return false;
                 }
@@ -144,7 +164,7 @@ impl CancellationStorage {
                 }
             }
         }
-        if retired != self.retired {
+        if retired != self.retired || retired_proposals != self.retired_proposals {
             return false;
         }
         if self.fixed {
@@ -216,6 +236,7 @@ impl CancellationStorage {
         }
         self.slots.push(ControlSlot {
             cell: Some(cell),
+            proposals: Vec::new(),
             class,
             phase: SlotPhase::Node(id),
             generation: 1,
@@ -406,7 +427,11 @@ impl CancellationStorage {
         id: SlotId,
     ) -> Option<(CancellationReset, Option<SlotId>, u64)> {
         let slot = self.slots.get_mut(id.0)?;
-        if slot.phase != SlotPhase::Retired {
+        if slot.phase != SlotPhase::Retired
+            || slot.proposals.iter().any(|cell| {
+                cell.phase != crate::joint_admission::ledger::proposal_storage::ProposalPhase::Free
+            })
+        {
             return None;
         }
         let cell = Arc::get_mut(slot.cell.as_mut()?)?;

@@ -20,8 +20,8 @@
 
 use super::{
     ledger::{
-        ChangeRecord, ProfileFacts, ProfileKey, ProfileRecord, RequestPhase, fail_request,
-        grant_request, validate_waiting,
+        ProfileFacts, ProfileKey, ProfileRecord, RequestPhase, fail_request, grant_request,
+        validate_waiting,
     },
     protection::{
         CheckError, CoordinateLimit, ExactProfile, Feasibility, ProofInput, ProtectionProof,
@@ -57,6 +57,10 @@ pub struct JointProgressDriver {
     scan_left: usize,
     scan_end: Option<u64>,
     scan_revision: Option<WorkloadProgressRevision>,
+    proposal_cursor: usize,
+    proposal_left: usize,
+    proposal_revision: Option<WorkloadProgressRevision>,
+    proposal_idle: Option<WorkloadProgressRevision>,
     reclaim_cursor: usize,
     reclaim_left: usize,
     reclaim_revision: Option<WorkloadProgressRevision>,
@@ -81,7 +85,7 @@ struct Turn {
     preparation: Preparation,
     id: u64,
     owner: WorkId,
-    changes: Arc<[ChangeRecord]>,
+    changes: super::ledger::proposal_storage::ChangeBody,
     release_epoch: u64,
     layout_revision: u64,
     cursor: Option<Arc<ProfileKey>>,
@@ -94,6 +98,7 @@ struct Turn {
     next_change: usize,
     work: u64,
     work_limit: u64,
+    _exit: crate::scope::ReclaimWakeOnExit,
 }
 impl JointProgressDriver {
     pub(super) fn new(inner: Arc<Inner>, config: Arc<ValidatedJointCapacityConfig>) -> Self {
@@ -105,6 +110,10 @@ impl JointProgressDriver {
             scan_left: 0,
             scan_end: None,
             scan_revision: None,
+            proposal_cursor: 0,
+            proposal_left: 0,
+            proposal_revision: None,
+            proposal_idle: None,
             reclaim_cursor: 0,
             reclaim_left: 0,
             reclaim_revision: None,
@@ -119,13 +128,17 @@ impl JointProgressDriver {
     /// At most one snapshot record or one configured solver budget is processed
     /// per call. Never call repeatedly without yielding the role's executor.
     pub fn step(&mut self) -> JointProgress {
+        let proposal_more = self.reclaim_proposal_one();
         let reclaim_more = self.reclaim_one();
         let proof = self.step_proof();
         if let JointProgress::Idle(marker) = proof {
             let state = self.inner.state.lock().unwrap();
             // A last alias may exit between the reaper's check and proof Idle.
             // Do not swallow that generation by returning the later marker.
-            if reclaim_more
+            if proposal_more
+                || reclaim_more
+                || (state.cancellations.retired_proposals != 0
+                    && self.proposal_idle != Some(marker))
                 || (state.cancellations.fixed
                     && state.cancellations.retired != 0
                     && self.reclaim_idle != Some(marker))
@@ -134,6 +147,56 @@ impl JointProgressDriver {
             }
         }
         proof
+    }
+
+    /// One nested original backing cell per turn, with a finite unchanged pass.
+    fn reclaim_proposal_one(&mut self) -> bool {
+        use super::ledger::proposal_storage::{finish_reap_proposal, prepare_reap_proposal};
+        let prepared = {
+            let mut state = self.inner.state.lock().unwrap();
+            let marker = self.inner.capture_progress(&state);
+            if !state.cancellations.fixed || state.cancellations.retired_proposals == 0 {
+                self.proposal_left = 0;
+                self.proposal_idle = Some(marker);
+                return false;
+            }
+            let per_slot = state.cancellations.slots[0].proposals.len();
+            let count = state.cancellations.slots.len() * per_slot;
+            if self.proposal_left == 0 {
+                if self.proposal_idle == Some(marker) {
+                    return false;
+                }
+                self.proposal_left = count;
+                self.proposal_revision = Some(marker);
+                self.proposal_idle = None;
+            }
+            let flat = self.proposal_cursor % count;
+            self.proposal_cursor = (flat + 1) % count;
+            self.proposal_left -= 1;
+            let slot = SlotId(flat / per_slot);
+            let index = flat % per_slot;
+            prepare_reap_proposal(&mut state.cancellations, slot, index)
+                .map(|(old, generation)| (slot, index, old, generation))
+        };
+        if let Some((slot, index, old, generation)) = prepared {
+            // Destruction precedes Free publication, outside the original mutex.
+            drop(old);
+            {
+                let mut state = self.inner.state.lock().unwrap();
+                finish_reap_proposal(&mut state.cancellations, slot, index, generation);
+                state.advance_progress_revision();
+            }
+            self.proposal_idle = None;
+            self.inner.notify_reclaim_progress();
+            return true;
+        }
+        let state = self.inner.state.lock().unwrap();
+        let marker = self.inner.capture_progress(&state);
+        if self.proposal_left != 0 || self.proposal_revision != Some(marker) {
+            return true;
+        }
+        self.proposal_idle = Some(marker);
+        false
     }
 
     /// One cell at most, alongside the original proof step. A successful leaf
@@ -280,7 +343,7 @@ impl JointProgressDriver {
                         preparation: Preparation::Allocate,
                         id,
                         owner: request.owner,
-                        changes: Arc::clone(&request.changes),
+                        changes: request.changes.clone(),
                         release_epoch: ledger.release_epoch,
                         layout_revision: ledger.profile_layout_revision,
                         cursor: None,
@@ -292,6 +355,9 @@ impl JointProgressDriver {
                         proof: None,
                         next_change: 0,
                         work: u64::from(request.budget.is_finite()),
+                        _exit: crate::scope::ReclaimWakeOnExit::observe(&Arc::downgrade(
+                            &self.inner,
+                        )),
                         work_limit: request
                             .budget
                             .limit(self.config.config.max_total_proof_work),

@@ -21,7 +21,8 @@ use super::*;
 use crate::control_storage::{ControlSlot, ControlStorageConfig};
 
 /// The actual storage envelope used by configuration. This deliberately covers
-/// this substrate only, not actor mailboxes, Provider parsing or complete roles.
+/// this substrate only, not queued body graphs, actor mailboxes, Provider parsing
+/// or complete roles. Proposal body geometry remains a separate prerequisite.
 pub(crate) fn control_storage_base(
     config: ControlStorageConfig,
 ) -> Result<JointResources, WorkError> {
@@ -29,13 +30,22 @@ pub(crate) fn control_storage_base(
         arc_bytes, btree_peak_bytes, resources_for_bytes, storage_cell_bytes,
     };
     let count = config.count()?;
-    if count == 0 || config.children_per_slot > count.saturating_sub(1) {
+    if count == 0
+        || config.proposals_per_slot == 0
+        || config.children_per_slot > count.saturating_sub(1)
+    {
         return Err(WorkError::InvalidConfig("fixed control storage geometry"));
     }
     if !cfg!(any(target_os = "macos", target_os = "linux")) {
         return Err(WorkError::InvalidConfig("fixed control storage platform"));
     }
-    let cell = storage_cell_bytes(config.children_per_slot)?;
+    let proposal_bytes = std::mem::size_of::<proposal_storage::ProposalCell>()
+        .checked_add(arc_bytes::<proposal_storage::ProposalBody>()?)
+        .and_then(|n| n.checked_mul(config.proposals_per_slot))
+        .ok_or(WorkError::ArithmeticOverflow)?;
+    let cell = storage_cell_bytes(config.children_per_slot)?
+        .checked_add(proposal_bytes)
+        .ok_or(WorkError::ArithmeticOverflow)?;
     let facts = arc_bytes::<ProfileFacts>()?
         .checked_add(arc_bytes::<ProfileKey>()?)
         .and_then(|n| n.checked_add(2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()))
@@ -51,6 +61,11 @@ pub(crate) fn control_storage_base(
         btree_peak_bytes::<WorkId, crate::scope::Node>(count)?,
         btree_peak_bytes::<u64, ClaimRecord>(count)?,
         btree_peak_bytes::<Arc<ProfileKey>, ProfileRecord>(count)?,
+        btree_peak_bytes::<u64, RequestRecord>(
+            count
+                .checked_mul(config.proposals_per_slot)
+                .ok_or(WorkError::ArithmeticOverflow)?,
+        )?,
     ] {
         bytes = bytes
             .checked_add(map)
@@ -94,7 +109,12 @@ impl WorkloadControl {
                 return Err(WorkError::Conflict);
             }
             let declared = &ledger.config.config;
-            if declared.max_claims < count {
+            if declared.max_claims < count
+                || declared.max_requests
+                    < count
+                        .checked_mul(config.proposals_per_slot)
+                        .ok_or(WorkError::ArithmeticOverflow)?
+            {
                 return Err(WorkError::InvalidConfig("fixed control claim inventory"));
             }
             let total_scopes = u64::try_from(count).map_err(|_| WorkError::ArithmeticOverflow)?;
@@ -177,8 +197,16 @@ impl WorkloadControl {
                         crate::cancellation::Cancellation::preallocated(config.children_per_slot)?;
                     let claim = state.next_id()?;
                     let id = SlotId(slots.len());
+                    let mut proposals = Vec::new();
+                    proposals
+                        .try_reserve_exact(config.proposals_per_slot)
+                        .map_err(|_| WorkError::Capacity("fixed proposal inventory"))?;
+                    for _ in 0..config.proposals_per_slot {
+                        proposals.push(proposal_storage::ProposalCell::new());
+                    }
                     slots.push(ControlSlot {
                         cell: Some(cell),
+                        proposals,
                         class: classes[class],
                         phase: SlotPhase::Free,
                         generation: 0,
@@ -219,6 +247,7 @@ impl WorkloadControl {
                 slots,
                 fixed: true,
                 retired: 0,
+                retired_proposals: 0,
                 free_heads,
                 legacy_vacant: None,
             };

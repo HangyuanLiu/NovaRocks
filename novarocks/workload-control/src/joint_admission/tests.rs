@@ -118,7 +118,7 @@ fn drive(driver: &mut JointProgressDriver) {
     }
     panic!("joint progression did not become idle");
 }
-fn granted(request: &mut JointAdmission) -> Vec<JointClaim> {
+fn granted(request: &mut JointAdmission) -> JointGrantedClaims {
     match poll(request) {
         Poll::Ready(Ok(batch)) => {
             assert!(batch.adjustment.is_none());
@@ -1964,4 +1964,137 @@ fn finite_pass_cannot_swallow_new_ticket_or_cancellation_before_its_last_skip() 
         drop(granted(&mut delivered_later));
         drop(original);
     }
+}
+
+struct QueueHandoffPanicWake(std::sync::atomic::AtomicBool);
+impl std::task::Wake for QueueHandoffPanicWake {
+    fn wake(self: std::sync::Arc<Self>) {
+        if self.0.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            panic!("intentional progress wake panic during queue handoff");
+        }
+    }
+}
+
+#[test]
+fn queue_handoff_panic_withdraws_the_original_ticket() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    for fixed in [false, true] {
+        let (control, handle, mut driver) = if fixed {
+            crate::scope::fixed_control_storage_tests::prototype_profile(3, 1, 1, 1)
+        } else {
+            control()
+        };
+        let work = control
+            .try_begin_root(WorkRequest::new(if fixed {
+                WorkClass::Query
+            } else {
+                WorkClass::Management
+            }))
+            .unwrap();
+        let scope = work.owner.scope();
+        let changes = vec![JointClaimChange::New {
+            dependencies: Vec::new(),
+            lane: if fixed {
+                JointLane::Custody
+            } else {
+                JointLane::Foreground
+            },
+            amounts: if fixed {
+                JointResources::ZERO
+            } else {
+                bytes(1)
+            },
+        }];
+        let prepared = handle.prepare_request(&scope, &changes).unwrap();
+        let wake = Waker::from(std::sync::Arc::new(QueueHandoffPanicWake(
+            std::sync::atomic::AtomicBool::new(true),
+        )));
+        let mut waiter = Box::pin(control.wait_progress(control.progress_revision()));
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&wake))
+                .is_pending()
+        );
+        assert!(catch_unwind(AssertUnwindSafe(|| handle.queue_request(prepared))).is_err());
+        drop(waiter);
+        let (requests, waiters) = {
+            let state = control.inner.state.lock().unwrap();
+            (
+                state.joint.as_ref().unwrap().requests.len(),
+                state.nodes[&scope.id()].resource_waiters,
+            )
+        };
+        assert_eq!(
+            requests, 0,
+            "unreceived admission must withdraw its original ticket"
+        );
+        assert_eq!(waiters, 0);
+        work.business.release();
+        work.owner.complete();
+        drive(&mut driver);
+        if fixed {
+            assert!(control.inner.state.lock().unwrap().cancellations.drained());
+        }
+    }
+}
+
+#[test]
+fn reply_handoff_panic_preserves_an_existing_physical_claim() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let (control, handle, mut driver) = control();
+    let work = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let scope = work.owner.scope();
+    let mut initial = request(&handle, &scope, &[], JointLane::Foreground, 1);
+    drive(&mut driver);
+    let original = granted(&mut initial).pop().unwrap();
+    let mut mixed = handle
+        .request(
+            &scope,
+            vec![
+                JointClaimChange::New {
+                    dependencies: Vec::new(),
+                    lane: JointLane::Foreground,
+                    amounts: bytes(1),
+                },
+                JointClaimChange::grow_by(original.view().unwrap(), bytes(1), Vec::new()),
+            ],
+        )
+        .unwrap();
+    drive(&mut driver);
+    let wake = Waker::from(std::sync::Arc::new(QueueHandoffPanicWake(
+        std::sync::atomic::AtomicBool::new(true),
+    )));
+    let mut waiter = Box::pin(control.wait_progress(control.progress_revision()));
+    assert!(
+        waiter
+            .as_mut()
+            .poll(&mut Context::from_waker(&wake))
+            .is_pending()
+    );
+    assert!(catch_unwind(AssertUnwindSafe(|| poll(&mut mixed))).is_err());
+    drop((waiter, mixed));
+    assert_eq!(
+        original.amounts().unwrap(),
+        bytes(1),
+        "the delivered original remains installed without the withdrawn delta"
+    );
+    let (claims, requests, holders, waiters) = {
+        let state = control.inner.state.lock().unwrap();
+        let ledger = state.joint.as_ref().unwrap();
+        let node = &state.nodes[&scope.id()];
+        (
+            ledger.claims.len(),
+            ledger.requests.len(),
+            node.resource_holders,
+            node.resource_waiters,
+        )
+    };
+    assert_eq!((claims, requests, holders, waiters), (1, 0, 1, 0));
+    drop(original);
+    work.business.release();
+    work.owner.complete();
+    drive(&mut driver);
 }
