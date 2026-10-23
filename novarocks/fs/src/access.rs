@@ -2368,7 +2368,8 @@ fn build_object_store_operator(
         .bucket(&endpoint.bucket)
         .region(&endpoint.region)
         .skip_signature()
-        .disable_config_load();
+        .disable_config_load()
+        .disable_ec2_metadata();
     if !endpoint.use_path_style {
         builder = builder.enable_virtual_host_style();
     }
@@ -2979,9 +2980,21 @@ fn parse_hdfs_path(raw: &str) -> FileResult<HdfsPath> {
             "hdfs path points to namenode root and cannot be used as file path",
         ));
     }
+    let user = if url.username().is_empty() {
+        None
+    } else {
+        Some(
+            percent_encoding::percent_decode_str(url.username())
+                .decode_utf8()
+                .map_err(|error| {
+                    FileError::with_source(FileErrorKind::Invalid, "decode HDFS user", error)
+                })?
+                .into_owned(),
+        )
+    };
     Ok(HdfsPath {
         name_node: format!("hdfs://{authority}"),
-        user: (!url.username().is_empty()).then(|| url.username().to_string()),
+        user,
         relative_path,
     })
 }
@@ -2999,15 +3012,7 @@ fn build_hdfs_operator(name_node: &str, user: Option<&str>) -> FileResult<Operat
     {
         return Ok(operator);
     }
-    let mut url = Url::parse(name_node)
-        .map_err(|error| FileError::with_source(FileErrorKind::Invalid, "parse namenode", error))?;
-    if let Some(user) = user {
-        url.set_username(user)
-            .map_err(|_| FileError::invalid("invalid hdfs user"))?;
-    }
-    let builder = opendal::services::HdfsNative::default()
-        .name_node(url.as_str().trim_end_matches('/'))
-        .root("/");
+    let builder = crate::hdfs_service::HdfsServiceBuilder::new(name_node, user);
     let operator = Operator::new(builder)
         .map_err(|error| map_opendal_error("initialize hdfs operator", error))?;
     hdfs_operator_cache()
@@ -3322,19 +3327,18 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
-    impl<A: Access> Layer<A> for ConditionalCompletion {
-        type LayeredAccess = ConditionalCompletionAccess<A>;
-        fn layer(&self, inner: A) -> Self::LayeredAccess {
-            ConditionalCompletionAccess {
+    impl Layer for ConditionalCompletion {
+        fn apply_service(&self, inner: Servicer) -> Servicer {
+            Arc::new(ConditionalCompletionAccess {
                 inner,
                 completion: self.clone(),
-            }
+            })
         }
     }
 
     #[derive(Debug)]
-    struct ConditionalCompletionAccess<A> {
-        inner: A,
+    struct ConditionalCompletionAccess {
+        inner: Servicer,
         completion: ConditionalCompletion,
     }
 
@@ -3367,48 +3371,107 @@ mod tests {
         }
     }
 
-    impl<A: Access> LayeredAccess for ConditionalCompletionAccess<A> {
-        type Inner = A;
-        type Reader = A::Reader;
-        type Writer = ConditionalCompletionWriter<A::Writer>;
-        type Lister = A::Lister;
-        type Deleter = A::Deleter;
-        fn inner(&self) -> &A {
-            &self.inner
+    impl Service for ConditionalCompletionAccess {
+        type Reader = oio::Reader;
+        type Writer = ConditionalCompletionWriter<oio::Writer>;
+        type Lister = oio::Lister;
+        type Deleter = oio::Deleter;
+        type Copier = oio::Copier;
+
+        fn info(&self) -> ServiceInfo {
+            self.inner.info()
         }
-        fn info(&self) -> Arc<opendal::raw::AccessorInfo> {
-            let info = self.inner.info();
+
+        fn capability(&self) -> opendal::Capability {
             // This layer models a condition-capable store's terminal ACK/error.
-            info.update_full_capability(|mut capability| {
-                capability.write_with_if_not_exists = true;
-                capability
-            });
-            info
+            let mut capability = self.inner.capability();
+            capability.write_with_if_not_exists = true;
+            capability
         }
-        async fn read(&self, path: &str, args: OpRead) -> opendal::Result<(RpRead, Self::Reader)> {
-            self.inner.read(path, args).await
-        }
-        async fn write(
+
+        async fn create_dir(
             &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpCreateDir,
+        ) -> opendal::Result<RpCreateDir> {
+            self.inner.create_dir(ctx, path, args).await
+        }
+
+        async fn stat(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpStat,
+        ) -> opendal::Result<RpStat> {
+            self.inner.stat(ctx, path, args).await
+        }
+
+        fn read(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpRead,
+        ) -> opendal::Result<Self::Reader> {
+            self.inner.read(ctx, path, args)
+        }
+
+        fn write(
+            &self,
+            ctx: &OperationContext,
             path: &str,
             args: OpWrite,
-        ) -> opendal::Result<(RpWrite, Self::Writer)> {
+        ) -> opendal::Result<Self::Writer> {
             assert!(args.if_not_exists());
-            self.inner.write(path, args).await.map(|(reply, inner)| {
-                (
-                    reply,
-                    ConditionalCompletionWriter {
-                        inner,
-                        completion: self.completion.clone(),
-                    },
-                )
-            })
+            self.inner
+                .write(ctx, path, args)
+                .map(|inner| ConditionalCompletionWriter {
+                    inner,
+                    completion: self.completion.clone(),
+                })
         }
-        async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
-            self.inner.delete().await
+
+        fn delete(&self, ctx: &OperationContext) -> opendal::Result<Self::Deleter> {
+            self.inner.delete(ctx)
         }
-        async fn list(&self, path: &str, args: OpList) -> opendal::Result<(RpList, Self::Lister)> {
-            self.inner.list(path, args).await
+
+        fn list(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpList,
+        ) -> opendal::Result<Self::Lister> {
+            self.inner.list(ctx, path, args)
+        }
+
+        fn copy(
+            &self,
+            ctx: &OperationContext,
+            from: &str,
+            to: &str,
+            args: OpCopy,
+            opts: OpCopier,
+        ) -> opendal::Result<Self::Copier> {
+            self.inner.copy(ctx, from, to, args, opts)
+        }
+
+        async fn rename(
+            &self,
+            ctx: &OperationContext,
+            from: &str,
+            to: &str,
+            args: OpRename,
+        ) -> opendal::Result<RpRename> {
+            self.inner.rename(ctx, from, to, args).await
+        }
+
+        async fn presign(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpPresign,
+        ) -> opendal::Result<RpPresign> {
+            self.inner.presign(ctx, path, args).await
         }
     }
 
@@ -5535,5 +5598,75 @@ mod tests {
             assert_eq!((fact.reason().domain(), fact.reason().code()), (4, code));
             assert_eq!(authority.metrics().blocking_waits, 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod hdfs_user_tests {
+    use super::*;
+
+    #[test]
+    fn decoded_user_is_the_exact_comparison_and_cache_identity() {
+        let a = parse_hdfs_path("hdfs://%61lice@warehouse-ha/data/a").unwrap();
+        let b = parse_hdfs_path("hdfs://alice@warehouse-ha/data/b").unwrap();
+        assert_eq!(a.name_node, "hdfs://warehouse-ha");
+        assert_eq!(a.user.as_deref(), Some("alice"));
+        assert_eq!(a.user, b.user);
+        assert_eq!(
+            parse_hdfs_path("hdfs://%2561lice@warehouse-ha/file")
+                .unwrap()
+                .user
+                .as_deref(),
+            Some("%61lice")
+        );
+        assert_eq!(
+            HdfsOperatorKey {
+                name_node: a.name_node,
+                user: a.user
+            },
+            HdfsOperatorKey {
+                name_node: b.name_node,
+                user: b.user
+            },
+        );
+        assert_eq!(
+            parse_hdfs_path("hdfs://%C3%A9@nn:8020/file")
+                .unwrap()
+                .user
+                .as_deref(),
+            Some("é")
+        );
+        for (encoded, expected) in [
+            ("alice%3Ateam", "alice:team"),
+            ("alice%40realm", "alice@realm"),
+        ] {
+            let parsed = parse_hdfs_path(&format!("hdfs://{encoded}@nn:8020/file")).unwrap();
+            assert_eq!(parsed.name_node, "hdfs://nn:8020");
+            assert_eq!(parsed.user.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn invalid_user_utf8_and_original_forbidden_uri_components_fail_before_build() {
+        for raw in [
+            "hdfs://%FF@nn:8020/file",
+            "hdfs://alice:password@nn:8020/file",
+            "hdfs://alice@nn:8020/file?query",
+            "hdfs://alice@nn:8020/file#fragment",
+        ] {
+            let Err(error) = parse_hdfs_path(raw) else {
+                panic!("invalid HDFS URI was accepted")
+            };
+            assert_eq!(error.kind(), FileErrorKind::Invalid);
+        }
+        let locations = vec![
+            FsLocation::parse("hdfs://alice@nn:8020/a").unwrap(),
+            FsLocation::parse("hdfs://bob@nn:8020/b").unwrap(),
+        ];
+        let result = resolve_hdfs_locations(StorageAccessDomainId::from_bytes([0; 32]), locations);
+        let Err(error) = result else {
+            panic!("mixed effective users were accepted")
+        };
+        assert_eq!(error.kind(), FileErrorKind::Invalid);
     }
 }

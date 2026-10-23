@@ -1780,9 +1780,7 @@ mod tests {
         // The low-level exact-delete entry is equally protected, without LIST.
         executor.block_on(async {
             let operator =
-                crate::opendal::Operator::new(crate::opendal::services::Memory::default())
-                    .unwrap()
-                    .finish();
+                crate::opendal::Operator::new(crate::opendal::services::Memory::default()).unwrap();
             operator
                 .write("other/metadata/v1.metadata.json", "retained")
                 .await

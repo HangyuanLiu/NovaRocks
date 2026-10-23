@@ -37,10 +37,13 @@ bytes.workspace = true
 crc32c.workspace = true
 futures.workspace = true
 http.workspace = true
+hdfs-native = "=0.14.6"
 http-body = "1"
 libc.workspace = true
-opendal = { workspace = true, features = ["services-fs", "services-s3", "services-hdfs-native", "services-memory", "executors-tokio", "layers-concurrent-limit", "layers-retry", "layers-timeout"] }
+opendal = { workspace = true, features = ["services-fs", "services-s3", "services-memory", "executors-tokio", "layers-concurrent-limit", "layers-retry", "layers-timeout"] }
 orc-rust = { version = "0.8.0", default-features = false }
+percent-encoding = "=2.3.2"
+serde = { workspace = true, features = ["derive"] }
 parquet = { workspace = true, features = ["arrow", "variant_experimental"] }
 # Provider-owned S3 signing uses this registry implementation directly;
 # StorageAuthority remains the only judge of credential validity.

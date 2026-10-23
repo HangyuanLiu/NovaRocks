@@ -4038,6 +4038,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "futures",
+ "hdfs-native",
  "http",
  "http-body",
  "libc",
@@ -4048,8 +4049,10 @@ dependencies = [
  "opendal",
  "orc-rust",
  "parquet",
+ "percent-encoding",
  "reqsign",
  "reqwest",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -5063,7 +5066,6 @@ dependencies = [
  "opendal-layer-retry",
  "opendal-layer-timeout",
  "opendal-service-fs",
- "opendal-service-hdfs-native",
  "opendal-service-s3",
 ]
 
@@ -5138,20 +5140,6 @@ dependencies = [
  "serde",
  "tokio",
  "xattr",
-]
-
-[[package]]
-name = "opendal-service-hdfs-native"
-version = "0.58.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdeb0c6fd99ffe3acf9c58f9664842ea549e4fd984c8202a5e656d18de46dae4"
-dependencies = [
- "bytes",
- "futures",
- "hdfs-native",
- "log",
- "opendal-core",
- "serde",
 ]
 
 [[package]]

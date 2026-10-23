@@ -36,6 +36,7 @@ mod access;
 mod cache;
 mod catalog_properties;
 mod error;
+mod hdfs_service;
 mod http_transport;
 mod list_body_limit;
 

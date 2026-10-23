@@ -254,6 +254,9 @@ impl<T> S3SigningTransport<T> {
 }
 impl<T: HttpTransport> HttpTransport for S3SigningTransport<T> {
     async fn fetch(&self, mut request: Request<Buffer>) -> opendal::Result<Response<HttpBody>> {
+        // Redirects cannot acquire a different object, version or subresource
+        // using the original handle's permission.
+        let frozen_target = request.uri().path_and_query().cloned();
         for redirects in 0..=MAX_REDIRECTS {
             let selected = self.signer.selected_request(request.uri())?;
             self.signer.sign_header(&mut request).await?;
@@ -314,6 +317,11 @@ impl<T: HttpTransport> HttpTransport for S3SigningTransport<T> {
                 .as_str()
                 .parse()
                 .map_err(|error| invalid("invalid S3 redirect request URI").set_source(error))?;
+            if replay.uri().path_and_query() != frozen_target.as_ref() {
+                return Err(Error::new(ErrorKind::Unsupported,
+                    "S3 redirect changes the frozen object target; scoped target authorization is required")
+                    .set_permanent());
+            }
             clear_signing_headers(replay.headers_mut());
             // Exit the actual response stream before issuing its replacement.
             // This does not manufacture a physical-exit receipt or a grant.
@@ -459,6 +467,7 @@ mod tests {
     struct CapturedHttp {
         requests: Arc<Mutex<Vec<(Uri, http::HeaderMap)>>>,
         replies: Arc<Mutex<VecDeque<(StatusCode, Option<&'static str>)>>>,
+        rotate_on_redirect: Arc<Mutex<Option<Arc<StorageAuthority>>>>,
     }
     impl HttpTransport for CapturedHttp {
         async fn fetch(&self, request: Request<Buffer>) -> opendal::Result<Response<HttpBody>> {
@@ -472,6 +481,12 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or((StatusCode::OK, None));
+            if status == StatusCode::TEMPORARY_REDIRECT {
+                let rotate = self.rotate_on_redirect.lock().unwrap().take();
+                if let Some(authority) = rotate {
+                    install(&authority, "redirect-next");
+                }
+            }
             let mut response = Response::new(HttpBody::new(
                 futures::stream::empty::<opendal::Result<Buffer>>(),
                 Some(0),
@@ -536,7 +551,8 @@ mod tests {
             .endpoint(&endpoint.endpoint)
             .region(&endpoint.region)
             .skip_signature()
-            .disable_config_load();
+            .disable_config_load()
+            .disable_ec2_metadata();
         if !endpoint.use_path_style {
             builder = builder.enable_virtual_host_style();
         }
@@ -616,13 +632,16 @@ mod tests {
         }
     }
     fn authority() -> Arc<StorageAuthority> {
+        authority_for_scope("s3://one/")
+    }
+    fn authority_for_scope(scope: &str) -> Arc<StorageAuthority> {
         Arc::new(StorageAuthority::new(
             StorageAuthorityId::new(
                 CatalogHandle::new(
                     ConnectorInstanceId::parse("lake").unwrap(),
                     CatalogVersion::from_bytes([0x11; 32]),
                 ),
-                StorageCredentialScopePrefix::try_from_normalized("s3://one/").unwrap(),
+                StorageCredentialScopePrefix::try_from_normalized(scope).unwrap(),
                 AuthorityCapabilityPath::SeededWithoutRenewal { grant: None },
             ),
             Arc::new(NeverAcquires),
@@ -717,12 +736,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_sdk_same_origin_redirect_is_resigned_and_foreign_origin_is_not_dispatched() {
+    async fn real_sdk_redirect_requires_the_original_object_target_before_resigning() {
         for (location, allowed, expected_calls) in [
-            ("/one/redirected", true, 2),
-            ("https://foreign.example.test/one/redirected", false, 1),
+            ("/one/allowed/original", true, 2),
+            ("/other-bucket/allowed/original", false, 1),
+            ("/one/outside/original", false, 1),
+            ("/one/allowed/another-object", false, 1),
+            ("/one/allowed/original?versionId=other", false, 1),
+            (
+                "https://foreign.example.test/one/allowed/original",
+                false,
+                1,
+            ),
         ] {
-            let authority = authority();
+            let authority = authority_for_scope("s3://one/allowed/");
             install(&authority, "redirect");
             let capture = CapturedHttp::default();
             capture
@@ -730,13 +757,17 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push_back((StatusCode::TEMPORARY_REDIRECT, Some(location)));
+            *capture.rotate_on_redirect.lock().unwrap() = Some(Arc::clone(&authority));
             let (operator, _) = sdk_operator(
                 &endpoint("one", "https://objects.example.test", true),
                 &ObjectStoreCredentialSource::Authority(Arc::clone(&authority)),
                 capture.clone(),
             );
-            let result = operator.stat("original").await;
+            let result = operator.stat("allowed/original").await;
             assert_eq!(result.is_ok(), allowed);
+            if !allowed {
+                assert_eq!(result.unwrap_err().kind(), ErrorKind::Unsupported);
+            }
             let requests = capture.requests.lock().unwrap();
             assert_eq!(requests.len(), expected_calls);
             assert!(
@@ -745,17 +776,33 @@ mod tests {
                     .all(|(_, headers)| headers.contains_key(header::AUTHORIZATION))
             );
             if allowed {
-                assert_ne!(requests[0].0.path(), requests[1].0.path());
+                assert_eq!(
+                    requests[0].0.path_and_query(),
+                    requests[1].0.path_and_query()
+                );
+                assert!(
+                    requests[0].1[header::AUTHORIZATION]
+                        .to_str()
+                        .unwrap()
+                        .contains("Credential=access-redirect/")
+                );
+                assert!(
+                    requests[1].1[header::AUTHORIZATION]
+                        .to_str()
+                        .unwrap()
+                        .contains("Credential=access-redirect-next/")
+                );
+                assert_eq!(requests[1].1["x-amz-security-token"], "token-redirect-next");
                 assert_ne!(
                     requests[0].1[header::AUTHORIZATION],
                     requests[1].1[header::AUTHORIZATION],
-                    "the new SDK path is signed again, not forwarded with the old signature"
+                    "the same authorized target is freshly signed with the authority's new material"
                 );
             }
             assert_eq!(
                 authority.metrics().cache_hits,
                 expected_calls as u64,
-                "only an allowed actual signing attempt reads authority material"
+                "a changed bucket, scope, object or query must not trigger a new sign"
             );
         }
     }
