@@ -2124,3 +2124,142 @@ fn checked_coordinate_author_has_no_hidden_growth_and_refuses_extra_projections(
         Err(WorkError::Conflict)
     ));
 }
+
+#[test]
+fn shared_class_lane_keeps_bad_domain_out_of_healthy_and_settlement_progress() {
+    // Four classes use one four-position physical budget, split into two
+    // foreground and two settlement positions. Class quotas do not create
+    // sixteen physical positions. This exercises the real ledger/proof driver;
+    // it does not qualify a Native CPU executor or its physical handoff.
+    let units = |n| JointResources::ZERO.with(JointResource::InternalCpuJobs, n);
+    let cap = |global, dependency, progress| JointResourceLimits {
+        global: units(global),
+        per_dependency: units(dependency),
+        protected_progress: units(progress),
+    };
+    let (mut config, mut required) = profile();
+    config.max_dependencies_per_claim = 1;
+    config.global = cap(4, 2, 2);
+    config.classes = [JointResourceLimits::default(); CLASS_COUNT];
+    config.class_lanes = [[JointResourceLimits::default(); LANE_COUNT]; CLASS_COUNT];
+    config.lanes = [JointResourceLimits::default(), cap(2, 1, 1), cap(2, 1, 1)];
+    required.global = units(2);
+    required.classes = [JointResources::ZERO; CLASS_COUNT];
+    required.lanes = [JointResources::ZERO, units(1), units(1)];
+    required.class_lanes = [[JointResources::ZERO; LANE_COUNT]; CLASS_COUNT];
+    for class in 0..4 {
+        config.classes[class] = cap(4, 2, 2);
+        required.classes[class] = units(2);
+        for lane in [
+            JointLane::Foreground as usize,
+            JointLane::Settlement as usize,
+        ] {
+            config.class_lanes[class][lane] = cap(2, 1, 1);
+            required.class_lanes[class][lane] = units(1);
+        }
+    }
+    // Sharing classes cannot borrow the other lane's actual reservation, or
+    // decompose a complete two-job action into a one-job progress declaration.
+    let mut bad = config.clone();
+    bad.lanes[JointLane::Foreground as usize].global = units(1);
+    assert!(bad.validate(&required).is_err());
+    let mut needs_two = required.clone();
+    needs_two.class_lanes[0][JointLane::Foreground as usize] = units(2);
+    assert!(config.clone().validate(&needs_two).is_err());
+    let control = WorkloadControl::try_new_counted(WorkloadConfig::default())
+        .unwrap()
+        .owner;
+    let (handle, mut driver) = control
+        .configure_joint_capacity(config.validate(&required).unwrap())
+        .unwrap();
+    control.mark_ready().unwrap();
+    let classes = [
+        WorkClass::Query,
+        WorkClass::MaterializedView,
+        WorkClass::Statistics,
+        WorkClass::TableMaintenance,
+    ];
+    let roots: Vec<_> = classes
+        .into_iter()
+        .map(|class| control.try_begin_root(WorkRequest::new(class)).unwrap())
+        .collect();
+    let a = dependency(&handle, "shared-class-bad");
+    let b = dependency(&handle, "shared-class-healthy");
+    let issue = |scope: &WorkScope, dep: &JointDependency, lane| {
+        handle
+            .request(
+                scope,
+                vec![JointClaimChange::New {
+                    dependencies: vec![dep.clone()],
+                    lane,
+                    amounts: units(1),
+                }],
+            )
+            .unwrap()
+    };
+    let mut a_foreground = issue(&roots[0].owner.scope(), &a, JointLane::Foreground);
+    let mut a_settlement = issue(&roots[0].owner.scope(), &a, JointLane::Settlement);
+    drive(&mut driver);
+    let held_a = (granted(&mut a_foreground), granted(&mut a_settlement));
+    // This blocked request precedes all healthy work and never releases A.
+    let mut blocked = issue(&roots[1].owner.scope(), &a, JointLane::Foreground);
+    let mut healthy: Vec<_> = roots
+        .iter()
+        .map(|root| Some(issue(&root.owner.scope(), &b, JointLane::Foreground)))
+        .collect();
+    let mut settlement = issue(&roots[0].owner.scope(), &b, JointLane::Settlement);
+    drive(&mut driver);
+    let held_settlement = granted(&mut settlement);
+    let mut completed = [false; 4];
+    for _ in 0..4 {
+        drive(&mut driver);
+        assert!(
+            poll(&mut blocked).is_pending(),
+            "bad domain consumed its protected remainder"
+        );
+        let selected = healthy
+            .iter_mut()
+            .enumerate()
+            .find_map(|(class, request)| {
+                let request = request.as_mut()?;
+                match poll(request) {
+                    Poll::Pending => None,
+                    Poll::Ready(Ok(batch)) => Some((class, batch)),
+                    Poll::Ready(Err(error)) => panic!("healthy class was refused: {error:?}"),
+                }
+            })
+            .expect("a healthy class must progress past the blocked head");
+        let (class, batch) = selected;
+        assert!(batch.adjustment.is_none());
+        assert!(!completed[class]);
+        completed[class] = true;
+        healthy[class].take();
+        {
+            let state = control.inner.state.lock().unwrap();
+            let records = &state.joint.as_ref().unwrap().claims;
+            let usage = |lane| {
+                records
+                    .values()
+                    .filter(|claim| claim.facts.lane == lane)
+                    .map(|claim| claim.amounts.get(JointResource::InternalCpuJobs))
+                    .sum::<u64>()
+            };
+            assert_eq!(usage(JointLane::Foreground), 2);
+            assert_eq!(usage(JointLane::Settlement), 2);
+            assert_eq!(
+                records
+                    .values()
+                    .map(|claim| claim.amounts.get(JointResource::InternalCpuJobs))
+                    .sum::<u64>(),
+                4
+            );
+        }
+        // Finite healthy work returns the shared position; another original
+        // class ticket progresses without freeing either bad-domain action.
+        drop(batch);
+    }
+    assert!(completed.into_iter().all(|done| done));
+    drop((held_a, held_settlement));
+    drive(&mut driver);
+    drop(granted(&mut blocked));
+}

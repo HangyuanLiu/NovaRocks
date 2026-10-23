@@ -1563,3 +1563,63 @@ async fn exporting_a_weak_ingress_permanently_refuses_same_authority_reinstallat
         1
     );
 }
+
+#[tokio::test]
+async fn stopped_bank_observes_its_sources_without_waiting_for_delivered_footer() {
+    let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
+    let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
+    let mut bank = RolePollBank::install(&mut control, 0, run).unwrap();
+    let retired = bank.retirement_observer();
+    let ingress = bank.ingress().unwrap();
+    control.mark_ready().unwrap();
+    let root = new_root(&control);
+    root.business.release();
+    let pending = new_input(false);
+    let ready = Arc::clone(&pending.ready);
+    let saved_waker = Arc::clone(&pending.wake);
+    let mut owner = Some(root.owner);
+    let mut input = Some(pending);
+    ingress
+        .try_mount_in(&mut owner, &mut input)
+        .finish()
+        .unwrap();
+
+    assert_eq!(
+        bank.has_owned_sources_after_stop(),
+        Err(WorkError::NotReady)
+    );
+    bank.stop_ingress();
+    assert_eq!(
+        bank.has_owned_sources_after_stop(),
+        Ok(true),
+        "queued original input"
+    );
+    assert!(bank.progress_turn(budget()).is_none());
+    assert_eq!(
+        bank.has_owned_sources_after_stop(),
+        Ok(true),
+        "original pending frame"
+    );
+    ready.store(true, Ordering::Release);
+    saved_waker.lock().unwrap().take().unwrap().wake();
+    let PollCompletion::Ready(output) = bank.progress_turn(budget()).unwrap() else {
+        panic!("original frame must finish");
+    };
+    assert_eq!(*output.value(), 7);
+    assert_eq!(
+        bank.has_owned_sources_after_stop(),
+        Ok(false),
+        "external output owns its original footer, not a bank-owned source"
+    );
+    drop(bank);
+    drain(&mut driver);
+    assert_eq!(
+        retired.is_reclaimed(),
+        Ok(false),
+        "output is still held by receiver"
+    );
+    drop(output);
+    driver.recheck_retired_backing();
+    drain(&mut driver);
+    assert_eq!(retired.is_reclaimed(), Ok(true));
+}

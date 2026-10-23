@@ -639,6 +639,9 @@ pub fn frontend_lane_connector(
     admitted_connector_service(connector, Some(admission), NativeDial::Frontend(lane))
 }
 
+mod reserved_call;
+pub use reserved_call::{ReservedNativeCall, SelectedNativeCall};
+
 #[cfg(test)]
 #[path = "native_lane_tests.rs"]
 mod tests;

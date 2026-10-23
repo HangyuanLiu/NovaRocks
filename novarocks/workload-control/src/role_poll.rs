@@ -404,6 +404,34 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F> RolePollBank<I, F, M> {
         self.shared.stop();
     }
 
+    /// Observes only sources still owned by this bank after its ingress cut.
+    /// This excludes PollOutput packets already handed to a receiving owner,
+    /// stale Wakers, sender tails and the root task itself. It is not a reclaim
+    /// proof; join the root and observe retirement separately. A frame's empty
+    /// prepaid Box is retained storage, not a live source.
+    pub fn has_owned_sources_after_stop(&self) -> Result<bool, WorkError> {
+        // Keep the original publication/take lock order. No user destructor,
+        // future poll or notification executes under either metadata lock.
+        let state = self.inner.state.lock().unwrap();
+        if state.cancellations.slots.iter().any(|slot| {
+            let role = &slot.polls[self.role];
+            role.registration_generation != self.shared.generation
+                || role.registration != RegistrationPhase::Stopping
+        }) {
+            return Err(WorkError::NotReady);
+        }
+        let inputs = self.shared.inputs.lock().unwrap();
+        Ok(inputs.iter().any(Option::is_some)
+            || self.positions.iter().any(|position| {
+                position.footer.is_some()
+                    || position.output.is_some()
+                    || position
+                        .frame
+                        .as_ref()
+                        .is_some_and(|frame| frame.as_ref().get_ref().is_some())
+            }))
+    }
+
     /// Level-triggered readiness. Register before reading the real queue;
     /// a consumed Notify permit never stands in for the queue's contents.
     pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<()> {

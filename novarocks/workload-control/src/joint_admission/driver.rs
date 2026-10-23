@@ -329,7 +329,7 @@ impl JointProgressDriver {
     /// The role service's prepaid timer requests a new finite pass after silent
     /// Arc/Waker exits. This changes only the driver's cache, never source facts
     /// or revision. The production timer/source profile is composed separately.
-    pub(crate) fn recheck_retired_backing(&mut self) {
+    pub fn recheck_retired_backing(&mut self) {
         self.reclaim_idle = None;
         self.reclaim_left = 0;
     }

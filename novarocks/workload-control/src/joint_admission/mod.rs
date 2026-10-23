@@ -89,6 +89,12 @@ impl JointResources {
         Ok(result)
     }
 
+    fn component_max(self, other: Self) -> Self {
+        Self(std::array::from_fn(|index| {
+            self.0[index].max(other.0[index])
+        }))
+    }
+
     fn checked_sub(self, other: Self) -> Result<Self, WorkError> {
         let mut result = Self::ZERO;
         for index in 0..RESOURCE_COUNT {
@@ -151,7 +157,8 @@ pub struct JointCapacityConfig {
     pub global: JointResourceLimits,
     pub classes: [JointResourceLimits; CLASS_COUNT],
     pub lanes: [JointResourceLimits; LANE_COUNT],
-    /// Static physical reservations also constrain each class/lane intersection.
+    /// Class quotas share the original lane pool. They are simultaneous upper
+    /// bounds, not independently reserved copies of that physical pool.
     pub class_lanes: [[JointResourceLimits; LANE_COUNT]; CLASS_COUNT],
     pub max_dependencies_per_claim: usize,
     pub max_registered_dependencies: usize,
@@ -252,13 +259,14 @@ impl JointCapacityConfig {
             let mut dependency = JointResources::ZERO;
             let mut progress = JointResources::ZERO;
             for class in 0..CLASS_COUNT {
-                global = global.checked_add(self.class_lanes[class][lane].global)?;
-                progress =
-                    progress.checked_add(self.class_lanes[class][lane].protected_progress)?;
-                dependency =
-                    dependency.checked_add(self.class_lanes[class][lane].per_dependency)?;
+                // Alternative classes share this actual lane. Reserve a
+                // complete supported action from any class; a single action's
+                // own concurrent jobs must already be in its full vector.
+                global = global.component_max(self.class_lanes[class][lane].global);
+                progress = progress.component_max(self.class_lanes[class][lane].protected_progress);
+                dependency = dependency.component_max(self.class_lanes[class][lane].per_dependency);
             }
-            if self.lanes[lane].protected_progress != progress
+            if !self.lanes[lane].protected_progress.covers(progress)
                 || !self.lanes[lane].global.covers(global)
                 || !self.lanes[lane].per_dependency.covers(dependency)
             {

@@ -1354,31 +1354,6 @@ impl FrontendApplicationHost {
             execution.query_cpu_executor_config,
             execution.query_blocking_executor_config,
         )?;
-        #[cfg(novarocks_dev_controls)]
-        if let Some(owner) = test_session
-            .as_ref()
-            .and_then(|session| session.statement.as_ref())
-        {
-            execution_runtime_owner
-                .lifecycle_diagnostics
-                .activate(owner)
-                .map_err(|error| {
-                    FrontendApplicationError::new(
-                        FrontendApplicationErrorKind::CoordinatorOpen,
-                        error,
-                    )
-                })?;
-            // Retain the existing startup attribution evidence only for the
-            // explicitly installed, live statement observation owner.
-            if owner.is_active() {
-                let bytes = frontend_process_id.to_bytes();
-                let namespace = QueryProcessNamespace::new(
-                    u64::from_be_bytes(bytes[..8].try_into().expect("UUID high half"))
-                        ^ u64::from_be_bytes(bytes[8..].try_into().expect("UUID low half")),
-                );
-                eprintln!("NOVAROCKS_QUERY_PROCESS_NAMESPACE query_process_namespace={namespace}");
-            }
-        }
         let catalog_runtime_projection =
             crate::catalog_application::CatalogRuntimeProjection::new();
         let mut host = Self {
@@ -1414,6 +1389,38 @@ impl FrontendApplicationHost {
             constant_policy: execution.constant_policy,
             static_plan_carrier: execution.static_plan_carrier,
         };
+
+        // Every fallible observer activation runs after the original process
+        // owner aggregate is in Host, so startup failure uses its real drain.
+        #[cfg(novarocks_dev_controls)]
+        if let Some(owner) = host
+            .test_session
+            .as_ref()
+            .and_then(|session| session.statement.as_ref())
+        {
+            if let Err(error) = host
+                .execution_runtime_owner
+                .lifecycle_diagnostics
+                .activate(owner)
+            {
+                return Err(host
+                    .cleanup_open_error(FrontendApplicationError::new(
+                        FrontendApplicationErrorKind::CoordinatorOpen,
+                        error,
+                    ))
+                    .await);
+            }
+            // Retain the existing startup attribution evidence only for the
+            // explicitly installed, live statement observation owner.
+            if owner.is_active() {
+                let bytes = frontend_process_id.to_bytes();
+                let namespace = QueryProcessNamespace::new(
+                    u64::from_be_bytes(bytes[..8].try_into().expect("UUID high half"))
+                        ^ u64::from_be_bytes(bytes[8..].try_into().expect("UUID low half")),
+                );
+                eprintln!("NOVAROCKS_QUERY_PROCESS_NAMESPACE query_process_namespace={namespace}");
+            }
+        }
 
         #[cfg(feature = "mem-1-m07-hms-listing-observe")]
         if let Some(owner) = host
