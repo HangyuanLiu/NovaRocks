@@ -202,6 +202,9 @@ pub(crate) struct Node {
     pub reserved_bytes: u64,
     pub used_bytes: u64,
     pub result_windows: crate::ResultCapacitySnapshot,
+    /// The original root has one queued or not-yet-received query admission,
+    /// including admissions that request no result window.
+    pub pending_query: bool,
     /// The result window class a queued query admission must take together
     /// with its computation permit; `None` when it is not queued or takes none.
     pub pending_query_window: Option<crate::ResultWindowClass>,
@@ -240,6 +243,7 @@ impl Node {
             reserved_bytes: 0,
             used_bytes: 0,
             result_windows: crate::ResultCapacitySnapshot::default(),
+            pending_query: false,
             pending_query_window: None,
             control_pending: ControlIntents::empty(),
             cancellation_signalled: false,

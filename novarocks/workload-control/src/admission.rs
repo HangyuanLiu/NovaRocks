@@ -228,6 +228,7 @@ fn take_request(state: &mut State, id: u64, receive: bool) -> PendingAdmission {
     let node = state.nodes.get_mut(&request.work).unwrap();
     node.pending_admissions -= 1;
     if request.kind == AdmissionKind::Query {
+        node.pending_query = false;
         node.pending_query_window = None;
     }
     match request.state {
@@ -479,7 +480,7 @@ impl WorkScope {
             if node.query_admitted {
                 return Err(WorkError::AlreadyAdmitted);
             }
-            if node.pending_query_window.is_some() {
+            if node.pending_query {
                 return Err(WorkError::Conflict);
             }
             if window.is_some() && state.result_capacity.is_none() {
@@ -507,6 +508,7 @@ impl WorkScope {
             state.record_waiting_peak();
             let node = state.nodes.get_mut(&self.id).unwrap();
             node.pending_admissions += 1;
+            node.pending_query = true;
             node.pending_query_window = window;
             state.query_queue.push(self.id, id);
             Ok(id)
@@ -701,5 +703,48 @@ impl Drop for StagePermit {
                 state.collect(scope.id);
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{WorkClass, WorkRequest, WorkloadConfig, WorkloadControl};
+
+    #[tokio::test]
+    async fn a_query_without_a_result_window_has_one_pending_request_and_reply() {
+        let control = WorkloadControl::try_new_counted(WorkloadConfig {
+            query_concurrency_limit: 1,
+            ..WorkloadConfig::default()
+        })
+        .unwrap()
+        .owner;
+        control.mark_ready().unwrap();
+        let blocker = control
+            .begin_query_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let blocker_permit = blocker.owner.scope().admit_query().unwrap().await.unwrap();
+        let queued = control
+            .begin_query_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let scope = queued.owner.scope();
+        let pending = scope.admit_query().unwrap();
+        assert!(matches!(scope.admit_query(), Err(WorkError::Conflict)));
+        assert_eq!(control.snapshot().admission_records, 1);
+        drop(pending);
+        assert_eq!(control.snapshot().admission_records, 0);
+        let replacement = scope.admit_query().unwrap();
+        assert!(matches!(scope.admit_query(), Err(WorkError::Conflict)));
+        drop(blocker_permit);
+        let admitted = replacement.await.unwrap();
+        assert!(matches!(
+            scope.admit_query(),
+            Err(WorkError::AlreadyAdmitted)
+        ));
+        assert_eq!(control.snapshot().admission_records, 0);
+        blocker.owner.complete();
+        queued.owner.complete();
+        drop(admitted);
+        assert_eq!(control.snapshot().root_responsibilities, 0);
     }
 }
