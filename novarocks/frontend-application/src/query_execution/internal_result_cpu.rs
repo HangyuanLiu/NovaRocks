@@ -31,22 +31,27 @@ use novarocks_execution_contract::{
 use novarocks_query_application::api::RetainedRootReply;
 use novarocks_query_application::cpu::{
     QueryBlockingExecutor, QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
-    QueryBlockingFailure,
+    QueryBlockingFailure, QueryBlockingPublishRefusal, QueryBlockingReceipt,
+    QueryBlockingReservation, QueryBlockingReserveRefusal,
 };
 use novarocks_query_application::{
     cancellation::{QueryCancellationReason, QueryCancellationView},
     execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
 };
 use novarocks_workload_control::{
-    ResultCapacityConfig, ResultWindowAlias, ResultWindowClass, WorkScope,
+    ResultCapacityConfig, ResultWindowAlias, ResultWindowClass, WorkError, WorkScope,
 };
 use tokio::sync::oneshot;
 
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::task_execution::status_intake::StatusIntakeWake;
-use std::sync::Arc;
+use novarocks_workload_control::joint_admission::{
+    InternalCpuActionAdmission, InternalCpuActionSource, JointLocalGrant,
+};
+use std::sync::{Arc, Weak};
 
 mod metadata_geometry;
+pub(crate) use metadata_geometry::InternalCpuActionQuote;
 pub use metadata_geometry::InternalCpuMetadataGeometry;
 
 // The whole maximum coexistence envelope is authorized before any domain
@@ -360,11 +365,31 @@ fn cpu_cancellation_failure(reason: QueryCancellationReason) -> ExecutionFailure
 /// An unclaimed output contains the same window until its actual destruction.
 /// One fixed retirement packet belongs to this original job and forwarder.
 /// At most one executor result, one early undelivered projection, one worker
-/// failure, two existing notification failures and one true JoinError exist.
+/// failure, one distinct physical failure, two existing notification failures
+/// and one true JoinError exist.
 struct InternalCpuRetirement<T> {
     state: std::sync::Mutex<InternalCpuRetirementState<T>>,
 }
+type OperationOutput = Result<InternalDomainSlot, InternalDomainFailure>;
+type OperationResult = Result<InternalResultValue<OperationOutput>, ExecutionFailureInput>;
+
+// This is a field of the same original retirement packet, not another queue.
+#[derive(Default)]
+struct CpuActionState {
+    admission: Option<InternalCpuActionAdmission>,
+    physical: Option<JointLocalGrant<QueryBlockingReservation>>,
+    receipt: Option<QueryBlockingReceipt<OperationResult>>,
+    published: bool,
+}
 struct InternalCpuRetirementState<T> {
+    closed_input: Option<InternalResultValue<InternalDomainSlot>>,
+    closed_operation: Option<InternalResultOperation>,
+    action: Option<CpuActionState>,
+    admission_failure: Option<WorkError>,
+    reserve_refusal: Option<QueryBlockingReserveRefusal>,
+    publication_refusal: Option<QueryBlockingPublishRefusal>,
+    physical_failure: Option<QueryBlockingFailure>,
+    physical_unproven: bool,
     outcome: Option<Result<InternalResultValue<T>, ExecutionFailureInput>>,
     early: Option<ExecutionFailureInput>,
     worker: Option<QueryBlockingFailure>,
@@ -377,6 +402,10 @@ struct InternalCpuRetirementState<T> {
         Option<novarocks_query_application::admitted_query_context::ResultCapacityActivityLease>,
 }
 pub(crate) struct InternalCpuRetired<T> {
+    _closed_input: Option<InternalResultValue<InternalDomainSlot>>,
+    _closed_operation: Option<InternalResultOperation>,
+    _action: Option<CpuActionState>,
+    _admission_failure: Option<WorkError>,
     _outcome: Option<Result<InternalResultValue<T>, ExecutionFailureInput>>,
     _window: Option<ResultWindowAlias>,
     _activity:
@@ -391,6 +420,14 @@ impl<T> InternalCpuRetirement<T> {
     ) -> Self {
         Self {
             state: std::sync::Mutex::new(InternalCpuRetirementState {
+                closed_input: None,
+                closed_operation: None,
+                action: None,
+                admission_failure: None,
+                reserve_refusal: None,
+                publication_refusal: None,
+                physical_failure: None,
+                physical_unproven: false,
                 outcome: None,
                 early: None,
                 worker: None,
@@ -408,6 +445,11 @@ impl<T> InternalCpuRetirement<T> {
             .as_ref()
             .is_some_and(QueryBlockingFailure::is_unexpected)
             || state.forwarder.is_some()
+            || state.physical_unproven
+            || state.physical_failure.is_some()
+            || state.admission_failure.as_ref().is_some_and(|error| {
+                error.failure_fact().class() == novarocks_failure_contract::FailureClass::Invariant
+            })
             || state.notifications.iter().any(Option::is_some)
     }
     /// The original work has actually returned. Restore its same activity to
@@ -549,6 +591,10 @@ impl<T: Send + 'static> InternalResultCpuJob<T> {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         Some(InternalCpuRetired {
+            _closed_input: state.closed_input.take(),
+            _closed_operation: state.closed_operation.take(),
+            _action: state.action.take(),
+            _admission_failure: state.admission_failure.take(),
             _outcome: state.outcome.take(),
             _window: state.window.take(),
             _activity: state.activity.take(),
@@ -585,8 +631,9 @@ impl<T: Send + 'static> InternalResultCpuJob<T> {
         match self.completion.try_recv() {
             Ok(mut value) => {
                 self.claimed = true;
-                // A claimed receipt proves CPU execution has exited. The
-                // serial consumer keeps the payload/window, not a CPU lease.
+                // The original result has returned. For a joint action this
+                // does not prove physical exit: the same forwarder still waits
+                // for poll_actual_exit before serial reuse or Ready.
                 if let Ok(value) = &mut value {
                     value.activity.take();
                 }
@@ -658,6 +705,13 @@ impl InternalResultOperation {
 }
 
 impl InternalResultCpu {
+    pub(crate) fn configured_capacity(&self) -> QueryBlockingExecutorConfig {
+        self.executor.configured_capacity()
+    }
+    pub(crate) fn operation_action_quote(&self) -> Result<InternalCpuActionQuote, WorkError> {
+        metadata_geometry::operation_action_quote(&self.executor)
+    }
+
     pub(crate) fn submit_operation(
         &self,
         input: InternalResultValue<InternalDomainSlot>,
@@ -672,8 +726,49 @@ impl InternalResultCpu {
             data_runtime,
             wake,
             operation,
-            make_operation_forwarder,
+            make_legacy_operation_forwarder,
         )
+    }
+
+    /// Root-backed production only. The original positive computation source
+    /// is captured by Domain under its lock; all admission and job publication
+    /// happens in this same original forwarder, outside that lock.
+    pub(crate) fn submit_root_operation(
+        &self,
+        mut input: InternalResultValue<InternalDomainSlot>,
+        source: InternalCpuActionSource,
+        cancellation: QueryCancellationView,
+        data_runtime: &FrontendDataRuntime,
+        wake: Arc<dyn StatusIntakeWake>,
+        operation: InternalResultOperation,
+    ) -> InternalResultCpuJob<OperationOutput> {
+        let (completed, completion) = oneshot::channel();
+        let retirement = Arc::new(InternalCpuRetirement::new(
+            input.window.clone(),
+            input.activity.take(),
+        ));
+        {
+            let mut state = retirement.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.closed_input = Some(input);
+            state.closed_operation = Some(operation);
+            state.action = Some(CpuActionState::default());
+        }
+        let forwarder = data_runtime.spawn(make_operation_forwarder(
+            self.executor.clone(),
+            source,
+            cancellation,
+            wake,
+            Arc::clone(&retirement),
+            completed,
+        ));
+        InternalResultCpuJob {
+            completion,
+            retirement,
+            forwarder: Some(forwarder),
+            closing: false,
+            claimed: false,
+            closed: None,
+        }
     }
 
     // The original fault-injection tests require arbitrary jobs, including real
@@ -755,7 +850,7 @@ impl InternalResultCpu {
 
 // Both execution and geometry use this same closed production factory. Merely
 // naming it for its output layout does not construct an input or poll a job.
-fn make_operation_forwarder(
+fn make_legacy_operation_forwarder(
     executor: QueryBlockingExecutor,
     input: InternalResultValue<InternalDomainSlot>,
     cancellation: QueryCancellationView,
@@ -778,6 +873,398 @@ fn make_operation_forwarder(
         completed,
         move |slot, _| operation.apply(slot),
     )
+}
+
+// Only this original forwarder borrows its action fields. A short poll lease
+// restores the same fields before any await or unwind. No foreign callback or
+// destructor runs under retirement.state, and the input remains in the packet.
+struct CpuActionLease<'a> {
+    packet: &'a InternalCpuRetirement<OperationOutput>,
+    value: Option<CpuActionState>,
+}
+impl<'a> CpuActionLease<'a> {
+    fn take(packet: &'a InternalCpuRetirement<OperationOutput>) -> Self {
+        let value = packet
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .action
+            .take();
+        assert!(value.is_some(), "one original CPU action poller");
+        Self { packet, value }
+    }
+    fn state(&mut self) -> &mut CpuActionState {
+        self.value.as_mut().expect("same original CPU action")
+    }
+}
+impl Drop for CpuActionLease<'_> {
+    fn drop(&mut self) {
+        let mut state = self.packet.state.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(state.action.is_none(), "same original CPU action return");
+        state.action = self.value.take();
+    }
+}
+
+fn action_failure(
+    packet: &InternalCpuRetirement<OperationOutput>,
+    error: WorkError,
+) -> ExecutionFailureInput {
+    let projected = ExecutionFailureInput::new(
+        error.failure_fact(),
+        SafeDetail::truncating("internal CPU action admission failed"),
+        ExecutionFailureSite::Coordinator,
+    );
+    let mut state = packet.state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.admission_failure.is_none() {
+        state.admission_failure = Some(error);
+    }
+    projected
+}
+
+// Only the real worker calls this factory output. Preparation captures no
+// unique input/Operation and cannot destroy them on forwarder cancellation.
+fn make_cpu_work(
+    packet: Weak<InternalCpuRetirement<OperationOutput>>,
+    cancellation: QueryCancellationView,
+) -> impl FnOnce() -> OperationResult + Send + 'static {
+    move || {
+        let packet = packet
+            .upgrade()
+            .ok_or_else(|| cpu_execution_failure("internal CPU job lost its original packet"))?;
+        if let Some(reason) = cancellation.reason() {
+            return Err(cpu_cancellation_failure(reason));
+        }
+        let (input, operation) = {
+            let mut state = packet.state.lock().unwrap_or_else(|e| e.into_inner());
+            let input = state.closed_input.take().expect("one real worker input");
+            let operation = state
+                .closed_operation
+                .take()
+                .expect("one real worker operation");
+            (input, operation)
+        };
+        // The original queued/running physical guard now covers this explicit
+        // execution handoff. First-party apply and every Drop remain lock-free;
+        // packet window/activity and opaque failure custody are independent.
+        Ok(input.transform(move |slot, _| operation.apply(slot)))
+    }
+}
+
+fn poll_cpu_offer(
+    packet: &InternalCpuRetirement<OperationOutput>,
+    executor: &QueryBlockingExecutor,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<Result<(), ExecutionFailureInput>> {
+    use std::task::Poll;
+    let mut lease = CpuActionLease::take(packet);
+    let mut notification = None;
+    let mut reserve_refusal = None;
+    let result = (|| {
+        let CpuActionState {
+            admission,
+            physical,
+            ..
+        } = lease.state();
+        let mut offer = match admission
+            .as_mut()
+            .expect("same finite CPU request")
+            .poll_local_offer(cx)
+        {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(failure)) => return Poll::Ready(Err(failure.error)),
+            Poll::Ready(Ok(offer)) => offer,
+        };
+        let mut original = match executor.try_reserve() {
+            Ok(original) => Some(original),
+            Err(reason) => {
+                reserve_refusal = Some(reason);
+                let mut absent: Option<QueryBlockingReservation> = None;
+                notification = Some(offer.reobserve_after_drop(&mut absent)?);
+                return Poll::Ready(Err(match reason {
+                    QueryBlockingReserveRefusal::Full => {
+                        WorkError::Capacity("original CPU physical queue")
+                    }
+                    QueryBlockingReserveRefusal::Closed => WorkError::Closed,
+                }));
+            }
+        };
+        match offer.accept_in(&mut original, physical) {
+            Ok(notify) => notification = Some(notify),
+            Err(error) => {
+                notification = Some(offer.reobserve_after_drop(&mut original)?);
+                return Poll::Ready(Err(error));
+            }
+        }
+        Poll::Ready(Ok(()))
+    })();
+    drop(lease);
+    if let Some(reason) = reserve_refusal {
+        packet
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reserve_refusal = Some(reason);
+    }
+    // Stable original admission/physical phase precedes either notification.
+    if let Some(notification) = notification {
+        notification.notify();
+    }
+    result.map(|result| result.map_err(|error| action_failure(packet, error)))
+}
+
+// Publication borrows only the physical field: the original receipt must
+// already remain in the packet while the row becomes visible to a worker.
+struct CpuPublicationLease<'a> {
+    packet: &'a InternalCpuRetirement<OperationOutput>,
+    physical: Option<JointLocalGrant<QueryBlockingReservation>>,
+}
+impl<'a> CpuPublicationLease<'a> {
+    fn take(packet: &'a InternalCpuRetirement<OperationOutput>) -> Self {
+        let physical = packet
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .action
+            .as_mut()
+            .expect("same original CPU publication")
+            .physical
+            .take();
+        Self { packet, physical }
+    }
+}
+impl Drop for CpuPublicationLease<'_> {
+    fn drop(&mut self) {
+        let mut state = self.packet.state.lock().unwrap_or_else(|e| e.into_inner());
+        let action = state
+            .action
+            .as_mut()
+            .expect("same original CPU publication return");
+        assert!(action.physical.is_none(), "one original physical publisher");
+        action.physical = self.physical.take();
+    }
+}
+
+fn publish_cpu_work(
+    packet: &Arc<InternalCpuRetirement<OperationOutput>>,
+    executor: &QueryBlockingExecutor,
+    cancellation: &QueryCancellationView,
+) -> Result<(), ExecutionFailureInput> {
+    let mut lease = CpuActionLease::take(packet);
+    let state = lease.state();
+    let work = make_cpu_work(Arc::downgrade(packet), cancellation.clone());
+    let prepared = match executor.prepare_preserving_in(
+        state
+            .physical
+            .as_mut()
+            .expect("accepted original CPU reservation"),
+        work,
+        &mut state.receipt,
+    ) {
+        Ok(prepared) => prepared,
+        Err(refused) => {
+            let reason = refused.reason();
+            drop(refused.into_work());
+            drop(lease);
+            packet
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .publication_refusal = Some(reason);
+            return Err(action_failure(packet, WorkError::Conflict));
+        }
+    };
+    // Restore the receipt to the original packet before making its row
+    // visible. The publication lease takes only the original physical field.
+    drop(lease);
+    let mut publication = CpuPublicationLease::take(packet);
+    // This local frame owns only a Weak packet call, never its original input.
+    let mut prepared = Some(prepared);
+    let result = executor.publish_joint_in(&mut publication.physical, &mut prepared);
+    if result.is_ok() {
+        packet
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .action
+            .as_mut()
+            .expect("same published original CPU action")
+            .published = true;
+    }
+    drop(prepared);
+    drop(publication);
+    match result {
+        Ok(notification) => {
+            notification.notify();
+            Ok(())
+        }
+        Err(reason) => {
+            packet
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .publication_refusal = Some(reason);
+            Err(action_failure(
+                packet,
+                match reason {
+                    QueryBlockingPublishRefusal::Closed
+                    | QueryBlockingPublishRefusal::ReceiptClosed => WorkError::Closed,
+                    _ => WorkError::Conflict,
+                },
+            ))
+        }
+    }
+}
+
+// No queued F exists on this path. Discard its Weak call first (in the caller),
+// then drop the accepted reservation outside locks; original business input
+// stays in its packet through the same forwarder join and explicit retirement.
+fn finish_unpublished(packet: &InternalCpuRetirement<OperationOutput>) {
+    let mut lease = CpuActionLease::take(packet);
+    assert!(!lease.state().published, "unpublished original CPU action");
+    let admission = lease.state().admission.take();
+    let physical = lease.state().physical.take();
+    drop(lease);
+    drop(admission);
+    drop(physical);
+}
+
+fn poll_cpu_result(
+    packet: &InternalCpuRetirement<OperationOutput>,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<Result<OperationResult, QueryBlockingFailure>> {
+    let mut lease = CpuActionLease::take(packet);
+    lease
+        .state()
+        .receipt
+        .as_mut()
+        .expect("stable original worker receipt")
+        .poll_result(cx)
+}
+fn poll_cpu_actual_exit(
+    packet: &InternalCpuRetirement<OperationOutput>,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<()> {
+    use std::task::Poll;
+    let mut lease = CpuActionLease::take(packet);
+    let receipt = lease
+        .state()
+        .receipt
+        .as_ref()
+        .expect("same actual-exit observer");
+    let result = receipt.poll_actual_exit(cx);
+    let failure = if result.is_ready() {
+        receipt.actual_exit_failure()
+    } else {
+        None
+    };
+    drop(lease);
+    match result {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(result) => {
+            let mut state = packet.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.physical_unproven = result.is_err();
+            state.physical_failure = failure;
+            Poll::Ready(())
+        }
+    }
+}
+
+// Execution and geometry use this exact production factory. The original
+// packet already owns input/Operation before the forwarder can first poll.
+fn make_operation_forwarder(
+    executor: QueryBlockingExecutor,
+    source: InternalCpuActionSource,
+    cancellation: QueryCancellationView,
+    wake: Arc<dyn StatusIntakeWake>,
+    packet: Arc<InternalCpuRetirement<OperationOutput>>,
+    mut completed: oneshot::Sender<OperationResult>,
+) -> impl std::future::Future<Output = ()> + Send {
+    async move {
+        let setup = (|| {
+            let quote = metadata_geometry::operation_action_quote(&executor)?;
+            let admission = source
+                .begin(quote.metadata_bytes, quote.physical_queue_bytes)
+                .map_err(|failure| failure.error)?;
+            packet
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .action
+                .as_mut()
+                .expect("same original CPU action")
+                .admission = Some(admission);
+            Ok::<(), WorkError>(())
+        })();
+        if let Err(error) = setup {
+            let error = action_failure(&packet, error);
+            finish_unpublished(&packet);
+            if let Err(original) = completed.send(Err(error)) {
+                packet
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .outcome = Some(original);
+            }
+            packet.notify(0, wake.as_ref());
+            return;
+        }
+        let admission = tokio::select! {
+            biased;
+            reason = cancellation.cancelled() => Err(cpu_cancellation_failure(reason)),
+            _ = completed.closed() => Err(cpu_execution_failure("internal CPU consumer closed before publication")),
+            result = std::future::poll_fn(|cx| poll_cpu_offer(&packet, &executor, cx)) => result,
+        };
+        let admission =
+            admission.and_then(|()| publish_cpu_work(&packet, &executor, &cancellation));
+        if let Err(error) = admission {
+            finish_unpublished(&packet);
+            if let Err(original) = completed.send(Err(error)) {
+                packet
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .outcome = Some(original);
+            }
+            packet.notify(0, wake.as_ref());
+            return;
+        }
+        let early = tokio::select! {
+            biased;
+            reason = cancellation.cancelled() => Err(cpu_cancellation_failure(reason)),
+            _ = completed.closed() => Err(cpu_execution_failure("internal result CPU consumer closed")),
+            result = std::future::poll_fn(|cx| poll_cpu_result(&packet, cx)) => Ok(result),
+        };
+        match early {
+            Ok(result) => {
+                let result = packet.receive_work(result);
+                if let Err(original) = completed.send(result) {
+                    packet
+                        .state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .outcome = Some(original);
+                }
+                packet.notify(0, wake.as_ref());
+            }
+            Err(error) => {
+                if let Err(Err(original)) = completed.send(Err(error)) {
+                    packet.state.lock().unwrap_or_else(|e| e.into_inner()).early = Some(original);
+                }
+                packet.notify(0, wake.as_ref());
+                let result = std::future::poll_fn(|cx| poll_cpu_result(&packet, cx)).await;
+                let result = packet.receive_work(result);
+                packet
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .outcome = Some(result);
+                packet.notify(1, wake.as_ref());
+            }
+        }
+        // A result/forwarder receipt alone is not the original worker exit.
+        // FailedUnproven retains the same original carrier in this same packet.
+        std::future::poll_fn(|cx| poll_cpu_actual_exit(&packet, cx)).await;
+    }
 }
 
 fn make_forwarder<I, O, F>(

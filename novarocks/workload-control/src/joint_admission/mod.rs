@@ -29,10 +29,10 @@ mod protection;
 pub use driver::{JointProgress, JointProgressDriver};
 pub use ledger::{
     ControlBindingProposal, InternalComputationAlias, InternalComputationGrant,
-    JointAdjustmentReceipt, JointAdmission, JointAdmissionFailure, JointAdmissionHandle,
-    JointClaim, JointClaimView, JointGrantedBatch, JointGrantedClaims, JointLocalGrant,
-    JointLocalOffer, JointProposal, RetainedPayloadAlias, RetainedPayloadGrant, RootStageAdmission,
-    RootStageProposal, RootStageReady, RootStageSource,
+    InternalCpuActionAdmission, InternalCpuActionSource, JointAdjustmentReceipt, JointAdmission,
+    JointAdmissionFailure, JointAdmissionHandle, JointClaim, JointClaimView, JointGrantedBatch,
+    JointGrantedClaims, JointLocalGrant, JointLocalOffer, JointProposal, RetainedPayloadAlias,
+    RetainedPayloadGrant, RootStageAdmission, RootStageProposal, RootStageReady, RootStageSource,
 };
 #[cfg(test)]
 pub use ledger::{JointClaimChange, JointDependency};

@@ -24,6 +24,17 @@ use std::{
 };
 
 fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+    fixture_with_cpu_jobs(0)
+}
+fn fixture_with_cpu_jobs(
+    cpu_jobs: u64,
+) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+    fixture_with_cpu_lane(cpu_jobs, JointLane::Foreground)
+}
+fn fixture_with_cpu_lane(
+    cpu_jobs: u64,
+    lane: JointLane,
+) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     let count = 8;
     let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 1, 2, &[]);
     let mut config = JointCapacityConfig {
@@ -64,12 +75,18 @@ fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
             .with(JointResource::ClaimRecords, 4)
             .with(JointResource::MetadataBytes, m * 16)
             .with(JointResource::PayloadBytes, 32)
-            .with(JointResource::Computations, 1),
+            .with(JointResource::Computations, 1)
+            .with(JointResource::InternalCpuJobs, cpu_jobs)
+            .with(JointResource::PhysicalQueueRecords, cpu_jobs)
+            .with(JointResource::PhysicalQueueBytes, cpu_jobs * 64),
         per_dependency: JointResources::ZERO
             .with(JointResource::ClaimRecords, 4)
             .with(JointResource::MetadataBytes, m * 8)
             .with(JointResource::PayloadBytes, 32)
-            .with(JointResource::Computations, 1),
+            .with(JointResource::Computations, 1)
+            .with(JointResource::InternalCpuJobs, cpu_jobs)
+            .with(JointResource::PhysicalQueueRecords, cpu_jobs)
+            .with(JointResource::PhysicalQueueBytes, cpu_jobs * 64),
         protected_progress: JointResources::ZERO,
     };
     let global = JointResourceLimits {
@@ -83,9 +100,14 @@ fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     config.global = global;
     config.classes[0] = global;
     config.lanes[0] = custody;
-    config.lanes[1] = foreground;
+    let lane_index = match lane {
+        JointLane::Foreground => 1,
+        JointLane::Settlement => 2,
+        JointLane::Custody => panic!("CPU fixture requires an execution lane"),
+    };
+    config.lanes[lane_index] = foreground;
     config.class_lanes[0][0] = custody;
-    config.class_lanes[0][1] = foreground;
+    config.class_lanes[0][lane_index] = foreground;
     // Only the original fixed substrate requires progress in this fixture.
     // CPU/complete Native action protection is deliberately not asserted.
     let mut required = RequiredJointProgress {
@@ -799,4 +821,284 @@ fn typed_record_rejects_even_internal_raw_source_and_retained_entry() {
     drop(target);
     finish(work, &mut driver);
     assert_eq!(held(&control, JointResource::PayloadBytes), 0);
+}
+
+fn cpu_stage(
+    handle: &JointAdmissionHandle,
+    work: &WorkOwner,
+    facts: &[SharedDependency],
+    driver: &mut JointProgressDriver,
+) -> InternalComputationGrant {
+    let scope = work.scope();
+    bind(&scope, facts, driver);
+    let mut source = Some(claim(
+        handle,
+        work,
+        facts,
+        JointLane::Foreground,
+        amounts(JointResource::Computations, 1),
+        driver,
+    ));
+    let mut grant = None;
+    InternalComputationGrant::adopt_in(&scope, &mut source, &mut grant)
+        .unwrap()
+        .notify();
+    grant.unwrap()
+}
+
+#[test]
+fn cpu_action_inherits_every_stage_domain_and_retires_after_original_physical_drop() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (control, handle, mut driver) = fixture_with_cpu_jobs(1);
+    let work = root(&control);
+    let scope = work.owner.scope();
+    let facts = [fact("cpu-a"), fact("cpu-b")];
+    let computation = cpu_stage(&handle, &work.owner, &facts, &mut driver);
+    let mut action = computation
+        .cpu_action_source(&scope)
+        .unwrap()
+        .begin(
+            std::num::NonZeroU64::new(17).unwrap(),
+            std::num::NonZeroU64::new(23).unwrap(),
+        )
+        .unwrap();
+    {
+        let state = control.inner.state.lock().unwrap();
+        let request = state
+            .joint
+            .as_ref()
+            .unwrap()
+            .requests
+            .values()
+            .next()
+            .unwrap();
+        assert_eq!(request.changes.len(), 1);
+        let change = &request.changes[0];
+        assert_eq!(change.claim.facts.dependencies.len(), 2);
+        assert_eq!(change.claim.facts.lane, JointLane::Foreground);
+        for original in &facts {
+            assert!(
+                change
+                    .claim
+                    .facts
+                    .dependencies
+                    .iter()
+                    .any(|d| d.fact == *original)
+            );
+        }
+        assert_eq!(change.claim.amounts.get(JointResource::MetadataBytes), 17);
+        assert_eq!(
+            change.claim.amounts.get(JointResource::PhysicalQueueBytes),
+            23
+        );
+        assert!(request.budget.is_finite());
+    }
+    assert_eq!(held(&control, JointResource::InternalCpuJobs), 0);
+    drive(&mut driver);
+    struct Physical<'a> {
+        control: &'a WorkloadControl,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Drop for Physical<'_> {
+        fn drop(&mut self) {
+            // The real local holder must exit while its original charge lives.
+            assert_eq!(held(&self.control, JointResource::InternalCpuJobs), 1);
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+    let dropped = Arc::new(AtomicBool::new(false));
+    let mut physical = Some(Physical {
+        control: &control,
+        dropped: Arc::clone(&dropped),
+    });
+    let mut received = None;
+    let mut offer = match action.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(offer)) => offer,
+        _ => panic!("expected same finite CPU action offer"),
+    };
+    offer
+        .accept_in(&mut physical, &mut received)
+        .unwrap()
+        .notify();
+    assert!(physical.is_none());
+    assert_eq!(held(&control, JointResource::Computations), 1);
+    assert_eq!(held(&control, JointResource::InternalCpuJobs), 1);
+    drop(received);
+    assert!(dropped.load(Ordering::Acquire));
+    assert_eq!(held(&control, JointResource::InternalCpuJobs), 0);
+    assert_eq!(held(&control, JointResource::PhysicalQueueRecords), 0);
+    assert_eq!(held(&control, JointResource::Computations), 1);
+    drop(computation);
+    finish(work, &mut driver);
+}
+
+#[test]
+fn cpu_action_refuses_foreign_scope_and_source_exit_at_both_physical_cuts() {
+    for exit_after_offer in [false, true] {
+        let (control, handle, mut driver) = fixture_with_cpu_jobs(1);
+        let work = root(&control);
+        let scope = work.owner.scope();
+        let computation = cpu_stage(&handle, &work.owner, &[fact("exact")], &mut driver);
+        let foreign = root(&control);
+        assert!(matches!(
+            computation.cpu_action_source(&foreign.owner.scope()),
+            Err(WorkError::Conflict)
+        ));
+        let mut action = computation
+            .cpu_action_source(&scope)
+            .unwrap()
+            .begin(
+                std::num::NonZeroU64::new(1).unwrap(),
+                std::num::NonZeroU64::new(1).unwrap(),
+            )
+            .unwrap();
+        drive(&mut driver);
+        if exit_after_offer {
+            let mut offer = match action.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(Ok(offer)) => offer,
+                _ => panic!("expected same original offer"),
+            };
+            drop(computation);
+            let mut physical = Some(());
+            let mut received = None;
+            assert_eq!(
+                offer.accept_in(&mut physical, &mut received).err(),
+                Some(WorkError::Released)
+            );
+            assert!(physical.is_some() && received.is_none());
+            // Explicit original local destruction, then original reply rollback.
+            offer.reobserve_after_drop(&mut physical).unwrap().notify();
+            assert!(physical.is_none());
+        } else {
+            drop(computation);
+            assert!(matches!(
+                action.poll_local_offer(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Err(JointAdmissionFailure {
+                    error: WorkError::Released
+                }))
+            ));
+        }
+        drop(action);
+        assert_eq!(held(&control, JointResource::InternalCpuJobs), 0);
+        finish(foreign, &mut driver);
+        finish(work, &mut driver);
+    }
+}
+
+#[test]
+fn original_settlement_cpu_action_survives_new_business_cancel_at_each_local_cut() {
+    for phase in 0..4 {
+        let (control, handle, mut driver) = fixture_with_cpu_lane(1, JointLane::Settlement);
+        let work = root(&control);
+        let scope = work.owner.scope();
+        let facts = [fact("settlement")];
+        bind(&scope, &facts, &mut driver);
+        let mut raw = Some(claim(
+            &handle,
+            &work.owner,
+            &facts,
+            JointLane::Settlement,
+            amounts(JointResource::Computations, 1),
+            &mut driver,
+        ));
+        let mut computation = None;
+        InternalComputationGrant::adopt_in(&scope, &mut raw, &mut computation)
+            .unwrap()
+            .notify();
+        let computation = computation.unwrap();
+        let source = computation.cpu_action_source(&scope).unwrap();
+        if phase == 0 {
+            work.owner.cancel(crate::CancellationReason::ServerShutdown);
+        }
+        let mut action = source
+            .begin(
+                std::num::NonZeroU64::new(1).unwrap(),
+                std::num::NonZeroU64::new(1).unwrap(),
+            )
+            .unwrap();
+        if phase == 1 {
+            work.owner.cancel(crate::CancellationReason::ServerShutdown);
+        }
+        drive(&mut driver);
+        let mut offer = match action.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(offer)) => offer,
+            _ => panic!("existing settlement CPU action must remain admitted"),
+        };
+        if phase == 2 {
+            work.owner.cancel(crate::CancellationReason::ServerShutdown);
+        }
+        if phase == 3 {
+            control.close_admission();
+        }
+        let mut physical = Some(());
+        let mut target = None;
+        offer
+            .accept_in(&mut physical, &mut target)
+            .unwrap()
+            .notify();
+        assert!(physical.is_none());
+        assert_eq!(held(&control, JointResource::InternalCpuJobs), 1);
+        drop(target);
+        assert_eq!(held(&control, JointResource::InternalCpuJobs), 0);
+        drop(action);
+        drop(computation);
+        work.owner.complete_after_terminal_cancel_settled();
+        work.business.release();
+        drive(&mut driver);
+    }
+}
+
+#[test]
+fn foreground_cpu_source_keeps_the_original_cancellation_refusal() {
+    let (control, handle, mut driver) = fixture_with_cpu_jobs(1);
+    let work = root(&control);
+    let scope = work.owner.scope();
+    let computation = cpu_stage(&handle, &work.owner, &[fact("foreground")], &mut driver);
+    let source = computation.cpu_action_source(&scope).unwrap();
+    work.owner.cancel(crate::CancellationReason::ServerShutdown);
+    assert!(matches!(
+        source.begin(
+            std::num::NonZeroU64::new(1).unwrap(),
+            std::num::NonZeroU64::new(1).unwrap()
+        ),
+        Err(JointAdmissionFailure {
+            error: WorkError::Cancelled(_)
+        })
+    ));
+    drop(computation);
+    work.owner.complete_after_terminal_cancel_settled();
+    work.business.release();
+    drive(&mut driver);
+}
+
+#[test]
+fn failed_cpu_action_keeps_original_refusal_after_the_producer_source_exits() {
+    let (control, handle, mut driver) = fixture_with_cpu_jobs(1);
+    let work = root(&control);
+    let scope = work.owner.scope();
+    let computation = cpu_stage(
+        &handle,
+        &work.owner,
+        &[fact("original-refusal")],
+        &mut driver,
+    );
+    let mut action = computation
+        .cpu_action_source(&scope)
+        .unwrap()
+        .begin(
+            std::num::NonZeroU64::new(1).unwrap(),
+            std::num::NonZeroU64::new(65).unwrap(),
+        )
+        .unwrap();
+    drive(&mut driver);
+    drop(computation);
+    assert!(matches!(
+        action.poll_local_offer(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Err(JointAdmissionFailure {
+            error: WorkError::Capacity("joint protected intersections")
+        }))
+    ));
+    assert_eq!(held(&control, JointResource::InternalCpuJobs), 0);
+    drop(action);
+    finish(work, &mut driver);
 }

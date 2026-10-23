@@ -37,26 +37,37 @@ impl opendal::Configurator for HdfsServiceConfig {
     type Builder = HdfsServiceBuilder;
 
     fn into_builder(self) -> Self::Builder {
-        HdfsServiceBuilder { config: self }
+        HdfsServiceBuilder {
+            config: self,
+            runtime: None,
+        }
     }
 }
 
 #[derive(Default)]
 pub(crate) struct HdfsServiceBuilder {
     config: HdfsServiceConfig,
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl HdfsServiceBuilder {
-    pub(crate) fn new(endpoint: &str, user: Option<&str>) -> Self {
+    pub(crate) fn new(endpoint: &str, user: Option<&str>, runtime: tokio::runtime::Handle) -> Self {
         Self {
             config: HdfsServiceConfig {
                 endpoint: Some(endpoint.to_owned()),
                 user: user.map(str::to_owned),
             },
+            runtime: Some(runtime),
         }
     }
 
     fn client_builder(&self) -> Result<ClientBuilder> {
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::ConfigInvalid,
+                "HDFS service requires an explicitly composed role runtime",
+            )
+        })?;
         let endpoint = self
             .config
             .endpoint
@@ -64,7 +75,9 @@ impl HdfsServiceBuilder {
             .ok_or_else(|| Error::new(ErrorKind::ConfigInvalid, "HDFS endpoint is missing"))?;
         // Preserve the original logical authority and SDK Hadoop configuration.
         // Effective user is independent of the NameNode RPC address.
-        let mut builder = ClientBuilder::new().with_url(endpoint);
+        let mut builder = ClientBuilder::new()
+            .with_url(endpoint)
+            .with_io_runtime(runtime.clone());
         if let Some(user) = &self.config.user {
             builder = builder.with_user(user);
         }

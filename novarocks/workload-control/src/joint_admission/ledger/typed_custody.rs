@@ -432,8 +432,24 @@ impl InternalComputationGrant {
     pub fn into_alias(self) -> InternalComputationAlias {
         InternalComputationAlias { pin: self.pin }
     }
+    /// Pure capture from this positive stage grant. Capture can run under the
+    /// original receiver lock; it allocates no backing, pins and notifies none.
+    /// Construct the paid action outside every receiver/physical-owner lock.
+    pub fn cpu_action_source(
+        &self,
+        scope: &WorkScope,
+    ) -> Result<InternalCpuActionSource, WorkError> {
+        super::paid_proposal::capture_cpu_action(&self.pin.inner, self.pin.key, scope)
+    }
 }
 /// No alias can release a position still used by another actual producer.
+/// Nor can retention-only pins author a new physical action.
+/// ```compile_fail
+/// use novarocks_workload_control::{WorkScope, joint_admission::InternalComputationAlias};
+/// fn no_action(alias: &InternalComputationAlias, scope: &WorkScope) {
+///     let _ = alias.cpu_action_source(scope);
+/// }
+/// ```
 /// ```compile_fail
 /// use novarocks_workload_control::joint_admission::InternalComputationAlias;
 /// fn no_release(value: &mut InternalComputationAlias) { value.release_position(); }

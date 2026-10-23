@@ -22,7 +22,7 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -2124,12 +2124,46 @@ impl Debug for ObjectStoreAccessContext<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FsAccessResolver;
+/// Cloneable view of one explicitly composed filesystem runtime epoch.
+/// A configuration-only view can parse locations and resolve local/S3 access;
+/// HDFS execution requires the role runtime before any cache lookup.
+#[derive(Clone, Default)]
+pub struct FsAccessResolver {
+    hdfs: Option<Arc<HdfsRuntimeView>>,
+}
+
+// The former HDFS operator cache is owned by this original resolver view,
+// rather than a process-global key which can cross role/runtime epochs.
+// Operators retain only a clone of the supplied Handle, never this view.
+struct HdfsRuntimeView {
+    runtime: tokio::runtime::Handle,
+    operators: Mutex<HashMap<HdfsOperatorKey, Operator>>,
+}
+
+impl Debug for FsAccessResolver {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FsAccessResolver")
+            .field("hdfs_runtime_installed", &self.hdfs.is_some())
+            .finish_non_exhaustive()
+    }
+}
 
 impl FsAccessResolver {
+    /// Configuration/local/S3 view. This never discovers or creates a runtime.
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// The composition root supplies its existing role runtime. Clones share
+    /// this same HDFS cache epoch; changing an I/O view does not mint another.
+    /// The caller retains the Runtime itself through all filesystem work.
+    pub fn with_runtime(runtime: tokio::runtime::Handle) -> Self {
+        Self {
+            hdfs: Some(Arc::new(HdfsRuntimeView {
+                runtime,
+                operators: Mutex::new(HashMap::new()),
+            })),
+        }
     }
 
     pub fn parse_location(&self, raw: impl AsRef<str>) -> FileResult<FsLocation> {
@@ -2176,7 +2210,9 @@ impl FsAccessResolver {
             FsScheme::ObjectStore => {
                 resolve_object_store_locations(access_domain, locations, object_store_access)
             }
-            FsScheme::Hdfs => resolve_hdfs_locations(access_domain, locations),
+            FsScheme::Hdfs => {
+                resolve_hdfs_locations(access_domain, locations, self.hdfs.as_deref())
+            }
         }
     }
 
@@ -2233,7 +2269,9 @@ impl FsAccessResolver {
                     .await?;
                 object_store_handle(access_domain, locations, bucket, operator)
             }
-            FsScheme::Hdfs => resolve_hdfs_locations(access_domain, locations),
+            FsScheme::Hdfs => {
+                resolve_hdfs_locations(access_domain, locations, self.hdfs.as_deref())
+            }
         }
     }
 
@@ -2964,14 +3002,10 @@ struct HdfsOperatorKey {
     user: Option<String>,
 }
 
-fn hdfs_operator_cache() -> &'static Mutex<HashMap<HdfsOperatorKey, Operator>> {
-    static CACHE: OnceLock<Mutex<HashMap<HdfsOperatorKey, Operator>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn resolve_hdfs_locations(
     access_domain: StorageAccessDomainId,
     locations: Vec<FsLocation>,
+    runtime: Option<&HdfsRuntimeView>,
 ) -> FileResult<FsAccessHandle> {
     let mut parsed = locations
         .iter()
@@ -2991,7 +3025,15 @@ fn resolve_hdfs_locations(
             "mixed hdfs users are not allowed in one access handle",
         ));
     }
-    let operator = build_hdfs_operator(&first.name_node, first.user.as_deref())?;
+    // Parse/identity refusals stay unchanged. Missing execution custody is
+    // refused before looking at any cached operator or constructing a client.
+    let runtime = runtime.ok_or_else(|| {
+        FileError::new(
+            FileErrorKind::Internal,
+            "HDFS execution requires an explicitly composed role runtime",
+        )
+    })?;
+    let operator = build_hdfs_operator(runtime, &first.name_node, first.user.as_deref())?;
     let paths = locations
         .into_iter()
         .zip(parsed.drain(..))
@@ -3061,12 +3103,17 @@ fn parse_hdfs_path(raw: &str) -> FileResult<HdfsPath> {
     })
 }
 
-fn build_hdfs_operator(name_node: &str, user: Option<&str>) -> FileResult<Operator> {
+fn build_hdfs_operator(
+    owner: &HdfsRuntimeView,
+    name_node: &str,
+    user: Option<&str>,
+) -> FileResult<Operator> {
     let key = HdfsOperatorKey {
         name_node: name_node.to_string(),
         user: user.map(str::to_string),
     };
-    if let Some(operator) = hdfs_operator_cache()
+    if let Some(operator) = owner
+        .operators
         .lock()
         .map_err(|_| FileError::new(FileErrorKind::Internal, "lock hdfs operator cache"))?
         .get(&key)
@@ -3074,14 +3121,26 @@ fn build_hdfs_operator(name_node: &str, user: Option<&str>) -> FileResult<Operat
     {
         return Ok(operator);
     }
-    let builder = crate::hdfs_service::HdfsServiceBuilder::new(name_node, user);
+    // Client construction is outside the original cache mutex. The service
+    // consumes this exact role Handle through hdfs-native's public builder.
+    let builder =
+        crate::hdfs_service::HdfsServiceBuilder::new(name_node, user, owner.runtime.clone());
     let operator = Operator::new(builder)
         .map_err(|error| map_opendal_error("initialize hdfs operator", error))?;
-    hdfs_operator_cache()
-        .lock()
-        .map_err(|_| FileError::new(FileErrorKind::Internal, "lock hdfs operator cache"))?
-        .insert(key, operator.clone());
-    Ok(operator)
+    let selected = {
+        let mut operators = owner
+            .operators
+            .lock()
+            .map_err(|_| FileError::new(FileErrorKind::Internal, "lock hdfs operator cache"))?;
+        // Concurrent misses may finish together. Keep the first published
+        // instance and destroy the redundant local instance outside the lock.
+        operators
+            .entry(key)
+            .or_insert_with(|| operator.clone())
+            .clone()
+    };
+    drop(operator);
+    Ok(selected)
 }
 
 /// Recover only an already projected FS acquisition cause through the actual
@@ -5990,10 +6049,104 @@ mod hdfs_user_tests {
             FsLocation::parse("hdfs://alice@nn:8020/a").unwrap(),
             FsLocation::parse("hdfs://bob@nn:8020/b").unwrap(),
         ];
-        let result = resolve_hdfs_locations(StorageAccessDomainId::from_bytes([0; 32]), locations);
+        let result =
+            resolve_hdfs_locations(StorageAccessDomainId::from_bytes([0; 32]), locations, None);
         let Err(error) = result else {
             panic!("mixed effective users were accepted")
         };
         assert_eq!(error.kind(), FileErrorKind::Invalid);
+    }
+    #[test]
+    fn hdfs_cache_is_shared_only_by_the_same_runtime_view_and_unready_cannot_hit() {
+        let first_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let second_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let first = FsAccessResolver::with_runtime(first_runtime.handle().clone());
+        let first_clone = first.clone();
+        let second = FsAccessResolver::with_runtime(second_runtime.handle().clone());
+        let configuration_only = FsAccessResolver::new();
+        let key = HdfsOperatorKey {
+            name_node: "hdfs://namenode.invalid:8020".into(),
+            user: Some("alice".into()),
+        };
+        // Populate the original cache with real storage instances. Memory
+        // makes the cache selection oracle independent of DNS/RPC or Hadoop
+        // machine configuration; production misses use the actual SDK client.
+        let first_operator = Operator::new(opendal::services::Memory::default()).unwrap();
+        let second_operator = Operator::new(opendal::services::Memory::default()).unwrap();
+        first_runtime
+            .block_on(first_operator.write("data", Bytes::from_static(b"first")))
+            .unwrap();
+        second_runtime
+            .block_on(second_operator.write("data", Bytes::from_static(b"second")))
+            .unwrap();
+        first
+            .hdfs
+            .as_ref()
+            .unwrap()
+            .operators
+            .lock()
+            .unwrap()
+            .insert(key.clone(), first_operator);
+        second
+            .hdfs
+            .as_ref()
+            .unwrap()
+            .operators
+            .lock()
+            .unwrap()
+            .insert(key, second_operator);
+        let domain = StorageAccessDomainId::from_bytes([19; 32]);
+        let location = "hdfs://alice@namenode.invalid:8020/data";
+        assert!(configuration_only.parse_location(location).is_ok());
+        let unready_sync = configuration_only
+            .resolve_location(domain, location, None)
+            .unwrap_err();
+        let unready_async = first_runtime
+            .block_on(configuration_only.resolve_location_async(
+                domain,
+                location,
+                None,
+                &FileCancellation::new(),
+            ))
+            .unwrap_err();
+        let first_file = first.resolve_location(domain, location, None).unwrap();
+        let clone_file = first_clone
+            .resolve_location(domain, location, None)
+            .unwrap();
+        let second_file = second_runtime
+            .block_on(second.resolve_location_async(
+                domain,
+                location,
+                None,
+                &FileCancellation::new(),
+            ))
+            .unwrap();
+        let first_data = first_runtime
+            .block_on(first_file.operator().read("data"))
+            .unwrap()
+            .to_bytes();
+        let clone_data = first_runtime
+            .block_on(clone_file.operator().read("data"))
+            .unwrap()
+            .to_bytes();
+        let second_data = second_runtime
+            .block_on(second_file.operator().read("data"))
+            .unwrap()
+            .to_bytes();
+        // All raw outputs and runtime views exit before their original owners.
+        drop((first_file, clone_file, second_file));
+        drop((first, first_clone, second, configuration_only));
+        drop((first_runtime, second_runtime));
+        assert_eq!(unready_sync.kind(), FileErrorKind::Internal);
+        assert_eq!(unready_async.kind(), FileErrorKind::Internal);
+        assert_eq!(&first_data[..], b"first");
+        assert_eq!(&clone_data[..], b"first");
+        assert_eq!(&second_data[..], b"second");
     }
 }

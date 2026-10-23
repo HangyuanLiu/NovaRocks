@@ -87,7 +87,7 @@ pub(crate) struct OriginalAttempt {
     pub(crate) native_credentials: Arc<AttemptCredentialStorage>,
     diagnostics: TaskFinalInfoCollector,
     _control: WorkloadControl,
-    business: BusinessPermit,
+    business: Option<BusinessPermit>,
 }
 impl OriginalAttempt {
     async fn new(attempt: u64) -> (Self, AttemptHandoffResources, InternalConsumerActivation) {
@@ -130,6 +130,35 @@ impl OriginalAttempt {
         native_credentials: Option<Arc<AttemptCredentialStorage>>,
         writers: bool,
     ) -> (Self, AttemptHandoffResources, InternalConsumerActivation) {
+        Self::new_bound_with_work(
+            execution,
+            transport,
+            description,
+            plan,
+            pending,
+            native_credentials,
+            writers,
+            None,
+        )
+        .await
+    }
+
+    // Test-only injection of an exact already-admitted owner. A child is not
+    // relabelled as RootWork and never receives its parent's BusinessPermit.
+    async fn new_bound_with_work(
+        execution: QueryExecutionId,
+        transport: Arc<dyn TaskResultTransport>,
+        description: novarocks_query_application::preparation::FrozenExecutionDescription,
+        plan: PlanSeal,
+        pending: bool,
+        native_credentials: Option<Arc<AttemptCredentialStorage>>,
+        writers: bool,
+        original: Option<(
+            WorkloadControl,
+            novarocks_workload_control::WorkOwner,
+            novarocks_workload_control::ResultCapacityHandle,
+        )>,
+    ) -> (Self, AttemptHandoffResources, InternalConsumerActivation) {
         let (mut round, acks, release, pending_upstream, clock, protocol, establish_facts) =
             if writers {
                 assert!(pending);
@@ -153,26 +182,30 @@ impl OriginalAttempt {
             };
         let root = round.root_task();
         let context = *round.execution().graph().contexts().next().unwrap();
-        let control = WorkloadControl::try_new(
-            WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1 << 20,
-                control_bytes: 1 << 10,
-                per_scope_bytes: 1 << 18,
-            },
-        )
-        .unwrap();
-        let capacity = control
-            .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+        let (control, work, capacity, business) = if let Some((control, work, capacity)) = original
+        {
+            (control, work, capacity, None)
+        } else {
+            let control = WorkloadControl::try_new(
+                WorkloadConfig::default(),
+                ResourceConfig {
+                    total_bytes: 1 << 20,
+                    control_bytes: 1 << 10,
+                    per_scope_bytes: 1 << 18,
+                },
+            )
             .unwrap();
-        control.mark_ready().unwrap();
-        let governed = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .unwrap();
-        let scope = governed.owner.scope();
-        let stage = governed
-            .owner
-            .scope()
+            let capacity = control
+                .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+                .unwrap();
+            control.mark_ready().unwrap();
+            let governed = control
+                .try_begin_root(WorkRequest::new(WorkClass::Query))
+                .unwrap();
+            (control, governed.owner, capacity, Some(governed.business))
+        };
+        let scope = work.scope();
+        let stage = scope
             .try_acquire(novarocks_workload_control::Stage::Execution)
             .unwrap();
         let (abort, abort_intake) =
@@ -188,7 +221,7 @@ impl OriginalAttempt {
             vec![context],
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
-            governed.owner,
+            work,
             stage,
         )
         .unwrap()
@@ -240,7 +273,7 @@ impl OriginalAttempt {
                 native_credentials,
                 diagnostics,
                 _control: control,
-                business: governed.business,
+                business,
             },
             resources,
             activation,
@@ -290,7 +323,12 @@ impl OriginalAttempt {
         assert!(self.diagnostics.is_closed());
         assert!(self.diagnostics.all_terminal_observed());
     }
-    pub(crate) async fn finish(mut self) {
+    pub(crate) async fn finish(self) {
+        // Existing fixtures own their process only through this attempt.
+        drop(self.finish_retaining_process().await);
+    }
+
+    pub(crate) async fn finish_retaining_process(mut self) -> WorkloadControl {
         if let Some(release) = self.release.as_ref() {
             let OperationIntent::ReleaseQueryContext(request) = release else {
                 unreachable!("the fixture returns its original Release")
@@ -364,7 +402,10 @@ impl OriginalAttempt {
             .finish_until(Instant::now() + Duration::from_secs(5))
             .await
             .unwrap();
-        self.business.release();
+        if let Some(business) = self.business {
+            business.release();
+        }
+        self._control
     }
 }
 

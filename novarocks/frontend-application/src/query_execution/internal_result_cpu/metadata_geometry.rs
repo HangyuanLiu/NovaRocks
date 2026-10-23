@@ -19,13 +19,16 @@
 //! Layouts do not pay for backing, certify a task, or bound opaque pointees.
 
 use super::{
-    ExecutionFailureInput, InternalCpuRetired, InternalCpuRetirement, InternalDomainFailure,
-    InternalDomainSlot, InternalResultCpuJob, InternalResultOperation, InternalResultValue,
-    QueryBlockingExecutor, QueryBlockingFailure, QueryCancellationView, StatusIntakeWake,
-    make_operation_forwarder, oneshot,
+    ExecutionFailureInput, InternalCpuActionSource, InternalCpuRetired, InternalCpuRetirement,
+    InternalDomainFailure, InternalDomainSlot, InternalResultCpuJob, InternalResultOperation,
+    InternalResultValue, OperationResult, QueryBlockingExecutor, QueryBlockingFailure,
+    QueryCancellationView, StatusIntakeWake, make_cpu_work, make_operation_forwarder, oneshot,
 };
 use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
-use std::{alloc::Layout, sync::Arc};
+use std::{
+    alloc::Layout,
+    sync::{Arc, Weak},
+};
 
 type Output = Result<InternalDomainSlot, InternalDomainFailure>;
 type Completion = oneshot::Sender<Result<InternalResultValue<Output>, ExecutionFailureInput>>;
@@ -36,14 +39,15 @@ type Completion = oneshot::Sender<Result<InternalResultValue<Output>, ExecutionF
 /// remain the original creators' responsibility. Reading this is not payment.
 ///
 /// The per-job known subtotal conservatively sums the one packet, original live job,
-/// actual forwarder frame, one normal retirement stack value, up to three
-/// opaque carriers (worker + two notification panics), and one Arc<JoinError>.
+/// actual forwarder frame, one normal retirement stack value, up to four
+/// opaque carriers (worker + physical cause + two notification panics), and one Arc<JoinError>.
 /// Handles already contained in those layouts must not be added again.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InternalCpuMetadataGeometry {
     packet: Layout,
     job: Layout,
     forwarder_frame: Layout,
+    worker_call: Layout,
     retired: Layout,
     opaque_carrier: Layout,
     forwarder_failure: Layout,
@@ -61,6 +65,9 @@ impl InternalCpuMetadataGeometry {
     pub const fn forwarder_frame_layout(self) -> Layout {
         self.forwarder_frame
     }
+    pub const fn worker_call_layout(self) -> Layout {
+        self.worker_call
+    }
     pub const fn retired_inline_layout(self) -> Layout {
         self.retired
     }
@@ -68,7 +75,7 @@ impl InternalCpuMetadataGeometry {
         self.opaque_carrier
     }
     pub const fn maximum_opaque_carriers_per_job(self) -> usize {
-        3
+        4
     }
     pub const fn forwarder_failure_layout(self) -> Layout {
         self.forwarder_failure
@@ -87,7 +94,7 @@ impl InternalCpuMetadataGeometry {
         let failures = self
             .opaque_carrier
             .size()
-            .checked_mul(3)
+            .checked_mul(4)
             .ok_or(LayoutResourceError::Arithmetic)?;
         [
             self.packet.size(),
@@ -124,15 +131,56 @@ impl InternalCpuMetadataGeometry {
 fn forwarder_layout<F: std::future::Future<Output = ()>>(
     _: fn(
         QueryBlockingExecutor,
-        InternalResultValue<InternalDomainSlot>,
+        InternalCpuActionSource,
         QueryCancellationView,
         Arc<dyn StatusIntakeWake>,
         Arc<InternalCpuRetirement<Output>>,
         Completion,
-        InternalResultOperation,
     ) -> F,
 ) -> Layout {
     Layout::new::<F>()
+}
+
+// Derive the actual Box-call closure from the same factory prepare consumes.
+// This neither constructs a dummy packet/input nor assumes a capture ABI.
+pub(super) fn operation_call_layout() -> Layout {
+    fn of<F: FnOnce() -> OperationResult + Send + 'static>(
+        _: fn(Weak<InternalCpuRetirement<Output>>, QueryCancellationView) -> F,
+    ) -> Layout {
+        QueryBlockingExecutor::preserving_call_layout::<OperationResult, F>()
+    }
+    of(make_cpu_work)
+}
+
+/// Exact source quote for the original worker row and actual same boxed call.
+/// Packet/header/forwarder aliases outlive this action and still require their
+/// original fixed role envelope; this value does not certify that payment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InternalCpuActionQuote {
+    pub(crate) metadata_bytes: std::num::NonZeroU64,
+    pub(crate) physical_queue_bytes: std::num::NonZeroU64,
+}
+pub(super) fn operation_action_quote(
+    executor: &QueryBlockingExecutor,
+) -> Result<InternalCpuActionQuote, super::WorkError> {
+    let geometry = executor
+        .queue_geometry()
+        .map_err(|_| super::WorkError::ArithmeticOverflow)?;
+    let queue_bytes = geometry
+        .queue_record_inline
+        .size()
+        .checked_add(operation_call_layout().size())
+        .ok_or(super::WorkError::ArithmeticOverflow)?;
+    let nonzero = |bytes| {
+        u64::try_from(bytes)
+            .ok()
+            .and_then(std::num::NonZeroU64::new)
+            .ok_or(super::WorkError::ArithmeticOverflow)
+    };
+    Ok(InternalCpuActionQuote {
+        metadata_bytes: nonzero(geometry.queue_record_inline.size())?,
+        physical_queue_bytes: nonzero(queue_bytes)?,
+    })
 }
 
 pub(super) fn geometry() -> Result<InternalCpuMetadataGeometry, LayoutResourceError> {
@@ -140,6 +188,7 @@ pub(super) fn geometry() -> Result<InternalCpuMetadataGeometry, LayoutResourceEr
         packet: arc_layout(Layout::new::<InternalCpuRetirement<Output>>())?,
         job: Layout::new::<InternalResultCpuJob<Output>>(),
         forwarder_frame: forwarder_layout(make_operation_forwarder),
+        worker_call: operation_call_layout(),
         retired: Layout::new::<InternalCpuRetired<Output>>(),
         opaque_carrier: QueryBlockingFailure::payload_holder_layout()?,
         forwarder_failure: arc_layout(Layout::new::<tokio::task::JoinError>())?,
@@ -161,10 +210,8 @@ mod tests {
         );
         assert!(actual.packet_layout().size() >= std::mem::size_of::<InternalDomainSlot>());
         assert!(actual.packet_layout().align() >= std::mem::align_of::<InternalDomainSlot>());
-        assert!(
-            actual.forwarder_frame_layout().size()
-                >= std::mem::size_of::<InternalResultOperation>()
-        );
+        assert!(actual.packet_layout().size() >= std::mem::size_of::<InternalResultOperation>());
+        assert_eq!(actual.worker_call_layout(), operation_call_layout());
         let one = actual.known_metadata_bytes_per_job().unwrap();
         assert!(one > actual.packet_layout().size());
         assert_eq!(actual.known_metadata_bytes_for_jobs(0), Ok(0));
@@ -179,9 +226,9 @@ mod tests {
     }
 
     #[test]
-    fn failure_carriers_are_one_worker_and_two_wakes_not_three_result_graphs() {
+    fn failure_carriers_are_worker_physical_and_two_wakes_not_four_result_graphs() {
         let actual = geometry().unwrap();
-        assert_eq!(actual.maximum_opaque_carriers_per_job(), 3);
+        assert_eq!(actual.maximum_opaque_carriers_per_job(), 4);
         assert_eq!(
             actual.opaque_carrier_layout(),
             QueryBlockingFailure::payload_holder_layout().unwrap()

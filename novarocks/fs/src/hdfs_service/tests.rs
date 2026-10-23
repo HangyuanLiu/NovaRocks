@@ -29,7 +29,11 @@ fn configured_client(builder: &HdfsServiceBuilder, directory: &std::path::Path) 
 async fn public_direct_and_effective_user_construction_needs_no_cluster() {
     let directory = tempfile::tempdir().unwrap();
     for user in [None, Some("alice"), Some("alice:team"), Some("alice@realm")] {
-        let builder = HdfsServiceBuilder::new("hdfs://namenode.invalid:8020", user);
+        let builder = HdfsServiceBuilder::new(
+            "hdfs://namenode.invalid:8020",
+            user,
+            tokio::runtime::Handle::current(),
+        );
         assert_eq!(
             builder.config.endpoint.as_deref(),
             Some("hdfs://namenode.invalid:8020")
@@ -45,7 +49,11 @@ async fn public_direct_and_effective_user_construction_needs_no_cluster() {
 #[tokio::test]
 async fn public_logical_ha_construction_uses_the_original_namespace() {
     let directory = tempfile::tempdir().unwrap();
-    let builder = HdfsServiceBuilder::new("hdfs://warehouse-ha", Some("alice"));
+    let builder = HdfsServiceBuilder::new(
+        "hdfs://warehouse-ha",
+        Some("alice"),
+        tokio::runtime::Handle::current(),
+    );
     let _client = configured_client(&builder, directory.path())
         .with_config([
             ("hadoop.security.authentication", "simple"),
@@ -110,7 +118,11 @@ fn error_projection_keeps_established_kinds_and_the_real_source() {
 #[tokio::test]
 async fn original_capabilities_do_not_gain_append_copy_or_presign() {
     let directory = tempfile::tempdir().unwrap();
-    let builder = HdfsServiceBuilder::new("hdfs://namenode.invalid:8020", Some("alice"));
+    let builder = HdfsServiceBuilder::new(
+        "hdfs://namenode.invalid:8020",
+        Some("alice"),
+        tokio::runtime::Handle::current(),
+    );
     let client = configured_client(&builder, directory.path())
         .build()
         .unwrap();
@@ -131,4 +143,53 @@ async fn original_capabilities_do_not_gain_append_copy_or_presign() {
         panic!("unchecked HDFS append was accepted")
     };
     assert_eq!(error.kind(), ErrorKind::Unsupported);
+}
+
+#[test]
+fn missing_runtime_configuration_refuses_before_client_construction() {
+    let builder = opendal::Configurator::into_builder(HdfsServiceConfig {
+        endpoint: Some("hdfs://namenode.invalid:8020".into()),
+        user: Some("alice".into()),
+    });
+    let error = builder
+        .client_builder()
+        .err()
+        .expect("runtime is mandatory");
+    assert_eq!(error.kind(), ErrorKind::ConfigInvalid);
+}
+
+#[test]
+fn public_client_built_off_runtime_uses_the_supplied_role_handle_on_last_drop() {
+    let role = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let observer = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    // There is deliberately no current Tokio context here. Without the public
+    // with_io_runtime consumption, the SDK would create an owned Runtime.
+    let builder = HdfsServiceBuilder::new(
+        "hdfs://namenode.invalid:8020",
+        Some("alice"),
+        role.handle().clone(),
+    );
+    let client = configured_client(&builder, directory.path())
+        .build()
+        .unwrap();
+    // Real last-client Drop on another nonblocking runtime thread must not
+    // attempt to synchronously shut down an SDK-owned Runtime. No RPC is sent.
+    let exited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        observer.block_on(async move {
+            drop(client);
+        });
+    }));
+    let role_still_owned = role.block_on(async { 29 });
+    drop(builder);
+    drop(observer);
+    drop(role);
+    assert!(exited.is_ok());
+    assert_eq!(role_still_owned, 29);
 }

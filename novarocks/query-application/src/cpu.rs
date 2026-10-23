@@ -497,6 +497,178 @@ pub struct QueryBlockingExecutor {
     handle: BoundedWorkerHandle<CpuResult>,
 }
 
+/// Original worker teardown failure, retained in the same fixed worker entry.
+/// Taking this value moves that exact custody; it does not acknowledge health
+/// or prove the held physical source has exited. Drop is explicit disposition.
+pub struct QueryBlockingWorkerFailure {
+    original: Box<dyn Any + Send>,
+}
+impl QueryBlockingWorkerFailure {
+    fn new(original: Box<dyn Any + Send>) -> Self {
+        Self { original }
+    }
+    pub fn cause(&self) -> Option<&QueryBlockingFailure> {
+        self.original
+            .downcast_ref::<bounded_worker::WorkerRetirementFailure>()
+            .map(|failure| failure.cause())
+    }
+    pub fn notification(&self, index: usize) -> Option<&QueryBlockingFailure> {
+        self.original
+            .downcast_ref::<bounded_worker::WorkerRetirementFailure>()?
+            .notification(index)
+    }
+    pub fn original_payload_is<T: Any>(&self) -> bool {
+        self.cause().map_or_else(
+            || self.original.is::<T>(),
+            |cause| cause.original_payload_is::<T>(),
+        )
+    }
+}
+impl std::fmt::Debug for QueryBlockingWorkerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryBlockingWorkerFailure")
+            .finish_non_exhaustive()
+    }
+}
+
+pub use bounded_worker::{
+    QueuePublishRefusal as QueryBlockingPublishRefusal,
+    QueueReserveRefusal as QueryBlockingReserveRefusal,
+    WorkerActualExitFailure as QueryBlockingActualExitFailure,
+};
+
+/// Only a position in the original pool, never a workload/finite-source grant.
+/// Its private weak identity prevents cross-pool publication without a new ID.
+#[must_use = "Keep the original reservation until acceptance or real refusal cleanup"]
+pub struct QueryBlockingReservation {
+    inner: bounded_worker::BoundedWorkerReservation,
+}
+impl std::fmt::Debug for QueryBlockingReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryBlockingReservation")
+            .finish_non_exhaustive()
+    }
+}
+/// A normal preparation refusal preserves the exact unexecuted F.
+pub struct QueryBlockingPrepareRefusal<F> {
+    reason: QueryBlockingPublishRefusal,
+    work: F,
+}
+impl<F> QueryBlockingPrepareRefusal<F> {
+    pub fn reason(&self) -> QueryBlockingPublishRefusal {
+        self.reason
+    }
+    pub fn into_work(self) -> F {
+        self.work
+    }
+}
+impl<F> std::fmt::Debug for QueryBlockingPrepareRefusal<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryBlockingPrepareRefusal")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The actual move-only boxed call and its one existing completion sender.
+/// The caller must pay captures/backing before preparation, after its grant.
+#[must_use = "Publish or dispose the same unexecuted input under its original custody"]
+pub struct QueryBlockingPreparedJob {
+    inner: Option<bounded_worker::BoundedWorkerPrepared<CpuResult>>,
+}
+impl QueryBlockingPreparedJob {
+    /// Requested Box-call layout only, excluding capture pointees and result.
+    pub fn call_layout(&self) -> std::alloc::Layout {
+        self.inner
+            .as_ref()
+            .expect("unpublished original call")
+            .call_layout()
+    }
+}
+impl std::fmt::Debug for QueryBlockingPreparedJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryBlockingPreparedJob")
+            .finish_non_exhaustive()
+    }
+}
+/// Same result channel, plus one independent actual-exit header. Keep this
+/// stable after poll_result: business output may precede physical source exit.
+#[must_use = "Result delivery is distinct from the original physical actual exit"]
+pub struct QueryBlockingReceipt<T> {
+    receipt: Option<bounded_worker::BoundedWorkerReceipt<CpuResult>>,
+    exit: Arc<bounded_worker::BoundedWorkerActualExit>,
+    _result: std::marker::PhantomData<fn() -> T>,
+}
+impl<T: Send + 'static> QueryBlockingReceipt<T> {
+    pub fn poll_result(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<T, QueryBlockingFailure>> {
+        use std::{future::Future, pin::Pin, task::Poll};
+        let Some(receipt) = self.receipt.as_mut() else {
+            return Poll::Ready(Err(QueryBlockingFailure::ExecutorClosed));
+        };
+        let result = std::task::ready!(Pin::new(&mut receipt.receiver).poll(cx));
+        self.receipt.take();
+        Poll::Ready(
+            result
+                .unwrap_or(Err(QueryBlockingFailure::ExecutorClosed))
+                .and_then(|value| {
+                    value
+                        .downcast::<T>()
+                        .map(|value| *value)
+                        .map_err(|original| {
+                            QueryBlockingFailure::InvalidResultType(
+                                QueryBlockingFailurePayload::new(original),
+                            )
+                        })
+                }),
+        )
+    }
+    pub fn poll_actual_exit(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), QueryBlockingActualExitFailure>> {
+        self.exit.poll(cx)
+    }
+    /// Same original failure carrier as the fixed worker entry, independent
+    /// of any earlier successful result. No raw payload or guard is copied.
+    pub fn actual_exit_failure(&self) -> Option<QueryBlockingFailure> {
+        self.exit.failure()
+    }
+}
+impl<T> std::fmt::Debug for QueryBlockingReceipt<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryBlockingReceipt")
+            .finish_non_exhaustive()
+    }
+}
+/// Notification for an already stable original queue publication. Drop also
+/// wakes the original workers; cancelling a caller cannot strand the row.
+pub struct QueryBlockingPublication {
+    inner: bounded_worker::BoundedWorkerPublication<CpuResult>,
+}
+impl QueryBlockingPublication {
+    pub fn notify(self) {
+        self.inner.notify();
+    }
+}
+
+/// Known inline/requested layouts of this exact original creator. This is not
+/// payment. Oneshot/platform Mutex backing, Waker and call/result pointees are
+/// deliberately not inferred from these layouts.
+#[derive(Clone, Copy, Debug)]
+pub struct QueryBlockingQueueGeometry {
+    pub reservation_inline: std::alloc::Layout,
+    pub prepared_inline: std::alloc::Layout,
+    pub receipt_inline: std::alloc::Layout,
+    pub publication_inline: std::alloc::Layout,
+    pub queue_record_inline: std::alloc::Layout,
+    pub worker_entry_inline: std::alloc::Layout,
+    pub retirement_failure_box: std::alloc::Layout,
+    pub actual_exit_header: std::alloc::Layout,
+}
+
 impl QueryCpuExecutorOwner {
     pub fn try_new(config: QueryCpuExecutorConfig) -> Result<Self, String> {
         let pool = Arc::new(ElasticPlanningPool::try_new(config)?);
@@ -596,6 +768,12 @@ impl QueryBlockingExecutorOwner {
         self.executor.clone()
     }
 
+    /// Only already-joined failures are movable. Shutdown retains them on Err;
+    /// the role owner must preserve or explicitly dispose this exact value.
+    pub fn take_worker_failure(&mut self) -> Option<QueryBlockingWorkerFailure> {
+        self.owner.take_worker_failure()
+    }
+
     /// Stops admission and joins the same fixed worker set.
     pub async fn shutdown_until(&mut self, deadline: Instant) -> Result<(), String> {
         self.owner
@@ -610,7 +788,129 @@ impl QueryBlockingExecutorOwner {
     }
 }
 
+fn preserving_call<T, F>(work: F) -> impl FnOnce() -> CpuResult + Send + 'static
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    move || Box::new(work()) as CpuResult
+}
+
 impl QueryBlockingExecutor {
+    /// The real same call factory's return layout, before allocating a job,
+    /// channel, observer header or constructing any F. No single-capture ABI
+    /// equivalence is assumed. Capture pointees remain the original author.
+    pub fn preserving_call_layout<T, F>() -> std::alloc::Layout
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        fn output_layout<I, O>(_: fn(I) -> O) -> std::alloc::Layout {
+            std::alloc::Layout::new::<O>()
+        }
+        output_layout(preserving_call::<T, F>)
+    }
+
+    /// Nonwaiting reservation in this exact original physical queue. New
+    /// Internal CPU composition must enforce all jobs jointly charged, L<=P
+    /// and Q>=P. This transport seam does not certify arbitrary FnOnce jobs.
+    pub fn try_reserve(&self) -> Result<QueryBlockingReservation, QueryBlockingReserveRefusal> {
+        self.handle
+            .try_reserve()
+            .map(|inner| QueryBlockingReservation { inner })
+    }
+
+    /// The original caller supplies an empty stable receipt slot before any
+    /// queue publication. Refusing a nonempty slot or foreign accepted reservation returns the untouched F.
+    /// Invoke only after original admission pays this actual call/frame/input.
+    pub fn prepare_preserving_in<T, F>(
+        &self,
+        physical: &mut novarocks_workload_control::joint_admission::JointLocalGrant<
+            QueryBlockingReservation,
+        >,
+        work: F,
+        receipt: &mut Option<QueryBlockingReceipt<T>>,
+    ) -> Result<QueryBlockingPreparedJob, QueryBlockingPrepareRefusal<F>>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let reason = if receipt.is_some() {
+            Some(QueryBlockingPublishRefusal::Empty)
+        } else if !self.handle.same_pool(&physical.physical_mut().inner) {
+            Some(QueryBlockingPublishRefusal::ForeignPool)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(QueryBlockingPrepareRefusal { reason, work });
+        }
+        let (prepared, original, exit) = self
+            .handle
+            .prepare(BoundedWorkerJob::new(preserving_call(work)));
+        *receipt = Some(QueryBlockingReceipt {
+            receipt: Some(original),
+            exit,
+            _result: std::marker::PhantomData,
+        });
+        Ok(QueryBlockingPreparedJob {
+            inner: Some(prepared),
+        })
+    }
+
+    /// Move only the same accepted grant and prepared call into the original
+    /// row. All refusal paths leave both original slots populated/unexecuted.
+    /// The same receipt must remain in its original stable caller through exit.
+    /// ```compile_fail
+    /// use novarocks_query_application::cpu::{QueryBlockingExecutor,
+    ///     QueryBlockingReservation, QueryBlockingPreparedJob};
+    /// fn raw_is_not_a_grant(executor: &QueryBlockingExecutor,
+    ///     mut raw: Option<QueryBlockingReservation>,
+    ///     mut job: Option<QueryBlockingPreparedJob>) {
+    ///     executor.publish_joint_in(&mut raw, &mut job);
+    /// }
+    /// ```
+    pub fn publish_joint_in(
+        &self,
+        physical: &mut Option<
+            novarocks_workload_control::joint_admission::JointLocalGrant<QueryBlockingReservation>,
+        >,
+        prepared: &mut Option<QueryBlockingPreparedJob>,
+    ) -> Result<QueryBlockingPublication, QueryBlockingPublishRefusal> {
+        // Borrow the original prepared field without allocating an adapter.
+        let Some(original) = prepared.as_mut() else {
+            return Err(QueryBlockingPublishRefusal::Empty);
+        };
+        self.handle
+            .publish_joint_in(&mut original.inner, physical)
+            .map(|inner| {
+                prepared.take();
+                QueryBlockingPublication { inner }
+            })
+    }
+
+    pub fn queue_geometry(
+        &self,
+    ) -> Result<
+        QueryBlockingQueueGeometry,
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+    > {
+        Ok(QueryBlockingQueueGeometry {
+            reservation_inline: std::alloc::Layout::new::<QueryBlockingReservation>(),
+            prepared_inline: std::alloc::Layout::new::<QueryBlockingPreparedJob>(),
+            receipt_inline: std::alloc::Layout::new::<QueryBlockingReceipt<()>>(),
+            publication_inline: std::alloc::Layout::new::<QueryBlockingPublication>(),
+            queue_record_inline: bounded_worker::queue_record_layout::<CpuResult>(),
+            worker_entry_inline: bounded_worker::worker_entry_layout(),
+            retirement_failure_box: std::alloc::Layout::new::<
+                bounded_worker::WorkerRetirementFailure,
+            >(),
+            actual_exit_header: novarocks_type_contract::owned_resources::layout::arc_layout(
+                std::alloc::Layout::new::<bounded_worker::BoundedWorkerActualExit>(),
+            )?,
+        })
+    }
+
     /// Original installed physical geometry, for composition checks. Reading
     /// this declaration does not reserve a worker or a waiting queue position.
     pub fn configured_capacity(&self) -> QueryBlockingExecutorConfig {
@@ -651,7 +951,7 @@ impl QueryBlockingExecutor {
     {
         let receipt = self
             .handle
-            .submit(BoundedWorkerJob::new(move || Box::new(work()) as CpuResult))
+            .submit(BoundedWorkerJob::new(preserving_call(work)))
             .await
             .map_err(|refused| {
                 // The original unexecuted input exits here, outside queue locks.
@@ -979,5 +1279,883 @@ mod tests {
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await
             .expect("shut down blocking workers");
+    }
+}
+
+#[cfg(test)]
+mod joint_queue_tests {
+    use super::*;
+    use novarocks_resource_contract::SharedDependency;
+    use novarocks_workload_control::joint_admission::*;
+    use novarocks_workload_control::{
+        ControlStorageConfig, WorkClass, WorkOwner, WorkRequest, WorkloadConfig, WorkloadControl,
+    };
+    use std::{
+        future::{Future, poll_fn},
+        pin::Pin,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        task::{Context, Poll, Wake, Waker},
+    };
+
+    fn joint_fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+        let count = 8;
+        let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 1, 2, &[]);
+        let mut config = JointCapacityConfig {
+            global: JointResourceLimits::default(),
+            classes: [JointResourceLimits::default(); 5],
+            lanes: [JointResourceLimits::default(); 3],
+            class_lanes: [[JointResourceLimits::default(); 3]; 5],
+            max_dependencies_per_claim: 2,
+            max_registered_dependencies: 402,
+            max_claims: 16,
+            max_requests: 16,
+            max_changes_per_request: 4,
+            max_snapshot_bytes: 16 * 1024 * 1024,
+            max_scratch_bytes: 16 * 1024 * 1024,
+            max_residual_arcs: 10000,
+            max_total_proof_work: 10000000,
+            work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
+        };
+        let base = storage.base_charge(&config).unwrap();
+        let m = base.get(JointResource::MetadataBytes);
+        let b = bounded_worker::queue_record_layout::<CpuResult>().size() as u64;
+        // This fixture protects a real one-job increment. It quotes only the
+        // original row's known inline envelope, not a complete Native source/frame.
+        let step = JointResources::ZERO
+            .with(JointResource::ClaimRecords, 1)
+            .with(JointResource::InternalCpuJobs, 1)
+            .with(JointResource::PhysicalQueueRecords, 1)
+            .with(JointResource::PhysicalQueueBytes, b);
+        let progress = base
+            .with(
+                JointResource::ClaimRecords,
+                base.get(JointResource::ClaimRecords) + 1,
+            )
+            .with(JointResource::InternalCpuJobs, 1)
+            .with(JointResource::PhysicalQueueRecords, 1)
+            .with(JointResource::PhysicalQueueBytes, b);
+        let custody = JointResourceLimits {
+            global: JointResources::ZERO
+                .with(JointResource::ScopeRecords, 8)
+                .with(JointResource::ClaimRecords, 12)
+                .with(JointResource::MetadataBytes, m * 16)
+                .with(JointResource::PayloadBytes, 64)
+                .with(JointResource::UnreceivedProductions, 1),
+            per_dependency: JointResources::ZERO
+                .with(JointResource::ScopeRecords, 7)
+                .with(JointResource::ClaimRecords, 12)
+                .with(JointResource::MetadataBytes, m * 8)
+                .with(JointResource::PayloadBytes, 64)
+                .with(JointResource::UnreceivedProductions, 1),
+            protected_progress: base,
+        };
+        let foreground = JointResourceLimits {
+            global: JointResources::ZERO
+                .with(JointResource::ClaimRecords, 4)
+                .with(JointResource::MetadataBytes, m * 16)
+                .with(JointResource::PayloadBytes, 32)
+                .with(JointResource::Computations, 1)
+                .with(JointResource::InternalCpuJobs, 3)
+                .with(JointResource::PhysicalQueueRecords, 3)
+                .with(JointResource::PhysicalQueueBytes, b * 3),
+            per_dependency: JointResources::ZERO
+                .with(JointResource::ClaimRecords, 4)
+                .with(JointResource::MetadataBytes, m * 8)
+                .with(JointResource::PayloadBytes, 32)
+                .with(JointResource::Computations, 1)
+                .with(JointResource::PhysicalQueueBytes, b * 2)
+                .with(JointResource::InternalCpuJobs, 2)
+                .with(JointResource::PhysicalQueueRecords, 2),
+            protected_progress: step,
+        };
+        let global = JointResourceLimits {
+            global: JointResources::ZERO
+                .with(JointResource::ScopeRecords, 8)
+                .with(JointResource::ClaimRecords, 16)
+                .with(JointResource::MetadataBytes, m * 32)
+                .with(JointResource::PayloadBytes, 96)
+                .with(JointResource::UnreceivedProductions, 1)
+                .with(JointResource::Computations, 1)
+                .with(JointResource::InternalCpuJobs, 3)
+                .with(JointResource::PhysicalQueueRecords, 3)
+                .with(JointResource::PhysicalQueueBytes, b * 3),
+            per_dependency: JointResources::ZERO
+                .with(JointResource::ScopeRecords, 7)
+                .with(JointResource::ClaimRecords, 16)
+                .with(JointResource::MetadataBytes, m * 16)
+                .with(JointResource::PayloadBytes, 96)
+                .with(JointResource::UnreceivedProductions, 1)
+                .with(JointResource::Computations, 1)
+                .with(JointResource::PhysicalQueueBytes, b * 2)
+                .with(JointResource::InternalCpuJobs, 2)
+                .with(JointResource::PhysicalQueueRecords, 2),
+            protected_progress: progress,
+        };
+        config.global = global;
+        config.classes[0] = global;
+        config.lanes[0] = custody;
+        config.lanes[1] = foreground;
+        config.class_lanes[0][0] = custody;
+        config.class_lanes[0][1] = foreground;
+        // Real CPU/queue minimum one is preserved. This still does not qualify
+        // complete Native captures, task frames, physical lanes or source facts.
+        let mut required = RequiredJointProgress {
+            global: progress,
+            classes: [JointResources::ZERO; 5],
+            lanes: [JointResources::ZERO; 3],
+            class_lanes: [[JointResources::ZERO; 3]; 5],
+        };
+        required.classes[0] = progress;
+        required.lanes[0] = base;
+        required.class_lanes[0][0] = base;
+        required.lanes[1] = step;
+        required.class_lanes[0][1] = step;
+        let control = WorkloadControl::try_new_counted(WorkloadConfig {
+            root_limit: count,
+            business_limit: count,
+            query_concurrency_limit: count,
+            scope_records_limit: count,
+            ..WorkloadConfig::default()
+        })
+        .unwrap()
+        .owner;
+        let (handle, driver) = control
+            .configure_joint_capacity(config.validate(&required).unwrap())
+            .unwrap();
+        control.configure_control_storage(storage).unwrap();
+        control.mark_ready().unwrap();
+        (control, handle, driver)
+    }
+
+    fn drive(driver: &mut JointProgressDriver) {
+        for _ in 0..10000 {
+            if matches!(driver.step(), JointProgress::Idle(_)) {
+                return;
+            }
+        }
+        panic!("original proof driver failed to reach idle");
+    }
+    fn root(
+        control: &WorkloadControl,
+        driver: &mut JointProgressDriver,
+    ) -> novarocks_workload_control::RootWork {
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let scope = root.owner.scope();
+        let mut proposal = scope.begin_control_binding().unwrap();
+        proposal
+            .push_dependency(&SharedDependency::LocalHost)
+            .unwrap();
+        proposal.end_change().unwrap();
+        let mut admission = proposal.submit().unwrap();
+        drive(driver);
+        let Poll::Ready(Ok(mut batch)) =
+            Pin::new(&mut admission).poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("control FirstBind");
+        };
+        batch
+            .adjustment
+            .as_mut()
+            .unwrap()
+            .install_control_scope_in(&scope)
+            .unwrap()
+            .notify();
+        drop(batch);
+        drive(driver);
+        root
+    }
+    fn request(handle: &JointAdmissionHandle, owner: &WorkOwner) -> JointAdmission {
+        let b = bounded_worker::queue_record_layout::<CpuResult>().size() as u64;
+        let mut proposal = handle.begin_paid_proposal(owner).unwrap();
+        proposal
+            .begin_new(
+                JointLane::Foreground,
+                JointResources::ZERO
+                    .with(JointResource::ClaimRecords, 1)
+                    .with(JointResource::InternalCpuJobs, 1)
+                    .with(JointResource::PhysicalQueueRecords, 1)
+                    .with(JointResource::PhysicalQueueBytes, b),
+            )
+            .unwrap();
+        proposal
+            .push_dependency(&SharedDependency::LocalHost)
+            .unwrap();
+        proposal.end_change().unwrap();
+        proposal.submit().unwrap()
+    }
+    fn accept(
+        executor: &QueryBlockingExecutor,
+        request: &mut JointAdmission,
+        driver: &mut JointProgressDriver,
+    ) -> JointLocalGrant<QueryBlockingReservation> {
+        drive(driver);
+        let mut offer = match request.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(offer)) => offer,
+            _ => panic!("expected original finite offer"),
+        };
+        let mut original = Some(executor.try_reserve().unwrap());
+        let mut stable = None;
+        offer
+            .accept_in(&mut original, &mut stable)
+            .unwrap()
+            .notify();
+        stable.unwrap()
+    }
+    fn worker() -> (QueryBlockingExecutorOwner, QueryBlockingExecutor) {
+        let owner = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
+            NonZeroUsize::new(3).unwrap(),
+            NonZeroUsize::new(3).unwrap(),
+        ))
+        .unwrap();
+        let executor = owner.executor();
+        (owner, executor)
+    }
+    async fn result<T: Send + 'static>(
+        receipt: &mut QueryBlockingReceipt<T>,
+    ) -> Result<T, QueryBlockingFailure> {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            poll_fn(|cx| receipt.poll_result(cx)),
+        )
+        .await
+        .unwrap()
+    }
+    async fn exited<T: Send + 'static>(
+        receipt: &QueryBlockingReceipt<T>,
+    ) -> Result<(), QueryBlockingActualExitFailure> {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            poll_fn(|cx| receipt.poll_actual_exit(cx)),
+        )
+        .await
+        .unwrap()
+    }
+    async fn receive<T>(receiver: &std::sync::mpsc::Receiver<T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match receiver.try_recv() {
+                    Ok(value) => return value,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                    Err(error) => panic!("observation channel closed: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+    async fn shutdown(owner: &mut QueryBlockingExecutorOwner) {
+        owner
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ungranted_reservations_execute_nothing_and_foreign_publish_preserves_originals() {
+        let (control, handle, mut driver) = joint_fixture();
+        let root = root(&control, &mut driver);
+        let (mut a_owner, a) = worker();
+        let (mut b_owner, b) = worker();
+        let reservation = a.try_reserve().unwrap();
+        assert_eq!(a.handle.snapshot().queued, 0);
+        drop(reservation);
+        let mut request = request(&handle, &root.owner);
+        let mut physical = Some(accept(&a, &mut request, &mut driver));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let original_runs = Arc::clone(&runs);
+        let mut receipt = None;
+        let text = String::from("original move-only input");
+        let address = text.as_ptr() as usize;
+        let work = move || {
+            assert_eq!(text.as_ptr() as usize, address);
+            assert_eq!(text, "original move-only input");
+            original_runs.fetch_add(1, Ordering::SeqCst);
+            17usize
+        };
+        fn quote<T: Send + 'static, F: FnOnce() -> T + Send + 'static>(
+            _: &F,
+        ) -> std::alloc::Layout {
+            QueryBlockingExecutor::preserving_call_layout::<T, F>()
+        }
+        let quoted = quote(&work);
+        let mut prepared = Some(
+            a.prepare_preserving_in(physical.as_mut().unwrap(), work, &mut receipt)
+                .unwrap(),
+        );
+        assert_eq!(prepared.as_ref().unwrap().call_layout(), quoted);
+        assert_eq!(
+            b.publish_joint_in(&mut physical, &mut prepared).err(),
+            Some(QueryBlockingPublishRefusal::ForeignPool)
+        );
+        assert!(physical.is_some() && prepared.is_some());
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        a.publish_joint_in(&mut physical, &mut prepared)
+            .unwrap()
+            .notify();
+        assert!(physical.is_none() && prepared.is_none());
+        let mut receipt = receipt.unwrap();
+        assert_eq!(result(&mut receipt).await.unwrap(), 17);
+        exited(&receipt).await.unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        shutdown(&mut a_owner).await;
+        shutdown(&mut b_owner).await;
+    }
+
+    struct PausedWake {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        once: AtomicBool,
+    }
+    impl Wake for PausedWake {
+        fn wake(self: Arc<Self>) {
+            if !self.once.swap(true, Ordering::SeqCst) {
+                let _ = self.entered.send(());
+                // Bounded even if the controller assertion unwinds.
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5));
+            }
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn early_result_does_not_release_running_physical_or_publish_actual_exit() {
+        let (control, handle, mut driver) = joint_fixture();
+        let first = root(&control, &mut driver);
+        let second = root(&control, &mut driver);
+        let third = root(&control, &mut driver);
+        let (mut owner, executor) = worker();
+        let mut a = request(&handle, &first.owner);
+        let mut physical = Some(accept(&executor, &mut a, &mut driver));
+        let mut b = request(&handle, &second.owner);
+        let held = accept(&executor, &mut b, &mut driver);
+        let mut blocked = request(&handle, &third.owner);
+        drive(&mut driver);
+        let mut receipt = None;
+        let mut prepared = Some(
+            executor
+                .prepare_preserving_in(physical.as_mut().unwrap(), || 23usize, &mut receipt)
+                .unwrap(),
+        );
+        let mut receipt = receipt.unwrap();
+        let (entered, did_enter) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let wake = Waker::from(Arc::new(PausedWake {
+            entered,
+            release: Mutex::new(released),
+            once: AtomicBool::new(false),
+        }));
+        assert!(
+            receipt
+                .poll_result(&mut Context::from_waker(&wake))
+                .is_pending()
+        );
+        executor
+            .publish_joint_in(&mut physical, &mut prepared)
+            .unwrap()
+            .notify();
+        receive(&did_enter).await;
+        assert!(matches!(
+            receipt.poll_result(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(23))
+        ));
+        assert!(
+            receipt
+                .poll_actual_exit(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(executor.handle.snapshot().running, 1);
+        drive(&mut driver);
+        assert!(matches!(
+            blocked.poll_local_offer(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(JointAdmissionFailure {
+                error: novarocks_workload_control::WorkError::Capacity(
+                    "joint protected intersections"
+                )
+            }))
+        ));
+        // This paid request has one finite verdict. It cannot self-convert to
+        // a capacity waiter; only a new intent after real exit can be admitted.
+        drop(blocked);
+        release.send(()).unwrap();
+        exited(&receipt).await.unwrap();
+        let mut blocked = request(&handle, &third.owner);
+        drive(&mut driver);
+        let mut offer = match blocked.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(offer)) => offer,
+            _ => panic!("a new intent progresses only after original actual exit"),
+        };
+        let mut no_physical: Option<QueryBlockingReservation> = None;
+        offer
+            .reobserve_after_drop(&mut no_physical)
+            .unwrap()
+            .notify();
+        drop(offer);
+        drop(blocked);
+        drop(held);
+        shutdown(&mut owner).await;
+    }
+
+    struct PanicTag(Arc<AtomicUsize>);
+    impl Drop for PanicTag {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[tokio::test]
+    async fn caught_call_panic_returns_physical_but_keeps_the_original_payload() {
+        let (control, handle, mut driver) = joint_fixture();
+        let first = root(&control, &mut driver);
+        let second = root(&control, &mut driver);
+        let third = root(&control, &mut driver);
+        let (mut owner, executor) = worker();
+        let mut held_request = request(&handle, &second.owner);
+        let held = accept(&executor, &mut held_request, &mut driver);
+        let mut pending = request(&handle, &first.owner);
+        let mut physical = Some(accept(&executor, &mut pending, &mut driver));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let raw = Arc::clone(&dropped);
+        let mut receipt = None;
+        let mut prepared = Some(
+            executor
+                .prepare_preserving_in(
+                    physical.as_mut().unwrap(),
+                    move || -> usize {
+                        std::panic::panic_any(PanicTag(raw));
+                    },
+                    &mut receipt,
+                )
+                .unwrap(),
+        );
+        executor
+            .publish_joint_in(&mut physical, &mut prepared)
+            .unwrap()
+            .notify();
+        let mut receipt = receipt.unwrap();
+        let cause = result(&mut receipt).await.unwrap_err();
+        assert!(cause.original_payload_is::<PanicTag>());
+        exited(&receipt).await.unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        let mut next = request(&handle, &third.owner);
+        drive(&mut driver);
+        let mut next_offer = match next.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(offer)) => offer,
+            _ => panic!("CPU returned while same panic payload remains alive"),
+        };
+        let mut no_physical: Option<QueryBlockingReservation> = None;
+        next_offer
+            .reobserve_after_drop(&mut no_physical)
+            .unwrap()
+            .notify();
+        drop(next_offer);
+        drop(next);
+        drop(held);
+        let reservations = [
+            executor.try_reserve().unwrap(),
+            executor.try_reserve().unwrap(),
+            executor.try_reserve().unwrap(),
+        ];
+        assert_eq!(
+            executor.try_reserve().err(),
+            Some(QueryBlockingReserveRefusal::Full)
+        );
+        drop(reservations);
+        shutdown(&mut owner).await;
+        assert!(owner.take_worker_failure().is_none());
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(cause);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    struct DropGate {
+        started: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        finished: Arc<AtomicBool>,
+    }
+    impl Drop for DropGate {
+        fn drop(&mut self) {
+            let _ = self.started.send(());
+            let _ = self.release.recv_timeout(Duration::from_secs(5));
+            self.finished.store(true, Ordering::SeqCst);
+        }
+    }
+    async fn park_all_legacy_workers(
+        executor: &QueryBlockingExecutor,
+    ) -> Vec<std::sync::mpsc::SyncSender<()>> {
+        let mut releases = Vec::new();
+        for _ in 0..3 {
+            let (start, started) = std::sync::mpsc::sync_channel(1);
+            let (release, released) = std::sync::mpsc::sync_channel(1);
+            let receipt = executor
+                .handle
+                .try_submit(BoundedWorkerJob::new(move || {
+                    let _ = start.send(());
+                    let _ = released.recv_timeout(Duration::from_secs(5));
+                    Box::new(()) as CpuResult
+                }))
+                .unwrap();
+            receive(&started).await;
+            drop(receipt);
+            releases.push(release);
+        }
+        releases
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_destroys_the_unexecuted_joint_input_before_physical_exit() {
+        let (control, handle, mut driver) = joint_fixture();
+        let root = root(&control, &mut driver);
+        let (mut owner, executor) = worker();
+        // Legacy blockers only force this interoperability close path. They
+        // are deliberately not part of a host-finite/profile qualification.
+        let parked = park_all_legacy_workers(&executor).await;
+        let mut pending = request(&handle, &root.owner);
+        let mut physical = Some(accept(&executor, &mut pending, &mut driver));
+        let (start, started) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let finished = Arc::new(AtomicBool::new(false));
+        let input = DropGate {
+            started: start,
+            release: released,
+            finished: Arc::clone(&finished),
+        };
+        let runs = Arc::new(AtomicUsize::new(0));
+        let actual_runs = Arc::clone(&runs);
+        let mut receipt = None;
+        let mut prepared = Some(
+            executor
+                .prepare_preserving_in(
+                    physical.as_mut().unwrap(),
+                    move || {
+                        actual_runs.fetch_add(1, Ordering::SeqCst);
+                        drop(input);
+                        29usize
+                    },
+                    &mut receipt,
+                )
+                .unwrap(),
+        );
+        executor
+            .publish_joint_in(&mut physical, &mut prepared)
+            .unwrap()
+            .notify();
+        owner.request_shutdown_for_process_exit();
+        for release in parked {
+            let _ = release.send(());
+        }
+        receive(&started).await;
+        let mut receipt = receipt.unwrap();
+        assert!(
+            receipt
+                .poll_actual_exit(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert!(!finished.load(Ordering::SeqCst));
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        release.send(()).unwrap();
+        assert!(matches!(
+            result(&mut receipt).await,
+            Err(QueryBlockingFailure::ExecutorClosed)
+        ));
+        exited(&receipt).await.unwrap();
+        assert!(finished.load(Ordering::SeqCst));
+        shutdown(&mut owner).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    struct PanicOnDrop(Arc<AtomicUsize>);
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            std::panic::panic_any(PanicTag(Arc::clone(&self.0)));
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_input_drop_panic_is_unproven_and_retained_by_the_original_worker_entry() {
+        let (control, handle, mut driver) = joint_fixture();
+        let root = root(&control, &mut driver);
+        let (mut owner, executor) = worker();
+        let parked = park_all_legacy_workers(&executor).await;
+        let mut pending = request(&handle, &root.owner);
+        let mut physical = Some(accept(&executor, &mut pending, &mut driver));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let input = PanicOnDrop(Arc::clone(&dropped));
+        let mut receipt = None;
+        let mut prepared = Some(
+            executor
+                .prepare_preserving_in(
+                    physical.as_mut().unwrap(),
+                    move || {
+                        drop(input);
+                        31usize
+                    },
+                    &mut receipt,
+                )
+                .unwrap(),
+        );
+        executor
+            .publish_joint_in(&mut physical, &mut prepared)
+            .unwrap()
+            .notify();
+        owner.request_shutdown_for_process_exit();
+        for release in parked {
+            let _ = release.send(());
+        }
+        let mut receipt = receipt.unwrap();
+        let cause = result(&mut receipt).await.unwrap_err();
+        assert_eq!(
+            exited(&receipt).await,
+            Err(QueryBlockingActualExitFailure::FailedUnproven)
+        );
+        assert!(cause.original_payload_is::<PanicTag>());
+        assert!(
+            receipt
+                .actual_exit_failure()
+                .unwrap()
+                .shares_original_with(&cause)
+        );
+        assert!(
+            owner
+                .shutdown_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+        let failure = owner
+            .take_worker_failure()
+            .expect("same fixed joined entry");
+        assert!(failure.cause().unwrap().shares_original_with(&cause));
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        // Actual disposition of the opaque entry is not an observer success.
+        drop(failure);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(cause);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(receipt);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+    struct DropCount(Arc<AtomicUsize>);
+    impl Drop for DropCount {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[tokio::test]
+    async fn close_between_reserve_and_publish_returns_both_original_slots_without_execution() {
+        let (control, handle, mut driver) = joint_fixture();
+        let root = root(&control, &mut driver);
+        let (mut owner, executor) = worker();
+        let mut pending = request(&handle, &root.owner);
+        let mut physical = Some(accept(&executor, &mut pending, &mut driver));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let input = DropCount(Arc::clone(&dropped));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let original_runs = Arc::clone(&runs);
+        let mut receipt = None;
+        let mut prepared = Some(
+            executor
+                .prepare_preserving_in(
+                    physical.as_mut().unwrap(),
+                    move || {
+                        original_runs.fetch_add(1, Ordering::SeqCst);
+                        drop(input);
+                        37usize
+                    },
+                    &mut receipt,
+                )
+                .unwrap(),
+        );
+        owner.request_shutdown_for_process_exit();
+        assert_eq!(
+            executor
+                .publish_joint_in(&mut physical, &mut prepared)
+                .err(),
+            Some(QueryBlockingPublishRefusal::Closed)
+        );
+        assert!(physical.is_some() && prepared.is_some());
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        let mut receipt = receipt.unwrap();
+        assert!(
+            receipt
+                .poll_result(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        // The source never entered the row. Explicit original-caller cleanup,
+        // not the receipt observer, retires these unpublished values in order.
+        drop(prepared.take());
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        drop(physical.take());
+        shutdown(&mut owner).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert!(
+            receipt
+                .poll_actual_exit(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn undelivered_output_drop_finishes_before_guard_refund_and_actual_exit() {
+        let (control, handle, mut driver) = joint_fixture();
+        let first = root(&control, &mut driver);
+        let second = root(&control, &mut driver);
+        let third = root(&control, &mut driver);
+        let (mut owner, executor) = worker();
+        let mut held_request = request(&handle, &second.owner);
+        let held = accept(&executor, &mut held_request, &mut driver);
+        let mut pending = request(&handle, &first.owner);
+        let mut physical = Some(accept(&executor, &mut pending, &mut driver));
+        let (started, did_start) = std::sync::mpsc::sync_channel(1);
+        let (release_work, released_work) = std::sync::mpsc::sync_channel(1);
+        let (dropping, did_drop) = std::sync::mpsc::sync_channel(1);
+        let (release_drop, released_drop) = std::sync::mpsc::sync_channel(1);
+        let finished = Arc::new(AtomicBool::new(false));
+        let output = DropGate {
+            started: dropping,
+            release: released_drop,
+            finished: Arc::clone(&finished),
+        };
+        let mut receipt = None;
+        let mut prepared = Some(
+            executor
+                .prepare_preserving_in(
+                    physical.as_mut().unwrap(),
+                    move || {
+                        let _ = started.send(());
+                        let _ = released_work.recv_timeout(Duration::from_secs(5));
+                        output
+                    },
+                    &mut receipt,
+                )
+                .unwrap(),
+        );
+        executor
+            .publish_joint_in(&mut physical, &mut prepared)
+            .unwrap()
+            .notify();
+        receive(&did_start).await;
+        let receipt = receipt.unwrap();
+        // A test-only alias of this same header observes the receipt-drop
+        // negative path; production callers keep their original opaque receipt.
+        let exit = Arc::clone(&receipt.exit);
+        drop(receipt);
+        release_work.send(()).unwrap();
+        receive(&did_drop).await;
+        assert!(!finished.load(Ordering::SeqCst));
+        assert!(
+            exit.poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(executor.handle.snapshot().running, 1);
+        let mut blocked = request(&handle, &third.owner);
+        drive(&mut driver);
+        assert!(matches!(
+            blocked.poll_local_offer(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(JointAdmissionFailure {
+                error: novarocks_workload_control::WorkError::Capacity(
+                    "joint protected intersections"
+                )
+            }))
+        ));
+        drop(blocked);
+        release_drop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), poll_fn(|cx| exit.poll(cx)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(finished.load(Ordering::SeqCst));
+        let mut blocked = request(&handle, &third.owner);
+        drive(&mut driver);
+        let mut offer = match blocked.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(offer)) => offer,
+            _ => panic!("a new intent progresses only after actual output Drop"),
+        };
+        let mut no_physical: Option<QueryBlockingReservation> = None;
+        offer
+            .reobserve_after_drop(&mut no_physical)
+            .unwrap()
+            .notify();
+        drop(offer);
+        drop(blocked);
+        drop(held);
+        shutdown(&mut owner).await;
+    }
+    struct PanicOnceWake {
+        armed: AtomicBool,
+        dropped: Arc<AtomicUsize>,
+    }
+    impl Wake for PanicOnceWake {
+        fn wake(self: Arc<Self>) {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                std::panic::panic_any(PanicTag(Arc::clone(&self.dropped)));
+            }
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_result_and_failed_physical_cleanup_share_the_actual_original_cause() {
+        let (control, handle, mut driver) = joint_fixture();
+        let root = root(&control, &mut driver);
+        let (mut owner, executor) = worker();
+        let mut pending = request(&handle, &root.owner);
+        let mut physical = Some(accept(&executor, &mut pending, &mut driver));
+        let (started, did_start) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let mut receipt = None;
+        let mut prepared = Some(
+            executor
+                .prepare_preserving_in(
+                    physical.as_mut().unwrap(),
+                    move || {
+                        let _ = started.send(());
+                        let _ = released.recv_timeout(Duration::from_secs(5));
+                        41usize
+                    },
+                    &mut receipt,
+                )
+                .unwrap(),
+        );
+        executor
+            .publish_joint_in(&mut physical, &mut prepared)
+            .unwrap()
+            .notify();
+        receive(&did_start).await;
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let wake = Waker::from(Arc::new(PanicOnceWake {
+            armed: AtomicBool::new(true),
+            dropped: Arc::clone(&dropped),
+        }));
+        let mut progress = Box::pin(control.wait_progress(control.progress_revision()));
+        assert!(
+            progress
+                .as_mut()
+                .poll(&mut Context::from_waker(&wake))
+                .is_pending()
+        );
+        release.send(()).unwrap();
+        let mut receipt = receipt.unwrap();
+        assert_eq!(result(&mut receipt).await.unwrap(), 41);
+        assert_eq!(
+            exited(&receipt).await,
+            Err(QueryBlockingActualExitFailure::FailedUnproven)
+        );
+        let cause = receipt
+            .actual_exit_failure()
+            .expect("successful result is not the physical failure");
+        assert!(cause.original_payload_is::<PanicTag>());
+        assert!(
+            owner
+                .shutdown_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+        let retained = owner.take_worker_failure().unwrap();
+        assert!(retained.cause().unwrap().shares_original_with(&cause));
+        drop(progress);
+        drop(retained);
+        drop(cause);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(receipt);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 }

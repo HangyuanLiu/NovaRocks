@@ -1137,7 +1137,7 @@ pub fn compose_connector_file_planning_resources(
     );
     Ok(FsAccessResources::new(
         pool,
-        FsAccessResolver::new(),
+        FsAccessResolver::with_runtime(runtime.clone()),
         std::sync::Arc::new(TokioFileIoRuntime::new(runtime.clone())),
         std::sync::Arc::new(TokioFileTaskSpawner::new(runtime)),
     ))

@@ -48,6 +48,7 @@ struct State {
     closing: bool,
     receipt: Option<Result<(), QueryExecutionError>>,
     domain_failure: Option<InternalDomainFailure>,
+    cpu_admission_failure: Option<novarocks_workload_control::WorkError>,
 }
 
 /// This object belongs to the registered consumer/statement holder, outside
@@ -134,6 +135,7 @@ impl DomainCpuCustody {
                 closing: false,
                 receipt: None,
                 domain_failure: None,
+                cpu_admission_failure: None,
             }),
             binding,
             cpu,
@@ -171,7 +173,7 @@ impl DomainCpuCustody {
     }
 
     fn start(&self, operation: Operation) -> Result<(), QueryExecutionError> {
-        let (input, computation) = {
+        let (input, computation, source) = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             if state.closing || state.busy || state.job.is_some() {
                 return Err(domain_error(
@@ -180,6 +182,24 @@ impl DomainCpuCustody {
             }
             // Checked retain is a callback-free original State transaction.
             // The stable grant remains here until the complete receiving cut.
+            let source = match state
+                .computation
+                .as_ref()
+                .map(|grant| grant.cpu_action_source(self.binding.scope()))
+                .transpose()
+            {
+                Ok(source) => source,
+                Err(error) => {
+                    let projected =
+                        QueryExecutionError::from_execution(ExecutionFailureInput::new(
+                            error.failure_fact(),
+                            SafeDetail::truncating("stage CPU action source is unavailable"),
+                            ExecutionFailureSite::Coordinator,
+                        ));
+                    state.cpu_admission_failure = Some(error);
+                    return Err(projected);
+                }
+            };
             let computation = state
                 .computation
                 .as_ref()
@@ -192,7 +212,7 @@ impl DomainCpuCustody {
                 .ok_or_else(|| domain_error("internal decoder has no serial input"))?;
             state.busy = true;
             state.receipt = None;
-            (input, computation)
+            (input, computation, source)
         };
         let tracked = match computation {
             Some(computation) => input.track_computation_exit(&self.binding, computation),
@@ -211,13 +231,26 @@ impl DomainCpuCustody {
                 return Err(error);
             }
         };
-        let job = self.cpu.submit_operation(
-            input,
-            self.cancellation.clone(),
-            &self.runtime,
-            Arc::new(NotifyWake::new(Arc::new(tokio::sync::Notify::new()))),
-            operation,
-        );
+        let wake = Arc::new(NotifyWake::new(Arc::new(tokio::sync::Notify::new())));
+        let job = match source {
+            Some(source) => self.cpu.submit_root_operation(
+                input,
+                source,
+                self.cancellation.clone(),
+                &self.runtime,
+                wake,
+                operation,
+            ),
+            // Explicit old non-Root path. It grants no joint/finite-source
+            // qualification; all Root-backed domains above require the source.
+            None => self.cpu.submit_operation(
+                input,
+                self.cancellation.clone(),
+                &self.runtime,
+                wake,
+                operation,
+            ),
+        };
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.job = Some(job);
         // A concurrent close sees busy and retains this exact job. Receipt
@@ -664,6 +697,408 @@ mod tests {
         root.business.release();
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
         owner
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod root_action_tests {
+    use super::*;
+    use crate::query_execution::internal_result_cpu::{
+        INTERNAL_PEAK_BYTES, InternalResultCpuOwner,
+    };
+    use crate::query_execution::statistics::StatisticsRootResultDecoder;
+    use novarocks_query_application::cancellation::{
+        QueryCancellationReason, QueryCancellationSource,
+    };
+    use novarocks_resource_contract::SharedDependency;
+    use novarocks_workload_control::joint_admission::*;
+    use novarocks_workload_control::{
+        ControlStorageConfig, WorkClass, WorkOwner, WorkRequest, WorkScope, WorkloadConfig,
+        WorkloadControl,
+    };
+    use std::{
+        future::Future,
+        num::NonZeroU64,
+        pin::Pin,
+        task::Waker,
+        time::{Duration, Instant},
+    };
+    fn root_control(
+        cpu: &InternalResultCpu,
+    ) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+        let lane = JointLane::Foreground;
+        let cpu_jobs = cpu.configured_capacity().worker_threads().get() as u64;
+        assert!(cpu.configured_capacity().queue_capacity().get() >= cpu_jobs as usize);
+        let quote = cpu.operation_action_quote().unwrap();
+        let count = 8;
+        let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 1, 2, &[]);
+        let mut config = JointCapacityConfig {
+            global: JointResourceLimits::default(),
+            classes: [JointResourceLimits::default(); 5],
+            lanes: [JointResourceLimits::default(); 3],
+            class_lanes: [[JointResourceLimits::default(); 3]; 5],
+            max_dependencies_per_claim: 2,
+            max_registered_dependencies: 266,
+            max_claims: 16,
+            max_requests: 16,
+            max_changes_per_request: 2,
+            max_snapshot_bytes: 16 * 1024 * 1024,
+            max_scratch_bytes: 16 * 1024 * 1024,
+            max_residual_arcs: 10000,
+            max_total_proof_work: 10000000,
+            work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
+        };
+        let base = storage.base_charge(&config).unwrap();
+        let m = base.get(JointResource::MetadataBytes);
+        let custody = JointResourceLimits {
+            global: JointResources::ZERO
+                .with(JointResource::ScopeRecords, 8)
+                .with(JointResource::ClaimRecords, 12)
+                .with(JointResource::MetadataBytes, m * 16)
+                .with(
+                    JointResource::PayloadBytes,
+                    crate::query_execution::internal_result_cpu::INTERNAL_PEAK_BYTES * 2,
+                )
+                .with(JointResource::UnreceivedProductions, 1),
+            per_dependency: JointResources::ZERO
+                .with(JointResource::ScopeRecords, 7)
+                .with(JointResource::ClaimRecords, 12)
+                .with(JointResource::MetadataBytes, m * 8)
+                .with(
+                    JointResource::PayloadBytes,
+                    crate::query_execution::internal_result_cpu::INTERNAL_PEAK_BYTES * 2,
+                )
+                .with(JointResource::UnreceivedProductions, 1),
+            protected_progress: base,
+        };
+        let foreground = JointResourceLimits {
+            global: JointResources::ZERO
+                .with(JointResource::ClaimRecords, 4)
+                .with(JointResource::MetadataBytes, m * 16)
+                .with(JointResource::PayloadBytes, 32)
+                .with(JointResource::Computations, 1)
+                .with(JointResource::InternalCpuJobs, cpu_jobs)
+                .with(JointResource::PhysicalQueueRecords, cpu_jobs)
+                .with(
+                    JointResource::PhysicalQueueBytes,
+                    cpu_jobs * quote.physical_queue_bytes.get(),
+                ),
+            per_dependency: JointResources::ZERO
+                .with(JointResource::ClaimRecords, 4)
+                .with(JointResource::MetadataBytes, m * 8)
+                .with(JointResource::PayloadBytes, 32)
+                .with(JointResource::Computations, 1)
+                .with(JointResource::InternalCpuJobs, cpu_jobs)
+                .with(JointResource::PhysicalQueueRecords, cpu_jobs)
+                .with(
+                    JointResource::PhysicalQueueBytes,
+                    cpu_jobs * quote.physical_queue_bytes.get(),
+                ),
+            protected_progress: JointResources::ZERO,
+        };
+        let global = JointResourceLimits {
+            // Explicit sums preserve these two real fixture lane vectors;
+            // JointResources arithmetic is intentionally private to WC.
+            global: JointResources::ZERO
+                .with(JointResource::ScopeRecords, 8)
+                .with(JointResource::ClaimRecords, 16)
+                .with(JointResource::MetadataBytes, m.checked_mul(32).unwrap())
+                .with(
+                    JointResource::PayloadBytes,
+                    INTERNAL_PEAK_BYTES
+                        .checked_mul(2)
+                        .unwrap()
+                        .checked_add(32)
+                        .unwrap(),
+                )
+                .with(JointResource::Computations, 1)
+                .with(JointResource::UnreceivedProductions, 1)
+                .with(JointResource::InternalCpuJobs, cpu_jobs)
+                .with(JointResource::PhysicalQueueRecords, cpu_jobs)
+                .with(
+                    JointResource::PhysicalQueueBytes,
+                    cpu_jobs
+                        .checked_mul(quote.physical_queue_bytes.get())
+                        .unwrap(),
+                ),
+            per_dependency: JointResources::ZERO
+                .with(JointResource::ScopeRecords, 7)
+                .with(JointResource::ClaimRecords, 16)
+                .with(JointResource::MetadataBytes, m.checked_mul(16).unwrap())
+                .with(
+                    JointResource::PayloadBytes,
+                    INTERNAL_PEAK_BYTES
+                        .checked_mul(2)
+                        .unwrap()
+                        .checked_add(32)
+                        .unwrap(),
+                )
+                .with(JointResource::Computations, 1)
+                .with(JointResource::UnreceivedProductions, 1)
+                .with(JointResource::InternalCpuJobs, cpu_jobs)
+                .with(JointResource::PhysicalQueueRecords, cpu_jobs)
+                .with(
+                    JointResource::PhysicalQueueBytes,
+                    cpu_jobs
+                        .checked_mul(quote.physical_queue_bytes.get())
+                        .unwrap(),
+                ),
+            protected_progress: base,
+        };
+        config.global = global;
+        config.classes[0] = global;
+        config.lanes[0] = custody;
+        let lane_index = match lane {
+            JointLane::Foreground => 1,
+            JointLane::Settlement => 2,
+            JointLane::Custody => panic!("CPU fixture requires an execution lane"),
+        };
+        config.lanes[lane_index] = foreground;
+        config.class_lanes[0][0] = custody;
+        config.class_lanes[0][lane_index] = foreground;
+        // Only the original fixed substrate requires progress in this fixture.
+        // CPU/complete Native action protection is deliberately not asserted.
+        let mut required = RequiredJointProgress {
+            global: base,
+            classes: [JointResources::ZERO; 5],
+            lanes: [JointResources::ZERO; 3],
+            class_lanes: [[JointResources::ZERO; 3]; 5],
+        };
+        required.classes[0] = base;
+        required.lanes[0] = base;
+        required.class_lanes[0][0] = base;
+        let control = WorkloadControl::try_new_counted(WorkloadConfig {
+            root_limit: count,
+            business_limit: count,
+            query_concurrency_limit: count,
+            scope_records_limit: count,
+            ..WorkloadConfig::default()
+        })
+        .unwrap()
+        .owner;
+        let (handle, driver) = control
+            .configure_joint_capacity(config.validate(&required).unwrap())
+            .unwrap();
+        control.configure_control_storage(storage).unwrap();
+        control.mark_ready().unwrap();
+        (control, handle, driver)
+    }
+    fn drive(driver: &mut JointProgressDriver) {
+        for _ in 0..10000 {
+            if matches!(driver.step(), JointProgress::Idle(_)) {
+                return;
+            }
+        }
+        panic!("original proof driver failed to reach idle");
+    }
+    fn receive(request: &mut JointAdmission) -> JointGrantedBatch {
+        match Pin::new(request).poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(reply)) => reply,
+            _ => panic!("expected the original paid reply"),
+        }
+    }
+    fn bind(scope: &WorkScope, driver: &mut JointProgressDriver) {
+        let mut proposal = scope.begin_control_binding().unwrap();
+        proposal
+            .push_dependency(&SharedDependency::LocalHost)
+            .unwrap();
+        proposal.end_change().unwrap();
+        let mut request = proposal.submit().unwrap();
+        drive(driver);
+        let mut reply = receive(&mut request);
+        reply
+            .adjustment
+            .as_mut()
+            .unwrap()
+            .install_control_scope_in(scope)
+            .unwrap()
+            .notify();
+        drop(reply);
+        drive(driver);
+    }
+    fn paid_claim(
+        handle: &JointAdmissionHandle,
+        owner: &WorkOwner,
+        lane: JointLane,
+        resource: JointResource,
+        amount: u64,
+        driver: &mut JointProgressDriver,
+    ) -> JointClaim {
+        let mut proposal = handle.begin_paid_proposal(owner).unwrap();
+        proposal
+            .begin_new(
+                lane,
+                JointResources::ZERO
+                    .with(JointResource::ClaimRecords, 1)
+                    .with(resource, amount),
+            )
+            .unwrap();
+        proposal
+            .push_dependency(&SharedDependency::LocalHost)
+            .unwrap();
+        proposal.end_change().unwrap();
+        let mut request = proposal.submit().unwrap();
+        drive(driver);
+        let mut reply = receive(&mut request);
+        reply.new_claims.pop().unwrap()
+    }
+    fn child(scope: &WorkScope, driver: &mut JointProgressDriver) -> WorkOwner {
+        let mut request = scope.request_joint_child().unwrap();
+        drive(driver);
+        let mut reply = receive(&mut request);
+        let mut target = None;
+        reply
+            .adjustment
+            .as_mut()
+            .unwrap()
+            .install_child_in(scope, &mut target)
+            .unwrap()
+            .notify();
+        drop(reply);
+        drive(driver);
+        target.unwrap()
+    }
+    async fn with_driver<F: Future>(
+        control: &WorkloadControl,
+        driver: &mut JointProgressDriver,
+        future: F,
+    ) -> F::Output {
+        tokio::pin!(future);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match driver.step() {
+                    JointProgress::More => tokio::task::yield_now().await,
+                    JointProgress::Idle(revision) => tokio::select! {
+                        biased;
+                        result = &mut future => return result,
+                        _ = control.wait_progress(revision) => {},
+                    },
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn root_eof_and_statistics_reuse_one_compute_through_the_real_joint_cpu_source() {
+        root_case(false).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_root_wait_keeps_its_original_input_until_the_same_forwarder_joins() {
+        root_case(true).await;
+    }
+    async fn root_case(cancel_before_proof: bool) {
+        let mut cpu_owner = InternalResultCpuOwner::try_new_for_test().unwrap();
+        let cpu = cpu_owner.runtime();
+        let quote = cpu.operation_action_quote().unwrap();
+        assert!(quote.metadata_bytes.get() > 0 && quote.physical_queue_bytes.get() > 0);
+        let (control, handle, mut driver) = root_control(&cpu);
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let root_scope = work.owner.scope();
+        bind(&root_scope, &mut driver);
+        let mut raw = Some(paid_claim(
+            &handle,
+            &work.owner,
+            JointLane::Custody,
+            JointResource::PayloadBytes,
+            INTERNAL_PEAK_BYTES,
+            &mut driver,
+        ));
+        let mut payload = None;
+        RetainedPayloadGrant::adopt_in(&root_scope, &mut raw, &mut payload)
+            .unwrap()
+            .notify();
+        let stage = child(&root_scope, &mut driver);
+        let stage_scope = stage.scope();
+        let mut raw = Some(paid_claim(
+            &handle,
+            &stage,
+            JointLane::Foreground,
+            JointResource::Computations,
+            1,
+            &mut driver,
+        ));
+        let mut computation = None;
+        InternalComputationGrant::adopt_in(&stage_scope, &mut raw, &mut computation)
+            .unwrap()
+            .notify();
+        let binding = QueryResultCapacityBinding::from_internal_payload(
+            &root_scope,
+            &stage_scope,
+            payload.as_ref().unwrap(),
+        )
+        .unwrap();
+        let cancellation = QueryCancellationSource::new();
+        let custody = DomainCpuCustody::try_new_with_computation(
+            InternalDomainState::Statistics(StatisticsRootResultDecoder::for_test_with_capacity(
+                [],
+                &binding,
+            )),
+            binding.clone(),
+            cpu,
+            FrontendDataRuntime::new(tokio::runtime::Handle::current()),
+            cancellation.view(),
+            computation.unwrap(),
+        )
+        .unwrap();
+        let end = RootResultEnd {
+            sequence: NonZeroU64::new(1).unwrap(),
+            output_rows: 0,
+        };
+        if cancel_before_proof {
+            custody.start(Operation::End(end)).unwrap();
+            let mut input_exit = Box::pin(binding.result_activities_exited());
+            assert!(
+                input_exit
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            cancellation.request(QueryCancellationReason::ExecutionCancellationRequested);
+            with_driver(&control, &mut driver, custody.join_closed())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), input_exit)
+                .await
+                .unwrap();
+            assert!(custody.take().is_err());
+        } else {
+            with_driver(&control, &mut driver, custody.finish_eof(end))
+                .await
+                .unwrap();
+            assert!(
+                custody.state.lock().unwrap().job.is_none(),
+                "the original forwarder joins before serial reuse"
+            );
+            with_driver(&control, &mut driver, custody.finish_statistics())
+                .await
+                .unwrap();
+            assert!(custody.state.lock().unwrap().job.is_none());
+            let output = custody.take().unwrap();
+            assert!(
+                output
+                    .hand_off(|slot, _| slot.into_statistics())
+                    .unwrap()
+                    .is_empty()
+            );
+            custody.finish_computation_after_handoff().unwrap();
+            with_driver(&control, &mut driver, custody.join_closed())
+                .await
+                .unwrap();
+        }
+        drop(custody);
+        drop(binding);
+        drop(payload);
+        stage.complete();
+        work.owner.complete();
+        work.business.release();
+        drive(&mut driver);
+        cpu_owner
             .shutdown_until(Instant::now() + Duration::from_secs(5))
             .await
             .unwrap();

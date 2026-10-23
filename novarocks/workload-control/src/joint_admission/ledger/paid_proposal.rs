@@ -22,6 +22,9 @@ use super::*;
 use crate::scope::ReclaimWakeOnExit;
 
 use novarocks_resource_contract::SelectedNetworkOrigin;
+mod cpu_action;
+pub(super) use cpu_action::{CpuActionFence, capture as capture_cpu_action, validate_cpu_action};
+pub use cpu_action::{InternalCpuActionAdmission, InternalCpuActionSource};
 mod root_stage;
 pub(super) use root_stage::validate_root_stage;
 pub use root_stage::{RootStageAdmission, RootStageProposal, RootStageReady, RootStageSource};
@@ -78,6 +81,7 @@ struct PendingChange {
 #[must_use = "A proposal must be submitted or dropped"]
 pub struct JointProposal {
     root_stage: Option<RootStageFence>,
+    cpu_action: Option<CpuActionFence>,
     records: Vec<ChangeRecord>,
     current: Option<PendingChange>,
     custody: Option<ProposalConstruction>,
@@ -117,6 +121,7 @@ impl JointAdmissionHandle {
         };
         let mut proposal = JointProposal {
             root_stage: None,
+            cpu_action: None,
             records: Vec::new(),
             current: None,
             custody: Some(custody),
@@ -452,6 +457,7 @@ impl JointProposal {
             handle.queue_request_mode(
                 PreparedRequest {
                     root_stage: self.root_stage,
+                    cpu_action: self.cpu_action,
                     budget: RequestBudget::Finite { remaining: limit },
                     changes,
                     custody: self.custody.take(),

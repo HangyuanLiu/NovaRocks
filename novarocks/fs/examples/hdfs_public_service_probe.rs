@@ -244,101 +244,101 @@ fn hdfs_public_service_consumer_helper() -> Result<()> {
     let ready = document(&run.join("ready"))?;
     ensure!(ready.get("READY") == Some(&token), "wrong ready generation");
     println!("CONSUMER_READY");
-    tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()?
-        .block_on(async {
-            for (route, user) in [("physical", "%61lice"), ("logical", "alice")] {
-                let mut base = url::Url::parse(ready.get(route).context("missing route")?)?;
-                base.set_username(user)
-                    .map_err(|()| anyhow::anyhow!("invalid userinfo"))?;
-                let root = ready.get("root").context("missing root")?;
-                base.set_path(&format!("{root}/{route}/"));
-                let resolver = FsAccessResolver::new();
-                let domain = StorageAccessDomainId::from_bytes([47; 32]);
-                let access = resolver.resolve_location(domain, base.as_str(), None)?;
-                let operator = access.operator();
-                let directory = access.paths()[0].operator_relative_path();
-                operator.create_dir(directory).await?;
-                let path = format!("{directory}payload");
-                let renamed = format!("{directory}renamed");
-                let empty = format!("{directory}empty");
-                operator.writer(&empty).await?.close().await?;
-                ensure!(
-                    operator.stat(&empty).await?.content_length() == 0,
-                    "empty close did not create an empty file"
-                );
-                operator.delete(&empty).await?;
-                let mut old = operator.writer(&path).await?;
-                old.write(Bytes::from_static(
-                    b"a longer previously closed file that must be truncated",
-                ))
+        .build()?;
+    let resolver = FsAccessResolver::with_runtime(runtime.handle().clone());
+    runtime.block_on(async {
+        for (route, user) in [("physical", "%61lice"), ("logical", "alice")] {
+            let mut base = url::Url::parse(ready.get(route).context("missing route")?)?;
+            base.set_username(user)
+                .map_err(|()| anyhow::anyhow!("invalid userinfo"))?;
+            let root = ready.get("root").context("missing root")?;
+            base.set_path(&format!("{root}/{route}/"));
+            let domain = StorageAccessDomainId::from_bytes([47; 32]);
+            let access = resolver.resolve_location(domain, base.as_str(), None)?;
+            let operator = access.operator();
+            let directory = access.paths()[0].operator_relative_path();
+            operator.create_dir(directory).await?;
+            let path = format!("{directory}payload");
+            let renamed = format!("{directory}renamed");
+            let empty = format!("{directory}empty");
+            operator.writer(&empty).await?.close().await?;
+            ensure!(
+                operator.stat(&empty).await?.content_length() == 0,
+                "empty close did not create an empty file"
+            );
+            operator.delete(&empty).await?;
+            let mut old = operator.writer(&path).await?;
+            old.write(Bytes::from_static(
+                b"a longer previously closed file that must be truncated",
+            ))
+            .await?;
+            old.close().await?;
+            let mut writer = operator.writer(&path).await?;
+            writer
+                .write(Bytes::from_static(b"0123456789abcdef"))
                 .await?;
-                old.close().await?;
-                let mut writer = operator.writer(&path).await?;
-                writer
-                    .write(Bytes::from_static(b"0123456789abcdef"))
-                    .await?;
-                writer.close().await?;
-                ensure!(
-                    operator.stat(&path).await?.content_length() == 16,
-                    "wrong stat size"
-                );
-                let object_url = format!("{}payload", base.as_str());
-                let file = resolver.resolve_location(domain, &object_url, None)?;
-                let bound = file.bind(0, FileIdentity::new(object_url, 16, None))?;
-                let cancel = FileCancellation::new();
-                ensure!(
-                    bound
-                        .read(FileReadRange::WholeFile, &cancel)
-                        .await?
-                        .as_ref()
-                        == b"0123456789abcdef",
-                    "whole read mismatch"
-                );
-                ensure!(
-                    bound
-                        .read(
-                            FileReadRange::Bounded {
-                                offset: 3,
-                                length: 5
-                            },
-                            &cancel
-                        )
-                        .await?
-                        .as_ref()
-                        == b"34567",
-                    "range read mismatch"
-                );
-                let entries = operator.list(directory).await?;
-                ensure!(
-                    entries.len() == 1 && entries[0].path() == path,
-                    "listing did not contain exactly the closed payload"
-                );
-                operator.rename(&path, &renamed).await?;
-                ensure!(
-                    !operator.exists(&path).await?
-                        && operator.stat(&renamed).await?.content_length() == 16,
-                    "rename mismatch"
-                );
-                ensure!(
-                    operator.read(&renamed).await?.to_bytes().as_ref() == b"0123456789abcdef",
-                    "renamed content mismatch"
-                );
-                operator.delete(&renamed).await?;
-                ensure!(
-                    !operator.exists(&renamed).await?,
-                    "delete did not take effect"
-                );
-                let witness = format!("{directory}owner-witness");
-                let mut writer = operator.writer(&witness).await?;
-                writer
-                    .write(Bytes::from_static(b"effective-user-witness"))
-                    .await?;
-                writer.close().await?;
-            }
-            Ok::<(), anyhow::Error>(())
-        })?;
+            writer.close().await?;
+            ensure!(
+                operator.stat(&path).await?.content_length() == 16,
+                "wrong stat size"
+            );
+            let object_url = format!("{}payload", base.as_str());
+            let file = resolver.resolve_location(domain, &object_url, None)?;
+            let bound = file.bind(0, FileIdentity::new(object_url, 16, None))?;
+            let cancel = FileCancellation::new();
+            ensure!(
+                bound
+                    .read(FileReadRange::WholeFile, &cancel)
+                    .await?
+                    .as_ref()
+                    == b"0123456789abcdef",
+                "whole read mismatch"
+            );
+            ensure!(
+                bound
+                    .read(
+                        FileReadRange::Bounded {
+                            offset: 3,
+                            length: 5
+                        },
+                        &cancel
+                    )
+                    .await?
+                    .as_ref()
+                    == b"34567",
+                "range read mismatch"
+            );
+            let entries = operator.list(directory).await?;
+            ensure!(
+                entries.len() == 1 && entries[0].path() == path,
+                "listing did not contain exactly the closed payload"
+            );
+            operator.rename(&path, &renamed).await?;
+            ensure!(
+                !operator.exists(&path).await?
+                    && operator.stat(&renamed).await?.content_length() == 16,
+                "rename mismatch"
+            );
+            ensure!(
+                operator.read(&renamed).await?.to_bytes().as_ref() == b"0123456789abcdef",
+                "renamed content mismatch"
+            );
+            operator.delete(&renamed).await?;
+            ensure!(
+                !operator.exists(&renamed).await?,
+                "delete did not take effect"
+            );
+            let witness = format!("{directory}owner-witness");
+            let mut writer = operator.writer(&witness).await?;
+            writer
+                .write(Bytes::from_static(b"effective-user-witness"))
+                .await?;
+            writer.close().await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
     println!("CONSUMER_DONE");
     Ok(())
 }
