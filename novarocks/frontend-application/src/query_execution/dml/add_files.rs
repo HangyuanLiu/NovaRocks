@@ -727,6 +727,7 @@ mod tests {
         )
         .expect("receipt");
         let outcome = project_committed(CompletedDataMutation {
+            cleanup: ExternalMutationFinalization::Complete,
             effect: ExternalMutationEffect::Applied,
             receipt,
             finalization: ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(

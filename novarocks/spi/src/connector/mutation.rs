@@ -284,7 +284,11 @@ pub enum ExternalMutationOutcome<T> {
     KnownCommitted {
         effect: ExternalMutationEffect,
         receipt: T,
+        /// Necessary business finalization; independent of safe cleanup.
         finalization: ExternalMutationFinalization,
+        /// Operation-owned cleanup diagnostics do not undo a proven commit.
+        /// Exact remaining artifacts and live obligations stay with their owner.
+        cleanup: ExternalMutationFinalization,
     },
     KnownUncommitted {
         failure: ConnectorMutationFailure,

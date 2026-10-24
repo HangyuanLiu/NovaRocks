@@ -160,6 +160,10 @@ struct JournalEntry<R> {
     // Independent dimensions: attaching finalization or positive observation
     // never replaces the original dispatch evidence.
     finalization: ExternalMutationFinalization,
+    cleanup: ExternalMutationFinalization,
+    // The original entry, not the public diagnostic, owns exact remaining
+    // objects/reasons until its existing operation owner is retired.
+    cleanup_report: Option<IcebergCleanupReport>,
     finalization_grant:
         Option<std::result::Result<crate::catalog::publication::EvidenceContext, ConnectorError>>,
     positive_proof: Option<CommitProof>,
@@ -382,6 +386,8 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                 checked,
                 phase: EntryPhase::Prepared,
                 finalization: ExternalMutationFinalization::Complete,
+                cleanup: ExternalMutationFinalization::Complete,
+                cleanup_report: None,
                 finalization_grant: None,
                 positive_proof: None,
             },
@@ -650,6 +656,70 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
         );
         entry.finalization = merge_finalization(entry.finalization.clone(), finalization);
     }
+    /// Diagnostic cleanup is an independent dimension of the SAME entry.
+    pub(crate) fn record_entry_cleanup(
+        &self,
+        entry_ref: JournalEntryRef,
+        cleanup: ExternalMutationFinalization,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state
+            .entries
+            .get_mut(&entry_ref.0)
+            .expect("cleanup entry remains owned");
+        assert!(
+            matches!(entry.phase, EntryPhase::Concluded(_)),
+            "Cleanup follows recorded dispatch evidence"
+        );
+        entry.cleanup = merge_finalization(entry.cleanup.clone(), cleanup);
+    }
+
+    /// Move the complete report into the original journal before projecting it.
+    pub(crate) fn record_entry_cleanup_report(
+        &self,
+        entry_ref: JournalEntryRef,
+        report: IcebergCleanupReport,
+    ) {
+        let cleanup = report.finalization();
+        let retired = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = state
+                .entries
+                .get_mut(&entry_ref.0)
+                .expect("cleanup entry remains owned");
+            // A real report may also conclude a pre-dispatch rejection. It
+            // records cleanup, never authorizes dispatch or changes its verdict.
+            if matches!(report, IcebergCleanupReport::NotAttempted)
+                && entry.cleanup_report.is_some()
+            {
+                // Absence cannot replace either an exact report or its known
+                // cleanup verdict. Independently recorded failures stay intact.
+                None
+            } else {
+                entry.cleanup = merge_finalization(entry.cleanup.clone(), cleanup);
+                entry.cleanup_report.replace(report)
+            }
+        };
+        drop(retired);
+    }
+
+    fn entry_cleanup(&self, entry_ref: JournalEntryRef) -> ExternalMutationFinalization {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .get(&entry_ref.0)
+            .expect("cleanup entry remains owned")
+            .cleanup
+            .clone()
+    }
+
     pub(crate) fn entry_descriptor(
         &self,
         entry_ref: JournalEntryRef,
@@ -897,6 +967,7 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
         match self.entry_phase(entry_ref) {
             Phase::Committed(proof, checked, finalization) => {
                 ExternalMutationOutcome::KnownCommitted {
+                    cleanup: self.entry_cleanup(entry_ref),
                     effect: proof.effect,
                     receipt: checked.receipts.for_effect(proof.effect),
                     finalization,
@@ -933,26 +1004,31 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
         }
     }
     pub(crate) fn project(&self, report: Report) -> ExternalMutationOutcome<R> {
+        let cleanup = report.cleanup.finalization();
+        let entry = self.current_entry();
+        if let Some(entry) = entry {
+            self.record_entry_cleanup_report(entry, report.cleanup);
+        }
         match report.publication {
             PublicationOutcome::KnownUncommitted(failure) => {
-                ExternalMutationOutcome::KnownUncommitted {
-                    failure,
-                    cleanup: report.cleanup.finalization(),
-                }
+                ExternalMutationOutcome::KnownUncommitted { failure, cleanup }
             }
             PublicationOutcome::Committed(_) => {
                 let Phase::Committed(proof, checked, finalization) = self.phase() else {
                     panic!("Committed publication follows its checked dispatch")
                 };
                 ExternalMutationOutcome::KnownCommitted {
+                    cleanup: self.entry_cleanup(entry.expect("committed publication has an entry")),
                     effect: proof.effect,
                     receipt: checked.receipts.for_effect(proof.effect),
-                    finalization: merge_finalization(finalization, report.cleanup.finalization()),
+                    finalization,
                 }
             }
             PublicationOutcome::Unknown { failure, .. } => match self.phase() {
                 Phase::Committed(proof, checked, finalization) => {
                     ExternalMutationOutcome::KnownCommitted {
+                        cleanup: self
+                            .entry_cleanup(entry.expect("committed publication has an entry")),
                         effect: proof.effect,
                         receipt: checked.receipts.for_effect(proof.effect),
                         finalization,
@@ -997,16 +1073,18 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                 } else {
                     cleanup
                 };
+                let entry = self
+                    .current_entry()
+                    .expect("committed publication has an entry");
+                self.record_entry_cleanup_report(entry, cleanup);
                 ExternalMutationOutcome::KnownCommitted {
                     effect: proof.effect,
                     receipt: checked.receipts.for_effect(proof.effect),
                     finalization: merge_finalization(
                         owner_finalization,
-                        merge_finalization(
-                            ExternalMutationFinalization::Failed(failure),
-                            cleanup.finalization(),
-                        ),
+                        ExternalMutationFinalization::Failed(failure),
                     ),
+                    cleanup: self.entry_cleanup(entry),
                 }
             }
             Phase::Rejected(original, finalization) => {
@@ -1049,17 +1127,21 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                 evidence: self.retained_evidence(checked),
             },
             Phase::Committed(proof, checked, finalization) => {
+                let entry = self
+                    .current_entry()
+                    .expect("committed publication has an entry");
+                self.record_entry_cleanup_report(
+                    entry,
+                    remaining_after_bridge(operation, &checked.retained, failure.message()),
+                );
                 ExternalMutationOutcome::KnownCommitted {
                     effect: proof.effect,
                     receipt: checked.receipts.for_effect(proof.effect),
                     finalization: merge_finalization(
                         finalization,
-                        merge_finalization(
-                            ExternalMutationFinalization::Failed(failure.clone()),
-                            remaining_after_bridge(operation, &checked.retained, failure.message())
-                                .finalization(),
-                        ),
+                        ExternalMutationFinalization::Failed(failure),
                     ),
+                    cleanup: self.entry_cleanup(entry),
                 }
             }
             Phase::Rejected(original, finalization) => ExternalMutationOutcome::KnownUncommitted {
@@ -1723,6 +1805,111 @@ mod tests {
         assert_eq!(exited.phases[P::Evidence as usize].started, 0);
     }
 
+    #[tokio::test]
+    async fn committed_bounded_cleanup_retains_exact_residue_without_failing_business_finalize() {
+        use crate::commit::model::{ArtifactClass, ArtifactKind, ArtifactWriter};
+        use crate::commit::operation::{CleanupBudget, OperationLimits};
+        use std::time::Duration;
+
+        for behavior in [Behavior::Commit, Behavior::CommitFinalizationFailure] {
+            let fixture = Fixture::new_with_limits(OperationLimits {
+                cleanup: CleanupBudget {
+                    time: Duration::from_secs(30),
+                    objects: 1,
+                },
+                ..OperationLimits::default()
+            });
+            let old = fixture.operation.begin_attempt().unwrap();
+            for _ in 0..3 {
+                let object = old
+                    .allocate(ArtifactClass::Attempt, ArtifactKind::Manifest)
+                    .unwrap();
+                old.file_io()
+                    .new_output(object.path())
+                    .unwrap()
+                    .write(Bytes::from_static(b"old attempt artifact"))
+                    .await
+                    .unwrap();
+            }
+            let metadata = fixture.metadata(FormatVersion::V3);
+            let intent = fixture.intent(&metadata, "main", vec![]);
+            let journal = PublicationJournal::new(fixture.operation.token());
+            let dispatches = Arc::new(AtomicUsize::new(0));
+            let publisher = journal.observe(Arc::new(Fake {
+                operation: fixture.operation.clone(),
+                metadata: metadata.clone(),
+                metadata_location: format!(
+                    "file://{}/base.metadata.json",
+                    fixture.directory.path().display()
+                ),
+                journal: journal.clone(),
+                dispatches: dispatches.clone(),
+                behavior,
+            }));
+            let report = run(
+                &fixture.operation,
+                &intent,
+                &PreparedChange::default(),
+                &[&FastAppendPreparer],
+                &publisher,
+                RetryPolicy::from_properties(metadata.properties()).unwrap(),
+            )
+            .await;
+            let expected = report.cleanup.clone();
+            let IcebergCleanupReport::Partial { remaining, .. } = &expected else {
+                panic!("one cleanup object cannot remove all three abandoned artifacts")
+            };
+            assert!(!remaining.is_empty());
+            // Physical files are independent evidence of unresolved cleanup.
+            for item in remaining {
+                assert!(
+                    std::path::Path::new(item.object.path().trim_start_matches("file://")).exists()
+                );
+            }
+            let ExternalMutationOutcome::KnownCommitted {
+                finalization,
+                cleanup,
+                receipt,
+                ..
+            } = journal.project(report)
+            else {
+                panic!("actual publication proof must survive partial cleanup")
+            };
+            assert_eq!(receipt, "preflight receipt");
+            assert!(matches!(cleanup, ExternalMutationFinalization::Failed(_)));
+            match behavior {
+                Behavior::Commit => {
+                    assert_eq!(finalization, ExternalMutationFinalization::Complete)
+                }
+                Behavior::CommitFinalizationFailure => assert!(
+                    matches!(finalization, ExternalMutationFinalization::Failed(ref e) if e.message() == "injected owner finalization failure")
+                ),
+                _ => unreachable!(),
+            }
+            let entry = journal.current_entry().unwrap();
+            assert_eq!(
+                journal.state.lock().unwrap().entries[&entry.0]
+                    .cleanup_report
+                    .as_ref(),
+                Some(&expected)
+            );
+            for item in remaining {
+                assert!(
+                    fixture
+                        .operation
+                        .recovery_artifacts()
+                        .iter()
+                        .any(|record| record.object == item.object)
+                );
+            }
+            assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+            assert!(
+                journal.claim_dispatch().is_err(),
+                "cleanup failure cannot authorize another publication"
+            );
+        }
+    }
+
     #[test]
     fn bridge_frontier_preserves_unknown_and_prebuilt_committed_receipts() {
         for behavior in [
@@ -2105,6 +2292,7 @@ mod tests {
             } else {
                 let ExternalMutationOutcome::KnownCommitted {
                     finalization: ExternalMutationFinalization::Failed(first),
+                    cleanup: ExternalMutationFinalization::Failed(first_cleanup),
                     ..
                 } = first
                 else {
@@ -2112,6 +2300,7 @@ mod tests {
                 };
                 let ExternalMutationOutcome::KnownCommitted {
                     finalization: ExternalMutationFinalization::Failed(second),
+                    cleanup: ExternalMutationFinalization::Failed(second_cleanup),
                     ..
                 } = second
                 else {
@@ -2139,15 +2328,21 @@ mod tests {
                 );
                 for record in &residue {
                     assert!(abandoned.contains(&record.object));
-                    assert!(first.message().contains(record.object.path()));
-                    assert!(second.message().contains(record.object.path()));
+                    assert!(first_cleanup.message().contains(record.object.path()));
+                    assert!(second_cleanup.message().contains(record.object.path()));
                 }
-                assert!(first.message().contains("BudgetExhausted"));
-                assert!(second.message().contains("BridgeInterrupted"));
-                assert!(!second.message().contains("DeleteFailed"));
+                assert!(
+                    first
+                        .message()
+                        .contains("first post-dispatch bridge failure")
+                );
+                assert!(second.message().contains("second recovery bridge failure"));
+                assert!(first_cleanup.message().contains("BudgetExhausted"));
+                assert!(second_cleanup.message().contains("BridgeInterrupted"));
+                assert!(!second_cleanup.message().contains("DeleteFailed"));
                 for object in &retained {
-                    assert!(!first.message().contains(object.path()));
-                    assert!(!second.message().contains(object.path()));
+                    assert!(!first_cleanup.message().contains(object.path()));
+                    assert!(!second_cleanup.message().contains(object.path()));
                 }
                 if matches!(behavior, Behavior::CommitFinalizationFailure) {
                     assert!(
@@ -2319,6 +2514,61 @@ mod tests {
             ExternalMutationOutcome::KnownCommitted { .. }
         ));
     }
+    #[tokio::test]
+    async fn absent_cleanup_attempt_preserves_exact_completion_and_independent_failure() {
+        let (journal, preparation) = catalog_journal();
+        let entry = journal
+            .claim_dispatch()
+            .unwrap()
+            .begin_dispatch(&preparation, &MemoryDispatchBarrier)
+            .await
+            .unwrap();
+        journal.conclude(&CatalogOutcome::committed(
+            CommitProof::applied(None),
+            ExternalMutationEffect::Applied,
+        ));
+        let exact = IcebergCleanupReport::Complete { deleted: 2 };
+        journal.record_entry_cleanup_report(entry, exact.clone());
+        let absent = || Report {
+            publication: PublicationOutcome::Committed(CommitProof::applied(None)),
+            cleanup: IcebergCleanupReport::NotAttempted,
+        };
+        let ExternalMutationOutcome::KnownCommitted {
+            finalization,
+            cleanup,
+            ..
+        } = journal.project(absent())
+        else {
+            panic!("absence of cleanup cannot change a proven publication")
+        };
+        assert_eq!(finalization, ExternalMutationFinalization::Complete);
+        assert_eq!(cleanup, ExternalMutationFinalization::Complete);
+        assert_eq!(
+            journal.state.lock().unwrap().entries[&entry.0]
+                .cleanup_report
+                .as_ref(),
+            Some(&exact)
+        );
+        // A real, separate cleanup failure is not hidden by the same no-op.
+        let failure = ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::Unavailable,
+            "independent reclamation failure",
+        );
+        journal.record_entry_cleanup(entry, ExternalMutationFinalization::Failed(failure.clone()));
+        let ExternalMutationOutcome::KnownCommitted { cleanup, .. } = journal.project(absent())
+        else {
+            unreachable!()
+        };
+        assert_eq!(cleanup, ExternalMutationFinalization::Failed(failure));
+        assert_eq!(
+            journal.state.lock().unwrap().entries[&entry.0]
+                .cleanup_report
+                .as_ref(),
+            Some(&exact)
+        );
+        assert!(journal.claim_dispatch().is_err());
+    }
+
     #[tokio::test]
     async fn abandoned_barrier_claim_is_definitely_undispatched() {
         let (journal, _) = catalog_journal();
@@ -2606,7 +2856,7 @@ mod tests {
                 matches!(journal.catalog_entry_outcome(entry), ExternalMutationOutcome::KnownCommitted { effect: actual, receipt, .. } if actual == effect && receipt == expected)
             );
             assert!(
-                matches!(journal.catalog_bridge_failure("late bridge failure".into()), ExternalMutationOutcome::KnownCommitted { effect: actual, receipt, finalization: ExternalMutationFinalization::Failed(_) } if actual == effect && receipt == expected)
+                matches!(journal.catalog_bridge_failure("late bridge failure".into()), ExternalMutationOutcome::KnownCommitted { cleanup: _, effect: actual, receipt, finalization: ExternalMutationFinalization::Failed(_) } if actual == effect && receipt == expected)
             );
         }
     }

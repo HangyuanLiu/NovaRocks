@@ -649,6 +649,7 @@ impl IcebergWriteSessionControl {
             handle.retain_recovery_evidence(evidence)?;
         }
         let ExternalMutationOutcome::KnownCommitted {
+            cleanup,
             effect,
             receipt,
             mut finalization,
@@ -709,6 +710,7 @@ impl IcebergWriteSessionControl {
             journal.record_entry_finalization(entry, finalization.clone());
         }
         Ok(ExternalMutationOutcome::KnownCommitted {
+            cleanup,
             effect,
             receipt: enriched,
             finalization,

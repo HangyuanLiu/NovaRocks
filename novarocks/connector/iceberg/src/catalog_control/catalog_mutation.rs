@@ -699,6 +699,7 @@ fn execute_create_table(
             cleanup: ExternalMutationFinalization::Complete,
         }),
         Ok(PreparedCreate::NoOp(receipt)) => Ok(ExternalMutationOutcome::KnownCommitted {
+            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             effect: ExternalMutationEffect::NoOp,
             receipt,
             finalization: ExternalMutationFinalization::Complete,
@@ -847,6 +848,7 @@ fn execute_drop_table(
         }
         Ok(None) => {
             return Ok(ExternalMutationOutcome::KnownCommitted {
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
                 effect: ExternalMutationEffect::NoOp,
                 receipt: seed,
                 finalization: ExternalMutationFinalization::Complete,
@@ -2227,6 +2229,7 @@ fn execute_view_publication(
             cleanup: ExternalMutationFinalization::Complete,
         }),
         Ok(PreparedView::NoOp(receipt)) => Ok(ExternalMutationOutcome::KnownCommitted {
+            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             effect: ExternalMutationEffect::NoOp,
             receipt,
             finalization: ExternalMutationFinalization::Complete,
@@ -2808,6 +2811,7 @@ fn reconcile_evidence(
                 .all(|(key, value)| physical.table.metadata().properties().get(key) == Some(value))
             {
                 Ok(ExternalMutationOutcome::KnownCommitted {
+                    cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
                     effect: ExternalMutationEffect::Applied,
                     receipt: receipt(provider, evidence.operation_id(), evidence.operation_kind())?,
                     finalization: ExternalMutationFinalization::Complete,
@@ -5459,6 +5463,7 @@ mod tests {
             .expect("no-op existing create");
         match no_op {
             ExternalMutationOutcome::KnownCommitted {
+                cleanup: _,
                 effect: ExternalMutationEffect::NoOp,
                 receipt,
                 finalization: ExternalMutationFinalization::Complete,
@@ -7385,6 +7390,7 @@ mod tests {
                 drop(release);
                 let outcome = worker.join().unwrap().unwrap();
                 let ExternalMutationOutcome::KnownCommitted {
+                    cleanup: _,
                     effect,
                     receipt,
                     finalization,

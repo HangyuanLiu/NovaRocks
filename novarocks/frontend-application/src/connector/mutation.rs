@@ -30,6 +30,7 @@ use novarocks_query_application::engine_error::EngineError;
 #[derive(Clone, Debug)]
 pub struct CompletedCatalogMutation {
     pub finalization: ExternalMutationFinalization,
+    pub cleanup: ExternalMutationFinalization,
 }
 
 /// Provider outcome after the application has performed its one permitted
@@ -116,6 +117,9 @@ fn present_catalog_mutation_result(
 ) -> Result<CompletedCatalogMutation, String> {
     match result {
         ResolvedCatalogMutation::KnownCommitted(completed) => {
+            if let ExternalMutationFinalization::Failed(error) = &completed.cleanup {
+                tracing::warn!(%error, "committed catalog mutation retains incomplete cleanup");
+            }
             if let ExternalMutationFinalization::Failed(failure) = &completed.finalization {
                 Err(
                     EngineError::commit_known_committed_finalize_failed(failure.to_string())
@@ -199,9 +203,14 @@ pub fn dispatch_catalog_mutation_once_with_lease(
     context: ConnectorRequestContext,
 ) -> ResolvedCatalogMutation {
     match lease.execute_operation(operation_id, operation, context) {
-        Ok(ExternalMutationOutcome::KnownCommitted { finalization, .. }) => {
-            ResolvedCatalogMutation::KnownCommitted(CompletedCatalogMutation { finalization })
-        }
+        Ok(ExternalMutationOutcome::KnownCommitted {
+            finalization,
+            cleanup,
+            ..
+        }) => ResolvedCatalogMutation::KnownCommitted(CompletedCatalogMutation {
+            finalization,
+            cleanup,
+        }),
         Ok(ExternalMutationOutcome::KnownUncommitted { failure, cleanup }) => {
             ResolvedCatalogMutation::KnownUncommitted { failure, cleanup }
         }
@@ -235,9 +244,14 @@ fn resolve_outcome(
         outcome => outcome,
     };
     match outcome {
-        ExternalMutationOutcome::KnownCommitted { finalization, .. } => {
-            ResolvedCatalogMutation::KnownCommitted(CompletedCatalogMutation { finalization })
-        }
+        ExternalMutationOutcome::KnownCommitted {
+            finalization,
+            cleanup,
+            ..
+        } => ResolvedCatalogMutation::KnownCommitted(CompletedCatalogMutation {
+            finalization,
+            cleanup,
+        }),
         ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
             ResolvedCatalogMutation::KnownUncommitted { failure, cleanup }
         }
@@ -313,6 +327,7 @@ mod tests {
                 });
             }
             Ok(ExternalMutationOutcome::KnownCommitted {
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
                 effect: ExternalMutationEffect::Applied,
                 receipt: ConnectorCatalogMutationReceipt::try_new(
                     self.descriptor.clone(),
@@ -469,6 +484,7 @@ mod tests {
         let finalization = ExternalMutationFinalization::Failed(cleanup_failure.clone());
         let committed = present_catalog_mutation_result(ResolvedCatalogMutation::KnownCommitted(
             CompletedCatalogMutation {
+                cleanup: ExternalMutationFinalization::Complete,
                 finalization: finalization.clone(),
             },
         ))

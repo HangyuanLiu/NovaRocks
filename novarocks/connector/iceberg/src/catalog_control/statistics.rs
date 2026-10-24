@@ -892,6 +892,7 @@ fn statistics_receipt(
     effect: ExternalMutationEffect,
 ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError> {
     Ok(ExternalMutationOutcome::KnownCommitted {
+        cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
         effect,
         receipt: StatisticsReceipt::try_new(
             provider.descriptor().clone(),

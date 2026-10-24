@@ -1108,9 +1108,11 @@ impl IcebergWriteSessionControl {
             Ok(ExternalMutationOutcome::KnownCommitted {
                 receipt,
                 finalization,
+                cleanup,
                 ..
             }) => {
                 handle.retain_finalization(finalization.clone());
+                handle.retain_cleanup(cleanup.clone());
                 IcebergWriteSessionState::KnownCommitted {
                     snapshot_id: receipt
                         .committed_version()
@@ -1232,6 +1234,7 @@ impl IcebergWriteSessionControl {
         // and it is `KnownCommitted` only in the sense the caller needs -- the
         // sealing is finished and its result is not in doubt.
         Ok(ExternalMutationOutcome::KnownCommitted {
+            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             effect: ExternalMutationEffect::NoOp,
             receipt,
             finalization: ExternalMutationFinalization::Complete,
@@ -1410,6 +1413,7 @@ pub(crate) fn settle_empty_write_without_commit(
         snapshot_id: Some(unchanged_snapshot_id),
     })?;
     Ok(ExternalMutationOutcome::KnownCommitted {
+        cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
         effect: ExternalMutationEffect::NoOp,
         receipt,
         finalization: ExternalMutationFinalization::Complete,
@@ -1467,6 +1471,7 @@ pub(crate) fn release_session_state(
                 Ok(ConnectorWriteAbortOutcome::KnownCommitted {
                     receipt,
                     finalization: handle.terminal_finalization(),
+                    cleanup: handle.terminal_cleanup(),
                 })
             }
             IcebergWriteSessionState::CommitUnknown {
@@ -1702,6 +1707,7 @@ fn reconciled_known_committed_outcome(
     metadata: Result<&TableMetadata, ConnectorError>,
 ) -> ExternalMutationOutcome<ConnectorWriteReceipt> {
     let ExternalMutationOutcome::KnownCommitted {
+        cleanup,
         effect,
         receipt,
         mut finalization,
@@ -1741,7 +1747,9 @@ fn reconciled_known_committed_outcome(
     };
     journal.record_entry_finalization(entry, finalization.clone());
     handle.retain_finalization(finalization.clone());
+    handle.retain_cleanup(cleanup.clone());
     ExternalMutationOutcome::KnownCommitted {
+        cleanup,
         effect,
         receipt,
         finalization,
@@ -4748,7 +4756,7 @@ mod terminal_finalization_tests {
     #[test]
     fn committed_reconcile_keeps_previous_failure_and_adds_projection_failure() {
         let handle = handle();
-        handle.retain_finalization(ExternalMutationFinalization::Failed(failure(
+        handle.retain_cleanup(ExternalMutationFinalization::Failed(failure(
             ConnectorMutationFailureKind::Unavailable,
             "old attempt cleanup failed",
         )));
@@ -4812,22 +4820,29 @@ mod terminal_finalization_tests {
                 proof: CommitProof::applied(Some(77)),
             },
         );
-        journal.record_entry_finalization(entry, handle.terminal_finalization());
-        let ExternalMutationOutcome::KnownCommitted { finalization, .. } =
-            reconciled_known_committed_outcome(
-                &handle,
-                &journal,
-                entry,
-                77,
-                Err(internal("row count reload failed")),
-            )
+        journal.record_entry_cleanup(entry, handle.terminal_cleanup());
+        let ExternalMutationOutcome::KnownCommitted {
+            finalization,
+            cleanup,
+            ..
+        } = reconciled_known_committed_outcome(
+            &handle,
+            &journal,
+            entry,
+            77,
+            Err(internal("row count reload failed")),
+        )
         else {
             panic!("committed proof lost")
         };
         let ExternalMutationFinalization::Failed(error) = &finalization else {
-            panic!("cleanup verdict lost")
+            panic!("necessary row-count projection failure lost")
         };
-        assert!(error.message().contains("old attempt cleanup failed"));
+        assert!(!error.message().contains("old attempt cleanup failed"));
+        assert!(
+            matches!(&cleanup, ExternalMutationFinalization::Failed(error) if error.message() == "old attempt cleanup failed")
+        );
+        assert_eq!(handle.terminal_cleanup(), cleanup);
         assert!(error.message().contains("row count reload failed"));
         assert_eq!(handle.terminal_finalization(), finalization);
     }
@@ -4839,6 +4854,11 @@ mod terminal_finalization_tests {
             "published version projection failed",
         ));
         handle.retain_finalization(finalization.clone());
+        let cleanup = ExternalMutationFinalization::Failed(failure(
+            ConnectorMutationFailureKind::Unavailable,
+            "safe cleanup still pending",
+        ));
+        handle.retain_cleanup(cleanup.clone());
         handle
             .settle(IcebergWriteSessionState::KnownCommitted { snapshot_id: None })
             .unwrap();
@@ -4848,6 +4868,7 @@ mod terminal_finalization_tests {
                 .unwrap(),
         };
         let ConnectorWriteAbortOutcome::KnownCommitted {
+            cleanup: actual_cleanup,
             receipt,
             finalization: actual,
         } = release_session_state(
@@ -4861,6 +4882,7 @@ mod terminal_finalization_tests {
         };
         assert!(receipt.committed_version().is_none());
         assert_eq!(actual, finalization);
+        assert_eq!(actual_cleanup, cleanup);
     }
 }
 

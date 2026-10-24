@@ -1164,6 +1164,7 @@ mod tests {
             Ok(ConnectorMetadataMaintenanceExecution::from_source(
                 Arc::new(ReadyExecution(Ok(
                     ExternalMutationOutcome::KnownCommitted {
+                        cleanup: crate::connector::ExternalMutationFinalization::Complete,
                         effect: ExternalMutationEffect::Applied,
                         receipt,
                         finalization: ExternalMutationFinalization::Complete,

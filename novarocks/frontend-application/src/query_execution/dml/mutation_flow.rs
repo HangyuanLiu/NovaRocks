@@ -5998,6 +5998,7 @@ mod tests {
 
         let outcomes = [
             ConnectorWriteAbortOutcome::KnownCommitted {
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
                 receipt: ConnectorWriteReceipt::try_new(bytes::Bytes::from_static(b"committed"))
                     .expect("receipt"),
                 finalization: ExternalMutationFinalization::Complete,

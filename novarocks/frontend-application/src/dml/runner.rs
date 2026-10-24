@@ -51,6 +51,8 @@ pub struct WriteTransactionSpec {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WriteTransactionOutcome {
     pub committed_receipt: Option<ConnectorWriteReceipt>,
+    /// Preserved cleanup diagnostics do not turn a necessary-finalized commit into failure.
+    pub cleanup: ExternalMutationFinalization,
 }
 
 #[derive(Debug)]
@@ -138,6 +140,7 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
                     &mut attempt,
                     None,
                     ExternalMutationFinalization::Complete,
+                    ExternalMutationFinalization::Complete,
                 )
             }
             CoordinatedWriteReport::CommitRequired(handle) => {
@@ -166,11 +169,17 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
                     Ok(ConnectorWriteAbortOutcome::KnownCommitted {
                         receipt,
                         finalization,
+                        cleanup,
                         ..
                     }) => {
                         attempt.mark_dispatch_possible().map_err(attempt_error)?;
-                        let settled =
-                            self.finish_committed(&spec, &mut attempt, Some(receipt), finalization);
+                        let settled = self.finish_committed(
+                            &spec,
+                            &mut attempt,
+                            Some(receipt),
+                            finalization,
+                            cleanup,
+                        );
                         if reason.execution_failure().is_some() {
                             if let Err(error) = &settled {
                                 tracing::warn!(%error, "publication finalization failed after the selected execution failure");
@@ -217,8 +226,9 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
             ExternalMutationOutcome::KnownCommitted {
                 receipt,
                 finalization,
+                cleanup,
                 ..
-            } => self.finish_committed(spec, attempt, Some(receipt), finalization),
+            } => self.finish_committed(spec, attempt, Some(receipt), finalization, cleanup),
             ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
                 attempt
                     .terminal_known_uncommitted()
@@ -236,8 +246,12 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
                     Ok(ExternalMutationOutcome::KnownCommitted {
                         receipt,
                         finalization,
+                        cleanup,
                         ..
                     }) => {
+                        if let ExternalMutationFinalization::Failed(error) = &cleanup {
+                            tracing::warn!(%error, "reconciled write retains incomplete cleanup");
+                        }
                         let finalize =
                             combine_finalization(finalization, self.executor.finalize(spec));
                         let finalization = if finalize.is_ok() {
@@ -260,6 +274,7 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
                         }
                         Ok(WriteTransactionOutcome {
                             committed_receipt: Some(receipt),
+                            cleanup,
                         })
                     }
                     Ok(ExternalMutationOutcome::KnownUncommitted { failure, cleanup }) => {
@@ -310,7 +325,11 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
         attempt: &mut DmlPublicationAttempt,
         receipt: Option<ConnectorWriteReceipt>,
         provider_finalization: ExternalMutationFinalization,
+        cleanup: ExternalMutationFinalization,
     ) -> Result<WriteTransactionOutcome, DmlError> {
+        if let ExternalMutationFinalization::Failed(error) = &cleanup {
+            tracing::warn!(%error, "known committed write retains incomplete cleanup");
+        }
         let finalized = combine_finalization(provider_finalization, self.executor.finalize(spec));
         let finalization = if finalized.is_ok() {
             DmlPublicationFinalization::Succeeded
@@ -328,6 +347,7 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
         }
         Ok(WriteTransactionOutcome {
             committed_receipt: receipt,
+            cleanup,
         })
     }
 }
@@ -546,9 +566,10 @@ mod tests {
             match self.adjudication {
                 Adjudication::Committed | Adjudication::CommittedCleanupFailed => {
                     Ok(ExternalMutationOutcome::KnownCommitted {
+                        finalization: ExternalMutationFinalization::Complete,
                         effect: ExternalMutationEffect::Applied,
                         receipt: Self::receipt(),
-                        finalization: if matches!(
+                        cleanup: if matches!(
                             self.adjudication,
                             Adjudication::CommittedCleanupFailed
                         ) {
@@ -688,6 +709,7 @@ mod tests {
     fn selected_task_failure_survives_abort_known_committed_and_finalization() {
         for fail_finalize in [false, true] {
             let mut executor = selected_executor(Ok(ConnectorWriteAbortOutcome::KnownCommitted {
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
                 receipt: UnknownCommitExecutor::receipt(),
                 finalization: ExternalMutationFinalization::Complete,
             }));
@@ -746,6 +768,7 @@ mod tests {
     #[test]
     fn legacy_abort_known_committed_keeps_its_original_success_verdict() {
         let mut executor = selected_executor(Ok(ConnectorWriteAbortOutcome::KnownCommitted {
+            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             receipt: UnknownCommitExecutor::receipt(),
             finalization: ExternalMutationFinalization::Complete,
         }));
@@ -804,33 +827,36 @@ mod tests {
             None,
         );
         attempt.mark_dispatch_possible().unwrap();
-        let error = StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::Write)
+        let outcome = StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::Write)
             .complete_commit(
                 &spec,
                 &mut attempt,
                 &(),
                 ExternalMutationOutcome::KnownCommitted {
+                    finalization: ExternalMutationFinalization::Complete,
                     effect: ExternalMutationEffect::Applied,
                     receipt: UnknownCommitExecutor::receipt(),
-                    finalization: ExternalMutationFinalization::Failed(
-                        ConnectorMutationFailure::new(
-                            ConnectorMutationFailureKind::Unavailable,
-                            "prior attempt artifacts remain",
-                        ),
-                    ),
+                    cleanup: ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Unavailable,
+                        "prior attempt artifacts remain",
+                    )),
                 },
             )
-            .expect_err("cleanup failure is visible after proven publication");
+            .expect("safe cleanup failure does not fail a necessary-finalized commit");
+        assert!(outcome.committed_receipt.is_some());
         assert_eq!(
-            error.publication_terminal().unwrap().disposition(),
+            attempt.terminal().unwrap().disposition(),
             LakePublicationDisposition::KnownCommitted
         );
-        assert!(error.publication_terminal().unwrap().do_not_retry());
+        assert!(attempt.terminal().unwrap().do_not_retry());
         assert_eq!(
             attempt.finalization(),
-            Some(DmlPublicationFinalization::Failed)
+            Some(DmlPublicationFinalization::Succeeded)
         );
-        assert!(error.to_string().contains("prior attempt artifacts remain"));
+        let ExternalMutationFinalization::Failed(cleanup) = outcome.cleanup else {
+            panic!("cleanup diagnostic lost")
+        };
+        assert!(cleanup.message().contains("prior attempt artifacts remain"));
         assert_eq!(executor.commits.load(Ordering::SeqCst), 0);
         assert_eq!(executor.adjudications.load(Ordering::SeqCst), 0);
         assert_eq!(executor.finalizations.load(Ordering::SeqCst), 1);
@@ -844,18 +870,18 @@ mod tests {
             adjudications: AtomicUsize::new(0),
             finalizations: AtomicUsize::new(0),
         };
-        let error = StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::Write)
+        let outcome = StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::Write)
             .run(spec())
-            .expect_err("known commit cleanup failure is visible");
-        let terminal = error.publication_terminal().unwrap();
-        assert_eq!(
-            terminal.disposition(),
-            LakePublicationDisposition::KnownCommitted
-        );
-        assert!(terminal.do_not_retry());
+            .expect(
+                "only safe cleanup failed; the publication and required finalization succeeded",
+            );
+        assert!(outcome.committed_receipt.is_some());
+        let ExternalMutationFinalization::Failed(cleanup) = outcome.cleanup else {
+            panic!("cleanup diagnostic lost")
+        };
         assert!(
-            error
-                .to_string()
+            cleanup
+                .message()
                 .contains("owned artifact cleanup incomplete")
         );
         assert_eq!(executor.commits.load(Ordering::SeqCst), 1);

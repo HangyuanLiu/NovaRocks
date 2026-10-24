@@ -2145,6 +2145,7 @@ pub(crate) mod tests {
 
     pub(crate) fn known_committed() -> ExternalMutationOutcome<ConnectorWriteReceipt> {
         ExternalMutationOutcome::KnownCommitted {
+            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             effect: novarocks_spi::connector::ExternalMutationEffect::Applied,
             receipt: ConnectorWriteReceipt::try_new(bytes::Bytes::from_static(b"receipt"))
                 .expect("receipt"),

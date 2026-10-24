@@ -288,7 +288,14 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
         outcome: ExternalMutationOutcome<novarocks_spi::connector::StatisticsReceipt>,
     ) -> StatisticsPublicationOutcome {
         match outcome {
-            ExternalMutationOutcome::KnownCommitted { finalization, .. } => {
+            ExternalMutationOutcome::KnownCommitted {
+                finalization,
+                cleanup,
+                ..
+            } => {
+                if let ExternalMutationFinalization::Failed(error) = &cleanup {
+                    tracing::warn!(%error, "committed statistics retain incomplete cleanup");
+                }
                 StatisticsPublicationOutcome {
                     fact: StatisticsPublicationFact::KnownCommitted,
                     finalization_failure: match finalization {
@@ -734,6 +741,7 @@ mod tests {
             }
             self.finish_calls.fetch_add(1, Ordering::SeqCst);
             Ok(ExternalMutationOutcome::KnownCommitted {
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
                 effect: ExternalMutationEffect::NoOp,
                 receipt: StatisticsReceipt::try_new(
                     self.descriptor.clone(),

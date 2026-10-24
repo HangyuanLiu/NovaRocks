@@ -688,16 +688,22 @@ fn interpret_committed_write(
         MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string())
     })? {
         ExternalMutationOutcome::KnownCommitted {
+            cleanup,
             effect,
             receipt,
             finalization,
-        } => match finalization {
-            ExternalMutationFinalization::Complete => Ok((effect, receipt)),
-            ExternalMutationFinalization::Failed(error) => Err(MvApplicationError::new(
-                MvApplicationErrorKind::KnownCommittedFinalizeFailed,
-                error.to_string(),
-            )),
-        },
+        } => {
+            if let ExternalMutationFinalization::Failed(error) = &cleanup {
+                tracing::warn!(%error, "committed MV write retains incomplete cleanup");
+            }
+            match finalization {
+                ExternalMutationFinalization::Complete => Ok((effect, receipt)),
+                ExternalMutationFinalization::Failed(error) => Err(MvApplicationError::new(
+                    MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+                    error.to_string(),
+                )),
+            }
+        }
         ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
             Err(MvApplicationError::new(
                 MvApplicationErrorKind::Engine,
@@ -764,6 +770,7 @@ mod tests {
     /// What a publication that actually committed reports back.
     fn published_outcome(row_count: u64) -> ExternalMutationOutcome<ConnectorWriteReceipt> {
         ExternalMutationOutcome::KnownCommitted {
+            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             effect: ExternalMutationEffect::Applied,
             receipt: ConnectorWriteReceipt::try_new_with_committed_facts(
                 bytes::Bytes::from_static(b"mv-publication-receipt"),
@@ -781,6 +788,7 @@ mod tests {
     /// `settle_empty_write_without_commit`.
     fn skipped_publication_outcome() -> ExternalMutationOutcome<ConnectorWriteReceipt> {
         ExternalMutationOutcome::KnownCommitted {
+            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             effect: ExternalMutationEffect::NoOp,
             receipt: ConnectorWriteReceipt::try_new_with_committed_facts(
                 bytes::Bytes::from_static(b"mv-publication-receipt"),

@@ -1842,6 +1842,7 @@ pub enum ConnectorWriteAbortOutcome {
     KnownCommitted {
         receipt: ConnectorWriteReceipt,
         finalization: ExternalMutationFinalization,
+        cleanup: ExternalMutationFinalization,
     },
     CommitUnknown {
         failure: ConnectorMutationFailure,

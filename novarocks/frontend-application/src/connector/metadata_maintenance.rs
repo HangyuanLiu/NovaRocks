@@ -104,6 +104,8 @@ pub struct CompletedMetadataMaintenance {
     pub effect: ExternalMutationEffect,
     pub receipt: ConnectorMetadataMaintenanceReceipt,
     pub finalization: ExternalMutationFinalization,
+    /// Diagnostic cleanup, independent of necessary business finalization.
+    pub cleanup: ExternalMutationFinalization,
 }
 
 /// Planning never crosses the dispatch boundary, whereas an explicit provider
@@ -720,6 +722,7 @@ fn outcome_after_frame_failure(
     );
     match outcome {
         ExternalMutationOutcome::KnownCommitted {
+            cleanup,
             effect,
             receipt,
             finalization,
@@ -736,6 +739,7 @@ fn outcome_after_frame_failure(
                 }
             };
             ExternalMutationOutcome::KnownCommitted {
+                cleanup,
                 effect,
                 receipt,
                 finalization,
@@ -764,14 +768,21 @@ fn project_terminal_without_cache(
 ) -> ResolvedMetadataMaintenance {
     match outcome {
         ExternalMutationOutcome::KnownCommitted {
+            cleanup,
             effect,
             receipt,
             finalization,
-        } => ResolvedMetadataMaintenance::KnownCommitted(CompletedMetadataMaintenance {
-            effect,
-            receipt,
-            finalization,
-        }),
+        } => {
+            if let ExternalMutationFinalization::Failed(error) = &cleanup {
+                tracing::warn!(%error, "committed metadata maintenance retains incomplete cleanup");
+            }
+            ResolvedMetadataMaintenance::KnownCommitted(CompletedMetadataMaintenance {
+                effect,
+                receipt,
+                finalization,
+                cleanup,
+            })
+        }
         ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
             ResolvedMetadataMaintenance::KnownUncommitted {
                 failure: KnownUncommittedMetadataMaintenance::Provider(failure),
@@ -869,6 +880,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum Mode {
         Committed,
+        CommittedCleanupFailed,
         UnknownStaysUnknown,
         PlanningFailure,
         Pending,
@@ -1038,6 +1050,14 @@ mod tests {
             }
             self.events.lock().unwrap().push("provider");
             Ok(ExternalMutationOutcome::KnownCommitted {
+                cleanup: if matches!(self.mode, Mode::CommittedCleanupFailed) {
+                    ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Unavailable,
+                        "retired objects remain",
+                    ))
+                } else {
+                    ExternalMutationFinalization::Complete
+                },
                 effect: ExternalMutationEffect::Applied,
                 receipt: self.receipt(&request.plan),
                 finalization: ExternalMutationFinalization::Complete,
@@ -1525,6 +1545,72 @@ mod tests {
 
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_is_retained_without_skipping_necessary_cache_finalization() {
+        struct CacheFailure;
+        impl MetadataMaintenanceCacheFinalizer for CacheFailure {
+            fn invalidate_generic_table(
+                &self,
+                _: &ConnectorTableIdentity,
+            ) -> Result<(), ConnectorError> {
+                Err(ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "necessary cache barrier failed",
+                ))
+            }
+        }
+        let provider = FakeProvider::new(Mode::CommittedCleanupFailed);
+        let resolver = Resolver::new(provider.clone());
+        let finalizer = Finalizer {
+            events: provider.events.clone(),
+        };
+        let ResolvedMetadataMaintenance::KnownCommitted(completed) = resolve_metadata_maintenance(
+            &resolver,
+            &finalizer,
+            &provider.descriptor.instance_id,
+            ConnectorMutationOperationId::new(),
+            table(&provider.descriptor.instance_id),
+            MetadataMaintenanceIntent::expire_table_versions(None, Some(1)),
+            context(),
+        )
+        .await
+        else {
+            panic!("publication is known committed")
+        };
+        assert_eq!(
+            completed.finalization,
+            ExternalMutationFinalization::Complete
+        );
+        assert!(
+            matches!(completed.cleanup, ExternalMutationFinalization::Failed(ref error) if error.message() == "retired objects remain")
+        );
+        assert_eq!(
+            *provider.events.lock().unwrap(),
+            vec!["provider", "generic"]
+        );
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+        let ResolvedMetadataMaintenance::KnownCommitted(completed) = resolve_metadata_maintenance(
+            &resolver,
+            &CacheFailure,
+            &provider.descriptor.instance_id,
+            ConnectorMutationOperationId::new(),
+            table(&provider.descriptor.instance_id),
+            MetadataMaintenanceIntent::expire_table_versions(None, Some(1)),
+            context(),
+        )
+        .await
+        else {
+            panic!("necessary cache failure cannot erase the commit")
+        };
+        assert!(
+            matches!(completed.finalization, ExternalMutationFinalization::Failed(ref error) if error.message().contains("necessary cache barrier failed"))
+        );
+        assert!(
+            matches!(completed.cleanup, ExternalMutationFinalization::Failed(ref error) if error.message() == "retired objects remain")
+        );
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

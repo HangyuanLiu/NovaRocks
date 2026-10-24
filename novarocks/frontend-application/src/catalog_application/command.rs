@@ -874,6 +874,7 @@ mod tests {
                 .unwrap()
                 .push(request.evidence.operation_id());
             Ok(spi::ExternalMutationOutcome::KnownCommitted {
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
                 effect: spi::ExternalMutationEffect::Applied,
                 receipt: spi::ConnectorCatalogMutationReceipt::try_new(
                     self.descriptor.clone(),

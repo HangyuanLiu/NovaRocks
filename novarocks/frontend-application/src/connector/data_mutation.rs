@@ -90,6 +90,8 @@ pub struct CompletedDataMutation {
     pub effect: ExternalMutationEffect,
     pub receipt: ConnectorDataMutationReceipt,
     pub finalization: ExternalMutationFinalization,
+    /// Diagnostic cleanup, independent of necessary business finalization.
+    pub cleanup: ExternalMutationFinalization,
 }
 
 /// A known-uncommitted result can originate either from read-only planning or
@@ -427,15 +429,20 @@ fn resolve_terminal_outcome(
 ) -> ResolvedDataMutation {
     match outcome {
         ExternalMutationOutcome::KnownCommitted {
+            cleanup,
             effect,
             receipt,
             finalization,
         } => {
+            if let ExternalMutationFinalization::Failed(error) = &cleanup {
+                tracing::warn!(%error, "committed data mutation retains incomplete cleanup");
+            }
             let generic_finalization = cache_finalizer.invalidate_generic_table(table);
             ResolvedDataMutation::KnownCommitted(CompletedDataMutation {
                 effect,
                 receipt,
                 finalization: merge_finalization(finalization, generic_finalization),
+                cleanup,
             })
         }
         ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
@@ -752,6 +759,7 @@ mod tests {
             }
             self.events.lock().expect("events").push("provider");
             Ok(ExternalMutationOutcome::KnownCommitted {
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
                 effect: ExternalMutationEffect::Applied,
                 receipt: self.receipt(&request.plan),
                 finalization: ExternalMutationFinalization::Complete,
@@ -799,6 +807,7 @@ mod tests {
             }
             self.events.lock().expect("events").push("provider");
             Ok(ExternalMutationOutcome::KnownCommitted {
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
                 effect: ExternalMutationEffect::Applied,
                 receipt: ConnectorDataMutationReceipt::try_new(
                     self.descriptor.clone(),

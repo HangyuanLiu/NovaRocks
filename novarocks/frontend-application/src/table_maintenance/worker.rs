@@ -261,8 +261,12 @@ impl DistributedRewriteSession for FrontendDistributedRewriteSession<'_> {
             ExternalMutationOutcome::KnownCommitted {
                 receipt,
                 finalization,
+                cleanup,
                 ..
             } => {
+                if let ExternalMutationFinalization::Failed(error) = &cleanup {
+                    tracing::warn!(%error, "committed rewrite retains incomplete cleanup");
+                }
                 self.committed_receipt = Some(receipt);
                 Ok(RewriteCommit::KnownCommitted {
                     finalization_failed: match finalization {

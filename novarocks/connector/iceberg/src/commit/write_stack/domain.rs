@@ -1754,6 +1754,7 @@ pub struct IcebergCommitHandle {
         BTreeMap<WriteTargetOrdinal, Vec<novarocks_spi::connector::StatisticsArtifactIdentity>>,
     document_records: std::sync::Mutex<Option<BTreeMap<String, String>>>,
     terminal_finalization: std::sync::Mutex<novarocks_spi::connector::ExternalMutationFinalization>,
+    terminal_cleanup: std::sync::Mutex<novarocks_spi::connector::ExternalMutationFinalization>,
     recovery_evidence:
         Arc<std::sync::Mutex<Option<novarocks_spi::connector::ExternalMutationEvidence>>>,
     state: std::sync::Mutex<IcebergWriteSessionState>,
@@ -1988,6 +1989,9 @@ impl IcebergCommitHandle {
             statistics_expectations: BTreeMap::new(),
             document_records: std::sync::Mutex::new(None),
             terminal_finalization: std::sync::Mutex::new(
+                novarocks_spi::connector::ExternalMutationFinalization::Complete,
+            ),
+            terminal_cleanup: std::sync::Mutex::new(
                 novarocks_spi::connector::ExternalMutationFinalization::Complete,
             ),
             recovery_evidence: Arc::new(std::sync::Mutex::new(None)),
@@ -2381,6 +2385,29 @@ impl IcebergCommitHandle {
         &self,
     ) -> novarocks_spi::connector::ExternalMutationFinalization {
         self.terminal_finalization
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn retain_cleanup(
+        &self,
+        result: novarocks_spi::connector::ExternalMutationFinalization,
+    ) {
+        let retired = {
+            let mut current = self
+                .terminal_cleanup
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::replace(&mut *current, result)
+        };
+        drop(retired);
+    }
+
+    pub(crate) fn terminal_cleanup(
+        &self,
+    ) -> novarocks_spi::connector::ExternalMutationFinalization {
+        self.terminal_cleanup
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()

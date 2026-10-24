@@ -374,8 +374,7 @@ impl MaintenanceEngine {
                 // IRU-5 owned-output cleanup is separate from snapshot GC. It
                 // retains the original operation and exact frozen roots.
                 let report = operation.cleanup_after_commit_in(&roots, context).await;
-                let finalization = report.finalization();
-                journal.record_entry_finalization(entry, finalization);
+                journal.record_entry_cleanup_report(entry, report);
             }
             if let Some(retired) = receipt.retired {
                 let mut proof = match journal.commit_outcome(entry) {
@@ -1013,10 +1012,12 @@ fn public_outcome(
 ) -> ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt> {
     match outcome {
         ExternalMutationOutcome::KnownCommitted {
+            cleanup,
             effect,
             receipt,
-            mut finalization,
+            finalization,
         } => {
+            let mut cleanup = cleanup;
             let report = receipt
                 .reclamation
                 .lock()
@@ -1040,14 +1041,15 @@ fn public_outcome(
                 ) {
                     Ok(enriched) => public = enriched,
                     Err(error) => {
-                        if matches!(finalization, ExternalMutationFinalization::Complete) {
-                            finalization =
+                        if matches!(cleanup, ExternalMutationFinalization::Complete) {
+                            cleanup =
                                 ExternalMutationFinalization::Failed(connector_failure(&error));
                         }
                     }
                 }
             }
             ExternalMutationOutcome::KnownCommitted {
+                cleanup,
                 effect,
                 receipt: public,
                 finalization,
@@ -1081,7 +1083,7 @@ fn record_reclamation_result(
         ))),
     };
     if let Some(error) = failure {
-        journal.record_entry_finalization(
+        journal.record_entry_cleanup(
             entry,
             ExternalMutationFinalization::Failed(connector_failure(&error)),
         );
@@ -1928,6 +1930,7 @@ mod tests {
                 ))
                 .unwrap();
             let ExternalMutationOutcome::KnownCommitted {
+                cleanup: _,
                 effect: ExternalMutationEffect::NoOp,
                 receipt,
                 finalization: ExternalMutationFinalization::Complete,
@@ -1945,6 +1948,82 @@ mod tests {
             );
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn committed_expiry_keeps_cleanup_failure_and_replays_without_republishing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (executor, _warehouse, base, key) = adapter();
+        let table = create_local_table_with_version(
+            &executor,
+            &base,
+            crate::iceberg::spec::FormatVersion::V3,
+        );
+        append_local_file(&executor, &base, table.identifier(), "first");
+        append_local_file(&executor, &base, table.identifier(), "second");
+        let before = executor.block_on(
+            crate::catalog::admission_test_support::load_static_fixture_table(
+                &base.runtime,
+                table.identifier(),
+            ),
+        );
+        let head = before.metadata().current_snapshot_id();
+        let retired_list = before
+            .metadata()
+            .snapshots()
+            .find(|snapshot| Some(snapshot.snapshot_id()) != head)
+            .unwrap()
+            .manifest_list()
+            .to_owned();
+        let location = novarocks_fs::FsLocation::parse(&retired_list).unwrap();
+        let blocked = std::path::Path::new(location.path()).to_owned();
+        // The retired snapshot's exact manifest list becomes an unreadable
+        // directory. REAL reclamation I/O must fail AFTER expiry publication;
+        // no cleanup status or catalog verdict is injected.
+        std::fs::remove_file(&blocked).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("retain"), b"unreclaimed").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let actual = recorded_adapter(
+            &base,
+            Arc::new(move |_, _| {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let lease = real_maintenance_lease(actual);
+        let plan = executor
+            .block_on(lease.plan_maintenance(local_planning_request(&key, true)))
+            .unwrap();
+        let execute = || {
+            ConnectorMetadataMaintenanceExecuteRequest::try_new(plan.clone(), context()).unwrap()
+        };
+        let first = executor.block_on(lease.execute(execute())).unwrap();
+        let ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::Applied,
+            finalization,
+            cleanup,
+            ..
+        } = &first
+        else {
+            panic!("metadata expiration publication must be proven")
+        };
+        assert_eq!(finalization, &ExternalMutationFinalization::Complete);
+        assert!(matches!(cleanup, ExternalMutationFinalization::Failed(_)));
+        let after = executor.block_on(
+            crate::catalog::admission_test_support::load_static_fixture_table(
+                &base.runtime,
+                table.identifier(),
+            ),
+        );
+        assert_eq!(after.metadata().current_snapshot_id(), head);
+        assert_eq!(after.metadata().snapshots().len(), 1);
+        assert_eq!(
+            std::fs::read(blocked.join("retain")).unwrap(),
+            b"unreclaimed"
+        );
+        assert_eq!(executor.block_on(lease.execute(execute())).unwrap(), first);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1998,6 +2077,7 @@ mod tests {
             ))
             .unwrap();
         let ExternalMutationOutcome::KnownCommitted {
+            cleanup: _,
             effect: ExternalMutationEffect::Applied,
             receipt,
             finalization: ExternalMutationFinalization::Complete,
@@ -2732,6 +2812,7 @@ mod tests {
             )
             .unwrap();
         let ExternalMutationOutcome::KnownCommitted {
+            cleanup: _,
             effect: ExternalMutationEffect::Applied,
             receipt,
             finalization,
@@ -2897,6 +2978,7 @@ mod tests {
             )
             .unwrap();
         let ExternalMutationOutcome::KnownCommitted {
+            cleanup: _,
             effect: ExternalMutationEffect::NoOp,
             receipt,
             finalization,
@@ -3277,6 +3359,7 @@ mod tests {
         for replay in 0..2 {
             loads.lock().unwrap().clear();
             let ExternalMutationOutcome::KnownCommitted {
+                cleanup: _,
                 effect: ExternalMutationEffect::Applied,
                 receipt,
                 finalization: ExternalMutationFinalization::Failed(failure),
@@ -3414,13 +3497,14 @@ mod tests {
         let expected_receipt = receipt(&adapter, &plan);
         let expected_failure = ConnectorMutationFailure::new(
             ConnectorMutationFailureKind::Unavailable,
-            "cleanup response was lost",
+            "necessary owner cache finalization was lost",
         );
         adapter.terminal.lock().expect("terminal").insert(
             plan.operation_id(),
             TerminalRecord {
                 plan_digest: plan.plan_digest(),
                 outcome: ExternalMutationOutcome::KnownCommitted {
+                    cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
                     effect: ExternalMutationEffect::Applied,
                     receipt: expected_receipt.clone(),
                     finalization: ExternalMutationFinalization::Failed(expected_failure.clone()),
