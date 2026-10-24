@@ -110,9 +110,7 @@ pub(crate) fn control_storage_dependency_records(
         .count()?
         .checked_mul(config.proposals_per_slot)
         .ok_or(WorkError::ArithmeticOverflow)?;
-    metadata_geometry::maximum_fact_roots(joint, proposals)?
-        .checked_mul(joint.max_dependencies_per_claim)
-        .ok_or(WorkError::ArithmeticOverflow)
+    metadata_geometry::maximum_dependency_origins(joint, proposals)
 }
 
 impl WorkloadControl {

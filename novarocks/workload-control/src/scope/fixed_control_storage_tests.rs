@@ -93,11 +93,7 @@ pub(crate) fn prototype_profile_with_roles(
         max_total_proof_work: 10000000,
         work_per_turn: NonZeroUsize::new(7).unwrap(),
     };
-    config.max_registered_dependencies = (4 * config.max_claims
-        + 2 * count * storage.proposals_per_slot * max_changes
-        + 2 * max_changes
-        + 1)
-        * max_dependencies;
+    config.max_registered_dependencies = storage.minimum_dependency_records(&config).unwrap();
     let base = storage.base_charge(&config).unwrap();
     let metadata = base.get(JointResource::MetadataBytes);
     let global = JointResources::ZERO

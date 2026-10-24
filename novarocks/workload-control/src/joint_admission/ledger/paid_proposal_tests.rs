@@ -629,3 +629,72 @@ fn paid_selected_origin_deduplicates_before_owned_output_and_preserves_full_unio
     finish(work);
     drive(&mut driver);
 }
+
+#[test]
+fn complete_request_union_is_bounded_before_another_change_mints_a_domain() {
+    let (control, handle, mut driver) =
+        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 1, 2);
+    let work = root(&control);
+    let a = network(0);
+    let b = network(1);
+    let mut proposal = handle.begin_paid_proposal(&work.owner).unwrap();
+    proposal
+        .begin_new(JointLane::Custody, JointResources::ZERO)
+        .unwrap();
+    proposal.push_dependency(&a).unwrap();
+    proposal.end_change().unwrap();
+    proposal
+        .begin_new(JointLane::Custody, JointResources::ZERO)
+        .unwrap();
+    let next = handle.inner.state.lock().unwrap().next_id;
+    assert!(matches!(
+        proposal.push_dependency(&b),
+        Err(WorkError::Capacity(_))
+    ));
+    assert_eq!(handle.inner.state.lock().unwrap().next_id, next);
+    assert_eq!(published(&handle, &b), None);
+    assert!(proposal.end_change().is_err());
+    assert!(proposal.submit().is_err());
+    finish(work);
+    drive(&mut driver);
+    assert_eq!(published(&handle, &a), None);
+    control.close_admission();
+    drive(&mut driver);
+    assert!(control.shutdown().is_ok());
+}
+
+#[test]
+fn multiple_changes_share_the_complete_request_union_without_new_canonical_facts() {
+    let (control, handle, mut driver) =
+        crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 2, 2);
+    let work = root(&control);
+    let a = network(0);
+    let b = network(1);
+    let mut proposal = handle.begin_paid_proposal(&work.owner).unwrap();
+    proposal
+        .begin_new(JointLane::Custody, JointResources::ZERO)
+        .unwrap();
+    proposal.push_dependency(&a).unwrap();
+    proposal.push_dependency(&b).unwrap();
+    proposal.end_change().unwrap();
+    let next = handle.inner.state.lock().unwrap().next_id;
+    proposal
+        .begin_new(JointLane::Custody, JointResources::ZERO)
+        .unwrap();
+    proposal.push_dependency(&b).unwrap();
+    proposal.push_dependency(&a).unwrap();
+    proposal.end_change().unwrap();
+    assert_eq!(handle.inner.state.lock().unwrap().next_id, next);
+    let mut request = proposal.submit().unwrap();
+    drive(&mut driver);
+    let reply = receive(&mut request);
+    assert_eq!(reply.new_claims.len(), 2);
+    drop((reply, request));
+    finish(work);
+    drive(&mut driver);
+    assert_eq!(published(&handle, &a), None);
+    assert_eq!(published(&handle, &b), None);
+    control.close_admission();
+    drive(&mut driver);
+    assert!(control.shutdown().is_ok());
+}

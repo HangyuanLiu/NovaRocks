@@ -44,6 +44,27 @@ pub(super) fn maximum_fact_roots(
         .ok_or(WorkError::ArithmeticOverflow)
 }
 
+/// Canonical origins, rather than independent copies of every fact graph.
+///
+/// Charged/active claims, aggregate and the one driver snapshot retain at most
+/// 4L source sets. Each original Q cell can retain old/new bodies, but the paid
+/// builder checks one complete K-union across ALL changes before minting any
+/// new origin. The same bound covers the two transaction-local source sets
+/// and the retained cursor. Graph backing still uses maximum_fact_roots: C
+/// copies of a set are not C different canonical identities.
+pub(super) fn maximum_dependency_origins(
+    config: &JointCapacityConfig,
+    proposals: usize,
+) -> Result<usize, WorkError> {
+    config
+        .max_claims
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(proposals.checked_mul(2)?))
+        .and_then(|n| n.checked_add(3))
+        .and_then(|n| n.checked_mul(config.max_dependencies_per_claim))
+        .ok_or(WorkError::ArithmeticOverflow)
+}
+
 pub(super) fn backing_bytes(
     config: &JointCapacityConfig,
     proposals: usize,
@@ -83,7 +104,13 @@ pub(super) fn backing_bytes(
     let origin_scratch = sum_bytes([array_bytes::<u8>(origin)?, arc_slice_bytes::<u8>(origin)?])?;
     let construction = sum_bytes([selected, origin_scratch])?;
     let reply = sum_bytes([array_bytes::<u64>(c)?, array_bytes::<JointClaim>(c)?])?;
-    let body = sum_bytes([array_bytes::<ChangeRecord>(c)?, construction.max(reply)])?;
+    let body = sum_bytes([
+        array_bytes::<ChangeRecord>(c)?,
+        construction.max(reply),
+        // The builder's allocation-free membership check has one prepaid
+        // capacity-K ordinal union, separate from its current selected set.
+        array_bytes::<u64>(k)?,
+    ])?;
     // Immutable graphs are counted above once, not again for every body pin.
     // Independent finite maxima reserve an envelope, not measured live bytes.
     sum_bytes([
@@ -178,5 +205,33 @@ mod tests {
         second.owner.complete();
         drive(&mut driver);
         assert!(original.upgrade().is_none());
+    }
+
+    #[test]
+    fn repeated_change_graphs_do_not_duplicate_the_canonical_origin_inventory() {
+        let (_control, handle, _driver) =
+            crate::scope::fixed_control_storage_tests::prototype_profile(4, 1, 2, 2);
+        let mut config = handle
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .joint
+            .as_ref()
+            .unwrap()
+            .config
+            .config
+            .clone();
+        config.max_changes_per_request = 1;
+        let canonical = maximum_dependency_origins(&config, 8).unwrap();
+        let graphs = maximum_fact_roots(&config, 8).unwrap();
+        config.max_changes_per_request = 64;
+        assert_eq!(maximum_dependency_origins(&config, 8).unwrap(), canonical);
+        assert!(maximum_fact_roots(&config, 8).unwrap() > graphs);
+        config.max_dependencies_per_claim = usize::MAX;
+        assert!(matches!(
+            maximum_dependency_origins(&config, 8),
+            Err(WorkError::ArithmeticOverflow)
+        ));
     }
 }

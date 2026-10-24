@@ -71,6 +71,22 @@ struct PendingChange {
     first_bind: bool,
 }
 
+fn track_dependency_union(
+    union: &mut Vec<u64>,
+    dependencies: &[DependencyRef],
+    maximum: usize,
+) -> Result<(), WorkError> {
+    for record in dependencies {
+        if let Err(position) = union.binary_search(&record.ordinal) {
+            if union.len() >= maximum {
+                return Err(WorkError::Capacity("joint request dependency union"));
+            }
+            union.insert(position, record.ordinal);
+        }
+    }
+    Ok(())
+}
+
 /// One original prepaid proposal position, including its construction phase.
 /// Any error poisons the proposal. It cannot submit a silently partial batch.
 /// Free registry handles and caller-vector request inputs are test harness only.
@@ -92,6 +108,9 @@ pub struct JointProposal {
     cpu_action: Option<CpuActionFence>,
     blocking_action: Option<BlockingActionFence>,
     records: Vec<ChangeRecord>,
+    // The complete source union, shared by every change in this one paid
+    // request. Ordinals grant no access and retain no canonical fact alias.
+    dependency_union: Vec<u64>,
     current: Option<PendingChange>,
     custody: Option<ProposalConstruction>,
     scope: WorkScope,
@@ -133,6 +152,7 @@ impl JointAdmissionHandle {
             cpu_action: None,
             blocking_action: None,
             records: Vec::new(),
+            dependency_union: Vec::new(),
             current: None,
             custody: Some(custody),
             scope,
@@ -146,6 +166,10 @@ impl JointAdmissionHandle {
             .records
             .try_reserve_exact(proposal.config.config.max_changes_per_request)
             .map_err(|_| WorkError::Capacity("paid joint change backing"))?;
+        proposal
+            .dependency_union
+            .try_reserve_exact(proposal.config.config.max_dependencies_per_claim)
+            .map_err(|_| WorkError::Capacity("paid joint request union backing"))?;
         Ok(proposal)
     }
 
@@ -244,6 +268,15 @@ impl JointProposal {
         } else {
             None
         };
+        if let Some((facts, _)) = &original {
+            // Adjustment retains its complete old union. Check it before
+            // allocating another selected set or creating any new facts.
+            track_dependency_union(
+                &mut self.dependency_union,
+                &facts.dependencies,
+                self.config.config.max_dependencies_per_claim,
+            )?;
+        }
         let mut selected = Vec::new();
         selected
             .try_reserve_exact(self.config.config.max_dependencies_per_claim)
@@ -347,6 +380,21 @@ impl JointProposal {
         if change.selected.len() >= k {
             return Err(WorkError::Capacity("joint dependency union"));
         }
+        if self.dependency_union.len() >= k
+            && !self.records.iter().any(|record| {
+                record
+                    .claim
+                    .facts
+                    .dependencies
+                    .iter()
+                    .any(|record| input.matches(&record.fact))
+            })
+        {
+            // All earlier members remain in records/current. A new domain
+            // cannot consume canonical inventory merely by starting another
+            // change of the same logical source. Never truncate its full D.
+            return Err(WorkError::Capacity("joint request dependency union"));
+        }
         let fact = input.into_owned();
         let record = self.scope.inner.update(|state| {
             let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
@@ -382,6 +430,10 @@ impl JointProposal {
                 .unwrap()
                 .insert(fact.clone(), ordinal)
         })?;
+        if let Err(position) = self.dependency_union.binary_search(&record.ordinal) {
+            assert!(self.dependency_union.len() < self.dependency_union.capacity());
+            self.dependency_union.insert(position, record.ordinal);
+        }
         let position = change
             .selected
             .binary_search_by_key(&record.ordinal, |record| record.ordinal)
@@ -397,6 +449,14 @@ impl JointProposal {
         self.remember(result)
     }
     fn end(&mut self) -> Result<(), WorkError> {
+        // Closed action authors can copy an already-paid original set without
+        // minting origins through push. They obey this SAME request bound
+        // before a new immutable graph is formed or any body can be queued.
+        track_dependency_union(
+            &mut self.dependency_union,
+            &self.current.as_ref().ok_or(WorkError::Conflict)?.selected,
+            self.config.config.max_dependencies_per_claim,
+        )?;
         let change = self.current.take().ok_or(WorkError::Conflict)?;
         if change.first_bind && change.selected.is_empty() {
             return Err(WorkError::Conflict);
