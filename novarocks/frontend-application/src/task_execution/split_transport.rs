@@ -279,7 +279,9 @@ impl SplitDeliveryBridge {
         admitted: Result<UpdateAdmission, &TaskExecutionError>,
     ) -> Result<(), SplitDeliveryError> {
         let outcome = match admitted {
-            Ok(UpdateAdmission::Queued) => return self.expect_live(delivery),
+            Ok(UpdateAdmission::Queued | UpdateAdmission::Preparing) => {
+                return self.expect_live(delivery);
+            }
             Ok(UpdateAdmission::DiscardedNoLongerNeeded) => {
                 DeliveryOutcome::DestinationFinished(format!(
                     "the original owner no longer needs input for task {}",
@@ -632,8 +634,12 @@ struct SplitDeliverySink {
 }
 
 impl TaskOperationSink for SplitDeliverySink {
-    fn try_reserve_queue(&self, request: TaskOperationQueueRequest) -> TaskOperationQueueAdmission {
-        self.inner.try_reserve_queue(request)
+    fn try_reserve_queue(
+        &self,
+        request: TaskOperationQueueRequest,
+        preparation: &mut super::intent::TaskOperationQueuePreparation,
+    ) -> TaskOperationQueueAdmission {
+        self.inner.try_reserve_queue(request, preparation)
     }
 
     fn try_submit(&self, batch: DispatchBatch) -> TaskOperationSubmit {
@@ -667,6 +673,9 @@ impl TaskOperationSink for SplitDeliverySink {
                 // batch the inner transport refused.
                 self.bridge.note_released(&released);
                 TaskOperationSubmit::Accepted
+            }
+            TaskOperationSubmit::AdmissionFailed { batch, error } => {
+                TaskOperationSubmit::AdmissionFailed { batch, error }
             }
             TaskOperationSubmit::Backpressured(batch) => TaskOperationSubmit::Backpressured(batch),
             TaskOperationSubmit::Rejected { batch, reason } => {
@@ -859,6 +868,7 @@ mod tests {
         fn try_reserve_queue(
             &self,
             _request: TaskOperationQueueRequest,
+            _preparation: &mut crate::task_execution::intent::TaskOperationQueuePreparation,
         ) -> TaskOperationQueueAdmission {
             TaskOperationQueueAdmission::Admitted(crate::task_execution::intent::test_queue_permit())
         }

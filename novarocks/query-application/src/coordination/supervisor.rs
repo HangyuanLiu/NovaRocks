@@ -1524,6 +1524,15 @@ async fn run_logical_role(
         return fail_uninstalled_start(pending_owner, reply, contract_error(error));
     }
     drop(body.acceptance.take());
+    body.native_actions = match body
+        .capacity
+        .as_ref()
+        .map(|capacity| capacity.native_action_authority())
+        .transpose()
+    {
+        Ok(source) => source,
+        Err(error) => return fail_uninstalled_start(pending_owner, reply, work_error(error)),
+    };
     body.session
         .as_mut()
         .unwrap()
@@ -1733,6 +1742,7 @@ async fn run_logical_role(
     };
     let actor_config = match actor_config {
         Ok(actor_config) => actor_config
+            .with_native_action_authority(body.native_actions.take())
             .with_clock(Arc::clone(&clock))
             .with_abort_query_context_effect_port(
                 session.abort_effect_port(),

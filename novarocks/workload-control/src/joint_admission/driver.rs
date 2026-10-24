@@ -578,10 +578,7 @@ impl JointProgressDriver {
                     self.cursor = Some(id);
                     self.scan_left -= 1;
                     let cancelled = ledger.driver_closed
-                        || request
-                            .changes
-                            .iter()
-                            .any(|change| change.claim.facts.lane != JointLane::Settlement)
+                        || request.requires_business_active()
                             && state
                                 .nodes
                                 .get(&request.owner)
@@ -669,10 +666,10 @@ impl JointProgressDriver {
                 if !ledger.requests.contains_key(&turn.id) {
                     return Err(WorkError::Released);
                 }
-                if turn
-                    .changes
-                    .iter()
-                    .any(|change| change.claim.facts.lane != JointLane::Settlement)
+                if ledger
+                    .requests
+                    .get(&turn.id)
+                    .is_none_or(|request| request.requires_business_active())
                 {
                     state
                         .nodes
@@ -963,10 +960,10 @@ fn validate_turn_stop(
     if ledger.driver_closed {
         return Err(WorkError::Closed);
     }
-    if turn
-        .changes
-        .iter()
-        .any(|change| change.claim.facts.lane != JointLane::Settlement)
+    if ledger
+        .requests
+        .get(&turn.id)
+        .is_none_or(|request| request.requires_business_active())
     {
         state
             .nodes

@@ -34,9 +34,12 @@ use std::{
 };
 
 mod typed_custody;
+pub(crate) use paid_proposal::{capture_native_action, delegate_native_actions};
 use typed_custody::ClaimCustody;
+pub(crate) use typed_custody::validate_native_payload_fence;
 pub use typed_custody::{
-    InternalComputationAlias, InternalComputationGrant, RetainedPayloadAlias, RetainedPayloadGrant,
+    InternalComputationAlias, InternalComputationGrant, NativeAsyncActionGrant,
+    NativeQueuedInputGrant, NativeReplyGrant, RetainedPayloadAlias, RetainedPayloadGrant,
     UnreceivedProductionAdmission, UnreceivedProductionGrant, UnreceivedProductionOwner,
     UnreceivedProductionQuote, UnreceivedProductionReady,
 };
@@ -48,17 +51,24 @@ mod dependency_storage;
 mod metadata_geometry;
 mod paid_proposal;
 pub(crate) mod retained_claim;
-pub use paid_proposal::{BlockingActionAdmission, BlockingActionSource};
+pub use paid_proposal::{
+    AsyncActionAdmission, AsyncActionGrant, AsyncActionSource, BlockingActionAdmission,
+    BlockingActionSource, NativeAsyncActionAdmission, NativeAsyncActionAuthority,
+    NativeAsyncActionQuote, NativeAsyncActionSource, NativeQueuedInputAdmission,
+    NativeQueuedInputQuote, NativeQueuedInputReady, RootPayloadInitialAdmission,
+};
 use paid_proposal::{
-    BlockingActionFence, CpuActionFence, production_change_count, validate_blocking_action,
-    validate_control_productions, validate_cpu_action, validate_root_stage,
+    ControlActionFence, CpuActionFence, NativeActionFence, RootPayloadFence,
+    validate_control_action, validate_control_productions, validate_cpu_action,
+    validate_native_action, validate_root_payload, validate_root_stage,
 };
 pub use paid_proposal::{
     InternalCpuActionAdmission, InternalCpuActionSource, InternalCpuFactoryBinding,
     InternalResultClosedFactoryDescriptor,
 };
 pub use paid_proposal::{
-    JointProposal, RootStageAdmission, RootStageProposal, RootStageReady, RootStageSource,
+    JointProposal, RootPayloadAdmission, RootPayloadProposal, RootPayloadReady, RootPayloadSource,
+    RootStageAdmission, RootStageProposal, RootStageReady, RootStageSource,
 };
 pub(crate) mod proposal_storage;
 pub(crate) use control_storage::{control_storage_base, control_storage_dependency_records};
@@ -250,8 +260,10 @@ struct RootStageFence {
 pub(super) struct RequestRecord {
     // Restricted by closed original sources, never caller-supplied identities.
     root_stage: Option<RootStageFence>,
+    root_payload: Option<RootPayloadFence>,
     cpu_action: Option<CpuActionFence>,
-    blocking_action: Option<BlockingActionFence>,
+    control_action: Option<ControlActionFence>,
+    native_action: Option<NativeActionFence>,
     pub(super) budget: RequestBudget,
     pub(super) owner: WorkId,
     pub(super) changes: ChangeBody,
@@ -567,8 +579,10 @@ impl JointAdmissionHandle {
         };
         Ok(PreparedRequest {
             root_stage: None,
+            root_payload: None,
             cpu_action: None,
-            blocking_action: None,
+            control_action: None,
+            native_action: None,
             budget: RequestBudget::Finite {
                 remaining: work_limit,
             },
@@ -723,8 +737,10 @@ impl JointAdmissionHandle {
         }
         Ok(PreparedRequest {
             root_stage: None,
+            root_payload: None,
             cpu_action: None,
-            blocking_action: None,
+            control_action: None,
+            native_action: None,
             // A resident control rekey uses one cumulative finite proof,
             // including later full-domain extensions. It cannot self-park.
             budget: if records.iter().any(|record| {
@@ -774,8 +790,11 @@ impl JointAdmissionHandle {
             if control_only {
                 validate_control_binding_shape(state, scope, records)?;
             }
-            if let Some(fence) = prepared.blocking_action {
-                validate_blocking_action(state, scope.id, fence, records)?;
+            if let Some(fence) = prepared.native_action.as_ref() {
+                validate_native_action(state, scope.id, fence, records)?;
+            }
+            if let Some(fence) = prepared.control_action {
+                validate_control_action(state, scope.id, fence, records)?;
             }
             if let Some(fence) = prepared.cpu_action {
                 validate_cpu_action(state, scope.id, fence, records)?;
@@ -788,6 +807,9 @@ impl JointAdmissionHandle {
                 // exemption. A registered WC also forbids E CPU rows from
                 // other constructors; backing custody is not source authority.
                 return Err(WorkError::Conflict);
+            }
+            if let Some(fence) = prepared.root_payload {
+                validate_root_payload(state, scope.id, fence, records)?;
             }
             if let Some(fence) = prepared.root_stage {
                 validate_root_stage(state, scope.id, fence, records)?;
@@ -821,10 +843,11 @@ impl JointAdmissionHandle {
                     }
                 }
             }
-            if records
-                .iter()
-                .any(|record| record.claim.facts.lane != JointLane::Settlement)
-            {
+            if requires_business_active(
+                records,
+                prepared.native_action.as_ref(),
+                prepared.root_payload,
+            ) {
                 node.check(&state.cancellations)?;
                 if state.closed {
                     return Err(WorkError::Closed);
@@ -856,8 +879,10 @@ impl JointAdmissionHandle {
                 id,
                 RequestRecord {
                     root_stage: prepared.root_stage,
+                    root_payload: prepared.root_payload,
                     cpu_action: prepared.cpu_action,
-                    blocking_action: prepared.blocking_action,
+                    control_action: prepared.control_action,
+                    native_action: prepared.native_action,
                     budget: match prepared.budget {
                         RequestBudget::Finite { remaining } => RequestBudget::Finite {
                             remaining: remaining.min(ledger.config.config.max_total_proof_work),
@@ -885,8 +910,10 @@ impl JointAdmissionHandle {
 
 pub(super) struct PreparedRequest {
     root_stage: Option<RootStageFence>,
+    root_payload: Option<RootPayloadFence>,
     cpu_action: Option<CpuActionFence>,
-    blocking_action: Option<BlockingActionFence>,
+    control_action: Option<ControlActionFence>,
+    native_action: Option<NativeActionFence>,
     budget: RequestBudget,
     scope: WorkScope,
     changes: ChangeBody,
@@ -1082,11 +1109,17 @@ pub(super) fn validate_waiting(
     let request = ledger.requests.get(&id).ok_or(WorkError::Released)?;
     let work = request.owner;
     validate_control_productions(state, changes)?;
-    if let Some(fence) = request.blocking_action {
-        validate_blocking_action(state, work, fence, changes)?;
+    if let Some(fence) = request.native_action.as_ref() {
+        validate_native_action(state, work, fence, changes)?;
+    }
+    if let Some(fence) = request.control_action {
+        validate_control_action(state, work, fence, changes)?;
     }
     if let Some(fence) = request.cpu_action {
         validate_cpu_action(state, work, fence, changes)?;
+    }
+    if let Some(fence) = request.root_payload {
+        validate_root_payload(state, work, fence, changes)?;
     }
     if let Some(fence) = request.root_stage {
         validate_root_stage(state, work, fence, changes)?;
@@ -1114,6 +1147,15 @@ pub(super) fn validate_waiting(
 }
 
 impl WorkScope {
+    /// Read the same original Joint configuration; this grants no admission.
+    pub fn joint_dependency_limit(&self) -> Result<usize, WorkError> {
+        let state = self.inner.state.lock().unwrap();
+        state
+            .joint
+            .as_ref()
+            .map(|joint| joint.config.declared().max_dependencies_per_claim)
+            .ok_or(WorkError::NotReady)
+    }
     /// Request one same-class child with the parent's complete admitted
     /// dependency set. This uses the original fixed proposal and proof driver;
     /// it grants neither an I/O stage nor physical execution capacity.
@@ -1492,6 +1534,7 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
     let changes = request.changes.clone();
     let owner = request.owner;
     let physical_owner = request.root_stage.map_or(owner, |fence| fence.stage);
+    let native_action = request.native_action.clone();
     let new_count = changes.iter().filter(|c| c.old.is_none()).count();
     if ledger
         .claims
@@ -1502,10 +1545,20 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
     {
         return Err(WorkError::Capacity("joint claim records"));
     }
-    state.nodes[&physical_owner]
-        .resource_holders
-        .checked_add(new_count)
-        .ok_or(WorkError::ArithmeticOverflow)?;
+    for (index, change) in changes.iter().enumerate() {
+        if change.old.is_none() {
+            let holder = native_action
+                .as_ref()
+                .map_or(physical_owner, |fence| fence.physical_owner(index));
+            state
+                .nodes
+                .get(&holder)
+                .ok_or(WorkError::Released)?
+                .resource_holders
+                .checked_add(new_count)
+                .ok_or(WorkError::ArithmeticOverflow)?;
+        }
+    }
     state
         .next_id
         .checked_add(new_count as u64)
@@ -1565,7 +1618,10 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
             .ok_or(WorkError::ArithmeticOverflow)?;
     }
     let mut new_ids = Vec::with_capacity(new_count);
-    for change in changes.iter() {
+    for (index, change) in changes.iter().enumerate() {
+        let physical_owner = native_action
+            .as_ref()
+            .map_or(physical_owner, |fence| fence.physical_owner(index));
         if let Some(old) = change.old {
             let ledger = state.joint.as_mut().unwrap();
             let record = ledger.claims.get_mut(&old).unwrap();
@@ -1652,6 +1708,30 @@ pub struct JointAdmission {
     inner: Arc<Inner>,
     id: Option<u64>,
 }
+fn requires_business_active(
+    changes: &[ChangeRecord],
+    native: Option<&NativeActionFence>,
+    root_payload: Option<RootPayloadFence>,
+) -> bool {
+    root_payload.map_or_else(
+        || {
+            !native.is_some_and(NativeActionFence::permits_original_settlement)
+                && changes
+                    .iter()
+                    .any(|change| change.claim.facts.lane != JointLane::Settlement)
+        },
+        RootPayloadFence::requires_business_active,
+    )
+}
+impl RequestRecord {
+    pub(super) fn requires_business_active(&self) -> bool {
+        requires_business_active(
+            &self.changes,
+            self.native_action.as_ref(),
+            self.root_payload,
+        )
+    }
+}
 impl Future for JointAdmission {
     type Output = Result<JointGrantedBatch, JointAdmissionFailure>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -1706,12 +1786,27 @@ impl Future for JointAdmission {
                 remove_request(state, id);
                 return Some(Err(WorkError::Closed));
             }
+            let control_action = request.control_action;
+            let root_payload = request.root_payload;
             let changes = request.changes.clone();
             let owner = request.owner;
-            if changes
-                .iter()
-                .any(|c| c.claim.facts.lane != JointLane::Settlement)
-            {
+            let requires_business_active = request.requires_business_active();
+            let source_valid = control_action
+                .map_or(Ok(()), |fence| {
+                    validate_control_action(state, owner, fence, &changes)
+                })
+                .and_then(|()| {
+                    root_payload.map_or(Ok(()), |fence| {
+                        validate_root_payload(state, owner, fence, &changes)
+                    })
+                });
+            if let Err(error) = source_valid {
+                fail_request(state, id, error.clone());
+                self.id = None;
+                remove_request(state, id);
+                return Some(Err(error));
+            }
+            if requires_business_active {
                 if let Err(error) = state
                     .nodes
                     .get(&owner)
@@ -1910,8 +2005,14 @@ impl JointAdmission {
                     return Err(WorkError::Conflict);
                 }
             }
-            if let Some(fence) = request.blocking_action {
-                validate_blocking_action(state, request.owner, fence, &request.changes)?;
+            if let Some(fence) = request.native_action.as_ref() {
+                validate_native_action(state, request.owner, fence, &request.changes)?;
+            }
+            if request.root_payload.is_some() {
+                return Err(WorkError::Conflict);
+            }
+            if let Some(fence) = request.control_action {
+                validate_control_action(state, request.owner, fence, &request.changes)?;
             }
             if let Some(fence) = request.cpu_action {
                 validate_cpu_action(state, request.owner, fence, &request.changes)?;
@@ -1919,11 +2020,7 @@ impl JointAdmission {
             if ledger.driver_closed {
                 return Err(WorkError::Closed);
             }
-            if request
-                .changes
-                .iter()
-                .any(|change| change.claim.facts.lane != JointLane::Settlement)
-            {
+            if request.requires_business_active() {
                 state
                     .nodes
                     .get(&request.owner)
@@ -2084,8 +2181,14 @@ impl JointLocalOffer<'_> {
             if let Some(error) = failure {
                 return Err(error.clone());
             }
-            if let Some(fence) = request.blocking_action {
-                validate_blocking_action(state, request.owner, fence, &request.changes)?;
+            if let Some(fence) = request.native_action.as_ref() {
+                validate_native_action(state, request.owner, fence, &request.changes)?;
+            }
+            if request.root_payload.is_some() {
+                return Err(WorkError::Conflict);
+            }
+            if let Some(fence) = request.control_action {
+                validate_control_action(state, request.owner, fence, &request.changes)?;
             }
             if let Some(fence) = request.cpu_action {
                 validate_cpu_action(state, request.owner, fence, &request.changes)?;
@@ -2099,11 +2202,7 @@ impl JointLocalOffer<'_> {
             {
                 return Err(WorkError::Conflict);
             }
-            if request
-                .changes
-                .iter()
-                .any(|change| change.claim.facts.lane != JointLane::Settlement)
-            {
+            if request.requires_business_active() {
                 state
                     .nodes
                     .get(&request.owner)
@@ -2357,6 +2456,9 @@ impl JointAdjustmentReceipt {
         if ledger.driver_closed {
             return Err(WorkError::Closed);
         }
+        if request.root_payload.is_some() {
+            return Err(WorkError::Conflict);
+        }
         let changes = request.changes.clone();
         validate_control_productions(state, &changes)?;
         if control_only {
@@ -2366,10 +2468,7 @@ impl JointAdjustmentReceipt {
             }
             validate_control_binding_shape(state, scope, &changes)?;
         }
-        if changes
-            .iter()
-            .any(|c| c.claim.facts.lane != JointLane::Settlement)
-        {
+        if request.requires_business_active() {
             state
                 .nodes
                 .get(&request.owner)

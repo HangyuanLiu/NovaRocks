@@ -59,6 +59,7 @@ impl ParticipantObservationFailure {
 /// Why the frontend task-protocol owners refuse to continue.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskExecutionError {
+    Workload(novarocks_workload_control::WorkError),
     /// A local owner has already projected its own fact and safe detail.
     Execution(novarocks_query_application::execution_error::ExecutionFailureInput),
     SplitAssignment(crate::query_execution::split_assignment::SplitAssignmentDriverError),
@@ -364,6 +365,7 @@ impl fmt::Display for TaskExecutionError {
         match self {
             Self::Execution(input) => formatter.write_str(input.detail().as_str()),
             Self::SplitAssignment(error) => write!(formatter, "split assignment failed: {error}"),
+            Self::Workload(error) => std::fmt::Display::fmt(error, formatter),
             Self::NativeTransport(error) => write!(
                 formatter,
                 "native Task transport construction failed: {error}"
@@ -481,6 +483,7 @@ impl fmt::Display for TaskExecutionError {
 impl std::error::Error for TaskExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Workload(error) => Some(error),
             Self::NativeTransport(error) => Some(error),
             Self::Actor(error) => Some(error),
             Self::Establish(error) => Some(error),
@@ -609,6 +612,13 @@ impl TaskExecutionError {
             ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
         };
         match self {
+            Self::Workload(error) => {
+                return ExecutionFailureInput::new(
+                    error.failure_fact(),
+                    SafeDetail::truncating("Native workload admission failed"),
+                    ExecutionFailureSite::Coordinator,
+                );
+            }
             Self::Execution(input) => return input.clone(),
             Self::SplitAssignment(error) => {
                 return error.execution_failure().unwrap_or_else(|| {

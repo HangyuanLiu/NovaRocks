@@ -63,6 +63,8 @@ pub(crate) struct AttemptTransport {
     pub(crate) attempt: AttemptWireFacts,
     pub(crate) data_runtime: FrontendDataRuntime,
     pub(crate) subscription_scope: novarocks_workload_control::WorkScope,
+    pub(crate) native_actions:
+        novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
 }
 
 /// One assembled attempt: its runner and the split-delivery bridge that shares
@@ -126,6 +128,7 @@ pub(crate) fn assemble_round(
         transport.attempt,
         acks.handle(),
         transport.data_runtime.clone(),
+        transport.native_actions,
     )
     .map_err(TaskExecutionError::NativeTransport)?;
     let sink = split_delivery.sink(Arc::new(sink) as Arc<dyn TaskOperationSink>);

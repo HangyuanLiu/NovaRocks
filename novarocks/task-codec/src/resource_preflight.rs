@@ -24,6 +24,8 @@
 
 use std::fmt;
 
+mod paid_reply;
+pub use paid_reply::OperationReplyDecodePlan;
 mod operation_reply;
 pub use operation_reply::check_operation_reply;
 

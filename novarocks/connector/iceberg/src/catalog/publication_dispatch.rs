@@ -107,6 +107,11 @@ impl EvidenceContext {
         novarocks_spi::connector::ConnectorError,
     > {
         use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
+        if original.io_admission().is_some() {
+            return Ok(original
+                .for_existing_obligation(self.deadline(), ConnectorStopOwner::new().view())
+                .after_external_effect());
+        }
         let mut request = ConnectorRequestContext::try_new(
             self.deadline(),
             ConnectorStopOwner::new().view(),

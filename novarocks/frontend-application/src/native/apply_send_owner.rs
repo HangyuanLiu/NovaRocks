@@ -71,7 +71,9 @@ impl JoinFacts {
         }
     }
 }
-type ReservationBacking = Mutex<ApplyReservations>;
+mod canonical_reply;
+pub(crate) use canonical_reply::{CanonicalAcknowledgement, OriginalReplyPublisher};
+use canonical_reply::{OriginalNativeAcceptance, ReservationBacking};
 type OriginalFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// Requested payload layouts of the actual original Apply holder. This does
@@ -184,6 +186,9 @@ impl Drop for OriginalInput {
 }
 enum OriginalState {
     Reserved,
+    Loaned,
+    UncommittedNative,
+    RetiringNative(Retirement<ReservationBacking>),
     #[allow(
         dead_code,
         reason = "pre-spawn original input custody, not an exit observation"
@@ -194,6 +199,9 @@ enum OriginalState {
         input: Arc<OriginalInput>,
     },
     Retiring(Retirement<ReservationBacking>),
+    RetiringPhysical(Retirement<ReservationBacking>),
+    RetiringAction(Retirement<ReservationBacking>),
+    ReplyOnly,
     // The public API supplied no original handle after an unwind. Keep all
     // custody; never infer joined from task Drop or fabricate another handle.
     #[allow(
@@ -203,6 +211,7 @@ enum OriginalState {
     UnjoinableSpawn(Arc<OriginalInput>),
 }
 struct OriginalRecord {
+    native: OriginalNativeAcceptance,
     state: OriginalState,
     reservations: Option<Arc<ReservationBacking>>,
 }
@@ -502,12 +511,38 @@ impl ApplySendPort {
         let core =
             novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<Core>())
                 .map_err(|_| WorkError::ArithmeticOverflow)?;
+        // Same fixed process inventory owns canonical backing headers until
+        // their actual final Arc exit. One old header can be leaving the
+        // serial reaper while its freed row admits its successor.
+        let reply_headers =
+            novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<
+                ReservationBacking,
+            >())
+            .map_err(|_| WorkError::ArithmeticOverflow)?;
+        let reply_headers = records
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(reply_headers.size()))
+            .ok_or(WorkError::ArithmeticOverflow)?;
         let bytes = array
             .size()
-            .checked_add(core.size())
+            .checked_add(reply_headers)
+            .and_then(|n| n.checked_add(core.size()))
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<ApplySendOwner>()))
             .ok_or(WorkError::ArithmeticOverflow)?;
         Ok((records, bytes))
+    }
+
+    /// Refuse a closed role before starting a paid proposal. This does not
+    /// reserve a row; reserve_original_slot rechecks the same state at accept.
+    pub(crate) fn check_role_admission(&self) -> Result<(), RegistrationFailure> {
+        let mut state = self.core.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.started || state.closed {
+            state
+                .first_rejection
+                .get_or_insert(RegistrationFailure::Closed);
+            return Err(RegistrationFailure::Closed);
+        }
+        Ok(())
     }
 
     /// Called while the ORIGINAL batch still owns its nonempty queue grants.
@@ -536,16 +571,18 @@ impl ApplySendPort {
             .position(Option::is_none)
             .expect("an original item-backed slot exists");
         state.records[index] = Some(OriginalRecord {
+            native: OriginalNativeAcceptance::new(),
             state: OriginalState::Reserved,
             reservations: None,
         });
-        drop(state);
-        self.core.changed.notify_one();
-        Ok(ApplySlot {
+        let slot = ApplySlot {
             core: Arc::clone(&self.core),
             index,
             active: true,
-        })
+        };
+        drop(state);
+        self.core.changed.notify_one();
+        Ok(slot)
     }
 }
 impl ApplySlot {
@@ -559,7 +596,26 @@ impl ApplySlot {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let backing = Arc::new(Mutex::new(reservations));
+        let backing = {
+            let state = self.core.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.records[self.index]
+                .as_ref()
+                .expect("original reserved slot")
+                .reservations
+                .as_ref()
+                .map(Arc::clone)
+        }
+        .unwrap_or_else(|| {
+            #[cfg(test)]
+            {
+                Arc::new(ReservationBacking::new(&self.core, 0, None, None))
+            }
+            #[cfg(not(test))]
+            {
+                panic!("original Native paid source must precede commit")
+            }
+        });
+        *backing.physical.lock().unwrap_or_else(|e| e.into_inner()) = Some(reservations);
         let input = Arc::new(OriginalInput {
             future: Mutex::new(Some(Box::pin(future))),
             raw_cause: Mutex::new(None),
@@ -629,7 +685,11 @@ impl Drop for ApplySlot {
             matches!(record.state, OriginalState::Reserved),
             "only an empty reserved slot may be released by its ticket"
         );
-        state.records[self.index] = None;
+        if record.reservations.is_some() {
+            state.records[self.index].as_mut().unwrap().state = OriginalState::UncommittedNative;
+        } else {
+            state.records[self.index] = None;
+        }
         drop(state);
         self.core.changed.notify_one();
     }
@@ -657,7 +717,13 @@ async fn reap_originals(core: Arc<Core>) {
                 let mut cancelled_to_drop = None;
                 let mut cleanup_failures = 0;
                 let done = match &mut record.state {
+                    OriginalState::ReplyOnly => record
+                        .reservations
+                        .as_ref()
+                        .is_none_or(|backing| Arc::strong_count(backing) == 1),
+                    OriginalState::UncommittedNative => true,
                     OriginalState::Reserved
+                    | OriginalState::Loaned
                     | OriginalState::Prepared(_)
                     | OriginalState::UnjoinableSpawn(_) => false,
                     OriginalState::Running { join, .. } => match Pin::new(join).poll(cx) {
@@ -667,7 +733,19 @@ async fn reap_originals(core: Arc<Core>) {
                             false
                         }
                     },
-                    OriginalState::Retiring(retirement) => {
+                    OriginalState::RetiringNative(retirement)
+                    | OriginalState::RetiringPhysical(retirement)
+                        if retirement.cleanup_failures != 0 =>
+                    {
+                        // The first actual physical cleanup unwind retains its
+                        // original cause/backing in this SAME fixed row. No
+                        // retry/disposal can manufacture a proven physical exit.
+                        false
+                    }
+                    OriginalState::Retiring(retirement)
+                    | OriginalState::RetiringNative(retirement)
+                    | OriginalState::RetiringPhysical(retirement)
+                    | OriginalState::RetiringAction(retirement) => {
                         let before = retirement.cleanup_failures;
                         let done = retirement.poll(&core.handle, cx).is_ready();
                         cleanup_failures = retirement.cleanup_failures.saturating_sub(before);
@@ -709,6 +787,55 @@ async fn reap_originals(core: Arc<Core>) {
                     return Poll::Ready((None, false, cancelled_to_drop));
                 }
                 if done {
+                    let record = state.records[index]
+                        .as_mut()
+                        .expect("original completed source");
+                    if !matches!(record.state, OriginalState::ReplyOnly) {
+                        let backing =
+                            Arc::clone(record.reservations.as_ref().expect("original backing"));
+                        let next = match &record.state {
+                            OriginalState::Retiring(_) | OriginalState::UncommittedNative => {
+                                let native = std::mem::replace(
+                                    &mut record.native,
+                                    OriginalNativeAcceptance::new(),
+                                );
+                                OriginalState::RetiringNative(Retirement::new(
+                                    native,
+                                    Arc::clone(&backing),
+                                ))
+                            }
+                            OriginalState::RetiringNative(_) => {
+                                let physical = backing
+                                    .physical
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .take();
+                                OriginalState::RetiringPhysical(Retirement::new(
+                                    physical,
+                                    Arc::clone(&backing),
+                                ))
+                            }
+                            OriginalState::RetiringPhysical(_) => {
+                                let action = backing
+                                    .action
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .take();
+                                OriginalState::RetiringAction(Retirement::new(
+                                    action,
+                                    Arc::clone(&backing),
+                                ))
+                            }
+                            OriginalState::RetiringAction(_) => OriginalState::ReplyOnly,
+                            _ => unreachable!(),
+                        };
+                        let previous = std::mem::replace(&mut record.state, next);
+                        drop(state);
+                        // Completed original retirement contains no foreign
+                        // payload; its final header/Arc leaves outside Core.
+                        drop(previous);
+                        return Poll::Ready((None, false, None));
+                    }
                     let success = state.records[index].take();
                     drop(state);
                     return Poll::Ready((success, false, None));

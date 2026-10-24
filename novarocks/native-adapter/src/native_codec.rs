@@ -29,12 +29,23 @@ use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder
 /// Native protobuf codec used by generated NovaRocks clients and servers.
 #[derive(Debug, Clone)]
 pub struct NativeProstCodec<T, U> {
+    operation_reply_plan: Option<resource_preflight::OperationReplyDecodePlan>,
     marker: PhantomData<(T, U)>,
 }
 
 impl<T, U> Default for NativeProstCodec<T, U> {
     fn default() -> Self {
         Self {
+            operation_reply_plan: None,
+            marker: PhantomData,
+        }
+    }
+}
+impl<T, U> NativeProstCodec<T, U> {
+    /// Caller has already installed this exact plan's original reply custody.
+    pub fn with_operation_reply_plan(plan: resource_preflight::OperationReplyDecodePlan) -> Self {
+        Self {
+            operation_reply_plan: Some(plan),
             marker: PhantomData,
         }
     }
@@ -55,7 +66,10 @@ where
     }
 
     fn decoder(&mut self) -> Self::Decoder {
-        NativeProstDecoder::default()
+        NativeProstDecoder {
+            operation_reply_plan: self.operation_reply_plan,
+            ..NativeProstDecoder::default()
+        }
     }
 }
 
@@ -95,6 +109,7 @@ impl<T: Message> Encoder for NativeProstEncoder<T> {
 
 #[derive(Debug, Clone)]
 pub struct NativeProstDecoder<U> {
+    operation_reply_plan: Option<resource_preflight::OperationReplyDecodePlan>,
     marker: PhantomData<U>,
     buffer_settings: BufferSettings,
 }
@@ -102,6 +117,7 @@ pub struct NativeProstDecoder<U> {
 impl<U> Default for NativeProstDecoder<U> {
     fn default() -> Self {
         Self {
+            operation_reply_plan: None,
             marker: PhantomData,
             buffer_settings: BufferSettings::default(),
         }
@@ -124,6 +140,11 @@ where
             return Err(Status::internal("native codec received a split frame"));
         }
         check_resource_shape::<U>(raw)?;
+        if TypeId::of::<U>() == TypeId::of::<proto::ApplyTaskOperationsResponse>()
+            && let Some(plan) = self.operation_reply_plan
+        {
+            plan.check(raw).map_err(operation_reply_failure)?;
+        }
         U::decode(source)
             .map(Some)
             .map_err(|error| Status::internal(error.to_string()))
@@ -155,6 +176,12 @@ pub fn is_operation_reply_preflight_failure(status: &Status) -> bool {
         source = error.source();
     }
     false
+}
+
+fn operation_reply_failure(error: resource_preflight::ResourcePreflightError) -> Status {
+    let mut status = Status::data_loss("Native operation reply exceeds its paid backing plan");
+    status.set_source(Arc::new(OperationReplyPreflightFailure(error)));
+    status
 }
 
 fn check_resource_shape<U: 'static>(raw: &[u8]) -> Result<(), Status> {

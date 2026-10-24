@@ -480,23 +480,36 @@ impl ConnectorVendedS3CredentialLeaseRefresher for IcebergRestVendedS3LeaseRefre
                 async move { endpoints.load_credentials(endpoint.as_ref()).await }
             },
         )?;
-        let refreshed = match parse_rest_delegation(delegation)? {
-            IcebergAccessDelegation::Vended(seed) => seed,
-            IcebergAccessDelegation::Static => {
-                return Err(invalid(
-                    "vended REST credential refresh returned static access delegation",
-                ));
-            }
-        };
-        if !self.scope.matches_seed(&refreshed) {
-            return Err(invalid(
-                "vended REST credential refresh changed prefix scope or endpoint",
-            ));
-        }
-        let (entries, _) = refreshed
-            .into_vended_s3_credential_lease_contribution()?
-            .into_parts();
-        VendedS3CredentialLeaseRefresh::try_new(entries)
+        self.project_refresh(delegation)
+    }
+
+    fn refresh_vended_s3_credentials_async<'a>(
+        &'a self,
+        policy: VendedS3CredentialRefreshCallPolicy,
+        request: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> futures::future::BoxFuture<'a, Result<VendedS3CredentialLeaseRefresh, ConnectorError>>
+    {
+        Box::pin(async move {
+            let endpoints = Arc::clone(&self.endpoints);
+            let endpoint = Arc::clone(&self.scope.endpoint);
+            let context = crate::rest_protocol::http::RequestContext::from_connector(&request);
+            let delegation = run_vended_renewal_with_policy_async(
+                policy,
+                "Iceberg REST credential refresh",
+                move || {
+                    let endpoints = Arc::clone(&endpoints);
+                    let endpoint = Arc::clone(&endpoint);
+                    let context = context.clone();
+                    async move {
+                        endpoints
+                            .load_credentials_in(endpoint.as_ref(), &context)
+                            .await
+                    }
+                },
+            )
+            .await?;
+            self.project_refresh(delegation)
+        })
     }
 }
 
@@ -549,32 +562,32 @@ impl ConnectorVendedS3CredentialLeaseRefresher for IcebergRestLoadTableVendedS3L
                 async move { endpoints.load_table_credentials(&table).await }
             },
         )?;
-        let observed_uuid = observed_uuid
-            .as_deref()
-            .and_then(|uuid| uuid::Uuid::parse_str(uuid).ok())
-            .ok_or_else(|| invalid("vended REST load-table refresh returned no table UUID"))?;
-        if observed_uuid != self.expected_table_uuid {
-            return Err(invalid(
-                "vended REST load-table refresh returned a different table UUID",
-            ));
-        }
-        let refreshed = match parse_rest_delegation(delegation)? {
-            IcebergAccessDelegation::Vended(seed) => seed,
-            IcebergAccessDelegation::Static => {
-                return Err(invalid(
-                    "vended REST load-table refresh returned static access delegation",
-                ));
-            }
-        };
-        if !self.scope.matches_seed(&refreshed) {
-            return Err(invalid(
-                "vended REST load-table refresh changed prefix scope or acquisition path",
-            ));
-        }
-        let (entries, _) = refreshed
-            .into_vended_s3_credential_lease_contribution()?
-            .into_parts();
-        VendedS3CredentialLeaseRefresh::try_new(entries)
+        self.project_refresh((observed_uuid, delegation))
+    }
+
+    fn refresh_vended_s3_credentials_async<'a>(
+        &'a self,
+        policy: VendedS3CredentialRefreshCallPolicy,
+        request: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> futures::future::BoxFuture<'a, Result<VendedS3CredentialLeaseRefresh, ConnectorError>>
+    {
+        Box::pin(async move {
+            let endpoints = Arc::clone(&self.endpoints);
+            let table = self.table.clone();
+            let context = crate::rest_protocol::http::RequestContext::from_connector(&request);
+            let observed = run_vended_renewal_with_policy_async(
+                policy,
+                "Iceberg REST load-table credential refresh",
+                move || {
+                    let endpoints = Arc::clone(&endpoints);
+                    let table = table.clone();
+                    let context = context.clone();
+                    async move { endpoints.load_table_credentials_in(&table, &context).await }
+                },
+            )
+            .await?;
+            self.project_refresh(observed)
+        })
     }
 }
 
@@ -594,44 +607,12 @@ pub(crate) fn run_vended_renewal_with_policy<T, F, Fut>(
 where
     T: Send + 'static,
     F: Fn() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Result<T, ConnectorError>> + Send,
+    Fut: std::future::Future<Output = Result<T, ConnectorError>> + Send + 'static,
 {
     runtime
-        .block_on(async move {
-            let deadline = tokio::time::Instant::now() + policy.remaining();
-            let mut attempts = 0_u8;
-            loop {
-                if policy.provider_dispatch() == VendedS3CredentialRefreshDispatch::Fenced {
-                    return Err(refresh_dispatch_fenced(operation));
-                }
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    return Err(refresh_deadline_exhausted(operation));
-                }
-                attempts = attempts.saturating_add(1);
-                let outcome = tokio::time::timeout(remaining, call()).await;
-                match outcome {
-                    Err(_) => return Err(refresh_deadline_exhausted(operation)),
-                    Ok(Ok(value)) => return Ok(value),
-                    Ok(Err(error)) => {
-                        if !error.retryable_before_progress()
-                            || attempts >= policy.max_attempts().get()
-                        {
-                            return Err(error);
-                        }
-                        let remaining =
-                            deadline.saturating_duration_since(tokio::time::Instant::now());
-                        if remaining <= policy.retry_backoff() {
-                            return Err(refresh_deadline_exhausted(operation));
-                        }
-                        tokio::time::sleep(policy.retry_backoff()).await;
-                        if policy.provider_dispatch() == VendedS3CredentialRefreshDispatch::Fenced {
-                            return Err(refresh_dispatch_fenced(operation));
-                        }
-                    }
-                }
-            }
-        })
+        .block_on(run_vended_renewal_with_policy_async(
+            policy, operation, call,
+        ))
         .map_err(|error| unavailable(format!("run {operation}: {error}")))?
 }
 
@@ -1281,7 +1262,7 @@ mod tests {
     where
         T: Send + 'static,
         F: Fn() -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = crate::iceberg::Result<T>> + Send,
+        Fut: std::future::Future<Output = crate::iceberg::Result<T>> + Send + 'static,
     {
         run_vended_renewal_with_policy(runtime, policy, operation, move || {
             let call = call();
@@ -2350,6 +2331,109 @@ mod tests {
                 2,
                 "retried within the policy"
             );
+        }
+    }
+}
+
+impl IcebergRestVendedS3LeaseRefresher {
+    fn project_refresh(
+        &self,
+        delegation: crate::rest_protocol::deferred::RestDelegation,
+    ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
+        let refreshed = match parse_rest_delegation(delegation)? {
+            IcebergAccessDelegation::Vended(seed) => seed,
+            IcebergAccessDelegation::Static => {
+                return Err(invalid(
+                    "vended REST credential refresh returned static access delegation",
+                ));
+            }
+        };
+        if !self.scope.matches_seed(&refreshed) {
+            return Err(invalid(
+                "vended REST credential refresh changed prefix scope or endpoint",
+            ));
+        }
+        let (entries, _) = refreshed
+            .into_vended_s3_credential_lease_contribution()?
+            .into_parts();
+        VendedS3CredentialLeaseRefresh::try_new(entries)
+    }
+}
+
+impl IcebergRestLoadTableVendedS3LeaseRefresher {
+    fn project_refresh(
+        &self,
+        (observed_uuid, delegation): (
+            Option<String>,
+            crate::rest_protocol::deferred::RestDelegation,
+        ),
+    ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
+        let observed_uuid = observed_uuid
+            .as_deref()
+            .and_then(|uuid| uuid::Uuid::parse_str(uuid).ok())
+            .ok_or_else(|| invalid("vended REST load-table refresh returned no table UUID"))?;
+        if observed_uuid != self.expected_table_uuid {
+            return Err(invalid(
+                "vended REST load-table refresh returned a different table UUID",
+            ));
+        }
+        let refreshed = match parse_rest_delegation(delegation)? {
+            IcebergAccessDelegation::Vended(seed) => seed,
+            IcebergAccessDelegation::Static => {
+                return Err(invalid(
+                    "vended REST load-table refresh returned static access delegation",
+                ));
+            }
+        };
+        if !self.scope.matches_seed(&refreshed) {
+            return Err(invalid(
+                "vended REST load-table refresh changed prefix scope or acquisition path",
+            ));
+        }
+        let (entries, _) = refreshed
+            .into_vended_s3_credential_lease_contribution()?
+            .into_parts();
+        VendedS3CredentialLeaseRefresh::try_new(entries)
+    }
+}
+
+pub(crate) async fn run_vended_renewal_with_policy_async<T, F, Fut>(
+    policy: VendedS3CredentialRefreshCallPolicy,
+    operation: &'static str,
+    call: F,
+) -> Result<T, ConnectorError>
+where
+    F: Fn() -> Fut + Send,
+    Fut: std::future::Future<Output = Result<T, ConnectorError>> + Send,
+{
+    let deadline = tokio::time::Instant::now() + policy.remaining();
+    let mut attempts = 0_u8;
+    loop {
+        if policy.provider_dispatch() == VendedS3CredentialRefreshDispatch::Fenced {
+            return Err(refresh_dispatch_fenced(operation));
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(refresh_deadline_exhausted(operation));
+        }
+        attempts = attempts.saturating_add(1);
+        let outcome = tokio::time::timeout(remaining, call()).await;
+        match outcome {
+            Err(_) => return Err(refresh_deadline_exhausted(operation)),
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error)) => {
+                if !error.retryable_before_progress() || attempts >= policy.max_attempts().get() {
+                    return Err(error);
+                }
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining <= policy.retry_backoff() {
+                    return Err(refresh_deadline_exhausted(operation));
+                }
+                tokio::time::sleep(policy.retry_backoff()).await;
+                if policy.provider_dispatch() == VendedS3CredentialRefreshDispatch::Fenced {
+                    return Err(refresh_dispatch_fenced(operation));
+                }
+            }
         }
     }
 }

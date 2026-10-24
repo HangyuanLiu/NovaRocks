@@ -214,11 +214,45 @@ impl NetworkServiceOrigin {
     }
 }
 
+/// The HDFS service selected by its original ClientBuilder URL. Logical HA
+/// nameservices remain service identities; user/path and DNS aliases are not.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HdfsServiceOrigin(Arc<str>);
+impl HdfsServiceOrigin {
+    pub const MAX_BYTES: usize = 1024;
+    pub fn from_selected_url(selected: &url::Url) -> Result<Self, DependencyFactError> {
+        if selected.scheme() != "hdfs" {
+            return Err(DependencyFactError::InvalidServiceOrigin);
+        }
+        let host = selected
+            .host_str()
+            .filter(|h| !h.is_empty())
+            .ok_or(DependencyFactError::InvalidServiceOrigin)?;
+        // Do not invent a default port: an unported logical nameservice is
+        // interpreted using the original Hadoop configuration by ClientBuilder.
+        let suffix = selected.port().map(|p| format!(":{p}")).unwrap_or_default();
+        let bytes = 7usize
+            .checked_add(host.len())
+            .and_then(|n| n.checked_add(suffix.len()))
+            .filter(|n| *n <= Self::MAX_BYTES)
+            .ok_or(DependencyFactError::EndpointTooLong)?;
+        let mut value = String::with_capacity(bytes);
+        value.push_str("hdfs://");
+        value.push_str(host);
+        value.push_str(&suffix);
+        Ok(Self(Arc::from(value)))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A shared host-local dependency is intentionally independent of directory or
 /// catalog name. Network dependencies name the actual selected service origin.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum SharedDependency {
     Network(NetworkServiceOrigin),
+    Hdfs(HdfsServiceOrigin),
     LocalHost,
 }
 
@@ -226,11 +260,15 @@ pub enum SharedDependency {
 pub enum DependencyFactError {
     EndpointTooLong,
     InvalidNetworkOrigin,
+    InvalidServiceOrigin,
 }
 impl fmt::Display for DependencyFactError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::EndpointTooLong => "shared dependency origin exceeds its bounded output profile",
+            Self::InvalidServiceOrigin => {
+                "shared dependency requires an actual selected service origin"
+            }
             Self::InvalidNetworkOrigin => {
                 "shared dependency requires a selected HTTP(S) service origin"
             }

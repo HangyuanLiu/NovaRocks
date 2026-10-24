@@ -643,6 +643,10 @@ async fn acquire_replacement_admissions(
         },
         acks.handle(),
         runtime.data_runtime.clone(),
+        qualification
+            .native_action_authority()
+            .map_err(|_| ReplacementQualificationFailure::InvalidReservation)?
+            .clone(),
     )
     .map_err(|error| ReplacementQualificationFailure::DomainRefused(error.failure_fact()))?;
     let valid_for =
@@ -667,43 +671,60 @@ async fn acquire_replacement_admissions(
             );
             let intent = OperationIntent::AcquireQueryContextAdmissionTicket(request);
             let mut retry_delay = runtime.task_update_retry_policy.initial_backoff();
+            // These are fields of the same original qualification future,
+            // already held by its stable QA owner. Local backpressure never
+            // recreates this request, paid ticket, or queue source.
+            let mut queue_preparation =
+                crate::task_execution::intent::TaskOperationQueuePreparation::new();
+            let mut pending_batch = None;
             loop {
                 if *cancellation.borrow() {
                     return Err(ReplacementQualificationFailure::Rejected);
                 }
-                // One exact admission per context, retried in place: this owner
-                // has no successor candidate that a full target could reorder.
-                let permit = match sink.try_reserve_queue(intent.queue_request()) {
-                    TaskOperationQueueAdmission::Admitted(permit) => permit,
-                    TaskOperationQueueAdmission::TargetFull
-                    | TaskOperationQueueAdmission::ProcessFull => {
-                        tokio::select! {
-                            _ = tokio::task::yield_now() => {},
-                            _ = cancellation.changed() => {
-                                return Err(ReplacementQualificationFailure::Rejected);
-                            }
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if pending_batch.is_none() {
+                    let permit = match sink
+                        .try_reserve_queue(intent.queue_request(), &mut queue_preparation)
+                    {
+                        TaskOperationQueueAdmission::Admitted(permit) => Some(permit),
+                        TaskOperationQueueAdmission::TargetFull
+                        | TaskOperationQueueAdmission::ProcessFull => None,
+                        TaskOperationQueueAdmission::Rejected(error) => {
+                            return Err(ReplacementQualificationFailure::DomainRefused(
+                                error.failure_fact(),
+                            ));
                         }
+                    };
+                    if let Some(permit) = permit {
+                        pending_batch = Some(DispatchBatch::with_queued_at(
+                            context.backend_process_id(),
+                            crate::task_protocol_config::DispatchLane::Lifecycle,
+                            vec![intent.clone()],
+                            vec![permit],
+                            intent.queued_bytes(),
+                            qualification.issued_at(),
+                        ));
+                    } else {
+                        tokio::select! {_=&mut notified=>{},_ = cancellation.changed()=>return Err(ReplacementQualificationFailure::Rejected)}
                         continue;
                     }
-                };
-                let batch = DispatchBatch::with_queued_at(
-                    context.backend_process_id(),
-                    crate::task_protocol_config::DispatchLane::Lifecycle,
-                    vec![intent.clone()],
-                    vec![permit],
-                    intent.queued_bytes(),
-                    qualification.issued_at(),
-                );
+                }
+                let batch = pending_batch
+                    .take()
+                    .expect("same original replacement batch");
                 match sink.try_submit(batch) {
                     TaskOperationSubmit::Accepted => {}
-                    TaskOperationSubmit::Backpressured(_) => {
-                        tokio::select! {
-                            _ = tokio::task::yield_now() => {},
-                            _ = cancellation.changed() => {
-                                return Err(ReplacementQualificationFailure::Rejected);
-                            }
-                        }
+                    TaskOperationSubmit::Backpressured(batch) => {
+                        pending_batch = Some(batch);
+                        tokio::select! {_=&mut notified=>{},_ = cancellation.changed()=>return Err(ReplacementQualificationFailure::Rejected)}
                         continue;
+                    }
+                    TaskOperationSubmit::AdmissionFailed { error, .. } => {
+                        return Err(ReplacementQualificationFailure::DomainRefused(
+                            error.failure_fact(),
+                        ));
                     }
                     TaskOperationSubmit::Rejected { .. } => {
                         return Err(ReplacementQualificationFailure::Rejected);
@@ -1351,6 +1372,7 @@ impl FrontendNativeLogicalExecutionLauncher {
 }
 
 struct ProductionManifestAttemptProjection {
+    native_actions: novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
     work_scope: novarocks_workload_control::WorkScope,
     runtime: FrontendNativeLogicalExecutionRuntime,
     options: Arc<ResolvedQueryOptions>,
@@ -1626,7 +1648,11 @@ impl FrontendDormantAttemptFactory for ProductionDormantAttemptFactory {
             .map_err(|error| attempt_failure(QueryFailureReason::PreparationProtocol, error))?;
         let delivery = ProductionRootDelivery::bind(carrier, Some(capacity.window_alias()))
             .map_err(|error| attempt_failure(QueryFailureReason::PreparationProtocol, error))?;
+        let native_actions = capacity
+            .native_action_authority()
+            .map_err(|error| attempt_failure(QueryFailureReason::PreparationProtocol, error))?;
         self.pending_projection = Some(ProductionManifestAttemptProjection {
+            native_actions,
             runtime: self.runtime.clone(),
             work_scope: capacity.scope().clone(),
             options: Arc::clone(&self.options),
@@ -2032,6 +2058,7 @@ impl ProductionManifestAttemptProjection {
                 },
                 data_runtime: self.runtime.data_runtime.clone(),
                 subscription_scope: self.work_scope.clone(),
+                native_actions: self.native_actions.clone(),
                 convergence_source: Arc::clone(&self.runtime.process_observation),
             },
         )

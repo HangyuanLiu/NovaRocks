@@ -260,47 +260,41 @@ impl ConnectorVendedS3CredentialLeaseRefresher for ExecutionNodeCredentialsEndpo
                 }
             },
         )?;
-        // D11b: only the table identity is read from the response, and only to
-        // compare it; no metadata reaches any plan, cache or table state here.
-        if let ExecutionNodeAcquisitionPath::LoadTableDelegation {
-            expected_table_uuid,
-            ..
-        } = &self.path
-        {
-            let observed = observed_uuid
-                .as_deref()
-                .and_then(|uuid| uuid::Uuid::parse_str(uuid).ok());
-            if observed != Some(*expected_table_uuid) {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::PermissionDenied,
-                    "load-table credential acquisition answered for a different table",
-                ));
-            }
-        }
-        if !delegation.is_present() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::PermissionDenied,
-                "credential acquisition returned static access delegation",
-            ));
-        }
-        // No prefix-scope equality check here, unlike the coordinator's
-        // refresher. That check exists to keep one admitted attempt's authority
-        // from being widened mid-flight; this node holds one authority per
-        // scope and `IcebergAuthorityMaterialSource` already refuses a response
-        // that does not cover the exact scope it owns (CAD-1 D7).
-        let seed = match parse_rest_delegation(delegation)? {
-            IcebergAccessDelegation::Vended(seed) => seed,
-            IcebergAccessDelegation::Static => {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::PermissionDenied,
-                    "credential acquisition returned static access delegation",
-                ));
-            }
-        };
-        let (entries, _) = seed
-            .into_vended_s3_credential_lease_contribution()?
-            .into_parts();
-        VendedS3CredentialLeaseRefresh::try_new(entries)
+        self.project_refresh(observed_uuid, delegation)
+    }
+
+    fn refresh_vended_s3_credentials_async<'a>(
+        &'a self,
+        policy: VendedS3CredentialRefreshCallPolicy,
+        request: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> futures::future::BoxFuture<'a, Result<VendedS3CredentialLeaseRefresh, ConnectorError>>
+    {
+        Box::pin(async move {
+            let owner = self.owner()?;
+            let routing = self.path.routing().clone();
+            let load_table = matches!(
+                self.path,
+                ExecutionNodeAcquisitionPath::LoadTableDelegation { .. }
+            );
+            let context = crate::rest_protocol::http::RequestContext::from_connector(&request);
+            let (uuid, delegation) = crate::loaded_table::run_vended_renewal_with_policy_async(
+                policy,
+                "Iceberg execution-node credential acquisition",
+                move || {
+                    let owner = Arc::clone(&owner);
+                    let routing = routing.clone();
+                    let context = context.clone();
+                    async move {
+                        crate::rest_protocol::endpoints::acquire_routed_in(
+                            &owner, &routing, load_table, &context,
+                        )
+                        .await
+                    }
+                },
+            )
+            .await?;
+            self.project_refresh(uuid, delegation)
+        })
     }
 }
 
@@ -585,5 +579,55 @@ mod tests {
         )
         .expect_err("a query string is not a route");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+}
+
+impl ExecutionNodeCredentialsEndpointRefresher {
+    fn project_refresh(
+        &self,
+        observed_uuid: Option<String>,
+        delegation: crate::rest_protocol::deferred::RestDelegation,
+    ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
+        // D11b: only the table identity is read from the response, and only to
+        // compare it; no metadata reaches any plan, cache or table state here.
+        if let ExecutionNodeAcquisitionPath::LoadTableDelegation {
+            expected_table_uuid,
+            ..
+        } = &self.path
+        {
+            let observed = observed_uuid
+                .as_deref()
+                .and_then(|uuid| uuid::Uuid::parse_str(uuid).ok());
+            if observed != Some(*expected_table_uuid) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::PermissionDenied,
+                    "load-table credential acquisition answered for a different table",
+                ));
+            }
+        }
+        if !delegation.is_present() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::PermissionDenied,
+                "credential acquisition returned static access delegation",
+            ));
+        }
+        // No prefix-scope equality check here, unlike the coordinator's
+        // refresher. That check exists to keep one admitted attempt's authority
+        // from being widened mid-flight; this node holds one authority per
+        // scope and `IcebergAuthorityMaterialSource` already refuses a response
+        // that does not cover the exact scope it owns (CAD-1 D7).
+        let seed = match parse_rest_delegation(delegation)? {
+            IcebergAccessDelegation::Vended(seed) => seed,
+            IcebergAccessDelegation::Static => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::PermissionDenied,
+                    "credential acquisition returned static access delegation",
+                ));
+            }
+        };
+        let (entries, _) = seed
+            .into_vended_s3_credential_lease_contribution()?
+            .into_parts();
+        VendedS3CredentialLeaseRefresh::try_new(entries)
     }
 }

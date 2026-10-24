@@ -72,11 +72,58 @@ impl MaintenanceCommandExecutor {
                 .to_string()
                 .into());
         }
-        let engine = RequestScopedMaintenanceEngine::new(
+        // Pure source selection only: no Product/Provider future is polled.
+        let original_engine = RequestScopedMaintenanceEngine::new(
             self.kernel.clone(),
             execution.clone(),
             connector_context.clone(),
         );
+        let name_parts = match &lowered {
+            crate::table_maintenance::ParsedMaintenanceStatement::Execute {
+                name_parts, ..
+            } => name_parts,
+            _ => unreachable!("closed metadata lower"),
+        };
+        let target = super::TableMaintenanceEngine::resolve_target(
+            &original_engine,
+            name_parts,
+            MaintenanceRequestContext {
+                current_catalog,
+                current_database,
+            },
+        )?;
+        let instance = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|e| e.to_string())?;
+        let lease = self
+            .kernel
+            .connector_control()
+            .acquire_current_metadata_maintenance(&instance)
+            .map_err(|e| e.to_string())?;
+        let profile = lease.io_profile().map_err(|e| e.to_string())?;
+        let capacity = execution.result_capacity().ok_or_else(|| {
+            novarocks_table_maintenance::runtime::TerminalError::failed(
+                "metadata source has no admitted root capacity",
+            )
+        })?;
+        let requirements = Self::metadata_io_requirements(
+            &profile,
+            capacity
+                .root_scope()
+                .joint_dependency_limit()
+                .map_err(|e| format!("metadata source geometry unavailable: {e:?}"))?,
+        )
+        .map_err(|e| format!("metadata source geometry unavailable: {e:?}"))?;
+        let io = super::io_admission::MetadataIoAdmission::new(
+            capacity.root_scope().clone(),
+            profile,
+            requirements.source_metadata_bytes,
+        )
+        .map_err(|e| format!("metadata source construction refused: {e:?}"))?;
+        let context = connector_context.clone().with_io_admission(
+            io.clone() as Arc<dyn novarocks_spi::connector::ConnectorIoAdmissionPort>
+        );
+        let engine =
+            RequestScopedMaintenanceEngine::new(self.kernel.clone(), execution.clone(), context);
         let original = MaintenanceActionState::default();
         original.install_engine(engine.clone())?;
         let retained = original.clone();
@@ -87,25 +134,21 @@ impl MaintenanceCommandExecutor {
             command,
             novarocks_sql::semantic::MaintenanceSqlCommand::Call { .. }
         );
-        let future = Box::pin(async move {
-            service
-                .handle_typed_statement(
-                    &engine,
-                    &retained,
-                    lowered,
-                    spark_call,
-                    MaintenanceRequestContext {
-                        current_catalog: catalog.as_deref(),
-                        current_database: &database,
-                    },
-                )
-                .await
-        });
+        let future = Box::pin(make_metadata_product(MetadataProductInput {
+            service,
+            engine,
+            retained,
+            lowered,
+            spark_call,
+            catalog,
+            database,
+        }));
         Ok(MaintenanceCommandCall {
             future: Some(future),
             result: None,
             poll_unproven: false,
             original,
+            io: Some(io),
         })
     }
 
@@ -205,6 +248,7 @@ pub struct MaintenanceCommandCall {
     >,
     poll_unproven: bool,
     original: MaintenanceActionState,
+    io: Option<Arc<super::io_admission::MetadataIoAdmission>>,
 }
 impl MaintenanceCommandCall {
     pub fn publication_disposition(
@@ -213,7 +257,105 @@ impl MaintenanceCommandCall {
         self.original.publication_disposition()
     }
 
+    pub fn local_health_failure(
+        &self,
+    ) -> Option<novarocks_query_application::api::StatementNativeHealthFailure> {
+        self.io.as_ref().and_then(|io| io.health_failure())
+    }
+
+    /// Only the original registered Source borrows its stable WorkOwner.
+    /// A cancelled UI never owns this sole owner, Product F, or request table.
     pub fn poll_result(
+        &mut self,
+        owner: &novarocks_workload_control::WorkOwner,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<
+        Result<MaintenanceStatementResult, novarocks_table_maintenance::runtime::TerminalError>,
+    > {
+        use std::task::Poll;
+        let io = match self.io.as_ref() {
+            Some(io) => Arc::clone(io),
+            None => {
+                return Poll::Ready(Err(
+                    novarocks_table_maintenance::runtime::TerminalError::failed(
+                        "metadata producer has no original I/O admission source",
+                    ),
+                ));
+            }
+        };
+        match io.poll_progress(owner, cx) {
+            Err(error) => return Poll::Ready(Err(io_terminal_error(error))),
+            Ok(false) => return Poll::Pending,
+            Ok(true) => {}
+        }
+        if io.health_failure().is_some() {
+            // Only an actual panic/disposition failure is unproven. Ordinary
+            // exited abort errors are received and projected below.
+            return Poll::Pending;
+        }
+        if self.result.is_none() {
+            match self.poll_product(cx) {
+                Poll::Pending => {
+                    let _ = io.poll_progress(owner, cx);
+                    return Poll::Pending;
+                }
+                Poll::Ready(result) => self.result = Some(result),
+            }
+        }
+        // A Product result is not proof that its original response/stream or
+        // in-flight credential acquisition has exited. Keep its actual result
+        // stable and drive the same finite cells to their real last alias cut.
+        let quiescent = io.poll_quiescent(owner, cx);
+        // This turn may itself have received an ordinary failure whose later
+        // cause Drop panicked. Do not publish success before that health cut.
+        if io.health_failure().is_some() {
+            return Poll::Pending;
+        }
+        match quiescent {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => {
+                if matches!(self.result, Some(Err(_))) {
+                    self.project_saved_cleanup(io.cleanup_failure());
+                    Poll::Ready(
+                        self.result
+                            .take()
+                            .expect("original Product primary retained"),
+                    )
+                } else {
+                    Poll::Ready(Err(io_terminal_error(error)))
+                }
+            }
+            Poll::Ready(Ok(())) => {
+                self.project_saved_cleanup(io.cleanup_failure());
+                Poll::Ready(self.result.take().expect("original saved Product result"))
+            }
+        }
+    }
+
+    /// Both primary Product result and exact publication snapshot stay in the
+    /// original Call while the one received cleanup failure is projected.
+    fn project_saved_cleanup(&mut self, cleanup: Option<novarocks_spi::connector::ConnectorError>) {
+        let Some(cleanup) = cleanup else {
+            return;
+        };
+        let result = self
+            .result
+            .as_mut()
+            .expect("Product result stable before cleanup projection");
+        if let Err(primary) = result {
+            // Do not replace state/class/control/cause with a cleanup failure.
+            primary.message.push_str(" (cleanup: ");
+            primary.message.push_str(cleanup.message());
+            primary.message.push(')');
+            return;
+        }
+        // An exited writer abort failure is cleanup evidence, not proof that a
+        // required business finalization failed. The Product alone classifies
+        // its actual publication and necessary finalization. Keep its success;
+        // the same Source retains the typed cleanup receipt and original cause.
+    }
+
+    fn poll_product(
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<
@@ -395,16 +537,17 @@ mod original_producer_tests {
             result: None,
             poll_unproven: false,
             original: state,
+            io: None,
         };
         use futures::FutureExt;
-        let mut wait = Box::pin(std::future::poll_fn(|cx| original.poll_result(cx)));
+        let mut wait = Box::pin(std::future::poll_fn(|cx| original.poll_product(cx)));
         assert!(wait.as_mut().now_or_never().is_none());
         drop(wait);
         assert!(original.future.is_some());
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         release.send(()).unwrap();
         assert!(matches!(
-            std::future::poll_fn(|cx| original.poll_result(cx)).await,
+            std::future::poll_fn(|cx| original.poll_product(cx)).await,
             Ok(MaintenanceStatementResult::Ok)
         ));
         assert!(original.future.is_none());
@@ -431,11 +574,12 @@ mod original_producer_tests {
             result: None,
             poll_unproven: false,
             original: MaintenanceActionState::default(),
+            io: None,
         };
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
         let Err(cause) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            original.poll_result(&mut cx)
+            original.poll_product(&mut cx)
         })) else {
             panic!("actual completed F Drop must panic")
         };
@@ -449,3 +593,107 @@ mod original_producer_tests {
         assert!(original.original.has_engine().is_ok());
     }
 }
+
+fn io_terminal_error(
+    error: novarocks_workload_control::WorkError,
+) -> novarocks_table_maintenance::runtime::TerminalError {
+    use novarocks_failure_contract::FailureProjection;
+    novarocks_table_maintenance::runtime::TerminalError::from(format!(
+        "metadata I/O admission refused: {error:?}"
+    ))
+    .with_execution_failure(Some(
+        novarocks_query_application::execution_error::ExecutionFailureInput::new(
+            error.failure_fact(),
+            novarocks_execution_contract::SafeDetail::truncating("metadata I/O admission refused"),
+            novarocks_query_application::execution_error::ExecutionFailureSite::Coordinator,
+        ),
+    ))
+}
+
+struct MetadataProductInput {
+    service: Arc<dyn TableMaintenanceService>,
+    engine: RequestScopedMaintenanceEngine,
+    retained: MaintenanceActionState,
+    lowered: crate::table_maintenance::ParsedMaintenanceStatement,
+    spark_call: bool,
+    catalog: Option<String>,
+    database: String,
+}
+async fn make_metadata_product(
+    input: MetadataProductInput,
+) -> Result<MaintenanceStatementResult, novarocks_table_maintenance::runtime::TerminalError> {
+    input
+        .service
+        .handle_typed_statement(
+            &input.engine,
+            &input.retained,
+            input.lowered,
+            input.spark_call,
+            MaintenanceRequestContext {
+                current_catalog: input.catalog.as_deref(),
+                current_database: &input.database,
+            },
+        )
+        .await
+}
+fn metadata_product_bytes<F: std::future::Future>(_: fn(MetadataProductInput) -> F) -> usize {
+    std::mem::size_of::<F>()
+}
+/// Same source's actual first-party fixed backing. Variable plan/journal
+/// increments and provider/cache loans are deliberately separate facts.
+pub struct MetadataStatementIoRequirements {
+    pub foreground: novarocks_workload_control::joint_admission::JointResources,
+    pub settlement: novarocks_workload_control::joint_admission::JointResources,
+    pub source_metadata_bytes: u64,
+    pub initial_payload_bytes: u64,
+    pub max_concurrent_io: std::num::NonZeroUsize,
+}
+impl MaintenanceCommandExecutor {
+    pub fn metadata_io_requirements(
+        profile: &novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile,
+        complete_dependency_limit: usize,
+    ) -> Result<MetadataStatementIoRequirements, novarocks_workload_control::WorkError> {
+        use novarocks_workload_control::{
+            WorkError,
+            joint_admission::{JointResource, JointResources},
+        };
+        let bytes = metadata_product_bytes(make_metadata_product)
+            .checked_add(std::mem::size_of::<MaintenanceCommandCall>())
+            .and_then(|n| n.checked_add(std::mem::size_of::<MetadataProductInput>()))
+            .and_then(|n| n.checked_add(MaintenanceActionState::owned_row_bytes().ok()?))
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        let source_metadata_bytes = u64::try_from(bytes)
+            .map_err(|_| WorkError::ArithmeticOverflow)?
+            .checked_add(profile.metadata_bytes().get())
+            .and_then(|n| {
+                n.checked_add(
+                    super::io_admission::MetadataIoAdmission::fixed_backing_bytes(
+                        profile.max_concurrent_io().get(),
+                        complete_dependency_limit,
+                    )
+                    .ok()?,
+                )
+            })
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        // There is no independent local physical queue. One genuine next I/O
+        // uses one same-Root AsyncIo action plus its real claim/row metadata.
+        let step = JointResources::ZERO
+            .with(JointResource::ClaimRecords, 1)
+            .with(JointResource::AsyncIo, 1)
+            .with(
+                JointResource::MetadataBytes,
+                super::io_admission::MetadataIoAdmission::request_metadata_bytes(),
+            );
+        Ok(MetadataStatementIoRequirements {
+            foreground: step,
+            settlement: step,
+            source_metadata_bytes,
+            initial_payload_bytes: profile.initial_owned_bytes().get(),
+            max_concurrent_io: profile.max_concurrent_io(),
+        })
+    }
+}
+
+#[cfg(test)]
+#[path = "command/cleanup_reception_tests.rs"]
+mod cleanup_reception_tests;

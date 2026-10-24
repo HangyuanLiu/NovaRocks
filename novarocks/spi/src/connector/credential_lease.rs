@@ -486,6 +486,22 @@ pub trait ConnectorVendedS3CredentialLeaseRefresher: Send + Sync {
         &self,
         policy: VendedS3CredentialRefreshCallPolicy,
     ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError>;
+
+    /// Explicit async acquisition for the original governed request. The old
+    /// synchronous capability is never used as a fallback on this path.
+    fn refresh_vended_s3_credentials_async<'a>(
+        &'a self,
+        _policy: VendedS3CredentialRefreshCallPolicy,
+        _request: super::ConnectorRequestContext,
+    ) -> futures::future::BoxFuture<'a, Result<VendedS3CredentialLeaseRefresh, ConnectorError>>
+    {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "async vended credential refresh requires an explicit provider author",
+            ))
+        })
+    }
 }
 
 /// FE-local receiver for provider vended-credential contributions.

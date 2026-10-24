@@ -426,6 +426,9 @@ pub struct ConnectorRequestContext {
     vended_credential_lease_collection: Option<ConnectorVendedCredentialLeaseCollectionPort>,
     request_scope: ConnectorRequestScope,
     execution_source: Option<ExecutionSource>,
+    io_admission: Option<std::sync::Weak<dyn super::ConnectorIoAdmissionPort>>,
+    io_phase: Option<super::ConnectorIoPermit>,
+    io_weak_phase: Option<super::ConnectorIoWeakPhase>,
     fresh_catalog_observation_required: bool,
     initiation: ConnectorRequestInitiation,
 }
@@ -517,9 +520,51 @@ impl ConnectorRequestContext {
             vended_credential_lease_collection: None,
             request_scope: ConnectorRequestScope::new(),
             execution_source: None,
+            io_admission: None,
+            io_phase: None,
+            io_weak_phase: None,
             fresh_catalog_observation_required: false,
             initiation: ConnectorRequestInitiation::Statement,
         })
+    }
+
+    /// Explicit same-action capability; never inferred from request extensions.
+    pub fn with_io_admission(mut self, port: Arc<dyn super::ConnectorIoAdmissionPort>) -> Self {
+        self.io_admission = Some(Arc::downgrade(&port));
+        self
+    }
+    pub fn io_admission(&self) -> Option<&std::sync::Weak<dyn super::ConnectorIoAdmissionPort>> {
+        self.io_admission.as_ref()
+    }
+
+    /// Continue the SAME already-admitted position in a nested serial request
+    /// (for example credential acquisition before signing). It grants no new
+    /// position; include_dependency still asks the original atomic D author.
+    pub fn with_io_phase(mut self, phase: super::ConnectorIoPermit) -> Self {
+        self.io_phase = Some(phase);
+        self.io_weak_phase = None;
+        self
+    }
+    pub fn with_io_weak_phase(mut self, phase: super::ConnectorIoWeakPhase) -> Self {
+        self.io_phase = None;
+        self.io_weak_phase = Some(phase);
+        self
+    }
+    pub fn io_weak_phase(&self) -> Option<&super::ConnectorIoWeakPhase> {
+        self.io_weak_phase.as_ref()
+    }
+    pub fn io_phase(&self) -> Option<&super::ConnectorIoPermit> {
+        self.io_phase.as_ref()
+    }
+
+    /// The original journal has already entered an existing obligation. Keep
+    /// its exact scope/lease/I/O source while using that obligation's independent
+    /// stop/deadline. This method itself grants no dispatch or capacity.
+    pub fn for_existing_obligation(&self, deadline: Instant, stop: ConnectorStopView) -> Self {
+        let mut context = self.clone();
+        context.deadline = deadline;
+        context.stop = stop;
+        context
     }
 
     /// A nested preparation budget may only shorten the admitted deadline.

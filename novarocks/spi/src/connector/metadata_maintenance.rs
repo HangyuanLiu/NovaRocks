@@ -31,6 +31,54 @@ use super::{
     ExternalMutationEvidence, ExternalMutationOutcome, ProviderBindingEpoch,
 };
 
+/// Pure owned-source geometry and initial selected dependencies of the SAME
+/// exact provider generation. This is input to admission, never a grant.
+#[derive(Clone)]
+pub struct ConnectorMetadataMaintenanceIoProfile {
+    max_concurrent_io: std::num::NonZeroUsize,
+    metadata_bytes: std::num::NonZeroU64,
+    initial_owned_bytes: std::num::NonZeroU64,
+    initial_dependencies: std::sync::Arc<[super::SharedDependency]>,
+}
+impl ConnectorMetadataMaintenanceIoProfile {
+    pub fn try_new(
+        max_concurrent_io: std::num::NonZeroUsize,
+        metadata_bytes: std::num::NonZeroU64,
+        initial_owned_bytes: std::num::NonZeroU64,
+        initial_dependencies: Vec<super::SharedDependency>,
+    ) -> Result<Self, ConnectorError> {
+        if initial_dependencies.is_empty()
+            || initial_dependencies
+                .iter()
+                .enumerate()
+                .any(|(i, f)| initial_dependencies[..i].contains(f))
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "metadata I/O profile requires distinct original route facts",
+            ));
+        }
+        Ok(Self {
+            max_concurrent_io,
+            metadata_bytes,
+            initial_owned_bytes,
+            initial_dependencies: initial_dependencies.into(),
+        })
+    }
+    pub fn max_concurrent_io(&self) -> std::num::NonZeroUsize {
+        self.max_concurrent_io
+    }
+    pub fn metadata_bytes(&self) -> std::num::NonZeroU64 {
+        self.metadata_bytes
+    }
+    pub fn initial_owned_bytes(&self) -> std::num::NonZeroU64 {
+        self.initial_owned_bytes
+    }
+    pub fn initial_dependencies(&self) -> &[super::SharedDependency] {
+        &self.initial_dependencies
+    }
+}
+
 pub const CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION: u16 = 2;
 pub const MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES: usize = 16 * 1024;
@@ -615,6 +663,16 @@ impl ConnectorMetadataMaintenanceExecution {
 }
 
 pub trait ConnectorMetadataMaintenance: Send + Sync {
+    /// Same-generation source facts, captured before the first physical poll.
+    /// An implementation must quote its actual closed factory/owned headers;
+    /// this default does NOT run a legacy synchronous or result-only path.
+    fn io_profile(&self) -> Result<ConnectorMetadataMaintenanceIoProfile, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "provider has no metadata async action source author",
+        ))
+    }
+
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn binding_key(&self) -> &ConnectorProviderBindingKey;
     fn plan_maintenance(
@@ -701,6 +759,9 @@ impl ConnectorMetadataMaintenanceLease {
                 release: Mutex::new(Some(Box::new(release))),
             }),
         })
+    }
+    pub fn io_profile(&self) -> Result<ConnectorMetadataMaintenanceIoProfile, ConnectorError> {
+        self.maintenance.io_profile()
     }
     pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor

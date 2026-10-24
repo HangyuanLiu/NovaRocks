@@ -290,7 +290,7 @@ pub(crate) fn adopt_window(
     }
 }
 
-struct WindowHolder {
+pub(crate) struct WindowHolder {
     scope: WorkScope,
     class: ResultWindowClass,
     all_objects_bytes: u64,
@@ -391,7 +391,75 @@ fn internal_pin_error(error: novarocks_resource_contract::RetentionPinError) -> 
         RetentionPinError::Overflow => WorkError::ArithmeticOverflow,
     }
 }
+#[derive(Clone)]
+pub(crate) enum NativeCapacityFence {
+    Window(std::sync::Weak<WindowHolder>),
+    InternalPayload([u64; 2]),
+}
+impl NativeCapacityFence {
+    pub(crate) fn validate(&self, state: &State, root: WorkId) -> Result<(), WorkError> {
+        match self {
+            Self::Window(holder) => {
+                // No upgrade/last-holder Drop while State is locked. The
+                // original alias was borrowed when this exact Weak was minted.
+                if holder.strong_count() == 0 {
+                    return Err(WorkError::Released);
+                }
+                Ok(())
+            }
+            Self::InternalPayload(key) => {
+                crate::joint_admission::ledger::validate_native_payload_fence(state, root, *key)
+            }
+        }
+    }
+}
 impl ResultWindowAlias {
+    pub fn native_action_authority(
+        &self,
+    ) -> Result<crate::joint_admission::NativeAsyncActionAuthority, WorkError> {
+        let fence = match &self.backing {
+            AliasBacking::Window { holder, .. } => {
+                if holder.class == ResultWindowClass::Closing {
+                    return Err(WorkError::Conflict);
+                }
+                NativeCapacityFence::Window(Arc::downgrade(holder))
+            }
+            AliasBacking::InternalRoot { payload, .. } => {
+                NativeCapacityFence::InternalPayload(payload.native_source_key()?)
+            }
+        };
+        crate::joint_admission::ledger::delegate_native_actions(
+            self.root_scope(),
+            self.execution_scope(),
+            fence,
+        )
+    }
+    /// Delegates only from the original result owner, never from a numeric
+    /// window size. Neither capture nor its weak fence adds a position/pin.
+    pub fn native_action_source(
+        &self,
+        lane: crate::joint_admission::JointLane,
+        quote: crate::joint_admission::NativeAsyncActionQuote,
+    ) -> Result<crate::joint_admission::NativeAsyncActionSource, WorkError> {
+        let fence = match &self.backing {
+            AliasBacking::Window { holder, .. } => {
+                if holder.class == ResultWindowClass::Closing {
+                    return Err(WorkError::Conflict);
+                }
+                NativeCapacityFence::Window(Arc::downgrade(holder))
+            }
+            AliasBacking::InternalRoot { payload, .. } => {
+                NativeCapacityFence::InternalPayload(payload.native_source_key()?)
+            }
+        };
+        crate::joint_admission::ledger::capture_native_action(
+            self.root_scope(),
+            self.execution_scope(),
+            fence,
+            lane,
+            quote,
+        )
+    }
     /// Project the original Root payload into an actual execution. This is
     /// retention/attribution only, never a computation or physical grant.
     pub fn from_internal_payload(

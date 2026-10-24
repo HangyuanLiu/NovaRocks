@@ -174,6 +174,13 @@ pub enum ReleaseSettlement {
 /// The frontend's owner of one query context.
 #[derive(Debug)]
 pub struct QueryContextOwner {
+    admission_queue_preparation: super::intent::TaskOperationQueuePreparation,
+    establish_queue_preparation: super::intent::TaskOperationQueuePreparation,
+    renewal_queue_preparation: super::intent::TaskOperationQueuePreparation,
+    quiesce_queue_preparation: super::intent::TaskOperationQueuePreparation,
+    release_queue_preparation: super::intent::TaskOperationQueuePreparation,
+    abort_queue_preparation: super::intent::TaskOperationQueuePreparation,
+    abort_released: bool,
     context: QueryContextRef,
     native_compatibility_id: NativeCompatibilityId,
     admission_epoch_capability: AdmissionEpochCapability,
@@ -222,6 +229,23 @@ pub struct QueryContextOwner {
 }
 
 impl QueryContextOwner {
+    pub(super) fn queue_preparation(
+        &mut self,
+        intent: &OperationIntent,
+    ) -> &mut super::intent::TaskOperationQueuePreparation {
+        match intent {
+            OperationIntent::AcquireQueryContextAdmissionTicket(_) => {
+                &mut self.admission_queue_preparation
+            }
+            OperationIntent::EstablishQueryContext(_) => &mut self.establish_queue_preparation,
+            OperationIntent::UpdateQueryContext(_) => &mut self.renewal_queue_preparation,
+            OperationIntent::QuiesceQueryContext(_) => &mut self.quiesce_queue_preparation,
+            OperationIntent::ReleaseQueryContext(_) => &mut self.release_queue_preparation,
+            OperationIntent::AbortQueryContext(_) => &mut self.abort_queue_preparation,
+            _ => panic!("Task input cannot borrow a Context preparation"),
+        }
+    }
+
     /// Creates the owner of one context, over the frozen task set this
     /// attempt places on that backend.
     pub const fn new(
@@ -231,6 +255,13 @@ impl QueryContextOwner {
         admission_epoch_capability: AdmissionEpochCapability,
     ) -> Self {
         Self {
+            admission_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
+            establish_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
+            renewal_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
+            quiesce_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
+            release_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
+            abort_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
+            abort_released: false,
             context,
             native_compatibility_id,
             admission_epoch_capability,
@@ -703,13 +734,14 @@ impl QueryContextOwner {
 
     /// The forced stand-down of this context, once.
     pub fn abort_intent(&mut self, cause: AbortCause) -> Option<OperationIntent> {
-        if self.released || self.abort.is_some() {
+        if self.released || self.abort_released {
             return None;
         }
         self.begin_terminal_cleanup();
         let request = *self.abort.get_or_insert_with(|| {
             AbortQueryContext::new(TaskOperationId::new_v7(), self.context, cause)
         });
+        self.abort_released = true;
         Some(OperationIntent::AbortQueryContext(request))
     }
 
@@ -767,7 +799,7 @@ impl QueryContextOwner {
             .abort
             .is_some_and(|request| request.envelope().operation_id() == operation_id)
         {
-            self.abort = None;
+            self.abort_released = false;
         }
     }
 

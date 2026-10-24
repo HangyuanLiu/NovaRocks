@@ -374,7 +374,10 @@ impl RootStageProposal {
             .map(|admission| RootStageAdmission { admission })
     }
 }
-fn merge(proposal: &mut JointProposal, references: &[DependencyRef]) -> Result<(), WorkError> {
+pub(super) fn merge(
+    proposal: &mut JointProposal,
+    references: &[DependencyRef],
+) -> Result<(), WorkError> {
     let current = proposal.current.as_mut().ok_or(WorkError::Conflict)?;
     let k = proposal.config.config.max_dependencies_per_claim;
     for reference in references {
@@ -390,7 +393,7 @@ fn merge(proposal: &mut JointProposal, references: &[DependencyRef]) -> Result<(
     }
     Ok(())
 }
-fn maximum_payload_increment(state: &State, root: WorkId) -> Result<u64, WorkError> {
+pub(super) fn maximum_payload_increment(state: &State, root: WorkId) -> Result<u64, WorkError> {
     let node = state.nodes.get(&root).ok_or(WorkError::Released)?;
     let config = &state
         .joint

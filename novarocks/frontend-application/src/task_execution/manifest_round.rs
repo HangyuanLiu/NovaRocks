@@ -71,6 +71,8 @@ pub(crate) struct ManifestAttemptTransport {
     pub(crate) wire: AttemptWireFacts,
     pub(crate) data_runtime: FrontendDataRuntime,
     pub(crate) subscription_scope: novarocks_workload_control::WorkScope,
+    pub(crate) native_actions:
+        novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
     /// Exact process evidence bounds active pre-ready observation and residual
     /// convergence. It cannot change the frozen manifest or schedule a successor.
     pub(crate) convergence_source: BackendProcessObservationService,
@@ -163,6 +165,7 @@ pub(crate) fn assemble_manifest_round(
             transport.wire.clone(),
             acks.handle(),
             transport.data_runtime.clone(),
+            transport.native_actions,
         )
         .map_err(TaskExecutionError::NativeTransport)?,
     ) as Arc<dyn TaskOperationSink>;
@@ -1079,6 +1082,7 @@ mod tests {
         fn try_reserve_queue(
             &self,
             _: super::super::intent::TaskOperationQueueRequest,
+            _: &mut super::super::intent::TaskOperationQueuePreparation,
         ) -> super::super::intent::TaskOperationQueueAdmission {
             super::super::intent::TaskOperationQueueAdmission::Admitted(
                 super::super::intent::test_queue_permit(),

@@ -225,7 +225,7 @@ impl FragmentArtifact {
         let frozen = wire::FrozenFragment {
             package: encode_checked_package(package, limits, control)?.into(),
         };
-        let content = FrozenBytes::freeze(frozen.encode_to_vec().into());
+        let content = FrozenBytes::freeze_encoded(frozen.encode_to_vec());
         #[cfg(test)]
         tests::record_freeze();
         let retained = static_fragment_frozen(content.len());

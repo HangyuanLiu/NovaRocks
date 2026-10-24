@@ -303,3 +303,17 @@ impl ConnectorMetadataMaintenanceExecutionSource for MaintenanceExecution {
 #[cfg(test)]
 #[path = "execution/tests.rs"]
 mod tests;
+
+/// Exact first-party fixed carrier payloads. The F pointee is quoted by the
+/// same parent factory; variable journal/plan increments are separate.
+pub(super) fn fixed_backing_bytes() -> usize {
+    std::mem::size_of::<MaintenanceExecution>()
+        + std::mem::size_of::<MaintenancePanic>()
+        + 2 * std::mem::size_of::<[usize; 2]>()
+        + std::mem::size_of::<Mutex<Option<Box<dyn Any + Send>>>>()
+        + if cfg!(target_os = "macos") {
+            2 * 128
+        } else {
+            0
+        }
+}

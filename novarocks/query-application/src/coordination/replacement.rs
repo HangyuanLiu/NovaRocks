@@ -76,6 +76,7 @@ pub struct ReplacementQualificationRequest {
     issued_at: MonotonicInstant,
     conservative_expiry: MonotonicInstant,
     absolute_expiry: std::time::Instant,
+    native_actions: Option<novarocks_workload_control::joint_admission::NativeAsyncActionAuthority>,
 }
 
 impl ReplacementQualificationRequest {
@@ -85,6 +86,9 @@ impl ReplacementQualificationRequest {
         replacement_contexts: Arc<[QueryContextRef]>,
         issued_at: MonotonicInstant,
         conservative_expiry: MonotonicInstant,
+        native_actions: Option<
+            novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
+        >,
     ) -> Self {
         let absolute_expiry = std::time::Instant::now()
             .checked_add(conservative_expiry.saturating_duration_since(issued_at))
@@ -97,7 +101,19 @@ impl ReplacementQualificationRequest {
             issued_at,
             conservative_expiry,
             absolute_expiry,
+            native_actions,
         }
+    }
+
+    pub fn native_action_authority(
+        &self,
+    ) -> Result<
+        &novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
+        novarocks_workload_control::WorkError,
+    > {
+        self.native_actions
+            .as_ref()
+            .ok_or(novarocks_workload_control::WorkError::NotReady)
     }
 
     pub const fn operation_id(&self) -> TaskOperationId {

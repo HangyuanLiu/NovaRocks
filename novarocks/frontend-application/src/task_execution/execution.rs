@@ -108,6 +108,25 @@ enum EdgeControlEffect {
     },
 }
 
+/// The original graph row keeps its exact generated input and paid ticket
+/// through a capacity wait. No process physical position is held while Joint
+/// admission is waiting, and polling never removes this row from its owner.
+#[derive(Debug)]
+struct PendingEdgeControlEffect {
+    effect: EdgeControlEffect,
+    input: Option<TaskDomainUpdate>,
+    preparation: super::intent::TaskOperationQueuePreparation,
+}
+impl From<EdgeControlEffect> for PendingEdgeControlEffect {
+    fn from(effect: EdgeControlEffect) -> Self {
+        Self {
+            effect,
+            input: None,
+            preparation: super::intent::TaskOperationQueuePreparation::new(),
+        }
+    }
+}
+
 impl EdgeControlEffect {
     const fn producer(self) -> TaskIdentity {
         match self {
@@ -328,7 +347,8 @@ pub struct QueryTaskExecution {
     deployment_window: BTreeMap<BackendProcessId, BTreeSet<TaskIdentity>>,
     /// The frozen graph bounds this by sum(producers * (destinations + 1)):
     /// the edge tracker emits each close member and each open only once.
-    edge_control_effects: VecDeque<EdgeControlEffect>,
+    edge_control_effects: VecDeque<PendingEdgeControlEffect>,
+    actor_abort_queue_preparation: super::intent::TaskOperationQueuePreparation,
     operation_targets: BTreeMap<TaskOperationId, OperationTarget>,
     expired_actor_aborts: Vec<TaskOperationId>,
     status_reconciliations: BTreeSet<QueryContextRef>,
@@ -609,6 +629,7 @@ impl QueryTaskExecution {
             deployment_window_limits,
             deployment_window: BTreeMap::new(),
             edge_control_effects: VecDeque::new(),
+            actor_abort_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
             operation_targets: BTreeMap::new(),
             expired_actor_aborts: Vec::new(),
             status_reconciliations: BTreeSet::new(),
@@ -855,6 +876,14 @@ impl QueryTaskExecution {
             return Ok(report);
         }
 
+        // One bounded pass of original Task rows. Each owner withdraws closed
+        // input before reserving; exact destination-close input remains live
+        // during normal drain. A blocked source cannot stop an independent row.
+        for stage in self.stages.values_mut() {
+            for (_, task) in stage.tasks_mut() {
+                task.poll_input_preparation(self.sink.as_ref())?;
+            }
+        }
         self.flush_edge_control_effects()?;
 
         let mut lifecycle = Vec::<AdmissionCandidate>::new();
@@ -1057,6 +1086,10 @@ impl QueryTaskExecution {
                 // Retry only after an original capacity wake or another turn.
                 Ok(false)
             }
+            TaskOperationSubmit::AdmissionFailed { batch, error } => {
+                self.rollback_rejected_batch(batch)?;
+                Err(TaskExecutionError::Workload(error))
+            }
             TaskOperationSubmit::Rejected { batch, reason } => {
                 self.rollback_rejected_batch(batch)?;
                 Err(TaskExecutionError::Schedule(reason))
@@ -1082,23 +1115,16 @@ impl QueryTaskExecution {
             .stage_of_task
             .get(&task_id)
             .ok_or(TaskExecutionError::UnknownOperation)?;
-        let backend = self
+        let remote = self
             .stages
-            .get(&stage_id)
-            .and_then(|stage| stage.task(task_id))
-            .ok_or(TaskExecutionError::UnknownOperation)?
-            .identity()
-            .backend_process_id();
-        let request = TaskOperationQueueRequest::task_update(backend, &update);
-        self.dispatcher.validate_queue_request(request)?;
-        let queue_permit = self
-            .reserve_process_request(request)
-            .ok_or_else(|| Self::process_queue_backpressure(request))?;
-        self.stages
             .get_mut(&stage_id)
             .and_then(|stage| stage.task_mut(task_id))
-            .ok_or(TaskExecutionError::UnknownOperation)?
-            .enqueue_update(update, queue_permit)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        let request =
+            TaskOperationQueueRequest::task_update(remote.identity().backend_process_id(), &update);
+        self.dispatcher.validate_queue_request(request)?;
+        remote.begin_input_preparation(update)?;
+        remote.poll_input_preparation(self.sink.as_ref())
     }
 
     /// Reserves the two capacities an actor-owned Abort needs before its
@@ -1109,7 +1135,7 @@ impl QueryTaskExecution {
     /// proved that the exact backend's lifecycle lane can advance now. The
     /// adapter slot is never treated as either authority.
     pub(crate) fn try_reserve_actor_abort(
-        &self,
+        &mut self,
         intent: &OperationIntent,
     ) -> Result<Option<ActorAbortReservation>, TaskExecutionError> {
         let OperationIntent::AbortQueryContext(request) = intent else {
@@ -1132,7 +1158,13 @@ impl QueryTaskExecution {
         if !self.dispatcher.priority_capacity_available(intent)? {
             return Ok(None);
         }
-        let Some(queue_permit) = self.reserve_process_queue(intent)? else {
+        self.dispatcher.validate_operation_carrier(intent)?;
+        let Some(queue_permit) = Self::reserve_process_request(
+            self.sink.as_ref(),
+            intent.queue_request(),
+            &mut self.actor_abort_queue_preparation,
+        )?
+        else {
             return Ok(None);
         };
         Ok(Some(ActorAbortReservation {
@@ -1356,7 +1388,15 @@ impl QueryTaskExecution {
             return Ok(AbortSubmission::NoIntent);
         };
         let operation_id = intent.operation_id();
-        let Some(queue_permit) = self.reserve_process_queue(&intent)? else {
+        self.dispatcher.validate_operation_carrier(&intent)?;
+        let preparation = self
+            .owners
+            .get_mut(&context)
+            .ok_or(TaskExecutionError::UnknownOperation)?
+            .queue_preparation(&intent);
+        let Some(queue_permit) =
+            Self::reserve_process_request(self.sink.as_ref(), intent.queue_request(), preparation)?
+        else {
             self.rollback_unsent(OperationTarget::Context(context), operation_id);
             return Ok(AbortSubmission::Backpressured);
         };
@@ -1384,6 +1424,10 @@ impl QueryTaskExecution {
             TaskOperationSubmit::Backpressured(batch) => {
                 self.dispatcher.restore_backpressured(batch);
                 Ok(AbortSubmission::Backpressured)
+            }
+            TaskOperationSubmit::AdmissionFailed { batch, error } => {
+                self.rollback_rejected_batch(batch)?;
+                Err(TaskExecutionError::Workload(error))
             }
             TaskOperationSubmit::Rejected { batch, reason } => {
                 self.rollback_rejected_batch(batch)?;
@@ -1636,11 +1680,13 @@ impl QueryTaskExecution {
                 "exchange edge decided; recording the open on every producer"
             );
             for producer in producers {
-                self.edge_control_effects
-                    .push_back(EdgeControlEffect::Open {
+                self.edge_control_effects.push_back(
+                    EdgeControlEffect::Open {
                         producer,
                         edge: edge_id,
-                    });
+                    }
+                    .into(),
+                );
             }
         }
     }
@@ -1653,12 +1699,14 @@ impl QueryTaskExecution {
         for effect in resolution.closed() {
             let producers = self.edges.producers_of(effect.edge_id()).to_vec();
             for producer in producers {
-                self.edge_control_effects
-                    .push_back(EdgeControlEffect::Close {
+                self.edge_control_effects.push_back(
+                    EdgeControlEffect::Close {
                         producer,
                         edge: effect.edge_id(),
                         destination: effect.destination(),
-                    });
+                    }
+                    .into(),
+                );
             }
         }
         self.apply_open_decisions(resolution.opened().to_vec());
@@ -1673,45 +1721,60 @@ impl QueryTaskExecution {
         let mut blocked_producers = BTreeSet::new();
         let pass_len = self.edge_control_effects.len();
         for _ in 0..pass_len {
-            let Some(effect) = self.edge_control_effects.pop_front() else {
+            let Some(row) = self.edge_control_effects.front() else {
                 break;
             };
-            if self.normal_drain_started && matches!(effect, EdgeControlEffect::Open { .. }) {
-                continue;
-            }
+            let effect = row.effect;
             let producer = effect.producer();
-            if blocked_producers.contains(&producer) {
-                self.edge_control_effects.push_back(effect);
+            if (self.normal_drain_started && matches!(effect, EdgeControlEffect::Open { .. }))
+                || self
+                    .task_by_identity_ref(producer)
+                    .is_some_and(RemoteTask::fenced_out)
+                || self.task_actual_stopped(producer)
+            {
+                drop(self.edge_control_effects.pop_front());
                 continue;
             }
             let task = self
                 .task_by_identity_ref(producer)
                 .ok_or(TaskExecutionError::UnknownOperation)?;
-            if task.fenced_out() || self.task_actual_stopped(producer) {
-                continue;
-            }
-            if task.is_terminal() && self.covered_observation_active {
+            if blocked_producers.contains(&producer)
+                || (task.is_terminal() && self.covered_observation_active)
+            {
                 blocked_producers.insert(producer);
-                self.edge_control_effects.push_back(effect);
+                self.edge_control_effects.rotate_left(1);
                 continue;
             }
-            let update = match effect {
-                EdgeControlEffect::Close {
-                    edge, destination, ..
-                } => task.prepare_destination_close(edge, destination)?,
-                EdgeControlEffect::Open { edge, .. } => task.prepare_edge_open(edge)?,
-            };
-            let request =
-                TaskOperationQueueRequest::task_update(producer.backend_process_id(), &update);
+            if self.edge_control_effects.front().unwrap().input.is_none() {
+                let input = match effect {
+                    EdgeControlEffect::Close {
+                        edge, destination, ..
+                    } => task.prepare_destination_close(edge, destination)?,
+                    EdgeControlEffect::Open { edge, .. } => task.prepare_edge_open(edge)?,
+                };
+                self.edge_control_effects.front_mut().unwrap().input = Some(input);
+            }
+            let row = self.edge_control_effects.front_mut().unwrap();
+            let request = TaskOperationQueueRequest::task_update(
+                producer.backend_process_id(),
+                row.input.as_ref().unwrap(),
+            );
             self.dispatcher.validate_queue_request(request)?;
-            let Some(permit) = self.reserve_process_request(request) else {
+            let Some(permit) =
+                Self::reserve_process_request(self.sink.as_ref(), request, &mut row.preparation)?
+            else {
                 blocked_producers.insert(producer);
-                self.edge_control_effects.push_back(effect);
+                self.edge_control_effects.rotate_left(1);
                 continue;
             };
+            let mut row = self
+                .edge_control_effects
+                .pop_front()
+                .expect("same original edge decision");
+            let input = row.input.take().expect("prepared original edge input");
             self.task_by_identity(producer)
                 .ok_or(TaskExecutionError::UnknownOperation)?
-                .enqueue_update(update, permit)?;
+                .enqueue_update(input, permit)?;
         }
         Ok(())
     }
@@ -2677,15 +2740,17 @@ impl QueryTaskExecution {
     /// Checks this attempt's own queue bounds for one request, then reserves
     /// it against process transport.
     fn reserve_candidate(
-        &self,
+        dispatcher: &OperationDispatcher,
+        sink: &dyn TaskOperationSink,
+        preparation: &mut super::intent::TaskOperationQueuePreparation,
         request: TaskOperationQueueRequest,
         holds_queue_permit: bool,
     ) -> Result<
         Result<Option<Box<dyn TaskOperationQueuePermit>>, CandidateAdmission>,
         TaskExecutionError,
     > {
-        self.dispatcher.validate_queue_request(request)?;
-        match self.dispatcher.local_capacity(request) {
+        dispatcher.validate_queue_request(request)?;
+        match dispatcher.local_capacity(request) {
             LocalQueueCapacity::Fits => {}
             LocalQueueCapacity::TargetFull => return Ok(Err(CandidateAdmission::TargetFull)),
             LocalQueueCapacity::AttemptFull => {
@@ -2697,8 +2762,11 @@ impl QueryTaskExecution {
         if holds_queue_permit {
             return Ok(Ok(None));
         }
-        Ok(match self.sink.try_reserve_queue(request) {
+        Ok(match sink.try_reserve_queue(request, preparation) {
             TaskOperationQueueAdmission::Admitted(permit) => Ok(Some(permit)),
+            TaskOperationQueueAdmission::Rejected(error) => {
+                return Err(TaskExecutionError::Workload(error));
+            }
             TaskOperationQueueAdmission::TargetFull => Err(CandidateAdmission::TargetFull),
             TaskOperationQueueAdmission::ProcessFull => Err(CandidateAdmission::Ended(
                 AdmissionPassEnd::ProcessTransport,
@@ -2731,7 +2799,28 @@ impl QueryTaskExecution {
                     self.rollback_unsent(target, operation_id);
                     return Err(error);
                 }
-                let permit = match self.reserve_candidate(intent.queue_request(), false) {
+                let permit = match Self::reserve_candidate(
+                    &self.dispatcher,
+                    self.sink.as_ref(),
+                    match target {
+                        OperationTarget::Context(context) => self
+                            .owners
+                            .get_mut(&context)
+                            .ok_or(TaskExecutionError::UnknownOperation)?
+                            .queue_preparation(&intent),
+                        OperationTarget::Task { stage, task } => {
+                            &mut self
+                                .stages
+                                .get_mut(&stage)
+                                .and_then(|stage| stage.task_mut(task))
+                                .ok_or(TaskExecutionError::UnknownOperation)?
+                                .cancel_queue_preparation
+                        }
+                        OperationTarget::ActorAbort => &mut self.actor_abort_queue_preparation,
+                    },
+                    intent.queue_request(),
+                    false,
+                ) {
                     Ok(Ok(permit)) => permit.expect("a minted candidate reserves its own permit"),
                     Ok(Err(refusal)) => {
                         self.rollback_unsent(target, operation_id);
@@ -2787,7 +2876,18 @@ impl QueryTaskExecution {
                 };
                 self.dispatcher
                     .validate_plan_carrier_bytes(candidate.plan_carrier_bytes())?;
-                let permit = match self.reserve_candidate(candidate.request(), false)? {
+                let permit = match Self::reserve_candidate(
+                    &self.dispatcher,
+                    self.sink.as_ref(),
+                    &mut self
+                        .stages
+                        .get_mut(&stage)
+                        .and_then(|stage| stage.task_mut(task))
+                        .ok_or(TaskExecutionError::UnknownOperation)?
+                        .create_queue_preparation,
+                    candidate.request(),
+                    false,
+                )? {
                     Ok(permit) => permit.expect("a create reserves its own permit"),
                     Err(refusal) => return Ok(refusal),
                 };
@@ -2797,7 +2897,10 @@ impl QueryTaskExecution {
                     .and_then(|stage| stage.task_mut(task))
                     .ok_or(TaskExecutionError::UnknownOperation)?;
                 // A freeze failure drops the permit it was admitted with.
-                let intent = remote.release_create(now)?;
+                let retention = permit
+                    .native_input_retention()
+                    .map_err(TaskExecutionError::Workload)?;
+                let intent = remote.release_create(now, retention)?;
                 let target = OperationTarget::Task { stage, task };
                 if let Err(error) = self.dispatcher.enqueue_reserved(intent, now, permit) {
                     self.rollback_unsent(target, candidate.operation_id());
@@ -2821,9 +2924,18 @@ impl QueryTaskExecution {
                 else {
                     return Ok(CandidateAdmission::Nothing);
                 };
-                let reserved = match self
-                    .reserve_candidate(candidate.request(), candidate.holds_queue_permit())?
-                {
+                let reserved = match Self::reserve_candidate(
+                    &self.dispatcher,
+                    self.sink.as_ref(),
+                    &mut self
+                        .stages
+                        .get_mut(&stage)
+                        .and_then(|stage| stage.task_mut(task))
+                        .ok_or(TaskExecutionError::UnknownOperation)?
+                        .update_queue_preparation,
+                    candidate.request(),
+                    candidate.holds_queue_permit(),
+                )? {
                     Ok(reserved) => reserved,
                     Err(refusal) => return Ok(refusal),
                 };
@@ -2899,28 +3011,18 @@ impl QueryTaskExecution {
         }
     }
 
-    fn reserve_process_queue(
-        &self,
-        intent: &OperationIntent,
-    ) -> Result<Option<Box<dyn TaskOperationQueuePermit>>, TaskExecutionError> {
-        self.dispatcher.validate_operation_carrier(intent)?;
-        Ok(self.reserve_process_request(intent.queue_request()))
-    }
-
-    /// Reserves one single-operation request against process transport.
-    ///
-    /// The single-operation owners -- a domain update, an actor Abort, a
-    /// cleanup Abort -- have no successor candidate a full target could
-    /// reorder, so both refusals mean the same thing to them: not now. Each
-    /// keeps its own retry or failure rule for that answer.
     fn reserve_process_request(
-        &self,
+        sink: &dyn TaskOperationSink,
         request: TaskOperationQueueRequest,
-    ) -> Option<Box<dyn TaskOperationQueuePermit>> {
-        match self.sink.try_reserve_queue(request) {
-            TaskOperationQueueAdmission::Admitted(permit) => Some(permit),
+        preparation: &mut super::intent::TaskOperationQueuePreparation,
+    ) -> Result<Option<Box<dyn TaskOperationQueuePermit>>, TaskExecutionError> {
+        match sink.try_reserve_queue(request, preparation) {
+            TaskOperationQueueAdmission::Admitted(permit) => Ok(Some(permit)),
             TaskOperationQueueAdmission::TargetFull | TaskOperationQueueAdmission::ProcessFull => {
-                None
+                Ok(None)
+            }
+            TaskOperationQueueAdmission::Rejected(error) => {
+                Err(TaskExecutionError::Workload(error))
             }
         }
     }

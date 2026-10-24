@@ -440,6 +440,24 @@ pub struct FsAccessHandle {
 }
 
 impl FsAccessHandle {
+    /// Derive only a request view. The pooled operator, signer, client and
+    /// authority identities remain the originals; no client/cache is minted.
+    pub fn with_request_context(
+        mut self,
+        request: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Self {
+        if request.io_admission().is_some() {
+            let base = self.operator.base_context();
+            let transport = HttpTransporter::new(s3_signing::GovernedRequestTransport::new(
+                base.http_transport().clone(),
+                request,
+            ));
+            let context = base.with_http_transport(transport);
+            self.operator = self.operator.with_context(context);
+        }
+        self
+    }
+
     pub fn new(
         access_domain: StorageAccessDomainId,
         scheme: FsScheme,
@@ -2170,6 +2188,46 @@ impl FsAccessResolver {
         FsLocation::parse(raw)
     }
 
+    /// Pure projection from the SAME route author used by resolve_locations.
+    /// It does not create an operator, resolve DNS, acquire secrets, or dial.
+    pub fn selected_dependency(
+        &self,
+        location: &str,
+        object_store: Option<&ObjectStoreEndpointConfig>,
+    ) -> FileResult<novarocks_spi::connector::SharedDependency> {
+        use novarocks_spi::connector::{HdfsServiceOrigin, NetworkServiceOrigin, SharedDependency};
+        let selected = self.parse_location(location)?;
+        match selected.scheme() {
+            FsScheme::Local => Ok(SharedDependency::LocalHost),
+            FsScheme::Hdfs => {
+                let original = parse_hdfs_selection(location, false)?;
+                let route = Url::parse(&original.name_node)
+                    .map_err(|_| FileError::invalid("invalid selected HDFS service"))?;
+                HdfsServiceOrigin::from_selected_url(&route)
+                    .map(SharedDependency::Hdfs)
+                    .map_err(|_| {
+                        FileError::invalid("selected HDFS service exceeds dependency profile")
+                    })
+            }
+            FsScheme::ObjectStore => {
+                let config = object_store.ok_or_else(|| {
+                    FileError::invalid("object-store route has no original endpoint configuration")
+                })?;
+                let bucket = selected
+                    .authority()
+                    .ok_or_else(|| FileError::invalid("object-store path has no bucket"))?;
+                let endpoint = ObjectStoreEndpointIdentity::try_new(bucket, config)?;
+                let route = Url::parse(&endpoint.endpoint)
+                    .map_err(|_| FileError::invalid("invalid selected object-store endpoint"))?;
+                NetworkServiceOrigin::from_selected_url(&route)
+                    .map(SharedDependency::Network)
+                    .map_err(|_| {
+                        FileError::invalid("selected storage service exceeds dependency profile")
+                    })
+            }
+        }
+    }
+
     pub fn parse_locations<I, S>(&self, locations: I) -> FileResult<Vec<FsLocation>>
     where
         I: IntoIterator<Item = S>,
@@ -2546,9 +2604,23 @@ struct AuthoritySigningSource {
 
 impl AuthoritySigningSource {
     async fn credential_for_request(&self) -> anyhow::Result<reqsign::AwsCredential> {
+        self.credential_for_request_in(None).await
+    }
+    async fn credential_for_request_in(
+        &self,
+        request: Option<&novarocks_spi::connector::ConnectorRequestContext>,
+    ) -> anyhow::Result<reqsign::AwsCredential> {
         let now = Instant::now();
         let deadline = now.checked_add(self.budget).unwrap_or(now);
-        match self.authority.material_for_request(now, deadline).await {
+        let result = match request {
+            Some(request) => {
+                self.authority
+                    .material_for_request_in(now, deadline, request.clone())
+                    .await
+            }
+            None => self.authority.material_for_request(now, deadline).await,
+        };
+        match result {
             Ok(material) => Ok(reqsign::AwsCredential {
                 access_key_id: material.access_key_id().expose_secret().to_string(),
                 secret_access_key: material.secret_access_key().expose_secret().to_string(),
@@ -3057,6 +3129,10 @@ struct HdfsPath {
 }
 
 fn parse_hdfs_path(raw: &str) -> FileResult<HdfsPath> {
+    parse_hdfs_selection(raw, true)
+}
+
+fn parse_hdfs_selection(raw: &str, require_file: bool) -> FileResult<HdfsPath> {
     let url = Url::parse(raw).map_err(|error| {
         FileError::with_source(FileErrorKind::Invalid, "parse hdfs path", error)
     })?;
@@ -3079,7 +3155,7 @@ fn parse_hdfs_path(raw: &str) -> FileResult<HdfsPath> {
         .map(|port| format!("{host}:{port}"))
         .unwrap_or_else(|| host.to_string());
     let relative_path = url.path().trim_start_matches('/').to_string();
-    if relative_path.is_empty() {
+    if require_file && relative_path.is_empty() {
         return Err(FileError::invalid(
             "hdfs path points to namenode root and cannot be used as file path",
         ));

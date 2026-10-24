@@ -373,7 +373,7 @@ impl MaintenanceEngine {
             if let Some((operation, roots)) = receipt.artifact_cleanup {
                 // IRU-5 owned-output cleanup is separate from snapshot GC. It
                 // retains the original operation and exact frozen roots.
-                let report = operation.cleanup_after_commit(&roots).await;
+                let report = operation.cleanup_after_commit_in(&roots, context).await;
                 let finalization = report.finalization();
                 journal.record_entry_finalization(entry, finalization);
             }
@@ -533,7 +533,7 @@ impl MaintenanceEngine {
                 )
             }),
         }));
-        let preparer = RewriteManifestsPreparer::new();
+        let preparer = RewriteManifestsPreparer::for_request(context.clone());
         let report = attempt::run(
             &operation,
             &intent,
@@ -564,6 +564,7 @@ impl MaintenanceEngine {
         let started = Instant::now();
         let runtime = self.runtime.resources().catalog_runtime();
         let mut ordinal = 0;
+        let mut retained_decisions = 0u64;
         loop {
             if started.elapsed() >= policy.total_timeout() {
                 return Ok(rejected(deadline("Maintenance retry budget expired")));
@@ -584,6 +585,13 @@ impl MaintenanceEngine {
                         if metadata.uuid().to_string() != payload.table_uuid {
                             return Err(invalid("Iceberg expiration table UUID was replaced"));
                         }
+                        let decision = RetentionPlan::owned_decision_bytes(metadata).map_err(iceberg_error)?;
+                        retained_decisions = retained_decisions.checked_add(decision).ok_or_else(||invalid("retention journal backing overflow"))?;
+                        let initial = 2*(novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES+novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES) as u64;
+                        let required = retained_decisions.checked_add(initial).and_then(std::num::NonZeroU64::new).ok_or_else(||invalid("retention journal backing overflow"))?;
+                        // The source reserves old journal decisions plus the new
+                        // decision before any owned retention clone is formed.
+                        context.reserve_owned_metadata(required).await?;
                         let retention = RetentionPlan::compute(
                             metadata,
                             payload.evaluation_time_ms,
@@ -789,6 +797,56 @@ impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
         })
     }
 
+    fn io_profile(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile, ConnectorError>
+    {
+        let dependencies = self.runtime.metadata_action_initial_dependencies()?;
+        // Exact original io_requests, not the cleanup object bound or a new
+        // semaphore. Header/F costs exclude borrowed SDK/cache/private graphs.
+        let io = std::num::NonZeroUsize::new(OperationLimits::default().io_requests as usize)
+            .ok_or_else(|| internal("metadata operation I/O inventory is empty"))?;
+        let fixed = std::mem::size_of::<MaintenanceEngine>()
+            .checked_add(std::mem::size_of::<MetadataExecutionInput>())
+            .and_then(|n| n.checked_add(metadata_execution_future_bytes(make_metadata_execution)))
+            .and_then(|n| n.checked_add(execution::fixed_backing_bytes()))
+            .and_then(|n| n.checked_add(IcebergCommitOperation::fixed_backing_bytes().ok()?))
+            .and_then(|n| {
+                n.checked_add(
+                    crate::fs_io::governed_writer_backing_bytes()
+                        .ok()?
+                        .checked_mul(io.get())?,
+                )
+            })
+            .ok_or_else(|| internal("metadata source geometry overflow"))?;
+        // Canonical plan/evidence String+Bytes and old/new conversion coexist.
+        // Variable retention/journal plans are reserved from observed metadata
+        // at their actual formation points, not hidden in this initial bound.
+        let initial = 2usize
+            .checked_mul(
+                novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES,
+            )
+            .and_then(|n| {
+                n.checked_add(
+                    2 * novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES,
+                )
+            })
+            .ok_or_else(|| internal("metadata initial payload geometry overflow"))?;
+        novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile::try_new(
+            io,
+            std::num::NonZeroU64::new(
+                u64::try_from(fixed).map_err(|_| internal("metadata source geometry overflow"))?,
+            )
+            .unwrap(),
+            std::num::NonZeroU64::new(
+                u64::try_from(initial)
+                    .map_err(|_| internal("metadata initial payload overflow"))?,
+            )
+            .unwrap(),
+            dependencies,
+        )
+    }
+
     fn begin_execute(
         &self,
         request: ConnectorMetadataMaintenanceExecuteRequest,
@@ -829,24 +887,13 @@ impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
         // The original active row exists before any physical future can be polled.
         let weak = Arc::downgrade(&row);
         let engine = Arc::clone(&self.engine);
-        let future = Box::pin(async move {
-            if let Some(terminal) = terminal {
-                engine
-                    .replay_terminal(&request.plan, terminal.outcome, &request.context, &weak)
-                    .await
-            } else {
-                engine
-                    .execute_once(
-                        &request.plan,
-                        payload
-                            .as_ref()
-                            .expect("new execution has a validated payload"),
-                        &request.context,
-                        &weak,
-                    )
-                    .await
-            }
-        });
+        let future = Box::pin(make_metadata_execution(MetadataExecutionInput {
+            engine,
+            request,
+            terminal,
+            payload,
+            weak,
+        }));
         row.install(future);
         active.insert(row.operation, Arc::clone(&row));
         drop(active);
@@ -893,6 +940,44 @@ impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
             Ok(ConnectorMaxCompactableDataFiles::new(Some(value)))
         })
     }
+}
+
+struct MetadataExecutionInput {
+    engine: Arc<MaintenanceEngine>,
+    request: ConnectorMetadataMaintenanceExecuteRequest,
+    terminal: Option<TerminalRecord>,
+    payload: Option<IcebergMetadataMaintenancePlanPayloadV1>,
+    weak: Weak<MaintenanceExecution>,
+}
+async fn make_metadata_execution(
+    input: MetadataExecutionInput,
+) -> Result<ConnectorMetadataMaintenanceOutcome, ConnectorError> {
+    let MetadataExecutionInput {
+        engine,
+        request,
+        terminal,
+        payload,
+        weak,
+    } = input;
+    if let Some(terminal) = terminal {
+        engine
+            .replay_terminal(&request.plan, terminal.outcome, &request.context, &weak)
+            .await
+    } else {
+        engine
+            .execute_once(
+                &request.plan,
+                payload
+                    .as_ref()
+                    .expect("new execution has a validated payload"),
+                &request.context,
+                &weak,
+            )
+            .await
+    }
+}
+fn metadata_execution_future_bytes<I, F>(_: fn(I) -> F) -> usize {
+    std::mem::size_of::<F>()
 }
 
 #[path = "metadata_maintenance/execution.rs"]

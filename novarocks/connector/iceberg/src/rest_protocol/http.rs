@@ -113,6 +113,23 @@ impl RestHttpClient {
             Ok(request) => request,
             Err(cause) => return (DispatchStage::NotWritten(cause), None),
         };
+        // The route is the exact prepared request, before credentials/wire
+        // dispatch. The same original receipt continues in the raw body.
+        let io = match &context.original {
+            Some(original) => {
+                let fact = match novarocks_spi::connector::NetworkServiceOrigin::from_selected_url(
+                    request.url(),
+                ) {
+                    Ok(origin) => novarocks_spi::connector::SharedDependency::Network(origin),
+                    Err(_) => return (DispatchStage::NotWritten(NotWrittenCause::Url), None),
+                };
+                match original.admit_selected_io(fact).await {
+                    Ok(permit) => permit,
+                    Err(_) => return (DispatchStage::NotWritten(NotWrittenCause::Build), None),
+                }
+            }
+            None => None,
+        };
         let executed = match context.deadline {
             Some(deadline) => {
                 match tokio::time::timeout_at(deadline, self.inner.execute(request)).await {
@@ -134,6 +151,7 @@ impl RestHttpClient {
                 let body = success_statuses.contains(&code).then(|| ResponseBody {
                     response,
                     deadline: context.deadline,
+                    _io: io,
                 });
                 (DispatchStage::Status { code, header_names }, body)
             }
@@ -273,12 +291,21 @@ impl RestRequest {
 }
 
 /// The caller's bounds on one request. Cancellation is dropping the future.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 #[cfg_attr(test, derive(Default))]
 pub(crate) struct RequestContext {
     deadline: Option<Instant>,
+    original: Option<novarocks_spi::connector::ConnectorRequestContext>,
 }
 
+impl fmt::Debug for RequestContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RequestContext")
+            .field("deadline", &self.deadline)
+            .field("original_io", &self.original.is_some())
+            .finish()
+    }
+}
 impl RequestContext {
     /// Configuration, OAuth and catalog reads have one finite phase budget,
     /// shared by response headers and every body chunk.
@@ -289,7 +316,23 @@ impl RequestContext {
     pub(crate) fn with_deadline(deadline: Instant) -> Self {
         Self {
             deadline: Some(deadline),
+            original: None,
         }
+    }
+    pub(crate) fn from_connector(
+        original: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Self {
+        Self {
+            deadline: Some(original.deadline().into()),
+            original: Some(original.clone()),
+        }
+    }
+    pub(crate) fn for_binding(
+        original: Option<&novarocks_spi::connector::ConnectorRequestContext>,
+    ) -> Self {
+        original
+            .map(Self::from_connector)
+            .unwrap_or_else(Self::for_read)
     }
 
     pub(crate) fn deadline(&self) -> Option<Instant> {
@@ -310,6 +353,8 @@ pub(crate) enum BodyReadError {
 pub(crate) struct ResponseBody {
     response: reqwest::Response,
     deadline: Option<Instant>,
+    // Declared after the raw response: actual body Drop precedes this alias.
+    _io: Option<novarocks_spi::connector::ConnectorIoPermit>,
 }
 
 impl fmt::Debug for ResponseBody {

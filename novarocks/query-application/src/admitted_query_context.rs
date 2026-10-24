@@ -233,6 +233,22 @@ impl Drop for ResultCapacityActivityLease {
 }
 
 impl QueryResultCapacityBinding {
+    pub fn native_action_authority(
+        &self,
+    ) -> Result<novarocks_workload_control::joint_admission::NativeAsyncActionAuthority, WorkError>
+    {
+        self.window.native_action_authority()
+    }
+    /// Pure delegation from the same original Root result owner. The returned
+    /// source is not a new budget, Native dispatch or physical grant.
+    pub fn native_action_source(
+        &self,
+        lane: novarocks_workload_control::joint_admission::JointLane,
+        quote: novarocks_workload_control::joint_admission::NativeAsyncActionQuote,
+    ) -> Result<novarocks_workload_control::joint_admission::NativeAsyncActionSource, WorkError>
+    {
+        self.window.native_action_source(lane, quote)
+    }
     pub fn try_new(scope: &WorkScope, window: ResultWindowAlias) -> Result<Self, WorkError> {
         if !window.is_for_scope(scope) || window.class() == ResultWindowClass::Closing {
             return Err(WorkError::Conflict);

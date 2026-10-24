@@ -243,8 +243,12 @@ impl ActorGatedTaskOperationSink {
 }
 
 impl TaskOperationSink for ActorGatedTaskOperationSink {
-    fn try_reserve_queue(&self, request: TaskOperationQueueRequest) -> TaskOperationQueueAdmission {
-        self.inner.try_reserve_queue(request)
+    fn try_reserve_queue(
+        &self,
+        request: TaskOperationQueueRequest,
+        preparation: &mut super::intent::TaskOperationQueuePreparation,
+    ) -> TaskOperationQueueAdmission {
+        self.inner.try_reserve_queue(request, preparation)
     }
 
     fn try_submit(&self, batch: DispatchBatch) -> TaskOperationSubmit {
@@ -767,6 +771,7 @@ mod tests {
         fn try_reserve_queue(
             &self,
             _request: TaskOperationQueueRequest,
+            _preparation: &mut crate::task_execution::intent::TaskOperationQueuePreparation,
         ) -> TaskOperationQueueAdmission {
             TaskOperationQueueAdmission::Admitted(test_queue_permit())
         }
@@ -784,6 +789,7 @@ mod tests {
         fn try_reserve_queue(
             &self,
             _request: TaskOperationQueueRequest,
+            _preparation: &mut crate::task_execution::intent::TaskOperationQueuePreparation,
         ) -> TaskOperationQueueAdmission {
             TaskOperationQueueAdmission::Admitted(test_queue_permit())
         }

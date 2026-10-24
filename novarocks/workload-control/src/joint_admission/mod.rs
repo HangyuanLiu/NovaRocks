@@ -28,12 +28,17 @@ mod protection;
 
 pub use driver::{JointProgress, JointProgressDriver};
 pub use ledger::{
-    BlockingActionAdmission, BlockingActionSource, ControlBindingProposal,
-    InternalComputationAlias, InternalComputationGrant, InternalCpuActionAdmission,
-    InternalCpuActionSource, InternalCpuFactoryBinding, InternalResultClosedFactoryDescriptor,
-    JointAdjustmentReceipt, JointAdmission, JointAdmissionFailure, JointAdmissionHandle,
-    JointClaim, JointClaimView, JointGrantedBatch, JointGrantedClaims, JointLocalGrant,
-    JointLocalOffer, JointProposal, RetainedPayloadAlias, RetainedPayloadGrant, RootStageAdmission,
+    AsyncActionAdmission, AsyncActionGrant, AsyncActionSource, BlockingActionAdmission,
+    BlockingActionSource, ControlBindingProposal, InternalComputationAlias,
+    InternalComputationGrant, InternalCpuActionAdmission, InternalCpuActionSource,
+    InternalCpuFactoryBinding, InternalResultClosedFactoryDescriptor, JointAdjustmentReceipt,
+    JointAdmission, JointAdmissionFailure, JointAdmissionHandle, JointClaim, JointClaimView,
+    JointGrantedBatch, JointGrantedClaims, JointLocalGrant, JointLocalOffer, JointProposal,
+    NativeAsyncActionAdmission, NativeAsyncActionAuthority, NativeAsyncActionGrant,
+    NativeAsyncActionQuote, NativeAsyncActionSource, NativeQueuedInputAdmission,
+    NativeQueuedInputGrant, NativeQueuedInputQuote, NativeQueuedInputReady, NativeReplyGrant,
+    RetainedPayloadAlias, RetainedPayloadGrant, RootPayloadAdmission, RootPayloadInitialAdmission,
+    RootPayloadProposal, RootPayloadReady, RootPayloadSource, RootStageAdmission,
     RootStageProposal, RootStageReady, RootStageSource, UnreceivedProductionAdmission,
     UnreceivedProductionGrant, UnreceivedProductionOwner, UnreceivedProductionQuote,
     UnreceivedProductionReady,

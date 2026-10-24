@@ -23,9 +23,30 @@ use novarocks_resource_contract::{ExistingOwnerRetentionLease, RetentionOwner, R
 #[derive(Clone, Copy)]
 pub(super) enum ClaimCustody {
     Raw,
-    Production { epoch: u64 },
-    Payload { epoch: u64, pins: usize },
-    Computation { epoch: u64, pins: usize },
+    Production {
+        epoch: u64,
+    },
+    Payload {
+        epoch: u64,
+        pins: usize,
+    },
+    Computation {
+        epoch: u64,
+        pins: usize,
+    },
+    NativeReply {
+        epoch: u64,
+        pins: usize,
+    },
+    NativeAction {
+        epoch: u64,
+        pins: usize,
+    },
+    NativeInput {
+        epoch: u64,
+        pins: usize,
+        queued: bool,
+    },
 }
 impl ClaimCustody {
     pub(super) fn is_raw(self) -> bool {
@@ -34,7 +55,16 @@ impl ClaimCustody {
     pub(super) fn can_release_current(self) -> bool {
         matches!(
             self,
-            Self::Raw | Self::Payload { pins: 0, .. } | Self::Computation { pins: 0, .. }
+            Self::Raw
+                | Self::Payload { pins: 0, .. }
+                | Self::Computation { pins: 0, .. }
+                | Self::NativeReply { pins: 0, .. }
+                | Self::NativeAction { pins: 0, .. }
+                | Self::NativeInput {
+                    pins: 0,
+                    queued: false,
+                    ..
+                }
         )
     }
 }
@@ -42,11 +72,16 @@ impl ClaimCustody {
 enum Kind {
     Payload,
     Computation,
+    NativeReply,
+    NativeAction,
+    NativeInput,
 }
 impl Kind {
     fn resource(self) -> JointResource {
         match self {
-            Self::Payload => JointResource::PayloadBytes,
+            Self::Payload | Self::NativeReply | Self::NativeInput | Self::NativeAction => {
+                JointResource::PayloadBytes
+            }
             Self::Computation => JointResource::Computations,
         }
     }
@@ -54,6 +89,13 @@ impl Kind {
         match self {
             Self::Payload => ClaimCustody::Payload { epoch, pins: 1 },
             Self::Computation => ClaimCustody::Computation { epoch, pins: 1 },
+            Self::NativeReply => ClaimCustody::NativeReply { epoch, pins: 1 },
+            Self::NativeAction => ClaimCustody::NativeAction { epoch, pins: 1 },
+            Self::NativeInput => ClaimCustody::NativeInput {
+                epoch,
+                pins: 1,
+                queued: true,
+            },
         }
     }
     fn pins(self, custody: &mut ClaimCustody, epoch: u64) -> Result<&mut usize, RetentionPinError> {
@@ -73,6 +115,37 @@ impl Kind {
                 pins,
             } => {
                 if matches!(self, Self::Computation) && *original == epoch {
+                    Ok(pins)
+                } else {
+                    Err(RetentionPinError::Conflict)
+                }
+            }
+            ClaimCustody::NativeReply {
+                epoch: original,
+                pins,
+            } => {
+                if matches!(self, Self::NativeReply) && *original == epoch {
+                    Ok(pins)
+                } else {
+                    Err(RetentionPinError::Conflict)
+                }
+            }
+            ClaimCustody::NativeAction {
+                epoch: original,
+                pins,
+            } => {
+                if matches!(self, Self::NativeAction) && *original == epoch {
+                    Ok(pins)
+                } else {
+                    Err(RetentionPinError::Conflict)
+                }
+            }
+            ClaimCustody::NativeInput {
+                epoch: original,
+                pins,
+                ..
+            } => {
+                if matches!(self, Self::NativeInput) && *original == epoch {
                     Ok(pins)
                 } else {
                     Err(RetentionPinError::Conflict)
@@ -133,18 +206,46 @@ fn payload_capacity(inner: &Inner, key: [u64; 2]) -> Result<u64, RetentionPinErr
         .and_then(|ledger| ledger.claims.get(&key[0]))
         .ok_or(RetentionPinError::Released)?;
     match row.custody {
-        ClaimCustody::Payload { epoch, pins } if epoch == key[1] && pins != 0 => {
+        ClaimCustody::Payload { epoch, pins }
+        | ClaimCustody::NativeReply { epoch, pins }
+        | ClaimCustody::NativeAction { epoch, pins }
+        | ClaimCustody::NativeInput { epoch, pins, .. }
+            if epoch == key[1] && pins != 0 =>
+        {
             Ok(row.active_amounts.get(JointResource::PayloadBytes))
+        }
+        _ => Err(RetentionPinError::Conflict),
+    }
+}
+fn retention_kind(inner: &Inner, key: [u64; 2]) -> Result<Kind, RetentionPinError> {
+    let state = inner.state.lock().unwrap();
+    let row = state
+        .joint
+        .as_ref()
+        .and_then(|ledger| ledger.claims.get(&key[0]))
+        .ok_or(RetentionPinError::Released)?;
+    match row.custody {
+        ClaimCustody::Payload { epoch, pins } if epoch == key[1] && pins != 0 => Ok(Kind::Payload),
+        ClaimCustody::NativeReply { epoch, pins } if epoch == key[1] && pins != 0 => {
+            Ok(Kind::NativeReply)
+        }
+        ClaimCustody::NativeAction { epoch, pins } if epoch == key[1] && pins != 0 => {
+            Ok(Kind::NativeAction)
+        }
+        ClaimCustody::NativeInput { epoch, pins, .. } if epoch == key[1] && pins != 0 => {
+            Ok(Kind::NativeInput)
         }
         _ => Err(RetentionPinError::Conflict),
     }
 }
 impl RetentionOwner for Inner {
     fn try_retain(&self, key: [u64; 2]) -> Result<(), RetentionPinError> {
-        try_pin(self, key, Kind::Payload)
+        try_pin(self, key, retention_kind(self, key)?)
     }
     fn release_pin(&self, key: [u64; 2]) {
-        drop_pin(self, key, Kind::Payload);
+        if let Ok(kind) = retention_kind(self, key) {
+            drop_pin(self, key, kind);
+        }
     }
     fn capacity_bytes(&self, key: [u64; 2]) -> Result<u64, RetentionPinError> {
         payload_capacity(self, key)
@@ -186,7 +287,8 @@ impl OriginalPin {
                 row.owner == ClaimOwner::PhysicalWork(scope.id)
                     && match (self.kind, row.custody) {
                         (Kind::Payload, ClaimCustody::Payload { epoch, pins })
-                        | (Kind::Computation, ClaimCustody::Computation { epoch, pins }) => {
+                        | (Kind::Computation, ClaimCustody::Computation { epoch, pins })
+                        | (Kind::NativeReply, ClaimCustody::NativeReply { epoch, pins }) => {
                             epoch == key[1] && pins != 0
                         }
                         _ => false,
@@ -204,18 +306,33 @@ impl Drop for OriginalPin {
 enum Target<'a> {
     Payload(&'a mut Option<RetainedPayloadGrant>),
     Computation(&'a mut Option<InternalComputationGrant>),
+    NativeReply(&'a mut Option<NativeReplyGrant>, &'a NativeActionFence),
+    NativeAction(
+        &'a mut Option<NativeAsyncActionGrant>,
+        &'a NativeActionFence,
+    ),
+    NativeInput(
+        &'a mut Option<NativeQueuedInputGrant>,
+        &'a NativeActionFence,
+    ),
 }
 impl Target<'_> {
     fn kind(&self) -> Kind {
         match self {
             Self::Payload(_) => Kind::Payload,
             Self::Computation(_) => Kind::Computation,
+            Self::NativeReply(_, _) => Kind::NativeReply,
+            Self::NativeAction(_, _) => Kind::NativeAction,
+            Self::NativeInput(_, _) => Kind::NativeInput,
         }
     }
     fn is_empty(&self) -> bool {
         match self {
             Self::Payload(slot) => slot.is_none(),
             Self::Computation(slot) => slot.is_none(),
+            Self::NativeReply(slot, _) => slot.is_none(),
+            Self::NativeAction(slot, _) => slot.is_none(),
+            Self::NativeInput(slot, _) => slot.is_none(),
         }
     }
 }
@@ -225,7 +342,19 @@ fn validate_adoption(
     original: &JointClaim,
     kind: Kind,
 ) -> Result<(u64, WorkClass, JointLane), WorkError> {
-    validate_active_control_node(state, scope)?;
+    if matches!(
+        kind,
+        Kind::NativeReply | Kind::NativeInput | Kind::NativeAction
+    ) {
+        // An already granted reply remains a custody obligation after business
+        // cancellation. Its original Root owner and fixed control must survive.
+        let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
+        if node.owner != crate::OwnerState::Active {
+            return Err(WorkError::Released);
+        }
+    } else {
+        validate_active_control_node(state, scope)?;
+    }
     let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
     let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
     let cell = &state.cancellations.slots[node.cancellation.0];
@@ -255,7 +384,10 @@ fn validate_adoption(
         || record.amounts != record.active_amounts
         || record.facts.key != record.active_facts.key
         || record.active_facts.class != node.class
-        || record.active_facts.key.dependencies != control.active_facts.key.dependencies
+        || (!matches!(
+            kind,
+            Kind::NativeAction | Kind::NativeReply | Kind::NativeInput
+        ) && record.active_facts.key.dependencies != control.active_facts.key.dependencies)
     {
         return Err(WorkError::Conflict);
     }
@@ -264,7 +396,17 @@ fn validate_adoption(
     }
     let capacity = record.active_amounts.get(kind.resource());
     let valid = match kind {
-        Kind::Payload => capacity != 0 && record.active_facts.lane == JointLane::Custody,
+        Kind::Payload | Kind::NativeReply => {
+            capacity != 0 && record.active_facts.lane == JointLane::Custody
+        }
+        Kind::NativeInput => record.active_facts.lane == JointLane::Custody,
+        Kind::NativeAction => {
+            capacity != 0
+                && matches!(
+                    record.active_facts.lane,
+                    JointLane::Foreground | JointLane::Settlement
+                )
+        }
         Kind::Computation => {
             capacity == 1
                 && matches!(
@@ -277,10 +419,33 @@ fn validate_adoption(
     // The enlarged ClaimRecord is prepaid by the original fixed map quote.
     // Any existing metadata amount stays on this same original claim; there
     // is no newly allocated self-funded carrier. Other coordinates are closed.
-    let expected = JointResources::ZERO
+    let mut expected = JointResources::ZERO
         .with(JointResource::ClaimRecords, 1)
         .with(JointResource::MetadataBytes, metadata)
         .with(kind.resource(), capacity);
+    if matches!(kind, Kind::NativeAction) {
+        let physical_bytes = record.active_amounts.get(JointResource::PhysicalQueueBytes);
+        if metadata == 0 || physical_bytes == 0 {
+            return Err(WorkError::Conflict);
+        }
+        expected = expected
+            .with(JointResource::AsyncIo, 1)
+            .with(JointResource::PhysicalQueueRecords, 1)
+            .with(JointResource::PhysicalQueueBytes, physical_bytes);
+    }
+    if matches!(kind, Kind::NativeReply) {
+        let replies = record.active_amounts.get(JointResource::ReplyRecords);
+        if replies == 0 {
+            return Err(WorkError::Conflict);
+        }
+        expected = expected.with(JointResource::ReplyRecords, replies);
+    }
+    if matches!(kind, Kind::NativeInput) {
+        if record.active_amounts.get(JointResource::QueueRecords) != 1 {
+            return Err(WorkError::Conflict);
+        }
+        expected = expected.with(JointResource::QueueRecords, 1);
+    }
     if !valid || record.active_amounts != expected {
         return Err(WorkError::Conflict);
     }
@@ -311,6 +476,19 @@ fn adopt_in(
     let retired = {
         let mut state = inner.state.lock().unwrap();
         let original = source.as_mut().ok_or(WorkError::Released)?;
+        if let Target::NativeInput(_, fence) = &target {
+            paid_proposal::native_action::validate_native_fence(&state, scope, fence)?;
+        }
+        if let Target::NativeAction(_, fence) = &target {
+            paid_proposal::native_action::validate_native_action_claim(
+                &state, scope, fence, original, false,
+            )?;
+        }
+        if let Target::NativeReply(_, fence) = &target {
+            paid_proposal::native_action::validate_native_action_claim(
+                &state, scope, fence, original, true,
+            )?;
+        }
         validate_adoption(&state, scope, original, kind)?;
         let id = original.id.ok_or(WorkError::Released)?;
         let row = state.joint.as_mut().unwrap().claims.get_mut(&id).unwrap();
@@ -329,6 +507,9 @@ fn adopt_in(
         match &mut target {
             Target::Payload(slot) => **slot = Some(RetainedPayloadGrant { pin }),
             Target::Computation(slot) => **slot = Some(InternalComputationGrant { pin }),
+            Target::NativeReply(slot, _) => **slot = Some(NativeReplyGrant { pin }),
+            Target::NativeAction(slot, _) => **slot = Some(NativeAsyncActionGrant { pin }),
+            Target::NativeInput(slot, _) => **slot = Some(NativeQueuedInputGrant { pin }),
         }
         state.advance_progress_revision();
         source.take()
@@ -337,12 +518,137 @@ fn adopt_in(
     Ok(WorkloadProgressNotification::new(inner))
 }
 
+/// Original action custody. Its protocol aliases retain the same physical
+/// vector through the actual source/body/upload-frame exit; reply aliases do
+/// not retain this position. No alias can release individual coordinates.
+#[must_use]
+pub struct NativeAsyncActionGrant {
+    pin: OriginalPin,
+}
+impl NativeAsyncActionGrant {
+    pub fn retain_protocol_tail(&self) -> Result<ExistingOwnerRetentionLease, RetentionPinError> {
+        let mut pin = self.pin.try_clone()?;
+        let key = pin.key.take().ok_or(RetentionPinError::Released)?;
+        Ok(ExistingOwnerRetentionLease::from_existing_pin(
+            Arc::clone(&pin.inner) as Arc<dyn RetentionOwner>,
+            key,
+        ))
+    }
+}
+pub(super) fn adopt_native_action_in(
+    scope: &WorkScope,
+    fence: &NativeActionFence,
+    source: &mut Option<JointClaim>,
+    target: &mut Option<NativeAsyncActionGrant>,
+) -> Result<WorkloadProgressNotification, WorkError> {
+    adopt_in(scope, source, Target::NativeAction(target, fence))
+}
+
+/// Closed Native response custody, distinct from generic retained payload.
+/// The same original record pays the canonical receipt cells until their final
+/// actual backing alias exits; no CPU, I/O or physical queue survives here.
+#[must_use = "Keep this original pin in the canonical reply backing"]
+pub struct NativeReplyGrant {
+    pin: OriginalPin,
+}
+impl NativeReplyGrant {
+    pub fn reply_records(&self) -> Result<u64, WorkError> {
+        let key = self.pin.key.ok_or(WorkError::Released)?;
+        let state = self.pin.inner.state.lock().unwrap();
+        let row = state
+            .joint
+            .as_ref()
+            .and_then(|ledger| ledger.claims.get(&key[0]))
+            .ok_or(WorkError::Released)?;
+        if !matches!(row.custody, ClaimCustody::NativeReply { epoch, pins } if epoch == key[1] && pins != 0)
+        {
+            return Err(WorkError::Conflict);
+        }
+        Ok(row.active_amounts.get(JointResource::ReplyRecords))
+    }
+
+    pub fn capacity_bytes(&self) -> Result<u64, RetentionPinError> {
+        payload_capacity(
+            &self.pin.inner,
+            self.pin.key.ok_or(RetentionPinError::Released)?,
+        )
+    }
+}
+
+pub(super) fn adopt_native_reply_in(
+    scope: &WorkScope,
+    fence: &NativeActionFence,
+    source: &mut Option<JointClaim>,
+    target: &mut Option<NativeReplyGrant>,
+) -> Result<WorkloadProgressNotification, WorkError> {
+    adopt_in(scope, source, Target::NativeReply(target, fence))
+}
+pub(super) fn adopt_native_input_in(
+    scope: &WorkScope,
+    fence: &NativeActionFence,
+    source: &mut Option<JointClaim>,
+    target: &mut Option<NativeQueuedInputGrant>,
+) -> Result<WorkloadProgressNotification, WorkError> {
+    adopt_in(scope, source, Target::NativeInput(target, fence))
+}
+/// One original Native input, before dispatcher/physical publication.
+/// The unique queue holder explicitly retires its one queue record only after
+/// actual removal/transport exit. Independent immutable payload aliases retain
+/// the original paid bytes; they cannot release the queue or mint another job.
+#[must_use]
+pub struct NativeQueuedInputGrant {
+    pin: OriginalPin,
+}
+impl NativeQueuedInputGrant {
+    pub fn retain_payload(&self) -> Result<ExistingOwnerRetentionLease, RetentionPinError> {
+        let mut pin = self.pin.try_clone()?;
+        let key = pin.key.take().ok_or(RetentionPinError::Released)?;
+        Ok(ExistingOwnerRetentionLease::from_existing_pin(
+            Arc::clone(&pin.inner) as Arc<dyn RetentionOwner>,
+            key,
+        ))
+    }
+    /// Original Native queue author only, after the same process permit and
+    /// queued/actual send input have genuinely exited. This does not release
+    /// payload aliases and does not certify remote mutation settlement.
+    pub fn queue_exited_in(&self) -> Result<WorkloadProgressNotification, WorkError> {
+        let key = self.pin.key.ok_or(WorkError::Released)?;
+        self.pin.inner.update_facts_silent(|state|{
+            let ledger=state.joint.as_mut().ok_or(WorkError::NotReady)?;
+            let row=ledger.claims.get_mut(&key[0]).ok_or(WorkError::Released)?;
+            if !matches!(row.custody,ClaimCustody::NativeInput{epoch,pins,queued:true} if epoch==key[1]&&pins!=0)
+                ||row.pending.is_some()||row.amounts!=row.active_amounts||row.facts.key!=row.active_facts.key{
+                return Err(WorkError::Conflict)
+            }
+            let revision=row.release_revision.checked_add(1).ok_or(WorkError::ArithmeticOverflow)?;
+            let released=JointResources::ZERO.with(JointResource::QueueRecords,1);
+            let charged=row.amounts.checked_sub(released)?;
+            let active=row.active_amounts.checked_sub(released)?;
+            let profile=ledger.profiles.get_mut(&row.facts.key).ok_or(WorkError::Released)?;
+            let total=profile.amounts.checked_sub(released)?;
+            profile.amounts=total;row.amounts=charged;row.active_amounts=active;row.release_revision=revision;
+            let ClaimCustody::NativeInput{queued,..}=&mut row.custody else{unreachable!()};*queued=false;
+            ledger.released();Ok(())
+        })?;
+        Ok(WorkloadProgressNotification::new(Arc::clone(
+            &self.pin.inner,
+        )))
+    }
+}
+
 /// A payload-only original paid record. Its inline pin allocates no holder.
 #[must_use = "Keep original payload custody through actual backing exit"]
 pub struct RetainedPayloadGrant {
     pin: OriginalPin,
 }
 impl RetainedPayloadGrant {
+    /// Inspect the same paid envelope without minting or retaining an alias.
+    pub fn capacity_bytes(&self) -> Result<u64, RetentionPinError> {
+        payload_capacity(
+            &self.pin.inner,
+            self.pin.key.ok_or(RetentionPinError::Released)?,
+        )
+    }
     /// Inspect the original paid record without retaining or notifying.
     pub fn is_for_scope(&self, scope: &WorkScope) -> bool {
         self.pin.is_for_scope(scope)
@@ -372,6 +678,9 @@ pub struct RetainedPayloadAlias {
     pin: OriginalPin,
 }
 impl RetainedPayloadAlias {
+    pub(crate) fn native_source_key(&self) -> Result<[u64; 2], WorkError> {
+        self.pin.key.ok_or(WorkError::Released)
+    }
     pub fn try_clone(&self) -> Result<Self, RetentionPinError> {
         Ok(Self {
             pin: self.pin.try_clone()?,
@@ -543,3 +852,24 @@ pub use unreceived::{
     UnreceivedProductionAdmission, UnreceivedProductionGrant, UnreceivedProductionOwner,
     UnreceivedProductionQuote, UnreceivedProductionReady,
 };
+
+pub(crate) fn validate_native_payload_fence(
+    state: &State,
+    root: WorkId,
+    key: [u64; 2],
+) -> Result<(), WorkError> {
+    let row = state
+        .joint
+        .as_ref()
+        .and_then(|ledger| ledger.claims.get(&key[0]))
+        .ok_or(WorkError::Released)?;
+    if row.owner != ClaimOwner::PhysicalWork(root)
+        || !matches!(row.custody, ClaimCustody::Payload { epoch, pins } if epoch == key[1] && pins != 0)
+        || row.pending.is_some()
+        || row.amounts != row.active_amounts
+        || row.facts.key != row.active_facts.key
+    {
+        return Err(WorkError::Conflict);
+    }
+    Ok(())
+}

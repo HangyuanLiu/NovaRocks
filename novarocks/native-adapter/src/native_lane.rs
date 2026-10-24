@@ -30,6 +30,10 @@
 //!
 //! Design: ADR-0170 (docs/adr/ADR-0170-third-party-crates-are-bounded-by-public-configuration-not-forked.md)
 
+mod request_custody;
+use request_custody::StreamCustody;
+pub use request_custody::{NativeRequestCustody, native_request_custody_layouts};
+
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -297,13 +301,22 @@ impl Drop for NativeLaneStreamPermit {
 /// A response body that holds its stream position until its public exit:
 /// the end of stream, an error (including a reset), or this wrapper's drop.
 pub struct NativeLaneStreamBody {
-    inner: BoxBody,
-    permit: Option<NativeLaneStreamPermit>,
+    inner: Option<BoxBody>,
+    permit: Option<StreamCustody>,
 }
 
 impl NativeLaneStreamBody {
     pub fn new(inner: BoxBody, permit: Option<NativeLaneStreamPermit>) -> Self {
-        Self { inner, permit }
+        Self {
+            inner: Some(inner),
+            permit: permit.map(StreamCustody::Direct),
+        }
+    }
+    fn boxed_with_custody(inner: BoxBody, permit: Option<StreamCustody>) -> BoxBody {
+        tonic::body::boxed(Self {
+            inner: Some(inner),
+            permit,
+        })
     }
 
     /// Box the wrapper as the Tonic body type, so the transport's response
@@ -324,21 +337,43 @@ impl HttpBody for NativeLaneStreamBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let polled = Pin::new(&mut self.inner).poll_frame(cx);
+        let polled = Pin::new(self.inner.as_mut().expect("original response body")).poll_frame(cx);
         if matches!(polled, Poll::Ready(None | Some(Err(_)))) {
-            // End of stream or error: the stream has exited.
-            drop(self.permit.take());
+            // Legacy observers retain their original public-body semantics.
+            // Paid calls retain the same source through actual inner Drop;
+            // outgoing Bytes aliases independently keep their same tail.
+            if matches!(self.permit, Some(StreamCustody::Direct(_))) {
+                drop(self.permit.take());
+            }
         }
         polled
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.inner.as_ref().is_none_or(HttpBody::is_end_stream)
     }
 
     fn size_hint(&self) -> hyper::body::SizeHint {
-        self.inner.size_hint()
+        self.inner
+            .as_ref()
+            .map_or_else(Default::default, HttpBody::size_hint)
     }
+}
+impl Drop for NativeLaneStreamBody {
+    fn drop(&mut self) {
+        let inner = self.inner.take();
+        if let Err(cause) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(inner))) {
+            std::panic::resume_unwind(Box::new(NativeStreamDropFailure {
+                _cause: cause,
+                _custody: self.permit.take(),
+            }));
+        }
+        drop(self.permit.take());
+    }
+}
+struct NativeStreamDropFailure {
+    _cause: Box<dyn std::any::Any + Send>,
+    _custody: Option<StreamCustody>,
 }
 
 /// One outgoing connection owner: a Tonic `Channel` over exactly one admitted
@@ -461,7 +496,7 @@ impl Service<hyper::http::Request<BoxBody>> for NativeLaneChannel {
         Service::poll_ready(&mut self.channel, cx).map_err(Into::into)
     }
 
-    fn call(&mut self, request: hyper::http::Request<BoxBody>) -> Self::Future {
+    fn call(&mut self, mut request: hyper::http::Request<BoxBody>) -> Self::Future {
         let Some(reserved) = self.reserved.take() else {
             return Box::pin(async { Err("native lane request was not ready".into()) });
         };
@@ -480,9 +515,10 @@ impl Service<hyper::http::Request<BoxBody>> for NativeLaneChannel {
             }
         };
         let permit = self.gate.permit_with_exit(reserved, outgoing_exit);
+        let permit = StreamCustody::install(permit, &mut request);
         let response = Service::call(&mut self.channel, request);
         Box::pin(NativeLaneResponseFuture {
-            inner: response,
+            inner: Some(response),
             permit: Some(permit),
         })
     }
@@ -491,27 +527,48 @@ impl Service<hyper::http::Request<BoxBody>> for NativeLaneChannel {
 // The actual response future drops before the original stream holder if a
 // caller abandons it. Headers hand that holder to the original response body.
 struct NativeLaneResponseFuture {
-    inner: <Channel as Service<hyper::http::Request<BoxBody>>>::Future,
-    permit: Option<NativeLaneStreamPermit>,
+    inner: Option<<Channel as Service<hyper::http::Request<BoxBody>>>::Future>,
+    permit: Option<StreamCustody>,
 }
 
 impl Future for NativeLaneResponseFuture {
     type Output = Result<hyper::http::Response<BoxBody>, StdError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match Pin::new(&mut self.inner).poll(cx) {
+        match Pin::new(
+            self.inner
+                .as_mut()
+                .expect("original Native response future"),
+        )
+        .poll(cx)
+        {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(response)) => {
                 let permit = self.permit.take();
                 Poll::Ready(Ok(
-                    response.map(|body| NativeLaneStreamBody::boxed(body, permit))
+                    response.map(|body| NativeLaneStreamBody::boxed_with_custody(body, permit))
                 ))
             }
             Poll::Ready(Err(error)) => {
-                drop(self.permit.take());
+                if matches!(self.permit, Some(StreamCustody::Direct(_))) {
+                    drop(self.permit.take());
+                }
                 Poll::Ready(Err(error.into()))
             }
         }
+    }
+}
+
+impl Drop for NativeLaneResponseFuture {
+    fn drop(&mut self) {
+        let inner = self.inner.take();
+        if let Err(cause) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(inner))) {
+            std::panic::resume_unwind(Box::new(NativeStreamDropFailure {
+                _cause: cause,
+                _custody: self.permit.take(),
+            }));
+        }
+        drop(self.permit.take());
     }
 }
 

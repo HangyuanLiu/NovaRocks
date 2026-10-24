@@ -96,7 +96,15 @@ impl MetadataMaintenanceAction {
             self.started = true;
         }
         if self.result.is_none() {
-            match self.call.poll_result(cx) {
+            let execution = match owner.execution_owner_slot().as_ref() {
+                Some(execution) => execution,
+                None => {
+                    return Poll::Ready(Err(internal_error(
+                        "metadata source lost its original execution owner",
+                    )));
+                }
+            };
+            match self.call.poll_result(execution, cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(result) => self.result = Some(result),
             }
@@ -157,6 +165,12 @@ impl MetadataMaintenanceAction {
 }
 
 impl GovernedStatementAction for MetadataMaintenanceAction {
+    fn local_health_failure(
+        &self,
+    ) -> Option<novarocks_query_application::api::StatementNativeHealthFailure> {
+        self.call.local_health_failure()
+    }
+
     fn publication_disposition(
         &self,
     ) -> Option<novarocks_spi::connector::LakePublicationDisposition> {

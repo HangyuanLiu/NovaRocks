@@ -34,6 +34,7 @@ mod error;
 mod execution;
 mod handle;
 mod identity;
+mod io_admission;
 mod listing;
 mod metadata;
 mod metadata_maintenance;
@@ -178,6 +179,12 @@ pub use handle::{
 pub use identity::{
     ConnectorIdentityError, ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
 };
+pub use io_admission::{
+    ConnectorIoAdmissionPort, ConnectorIoCleanupFuture, ConnectorIoPermit,
+    ConnectorIoProgressSource, ConnectorIoRequest, ConnectorIoRequestSource,
+    ConnectorIoStreamCustody, ConnectorIoWeakPhase, HdfsServiceOrigin, NetworkServiceOrigin,
+    SharedDependency,
+};
 pub use listing::{ConnectorListingBound, ConnectorListingBudget, ConnectorListingCollector};
 pub use metadata::{
     CONNECTOR_FIELD_HIDDEN_FROM_SQL, CONNECTOR_MV_APPLY_KEY_COLUMN_PROPERTY,
@@ -207,12 +214,12 @@ pub use metadata_maintenance::{
     ConnectorMaxCompactableDataFilesRequest, ConnectorMetadataMaintenance,
     ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenanceExecution,
     ConnectorMetadataMaintenanceExecutionSource, ConnectorMetadataMaintenanceFuture,
-    ConnectorMetadataMaintenanceLease, ConnectorMetadataMaintenanceOperation,
-    ConnectorMetadataMaintenanceOutcome, ConnectorMetadataMaintenancePlan,
-    ConnectorMetadataMaintenancePlanSummary, ConnectorMetadataMaintenancePlanningRequest,
-    ConnectorMetadataMaintenanceReceipt, ConnectorMetadataMaintenanceReceiptSummary,
-    ConnectorMetadataMaintenanceResolver, EXPIRE_TABLE_VERSIONS_KIND,
-    MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES,
+    ConnectorMetadataMaintenanceIoProfile, ConnectorMetadataMaintenanceLease,
+    ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenanceOutcome,
+    ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenancePlanSummary,
+    ConnectorMetadataMaintenancePlanningRequest, ConnectorMetadataMaintenanceReceipt,
+    ConnectorMetadataMaintenanceReceiptSummary, ConnectorMetadataMaintenanceResolver,
+    EXPIRE_TABLE_VERSIONS_KIND, MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES,
     MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES, REWRITE_METADATA_LAYOUT_KIND,
 };
 pub use mutation::{

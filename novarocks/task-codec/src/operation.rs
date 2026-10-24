@@ -1814,6 +1814,23 @@ pub fn decode_release_ack(
     })
 }
 
+/// Decode the original owned Release body without cloning its generated
+/// terminal graph. The existing borrowed decoder remains a pure projection.
+pub fn decode_release_ack_owned(
+    mut src: novarocks::ReleaseQueryContextAck,
+    path: FieldPath,
+) -> Result<DecodedReleaseAck, ProtocolError> {
+    let telemetry = src.runtime_filter.take();
+    let mut decoded = decode_release_ack(&src, path.clone())?;
+    decoded.runtime_filter = telemetry.map(|raw| {
+        QueryTerminalProfileContributionTelemetry::parse(raw).map_err(|error| invalid(
+            path.clone().field("runtime_filter"),
+            format!("a release acknowledgement carries an invalid runtime-filter contribution: {error}"),
+        ))
+    }).transpose()?;
+    Ok(decoded)
+}
+
 /// Encodes a cancel reason back onto the wire, for a receipt or a status.
 pub fn encode_cancel_reason_field(
     value: novarocks_execution_contract::task_execution::status::CancelReason,

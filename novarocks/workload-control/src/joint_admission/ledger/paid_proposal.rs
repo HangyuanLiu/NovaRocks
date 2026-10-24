@@ -22,9 +22,22 @@ use super::*;
 use crate::scope::ReclaimWakeOnExit;
 
 use novarocks_resource_contract::SelectedNetworkOrigin;
+mod async_action;
+mod control_action;
+pub use async_action::{
+    AsyncActionAdmission, AsyncActionGrant, AsyncActionSource, RootPayloadInitialAdmission,
+};
+pub(super) mod native_action;
+pub(super) use native_action::{NativeActionFence, validate_native_action};
+pub use native_action::{
+    NativeAsyncActionAdmission, NativeAsyncActionAuthority, NativeAsyncActionQuote,
+    NativeAsyncActionSource, NativeQueuedInputAdmission, NativeQueuedInputQuote,
+    NativeQueuedInputReady,
+};
+pub(crate) use native_action::{capture_native_action, delegate_native_actions};
 mod blocking_action;
 pub use blocking_action::{BlockingActionAdmission, BlockingActionSource};
-pub(super) use blocking_action::{BlockingActionFence, validate_blocking_action};
+pub(super) use control_action::{ControlActionFence, validate_control_action};
 mod cpu_action;
 pub(super) use cpu_action::{CpuActionFence, capture as capture_cpu_action, validate_cpu_action};
 pub use cpu_action::{
@@ -33,6 +46,11 @@ pub use cpu_action::{
 };
 mod production_growth;
 pub(super) use production_growth::{production_change_count, validate_control_productions};
+mod root_payload;
+pub use root_payload::{
+    RootPayloadAdmission, RootPayloadProposal, RootPayloadReady, RootPayloadSource,
+};
+pub(super) use root_payload::{RootPayloadFence, validate_root_payload};
 mod root_stage;
 pub(super) use root_stage::validate_root_stage;
 pub use root_stage::{RootStageAdmission, RootStageProposal, RootStageReady, RootStageSource};
@@ -50,7 +68,7 @@ impl DependencyInput<'_> {
             (Self::Selected(selected), SharedDependency::Network(fact)) => {
                 fact.matches_selected(*selected)
             }
-            (Self::Selected(_), SharedDependency::LocalHost) => false,
+            (Self::Selected(_), SharedDependency::LocalHost | SharedDependency::Hdfs(_)) => false,
         }
     }
     fn into_owned(self) -> SharedDependency {
@@ -105,8 +123,10 @@ fn track_dependency_union(
 #[must_use = "A proposal must be submitted or dropped"]
 pub struct JointProposal {
     root_stage: Option<RootStageFence>,
+    root_payload: Option<RootPayloadFence>,
     cpu_action: Option<CpuActionFence>,
-    blocking_action: Option<BlockingActionFence>,
+    control_action: Option<ControlActionFence>,
+    native_action: Option<NativeActionFence>,
     records: Vec<ChangeRecord>,
     // The complete source union, shared by every change in this one paid
     // request. Ordinals grant no access and retain no canonical fact alias.
@@ -149,8 +169,10 @@ impl JointAdmissionHandle {
         };
         let mut proposal = JointProposal {
             root_stage: None,
+            root_payload: None,
             cpu_action: None,
-            blocking_action: None,
+            control_action: None,
+            native_action: None,
             records: Vec::new(),
             dependency_union: Vec::new(),
             current: None,
@@ -539,8 +561,10 @@ impl JointProposal {
             handle.queue_request_mode(
                 PreparedRequest {
                     root_stage: self.root_stage,
+                    root_payload: self.root_payload,
                     cpu_action: self.cpu_action,
-                    blocking_action: self.blocking_action,
+                    control_action: self.control_action,
+                    native_action: self.native_action.take(),
                     budget: RequestBudget::Finite { remaining: limit },
                     changes,
                     custody: self.custody.take(),

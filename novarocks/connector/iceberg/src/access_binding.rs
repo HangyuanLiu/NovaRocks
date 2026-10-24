@@ -630,6 +630,82 @@ impl IcebergReadBinding {
             .map_err(|error| format!("parse Iceberg output location: {error}"))
     }
 
+    /// Borrow the original endpoint selection before any credential loader or
+    /// operator is constructed. Bucket/user/path never define an HTTP domain.
+    pub(crate) fn selected_io_dependency(
+        &self,
+        location: &str,
+    ) -> Result<novarocks_spi::connector::SharedDependency, ConnectorError> {
+        let endpoint = match self.storage_access.as_ref() {
+            Some(IcebergStorageAccess::StaticObjectStore {
+                endpoint_config, ..
+            })
+            | Some(IcebergStorageAccess::VendedObjectStore {
+                endpoint_config, ..
+            }) => Some(endpoint_config),
+            _ => None,
+        };
+        self.resources
+            .access_resolver()
+            .selected_dependency(location, endpoint)
+            .map_err(file_error)
+    }
+
+    /// Same explicit binding and pool, awaited directly by metadata I/O.
+    pub(crate) async fn resolve_access_for_request_async(
+        &self,
+        location: &str,
+    ) -> Result<FsAccessHandle, ConnectorError> {
+        let Some(request) = self.request_context.as_ref() else {
+            return self.resolve_access(location);
+        };
+        let (domain, locations, access) = self.access_resolution(std::iter::once(location))?;
+        let cancellation = novarocks_fs::FileCancellation::from_connector_request(request);
+        self.resources
+            .access_resolver()
+            .resolve_locations_async(domain, locations, access, &cancellation)
+            .await
+            .map(|access| access.with_request_context(request.clone()))
+            .map_err(file_error)
+    }
+    pub(crate) async fn admit_owned_stream(
+        &self,
+        location: &str,
+    ) -> Result<Option<novarocks_spi::connector::ConnectorIoPermit>, ConnectorError> {
+        match self.request_context.as_ref() {
+            Some(request) => {
+                request
+                    .admit_selected_io(self.selected_io_dependency(location)?)
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn admit_non_http_io(
+        &self,
+        location: &str,
+    ) -> Result<Option<novarocks_spi::connector::ConnectorIoPermit>, ConnectorError> {
+        let Some(request) = self.request_context.as_ref() else {
+            return Ok(None);
+        };
+        if self
+            .resources
+            .access_resolver()
+            .parse_location(location)
+            .map_err(file_error)?
+            .scheme()
+            == FsScheme::ObjectStore
+        {
+            // The S3 signer admits the actual SDK-selected request before
+            // credential acquisition, and retains it in the real response.
+            return Ok(None);
+        }
+        request
+            .admit_selected_io(self.selected_io_dependency(location)?)
+            .await
+    }
+
     pub fn resolve_access(&self, location: &str) -> Result<FsAccessHandle, ConnectorError> {
         self.resolve_access_for_locations(std::iter::once(location))
     }
@@ -667,6 +743,10 @@ impl IcebergReadBinding {
             .access_resolver()
             .resolve_locations_async(access_domain, locations, object_store_access, &cancellation)
             .await
+            .map(|access| match self.request_context.as_ref() {
+                Some(request) => access.with_request_context(request.clone()),
+                None => access,
+            })
             .map_err(file_error)
     }
 

@@ -138,6 +138,17 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
             .as_ref()
             .map(|owner| owner.enter(novarocks_spi::connector::CatalogActivityPhase::Evidence));
         self.mark_dispatch_start(entry_ref);
+        // The journal has entered its original non-abortable evidence interval;
+        // subsequent real requests continue as existing Settlement obligations.
+        preparation
+            .publication_obligation_started()
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Original publication I/O source is unavailable",
+                )
+                .with_source(error)
+            })?;
         // No statement cancellation branch may drop a dispatched mutation.
         let completion = dispatch.dispatch_once(evidence_context).await;
         // This is deliberately the first statement after adapter return.

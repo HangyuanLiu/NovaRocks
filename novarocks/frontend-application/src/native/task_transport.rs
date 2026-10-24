@@ -47,6 +47,7 @@ use std::fmt;
 use std::future::Future;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 
 use once_cell::sync::Lazy;
@@ -121,6 +122,12 @@ fn covered_reconnect_backoff(failures: u32, jitter_sample: u64) -> Duration {
     let percent = 80 + jitter_sample % 41;
     Duration::from_millis(base_ms * percent / 100)
 }
+
+mod joint_action;
+use joint_action::NativeCallSource;
+pub(crate) use joint_action::{NativeBatchAdmission, NativePhysicalOffer};
+mod queue_input;
+pub(crate) use queue_input::{queued_creation_quote, queued_intent_quote, queued_update_quote};
 
 // ---------------------------------------------------------------------------
 // The codec content a neutral intent cannot carry
@@ -458,32 +465,57 @@ fn decode_ack(
         ) => {
             let decoded =
                 codec::decode_release_ack(ack, path()).map_err(|error| error.to_string())?;
-            let acked = decoded.context;
-            let cause = decoded.termination_cause;
-            if acked != context {
-                return Err(
-                    "a release acknowledgement names a different context than the request"
-                        .to_owned(),
-                );
-            }
-            if let Some(cause) = cause {
-                // A release that answers on a terminated context reports why.
-                tracing::info!(
-                    %context,
-                    ?cause,
-                    "release acknowledgement reports a termination cause"
-                );
-            }
-            Ok(AckPayload::Release {
-                receipt: QueryContextReceipt::new(acked, decoded.state),
-                outcome: decoded.outcome,
-                runtime_filter: decoded.runtime_filter,
-            })
+            release_payload(decoded, context)
         }
+
         (kind, _, _) => Err(format!(
             "an applied {kind} carries an acknowledgement body of another kind"
         )),
     }
+}
+
+fn release_payload(
+    decoded: codec::DecodedReleaseAck,
+    context: QueryContextRef,
+) -> Result<AckPayload, String> {
+    if decoded.context != context {
+        return Err(
+            "a release acknowledgement names a different context than the request".to_owned(),
+        );
+    }
+    if let Some(cause) = decoded.termination_cause {
+        tracing::info!(%context, ?cause, "release acknowledgement reports a termination cause");
+    }
+    Ok(AckPayload::Release {
+        receipt: QueryContextReceipt::new(decoded.context, decoded.state),
+        outcome: decoded.outcome,
+        runtime_filter: decoded.runtime_filter,
+    })
+}
+fn decode_ack_owned(
+    kind: OperationKind,
+    address: AckAddress,
+    receipt: proto::TaskOperationReceipt,
+) -> Result<AckPayload, String> {
+    if let (OperationKind::ReleaseQueryContext, AckAddress::Context(context)) = (kind, address) {
+        let Some(proto::task_operation_receipt::Result::Verdict(verdict)) = receipt.result else {
+            return Err(format!(
+                "{kind} requires a protocol verdict acknowledgement"
+            ));
+        };
+        let Some(proto::task_operation_verdict::Ack::ReleaseQueryContext(ack)) = verdict.ack else {
+            return Err(format!(
+                "an applied {kind} carries an acknowledgement body of another kind"
+            ));
+        };
+        let decoded = codec::decode_release_ack_owned(
+            ack,
+            FieldPath::root("apply_task_operations").field("receipts"),
+        )
+        .map_err(|error| error.to_string())?;
+        return release_payload(decoded, context);
+    }
+    decode_ack(kind, address, &receipt)
 }
 
 // ---------------------------------------------------------------------------
@@ -619,9 +651,9 @@ impl TaskAckIntake {
 fn classify_apply_status(status: &tonic::Status) -> OperationDispatchResult {
     if novarocks_native_adapter::native_codec::is_operation_reply_preflight_failure(status) {
         // A reply arrived but its generated tree exceeded the original reply
-        // grammar. Match the existing unusable-response verdict: this is not
-        // evidence of a remote pre-admission refusal and must not be retried.
-        return worker_result(OperationOutcome::InvalidStateOrRequest);
+        // grammar. This is a local refusal, never a Worker verdict or proof
+        // of no remote effect. It must not authorize another dispatch.
+        return OperationDispatchResult::NonWorkerRejected;
     }
     match status.code() {
         tonic::Code::Unavailable
@@ -793,6 +825,7 @@ pub(crate) struct NativeTaskOperationSink {
     acks: TaskAckIntakeHandle,
     data_runtime: FrontendDataRuntime,
     transport_waiter: NativeTransportWaiter,
+    authority: novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
 }
 
 impl fmt::Debug for NativeTaskOperationSink {
@@ -811,6 +844,7 @@ impl NativeTaskOperationSink {
         attempt: AttemptWireFacts,
         acks: TaskAckIntakeHandle,
         data_runtime: FrontendDataRuntime,
+        authority: novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
     ) -> Result<Self, NativeTaskTransportCreationError> {
         if !data_runtime
             .task_transport_supervisor()
@@ -828,6 +862,7 @@ impl NativeTaskOperationSink {
             acks,
             data_runtime,
             transport_waiter,
+            authority,
         })
     }
 
@@ -865,29 +900,12 @@ impl TaskOperationSink for NativeTaskOperationSink {
     fn try_reserve_queue(
         &self,
         request: crate::task_execution::intent::TaskOperationQueueRequest,
+        preparation: &mut crate::task_execution::intent::TaskOperationQueuePreparation,
     ) -> TaskOperationQueueAdmission {
-        let lane = if request.requires_control_progress() {
-            NativeTransportLane::Control
-        } else {
-            NativeTransportLane::Ordinary
-        };
-        match self
-            .data_runtime
-            .task_transport_supervisor()
-            .try_reserve_queue(
-                &self.transport_waiter,
-                request.backend_process_id(),
-                lane,
-                1,
-                request.queued_bytes(),
-            ) {
-            Ok(permit) => TaskOperationQueueAdmission::Admitted(Box::new(permit)),
-            Err(NativeTransportBackpressure::Target) => TaskOperationQueueAdmission::TargetFull,
-            Err(NativeTransportBackpressure::Process) => TaskOperationQueueAdmission::ProcessFull,
-        }
+        self.reserve_paid_queue_in(request, preparation)
     }
 
-    fn try_submit(&self, batch: DispatchBatch) -> TaskOperationSubmit {
+    fn try_submit(&self, mut batch: DispatchBatch) -> TaskOperationSubmit {
         let backend = batch.backend();
         let Some(target) = self.targets.get(&backend) else {
             // The batch addresses a process this attempt never froze, so no
@@ -940,35 +958,22 @@ impl TaskOperationSink for NativeTaskOperationSink {
                 return TaskOperationSubmit::Accepted;
             }
         };
-        // The original batch still holds its exact process-item grants. Reserve
-        // only fixed bookkeeping custody BEFORE constructing any Native F.
-        let original_slot = match self
-            .data_runtime
-            .apply_send_port()
-            .reserve_original_slot(batch.operations().len())
-        {
-            Ok(slot) => slot,
-            Err(failure) => {
-                return TaskOperationSubmit::Rejected {
-                    batch,
-                    reason: failure.to_string(),
-                };
-            }
-        };
         let target = target.clone();
-        let supervisor_lane = supervisor_lane(&batch);
-        let mut encoding_permit = match self
-            .data_runtime
-            .task_transport_supervisor()
-            .try_reserve_encoding(&self.transport_waiter, backend, supervisor_lane)
-        {
-            Ok(permit) => permit,
-            Err(_) => {
-                drop(original_slot);
-                return TaskOperationSubmit::Backpressured(batch);
+        let joint_action = match self.admit_original_batch(&mut batch, &target.client) {
+            Ok(Some(action)) => action,
+            Ok(None) => return TaskOperationSubmit::Backpressured(batch),
+            Err(joint_action::NativeAdmissionFailure::Governance(error)) => {
+                return TaskOperationSubmit::AdmissionFailed { batch, error };
+            }
+            Err(joint_action::NativeAdmissionFailure::Unsent(reason)) => {
+                return TaskOperationSubmit::Rejected { batch, reason };
             }
         };
-
+        let joint_action::AcceptedNativeAction {
+            slot: original_slot,
+            publisher,
+            notifications,
+        } = joint_action;
         let mut operations = Vec::with_capacity(input.items());
         let mut sent = Vec::with_capacity(input.items());
         let mut unencodable = Vec::with_capacity(input.items());
@@ -1039,7 +1044,9 @@ impl TaskOperationSink for NativeTaskOperationSink {
             }
         };
         let encoded_bytes = requests.iter().map(EncodedMethodBatch::encoded_len).sum();
-        encoding_permit.shrink_to(encoded_bytes);
+        original_slot
+            .shrink_native_encoding(encoded_bytes)
+            .expect("original paid encoding source remains installed");
         settle_unencodable(self, unencodable);
         observe_batch(batch.lane(), items, encoded_bytes);
         let queue_permits = batch.commit_queue_permits();
@@ -1052,9 +1059,25 @@ impl TaskOperationSink for NativeTaskOperationSink {
         // A submission never blocks on a round trip: the batch leaves on the
         // role's runtime and its receipts come back through the intake, which
         // is what lets the frontend keep one serial runner.
+        let action_tail = publisher
+            .protocol_tail()
+            .expect("installed original Native action tail");
+        let mut physical = original_slot
+            .take_native_physical()
+            .expect("original physical source transfers once to final commit");
+        let encoding_permit = physical
+            .encoding
+            .take()
+            .expect("same original encoding reservation");
         let send = ApplySend {
             client,
-            receipts: AcceptedOperationReceipts::new(acks, sent),
+            receipts: AcceptedOperationReceipts::new_canonical(acks, sent, publisher),
+            physical: physical.call.take(),
+            action_tail: Some(action_tail),
+            reply_plan:
+                novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_transport(
+                    self.transport,
+                ),
         };
         let reservations = ApplyReservations::new(queue_permits, encoding_permit);
         // The pure async constructor does not poll user code. Once committed,
@@ -1068,6 +1091,11 @@ impl TaskOperationSink for NativeTaskOperationSink {
             OriginalDisposition::SpawnUnjoinable => {
                 tracing::error!("Native Apply spawn unwound without an original join handle")
             }
+        }
+        // The same original slot now owns the actual F and its physical
+        // source. A callback unwind cannot drop the only accepted authority.
+        for notification in notifications {
+            notification.notify()
         }
         TaskOperationSubmit::Accepted
     }
@@ -1219,6 +1247,9 @@ fn settle_unencodable(
 struct ApplySend {
     client: Client,
     receipts: AcceptedOperationReceipts,
+    physical: Option<NativeCallSource>,
+    action_tail: Option<novarocks_resource_contract::ExistingOwnerRetentionLease>,
+    reply_plan: novarocks_task_codec::resource_preflight::OperationReplyDecodePlan,
 }
 
 /// First-wins settlement for every operation an accepted send owns.
@@ -1231,6 +1262,7 @@ struct ApplySend {
 struct AcceptedOperationReceipts {
     acks: TaskAckIntakeHandle,
     pending: VecDeque<SentOperation>,
+    canonical: Option<super::apply_send_owner::OriginalReplyPublisher>,
 }
 
 impl AcceptedOperationReceipts {
@@ -1238,7 +1270,26 @@ impl AcceptedOperationReceipts {
         Self {
             acks,
             pending: sent.into(),
+            canonical: None,
         }
+    }
+    fn new_canonical(
+        acks: TaskAckIntakeHandle,
+        sent: Vec<SentOperation>,
+        canonical: super::apply_send_owner::OriginalReplyPublisher,
+    ) -> Self {
+        Self {
+            acks,
+            pending: sent.into(),
+            canonical: Some(canonical),
+        }
+    }
+    fn publish_canonical(&self, ack: OperationAcknowledgement) {
+        let ack = match &self.canonical {
+            Some(publisher) => publisher.canonicalize(ack),
+            None => ack,
+        };
+        self.acks.publish(ack);
     }
 
     fn prefix_ids(&self, count: usize) -> Vec<TaskOperationId> {
@@ -1287,19 +1338,18 @@ impl AcceptedOperationReceipts {
             ack.operation_id(),
             "an accepted response must settle the request at the queue head"
         );
-        self.acks.publish(ack);
+        self.publish_canonical(ack);
     }
 
     fn publish_uniform(&mut self, result: OperationDispatchResult) {
         while let Some(item) = self.pending.pop_front() {
             observe_dispatch_result(item.kind, item.lease_renewal, result);
-            self.acks
-                .publish(OperationAcknowledgement::from_dispatch_result(
-                    item.operation_id,
-                    item.kind,
-                    result,
-                    AckPayload::None,
-                ));
+            self.publish_canonical(OperationAcknowledgement::from_dispatch_result(
+                item.operation_id,
+                item.kind,
+                result,
+                AckPayload::None,
+            ));
         }
     }
 
@@ -1310,13 +1360,12 @@ impl AcceptedOperationReceipts {
                 .pop_front()
                 .expect("accepted batch count cannot exceed pending operations");
             observe_dispatch_result(item.kind, item.lease_renewal, result);
-            self.acks
-                .publish(OperationAcknowledgement::from_dispatch_result(
-                    item.operation_id,
-                    item.kind,
-                    result,
-                    AckPayload::None,
-                ));
+            self.publish_canonical(OperationAcknowledgement::from_dispatch_result(
+                item.operation_id,
+                item.kind,
+                result,
+                AckPayload::None,
+            ));
         }
     }
 }
@@ -1342,12 +1391,15 @@ async fn apply_operations(
     for batch in requests {
         let expires_at = batch.expires_at(submitted_at);
         let establishes = send.receipts.prefix_establishes(batch.items);
-        let response = match send_operations(
+        let response = match send_operations_in(
             &send.client,
             batch.request,
             expires_at,
             &send.receipts.acks,
             &establishes,
+            &mut send.physical,
+            &mut send.action_tail,
+            send.reply_plan,
         )
         .await
         {
@@ -1375,18 +1427,18 @@ async fn apply_operations(
                 observe_refusal(REFUSAL_UNUSABLE_RESPONSE, ids.len());
                 send.receipts.publish_prefix_uniform(
                     batch.items,
-                    worker_result(OperationOutcome::InvalidStateOrRequest),
+                    OperationDispatchResult::NonWorkerRejected,
                 );
                 continue;
             }
         };
 
-        for (header, receipt) in headers.iter().zip(response.receipts.iter()) {
+        for (header, receipt) in headers.iter().zip(response.receipts) {
             let item = send
                 .receipts
                 .front()
                 .expect("validated receipt count matches the accepted request");
-            let ack = acknowledgement(&item, header, receipt);
+            let ack = acknowledgement_owned(&item, header, receipt);
             send.receipts.publish_next(ack);
         }
     }
@@ -1397,6 +1449,24 @@ fn acknowledgement(
     item: &SentOperation,
     header: &ReceiptHeader,
     receipt: &proto::TaskOperationReceipt,
+) -> OperationAcknowledgement {
+    acknowledgement_with(item, header, || {
+        decode_ack(item.kind, item.address, receipt)
+    })
+}
+fn acknowledgement_owned(
+    item: &SentOperation,
+    header: &ReceiptHeader,
+    receipt: proto::TaskOperationReceipt,
+) -> OperationAcknowledgement {
+    acknowledgement_with(item, header, || {
+        decode_ack_owned(item.kind, item.address, receipt)
+    })
+}
+fn acknowledgement_with(
+    item: &SentOperation,
+    header: &ReceiptHeader,
+    decode: impl FnOnce() -> Result<AckPayload, String>,
 ) -> OperationAcknowledgement {
     if let novarocks_execution_contract::operation::OperationResult::DomainFailure {
         outcome,
@@ -1422,7 +1492,7 @@ fn acknowledgement(
         )
         .with_detail(header.detail().cloned());
     }
-    match decode_ack(item.kind, item.address, receipt) {
+    match decode() {
         Ok(payload) => {
             observe_settled(item.kind, item.lease_renewal, outcome);
             OperationAcknowledgement::worker_receipt(item.operation_id, item.kind, outcome, payload)
@@ -1438,15 +1508,15 @@ fn acknowledgement(
                 "task operation receipt has a required but unreadable acknowledgement"
             );
             observe_refusal(REFUSAL_UNUSABLE_ACK, 1);
-            observe_settled(
+            observe_dispatch_result(
                 item.kind,
                 item.lease_renewal,
-                OperationOutcome::InvalidStateOrRequest,
+                OperationDispatchResult::NonWorkerRejected,
             );
-            OperationAcknowledgement::worker_receipt(
+            OperationAcknowledgement::from_dispatch_result(
                 item.operation_id,
                 item.kind,
-                OperationOutcome::InvalidStateOrRequest,
+                OperationDispatchResult::NonWorkerRejected,
                 AckPayload::None,
             )
         }
@@ -1458,6 +1528,142 @@ fn acknowledgement(
 /// The deadline is the shared absolute submit deadline of this run. A batch that
 /// has not answered by then has a genuinely unknown outcome, which is exactly
 /// what the retry rule exists for.
+async fn send_operations_in(
+    client: &Client,
+    request: EncodedMethodRequest,
+    expires_at: tokio::time::Instant,
+    intake: &TaskAckIntakeHandle,
+    establishes: &[(TaskOperationId, QueryContextRef)],
+    selected: &mut Option<NativeCallSource>,
+    action_tail: &mut Option<novarocks_resource_contract::ExistingOwnerRetentionLease>,
+    reply_plan: novarocks_task_codec::resource_preflight::OperationReplyDecodePlan,
+) -> Result<proto::ApplyTaskOperationsResponse, OperationDispatchResult> {
+    let method = match &request {
+        EncodedMethodRequest::Ordinary(_) => NativeRpcMethod::ApplyTaskOperations,
+        EncodedMethodRequest::Control(_) => NativeRpcMethod::ApplyTaskControlOperations,
+    };
+    let source = selected
+        .take()
+        .ok_or(OperationDispatchResult::NonWorkerRejected)?;
+    let (reserved, acquired) = match source {
+        NativeCallSource::Warm { acquired, call } => (call, acquired),
+        NativeCallSource::Cold(handoff) => {
+            let acquired = match handoff {
+                super::transport::NativeDialHandoff::Ready(acquired) => acquired,
+                super::transport::NativeDialHandoff::Reserved(dial) => {
+                    let mut acquired = None;
+                    tokio::time::timeout_at(expires_at, dial.connect_in(&mut acquired))
+                        .await
+                        .map_err(|_| OperationDispatchResult::TransportUnknown)?
+                        .map_err(|error| classify_channel_error(&error))?;
+                    acquired.ok_or(OperationDispatchResult::NonWorkerRejected)?
+                }
+            };
+            // A fresh connection's first local stream/Buffer is attempted once.
+            // No async wait holds an admitted Joint vector for another local
+            // physical position. Refusal proves no Apply was dispatched.
+            let call = std::future::poll_fn(|cx| {
+                Poll::Ready(acquired.channel.select_local_call().try_reserve(cx))
+            })
+            .await;
+            let call = match call {
+                Poll::Ready(Ok(call)) => call,
+                _ => return Err(OperationDispatchResult::NonWorkerRejected),
+            };
+            (call, acquired)
+        }
+    };
+    let mut grpc = client.grpc_for_reserved_call(reserved);
+    let remaining = expires_at.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        // Nothing was submitted, so nothing was applied. It is still reported
+        // as unknown rather than as a rejection, because a caller may only
+        // conclude "not applied" from an answer it received.
+        client.invalidate_channel_if_current(method, &acquired);
+        return Err(OperationDispatchResult::TransportUnknown);
+    }
+    let call = async {
+        match request {
+            EncodedMethodRequest::Ordinary(request) => {
+                let mut wire = tonic::Request::new(request);
+                wire.set_timeout(remaining);
+                wire.extensions_mut().insert(novarocks_native_adapter::native_lane::NativeRequestCustody::from_retained_action(
+                    action_tail.take().expect("one original unary method run retains its action source")));
+                let codec=novarocks_native_adapter::native_codec::NativeProstCodec::with_operation_reply_plan(reply_plan);
+                let rpc = grpc.unary(
+                    wire,
+                    tonic::codegen::http::uri::PathAndQuery::from_static(
+                        "/novarocks.NovaRocksGrpc/ApplyTaskOperations",
+                    ),
+                    codec,
+                );
+                tokio::pin!(rpc);
+                let mut started = false;
+                std::future::poll_fn(|cx| {
+                    let result = rpc.as_mut().poll(cx);
+                    if !started {
+                        started = true;
+                        for &(operation_id, context) in establishes {
+                            intake.publish_establish_send_started(operation_id, context);
+                        }
+                    }
+                    result
+                })
+                .await
+            }
+            EncodedMethodRequest::Control(request) => {
+                let mut wire = tonic::Request::new(request);
+                wire.set_timeout(remaining);
+                wire.extensions_mut().insert(novarocks_native_adapter::native_lane::NativeRequestCustody::from_retained_action(
+                    action_tail.take().expect("one original unary method run retains its action source")));
+                let codec=novarocks_native_adapter::native_codec::NativeProstCodec::with_operation_reply_plan(reply_plan);
+                let rpc = grpc.unary(
+                    wire,
+                    tonic::codegen::http::uri::PathAndQuery::from_static(
+                        "/novarocks.NovaRocksGrpc/ApplyTaskControlOperations",
+                    ),
+                    codec,
+                );
+                tokio::pin!(rpc);
+                let mut started = false;
+                std::future::poll_fn(|cx| {
+                    let result = rpc.as_mut().poll(cx);
+                    if !started {
+                        started = true;
+                        for &(operation_id, context) in establishes {
+                            intake.publish_establish_send_started(operation_id, context);
+                        }
+                    }
+                    result
+                })
+                .await
+            }
+        }
+    };
+    let outcome = match tokio::time::timeout_at(expires_at, call).await {
+        Ok(result) => result.map(tonic::Response::into_inner).map_err(|status| {
+            let outcome = classify_apply_status(&status);
+            tracing::warn!(
+                code = ?status.code(),
+                detail = status.message(),
+                "task operation rpc failed"
+            );
+            outcome
+        }),
+        Err(_) => Err(OperationDispatchResult::TransportUnknown),
+    };
+    if matches!(outcome, Err(OperationDispatchResult::TransportUnknown)) {
+        // An unknown outcome may have poisoned this stream. An old request
+        // cannot evict a replacement channel already installed by another
+        // attempt or by membership reconciliation.
+        client.invalidate_channel_if_current(method, &acquired);
+    }
+    outcome
+}
+
+// Legacy wire-only fixtures exercise their original request/classifier
+// contract directly. Production has no source-free call to this author.
+#[cfg(test)]
 async fn send_operations(
     client: &Client,
     request: EncodedMethodRequest,
@@ -3963,24 +4169,77 @@ mod tests {
         loopback: Loopback,
         sink: NativeTaskOperationSink,
         acks: TaskAckIntake,
+        governed: governed_wire::GovernedWireRole,
     }
+
+    mod governed_wire;
 
     fn sink_fixture(loopback: Loopback, backend: BackendProcessId) -> SinkFixture {
         let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
         let acks = TaskAckIntake::new(Arc::new(CountingWake::default()));
+        let governed = governed_wire::GovernedWireRole::new(&loopback);
         let sink = NativeTaskOperationSink::new(
             &[loopback.descriptor(backend)],
             TransportBudget::DEFAULT,
             test_attempt_facts(),
             acks.handle(),
             data_runtime,
+            governed.authority(),
         )
         .expect("one frozen backend target");
         SinkFixture {
             loopback,
             sink,
             acks,
+            governed,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn canonical_reply_alias_survives_original_send_and_physical_exit() {
+        let backend = BackendProcessId::new_v7();
+        let fixture = sink_fixture(Loopback::start().await, backend);
+        let intent = cancel_intent(1, backend);
+        fixture
+            .loopback
+            .peer
+            .expect_apply(ApplyAnswer::Outcomes(vec![
+                OperationOutcome::ResourceExhausted,
+            ]));
+        submit_batch(&fixture, released_batch(backend, vec![intent]));
+        let mut acks = settled(&fixture.acks, 1).await;
+        let original = acks.pop().unwrap();
+        let retained = original.clone();
+        assert!(
+            original.shares_original_canonical_with(&retained),
+            "both values borrow the same original canonical receipt"
+        );
+        drop(original);
+        // The real original task and cleanup execute on the actual fixture
+        // runtime; reply aliases are independent of process queue occupancy.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if fixture
+                    .sink
+                    .data_runtime
+                    .task_transport_supervisor()
+                    .snapshot()
+                    .retained_items
+                    == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual original queue/encoding exit");
+        assert_eq!(
+            retained.worker_outcome(),
+            Some(OperationOutcome::ResourceExhausted)
+        );
+        assert_eq!(fixture.loopback.peer.control_requests(), 1);
+        drop(retained);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4121,26 +4380,23 @@ mod tests {
         );
     }
 
-    fn submit_batch(sink: &NativeTaskOperationSink, mut batch: DispatchBatch) {
-        // The synthetic dispatcher fixture uses untracked permits. Exercise
-        // the real process owner before submission so its target lifetime is
-        // the same as the production dispatcher path.
+    fn submit_batch(fixture: &SinkFixture, mut batch: DispatchBatch) {
         let permits = batch
             .operations()
             .iter()
-            .map(
-                |intent| match sink.try_reserve_queue(intent.queue_request()) {
-                    TaskOperationQueueAdmission::Admitted(permit) => permit,
-                    TaskOperationQueueAdmission::TargetFull
-                    | TaskOperationQueueAdmission::ProcessFull => {
-                        panic!("a small loopback fixture needs target queue capacity")
-                    }
-                },
-            )
+            .map(|intent| fixture.governed.reserve(&fixture.sink, intent))
             .collect();
         batch.replace_fixture_permits(permits);
+        let batch = match fixture.sink.try_submit(batch) {
+            TaskOperationSubmit::Backpressured(batch) => batch,
+            result => {
+                assert!(matches!(result, TaskOperationSubmit::Accepted));
+                return;
+            }
+        };
+        fixture.governed.drive();
         assert!(matches!(
-            sink.try_submit(batch),
+            fixture.sink.try_submit(batch),
             TaskOperationSubmit::Accepted
         ));
     }
@@ -4431,6 +4687,7 @@ mod tests {
             test_attempt_facts(),
             fixture.acks.handle(),
             original_role,
+            fixture.governed.authority(),
         )
         .expect("one frozen backend target after original role drain");
         // Keep the actual wire client on the live test runtime. Only the
@@ -4454,13 +4711,7 @@ mod tests {
         let permits = batch
             .operations()
             .iter()
-            .map(
-                |intent| match sink.try_reserve_queue(intent.queue_request()) {
-                    TaskOperationQueueAdmission::Admitted(permit) => permit,
-                    TaskOperationQueueAdmission::TargetFull
-                    | TaskOperationQueueAdmission::ProcessFull => panic!("two cancels fit"),
-                },
-            )
+            .map(|intent| fixture.governed.reserve(&sink, intent))
             .collect();
         batch.replace_fixture_permits(permits);
         assert_eq!(
@@ -4491,6 +4742,10 @@ mod tests {
                 (false, Vec::new(), String::new(), 0)
             }
             TaskOperationSubmit::Accepted => (false, Vec::new(), String::new(), 0),
+            TaskOperationSubmit::AdmissionFailed { batch, error } => {
+                drop(batch);
+                panic!("original source must admit before testing closed role: {error}")
+            }
         };
         let acknowledgements = fixture.acks.drain_events();
         let returned = supervisor.snapshot();
@@ -4684,7 +4939,7 @@ mod tests {
                 OperationOutcome::Idempotent,
             ]));
 
-        submit_batch(&fixture.sink, batch);
+        submit_batch(&fixture, batch);
         let acks = settled(&fixture.acks, 3).await;
 
         assert_eq!(
@@ -4729,13 +4984,13 @@ mod tests {
                 OperationOutcome::TerminalRejected,
             ]));
 
-        submit_batch(&fixture.sink, batch);
+        submit_batch(&fixture, batch);
         let acks = settled(&fixture.acks, 2).await;
 
         for ack in &acks {
             assert_eq!(
-                ack.worker_outcome(),
-                Some(OperationOutcome::InvalidStateOrRequest)
+                ack.dispatch_result(),
+                OperationDispatchResult::NonWorkerRejected
             );
         }
     }
@@ -4756,14 +5011,58 @@ mod tests {
                 OperationOutcome::Accepted,
             ]));
 
-        submit_batch(&fixture.sink, batch);
+        submit_batch(&fixture, batch);
         let acks = settled(&fixture.acks, 2).await;
 
         assert!(
             acks.iter()
-                .all(|ack| ack.worker_outcome() == Some(OperationOutcome::InvalidStateOrRequest)),
+                .all(|ack| ack.dispatch_result() == OperationDispatchResult::NonWorkerRejected),
             "a response with fewer receipts than items cannot be attributed"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_reply_preflight_failure_preserves_remote_effect_without_worker_verdict_or_replay()
+     {
+        let backend = BackendProcessId::new_v7();
+        let fixture = sink_fixture(Loopback::start().await, backend);
+        let batch = released_batch(backend, vec![cancel_intent(1, backend)]);
+        fixture
+            .loopback
+            .peer
+            .expect_apply(ApplyAnswer::WithAck(vec![(
+                OperationOutcome::Accepted,
+                Some(proto::task_operation_verdict::Ack::CreateTask(
+                    proto::CreateTaskAck {
+                        accepted_domains: vec![
+                            proto::TaskDomainReceipt::default();
+                            novarocks_task_codec::domain::MAX_DOMAIN_UPDATES + 1
+                        ],
+                        ..Default::default()
+                    },
+                )),
+            )]));
+        submit_batch(&fixture, batch);
+        let acks = settled(&fixture.acks, 1).await;
+        assert_eq!(
+            fixture.loopback.peer.applied().len(),
+            1,
+            "the remote effect was dispatched once before its reply was refused locally"
+        );
+        assert_eq!(
+            acks[0].dispatch_result(),
+            OperationDispatchResult::NonWorkerRejected
+        );
+        assert_eq!(
+            acks[0].worker_outcome(),
+            None,
+            "a local decoder never mints a Worker verdict"
+        );
+        assert_eq!(
+            crate::task_execution::operation::frontend_action(acks[0].dispatch_result()),
+            crate::task_execution::operation::FrontendAction::FailAttempt
+        );
+        assert_eq!(*acks[0].payload(), AckPayload::None);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4777,7 +5076,7 @@ mod tests {
             .peer
             .expect_apply(ApplyAnswer::Reject(tonic::Code::Unavailable));
 
-        submit_batch(&fixture.sink, released_batch(backend, vec![intent]));
+        submit_batch(&fixture, released_batch(backend, vec![intent]));
         let first = settled(&fixture.acks, 1).await;
         assert_eq!(
             first[0].dispatch_result(),
@@ -4786,7 +5085,7 @@ mod tests {
 
         // The owner replays the same immutable intent, so the same bytes go
         // back out under the same operation id.
-        submit_batch(&fixture.sink, batch);
+        submit_batch(&fixture, batch);
         let second = settled(&fixture.acks, 1).await;
         assert_eq!(second[0].worker_outcome(), Some(OperationOutcome::Accepted));
         assert_eq!(second[0].operation_id(), first[0].operation_id());
@@ -4809,7 +5108,7 @@ mod tests {
             .peer
             .expect_apply(ApplyAnswer::Reject(tonic::Code::InvalidArgument));
 
-        submit_batch(&fixture.sink, batch);
+        submit_batch(&fixture, batch);
         let acks = settled(&fixture.acks, 1).await;
 
         assert_eq!(
@@ -4826,7 +5125,7 @@ mod tests {
         let fixture = sink_fixture(Loopback::start().await, frozen);
         let batch = released_batch(replacement, vec![cancel_intent(1, replacement)]);
 
-        submit_batch(&fixture.sink, batch);
+        submit_batch(&fixture, batch);
         let acks = settled(&fixture.acks, 1).await;
 
         assert_eq!(
@@ -4850,7 +5149,7 @@ mod tests {
             )],
         );
 
-        submit_batch(&fixture.sink, batch);
+        submit_batch(&fixture, batch);
         let acks = settled(&fixture.acks, 1).await;
 
         assert_eq!(acks[0].kind(), OperationKind::FetchTaskDynamicFilters);
@@ -7140,12 +7439,15 @@ mod tests {
             RuntimeEndpoint::new("127.0.0.1", 9000).unwrap(),
             RuntimeEndpoint::new("control.test.invalid", 19061).unwrap(),
         );
+        let source_loopback = Loopback::start().await;
+        let governed = governed_wire::GovernedWireRole::new(&source_loopback);
         let error = NativeTaskOperationSink::new(
             &[],
             TransportBudget::DEFAULT,
             test_attempt_facts(),
             acks.handle(),
             fixture.runtime.clone(),
+            governed.authority(),
         )
         .unwrap_err();
         assert_eq!(error, NativeTaskTransportCreationError::NoBackends);
@@ -7156,6 +7458,7 @@ mod tests {
             test_attempt_facts(),
             acks.handle(),
             fixture.runtime.clone(),
+            governed.authority(),
         )
         .unwrap_err();
         assert_eq!(
@@ -7174,6 +7477,7 @@ mod tests {
             test_attempt_facts(),
             acks.handle(),
             fixture.runtime.clone(),
+            governed.authority(),
         )
         .unwrap_err();
         assert_eq!(error, NativeTaskTransportCreationError::BudgetMismatch);
@@ -7459,11 +7763,11 @@ mod tests {
                 )),
             )]));
 
-        submit_batch(&fixture.sink, batch);
+        submit_batch(&fixture, batch);
         let acks = settled(&fixture.acks, 1).await;
         assert_eq!(
-            acks[0].worker_outcome(),
-            Some(OperationOutcome::InvalidStateOrRequest)
+            acks[0].dispatch_result(),
+            OperationDispatchResult::NonWorkerRejected
         );
         assert_eq!(*acks[0].payload(), AckPayload::None);
     }
@@ -7500,7 +7804,7 @@ mod tests {
                     )),
                 )]));
             submit_batch(
-                &fixture.sink,
+                &fixture,
                 released_batch(backend, vec![abort_intent(context)]),
             );
             let acks = settled(&fixture.acks, 1).await;
@@ -7525,13 +7829,13 @@ mod tests {
                 None,
             )]));
         submit_batch(
-            &fixture.sink,
+            &fixture,
             released_batch(backend, vec![abort_intent(context(backend))]),
         );
         let acks = settled(&fixture.acks, 1).await;
         assert_eq!(
-            acks[0].worker_outcome(),
-            Some(OperationOutcome::InvalidStateOrRequest)
+            acks[0].dispatch_result(),
+            OperationDispatchResult::NonWorkerRejected
         );
         assert_eq!(*acks[0].payload(), AckPayload::None);
     }
@@ -7556,7 +7860,7 @@ mod tests {
                 )),
             )]));
 
-        submit_batch(&fixture.sink, batch);
+        submit_batch(&fixture, batch);
         let acks = settled(&fixture.acks, 1).await;
         assert_eq!(acks[0].worker_outcome(), Some(OperationOutcome::Accepted));
         assert_eq!(*acks[0].payload(), AckPayload::None);

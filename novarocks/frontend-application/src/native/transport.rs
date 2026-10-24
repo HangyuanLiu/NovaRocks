@@ -334,6 +334,23 @@ impl Client {
             .map(|(grpc, _)| grpc)
     }
 
+    pub(in crate::native) fn grpc_for_reserved_call(
+        &self,
+        call: novarocks_native_adapter::native_lane::ReservedNativeCall,
+    ) -> tonic::client::Grpc<
+        InterceptedService<
+            novarocks_native_adapter::native_lane::ReservedNativeCall,
+            NativeClientAuthInterceptor,
+        >,
+    > {
+        tonic::client::Grpc::new(InterceptedService::new(
+            call,
+            NativeClientAuthInterceptor::new(self.data_runtime.native_trust().as_ref().clone()),
+        ))
+        .max_encoding_message_size(MAX_MESSAGE_BYTES)
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+    }
+
     pub(super) async fn grpc_with_channel_identity(
         &self,
         method: NativeRpcMethod,

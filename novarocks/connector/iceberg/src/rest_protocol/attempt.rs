@@ -201,7 +201,22 @@ pub(crate) async fn ensure_session(
     gate: &SessionGate,
     properties: &Arc<std::collections::HashMap<String, String>>,
 ) -> Result<Arc<SessionBinding>, AttemptFailure> {
+    ensure_session_in(
+        owner,
+        gate,
+        properties,
+        &super::http::RequestContext::for_read(),
+    )
+    .await
+}
+pub(crate) async fn ensure_session_in(
+    owner: &Arc<RestAuthOwner>,
+    gate: &SessionGate,
+    properties: &Arc<std::collections::HashMap<String, String>>,
+    context: &super::http::RequestContext,
+) -> Result<Arc<SessionBinding>, AttemptFailure> {
     gate.get_or_attempt(|attempt| {
+        let context = context.clone();
         let owner = Arc::clone(owner);
         let properties = Arc::clone(properties);
         async move {
@@ -210,7 +225,7 @@ pub(crate) async fn ensure_session(
             });
             tokio::time::timeout(
                 crate::catalog_runtime::REST_READ_TIMEOUT,
-                super::configuration::establish(&owner, &properties),
+                super::configuration::establish_in(&owner, &properties, &context),
             )
             .await
             .unwrap_or(Err(BindingFailure::ConfigFetch))

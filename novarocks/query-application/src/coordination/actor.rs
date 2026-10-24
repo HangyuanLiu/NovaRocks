@@ -812,6 +812,7 @@ pub struct LogicalExecutionActorConfig {
     result_row_carrier: Option<crate::api::ResultRowCarrier>,
     internal_budgets: crate::api::ComputationObservationBudgets,
     internal_plan: Option<crate::api::PlanSeal>,
+    native_actions: Option<novarocks_workload_control::joint_admission::NativeAsyncActionAuthority>,
 }
 
 impl fmt::Debug for LogicalExecutionActorConfig {
@@ -848,6 +849,14 @@ fn close_unstarted_governance(work_owner: WorkOwner, execution_stage: StagePermi
 }
 
 impl LogicalExecutionActorConfig {
+    pub(crate) fn with_native_action_authority(
+        mut self,
+        source: Option<novarocks_workload_control::joint_admission::NativeAsyncActionAuthority>,
+    ) -> Self {
+        self.native_actions = source;
+        self
+    }
+
     pub(crate) const fn initial_execution(&self) -> QueryExecutionId {
         self.initial_execution
     }
@@ -898,6 +907,7 @@ impl LogicalExecutionActorConfig {
             result_row_carrier: None,
             internal_budgets: crate::api::ComputationObservationBudgets::default(),
             internal_plan: None,
+            native_actions: None,
         })
     }
 
@@ -1018,6 +1028,7 @@ impl LogicalExecutionActorConfig {
             result_row_carrier: None,
             internal_budgets: crate::api::ComputationObservationBudgets::default(),
             internal_plan: None,
+            native_actions: None,
         })
     }
 
@@ -2447,6 +2458,7 @@ pub(crate) fn spawn_logical_execution_actor(
             config.max_establish_authorizations_per_context,
             config.max_abort_authorizations_per_context,
             result_runtime,
+            config.native_actions.take(),
             clock,
             registry_close_requested_rx,
             registry_ingress_closed,
@@ -2497,6 +2509,7 @@ async fn run_actor(
     max_establish_authorizations_per_context: NonZeroUsize,
     max_abort_authorizations_per_context: NonZeroUsize,
     mut result_runtime: Option<ResultRuntime>,
+    native_actions: Option<novarocks_workload_control::joint_admission::NativeAsyncActionAuthority>,
     clock: Arc<dyn MonotonicClock>,
     mut registry_close_requested_rx: watch::Receiver<Option<RegistryClose>>,
     registry_ingress_closed: watch::Sender<bool>,
@@ -2834,6 +2847,7 @@ async fn run_actor(
                     replacement_reservation_valid_for,
                     result_runtime.as_mut(),
                     &mut root_terminal_receiver,
+                    native_actions.as_ref(),
                     command,
                 );
             }
@@ -4442,6 +4456,9 @@ fn handle_command(
     replacement_reservation_valid_for: Option<Duration>,
     mut result_runtime: Option<&mut ResultRuntime>,
     root_terminal_receiver: &mut Option<mpsc::Receiver<RootTerminalObservation>>,
+    native_actions: Option<
+        &novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
+    >,
     command: ActorCommand,
 ) {
     match command {
@@ -5144,6 +5161,7 @@ fn handle_command(
                 contexts,
                 issued_at,
                 conservative_expiry,
+                native_actions.cloned(),
             ));
             *replacement = Some(ReplacementRuntime {
                 token,

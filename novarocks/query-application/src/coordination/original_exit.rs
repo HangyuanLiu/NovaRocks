@@ -399,6 +399,8 @@ pub(super) struct OriginalNativePreparation {
     pub(super) description: Option<Arc<crate::preparation::FrozenExecutionDescription>>,
     pub(super) consumer: Option<Arc<dyn crate::api::InternalComputationConsumer>>,
     pub(super) capacity: Option<crate::admitted_query_context::QueryResultCapacityBinding>,
+    pub(super) native_actions:
+        Option<novarocks_workload_control::joint_admission::NativeAsyncActionAuthority>,
     pub(super) exiting: bool,
 }
 impl OriginalNativePreparation {
@@ -412,6 +414,7 @@ impl OriginalNativePreparation {
         drop(self.seed.take());
         drop(self.acceptance.take());
         drop(self.session.take());
+        drop(self.native_actions.take());
         drop(self.capacity.take());
         drop(self.consumer.take());
         drop(self.description.take());

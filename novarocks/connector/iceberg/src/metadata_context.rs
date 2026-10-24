@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use novarocks_spi::connector::{
-    ConnectorErrorKind, ConnectorOperationControl, ConnectorRequestContext,
+    ConnectorError, ConnectorErrorKind, ConnectorOperationControl, ConnectorRequestContext,
     ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedS3CredentialLeaseRefresher,
     CredentialLoadTableDelegation, CredentialRenewalPath, MaterializationContext,
 };
@@ -379,6 +379,58 @@ impl IcebergMetadataContext {
         &self,
     ) -> &Arc<crate::catalog::table_coordination::IcebergTableCoordination> {
         &self.table_coordination
+    }
+
+    /// Pure facts of the current original generation. Actual requests may
+    /// discover further vended/configured routes and must extend the same Root
+    /// before those routes' first credential/network dispatch.
+    pub(crate) fn metadata_action_initial_dependencies(
+        &self,
+    ) -> Result<Vec<novarocks_spi::connector::SharedDependency>, ConnectorError> {
+        use novarocks_spi::connector::{NetworkServiceOrigin, SharedDependency};
+        let config = self.control_state.configuration();
+        let mut dependencies = Vec::new();
+        match config.kind {
+            crate::catalog_config::IcebergCatalogKind::Rest => {
+                let uri = config.rest_uri.as_ref().ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "REST generation has no original URI",
+                    )
+                })?;
+                let selected = url::Url::parse(uri).map_err(|_| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "invalid original REST URI",
+                    )
+                })?;
+                let fact = SharedDependency::Network(
+                    NetworkServiceOrigin::from_selected_url(&selected).map_err(|_| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "REST origin exceeds dependency profile",
+                        )
+                    })?,
+                );
+                dependencies.push(fact);
+            }
+            crate::catalog_config::IcebergCatalogKind::Hadoop => {
+                dependencies.push(
+                    self.resources
+                        .planning_binding()
+                        .selected_io_dependency(&config.warehouse_uri)?,
+                );
+            }
+            crate::catalog_config::IcebergCatalogKind::Hive => {
+                // The existing catalog author permanently refuses these two
+                // mutations. This does not remove any HMS read capability.
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "Hive Metastore catalog is a read-only compatibility entry",
+                ));
+            }
+        }
+        Ok(dependencies)
     }
 
     pub(crate) fn control_state(&self) -> &IcebergCatalogControlState {

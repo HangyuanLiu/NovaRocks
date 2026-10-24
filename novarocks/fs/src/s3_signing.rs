@@ -175,13 +175,16 @@ impl S3RequestSigner {
         })
     }
 
-    async fn credential(&self) -> opendal::Result<Cow<'_, reqsign::AwsCredential>> {
+    async fn credential_in(
+        &self,
+        request: Option<&novarocks_spi::connector::ConnectorRequestContext>,
+    ) -> opendal::Result<Cow<'_, reqsign::AwsCredential>> {
         match &self.material {
             SigningMaterial::Static(value) => Ok(Cow::Borrowed(value)),
             SigningMaterial::Authority(loader) => {
                 // Call the original authority on every real sign, including
                 // each replay. No SDK cache or invented wall-clock expiry.
-                match loader.credential_for_request().await {
+                match loader.credential_for_request_in(request).await {
                     Ok(value) => Ok(Cow::Owned(value)),
                     Err(error) => Err(self.denial.classify(
                         Error::new(ErrorKind::Unexpected, "acquire S3 signing material")
@@ -198,7 +201,10 @@ impl S3RequestSigner {
         // Pure selected facts only. No admission has occurred in this slice.
         let _service_base = selected.service_base();
         clear_signing_headers(request.headers_mut());
-        let credential = self.credential().await?;
+        let context = request
+            .extensions()
+            .get::<novarocks_spi::connector::ConnectorRequestContext>();
+        let credential = self.credential_in(context).await?;
         self.signer
             .sign(request, credential.as_ref())
             .map_err(|error| invalid("sign actual S3 request").set_source(error))?;
@@ -216,7 +222,7 @@ impl S3RequestSigner {
         let selected = self.selected_request(request.uri())?;
         let _service_base = selected.service_base();
         clear_signing_headers(request.headers_mut());
-        let credential = self.credential().await?;
+        let credential = self.credential_in(None).await?;
         self.signer
             .sign_query(&mut request, expiry, credential.as_ref())
             .map_err(|error| invalid("presign actual S3 request").set_source(error))?;
@@ -261,6 +267,31 @@ impl<T: HttpTransport> HttpTransport for S3SigningTransport<T> {
         let frozen_target = request.uri().path_and_query().cloned();
         for redirects in 0..=MAX_REDIRECTS {
             let selected = self.signer.selected_request(request.uri())?;
+            let original = request
+                .extensions()
+                .get::<novarocks_spi::connector::ConnectorRequestContext>()
+                .cloned();
+            let permit = match original.as_ref() {
+                Some(context) => {
+                    let dependency =
+                        novarocks_spi::connector::NetworkServiceOrigin::from_selected_url(
+                            selected.service_base(),
+                        )
+                        .map(novarocks_spi::connector::SharedDependency::Network)
+                        .map_err(|e| invalid("invalid selected S3 service origin").set_source(e))?;
+                    context
+                        .admit_selected_io(dependency)
+                        .await
+                        .map_err(|e| invalid("original S3 I/O admission refused").set_source(e))?
+                }
+                None => None,
+            };
+            // Nested credential traffic extends THIS paid phase atomically.
+            if let (Some(context), Some(permit)) = (original.as_ref(), permit.as_ref()) {
+                request
+                    .extensions_mut()
+                    .insert(context.clone().with_io_phase(permit.retain()));
+            }
             self.signer.sign_header(&mut request).await?;
             // Buffer clone shares the original payload; no detached byte copy.
             let mut replay = Request::new(request.body().clone());
@@ -268,7 +299,11 @@ impl<T: HttpTransport> HttpTransport for S3SigningTransport<T> {
             *replay.uri_mut() = request.uri().clone();
             *replay.version_mut() = request.version();
             *replay.headers_mut() = request.headers().clone();
+            if let Some(context) = original {
+                replay.extensions_mut().insert(context);
+            }
             let response = self.inner.fetch(request).await?;
+            let response = retain_response_phase(response, permit);
             if !matches!(
                 response.status(),
                 StatusCode::MOVED_PERMANENTLY
@@ -815,4 +850,51 @@ mod tests {
             );
         }
     }
+}
+
+/// Explicit per-request context over the same pooled transport. The typed
+/// extension belongs to this actual HTTP Request, not an authority lookup.
+pub(super) struct GovernedRequestTransport {
+    inner: opendal::HttpTransporter,
+    request: novarocks_spi::connector::ConnectorRequestContext,
+}
+impl GovernedRequestTransport {
+    pub(super) fn new(
+        inner: opendal::HttpTransporter,
+        request: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Self {
+        Self { inner, request }
+    }
+}
+impl HttpTransport for GovernedRequestTransport {
+    async fn fetch(&self, mut request: Request<Buffer>) -> opendal::Result<Response<HttpBody>> {
+        if request
+            .extensions()
+            .get::<novarocks_spi::connector::ConnectorRequestContext>()
+            .is_none()
+        {
+            request.extensions_mut().insert(self.request.clone());
+        }
+        self.inner.fetch(request).await
+    }
+}
+fn retain_response_phase(
+    response: Response<HttpBody>,
+    phase: Option<novarocks_spi::connector::ConnectorIoPermit>,
+) -> Response<HttpBody> {
+    let Some(phase) = phase else {
+        return response;
+    };
+    let (parts, body) = response.into_parts();
+    // The original body validates content length. The wrapper retains its
+    // paid alias through actual body/F Drop, including partial reads/unwind.
+    let stream = futures::stream::try_unfold((body, phase), |(mut body, phase)| async move {
+        let chunk = opendal::raw::oio::ReadStream::read(&mut body).await?;
+        if chunk.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some((chunk, (body, phase))))
+        }
+    });
+    Response::from_parts(parts, HttpBody::new(Box::pin(stream), None))
 }

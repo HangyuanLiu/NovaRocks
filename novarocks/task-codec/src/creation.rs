@@ -32,6 +32,8 @@
 //! never read.
 // Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
 
+pub mod size;
+
 use std::any::Any;
 use std::collections::BTreeSet;
 

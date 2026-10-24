@@ -387,7 +387,11 @@ impl RecordingSink {
 }
 
 impl TaskOperationSink for RecordingSink {
-    fn try_reserve_queue(&self, request: TaskOperationQueueRequest) -> TaskOperationQueueAdmission {
+    fn try_reserve_queue(
+        &self,
+        request: TaskOperationQueueRequest,
+        preparation: &mut super::intent::TaskOperationQueuePreparation,
+    ) -> TaskOperationQueueAdmission {
         let key = (request.lane(), request.backend_process_id());
         self.reservations
             .lock()
@@ -438,6 +442,8 @@ struct SwitchableQueueSink {
     submit_open: std::sync::atomic::AtomicBool,
     batches: Mutex<Vec<(DispatchLane, Vec<OperationIntent>)>>,
     live_queue_permits: Arc<AtomicUsize>,
+    reserve_attempts: AtomicUsize,
+    ordinary_update_reserve_attempts: AtomicUsize,
 }
 
 impl Default for SwitchableQueueSink {
@@ -447,6 +453,8 @@ impl Default for SwitchableQueueSink {
             submit_open: std::sync::atomic::AtomicBool::new(true),
             batches: Mutex::new(Vec::new()),
             live_queue_permits: Arc::new(AtomicUsize::new(0)),
+            reserve_attempts: AtomicUsize::new(0),
+            ordinary_update_reserve_attempts: AtomicUsize::new(0),
         }
     }
 }
@@ -482,13 +490,27 @@ impl SwitchableQueueSink {
     fn live_queue_permits(&self) -> usize {
         self.live_queue_permits.load(Ordering::SeqCst)
     }
+
+    fn reserve_attempts(&self) -> usize {
+        self.reserve_attempts.load(Ordering::SeqCst)
+    }
+
+    fn ordinary_update_reserve_attempts(&self) -> usize {
+        self.ordinary_update_reserve_attempts.load(Ordering::SeqCst)
+    }
 }
 
 impl TaskOperationSink for SwitchableQueueSink {
     fn try_reserve_queue(
         &self,
-        _request: TaskOperationQueueRequest,
+        request: TaskOperationQueueRequest,
+        _preparation: &mut crate::task_execution::intent::TaskOperationQueuePreparation,
     ) -> TaskOperationQueueAdmission {
+        self.reserve_attempts.fetch_add(1, Ordering::SeqCst);
+        if request.lane() == DispatchLane::Update && !request.requires_control_progress() {
+            self.ordinary_update_reserve_attempts
+                .fetch_add(1, Ordering::SeqCst);
+        }
         if self.queue_open.load(Ordering::SeqCst) {
             self.live_queue_permits.fetch_add(1, Ordering::SeqCst);
             TaskOperationQueueAdmission::Admitted(Box::new(SwitchableQueuePermit {
@@ -517,6 +539,7 @@ impl TaskOperationSink for QueueBackpressureOnceSink {
     fn try_reserve_queue(
         &self,
         _request: TaskOperationQueueRequest,
+        _preparation: &mut crate::task_execution::intent::TaskOperationQueuePreparation,
     ) -> TaskOperationQueueAdmission {
         if self.reserve_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
             TaskOperationQueueAdmission::ProcessFull
@@ -536,6 +559,7 @@ impl TaskOperationSink for BackpressureOnceSink {
     fn try_reserve_queue(
         &self,
         _request: TaskOperationQueueRequest,
+        _preparation: &mut crate::task_execution::intent::TaskOperationQueuePreparation,
     ) -> TaskOperationQueueAdmission {
         TaskOperationQueueAdmission::Admitted(test_queue_permit())
     }
@@ -2012,11 +2036,11 @@ fn an_unknown_create_outcome_retries_the_identical_request() {
         unreachable!("both intents are creates");
     };
     assert!(
-        Arc::ptr_eq(first, second),
+        first.same_original(second),
         "a retry must resend the identical immutable request, not a rebuilt one"
     );
     assert!(
-        Arc::ptr_eq(first.parts(), second.parts()),
+        first.same_parts(second),
         "a retry resends the carriers frozen for the first send"
     );
 }
@@ -2054,7 +2078,7 @@ fn create_not_ready_waits_for_exact_establish_ack_before_replay() {
     else {
         unreachable!("both intents are creates");
     };
-    assert!(Arc::ptr_eq(first, replayed));
+    assert!(first.same_original(replayed));
 }
 
 #[test]
@@ -2553,7 +2577,7 @@ fn preparation_busy_uses_bounded_backoff_and_exact_replay() {
     else {
         unreachable!("both intents are creates");
     };
-    assert!(Arc::ptr_eq(first, replayed));
+    assert!(first.same_original(replayed));
 }
 
 #[test]
@@ -3517,7 +3541,7 @@ fn a_create_payload_lives_until_its_exact_acknowledgement_and_never_after() {
     let OperationIntent::CreateTask(frozen) = &first else {
         unreachable!("a create intent carries its request");
     };
-    let frozen = Arc::clone(frozen);
+    let frozen = frozen.clone();
     let operation = first.operation_id();
     let task = harness.execution.task(leaf).expect("the leaf is owned");
     assert!(task.create_frozen() && task.holds_create_payload());
@@ -3541,7 +3565,7 @@ fn a_create_payload_lives_until_its_exact_acknowledgement_and_never_after() {
     let OperationIntent::CreateTask(replayed) = &replay else {
         unreachable!("a create intent carries its request");
     };
-    assert!(Arc::ptr_eq(replayed, &frozen));
+    assert!(replayed.same_original(&frozen));
 
     // The exact acknowledgement settles the create and lets go of it.
     harness
@@ -3556,7 +3580,7 @@ fn a_create_payload_lives_until_its_exact_acknowledgement_and_never_after() {
             .holds_create_payload()
     );
     assert_eq!(
-        Arc::strong_count(&frozen),
+        frozen.original_strong_count(),
         1,
         "after the exact acknowledgement nothing but this test holds the frozen create"
     );
@@ -3602,7 +3626,7 @@ fn a_create_that_fails_closed_drops_its_payload_and_a_late_answer_cannot_revive_
     let OperationIntent::CreateTask(frozen) = &create else {
         unreachable!("a create intent carries its request");
     };
-    let frozen = Arc::clone(frozen);
+    let frozen = frozen.clone();
     let operation = create.operation_id();
 
     // A refusal is terminal for the task: dispatch closes first, and the
@@ -3612,7 +3636,7 @@ fn a_create_that_fails_closed_drops_its_payload_and_a_late_answer_cannot_revive_
     let task = harness.execution.task(leaf).expect("the leaf is owned");
     assert_eq!(task.state(), RemoteTaskState::Terminal);
     assert!(!task.holds_create_payload());
-    assert_eq!(Arc::strong_count(&frozen), 1);
+    assert_eq!(frozen.original_strong_count(), 1);
 
     let late = harness
         .execution
@@ -4861,8 +4885,9 @@ fn process_queue_backpressure_rolls_back_every_unadmitted_owner_transition() {
     assert!(sink.submitted_operations.load(Ordering::SeqCst) > 0);
 }
 
-#[test]
-fn task_update_process_rejection_precedes_remote_task_retention() {
+// Reuse the original update-admission graph and owner construction. The sink
+// still exercises the real QueryTaskExecution/RemoteTask producer path.
+fn update_admission_execution(sink: Arc<dyn TaskOperationSink>) -> (QueryTaskExecution, TaskId) {
     let processes = backends(1);
     let schedule = chain_schedule(&[0], &[0]);
     let graph = build_graph(&schedule, &chain_edges(), &processes, 512).expect("legal graph");
@@ -4875,10 +4900,9 @@ fn task_update_process_rejection_precedes_remote_task_retention() {
         .contexts()
         .map(|context| (context.backend_process_id(), admission_epoch()))
         .collect::<BTreeMap<_, _>>();
-    let sink = Arc::new(QueueBackpressureOnceSink::default());
     let wake = Arc::new(CountingWake::default());
     let intake = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
-    let mut execution = QueryTaskExecution::new(
+    let execution = QueryTaskExecution::new(
         graph,
         DispatchBudget::DEFAULT,
         TransportBudget::DEFAULT,
@@ -4889,32 +4913,193 @@ fn task_update_process_rejection_precedes_remote_task_retention() {
             .map(|&process| (process, 4096))
             .collect(),
         Arc::new(ManualClock::new()),
-        Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
+        sink,
         intake,
     )
     .expect("compose execution");
 
-    let error = execution
-        .enqueue_task_update(leaf, split_update(SCAN_NODE, 1, false))
-        .expect_err("the first process reservation is refused");
-    assert!(matches!(
-        error,
-        TaskExecutionError::Capacity(CapacityBound::ProcessTransportQueue { .. })
-    ));
+    (execution, leaf)
+}
+
+fn split_payload(update: &TaskDomainUpdate) -> &Arc<dyn CodecOwnedContent> {
+    let TaskDomainUpdate::SplitAssignment(split) = update else {
+        panic!("the fixture retains one exact split input");
+    };
+    split.payload()
+}
+
+#[test]
+fn task_update_process_rejection_precedes_remote_task_retention() {
+    let sink = Arc::new(QueueBackpressureOnceSink::default());
+    let (mut execution, leaf) =
+        update_admission_execution(Arc::clone(&sink) as Arc<dyn TaskOperationSink>);
+    let update = split_update(SCAN_NODE, 1, false);
+    let original = Arc::downgrade(split_payload(&update));
     assert_eq!(
         execution
-            .task(leaf)
-            .expect("the task is owned")
-            .pending_updates(),
-        0,
-        "a rejected process reservation must leave no per-attempt payload"
+            .enqueue_task_update(leaf, update)
+            .expect("stable producer accepts its input"),
+        UpdateAdmission::Preparing
     );
+    let task = execution.task(leaf).expect("the task is owned");
+    assert_eq!(
+        task.pending_updates(),
+        0,
+        "no domain fact precedes queue admission"
+    );
+    assert_eq!(
+        original.strong_count(),
+        1,
+        "only the original pending cell owns this input"
+    );
+    assert!(Arc::ptr_eq(
+        &original
+            .upgrade()
+            .expect("same original input remains live"),
+        split_payload(task.preparing_update().expect("same pending preparation")),
+    ));
+
+    execution
+        .pump(&FakeEstablish)
+        .expect("the next turn resumes the same cell");
+    let task = execution.task(leaf).expect("the task is owned");
+    assert!(task.preparing_update().is_none());
+    assert_eq!(task.pending_updates(), 1);
+    assert_eq!(original.strong_count(), 1);
+    assert!(Arc::ptr_eq(
+        &original
+            .upgrade()
+            .expect("original input was transferred, not rebuilt"),
+        split_payload(
+            task.first_pending_update()
+                .expect("one admitted original update")
+        ),
+    ));
+}
+
+#[test]
+fn pending_update_input_is_withdrawn_before_normal_or_terminal_pump() {
+    for terminal_cleanup in [false, true] {
+        let sink = Arc::new(SwitchableQueueSink::default());
+        let (mut execution, leaf) =
+            update_admission_execution(Arc::clone(&sink) as Arc<dyn TaskOperationSink>);
+        let queued = split_update(SCAN_NODE, 1, false);
+        let queued_original = Arc::downgrade(split_payload(&queued));
+        assert_eq!(
+            execution.enqueue_task_update(leaf, queued).unwrap(),
+            UpdateAdmission::Queued
+        );
+        assert_eq!(sink.live_queue_permits(), 1);
+        sink.set_queue_open(false);
+        let update = split_update(SCAN_NODE, 2, false);
+        let original = Arc::downgrade(split_payload(&update));
+        assert_eq!(
+            execution.enqueue_task_update(leaf, update).unwrap(),
+            UpdateAdmission::Preparing
+        );
+        assert_eq!(original.strong_count(), 1);
+        assert_eq!(sink.reserve_attempts(), 2);
+        assert_eq!(sink.live_queue_permits(), 1);
+        assert_eq!(execution.task(leaf).unwrap().pending_updates(), 1);
+        if terminal_cleanup {
+            execution.begin_terminal_cleanup();
+        } else {
+            execution.begin_normal_drain();
+        }
+        assert!(
+            original.upgrade().is_none(),
+            "the never-dispatched original input actually exits"
+        );
+        assert!(
+            queued_original.upgrade().is_none(),
+            "the original admitted but unsent input exits too"
+        );
+        assert_eq!(
+            sink.live_queue_permits(),
+            0,
+            "the actual unsent queue permit exits"
+        );
+        let task = execution.task(leaf).unwrap();
+        assert!(task.preparing_update().is_none());
+        assert_eq!(task.pending_updates(), 0);
+        assert_eq!(task.discarded_updates(), 2);
+        sink.set_queue_open(true);
+        execution
+            .pump(&FakeEstablish)
+            .expect("closure still converges");
+        assert_eq!(
+            sink.ordinary_update_reserve_attempts(),
+            2,
+            "no ordinary input physical reservation after withdrawal"
+        );
+        assert!(
+            sink.take()
+                .iter()
+                .flat_map(|(_, operations)| operations)
+                .all(|intent| {
+                    let OperationIntent::UpdateTask(request) = intent else {
+                        return true;
+                    };
+                    request.domains().iter().all(|update| {
+                        matches!(update, TaskDomainUpdate::CloseExchangeDestination { .. })
+                    })
+                }),
+            "only genuine destination-close controls may continue"
+        );
+    }
+}
+
+#[test]
+fn terminal_status_withdraws_preparing_input_before_queue_reopens() {
+    let sink = Arc::new(SwitchableQueueSink::default());
+    sink.set_queue_open(false);
+    let (mut execution, leaf) =
+        update_admission_execution(Arc::clone(&sink) as Arc<dyn TaskOperationSink>);
+    let update = split_update(SCAN_NODE, 1, false);
+    let original = Arc::downgrade(split_payload(&update));
+    assert_eq!(
+        execution.enqueue_task_update(leaf, update).unwrap(),
+        UpdateAdmission::Preparing
+    );
+    let identity = execution.task(leaf).unwrap().identity();
+    for (version, state) in [(2, TaskState::Canceling), (3, TaskState::Canceled)] {
+        assert_eq!(
+            execution
+                .intake()
+                .handle()
+                .publish(StatusEvent::Published(Box::new(
+                    TaskStatus::try_new(
+                        identity,
+                        TaskStatusVersion::new(version).unwrap(),
+                        state,
+                        Some(TerminationDetail::Canceled(
+                            CancelReason::UpstreamNoLongerNeeded,
+                        )),
+                        TaskOutputFacts::default(),
+                    )
+                    .expect("a legal cancellation status"),
+                ))),
+            StatusIntakeAdmission::Enqueued
+        );
+        execution
+            .apply_status(64)
+            .expect("the original status author applies cancellation");
+    }
+    assert!(original.upgrade().is_none());
+    assert!(execution.task(leaf).unwrap().is_terminal());
+    assert_eq!(execution.task(leaf).unwrap().pending_updates(), 0);
+    sink.set_queue_open(true);
+    // Terminal task input is decided before entering the queue gate. Other
+    // original context lifecycle operations may still converge in this turn.
+    let attempts = sink.reserve_attempts();
     assert_eq!(
         execution
             .enqueue_task_update(leaf, split_update(SCAN_NODE, 1, false))
-            .expect("the unchanged domain update can be admitted later"),
-        UpdateAdmission::Queued
+            .unwrap(),
+        UpdateAdmission::DiscardedNoLongerNeeded,
     );
+    assert_eq!(sink.reserve_attempts(), attempts);
+    assert_eq!(sink.live_queue_permits(), 0);
 }
 
 #[test]
@@ -9917,7 +10102,7 @@ fn exercise_covered_installed_retiring_unknown_create(unknown_first: bool) {
             unreachable!("the target operation is a Create");
         };
         assert!(!request.parts().metadata().is_empty());
-        (Arc::downgrade(request), Arc::downgrade(request.parts()))
+        request.weak_original_lifetimes()
     };
     assert!(
         harness
