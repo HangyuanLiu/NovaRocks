@@ -119,6 +119,7 @@ const ABORT_DELAY_S: i64 = 5;
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(DistributedWriterDataflow),
+        Box::new(DistributedWriterConcurrentProgress::default()),
         Box::new(DistributedStatisticsDataflow),
         Box::new(DistributedWriterOverwrite),
         Box::new(DistributedWriterRowLevel),
@@ -626,6 +627,385 @@ fn seed_delay_source_files(
             .with_context(|| format!("seed {catalog}.{database}.{source} row {row}"))?;
     }
     Ok(())
+}
+
+// Deliberate scenario policy, not a physical-layout quote. The normal Server
+// creator must still validate the complete original action/source projections.
+// Keep the three Internal positions explicit rather than relying on V1's four.
+const CONCURRENT_CAPACITY_OVERLAY: &str = r#"
+query_blocking_worker_threads = 1
+query_blocking_queue_capacity = 64
+[runtime.frontend_workload]
+concurrency_limit = 3
+internal_result_positions = 3
+internal_result_all_objects_bytes = 1056964608
+[runtime.frontend_workload.scope_slots]
+query = 4096
+materialized_view = 1024
+statistics = 1024
+table_maintenance = 1024
+management = 1024
+[runtime.frontend_workload.dependency_custody]
+unreceived_productions = 256
+publications = 256
+residuals = 256
+retained_payload_bytes = 4294967296
+"#;
+const CONCURRENT_CAPACITY_EXPECTED: &[(&[&str], i64)] = &[
+    (&["runtime", "query_blocking_worker_threads"], 1),
+    (&["runtime", "query_blocking_queue_capacity"], 64),
+    (&["runtime", "frontend_workload", "concurrency_limit"], 3),
+    (
+        &["runtime", "frontend_workload", "internal_result_positions"],
+        3,
+    ),
+    (
+        &[
+            "runtime",
+            "frontend_workload",
+            "internal_result_all_objects_bytes",
+        ],
+        1056964608,
+    ),
+    (
+        &["runtime", "frontend_workload", "scope_slots", "query"],
+        4096,
+    ),
+    (
+        &[
+            "runtime",
+            "frontend_workload",
+            "scope_slots",
+            "materialized_view",
+        ],
+        1024,
+    ),
+    (
+        &["runtime", "frontend_workload", "scope_slots", "statistics"],
+        1024,
+    ),
+    (
+        &[
+            "runtime",
+            "frontend_workload",
+            "scope_slots",
+            "table_maintenance",
+        ],
+        1024,
+    ),
+    (
+        &["runtime", "frontend_workload", "scope_slots", "management"],
+        1024,
+    ),
+    (
+        &[
+            "runtime",
+            "frontend_workload",
+            "dependency_custody",
+            "unreceived_productions",
+        ],
+        256,
+    ),
+    (
+        &[
+            "runtime",
+            "frontend_workload",
+            "dependency_custody",
+            "publications",
+        ],
+        256,
+    ),
+    (
+        &[
+            "runtime",
+            "frontend_workload",
+            "dependency_custody",
+            "residuals",
+        ],
+        256,
+    ),
+    (
+        &[
+            "runtime",
+            "frontend_workload",
+            "dependency_custody",
+            "retained_payload_bytes",
+        ],
+        4294967296,
+    ),
+];
+const CONCURRENT_WRITERS: usize = 3;
+const CONCURRENT_APPEND_HOLD: &str = "connector-write-append-hold";
+const CONCURRENT_CATALOG: &str = "distributed_writer_concurrent";
+const CONCURRENT_DATABASE: &str = "distributed_writer_concurrent_db";
+const CONCURRENT_SOURCE: &str = "distributed_writer_concurrent_source";
+
+#[derive(Default)]
+struct DistributedWriterConcurrentProgress {
+    intent: SqlIntentOwner,
+}
+
+struct ConcurrentWriter {
+    ordinal: usize,
+    selected: SelectedStatement,
+    actor: WriterActor,
+    early_outcome: Option<mysql::Result<()>>,
+}
+
+fn concurrent_target(ordinal: usize) -> String {
+    format!("{CONCURRENT_CATALOG}.{CONCURRENT_DATABASE}.target_{ordinal}")
+}
+
+fn concurrent_insert(ordinal: usize) -> String {
+    format!(
+        "INSERT INTO {} SELECT v FROM {CONCURRENT_CATALOG}.{CONCURRENT_DATABASE}.{CONCURRENT_SOURCE}",
+        concurrent_target(ordinal)
+    )
+}
+
+fn require_concurrent_effective_config(context: &ScenarioContext) -> Result<()> {
+    let evidence: serde_json::Value =
+        serde_json::from_slice(context.effective_launch_config_evidence().artifact_bytes())?;
+    let roles = evidence["semantics"]["roles"]
+        .as_array()
+        .context("missing effective roles for concurrent writer scenario")?;
+    let frontend = roles
+        .iter()
+        .filter(|role| role["role"] == "fe")
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        frontend.len() == 1,
+        "concurrent writer scenario requires one effective FE config"
+    );
+    let config = &frontend[0]["effective_config"];
+    for &(path, expected_value) in CONCURRENT_CAPACITY_EXPECTED {
+        let mut value = config;
+        for key in path {
+            anyhow::ensure!(
+                value["type"] == "table",
+                "effective config has no table before {}",
+                path.join(".")
+            );
+            value = &value["value"][*key];
+        }
+        anyhow::ensure!(
+            value["type"] == "integer" && value["value"].as_i64() == Some(expected_value),
+            "concurrent writer effective {} must be exactly {expected_value}",
+            path.join(".")
+        );
+    }
+    Ok(())
+}
+
+impl Scenario for DistributedWriterConcurrentProgress {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        let mut declaration = crate::scenarios::declarations::for_module(
+            "distributed_writer",
+            self.name(),
+            self.is_explicit_stage(),
+            self.is_compatibility_stage(),
+        );
+        declaration.impact.paths.extend([
+            "novarocks/workload-control/**".into(),
+            "novarocks-server/**".into(),
+            "tests/system-test-runner/src/scenarios/writer_statement_actor.rs".into(),
+            "tests/system-test-runner/src/scenarios/native_sql_controls.rs".into(),
+        ]);
+        declaration
+    }
+
+    fn name(&self) -> &'static str {
+        "connector/distributed-writer-concurrent-progress"
+    }
+
+    fn launch_config(&self, _root: &Path) -> Result<ScenarioLaunchConfig> {
+        let capacity = CONCURRENT_CAPACITY_OVERLAY;
+        let mut launch = connector_launch_config();
+        launch.config_overlay.fe = Some(format!(
+            "{}\n[runtime]\n{capacity}\n",
+            launch.config_overlay.fe.take().unwrap_or_default()
+        ));
+        Ok(launch)
+    }
+
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        anyhow::ensure!(
+            cluster_size == CONCURRENT_WRITERS,
+            "concurrent writer scenario requires native 1FE+3BE"
+        );
+        // The existing harness admits one selected token per (BE, fault kind).
+        // Distinct BE targets allow all three original statements to stay held
+        // concurrently without ending an earlier token or widening authority.
+        let statements = (0..CONCURRENT_WRITERS)
+            .map(|ordinal| StatementSpec {
+                sql: concurrent_insert(ordinal),
+                faults: vec![(ordinal, CONCURRENT_APPEND_HOLD)],
+                observations: vec![],
+            })
+            .collect();
+        Ok(Some(self.intent.freeze(
+            statements,
+            &[],
+            cluster_size,
+            binary,
+            deadline,
+        )?))
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        require_concurrent_effective_config(context)?;
+        let baseline = resource_baseline(context)?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
+        seed_source_files(
+            context,
+            &mut control,
+            CONCURRENT_CATALOG,
+            CONCURRENT_DATABASE,
+            CONCURRENT_SOURCE,
+            "distributed-writer-concurrent-progress",
+        )?;
+        for ordinal in 0..CONCURRENT_WRITERS {
+            control.query_drop(format!(
+                "CREATE TABLE {} (v BIGINT)",
+                concurrent_target(ordinal)
+            ))?;
+        }
+        control.finish()?;
+        await_resource_convergence(context, &baseline, "concurrent writer fixture setup")?;
+
+        // Reserve time from the original scenario deadline for cancellation,
+        // actor joins and resource convergence; do not renew a timeout per SQL.
+        let progress_budget = context
+            .remaining("start concurrent held writers")?
+            .checked_sub(Duration::from_secs(10))
+            .context("concurrent writers have no time left for actual cleanup")?
+            .min(Duration::from_secs(30));
+        anyhow::ensure!(
+            !progress_budget.is_zero(),
+            "no concurrent writer progress budget remains"
+        );
+        let progress_deadline = Instant::now() + progress_budget;
+        let mut writers = Vec::with_capacity(CONCURRENT_WRITERS);
+        let progress = (|| -> Result<()> {
+            context.action("submit three independent INSERTs with one FE blocking worker");
+            for ordinal in 0..CONCURRENT_WRITERS {
+                let selected = self.intent.take(ordinal)?;
+                let actor = WriterActor::start(
+                    context,
+                    &concurrent_insert(ordinal),
+                    selected.clone(),
+                    None,
+                )?;
+                writers.push(ConcurrentWriter {
+                    ordinal,
+                    selected,
+                    actor,
+                    early_outcome: None,
+                });
+            }
+            await_concurrent_append_holds(context, &mut writers, progress_deadline)?;
+            context.action("all three exact INSERTs reached append hold before any KILL");
+            Ok(())
+        })();
+
+        // Do not return early after one cancellation or join fails: every actor
+        // admitted above retains its original connection and requires settlement.
+        let mut result = progress;
+        let deadline = context.deadline();
+        for writer in &writers {
+            if writer.early_outcome.is_none() {
+                let cancelled = context
+                    .handle()
+                    .kill_query_until(writer.actor.connection_id, deadline)
+                    .with_context(|| {
+                        format!("cancel original concurrent writer {}", writer.ordinal)
+                    });
+                result = writer_statement_actor::combine(result, cancelled);
+            }
+        }
+        for writer in writers {
+            let ordinal = writer.ordinal;
+            let outcome =
+                match writer.early_outcome {
+                    Some(outcome) => Ok(outcome),
+                    None => context
+                        .remaining("receive original concurrent writer cancellation")
+                        .and_then(|remaining| {
+                            writer.actor.done.recv_timeout(remaining).with_context(|| {
+                                format!("concurrent writer {ordinal} did not finish")
+                            })
+                        }),
+                };
+            let settled = writer.actor.settle(context, outcome).and_then(|outcome| {
+                match outcome {
+                    Err(mysql::Error::MySqlError(error))
+                        if error.code == 1317 && error.state == "70100" => Ok(()),
+                    other => bail!(
+                        "concurrent writer {ordinal} must return its public KILL cancellation: {other:?}"
+                    ),
+                }
+            });
+            result = writer_statement_actor::combine(result, settled);
+        }
+        let faults = context.handle().clear_query_lifecycle_faults();
+        result = writer_statement_actor::combine(result, faults);
+        let convergence =
+            await_resource_convergence(context, &baseline, "all original concurrent writers");
+        writer_statement_actor::combine(result, convergence)
+    }
+}
+
+fn await_concurrent_append_holds(
+    context: &mut ScenarioContext,
+    writers: &mut [ConcurrentWriter],
+    deadline: Instant,
+) -> Result<()> {
+    let mut hit = vec![false; writers.len()];
+    loop {
+        for writer in writers.iter_mut() {
+            match writer.actor.done.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Ok(outcome) => {
+                    let detail = format!("{outcome:?}");
+                    writer.early_outcome = Some(outcome);
+                    bail!(
+                        "concurrent writer {} became terminal before all three held: {detail}",
+                        writer.ordinal
+                    );
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    bail!(
+                        "concurrent writer {} disconnected before all held",
+                        writer.ordinal
+                    );
+                }
+            }
+            hit[writer.ordinal] = context.handle().selected_query_lifecycle_fault_hit(
+                writer.ordinal,
+                CONCURRENT_APPEND_HOLD,
+                &writer.selected.token,
+            )?;
+        }
+        if hit.iter().all(|value| *value) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "three INSERTs did not independently reach append hold with one blocking worker; exact hits={hit:?}"
+        );
+        thread::sleep(
+            Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
 }
 
 /// Proves the shape the design is actually about: writers on more than one
