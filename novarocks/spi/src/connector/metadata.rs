@@ -1503,8 +1503,93 @@ impl ConnectorReadReferenceFacts {
     }
 }
 
+/// The completed physical observation of one table load. This value contains
+/// provider facts only: no callback, pending I/O future, or schema observer.
+/// It is consumed once by the same provider's synchronous schema author.
+/// Allocating this carrier grants no resource capacity.
+pub struct ConnectorTablePreparation {
+    owner: ConnectorInstanceId,
+    facts: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl ConnectorTablePreparation {
+    pub fn new<T: std::any::Any + Send + Sync>(owner: ConnectorInstanceId, facts: T) -> Self {
+        Self {
+            owner,
+            facts: Box::new(facts),
+        }
+    }
+
+    /// Providers must also validate their private exact-generation fence.
+    pub fn into_facts<T: std::any::Any + Send + Sync>(
+        self,
+        owner: &ConnectorInstanceId,
+    ) -> Result<T, ConnectorError> {
+        if &self.owner != owner {
+            return Err(ConnectorError::new(
+                super::ConnectorErrorKind::InvalidRequest,
+                "table preparation belongs to another connector instance",
+            ));
+        }
+        self.facts.downcast::<T>().map(|facts| *facts).map_err(|_| {
+            ConnectorError::new(
+                super::ConnectorErrorKind::InvalidRequest,
+                "table preparation belongs to another provider author",
+            )
+        })
+    }
+}
+
+impl std::fmt::Debug for ConnectorTablePreparation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectorTablePreparation")
+            .field("owner", &self.owner)
+            .finish_non_exhaustive()
+    }
+}
+
+pub type ConnectorTablePreparationFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<ConnectorTablePreparation, ConnectorError>>
+            + Send
+            + 'a,
+    >,
+>;
+
 pub trait ConnectorMetadata: Send + Sync {
     fn instance_id(&self) -> &ConnectorInstanceId;
+
+    /// Await the original provider's real I/O before borrowing any synchronous
+    /// schema-creation observer. No implementation may call the legacy joining
+    /// load as an async fallback.
+    fn prepare_table(&self, request: ConnectorTableRequest) -> ConnectorTablePreparationFuture<'_> {
+        Box::pin(async move {
+            let _ = request;
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector does not support asynchronous table preparation",
+            ))
+        })
+    }
+
+    /// Create the same public schema and opaque handle from already observed
+    /// facts. This stage performs no external I/O and retains no observer.
+    fn create_prepared_table(
+        &self,
+        preparation: ConnectorTablePreparation,
+        creation: &mut super::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        let _ = (preparation, creation);
+        Err(ConnectorError::new(
+            super::ConnectorErrorKind::Unsupported,
+            "connector does not support prepared table schema creation",
+        )
+        .into())
+    }
 
     /// Admit a statement-submitted table job before any job state or external
     /// mutation is created. AwaitTerminal requires waiting for actual exit,
@@ -1636,6 +1721,31 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
+
+    #[test]
+    fn prepared_table_facts_exit_once_on_wrong_owner_or_wrong_author() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Facts(Arc<AtomicUsize>);
+        impl Drop for Facts {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let owner = ConnectorInstanceId::parse("prepared-owner").unwrap();
+        let other = ConnectorInstanceId::parse("other-owner").unwrap();
+        let exits = Arc::new(AtomicUsize::new(0));
+        let preparation = ConnectorTablePreparation::new(owner.clone(), Facts(Arc::clone(&exits)));
+        assert!(preparation.into_facts::<Facts>(&other).is_err());
+        assert_eq!(exits.load(Ordering::SeqCst), 1);
+        let preparation = ConnectorTablePreparation::new(owner.clone(), Facts(Arc::clone(&exits)));
+        assert!(preparation.into_facts::<()>(&owner).is_err());
+        assert_eq!(exits.load(Ordering::SeqCst), 2);
+        let preparation = ConnectorTablePreparation::new(owner.clone(), Facts(Arc::clone(&exits)));
+        let facts = preparation.into_facts::<Facts>(&owner).unwrap();
+        assert_eq!(exits.load(Ordering::SeqCst), 2);
+        drop(facts);
+        assert_eq!(exits.load(Ordering::SeqCst), 3);
+    }
 
     fn typed_catalog_header() -> ConnectorTableMetadataHeader {
         let instance_id = ConnectorInstanceId::parse("typed-catalog").unwrap();

@@ -610,6 +610,70 @@ impl ConnectorMetadata for IcebergMetadata {
         Ok(binding)
     }
 
+    fn prepare_table(
+        &self,
+        request: ConnectorTableRequest,
+    ) -> novarocks_spi::connector::ConnectorTablePreparationFuture<'_> {
+        Box::pin(async move {
+            self.validate_context(&request.context)?;
+            self.ensure_owner(&request.table.instance_id)?;
+            let (table_name, metadata_table_type) =
+                resolve_table_request(&request.table.table, request.resolution)?;
+            self.runtime
+                .control_state()
+                .invalidate_table(&request.table.namespace, &table_name);
+            let loaded = self
+                .runtime
+                .observe_table_classified_for_request_with_snapshots_async(
+                    &request.table.namespace,
+                    &table_name,
+                    &request.context,
+                    if metadata_table_type.is_none() {
+                        crate::catalog::SnapshotLoading::Refs
+                    } else {
+                        crate::catalog::SnapshotLoading::All
+                    },
+                )
+                .await
+                .map_err(classified_control_error)?;
+            Ok(novarocks_spi::connector::ConnectorTablePreparation::new(
+                self.descriptor.instance_id.clone(),
+                IcebergPreparedTableFacts {
+                    request,
+                    loaded,
+                    table_name,
+                    metadata_table_type,
+                    incarnation: self.incarnation,
+                    generation_owner: Arc::clone(&self.generation_owner),
+                },
+            ))
+        })
+    }
+
+    fn create_prepared_table(
+        &self,
+        preparation: novarocks_spi::connector::ConnectorTablePreparation,
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        let facts =
+            preparation.into_facts::<IcebergPreparedTableFacts>(&self.descriptor.instance_id)?;
+        if facts.incarnation != self.incarnation
+            || !Arc::ptr_eq(&facts.generation_owner, &self.generation_owner)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg table preparation belongs to another exact generation",
+            )
+            .into());
+        }
+        creation.work(1)?;
+        self.validate_context(&facts.request.context)?;
+        self.create_table_from_observation(facts, creation)
+    }
+
     fn load_table(
         &self,
         request: ConnectorTableRequest,
@@ -643,6 +707,45 @@ impl ConnectorMetadata for IcebergMetadata {
                 },
             )
             .map_err(classified_control_error)?;
+        self.create_table_from_observation(
+            IcebergPreparedTableFacts {
+                request,
+                loaded,
+                table_name,
+                metadata_table_type,
+                incarnation: self.incarnation,
+                generation_owner: Arc::clone(&self.generation_owner),
+            },
+            creation,
+        )
+    }
+}
+
+struct IcebergPreparedTableFacts {
+    request: ConnectorTableRequest,
+    loaded: crate::loaded_table::IcebergPhysicalTable,
+    table_name: String,
+    metadata_table_type: Option<MetadataTableType>,
+    incarnation: ProviderBindingEpoch,
+    generation_owner: Arc<GenerationOwner>,
+}
+
+impl IcebergMetadata {
+    fn create_table_from_observation(
+        &self,
+        facts: IcebergPreparedTableFacts,
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        let IcebergPreparedTableFacts {
+            request,
+            loaded,
+            table_name,
+            metadata_table_type,
+            ..
+        } = facts;
         let metadata = loaded.table.metadata();
         let definition_schema = metadata.current_schema().clone();
         let table_comment = metadata.properties().get("comment").cloned();
@@ -2336,6 +2439,95 @@ mod plan_splits_pruning_tests {
             runtime,
         );
         (executor, warehouse, provider)
+    }
+
+    #[test]
+    fn completed_async_observation_creates_the_original_schema_without_further_io() {
+        use crate::catalog::CatalogNamespaceName;
+        use crate::catalog::catalog_request::CatalogPublicationRequest;
+        use crate::catalog::error::CatalogOutcome;
+        use crate::iceberg::TableCreation;
+        let (executor, warehouse, metadata) = provider();
+        let (_other_executor, _other_warehouse, other_generation) = provider();
+        let (prepared, foreign) = executor.block_on(async {
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                &metadata.runtime,
+                metadata.incarnation,
+                CatalogPublicationRequest::CreateNamespace {
+                    namespace: CatalogNamespaceName::new("prepared_test"),
+                    properties: HashMap::new(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
+            let schema = Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .unwrap();
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                &metadata.runtime,
+                metadata.incarnation,
+                CatalogPublicationRequest::CreateTable {
+                    namespace: CatalogNamespaceName::new("prepared_test"),
+                    creation: TableCreation::builder()
+                        .name("t".into())
+                        .schema(schema)
+                        .format_version(FormatVersion::V2)
+                        .build(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
+            let request = ConnectorTableRequest {
+                table: ConnectorTableIdentity {
+                    instance_id: metadata.descriptor.instance_id.clone(),
+                    namespace: "prepared_test".into(),
+                    table: "t".into(),
+                },
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context: context(),
+            };
+            let prepared = metadata.prepare_table(request.clone()).await.unwrap();
+            let foreign = metadata.prepare_table(request).await.unwrap();
+            (prepared, foreign)
+        });
+        // Real local catalog/file I/O has finished. A schema creator must now
+        // use that observation even when the original storage disappears.
+        std::fs::remove_dir_all(warehouse.path()).unwrap();
+        let mut request = |_: std::alloc::Layout| Ok(());
+        let mut work = |_: usize| Ok(());
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut work,
+        );
+        assert!(
+            other_generation
+                .create_prepared_table(foreign, &mut creation)
+                .is_err()
+        );
+        let table = metadata
+            .create_prepared_table(prepared, &mut creation)
+            .unwrap();
+        assert_eq!(table.identity.namespace.as_ref(), "prepared_test");
+        assert_eq!(table.identity.table.as_ref(), "t");
+        assert_eq!(table.schema().field(0).name(), "id");
+        let payload = metadata.table_payload(&table.table).unwrap();
+        assert_eq!(payload.namespace, "prepared_test");
+        assert_eq!(payload.table, "t");
+        assert!(payload.table_info.unwrap().table_uuid.is_some());
     }
 
     #[test]
