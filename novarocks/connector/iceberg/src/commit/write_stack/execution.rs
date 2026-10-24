@@ -201,12 +201,28 @@ fn staged_path(
     }
 }
 
+/// Local deletion authority ends at successful sealing, before any fragment
+/// escapes. A failed or interrupted finish remains owned and abortable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriterLifecycle {
+    Live,
+    Finishing,
+    Sealed,
+    Aborting,
+    Aborted,
+}
+impl WriterLifecycle {
+    fn can_abort(self) -> bool {
+        matches!(self, Self::Live | Self::Finishing | Self::Aborting)
+    }
+}
+
 fn ensure_live(
-    terminal: bool,
+    lifecycle: WriterLifecycle,
     context: &ConnectorRequestContext,
     what: &str,
 ) -> Result<(), ConnectorError> {
-    if terminal {
+    if lifecycle != WriterLifecycle::Live {
         return Err(error(
             ConnectorErrorKind::InvalidRequest,
             format!("Iceberg {what} writer is already terminal"),
@@ -234,7 +250,7 @@ struct IcebergDataStackWriter {
     request_context: ConnectorRequestContext,
     fragments: Vec<ConnectorCommitFragment>,
     staged_paths: Vec<String>,
-    terminal: bool,
+    lifecycle: WriterLifecycle,
 }
 
 impl IcebergDataStackWriter {
@@ -280,7 +296,7 @@ impl IcebergDataStackWriter {
             request_context: request.context,
             fragments: Vec::new(),
             staged_paths: Vec::new(),
-            terminal: false,
+            lifecycle: WriterLifecycle::Live,
         })
     }
 
@@ -366,7 +382,7 @@ impl IcebergDataStackWriter {
 #[async_trait::async_trait]
 impl ConnectorBatchWriter for IcebergDataStackWriter {
     async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
-        ensure_live(self.terminal, &self.request_context, "data")?;
+        ensure_live(self.lifecycle, &self.request_context, "data")?;
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -377,22 +393,28 @@ impl ConnectorBatchWriter for IcebergDataStackWriter {
     }
 
     async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
-        ensure_live(self.terminal, &self.request_context, "data")?;
-        self.terminal = true;
+        ensure_live(self.lifecycle, &self.request_context, "data")?;
+        self.lifecycle = WriterLifecycle::Sealed;
         // A writer that staged nothing returns an empty vector; that is a
         // legal outcome and is not a failure.
         Ok(std::mem::take(&mut self.fragments))
     }
 
     async fn abort(&mut self) -> Result<(), ConnectorError> {
-        if !self.staged_paths.is_empty() {
-            let paths = std::mem::take(&mut self.staged_paths);
-            cleanup_staged_files(&self.context, &paths)
+        if !self.lifecycle.can_abort() {
+            return Ok(());
+        }
+        self.lifecycle = WriterLifecycle::Aborting;
+        // Keep each original path until its own deletion is observed. Failed
+        // cleanup or a dropped wait never erases the remaining responsibility.
+        while let Some(path) = self.staged_paths.last().cloned() {
+            cleanup_staged_files(&self.context, std::slice::from_ref(&path))
                 .await
                 .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
+            self.staged_paths.pop();
         }
         self.fragments.clear();
-        self.terminal = true;
+        self.lifecycle = WriterLifecycle::Aborted;
         Ok(())
     }
 }
@@ -412,7 +434,7 @@ struct IcebergDeleteStackWriter {
     pending: BTreeMap<String, roaring::RoaringTreemap>,
     staged_paths: Vec<String>,
     next_sequence: u64,
-    terminal: bool,
+    lifecycle: WriterLifecycle,
 }
 
 impl IcebergDeleteStackWriter {
@@ -434,7 +456,7 @@ impl IcebergDeleteStackWriter {
             pending: BTreeMap::new(),
             staged_paths: Vec::new(),
             next_sequence: 0,
-            terminal: false,
+            lifecycle: WriterLifecycle::Live,
         })
     }
 
@@ -578,15 +600,15 @@ impl IcebergDeleteStackWriter {
         if self.staged_paths.is_empty() {
             return Ok(());
         }
-        let paths = std::mem::take(&mut self.staged_paths);
         let file_io = self.file_io.clone();
-        for path in &paths {
-            file_io.delete(path).await.map_err(|delete_error| {
+        while let Some(path) = self.staged_paths.last().cloned() {
+            file_io.delete(&path).await.map_err(|delete_error| {
                 error(
                     ConnectorErrorKind::Internal,
                     format!("cleanup staged Iceberg delete artifact {path}: {delete_error}"),
                 )
             })?;
+            self.staged_paths.pop();
         }
         Ok(())
     }
@@ -595,7 +617,7 @@ impl IcebergDeleteStackWriter {
 #[async_trait::async_trait]
 impl ConnectorBatchWriter for IcebergDeleteStackWriter {
     async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
-        ensure_live(self.terminal, &self.request_context, self.branch_name())?;
+        ensure_live(self.lifecycle, &self.request_context, self.branch_name())?;
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -671,8 +693,8 @@ impl ConnectorBatchWriter for IcebergDeleteStackWriter {
     }
 
     async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
-        ensure_live(self.terminal, &self.request_context, self.branch_name())?;
-        self.terminal = true;
+        ensure_live(self.lifecycle, &self.request_context, self.branch_name())?;
+        self.lifecycle = WriterLifecycle::Finishing;
         let pending = std::mem::take(&mut self.pending);
         let mut fragments = Vec::with_capacity(pending.len());
         for (data_file, new_positions) in pending {
@@ -718,13 +740,18 @@ impl ConnectorBatchWriter for IcebergDeleteStackWriter {
             };
             fragments.push(self.adapter.wrap_commit_fragment(fragment));
         }
+        self.lifecycle = WriterLifecycle::Sealed;
         Ok(fragments)
     }
 
     async fn abort(&mut self) -> Result<(), ConnectorError> {
+        if !self.lifecycle.can_abort() {
+            return Ok(());
+        }
+        self.lifecycle = WriterLifecycle::Aborting;
         self.pending.clear();
         self.cleanup().await?;
-        self.terminal = true;
+        self.lifecycle = WriterLifecycle::Aborted;
         Ok(())
     }
 }
@@ -748,7 +775,7 @@ struct IcebergEqualityDeleteStackWriter {
     partition: IcebergArtifactPartition,
     fragments: Vec<ConnectorCommitFragment>,
     staged_paths: Vec<String>,
-    terminal: bool,
+    lifecycle: WriterLifecycle,
 }
 
 impl IcebergEqualityDeleteStackWriter {
@@ -796,7 +823,7 @@ impl IcebergEqualityDeleteStackWriter {
             partition,
             fragments: Vec::new(),
             staged_paths: Vec::new(),
-            terminal: false,
+            lifecycle: WriterLifecycle::Live,
         })
     }
 
@@ -804,15 +831,15 @@ impl IcebergEqualityDeleteStackWriter {
         if self.staged_paths.is_empty() {
             return Ok(());
         }
-        let paths = std::mem::take(&mut self.staged_paths);
         let file_io = self.file_io.clone();
-        for path in &paths {
-            file_io.delete(path).await.map_err(|delete_error| {
+        while let Some(path) = self.staged_paths.last().cloned() {
+            file_io.delete(&path).await.map_err(|delete_error| {
                 error(
                     ConnectorErrorKind::Internal,
                     format!("cleanup staged Iceberg equality-delete file {path}: {delete_error}"),
                 )
             })?;
+            self.staged_paths.pop();
         }
         Ok(())
     }
@@ -821,7 +848,7 @@ impl IcebergEqualityDeleteStackWriter {
 #[async_trait::async_trait]
 impl ConnectorBatchWriter for IcebergEqualityDeleteStackWriter {
     async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
-        ensure_live(self.terminal, &self.request_context, "equality-delete")?;
+        ensure_live(self.lifecycle, &self.request_context, "equality-delete")?;
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -858,15 +885,22 @@ impl ConnectorBatchWriter for IcebergEqualityDeleteStackWriter {
     }
 
     async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
-        ensure_live(self.terminal, &self.request_context, "equality-delete")?;
-        self.terminal = true;
+        ensure_live(self.lifecycle, &self.request_context, "equality-delete")?;
+        self.lifecycle = WriterLifecycle::Sealed;
         Ok(std::mem::take(&mut self.fragments))
     }
 
     async fn abort(&mut self) -> Result<(), ConnectorError> {
+        if !self.lifecycle.can_abort() {
+            return Ok(());
+        }
+        self.lifecycle = WriterLifecycle::Aborting;
         self.cleanup().await?;
         self.fragments.clear();
-        self.terminal = true;
+        self.lifecycle = WriterLifecycle::Aborted;
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod seal_tests;
