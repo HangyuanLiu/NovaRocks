@@ -384,6 +384,11 @@ impl PaimonFixture {
         let bindings = Arc::new(QueryTableBindingStore::try_new().expect("binding store"));
         let blocking = ConnectorBlockingIoSupervisor::new(self.runtime.handle().clone());
         let (_root, _query_permit, scope, capacity) = query_scope(&self.runtime);
+        // Explicit fault/protocol fixture: same bounded production factory,
+        // without a joint source or finite protection qualification.
+        let mut provider_cpu =
+            crate::query_execution::internal_result_cpu::InternalResultCpuOwner::try_new_for_test()
+                .unwrap();
         let source = QueryCompletionFactSource::new(
             Arc::new(FixtureCatalogFacts {
                 host: Arc::clone(&self.host),
@@ -398,21 +403,29 @@ impl PaimonFixture {
                 blocking: blocking.clone(),
             }),
             Arc::new(NoMaterializedViews),
-            Arc::new(FrontendProviderReadFacts::new(
-                Arc::clone(&self.host),
-                bindings,
-                crate::query_execution::compiler::typed_connector_session()
-                    .expect("connector session"),
-                context,
-                blocking,
-                capacity,
-            )),
+            Arc::new(
+                FrontendProviderReadFacts::new(
+                    Arc::clone(&self.host),
+                    bindings,
+                    crate::query_execution::compiler::typed_connector_session()
+                        .expect("connector session"),
+                    context,
+                    blocking,
+                    capacity,
+                )
+                .for_cpu_fixture(provider_cpu.runtime()),
+            ),
         );
-        self.runtime
+        let completed = self
+            .runtime
             .block_on(
                 FinalPlanCompletionDriver::new(Arc::new(source)).complete(request_for(sql), &scope),
             )
-            .unwrap_or_else(|failure| panic!("{sql}: completes against Paimon: {failure}"))
+            .unwrap_or_else(|failure| panic!("{sql}: completes against Paimon: {failure}"));
+        self.runtime
+            .block_on(provider_cpu.shutdown_until(Instant::now() + Duration::from_secs(5)))
+            .unwrap();
+        completed
     }
 }
 

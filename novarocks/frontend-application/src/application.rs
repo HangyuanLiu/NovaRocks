@@ -429,6 +429,14 @@ impl FrontendExecutionRuntimeOwner {
                 },
             )?;
         let internal_result_cpu_runtime = internal_result_cpu.runtime();
+        connector_blocking_io
+            .install_provider_creator_cpu(internal_result_cpu_runtime.clone())
+            .map_err(|error| {
+                FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::InternalResultCpuOpen,
+                    error.to_string(),
+                )
+            })?;
         // Actual pool/factory capture precedes starting the logical-role service.
         let native_capacity_sources = native_capacity_profile
             .capture_sources(
@@ -633,11 +641,11 @@ impl FrontendExecutionRuntimeOwner {
                     "frontend joint progress service terminated before workload drain".to_string(),
                 );
             }
-            if let Some(error) = self.connector_blocking_io.take_original_failure() {
-                // Keep arbitrary provider payload destruction off the Host
-                // future and hold its original backing until actual join.
-                self.record_terminal_error(error.to_string());
-                self.connector_blocking_io.retire_original_failure(error);
+            if let Some(detail) = self.connector_blocking_io.original_failure_detail() {
+                // Raw cause/backing stays in its original owner. Arbitrary Any
+                // destruction is not a new unbounded cleanup job or exit proof.
+                self.record_terminal_error(detail);
+                return Err("original Connector failure remains unresolved".to_owned());
             }
             let revision = self
                 .workload
@@ -2871,7 +2879,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn host_drain_consumes_an_unclaimed_original_panic_before_releasing_its_window() {
+    async fn host_drain_keeps_opaque_cause_until_explicit_original_disposition() {
         use crate::task_execution::blocking_io::ConnectorBlockingIoResponsibility;
         struct Payload {
             destroyed: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2951,6 +2959,17 @@ mod tests {
         let shutdown_elapsed = began.elapsed();
         let payload_started_by_deadline = !payload_entered.is_empty();
         let held = host.execution_runtime_owner.workload_observation.snapshot();
+        let before_disposition_destroyed = destroyed.load(std::sync::atomic::Ordering::Acquire);
+        // Explicit legacy fixture disposition, not production Host policy:
+        // ordinary shutdown must leave this original opaque cause untouched.
+        let same_original = host
+            .connector_blocking_io_supervisor()
+            .take_original_failure();
+        let retained_original = same_original.is_some();
+        if let Some(original) = same_original {
+            host.connector_blocking_io_supervisor()
+                .retire_original_failure(original);
+        }
         let _ = release_payload.send(());
         let _ = disarm_watchdog.send(());
         let watchdog_joined = watchdog.join().is_ok();
@@ -2967,7 +2986,12 @@ mod tests {
             .await
             .expect("cleaned Host remains closed");
         assert!(callback_entered && failure_published && payload_entered && watchdog_joined);
-        assert!(blocked.is_err() && payload_started_by_deadline);
+        assert!(
+            blocked.is_err()
+                && !payload_started_by_deadline
+                && !before_disposition_destroyed
+                && retained_original
+        );
         assert!(
             shutdown_elapsed < Duration::from_millis(500),
             "Host deadline blocked on its original panic payload destructor: {shutdown_elapsed:?}"

@@ -116,6 +116,9 @@ pub(crate) enum InternalDomainCompletion {
 }
 
 pub(crate) enum InternalDomainSlot {
+    // Only a closed worker completion marker. Provider facts/capabilities stay
+    // in its original packet, never disguised as a result domain payload.
+    ProviderCreatorFinished,
     Collecting {
         state: Box<InternalDomainState>,
         receipt: Option<u64>,

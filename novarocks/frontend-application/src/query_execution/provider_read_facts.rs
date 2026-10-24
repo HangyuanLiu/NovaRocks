@@ -36,6 +36,13 @@
 
 use novarocks_query_application::api::RuntimeSplitPlacement;
 
+use super::internal_result_cpu::{InternalResultCpu, ProviderCreatorCpuSource, ProviderReadCpuJob};
+use crate::task_execution::blocking_io::{
+    ConnectorBlockingIoAdmission, ConnectorBlockingIoResponsibility,
+};
+use crate::task_execution::status_intake::StatusIntakeWake;
+use futures::task::AtomicWaker;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
@@ -156,10 +163,36 @@ pub(crate) struct FrontendProviderReadFacts {
     context: ConnectorRequestContext,
     blocking: ConnectorBlockingIoSupervisor,
     capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    source: tokio::sync::Mutex<ProviderCreatorSource>,
+    closing: AtomicBool,
+    wake: Arc<ProviderCreatorWake>,
+    #[cfg(test)]
+    fixture_cpu: Option<InternalResultCpu>,
+}
+
+#[derive(Default)]
+struct ProviderCreatorSource {
+    admission: Option<ConnectorBlockingIoAdmission>,
+    responsibility: Option<ConnectorBlockingIoResponsibility>,
+    prepared: Option<PreparedProviderRead>,
+    job: Option<ProviderReadCpuJob>,
+    result: Option<Result<ProviderReadFact, String>>,
+}
+#[derive(Default)]
+struct ProviderCreatorWake(AtomicWaker);
+impl std::fmt::Debug for ProviderCreatorWake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProviderCreatorWake")
+    }
+}
+impl StatusIntakeWake for ProviderCreatorWake {
+    fn wake(&self) {
+        self.0.wake();
+    }
 }
 
 impl FrontendProviderReadFacts {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         control: Arc<ConnectorControlHost>,
         bindings: Arc<QueryTableBindingStore>,
         session: ConnectorSession,
@@ -174,7 +207,59 @@ impl FrontendProviderReadFacts {
             context,
             blocking,
             capacity,
+            source: tokio::sync::Mutex::new(ProviderCreatorSource::default()),
+            closing: AtomicBool::new(false),
+            wake: Arc::new(ProviderCreatorWake::default()),
+            #[cfg(test)]
+            fixture_cpu: None,
         }
+    }
+    /// Explicit unqualified Counted fixture. Production never takes this path.
+    #[cfg(test)]
+    pub(crate) fn for_cpu_fixture(mut self, cpu: InternalResultCpu) -> Self {
+        self.fixture_cpu = Some(cpu);
+        self
+    }
+    pub(crate) fn begin_local_close(&self) {
+        self.closing.store(true, Ordering::Release);
+        self.wake.wake();
+    }
+    /// This borrows the same source/job. Cancelling this wait never detaches or
+    /// replaces its original worker receipt or forwarder JoinHandle.
+    pub(crate) async fn join_local_closed(
+        &self,
+    ) -> Result<(), Arc<dyn std::error::Error + Send + Sync>> {
+        self.begin_local_close();
+        let mut source = self.source.lock().await;
+        if let Some(job) = source.job.as_mut() {
+            job.close().await?;
+        }
+        source.job.take();
+        source.prepared.take();
+        source.admission.take();
+        source.responsibility.take();
+        Ok(())
+    }
+    /// Pure known first-party header facts. Self already includes the private
+    /// body; its inline fields are not counted again as separate allocations.
+    pub(crate) fn known_source_layouts() -> Result<
+        [std::alloc::Layout; 2],
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+    > {
+        use novarocks_type_contract::owned_resources::layout::arc_layout;
+        Ok([
+            arc_layout(std::alloc::Layout::new::<Self>())?,
+            arc_layout(std::alloc::Layout::new::<ProviderCreatorWake>())?,
+        ])
+    }
+    pub(crate) async fn local_health_failure(
+        &self,
+    ) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+        let source = self.source.lock().await;
+        source
+            .job
+            .as_ref()
+            .and_then(ProviderReadCpuJob::health_failure)
     }
 }
 
@@ -192,36 +277,142 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
         taken: &ReadAccessSink<Self::Access>,
     ) -> Result<Vec<ProviderReadFact>, String> {
         let mut facts = Vec::with_capacity(needs.len());
+        // One original Source serializes its pure creators. This private body
+        // lock is never acquired by the worker; no WC/Core/registry lock spans
+        // Provider calls, publication, notification, actual Drop or an await.
+        let mut source = self.source.lock().await;
         for need in needs {
-            let need = need.clone();
-            let deposits = taken.deposits();
-            let session = self.session.clone();
-            let context = self.context.clone();
-            let prepared = prepare_one_read(
-                need,
+            if self.closing.load(Ordering::Acquire) {
+                return Err("provider read source is closing".into());
+            }
+            // An interrupted previous borrow is not another request. Its same
+            // job/output/cause must be observed/closed by this original owner.
+            if source.job.is_some() || source.prepared.is_some() {
+                return Err("provider read source has an unresolved creator".into());
+            }
+            let cpu = {
+                #[cfg(test)]
+                if let Some(cpu) = &self.fixture_cpu {
+                    cpu.clone()
+                } else {
+                    self.blocking
+                        .provider_creator_cpu()
+                        .map_err(|e| e.to_string())?
+                }
+                #[cfg(not(test))]
+                self.blocking
+                    .provider_creator_cpu()
+                    .map_err(|e| e.to_string())?
+            };
+            let fixture = {
+                #[cfg(test)]
+                {
+                    self.fixture_cpu.is_some()
+                }
+                #[cfg(not(test))]
+                {
+                    false
+                }
+            };
+            if fixture {
+                source.responsibility = Some(
+                    ConnectorBlockingIoResponsibility::admit(
+                        self.capacity.scope(),
+                        &self.capacity.window_alias(),
+                    )
+                    .map_err(|e| e.to_string())?,
+                );
+            } else {
+                if source.admission.is_none() {
+                    source.admission = Some(
+                        ConnectorBlockingIoResponsibility::request(
+                            self.capacity.scope(),
+                            &self.capacity.window_alias(),
+                        )
+                        .map_err(|e| e.to_string())?,
+                    );
+                }
+                source.responsibility = Some(
+                    source
+                        .admission
+                        .as_mut()
+                        .expect("same child request")
+                        .ready()
+                        .await
+                        .map_err(|e| e.to_string())?,
+                );
+                source.admission.take();
+            }
+            // Original admission precedes need/context/deposit capture. The
+            // original opening remains in this source across async prepare.
+            source.prepared = Some(begin_one_read(
+                need.clone(),
                 self.control.as_ref(),
                 self.bindings.as_ref(),
-                &session,
-                &context,
+                &self.context,
+            )?);
+            prepare_observation(
+                source.prepared.as_mut().expect("stable opening"),
+                &self.session,
             )
             .await?;
-            let fact = self
-                .blocking
-                .spawn_admitted(
-                    self.capacity.scope(),
-                    &self.capacity.window_alias(),
-                    move || finish_prepared_read(prepared, &session, &context, &deposits),
+            let responsibility = source.responsibility.as_ref().expect("same original child");
+            let scope = responsibility.scope().map_err(|e| e.to_string())?;
+            #[cfg(test)]
+            let action = if fixture {
+                ProviderCreatorCpuSource::UnqualifiedFixture
+            } else {
+                ProviderCreatorCpuSource::Bound(
+                    cpu.provider_creator_source(&scope)
+                        .map_err(|e| e.to_string())?,
                 )
-                .map_err(|error| format!("frontend provider read admission: {error}"))?
-                .finish()
-                .await
-                .map_err(|error| {
-                    format!(
-                        "frontend provider read lane: {}",
-                        self.blocking.present_and_retire_failure(error)
-                    )
-                })??;
-            facts.push(fact);
+            };
+            #[cfg(not(test))]
+            let action = ProviderCreatorCpuSource::Bound(
+                cpu.provider_creator_source(&scope)
+                    .map_err(|e| e.to_string())?,
+            );
+            let window = responsibility.window().map_err(|e| e.to_string())?;
+            let backing = responsibility.retain_backing();
+            let cancellation =
+                novarocks_query_application::cancellation::QueryCancellationView::governed(
+                    scope.cancellation().map_err(|e| e.to_string())?,
+                    None,
+                );
+            let input = ProviderReadCreatorInput::new(
+                source.prepared.take().expect("stable prepared input"),
+                self.session.clone(),
+                self.context.clone(),
+                taken.deposits(),
+            );
+            source.job = Some(cpu.submit_provider_creator(
+                input,
+                window,
+                backing,
+                action,
+                cancellation,
+                &tokio::runtime::Handle::current(),
+                self.wake.clone(),
+            ));
+            let ProviderCreatorSource { job, result, .. } = &mut *source;
+            std::future::poll_fn(|cx| {
+                self.wake.0.register(cx.waker());
+                job.as_mut()
+                    .expect("stable original CPU job")
+                    .poll_finish_in(cx, result)
+            })
+            .await
+            .map_err(|_| "original provider creator failure remains in its source".to_owned())?;
+            // Result is already stable before input/worker retirement callbacks.
+            // Only a genuinely joined, healthy original job is removed here.
+            source.job.take();
+            source.responsibility.take();
+            facts.push(
+                source
+                    .result
+                    .take()
+                    .expect("same original result receiver")?,
+            );
         }
         Ok(facts)
     }
@@ -398,29 +589,46 @@ enum ReadObservation {
 /// Completed physical facts and exact original request/generation. SDK facts
 /// exit before opening; a frozen original source is adopted only in the pure job.
 pub(crate) struct PreparedProviderRead {
-    observation: ReadObservation,
+    observation: Option<ReadObservation>,
     opening: ReadOpening,
     need: ProviderReadNeed,
 }
 
-pub(crate) async fn prepare_one_read(
+fn begin_one_read(
     need: ProviderReadNeed,
     control: &ConnectorControlHost,
     bindings: &QueryTableBindingStore,
-    session: &ConnectorSession,
     context: &ConnectorRequestContext,
 ) -> Result<PreparedProviderRead, String> {
+    let opening = prepare_read_opening(&need, control, bindings, context)?;
+    Ok(PreparedProviderRead {
+        observation: None,
+        opening,
+        need,
+    })
+}
+async fn prepare_observation(
+    prepared: &mut PreparedProviderRead,
+    session: &ConnectorSession,
+) -> Result<(), String> {
     use crate::catalog_application::query_bindings::QueryFrozenCohortRead;
     use novarocks_spi::connector::read_stack::{
         ConnectorReadRelationPreparationKind as K,
         ConnectorReadRelationPreparationRequest as Request,
     };
-    let opening = prepare_read_opening(&need, control, bindings, context)?;
+    let PreparedProviderRead {
+        need,
+        opening,
+        observation,
+    } = prepared;
+    if observation.is_some() {
+        return Ok(());
+    }
     let kind = if let AdmittedRead::Cohort(cohort) = &opening.admitted {
         match (need.relation(),cohort) {
             (ProviderReadRelationNeed::PinnedFileSet { .. },QueryFrozenCohortRead::PinnedFileSet(read)) => {
                 if read.frozen_source.is_some() {
-                    return Ok(PreparedProviderRead { need,observation:ReadObservation::OriginalFrozenSource,opening });
+                    *observation=Some(ReadObservation::OriginalFrozenSource); return Ok(());
                 }
                 K::PinnedFileSet { pinned:read.pinned.clone() }
             },
@@ -497,11 +705,8 @@ pub(crate) async fn prepare_one_read(
         .await
         .map_err(|error| relation_open_error(need.relation(), &opening, error))?
         .ok_or_else(|| relation_open_missing(need.relation(), &opening))?;
-    Ok(PreparedProviderRead {
-        need,
-        observation: ReadObservation::Physical(prepared),
-        opening,
-    })
+    *observation = Some(ReadObservation::Physical(prepared));
+    Ok(())
 }
 
 fn relation_open_error(
@@ -567,17 +772,84 @@ fn relation_open_missing(relation: &ProviderReadRelationNeed, opening: &ReadOpen
     }
 }
 
-pub(crate) fn finish_prepared_read(
+/// One closed Provider creator's original stable input/output. The fixed CPU
+/// factory only borrows this value; its request/generation/context and rejected
+/// access are not moved into, or destroyed at the tail of, that worker F.
+/// There is no generic closure or caller-selected finite qualification here.
+pub(crate) struct ProviderReadCreatorInput {
     prepared: PreparedProviderRead,
+    session: ConnectorSession,
+    context: ConnectorRequestContext,
+    deposits: ReadAccessDeposit<FrozenProviderRead>,
+    rejected_access: Option<FrozenReadAccess<FrozenProviderRead>>,
+    result: Option<Result<ProviderReadFact, String>>,
+    started: bool,
+}
+impl ProviderReadCreatorInput {
+    pub(crate) fn new(
+        prepared: PreparedProviderRead,
+        session: ConnectorSession,
+        context: ConnectorRequestContext,
+        deposits: ReadAccessDeposit<FrozenProviderRead>,
+    ) -> Self {
+        Self {
+            prepared,
+            session,
+            context,
+            deposits,
+            rejected_access: None,
+            result: None,
+            started: false,
+        }
+    }
+    /// The same finite factory invokes this once while its original packet
+    /// retains self. A panic poisons this attempt before any foreign callback.
+    pub(crate) fn run_once(&mut self) {
+        assert!(!self.started, "one original Provider creator invocation");
+        self.started = true;
+        let result = finish_prepared_read_borrowed(
+            &mut self.prepared,
+            &self.session,
+            &self.context,
+            &self.deposits,
+            Some(&mut self.rejected_access),
+        );
+        self.result = Some(result);
+    }
+    /// Delivery does not retire this input or its original rejected capability.
+    pub(crate) fn take_result_in(
+        &mut self,
+        target: &mut Option<Result<ProviderReadFact, String>>,
+    ) -> Result<(), &'static str> {
+        if target.is_some() {
+            return Err("Provider creator target is occupied");
+        }
+        if self.result.is_none() {
+            return Err("Provider creator has no completed result");
+        }
+        *target = self.result.take();
+        Ok(())
+    }
+    pub(crate) fn known_input_layout() -> std::alloc::Layout {
+        std::alloc::Layout::new::<Self>()
+    }
+}
+
+fn finish_prepared_read_borrowed(
+    prepared: &mut PreparedProviderRead,
     session: &ConnectorSession,
     context: &ConnectorRequestContext,
     deposits: &ReadAccessDeposit<FrozenProviderRead>,
+    rejected_access: Option<&mut Option<FrozenReadAccess<FrozenProviderRead>>>,
 ) -> Result<ProviderReadFact, String> {
     let PreparedProviderRead {
         need,
         observation,
         opening,
     } = prepared;
+    let observation = observation
+        .take()
+        .ok_or_else(|| "Provider creator observation was already consumed".to_owned())?;
     let metadata = opening.request_control.metadata();
     let opened = match observation {
         ReadObservation::OriginalFrozenSource => open_relation(
@@ -617,7 +889,15 @@ pub(crate) fn finish_prepared_read(
             (handle, placement, kind)
         }
     };
-    finish_read_from_opened(&need, session, context, deposits, opening, opened)
+    finish_read_from_opened(
+        need,
+        session,
+        context,
+        deposits,
+        opening,
+        opened,
+        rejected_access,
+    )
 }
 
 /// Legacy synchronous family author, retained only until every direct caller
@@ -641,7 +921,7 @@ pub(crate) fn freeze_one_read(
         &opening.admitted,
         &opening.name,
     )?;
-    finish_read_from_opened(need, session, context, deposits, opening, opened)
+    finish_read_from_opened(need, session, context, deposits, &opening, opened, None)
 }
 
 fn finish_read_from_opened(
@@ -649,12 +929,13 @@ fn finish_read_from_opened(
     session: &ConnectorSession,
     context: &ConnectorRequestContext,
     deposits: &ReadAccessDeposit<FrozenProviderRead>,
-    opening: ReadOpening,
+    opening: &ReadOpening,
     opened: (
         ConnectorReadTableHandle,
         Option<RuntimeSplitPlacement>,
         Option<ConnectorReadMetadataKind>,
     ),
+    rejected_access: Option<&mut Option<FrozenReadAccess<FrozenProviderRead>>>,
 ) -> Result<ProviderReadFact, String> {
     let relation = need.relation();
     let name = &opening.name;
@@ -774,7 +1055,19 @@ fn finish_read_from_opened(
                 },
             },
         )
-        .map_err(|_| format!("provider read of {name} completed after its plan owner closed"))?;
+        .map_err(|access| {
+            // Original fixed receiver first; no callback or foreign Drop may
+            // destroy the returned capability on the finite CPU worker.
+            if let Some(target) = rejected_access {
+                assert!(target.is_none(), "one original rejected read capability");
+                *target = Some(access);
+            } else {
+                // Legacy synchronous families retain their old contract until
+                // their own stable source/async cutover is completed.
+                drop(access);
+            }
+            format!("provider read of {name} completed after its plan owner closed")
+        })?;
 
     // 7. Project the frozen read into the contract the plan is built against.
     let relation_payload = encoder

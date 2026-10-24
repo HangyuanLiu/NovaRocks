@@ -634,14 +634,20 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )
     .unwrap();
-    let port = FrontendProviderReadFacts::new(
-        host.clone(),
-        bindings.clone(),
-        ConnectorSession::try_new("actual-port", "u", "UTC", "en_US", SystemTime::UNIX_EPOCH)
-            .unwrap(),
-        context,
-        blocking.clone(),
-        capacity.clone(),
+    let mut provider_cpu =
+        crate::query_execution::internal_result_cpu::InternalResultCpuOwner::try_new_for_test()
+            .unwrap();
+    let port = Arc::new(
+        FrontendProviderReadFacts::new(
+            host.clone(),
+            bindings.clone(),
+            ConnectorSession::try_new("actual-port", "u", "UTC", "en_US", SystemTime::UNIX_EPOCH)
+                .unwrap(),
+            context,
+            blocking.clone(),
+            capacity.clone(),
+        )
+        .for_cpu_fixture(provider_cpu.runtime()),
     );
     let column = novarocks_sql::compiler::fixtures::provider_read_column_need(
         0,
@@ -666,9 +672,10 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
     let delivered = Arc::new(AtomicBool::new(false));
     let published = delivered.clone();
     // Only this future owns the real plan sink; its destruction closes deposits.
+    let waiter_port = Arc::clone(&port);
     let mut waiter = runtime.spawn(async move {
         let sink = ReadAccessSink::new();
-        let answer = port.resolve_provider_reads(&[need], &sink).await;
+        let answer = waiter_port.resolve_provider_reads(&[need], &sink).await;
         published.store(true, Ordering::Release);
         (answer, sink.into_taken())
     });
@@ -694,6 +701,8 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
     root.business.release();
     drop(window);
     let held_call = control.snapshot();
+    let close_port = Arc::clone(&port);
+    let mut closed = runtime.spawn(async move { close_port.join_local_closed().await });
     let _ = release_seal.send(());
     let table_drop_entered = drop_entered.recv_timeout(Duration::from_secs(2)).is_ok();
     let held_output = control.snapshot();
@@ -701,6 +710,39 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
     let _ = release_drop.send(());
     let _ = disarm.send(());
     let watchdog_joined = watchdog.join().is_ok();
+    let actual_closed =
+        runtime.block_on(async { tokio::time::timeout(Duration::from_secs(2), &mut closed).await });
+    let closed_ok = matches!(&actual_closed, Ok(Ok(Ok(()))));
+    // Do not detach a timed-out original close task. Its same JoinHandle is
+    // retained in this concrete failure packet through test-harness disposition.
+    if !closed_ok {
+        struct CloseFailure {
+            _join: tokio::task::JoinHandle<Result<(), Arc<dyn std::error::Error + Send + Sync>>>,
+            _outcome: Result<
+                Result<
+                    Result<(), Arc<dyn std::error::Error + Send + Sync>>,
+                    tokio::task::JoinError,
+                >,
+                tokio::time::error::Elapsed,
+            >,
+            _source: Arc<FrontendProviderReadFacts>,
+            _cpu: std::mem::ManuallyDrop<
+                crate::query_execution::internal_result_cpu::InternalResultCpuOwner,
+            >,
+            _runtime: std::mem::ManuallyDrop<tokio::runtime::Runtime>,
+        }
+        std::panic::panic_any(CloseFailure {
+            _join: closed,
+            _outcome: actual_closed,
+            _source: port,
+            _cpu: std::mem::ManuallyDrop::new(provider_cpu),
+            _runtime: std::mem::ManuallyDrop::new(runtime),
+        });
+    }
+    runtime
+        .block_on(provider_cpu.shutdown_until(Instant::now() + Duration::from_secs(2)))
+        .unwrap();
+    drop(port);
     let deadline = Instant::now() + Duration::from_secs(2);
     let after = loop {
         let facts = control.snapshot();
@@ -727,6 +769,7 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
             && table_drop_entered
             && held
             && watchdog_joined
+            && closed_ok
     );
     for facts in [&held_call, &held_output] {
         assert_eq!(facts.root_responsibilities, 1);

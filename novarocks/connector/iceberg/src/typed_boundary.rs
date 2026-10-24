@@ -669,7 +669,9 @@ impl IcebergTypedBoundary {
         &self,
         handle: &IcebergTableHandle,
     ) -> Result<bool, ConnectorError> {
-        let physical = self.load_pinned_relation(handle.schema_table_name())?;
+        // This creator consumes the exact already-observed request fact.
+        // A missing pin must not acquire network capability on a CPU worker.
+        let physical = self.pinned_table_for_attempt(handle.schema_table_name())?;
         Ok(row_lineage_enabled(physical.table.metadata()))
     }
 
@@ -683,7 +685,7 @@ impl IcebergTypedBoundary {
         &self,
         reference: &IcebergSystemTableReference,
     ) -> Result<TableMetadata, ConnectorError> {
-        let physical = self.load_pinned_relation(reference.schema_table_name())?;
+        let physical = self.pinned_table_for_attempt(reference.schema_table_name())?;
         let metadata = physical.table.metadata();
         reference.verify_loaded_metadata(metadata)?;
         Ok(metadata.clone())
@@ -4659,6 +4661,19 @@ mod attempt_access_tests {
             handle.parse_table_schema().unwrap(),
             *table.metadata().current_schema().as_ref()
         );
+        assert_eq!(*loads.lock().unwrap(), observed_loads);
+        // A pure creator must refuse absent original observations; these
+        // checks must not invoke the catalog even when the warehouse is gone.
+        let missing_resources = TrackedAttemptResources::new();
+        let missing = template.for_request(request_context(&missing_resources));
+        let absent = missing.relation_has_row_lineage(&handle).unwrap_err();
+        assert_eq!(absent.kind(), ConnectorErrorKind::InvalidRequest);
+        let crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) = &metadata_relation
+        else {
+            panic!("prepared system relation");
+        };
+        let absent = missing.system_relation_metadata(reference).unwrap_err();
+        assert_eq!(absent.kind(), ConnectorErrorKind::InvalidRequest);
         assert_eq!(*loads.lock().unwrap(), observed_loads);
         // A fresh typed control for the SAME request must still borrow that
         // request's original frozen cache entry, even after warehouse removal.

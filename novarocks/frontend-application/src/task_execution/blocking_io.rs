@@ -162,6 +162,16 @@ impl ConnectorBlockingIoResponsibility {
         })))
     }
 
+    pub(crate) fn scope(&self) -> Result<WorkScope, WorkError> {
+        self.0
+            .owner
+            .as_ref()
+            .map(WorkOwner::scope)
+            .ok_or(WorkError::Released)
+    }
+    pub(crate) fn window(&self) -> Result<ResultWindowAlias, WorkError> {
+        self.0._window.clone().ok_or(WorkError::Released)
+    }
     /// Fixed backing alias, retained after all other fields of an enclosing
     /// source/result have been destroyed. It cannot authorize another job.
     pub(crate) fn retain_backing(&self) -> ConnectorBlockingIoBacking {
@@ -173,6 +183,7 @@ impl ConnectorBlockingIoResponsibility {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ConnectorBlockingIoBacking(#[allow(dead_code)] Arc<ResponsibilityCell>);
 
 /// Remains outside the panic-able synchronous closure. Only the actual await
@@ -271,6 +282,7 @@ fn resume_backed_panic(
     }))
 }
 
+#[cfg(test)]
 struct JobOutcome<T: Send + 'static> {
     value: Mutex<Option<Result<T, ConnectorBlockingIoError>>>,
     // A source close can return its primary cause before its subsequent Drop
@@ -282,6 +294,7 @@ struct JobOutcome<T: Send + 'static> {
     retirement: ConnectorBlockingIoSupervisor,
 }
 
+#[cfg(test)]
 impl<T: Send + 'static> Drop for JobOutcome<T> {
     fn drop(&mut self) {
         let outcome = self
@@ -373,6 +386,7 @@ impl<'a> ConnectorSourceCloseResult<'a> {
 }
 
 /// A submitted call whose result can be polled by an existing serial owner.
+#[cfg(test)]
 pub(crate) struct ConnectorBlockingIoJob<T: Send + 'static> {
     outcome: Arc<JobOutcome<T>>,
     ready: Arc<tokio::sync::Notify>,
@@ -382,6 +396,7 @@ pub(crate) struct ConnectorBlockingIoJob<T: Send + 'static> {
     original_blocking_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
 }
 
+#[cfg(test)]
 impl<T: Send + 'static> ConnectorBlockingIoJob<T> {
     pub(crate) fn try_take(&self) -> Option<Result<T, ConnectorBlockingIoError>> {
         self.outcome
@@ -439,6 +454,8 @@ impl<T: Send + 'static> ConnectorBlockingIoJob<T> {
 struct OriginalExecutors {
     cpu: novarocks_query_application::cpu::QueryCpuExecutor,
     blocking: novarocks_query_application::cpu::QueryBlockingExecutor,
+    provider_creator:
+        std::sync::OnceLock<crate::query_execution::internal_result_cpu::InternalResultCpu>,
 }
 /// The one process owner that supervises frontend Connector blocking calls.
 #[derive(Clone)]
@@ -452,6 +469,7 @@ pub(crate) struct ConnectorBlockingIoSupervisor {
 impl ConnectorBlockingIoSupervisor {
     /// Derive the job's responsibility from the caller's exact admission
     /// before submitting any synchronous provider code.
+    #[cfg(test)]
     pub(crate) fn spawn_admitted<T, F>(
         &self,
         scope: &WorkScope,
@@ -473,6 +491,7 @@ impl ConnectorBlockingIoSupervisor {
     /// A claimed lane error may cross a String-only application port. Move its
     /// original payload into protected retirement before returning that finite
     /// presentation, so caller cancellation cannot destroy it on the async lane.
+    #[cfg(test)]
     pub(crate) fn present_and_retire_failure(&self, error: ConnectorBlockingIoError) -> String {
         let detail = error.to_string();
         self.retire_original_failure(error);
@@ -495,8 +514,35 @@ impl ConnectorBlockingIoSupervisor {
         blocking: novarocks_query_application::cpu::QueryBlockingExecutor,
     ) -> Result<(), WorkError> {
         self.executors
-            .set(OriginalExecutors { cpu, blocking })
+            .set(OriginalExecutors {
+                cpu,
+                blocking,
+                provider_creator: std::sync::OnceLock::new(),
+            })
             .map_err(|_| WorkError::Conflict)
+    }
+
+    /// Same already-created fixed CPU owner; mandatory production composition
+    /// calls this before Ready. No fallback pool is constructed by a consumer.
+    pub(crate) fn install_provider_creator_cpu(
+        &self,
+        cpu: crate::query_execution::internal_result_cpu::InternalResultCpu,
+    ) -> Result<(), WorkError> {
+        self.executors
+            .get()
+            .ok_or(WorkError::NotReady)?
+            .provider_creator
+            .set(cpu)
+            .map_err(|_| WorkError::Conflict)
+    }
+    pub(crate) fn provider_creator_cpu(
+        &self,
+    ) -> Result<crate::query_execution::internal_result_cpu::InternalResultCpu, WorkError> {
+        self.executors
+            .get()
+            .and_then(|e| e.provider_creator.get())
+            .cloned()
+            .ok_or(WorkError::NotReady)
     }
 
     /// The runtime this lane's work is admitted onto.
@@ -531,6 +577,7 @@ impl ConnectorBlockingIoSupervisor {
         self.spawn_pinned(Vec::new(), call)
     }
 
+    #[cfg(test)]
     pub(crate) fn spawn_pinned<T, F>(
         &self,
         pins: Vec<ConnectorBlockingIoJoinPin>,
@@ -545,6 +592,7 @@ impl ConnectorBlockingIoSupervisor {
 
     /// The initializer's source-close call writes its returned typed cause to
     /// this SAME job header before any source destructor or later callback.
+    #[cfg(test)]
     pub(crate) fn spawn_pinned_source_close<F>(
         &self,
         pins: Vec<ConnectorBlockingIoJoinPin>,
@@ -565,6 +613,7 @@ impl ConnectorBlockingIoSupervisor {
         })
     }
 
+    #[cfg(test)]
     fn spawn_pinned_original<T, F, P>(
         &self,
         pins: Vec<ConnectorBlockingIoJoinPin>,
@@ -643,9 +692,20 @@ impl ConnectorBlockingIoSupervisor {
         }
     }
 
+    /// Safe projection never consumes/drops an original opaque cause. Existing
+    /// failure custody remains in the same supervisor until explicit disposition.
+    pub(crate) fn original_failure_detail(&self) -> Option<String> {
+        self.failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|failure| failure.detail.clone())
+    }
+
     /// Move the original unclaimed failure out of the fixed process slot.
     /// Host teardown records its finite verdict, destroys the actual payload
     /// and its backing aliases, and then drains the same workload authority.
+    #[cfg(test)]
     pub(crate) fn take_original_failure(&self) -> Option<ConnectorBlockingIoError> {
         self.failure
             .lock()
@@ -656,6 +716,7 @@ impl ConnectorBlockingIoSupervisor {
     /// Payload destructors are provider code too. Retire the original failure
     /// on the same protected blocking lane, preserving each original scope
     /// through that destructor's actual JoinHandle without new admission.
+    #[cfg(test)]
     pub(crate) fn retire_original_failure(&self, error: ConnectorBlockingIoError) {
         let pins = error
             .original
@@ -670,6 +731,7 @@ impl ConnectorBlockingIoSupervisor {
         );
     }
 
+    #[cfg(test)]
     fn publish_original_failure(&self, error: ConnectorBlockingIoError) {
         let rejected = {
             let mut first = self
@@ -694,6 +756,7 @@ impl ConnectorBlockingIoSupervisor {
     /// A cleanup has no consuming waiter or unclaimed output. Observe its
     /// original blocking join directly, avoiding a new cleanup for a unit
     /// output and preserving the raw panic payload if provider Drop panics.
+    #[cfg(test)]
     fn spawn_cleanup<F>(
         &self,
         pins: Vec<ConnectorBlockingIoJoinPin>,

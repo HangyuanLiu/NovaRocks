@@ -52,6 +52,30 @@ fn fixture_with_production_changes(
     publications: u64,
     changes: usize,
 ) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+    let (control, handle, driver, binding) = fixture_with_optional_closed_factory(
+        cpu_jobs,
+        lane,
+        production_records,
+        publications,
+        changes,
+        None,
+    );
+    assert!(binding.is_none());
+    (control, handle, driver)
+}
+fn fixture_with_optional_closed_factory(
+    cpu_jobs: u64,
+    lane: JointLane,
+    production_records: u64,
+    publications: u64,
+    changes: usize,
+    descriptor: Option<InternalResultClosedFactoryDescriptor>,
+) -> (
+    WorkloadControl,
+    JointAdmissionHandle,
+    JointProgressDriver,
+    Option<InternalCpuFactoryBinding>,
+) {
     let count = 8;
     let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 1, 2, &[]);
     let mut config = JointCapacityConfig {
@@ -143,7 +167,7 @@ fn fixture_with_production_changes(
     required.classes[0] = base;
     required.lanes[0] = base;
     required.class_lanes[0][0] = base;
-    let control = WorkloadControl::try_new_counted(WorkloadConfig {
+    let mut control = WorkloadControl::try_new_counted(WorkloadConfig {
         root_limit: count,
         business_limit: count,
         query_concurrency_limit: count,
@@ -152,12 +176,17 @@ fn fixture_with_production_changes(
     })
     .unwrap()
     .owner;
+    let binding = descriptor.map(|d| {
+        control
+            .bind_internal_result_closed_factory_for_composition(d)
+            .unwrap()
+    });
     let (handle, driver) = control
         .configure_joint_capacity(config.validate(&required).unwrap())
         .unwrap();
     control.configure_control_storage(storage).unwrap();
     control.mark_ready().unwrap();
-    (control, handle, driver)
+    (control, handle, driver, binding)
 }
 fn drive(driver: &mut JointProgressDriver) {
     crate::joint_admission::tests::drive(driver);
@@ -1514,4 +1543,77 @@ fn an_already_granted_new_record_cannot_register_across_pending_control_growth()
     grant.owner().settle_received_in().unwrap().notify();
     drop((grant, reply, admission));
     finish(work, &mut driver);
+}
+
+#[test]
+fn provider_control_cpu_source_uses_exact_bound_node_without_computation_custody() {
+    // This neutral identity fixture proves fences/accounting, not a Provider
+    // callback's finiteness or the physical QA factory. FA's actual fixed-pool
+    // consumer exercises the same real production factory separately.
+    let pool: Arc<dyn Send + Sync> = Arc::new(());
+    let descriptor = InternalResultClosedFactoryDescriptor::for_composition(
+        Arc::downgrade(&pool),
+        std::any::TypeId::of::<fn()>(),
+        std::num::NonZeroU64::new(23).unwrap(),
+    );
+    let (control, _handle, mut driver, binding) =
+        fixture_with_optional_closed_factory(1, JointLane::Foreground, 1, 0, 2, Some(descriptor));
+    let binding = binding.unwrap();
+    let work = root(&control);
+    let scope = work.owner.scope();
+    assert!(binding.provider_creator_source(&scope).is_err()); // unbound D
+    let facts = [fact("creator-original-a"), fact("creator-original-b")];
+    bind(&scope, &facts, &mut driver);
+    let source = binding.provider_creator_source(&scope).unwrap();
+    let mut action = source
+        .begin(
+            std::num::NonZeroU64::new(17).unwrap(),
+            std::num::NonZeroU64::new(23).unwrap(),
+        )
+        .unwrap();
+    {
+        let state = control.inner.state.lock().unwrap();
+        let request = state
+            .joint
+            .as_ref()
+            .unwrap()
+            .requests
+            .values()
+            .next()
+            .unwrap();
+        let claim = &request.changes[0].claim;
+        assert_eq!(claim.facts.dependencies.len(), 2);
+        assert_eq!(claim.facts.lane, JointLane::Foreground);
+        assert_eq!(claim.amounts.get(JointResource::Computations), 0);
+        assert_eq!(claim.amounts.get(JointResource::InternalCpuJobs), 1);
+        assert_eq!(claim.amounts.get(JointResource::PhysicalQueueRecords), 1);
+    }
+    drive(&mut driver);
+    let mut offer = match action.poll_local_offer(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(offer)) => offer,
+        _ => panic!("expected exact original CPU offer"),
+    };
+    let mut physical = Some(());
+    let mut installed = None;
+    offer
+        .accept_in(&mut physical, &mut installed)
+        .unwrap()
+        .notify();
+    assert!(physical.is_none());
+    assert_eq!(held(&control, JointResource::InternalCpuJobs), 1);
+    assert_eq!(held(&control, JointResource::Computations), 0);
+    drop(installed);
+    assert_eq!(held(&control, JointResource::InternalCpuJobs), 0);
+    let stale = binding.provider_creator_source(&scope).unwrap();
+    work.owner.complete();
+    assert!(
+        stale
+            .begin(
+                std::num::NonZeroU64::new(17).unwrap(),
+                std::num::NonZeroU64::new(23).unwrap()
+            )
+            .is_err()
+    );
+    work.business.release();
+    drive(&mut driver);
 }

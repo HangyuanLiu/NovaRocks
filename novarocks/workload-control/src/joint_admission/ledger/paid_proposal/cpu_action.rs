@@ -95,6 +95,50 @@ impl InternalCpuFactoryBinding {
     pub fn matches_descriptor(&self, descriptor: &InternalResultClosedFactoryDescriptor) -> bool {
         self.descriptor.matches(descriptor)
     }
+    /// Closed first-party Provider creator uses the SAME registered CPU factory
+    /// and exact bound control Node. This captures facts only; there is no
+    /// caller-selected resource vector, finite boolean or execution permit.
+    pub fn provider_creator_source(
+        &self,
+        scope: &WorkScope,
+    ) -> Result<InternalCpuActionSource, WorkError> {
+        if !Weak::ptr_eq(&self.inner, &Arc::downgrade(&scope.inner)) {
+            return Err(WorkError::ForeignAuthority);
+        }
+        let (view, _) = control_claim_view_for_scope(scope, false)?;
+        let ClaimSource::NodeControl {
+            slot, generation, ..
+        } = view.source
+        else {
+            return Err(WorkError::Conflict);
+        };
+        let state = scope.inner.state.lock().unwrap();
+        let registered = state
+            .internal_cpu_factory
+            .as_ref()
+            .ok_or(WorkError::NotReady)?;
+        if !registered.matches(&self.descriptor) || !registered.is_live() {
+            return Err(WorkError::Released);
+        }
+        let fence = CpuActionFence {
+            claim: view.id,
+            epoch: 0,
+            structure_revision: view.structure_revision,
+            factory: Some(registered.stamp()),
+            control: Some(CpuControlFence {
+                slot,
+                generation,
+                release_revision: view.release_revision,
+            }),
+        };
+        action_source_facts(&state, scope.id, fence)?;
+        Ok(InternalCpuActionSource {
+            inner: Arc::downgrade(&scope.inner),
+            owner: scope.id,
+            fence,
+        })
+    }
+
     pub fn bind_source(
         &self,
         mut source: InternalCpuActionSource,
@@ -112,7 +156,7 @@ impl InternalCpuFactoryBinding {
             return Err(WorkError::Released);
         }
         source.fence.factory = Some(registered.stamp());
-        computation_facts(&state, source.owner, source.fence)?;
+        action_source_facts(&state, source.owner, source.fence)?;
         Ok(source)
     }
 }
@@ -194,10 +238,17 @@ impl WorkloadControl {
 
 #[derive(Clone, Copy)]
 pub(in crate::joint_admission::ledger) struct CpuActionFence {
-    computation: u64,
+    claim: u64,
     epoch: u64,
     structure_revision: u64,
     factory: Option<CpuFactoryStamp>,
+    control: Option<CpuControlFence>,
+}
+#[derive(Clone, Copy)]
+struct CpuControlFence {
+    slot: crate::control_storage::SlotId,
+    generation: u64,
+    release_revision: u64,
 }
 
 /// The same finite request and paid proposal cell. Its only receiving path
@@ -233,7 +284,7 @@ impl InternalCpuActionAdmission {
     }
 }
 
-fn computation_facts(
+fn action_source_facts(
     state: &State,
     owner: WorkId,
     fence: CpuActionFence,
@@ -255,10 +306,38 @@ fn computation_facts(
     if node.owner != crate::OwnerState::Active {
         return Err(WorkError::Released);
     }
-    let row = ledger
-        .claims
-        .get(&fence.computation)
-        .ok_or(WorkError::Released)?;
+    let row = ledger.claims.get(&fence.claim).ok_or(WorkError::Released)?;
+    if let Some(control) = fence.control {
+        let slot = state
+            .cancellations
+            .slots
+            .get(control.slot.0)
+            .ok_or(WorkError::Released)?;
+        if !state.cancellations.fixed
+            || node.cancellation != control.slot
+            || slot.phase != crate::control_storage::SlotPhase::Node(owner)
+            || slot.generation != control.generation
+            || slot.claim != Some(fence.claim)
+            || row.owner != ClaimOwner::ControlSlot(control.slot)
+            || !row.custody.is_raw()
+            || row.structure_revision != fence.structure_revision
+            || row.release_revision != control.release_revision
+            || row.pending.is_some()
+            || row.amounts != slot.base
+            || row.active_amounts != slot.base
+            || row.facts.key != row.active_facts.key
+            || row.active_facts.class != node.class
+            || row.active_facts.dependencies.is_empty()
+            || !row.active_facts.key.causal.is_empty()
+        {
+            return Err(WorkError::Conflict);
+        }
+        node.check(&state.cancellations)?;
+        if state.closed {
+            return Err(WorkError::Closed);
+        }
+        return Ok(&row.active_facts);
+    }
     if row.owner != ClaimOwner::PhysicalWork(owner)
         || !matches!(row.custody, ClaimCustody::Computation { epoch, pins } if epoch == fence.epoch && pins != 0)
         || row.structure_revision != fence.structure_revision
@@ -322,7 +401,7 @@ pub(in crate::joint_admission::ledger) fn validate_cpu_action(
     changes: &[ChangeRecord],
 ) -> Result<(), WorkError> {
     require_registered_factory(state, fence)?;
-    let original = computation_facts(state, owner, fence)?;
+    let original = action_source_facts(state, owner, fence)?;
     let [change] = changes else {
         return Err(WorkError::Conflict);
     };
@@ -346,7 +425,12 @@ pub(in crate::joint_admission::ledger) fn validate_cpu_action(
         || amounts.get(JointResource::MetadataBytes) == 0
         || amounts.get(JointResource::PhysicalQueueBytes) == 0
         || change.claim.facts.key.class != original.key.class
-        || change.claim.facts.key.lane != original.key.lane
+        || change.claim.facts.key.lane
+            != if fence.control.is_some() {
+                JointLane::Foreground as usize
+            } else {
+                original.key.lane
+            }
         || change.claim.facts.key.dependencies != original.key.dependencies
         || change.claim.facts.key.causal
             != if fence.factory.is_some() {
@@ -388,12 +472,13 @@ pub(in crate::joint_admission::ledger) fn capture(
         .get(&id)
         .ok_or(WorkError::Released)?;
     let fence = CpuActionFence {
-        computation: id,
+        claim: id,
         epoch,
         structure_revision: row.structure_revision,
         factory: None,
+        control: None,
     };
-    computation_facts(&state, scope.id, fence)?;
+    action_source_facts(&state, scope.id, fence)?;
     Ok(InternalCpuActionSource {
         inner: Arc::downgrade(inner),
         owner: scope.id,
@@ -423,7 +508,7 @@ impl InternalCpuActionSource {
             // Refuse an unauthorized request before reserving the original Q
             // cell or retaining any additional profile graph backing.
             require_registered_factory(&state, self.fence)?;
-            computation_facts(&state, self.owner, self.fence)?;
+            action_source_facts(&state, self.owner, self.fence)?;
             validate_queue_quote(&state, self.fence, physical_queue_bytes.get())?;
         }
         let scope = WorkScope {
@@ -439,7 +524,7 @@ impl InternalCpuActionSource {
         let facts = {
             let state = inner.state.lock().unwrap();
             require_registered_factory(&state, self.fence)?;
-            Arc::clone(computation_facts(&state, self.owner, self.fence)?)
+            Arc::clone(action_source_facts(&state, self.owner, self.fence)?)
         };
         let amounts = JointResources::ZERO
             .with(JointResource::ClaimRecords, 1)
@@ -453,7 +538,12 @@ impl InternalCpuActionSource {
         // Arm the same private source before its one body is constructed.
         // No generic builder can choose this per-resource causal shape.
         proposal.cpu_action = Some(self.fence);
-        proposal.begin_new(facts.lane, amounts)?;
+        let lane = if self.fence.control.is_some() {
+            JointLane::Foreground
+        } else {
+            facts.lane
+        };
+        proposal.begin_new(lane, amounts)?;
         let current = proposal.current.as_mut().expect("same closed CPU proposal");
         if facts.dependencies.len() > current.selected.capacity() {
             return Err(WorkError::Capacity("CPU action full dependency backing"));

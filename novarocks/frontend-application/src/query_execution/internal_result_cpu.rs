@@ -428,6 +428,11 @@ struct CpuActionState {
 struct InternalCpuRetirementState<T> {
     closed_input: Option<InternalResultValue<InternalDomainSlot>>,
     closed_operation: Option<InternalResultOperation>,
+    provider_input: Option<Box<super::provider_read_facts::ProviderReadCreatorInput>>,
+    provider_backing: Option<crate::task_execution::blocking_io::ConnectorBlockingIoBacking>,
+    provider_marker_failure: Option<QueryBlockingFailure>,
+    provider_retirement_failure: Option<QueryBlockingFailure>,
+    provider_close_failure: Option<QueryBlockingFailure>,
     action: Option<CpuActionState>,
     admission_failure: Option<WorkError>,
     reserve_refusal: Option<QueryBlockingReserveRefusal>,
@@ -466,6 +471,11 @@ impl<T> InternalCpuRetirement<T> {
             state: std::sync::Mutex::new(InternalCpuRetirementState {
                 closed_input: None,
                 closed_operation: None,
+                provider_input: None,
+                provider_backing: None,
+                provider_marker_failure: None,
+                provider_retirement_failure: None,
+                provider_close_failure: None,
                 action: None,
                 admission_failure: None,
                 reserve_refusal: None,
@@ -489,6 +499,9 @@ impl<T> InternalCpuRetirement<T> {
             .as_ref()
             .is_some_and(QueryBlockingFailure::is_unexpected)
             || state.forwarder.is_some()
+            || state.provider_marker_failure.is_some()
+            || state.provider_retirement_failure.is_some()
+            || state.provider_close_failure.is_some()
             || state.physical_unproven
             || state.physical_failure.is_some()
             || state.admission_failure.as_ref().is_some_and(|error| {
@@ -634,6 +647,11 @@ impl<T: Send + 'static> InternalResultCpuJob<T> {
             .state
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // Provider input/opaque source must be explicitly retired outside the
+        // finite worker and custody lock before ordinary packet retirement.
+        if state.provider_input.is_some() {
+            return None;
+        }
         Some(InternalCpuRetired {
             _closed_input: state.closed_input.take(),
             _closed_operation: state.closed_operation.take(),
@@ -728,10 +746,150 @@ impl<T: Send + 'static> Drop for InternalResultCpuJob<T> {
     }
 }
 
+pub(crate) enum ProviderCreatorCpuSource {
+    Bound(InternalCpuActionSource),
+    #[cfg(test)]
+    UnqualifiedFixture,
+}
+
+/// Original Provider serial owner keeps this concrete same job and join.
+/// Cancellation of finish/close only drops a borrow, never the receipt/input.
+pub(crate) struct ProviderReadCpuJob {
+    job: Option<InternalResultCpuJob<OperationOutput>>,
+    marker: Option<OperationResult>,
+    finished: bool,
+}
+impl ProviderReadCpuJob {
+    pub(crate) fn health_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+        self.job
+            .as_ref()
+            .and_then(InternalResultCpuJob::health_failure)
+    }
+    pub(crate) fn poll_finish_in(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        destination: &mut Option<Result<novarocks_sql::compiler::ProviderReadFact, String>>,
+    ) -> std::task::Poll<Result<(), Arc<dyn std::error::Error + Send + Sync>>> {
+        use std::task::Poll;
+        let job = self.job.as_mut().expect("same original Provider CPU job");
+        if self.marker.is_none() {
+            self.marker = Some(std::task::ready!(job.poll_take(cx)));
+        }
+        std::task::ready!(job.poll_forwarder_closed(cx))?;
+        if destination.is_none() {
+            if matches!(self.marker.as_ref(),Some(Ok(value)) if matches!(value.value(),Ok(InternalDomainSlot::ProviderCreatorFinished)))
+            {
+                job.retirement
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .provider_input
+                    .as_mut()
+                    .expect("same retained Provider input")
+                    .take_result_in(destination)
+                    .expect("one stable Provider result receiver");
+            } else {
+                let detail = match self.marker.as_ref() {
+                    Some(Err(error)) => error.detail().as_str().to_owned(),
+                    _ => "Provider creator stopped before result delivery".into(),
+                };
+                *destination = Some(Err(detail));
+            }
+        }
+        self.retire_sources()?;
+        Poll::Ready(Ok(()))
+    }
+    pub(crate) async fn close(&mut self) -> Result<(), Arc<dyn std::error::Error + Send + Sync>> {
+        let job = self.job.as_mut().expect("same original Provider CPU job");
+        // A closed receiver never cancels an already running CPU operation.
+        // It keeps the actual unreceived value/input in the same packet.
+        if !job.closing {
+            job.closing = true;
+            if let Err(cause) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.completion.close()))
+            {
+                job.retirement
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .provider_close_failure = Some(QueryBlockingFailure::panicked(cause));
+            }
+        }
+        std::future::poll_fn(|cx| job.poll_forwarder_closed(cx)).await?;
+        self.retire_sources()
+    }
+    fn retire_sources(&mut self) -> Result<(), Arc<dyn std::error::Error + Send + Sync>> {
+        let job = self.job.as_mut().expect("same original Provider CPU job");
+        // Both original output and input are stable before any actual Drop.
+        // Each named destruction cut executes once. Opaque payloads remain in
+        // the original packet; no formatting, retry, extra worker or reaper.
+        if let Some(marker) = self.marker.take() {
+            if let Err(cause) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(marker)))
+            {
+                job.retirement
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .provider_marker_failure = Some(QueryBlockingFailure::panicked(cause));
+            }
+        }
+        if let Some(cause) = job.health_failure() {
+            return Err(cause);
+        }
+        let input = job
+            .retirement
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .provider_input
+            .take();
+        if let Err(cause) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(input))) {
+            job.retirement
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .provider_retirement_failure = Some(QueryBlockingFailure::panicked(cause));
+        }
+        if let Some(cause) = job.health_failure() {
+            return Err(cause);
+        }
+        let retired = job.take_retired_outcome();
+        if let Err(cause) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(retired)))
+        {
+            // Input retirement was healthy above; this same named terminal
+            // retirement slot is still empty. Never repeat either Drop cut.
+            job.retirement
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .provider_retirement_failure = Some(QueryBlockingFailure::panicked(cause));
+        }
+        if let Some(cause) = job.health_failure() {
+            return Err(cause);
+        }
+        self.finished = true;
+        Ok(())
+    }
+}
+impl Drop for ProviderReadCpuJob {
+    fn drop(&mut self) {
+        if !self.finished {
+            if let Some(job) = self.job.take() {
+                // Invalid whole-source loss is fail-closed, not normal close.
+                // Keep the finite original packet/join/backing; do not spawn a
+                // replacement or pretend the actual source has exited.
+                std::mem::forget(job);
+            }
+        }
+    }
+}
+
 /// Closed production operations for the original internal result worker.
 /// This limits its call surface; it does not certify Provider codecs, locks,
 /// callbacks or destruction as finite, or grant a host-only protection policy.
 pub(crate) enum InternalResultOperation {
+    ProviderCreator,
     Body(Arc<RetainedRootReply>),
     End(RootResultEnd),
     FinishStatistics,
@@ -740,6 +898,7 @@ pub(crate) enum InternalResultOperation {
 impl InternalResultOperation {
     fn apply(self, slot: InternalDomainSlot) -> Result<InternalDomainSlot, InternalDomainFailure> {
         match self {
+            Self::ProviderCreator => Err("Provider creator used a domain payload path".into()),
             Self::Body(reply) => slot.apply_body(reply),
             Self::End(end) => slot.finish_eof(end),
             Self::FinishStatistics => slot.finish_statistics(),
@@ -759,6 +918,65 @@ impl InternalResultCpu {
             .ok_or(WorkError::NotReady)?
             .bind_source(grant.cpu_action_source(scope)?)
     }
+    pub(crate) fn provider_creator_source(
+        &self,
+        scope: &WorkScope,
+    ) -> Result<InternalCpuActionSource, WorkError> {
+        self.factory
+            .as_ref()
+            .ok_or(WorkError::NotReady)?
+            .provider_creator_source(scope)
+    }
+
+    /// Same factory, bounded pool, original receipt/forwarder/cause algorithm.
+    /// Input metadata is separate from the cumulative Internal result window.
+    pub(crate) fn submit_provider_creator(
+        &self,
+        input: super::provider_read_facts::ProviderReadCreatorInput,
+        window: ResultWindowAlias,
+        backing: crate::task_execution::blocking_io::ConnectorBlockingIoBacking,
+        source: ProviderCreatorCpuSource,
+        cancellation: QueryCancellationView,
+        runtime: &tokio::runtime::Handle,
+        wake: Arc<dyn StatusIntakeWake>,
+    ) -> ProviderReadCpuJob {
+        let source = match source {
+            ProviderCreatorCpuSource::Bound(source) => Some(source),
+            #[cfg(test)]
+            ProviderCreatorCpuSource::UnqualifiedFixture => None,
+        };
+        let (completed, completion) = oneshot::channel();
+        let retirement = Arc::new(InternalCpuRetirement::new(window, None));
+        {
+            let mut state = retirement.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.closed_operation = Some(InternalResultOperation::ProviderCreator);
+            state.provider_input = Some(Box::new(input));
+            state.provider_backing = Some(backing);
+            state.action = Some(CpuActionState::default());
+        }
+        let forwarder = runtime.spawn(make_operation_forwarder(
+            self.executor.clone(),
+            self.factory.clone(),
+            source,
+            cancellation,
+            wake,
+            Arc::clone(&retirement),
+            completed,
+        ));
+        ProviderReadCpuJob {
+            job: Some(InternalResultCpuJob {
+                completion,
+                retirement,
+                forwarder: Some(forwarder),
+                closing: false,
+                claimed: false,
+                closed: None,
+            }),
+            marker: None,
+            finished: false,
+        }
+    }
+
     pub(crate) fn configured_capacity(&self) -> QueryBlockingExecutorConfig {
         self.executor.configured_capacity()
     }
@@ -961,6 +1179,32 @@ fn action_failure(
     projected
 }
 
+struct ProviderCreatorInputLoan<'a> {
+    packet: &'a InternalCpuRetirement<OperationOutput>,
+    input: Option<Box<super::provider_read_facts::ProviderReadCreatorInput>>,
+}
+impl<'a> ProviderCreatorInputLoan<'a> {
+    fn take(packet: &'a InternalCpuRetirement<OperationOutput>) -> Self {
+        let input = packet
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .provider_input
+            .take();
+        Self { packet, input }
+    }
+}
+impl Drop for ProviderCreatorInputLoan<'_> {
+    fn drop(&mut self) {
+        let mut state = self.packet.state.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            state.provider_input.is_none(),
+            "one original Provider input receiver"
+        );
+        state.provider_input = self.input.take();
+    }
+}
+
 // Only the real worker calls this factory output. Preparation captures no
 // unique input/Operation and cannot destroy them on forwarder cancellation.
 fn make_cpu_work(
@@ -974,15 +1218,42 @@ fn make_cpu_work(
         if let Some(reason) = cancellation.reason() {
             return Err(cpu_cancellation_failure(reason));
         }
-        let (input, operation) = {
-            let mut state = packet.state.lock().unwrap_or_else(|e| e.into_inner());
-            let input = state.closed_input.take().expect("one real worker input");
-            let operation = state
-                .closed_operation
-                .take()
-                .expect("one real worker operation");
-            (input, operation)
-        };
+        let operation = packet
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .closed_operation
+            .take()
+            .expect("one real worker operation");
+        if matches!(operation, InternalResultOperation::ProviderCreator) {
+            let mut input = ProviderCreatorInputLoan::take(&packet);
+            input
+                .input
+                .as_mut()
+                .expect("same Provider creator input")
+                .run_once();
+            drop(input); // restore to the original packet, never Drop on CPU
+            let window = packet
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .window
+                .as_ref()
+                .expect("same Provider source window")
+                .clone();
+            return Ok(InternalResultValue {
+                value: Ok(InternalDomainSlot::ProviderCreatorFinished),
+                window,
+                activity: None,
+            });
+        }
+        let input = packet
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .closed_input
+            .take()
+            .expect("one real domain worker input");
         // The original queued/running physical guard now covers this explicit
         // execution handoff. First-party apply and every Drop remain lock-free;
         // packet window/activity and opaque failure custody are independent.

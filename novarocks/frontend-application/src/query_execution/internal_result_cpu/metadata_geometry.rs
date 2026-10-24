@@ -39,8 +39,8 @@ type Completion = oneshot::Sender<Result<InternalResultValue<Output>, ExecutionF
 /// remain the original creators' responsibility. Reading this is not payment.
 ///
 /// The per-job known subtotal conservatively sums the one packet, original live job,
-/// actual forwarder frame, one normal retirement stack value, up to four
-/// opaque carriers (worker + physical cause + two notification panics), and one Arc<JoinError>.
+/// actual forwarder frame, one normal retirement stack value, up to seven
+/// opaque carriers (worker + physical cause + two notification panics and Provider close/marker/input retirement panics), and one Arc<JoinError>.
 /// Handles already contained in those layouts must not be added again.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InternalCpuMetadataGeometry {
@@ -51,9 +51,13 @@ pub struct InternalCpuMetadataGeometry {
     retired: Layout,
     opaque_carrier: Layout,
     forwarder_failure: Layout,
-    // These are explanatory sub-layouts, not extra amounts in the sum.
+    // Domain/operation are explanatory sub-layouts, not additive amounts.
     domain_slot: Layout,
     operation: Layout,
+    // Provider input is a distinct Box pointee. Its wrapper already embeds
+    // the ordinary job; the subtotal uses max(job, wrapper), not their sum.
+    provider_input: Layout,
+    provider_job: Layout,
 }
 impl InternalCpuMetadataGeometry {
     pub const fn packet_layout(self) -> Layout {
@@ -75,7 +79,7 @@ impl InternalCpuMetadataGeometry {
         self.opaque_carrier
     }
     pub const fn maximum_opaque_carriers_per_job(self) -> usize {
-        4
+        7
     }
     pub const fn forwarder_failure_layout(self) -> Layout {
         self.forwarder_failure
@@ -87,6 +91,12 @@ impl InternalCpuMetadataGeometry {
         self.operation
     }
 
+    pub const fn provider_creator_input_layout(self) -> Layout {
+        self.provider_input
+    }
+    pub const fn provider_creator_job_layout(self) -> Layout {
+        self.provider_job
+    }
     /// Known additive component, not a complete allocation/task/payload quote.
     /// The diagnostic domain_slot/operation sub-layouts are already represented
     /// in the real packet/factory frame and are not charged a second time.
@@ -94,15 +104,16 @@ impl InternalCpuMetadataGeometry {
         let failures = self
             .opaque_carrier
             .size()
-            .checked_mul(4)
+            .checked_mul(7)
             .ok_or(LayoutResourceError::Arithmetic)?;
         [
             self.packet.size(),
-            self.job.size(),
+            self.job.size().max(self.provider_job.size()),
             self.forwarder_frame.size(),
             self.retired.size(),
             failures,
             self.forwarder_failure.size(),
+            self.provider_input.size(),
         ]
         .into_iter()
         .try_fold(0usize, |total, bytes| {
@@ -219,6 +230,9 @@ pub(super) fn geometry() -> Result<InternalCpuMetadataGeometry, LayoutResourceEr
         forwarder_failure: arc_layout(Layout::new::<tokio::task::JoinError>())?,
         domain_slot: Layout::new::<InternalDomainSlot>(),
         operation: Layout::new::<InternalResultOperation>(),
+        provider_input:
+            super::super::provider_read_facts::ProviderReadCreatorInput::known_input_layout(),
+        provider_job: Layout::new::<super::ProviderReadCpuJob>(),
     })
 }
 
@@ -251,9 +265,9 @@ mod tests {
     }
 
     #[test]
-    fn failure_carriers_are_worker_physical_and_two_wakes_not_four_result_graphs() {
+    fn failure_carriers_include_provider_retirement_without_copying_payload_graphs() {
         let actual = geometry().unwrap();
-        assert_eq!(actual.maximum_opaque_carriers_per_job(), 4);
+        assert_eq!(actual.maximum_opaque_carriers_per_job(), 7);
         assert_eq!(
             actual.opaque_carrier_layout(),
             QueryBlockingFailure::payload_holder_layout().unwrap()
