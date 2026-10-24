@@ -55,6 +55,28 @@ impl fmt::Debug for OriginalFailure {
     }
 }
 
+impl fmt::Display for OriginalFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("original connector blocking-I/O failure")
+    }
+}
+impl std::error::Error for OriginalFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.cause {
+            OriginalFailureCause::WorkerJoin(error) => Some(error),
+            OriginalFailureCause::OutcomeDrop(_) => None,
+        }
+    }
+}
+impl ConnectorBlockingIoError {
+    /// Alias the existing opaque carrier, without moving or formatting its raw
+    /// panic payload and without allocating a second payload wrapper.
+    pub(crate) fn health_cause(&self) -> Arc<dyn std::error::Error + Send + Sync> {
+        let cause = Arc::clone(&self.original);
+        cause
+    }
+}
+
 impl fmt::Display for ConnectorBlockingIoError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.detail)
@@ -233,6 +255,9 @@ fn resume_backed_panic(
 
 struct JobOutcome<T: Send + 'static> {
     value: Mutex<Option<Result<T, ConnectorBlockingIoError>>>,
+    // A source close can return its primary cause before its subsequent Drop
+    // or another source callback panics. This is the SAME original job header.
+    source_close_failure: Mutex<Option<Arc<novarocks_spi::connector::ConnectorError>>>,
     // Unclaimed output retirement receives the same cells before these pins
     // retire. Its own original join keeps the backing through actual cleanup.
     pins: Box<[ConnectorBlockingIoJoinPin]>,
@@ -266,6 +291,31 @@ impl<T: Send + 'static> Drop for JobOutcome<T> {
     }
 }
 
+/// Borrowed access to one original job's fixed primary close-result slot.
+/// Installing a cause is not completion: only that job's original join does it.
+pub(crate) struct ConnectorSourceCloseResult<'a> {
+    failure: &'a Mutex<Option<Arc<novarocks_spi::connector::ConnectorError>>>,
+}
+impl ConnectorSourceCloseResult<'_> {
+    pub(crate) fn record_error(&self, error: novarocks_spi::connector::ConnectorError) {
+        let rejected = {
+            let mut first = self
+                .failure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if first.is_none() {
+                *first = Some(Arc::new(error));
+                None
+            } else {
+                Some(error)
+            }
+        };
+        // A later opaque cause may itself have a destructor. The primary is
+        // already stable; no foreign destructor runs under the result lock.
+        drop(rejected);
+    }
+}
+
 /// A submitted call whose result can be polled by an existing serial owner.
 pub(crate) struct ConnectorBlockingIoJob<T: Send + 'static> {
     outcome: Arc<JobOutcome<T>>,
@@ -285,19 +335,47 @@ impl<T: Send + 'static> ConnectorBlockingIoJob<T> {
             .take()
     }
 
-    /// Waits asynchronously for the submitted call to publish its outcome.
-    ///
-    /// The polling accessor remains useful to serial owners such as credential
-    /// rotation. Split assignment uses this form to wake its serial round only
-    /// after the blocking worker has really returned.
-    pub(crate) async fn finish(self) -> Result<T, ConnectorBlockingIoError> {
+    #[cfg(test)]
+    pub(crate) async fn join_original_publisher(&mut self) -> Result<(), tokio::task::JoinError> {
+        (&mut self.publisher).await
+    }
+
+    pub(crate) fn source_close_failure(
+        &self,
+    ) -> Option<Arc<novarocks_spi::connector::ConnectorError>> {
+        self.outcome
+            .source_close_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Borrow the original job and publish directly into its owner's stable
+    /// outcome field. Dropping this wait future does not drop the job or move
+    /// an unclaimed provider result onto the waiter's stack.
+    pub(crate) async fn finish_in(
+        &self,
+        destination: &mut Option<Result<T, ConnectorBlockingIoError>>,
+    ) {
+        assert!(
+            destination.is_none(),
+            "a blocking outcome needs an empty original slot"
+        );
         loop {
             let notified = self.ready.notified();
             if let Some(outcome) = self.try_take() {
-                return outcome;
+                *destination = Some(outcome);
+                return;
             }
             notified.await;
         }
+    }
+
+    /// Existing consuming callers use the same original wait author.
+    pub(crate) async fn finish(self) -> Result<T, ConnectorBlockingIoError> {
+        let mut outcome = None;
+        self.finish_in(&mut outcome).await;
+        outcome.expect("the borrowed job wait installed its outcome")
     }
 }
 
@@ -388,16 +466,52 @@ impl ConnectorBlockingIoSupervisor {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
+        self.spawn_pinned_original(pins, move |_| call)
+    }
+
+    /// The initializer's source-close call writes its returned typed cause to
+    /// this SAME job header before any source destructor or later callback.
+    pub(crate) fn spawn_pinned_source_close<F>(
+        &self,
+        pins: Vec<ConnectorBlockingIoJoinPin>,
+        call: F,
+    ) -> ConnectorBlockingIoJob<()>
+    where
+        F: FnOnce(&ConnectorSourceCloseResult<'_>) + Send + 'static,
+    {
+        self.spawn_pinned_original(pins, move |outcome| {
+            let outcome = Arc::clone(outcome);
+            move || {
+                call(&ConnectorSourceCloseResult {
+                    failure: &outcome.source_close_failure,
+                })
+            }
+        })
+    }
+
+    fn spawn_pinned_original<T, F, P>(
+        &self,
+        pins: Vec<ConnectorBlockingIoJoinPin>,
+        prepare: P,
+    ) -> ConnectorBlockingIoJob<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+        P: FnOnce(&Arc<JobOutcome<T>>) -> F,
+    {
         let runtime = self.runtime.clone();
         let outcome = Arc::new(JobOutcome {
             value: Mutex::new(None),
+            source_close_failure: Mutex::new(None),
             pins: pins.into_boxed_slice(),
             retirement: self.clone(),
         });
         let published = Arc::clone(&outcome);
         let ready = Arc::new(tokio::sync::Notify::new());
         let publish_ready = Arc::clone(&ready);
-        let call = BackedBlockingValue::new(call, &published.pins);
+        // Ordinary jobs keep their exact original call and Arc lifetime. Only
+        // the close-source author borrows its header through the actual call.
+        let call = BackedBlockingValue::new(prepare(&outcome), &published.pins);
         #[cfg(test)]
         let original_blocking_abort = Arc::new(Mutex::new(None));
         #[cfg(test)]
@@ -733,6 +847,9 @@ pub(crate) mod tests {
         drop(job);
         until(|| supervisor.failure.lock().unwrap().is_some());
         let error = supervisor.take_original_failure().expect("original panic");
+        let health = error.health_cause();
+        let same_original =
+            Arc::as_ptr(&health) as *const () == Arc::as_ptr(&error.original) as *const ();
         root.owner.complete();
         root.business.release();
         drop(window);
@@ -741,8 +858,10 @@ pub(crate) mod tests {
         drop(supervisor);
         let last_alias_held = !destroyed.load(Ordering::Acquire);
         drop(error);
+        let health_alias_held = !destroyed.load(Ordering::Acquire);
+        drop(health);
         until(|| control.snapshot().scopes.is_empty());
-        assert!(payload_held && last_alias_held);
+        assert!(payload_held && last_alias_held && health_alias_held && same_original);
         assert!(destroyed.load(Ordering::Acquire));
         assert_eq!(held.result_windows.held_positions, [0, 0, 1, 0]);
         control.close_admission();

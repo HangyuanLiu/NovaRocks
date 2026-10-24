@@ -337,7 +337,7 @@ mod internal_supervisor_tests {
             &'a mut self,
             _: novarocks_workload_control::CancellationView,
         ) -> NativeAttemptConvergenceFuture<'a> {
-            Box::pin(async {})
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -1336,8 +1336,9 @@ mod internal_supervisor_tests {
             Box::pin(async move {
                 native.cleanup_entered.store(true, Ordering::SeqCst);
                 native.release_cleanup.notified().await;
-                convergence.await;
+                convergence.await?;
                 native.cleanup_completed.store(true, Ordering::SeqCst);
+                Ok(())
             })
         }
     }
@@ -1621,10 +1622,26 @@ mod internal_supervisor_tests {
                     Duration::from_secs(94),
                 ))),
             );
-            let result =
-                tokio::time::timeout(Duration::from_secs(2), client.start(request, root.owner))
-                    .await
-                    .expect("factory panic must become an actor verdict before held cleanup exits");
+            let mut original_exit = None;
+            let start = if phase == NativeFactoryPanicPhase::Activate {
+                let mut input = match client.prepare_observed_start(request, None) {
+                    Ok(input) => Some(input),
+                    Err(original) => std::panic::panic_any(original),
+                };
+                let mut owner = Some(root.owner);
+                let mut ready = None;
+                client
+                    .start_observed_in(&mut input, &mut owner, &mut ready, &mut original_exit)
+                    .unwrap()
+                    .finish()
+                    .unwrap();
+                ready.take().unwrap()
+            } else {
+                client.start(request, root.owner)
+            };
+            let result = tokio::time::timeout(Duration::from_secs(2), start)
+                .await
+                .expect("factory panic must become an actor verdict before held cleanup exits");
             let error = match result {
                 Err(error) => error,
                 Ok(_) => panic!("a Native factory panic cannot produce internal Ready"),
@@ -1658,30 +1675,56 @@ mod internal_supervisor_tests {
                 .shutdown_until(Instant::now() + Duration::from_secs(5))
                 .await;
             if phase == NativeFactoryPanicPhase::Activate {
-                let Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)) =
-                    shutdown
-                else {
-                    panic!("activation panic retains its existing process-health receipt");
-                };
-                assert_eq!(error.execution_failure(), Some(&expected));
+                assert!(matches!(&shutdown,
+                    Err(LogicalExecutionSupervisorShutdownError::Registry(
+                        LogicalExecutionRuntimeRegistryError::OriginalExitFailureUnresolved
+                    ))
+                ), "original activation shutdown: {shutdown:?}");
+                let mut exit = original_exit.take().expect("the same original Source");
+                wait_for_dormant_failure(&mut exit).await;
+                let view = exit.view().unwrap();
+                assert!(view.native_dormant_failed());
+                assert!(!view.native_preparation_exited());
+                drop(view);
+                let failure = exit.dormant_failure().unwrap();
+                assert_eq!(failure.activation_panic().unwrap().downcast_ref::<&str>(),
+                    Some(&"injected synchronous Native activation factory panic"));
+                assert!(failure.convergence_panic().is_none());
+                assert!(failure.reported_failure().is_none());
+                drop(failure);
+                assert!(futures::poll!(std::future::poll_fn(|cx| exit.poll_exit(cx))).is_pending());
+                assert!(futures::poll!(Box::pin(scope.wait_released())).is_pending());
+                assert_eq!(control.snapshot().result_windows.held_positions[2], 1);
+                assert!(!activation.dormant_dropped.load(Ordering::SeqCst));
+                assert!(native.cleanup_completed.load(Ordering::SeqCst));
+                // The root itself really joined; its failed Source remains
+                // retained by registry/health and cannot report local exit.
+                assert!(supervisor.join.is_none());
+                assert!(supervisor.run_outcome.is_some());
+                assert!(!supervisor.shutdown_complete);
+                assert_eq!(supervisor.registry.active_native_custody_count(), 0);
+                drop(exit);
+                supervisor.abandon_for_process_exit();
             } else {
                 shutdown.unwrap();
-            }
-            acknowledge_all_control(&control);
-            tokio::time::timeout(Duration::from_secs(2), scope.wait_released())
-                .await
-                .unwrap();
-            assert!(activation.dormant_dropped.load(Ordering::SeqCst));
-            assert!(native.cleanup_completed.load(Ordering::SeqCst));
-            if phase == NativeFactoryPanicPhase::Run {
+                acknowledge_all_control(&control);
+                tokio::time::timeout(Duration::from_secs(2), scope.wait_released())
+                    .await
+                    .unwrap();
+                assert!(activation.dormant_dropped.load(Ordering::SeqCst));
+                assert!(native.cleanup_completed.load(Ordering::SeqCst));
                 assert!(native.active_dropped.load(Ordering::SeqCst));
+                assert_eq!(supervisor.registry.active_native_custody_count(), 0);
             }
-            assert_eq!(supervisor.registry.active_native_custody_count(), 0);
 
             control
         };
-        acknowledge_all_control(&control);
-        control.finish().await;
+        if phase == NativeFactoryPanicPhase::Activate {
+            control.finish_for_process_exit().await;
+        } else {
+            acknowledge_all_control(&control);
+            control.finish().await;
+        }
     }
 
     #[tokio::test]

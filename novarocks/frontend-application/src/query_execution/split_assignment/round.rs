@@ -371,13 +371,22 @@ impl RoundSplitAssignment {
     }
 
     pub(crate) fn close_source(mut source: RoundSplitSource) {
-        if let Err(error) = source.source.close() {
+        let scan = source.scan;
+        if let Err(error) = Self::close_source_result(&mut source) {
             tracing::warn!(
-                plan_node_id = source.scan.plan_node_id(),
+                plan_node_id = scan.plan_node_id(),
                 error = %error,
                 "closing a split source failed"
             );
         }
+    }
+
+    /// The same original close author, retaining its typed domain cause for
+    /// an initializer that must explicitly observe its cleanup job.
+    pub(crate) fn close_source_result(
+        source: &mut RoundSplitSource,
+    ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+        source.source.close()
     }
 
     /// Close every source once, isolating each provider hook. Normal domain

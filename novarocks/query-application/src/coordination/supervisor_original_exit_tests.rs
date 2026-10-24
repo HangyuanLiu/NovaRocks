@@ -743,6 +743,7 @@ impl NativeAttemptPreparationPort for CompletedActivationDropPreparation {
                 allow_initial_convergence: Arc::new(tokio::sync::Notify::new()),
                 block_initial_convergence: false,
                 replacement_missing_rows: false,
+                replacement_activation_panic: false,
                 failures_before_success: self.panic_ordinal - 1,
             },
             target_drops: Arc::clone(&self.target_drops),

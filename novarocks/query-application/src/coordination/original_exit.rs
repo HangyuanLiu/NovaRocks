@@ -61,6 +61,7 @@ struct State {
     native_pre_actor_started: bool,
     native_body_exited: bool,
     native_failure: Option<Box<dyn std::any::Any + Send>>,
+    native_dormant_failed: bool,
     native_closure_seen: bool,
     native_return_disposition: Option<LocalExecutionDisposition>,
     role: Option<RoleResult>,
@@ -97,6 +98,7 @@ impl OriginalLogicalExit {
                 native_pre_actor_started: false,
                 native_body_exited: true,
                 native_failure: None,
+                native_dormant_failed: false,
                 native_closure_seen: false,
                 native_return_disposition: None,
                 role: None,
@@ -128,14 +130,25 @@ impl OriginalLogicalExit {
     pub(super) fn retire_native_body_silent(&self) {
         {
             let state = self.lock();
-            if !state.role_ended || state.role_failed || state.native_body_exited {
+            if !state.role_ended || state.native_body_exited {
                 return;
             }
         }
+        let role_failed = self.lock().role_failed;
         let Ok(mut body) = self.native.try_lock() else {
             return;
         };
-        if body.exiting
+        if body.dormant.has_failure() {
+            // The original two causes remain beside their original owner.
+            // Publish only this failure fact, never copy into native_failure.
+            drop(body);
+            let mut state = self.lock();
+            state.native_dormant_failed = true;
+            state.role_failed = true;
+            return;
+        }
+        if role_failed
+            || body.exiting
             || body.pending_activated.is_some()
             || body
                 .session
@@ -149,9 +162,13 @@ impl OriginalLogicalExit {
         drop(body);
         let mut state = self.lock();
         match result {
-            Ok(()) => {
+            Ok(Ok(())) => {
                 state.native_body_exited = true;
                 state.native_pre_actor_started = false;
+            }
+            Ok(Err(())) => {
+                state.native_dormant_failed = true;
+                state.role_failed = true;
             }
             Err(original) => {
                 // A failed real Drop is not a successful local return. This
@@ -341,11 +358,11 @@ pub(super) struct OriginalNativePreparation {
     pub(super) exiting: bool,
 }
 impl OriginalNativePreparation {
-    fn close(&mut self) {
+    fn close(&mut self) -> Result<(), ()> {
         self.exiting = true;
         // This actual Drop, not None or an empty converge future, is the local
         // author. Any unwind leaves exiting=true and Source unproven.
-        self.dormant.retire();
+        self.dormant.retire()?;
         drop(self.start.take());
         drop(self.open.take());
         drop(self.seed.take());
@@ -356,6 +373,7 @@ impl OriginalNativePreparation {
         drop(self.description.take());
         drop(self.port.take());
         self.exiting = false;
+        Ok(())
     }
 }
 
@@ -423,6 +441,11 @@ impl LogicalExecutionExitView<'_> {
     pub fn native_preparation_failure(&self) -> Option<&(dyn std::any::Any + Send)> {
         self.state.native_failure.as_deref()
     }
+    /// A diagnostic failure fact, never an actual-exit receipt. Raw causes
+    /// remain in the original Native body beside the dormant owner.
+    pub fn native_dormant_failed(&self) -> bool {
+        self.state.native_dormant_failed
+    }
     pub fn native_preparation_exited(&self) -> bool {
         self.state.native_body_exited
     }
@@ -439,7 +462,31 @@ impl LogicalExecutionExitView<'_> {
         self.state.native_return_disposition
     }
 }
+/// Borrow-only access to this source's original dormant failure fields.
+/// Holding this view prevents Native-body mutation, never grants actual exit.
+pub(crate) struct LogicalDormantFailureView<'a> {
+    body: tokio::sync::MutexGuard<'a, OriginalNativePreparation>,
+}
+impl LogicalDormantFailureView<'_> {
+    pub(crate) fn activation_panic(&self) -> Option<&(dyn std::any::Any + Send)> {
+        self.body.dormant.activation_panic()
+    }
+    pub(crate) fn convergence_panic(&self) -> Option<&(dyn std::any::Any + Send)> {
+        self.body.dormant.convergence_panic()
+    }
+    pub(crate) fn reported_failure(&self) -> Option<&crate::api::StatementNativeHealthFailure> {
+        self.body.dormant.convergence_failure()
+    }
+}
 impl LogicalExecutionExitObserver {
+    pub(crate) fn dormant_failure(&self) -> Option<LogicalDormantFailureView<'_>> {
+        let body = self.source.as_ref()?.native.try_lock().ok()?;
+        if !body.dormant.has_failure() {
+            return None;
+        }
+        Some(LogicalDormantFailureView { body })
+    }
+
     pub(super) fn new(source: Arc<OriginalLogicalExit>) -> Self {
         Self {
             source: Some(source),

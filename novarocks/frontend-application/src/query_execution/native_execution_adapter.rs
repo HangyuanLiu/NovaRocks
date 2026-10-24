@@ -80,7 +80,7 @@ use crate::query_execution::artifact::{
     SnapshotBoundDormantAttemptInputs, TaskExecutionPreparedQuery, TaskManifestBinding,
 };
 use crate::query_execution::attempt_initialization::{
-    AttemptInitializing, RoundCredentialLeaseSource,
+    AttemptInitializing, AttemptReady, RoundCredentialLeaseSource,
 };
 use crate::query_execution::completion::PreparedLogicalRead;
 use crate::query_execution::contract::{DistributedQueryError, ResolvedQueryOptions};
@@ -1207,7 +1207,6 @@ impl FrontendNativeLogicalExecutionLauncher {
     }
 }
 
-#[derive(Clone)]
 struct ProductionManifestAttemptProjection {
     work_scope: novarocks_workload_control::WorkScope,
     runtime: FrontendNativeLogicalExecutionRuntime,
@@ -1216,6 +1215,13 @@ struct ProductionManifestAttemptProjection {
     delivery: ProductionRootDelivery,
     diagnostics: ComputationDiagnostics,
     initial_credentials: Option<Weak<InitialComputationCredentials>>,
+    pending_credential_source: Option<RoundCredentialLeaseSource>,
+    pending_initializer: Option<AttemptInitializing>,
+    pending_ready: Option<AttemptReady>,
+    // A complete round is stable before source-plan installation may publish
+    // callbacks. Its existing round convergence remains the actual exit author.
+    pending_projected: Option<ProjectedManifestAttempt>,
+    credential_anchor: Option<Arc<InitialComputationCredentials>>,
 }
 
 impl std::fmt::Debug for ProductionManifestAttemptProjection {
@@ -1485,6 +1491,11 @@ impl FrontendDormantAttemptFactory for ProductionDormantAttemptFactory {
             delivery,
             diagnostics: self.diagnostics.clone(),
             initial_credentials: self.initial_credentials.clone(),
+            pending_credential_source: None,
+            pending_initializer: None,
+            pending_ready: None,
+            pending_projected: None,
+            credential_anchor: None,
         });
         if let Some(offers) = self.handoffs.as_ref() {
             // The actual producer enters this stable factory field before an
@@ -1624,13 +1635,32 @@ impl FrontendManifestAttemptProjection for ProductionManifestAttemptProjection {
         &'a mut self,
         _cancellation: CancellationView,
     ) -> NativeAttemptConvergenceFuture<'a> {
-        Box::pin(async {})
+        Box::pin(async move {
+            if self.pending_projected.is_some() {
+                // The original round has been assembled: its existing actual
+                // round-close contract, not initializer cleanup, owns it.
+                std::future::pending::<()>().await;
+            }
+            if let Some(ready) = self.pending_ready.as_mut() {
+                ready.close().await?;
+            }
+            if let Some(initializing) = self.pending_initializer.as_mut() {
+                initializing.close().await?;
+            }
+            // All original source-open/close and panic-payload jobs actually
+            // joined. Credential/source fields remain installed through that cut.
+            self.pending_ready = None;
+            self.pending_initializer = None;
+            self.pending_credential_source = None;
+            self.credential_anchor = None;
+            Ok(())
+        })
     }
 }
 
 impl ProductionManifestAttemptProjection {
     async fn project_attempt(
-        &self,
+        &mut self,
         prepared: PreparedDistributedQuery,
         manifest: &TaskManifestBinding,
         replacement_admissions: Option<
@@ -1638,6 +1668,16 @@ impl ProductionManifestAttemptProjection {
         >,
         cancellation: CancellationView,
     ) -> Result<ProjectedManifestAttempt, NativeAttemptActivationFailure> {
+        if self.pending_credential_source.is_some()
+            || self.pending_initializer.is_some()
+            || self.pending_ready.is_some()
+            || self.pending_projected.is_some()
+            || self.credential_anchor.is_some()
+        {
+            return Err(projection_message(
+                "the original Native initializer still owns its source disposition",
+            ));
+        }
         let execution = manifest.execution();
         let schedule = prepared
             .native_schedule_from_manifest(manifest)
@@ -1656,7 +1696,7 @@ impl ProductionManifestAttemptProjection {
         // This projection runs only after QA binds the original open ticket.
         // Upgrade once under the admitted attempt, then keep that exact owner
         // until its original table has crossed Native initialization.
-        let initial_credentials = self
+        self.credential_anchor = self
             .initial_credentials
             .as_ref()
             .map(|credentials| {
@@ -1665,12 +1705,12 @@ impl ProductionManifestAttemptProjection {
             ))
             })
             .transpose()?;
-        let credential_source = match &initial_credentials {
+        self.pending_credential_source = Some(match &self.credential_anchor {
             Some(credentials) => credentials
                 .take_source(execution)
                 .map_err(projection_failure)?,
             None => RoundCredentialLeaseSource::fresh(execution),
-        };
+        });
         let connector_context = crate::connector::query_connector_request_context_on_runtime(
             self.runtime.data_runtime.handle(),
             deadline,
@@ -1680,11 +1720,14 @@ impl ProductionManifestAttemptProjection {
             ),
         )
         .map_err(projection_message)?;
-        let connector_context = credential_source
+        let connector_context = self
+            .pending_credential_source
+            .as_ref()
+            .unwrap()
             .connector_request_context(connector_context)
             .map_err(projection_message)?;
         let ProductionRootDelivery::Relayed { window, .. } = &self.delivery;
-        let ready = AttemptInitializing::new_governed(
+        AttemptInitializing::new_governed_in(
             execution,
             self.work_scope.clone(),
             window.clone(),
@@ -1696,14 +1739,21 @@ impl ProductionManifestAttemptProjection {
             connector_context,
             cancellation,
             self.runtime.data_runtime.clone(),
-            credential_source,
+            &mut self.pending_credential_source,
+            &mut self.pending_initializer,
         )
-        .map_err(projection_failure)?
-        .initialize()
-        .await
         .map_err(projection_failure)?;
-        let (ready_execution, artifacts, schedule, ready_feedback, split_plan, credential_leases) =
-            ready.into_parts();
+        let initializing = self.pending_initializer.as_mut().unwrap();
+        initializing
+            .initialize()
+            .await
+            .map_err(projection_failure)?;
+        initializing.take_ready_in(&mut self.pending_ready);
+        let (ready_execution, artifacts, schedule, ready_feedback, credential_leases) = self
+            .pending_ready
+            .as_mut()
+            .unwrap()
+            .take_preparation_parts();
         if ready_execution != execution || !Arc::ptr_eq(&feedback, &ready_feedback) {
             return Err(projection_message(
                 "attempt initialization returned facts for another Native attempt",
@@ -1795,7 +1845,7 @@ impl ProductionManifestAttemptProjection {
         // route and material remain attached to this exact attempt until the
         // domain result transfers them to its publication owner.
         let storage = task_prepared.take_terminal_storage();
-        if let Some(credentials) = &initial_credentials {
+        if let Some(credentials) = &self.credential_anchor {
             credentials
                 .verify_native_storage(&storage)
                 .map_err(projection_failure)?;
@@ -1837,9 +1887,6 @@ impl ProductionManifestAttemptProjection {
             )
             .map_err(projection_message)?,
         );
-        let split_assignment = split_plan.and_then(|plan| {
-            round.install_split_assignment(execution, plan, self.runtime.data_runtime.clone())
-        });
         install_attempt_pumps(
             &mut round.round,
             AttemptPumps {
@@ -1886,17 +1933,28 @@ impl ProductionManifestAttemptProjection {
                     .map_err(|error| projection_message(error.to_string()))?,
             ),
         };
-        let mut attempt = ProjectedManifestAttempt::production_rows(
+        self.pending_projected = Some(ProjectedManifestAttempt::production_rows(
             round,
             root_binding,
             root_status,
             task_prepared,
             credential_storage,
-            split_assignment,
+            None,
             abort_route,
-        );
+        ));
+        let attempt = self.pending_projected.as_mut().unwrap();
         attempt.profile_observer = profile_observer;
-        Ok(attempt)
+        // Every fallible preparation step completed while the initializer's
+        // original Ready field still owned all source handles. Publish the
+        // complete original round before the sole plan-to-pump transfer.
+        if let Some(plan) = self.pending_ready.as_mut().unwrap().take_split_plan() {
+            attempt._split_assignment = attempt.round.install_split_assignment(
+                execution,
+                plan,
+                self.runtime.data_runtime.clone(),
+            );
+        }
+        Ok(self.pending_projected.take().unwrap())
     }
 }
 
@@ -2372,7 +2430,7 @@ where
         }
         match self.manifest_inputs.as_mut() {
             Some(inputs) => self.behavior.converge(inputs, cancellation),
-            None => Box::pin(async {}),
+            None => Box::pin(async { Ok(()) }),
         }
     }
 }
@@ -3309,7 +3367,7 @@ mod tests {
             _inputs: &'a mut M,
             _cancellation: CancellationView,
         ) -> NativeAttemptConvergenceFuture<'a> {
-            Box::pin(async {})
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -3467,6 +3525,7 @@ mod tests {
             let observed = Arc::clone(&self.convergence_observed);
             Box::pin(async move {
                 observed.store(true, Ordering::SeqCst);
+                Ok(())
             })
         }
     }
@@ -3583,7 +3642,10 @@ mod tests {
         cancellation: CancellationView,
     ) {
         assert_eq!(owner.manifest_inputs.as_ref().unwrap().marker, 73);
-        owner.converge_retained(cancellation).await;
+        owner
+            .converge_retained(cancellation)
+            .await
+            .expect("original dormant fixture cleanup succeeds");
         assert!(convergence_observed.load(Ordering::SeqCst));
     }
 
@@ -3746,7 +3808,7 @@ mod tests {
             _cancellation: CancellationView,
         ) -> NativeAttemptConvergenceFuture<'a> {
             self.dormant_closes.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {})
+            Box::pin(async { Ok(()) })
         }
     }
     #[tokio::test]

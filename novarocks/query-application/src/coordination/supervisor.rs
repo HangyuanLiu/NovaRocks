@@ -71,7 +71,6 @@ use super::{
 use novarocks_coordination_contract::{MonotonicClock, RecoveryMode};
 
 static NEXT_PROCESS_QUERY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-const NATIVE_CONVERGENCE_PANIC_BACKOFF: Duration = Duration::from_millis(10);
 const DEFAULT_REMOTE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Explicit process bounds used by the logical execution supervisor.
@@ -1729,8 +1728,17 @@ async fn run_logical_role(
                     .await
                     .map(|_| ())
                     .or_else(actor_terminal_refusal);
-                converge_dormant(dormant.as_mut(), cancellation, &mut shutdown, &requester).await;
-                dormant.retire();
+                let convergence =
+                    converge_dormant(dormant, cancellation, &mut shutdown, &requester).await;
+                if convergence.is_err() {
+                    return first_supervision_error(
+                        Err(error),
+                        first_supervision_error(actor_result, convergence),
+                    );
+                }
+                dormant
+                    .retire()
+                    .expect("original dormant cleanup has proven its own exit");
                 let retire_result = retire_logical(&registry, registration).await;
                 return first_supervision_error(
                     Err(error),
@@ -1743,29 +1751,29 @@ async fn run_logical_role(
             "one original activation output"
         );
         let activation = await_with_shutdown(
-            catch_future_panic(async {
-                dormant
-                    .as_mut()
-                    .activate(&schedule, None, cancellation.clone())
-                    .await
-            }),
+            activate_dormant(
+                dormant,
+                pending_activated,
+                &schedule,
+                None,
+                cancellation.clone(),
+            ),
             &mut shutdown,
             &requester,
         )
         .await;
         let (mut active, rows_runtime) = match activation {
-            Ok(Ok(active)) => {
-                // The complete return first occupies its same Source field.
-                // Then the Box enters its ORIGINAL slot before dormant Drop.
-                *pending_activated = Some(
-                    super::native_active_custody::PendingNativeActivation::new(active),
-                );
+            Ok(Ok(())) => {
+                // The original poll author installed this whole return before
+                // dropping its Future. Stage that SAME Source field now.
                 active_custody
                     .as_ref()
                     .expect("reserved before activation")
                     .stage_activated_in(pending_activated)
                     .expect("same original activation slot");
-                dormant.retire();
+                dormant
+                    .retire()
+                    .expect("successful original activation has no dormant failure");
                 active_custody
                     .as_mut()
                     .expect("reserved before activation")
@@ -1782,8 +1790,14 @@ async fn run_logical_role(
                     .await
                     .map(|_| ())
                     .or_else(actor_terminal_refusal);
-                converge_dormant(dormant.as_mut(), cancellation, &mut shutdown, &requester).await;
-                dormant.retire();
+                let convergence =
+                    converge_dormant(dormant, cancellation, &mut shutdown, &requester).await;
+                if convergence.is_err() {
+                    return first_supervision_error(actor_result, convergence);
+                }
+                dormant
+                    .retire()
+                    .expect("original dormant cleanup has proven its own exit");
                 let retire_result = retire_logical(&registry, registration).await;
                 return first_supervision_error(actor_result, retire_result);
             }
@@ -1797,8 +1811,17 @@ async fn run_logical_role(
                     .await
                     .map(|_| ())
                     .or_else(actor_terminal_refusal);
-                converge_dormant(dormant.as_mut(), cancellation, &mut shutdown, &requester).await;
-                dormant.retire();
+                let convergence =
+                    converge_dormant(dormant, cancellation, &mut shutdown, &requester).await;
+                if convergence.is_err() {
+                    return first_supervision_error(
+                        Err(error),
+                        first_supervision_error(actor_result, convergence),
+                    );
+                }
+                dormant
+                    .retire()
+                    .expect("original dormant cleanup has proven its own exit");
                 let retire_result = retire_logical(&registry, registration).await;
                 return first_supervision_error(
                     Err(error),
@@ -1879,6 +1902,15 @@ async fn run_logical_role(
                     },
                 )
                 .await;
+                if dormant.drop_unproven() {
+                    // A failed replacement's original body remains in Source.
+                    // No later actor retirement may manufacture its closure or
+                    // prevent that same Source from publishing its health fact.
+                    return first_supervision_error(
+                        actor_result,
+                        Err(dormant_unproven_error(dormant)),
+                    );
+                }
                 let retire_result = retire_logical(&registry, registration).await;
                 return first_supervision_error(actor_result, retire_result);
             }
@@ -2819,13 +2851,24 @@ async fn supervise_rows_inner(
                     Ok((qualification, _)) => qualification,
                     Err(error) => {
                         session.retire_preparation();
-                        converge_dormant(dormant.as_mut(), cancellation, shutdown, requester).await;
-                        let replacement_convergence = record_active_convergence(
-                            registry,
-                            registration,
-                            replacement_schedule.contexts(),
+                        let replacement_convergence = match converge_dormant(
+                            dormant,
+                            cancellation,
+                            shutdown,
+                            requester,
                         )
-                        .await;
+                        .await
+                        {
+                            Ok(()) => {
+                                record_active_convergence(
+                                    registry,
+                                    registration,
+                                    replacement_schedule.contexts(),
+                                )
+                                .await
+                            }
+                            Err(original) => Err(original),
+                        };
                         let old_convergence = converge_rows_attempts(
                             &mut attempt.active,
                             attempt.schedule.contexts(),
@@ -2865,13 +2908,24 @@ async fn supervise_rows_inner(
                     Err(error) => {
                         session.retire_preparation();
 
-                        converge_dormant(dormant.as_mut(), cancellation, shutdown, requester).await;
-                        let replacement_convergence = record_active_convergence(
-                            registry,
-                            registration,
-                            replacement_schedule.contexts(),
+                        let replacement_convergence = match converge_dormant(
+                            dormant,
+                            cancellation,
+                            shutdown,
+                            requester,
                         )
-                        .await;
+                        .await
+                        {
+                            Ok(()) => {
+                                record_active_convergence(
+                                    registry,
+                                    registration,
+                                    replacement_schedule.contexts(),
+                                )
+                                .await
+                            }
+                            Err(original) => Err(original),
+                        };
                         let old_convergence =
                             converge_residual_rows_attempts(&mut residuals, registry, registration)
                                 .await;
@@ -2891,13 +2945,24 @@ async fn supervise_rows_inner(
                     Ok(admissions) => admissions,
                     Err(error) => {
                         session.retire_preparation();
-                        converge_dormant(dormant.as_mut(), cancellation, shutdown, requester).await;
-                        let replacement_convergence = record_active_convergence(
-                            registry,
-                            registration,
-                            replacement_schedule.contexts(),
+                        let replacement_convergence = match converge_dormant(
+                            dormant,
+                            cancellation,
+                            shutdown,
+                            requester,
                         )
-                        .await;
+                        .await
+                        {
+                            Ok(()) => {
+                                record_active_convergence(
+                                    registry,
+                                    registration,
+                                    replacement_schedule.contexts(),
+                                )
+                                .await
+                            }
+                            Err(original) => Err(original),
+                        };
                         let old_convergence =
                             converge_residual_rows_attempts(&mut residuals, registry, registration)
                                 .await;
@@ -2921,13 +2986,24 @@ async fn supervise_rows_inner(
                             .await
                             .map(|_| ())
                             .or_else(actor_terminal_refusal);
-                        converge_dormant(dormant.as_mut(), cancellation, shutdown, requester).await;
-                        let replacement_convergence = record_active_convergence(
-                            registry,
-                            registration,
-                            replacement_schedule.contexts(),
+                        let replacement_convergence = match converge_dormant(
+                            dormant,
+                            cancellation,
+                            shutdown,
+                            requester,
                         )
-                        .await;
+                        .await
+                        {
+                            Ok(()) => {
+                                record_active_convergence(
+                                    registry,
+                                    registration,
+                                    replacement_schedule.contexts(),
+                                )
+                                .await
+                            }
+                            Err(original) => Err(original),
+                        };
                         let old_convergence =
                             converge_residual_rows_attempts(&mut residuals, registry, registration)
                                 .await;
@@ -2945,25 +3021,19 @@ async fn supervise_rows_inner(
                     "one original activation output"
                 );
                 let activated = await_with_shutdown(
-                    catch_future_panic(async {
-                        dormant
-                            .as_mut()
-                            .activate(
-                                &replacement_schedule,
-                                replacement_admissions,
-                                cancellation.clone(),
-                            )
-                            .await
-                    }),
+                    activate_dormant(
+                        dormant,
+                        pending_activated,
+                        &replacement_schedule,
+                        replacement_admissions,
+                        cancellation.clone(),
+                    ),
                     shutdown,
                     requester,
                 )
                 .await;
                 match activated {
-                    Ok(Ok(activated)) => {
-                        *pending_activated = Some(
-                            super::native_active_custody::PendingNativeActivation::new(activated),
-                        );
+                    Ok(Ok(())) => {
                         replacement_custody
                             .as_ref()
                             .expect("reserved before replacement activation")
@@ -2979,13 +3049,24 @@ async fn supervise_rows_inner(
                             .await;
 
                         let supervision = preparation_supervision_result(error, actor_outcome);
-                        converge_dormant(dormant.as_mut(), cancellation, shutdown, requester).await;
-                        let replacement_convergence = record_active_convergence(
-                            registry,
-                            registration,
-                            replacement_schedule.contexts(),
+                        let replacement_convergence = match converge_dormant(
+                            dormant,
+                            cancellation,
+                            shutdown,
+                            requester,
                         )
-                        .await;
+                        .await
+                        {
+                            Ok(()) => {
+                                record_active_convergence(
+                                    registry,
+                                    registration,
+                                    replacement_schedule.contexts(),
+                                )
+                                .await
+                            }
+                            Err(original) => Err(original),
+                        };
                         let old_convergence =
                             converge_residual_rows_attempts(&mut residuals, registry, registration)
                                 .await;
@@ -3005,13 +3086,24 @@ async fn supervise_rows_inner(
                             .await
                             .map(|_| ())
                             .or_else(actor_terminal_refusal);
-                        converge_dormant(dormant.as_mut(), cancellation, shutdown, requester).await;
-                        let replacement_convergence = record_active_convergence(
-                            registry,
-                            registration,
-                            replacement_schedule.contexts(),
+                        let replacement_convergence = match converge_dormant(
+                            dormant,
+                            cancellation,
+                            shutdown,
+                            requester,
                         )
-                        .await;
+                        .await
+                        {
+                            Ok(()) => {
+                                record_active_convergence(
+                                    registry,
+                                    registration,
+                                    replacement_schedule.contexts(),
+                                )
+                                .await
+                            }
+                            Err(original) => Err(original),
+                        };
                         let old_convergence =
                             converge_residual_rows_attempts(&mut residuals, registry, registration)
                                 .await;
@@ -3024,7 +3116,9 @@ async fn supervise_rows_inner(
                         );
                     }
                 };
-                dormant.retire();
+                dormant
+                    .retire()
+                    .expect("successful original activation has no dormant failure");
                 let (active, rows_runtime) = replacement_custody
                     .as_mut()
                     .expect("reserved before replacement activation")
@@ -3278,23 +3372,135 @@ async fn record_remote_tracking_ended(
     first_error.map_or(Ok(()), Err)
 }
 
+/// Only this original dormant owner can receive these two causes. Capture
+/// into its fixed field before the borrowed Future's actual Drop can unwind.
+async fn activate_dormant(
+    custody: &mut crate::api::NativeDormantCustody,
+    pending_activated: &mut Option<super::native_active_custody::PendingNativeActivation>,
+    schedule: &super::AttemptSchedule,
+    admissions: Option<Box<[super::ReplacementWorkerAdmissionEvidence]>>,
+    cancellation: novarocks_workload_control::CancellationView,
+) -> Result<Result<(), crate::api::NativeAttemptActivationFailure>, ()> {
+    assert!(
+        pending_activated.is_none(),
+        "one original activation output"
+    );
+    let Some((owner, original)) = custody.activation_parts() else {
+        // These are real owned arguments. Their Drop may notify WC progress;
+        // the original failed owner/cause stays stable before that callback.
+        drop(admissions);
+        drop(cancellation);
+        return Err(());
+    };
+    let mut future = match catch_unwind(AssertUnwindSafe(move || {
+        owner.activate(schedule, admissions, cancellation)
+    })) {
+        Ok(original_future) => original_future,
+        Err(payload) => {
+            *original = Some(payload);
+            return Err(());
+        }
+    };
+    std::future::poll_fn(move |cx| {
+        match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+            Ok(Poll::Ready(Ok(activated))) => {
+                // Complete the same original stable handoff BEFORE original F
+                // Drop. A secondary Drop panic cannot destroy this new owner.
+                *pending_activated = Some(
+                    super::native_active_custody::PendingNativeActivation::new(activated),
+                );
+                Poll::Ready(Ok(Ok(())))
+            }
+            Ok(Poll::Ready(Err(failure))) => Poll::Ready(Ok(Err(failure))),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(payload) => {
+                *original = Some(payload);
+                Poll::Ready(Err(()))
+            }
+        }
+    })
+    .await
+}
+
+fn dormant_unproven_error(custody: &crate::api::NativeDormantCustody) -> QueryExecutionError {
+    if custody.activation_panic().is_some() {
+        native_future_panicked("Native attempt activation panicked")
+    } else if custody.convergence_panic().is_some() {
+        native_future_panicked("Native dormant attempt convergence panicked")
+    } else if let Some(original) = custody.convergence_failure() {
+        // This is the process-health projection, not a new Task/SQL verdict.
+        // The original typed error/cause remains in the same fixed source slot.
+        QueryExecutionError::new(QueryExecutionErrorKind::Failed, original.detail())
+    } else {
+        result_protocol_error("original dormant cleanup source is unavailable")
+    }
+}
+
 async fn converge_dormant(
-    owner: &mut dyn DormantNativeAttemptOwner,
+    custody: &mut crate::api::NativeDormantCustody,
     cancellation: novarocks_workload_control::CancellationView,
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
-) {
-    loop {
-        let convergence = async { owner.converge(cancellation.clone()).await };
-        if await_with_shutdown(catch_future_panic(convergence), shutdown, requester)
-            .await
-            .is_ok()
-        {
-            return;
-        }
-        let _ = requester.request(CancellationReason::Requested);
-        tokio::time::sleep(NATIVE_CONVERGENCE_PANIC_BACKOFF).await;
+) -> Result<(), QueryExecutionError> {
+    if custody.convergence_completed() {
+        // CancellationView Drop can wake the original progress observer. Do
+        // that while any original failure is still in its stable fixed slot,
+        // before constructing even the safe projection returned below.
+        drop(cancellation);
+        return if custody.has_failure() {
+            Err(dormant_unproven_error(custody))
+        } else {
+            Ok(())
+        };
     }
+    if custody.convergence_panic().is_some() || custody.convergence_failure().is_some() {
+        drop(cancellation);
+        return Err(dormant_unproven_error(custody));
+    }
+    let outcome = {
+        let Some((owner, original)) = custody.convergence_parts() else {
+            drop(cancellation);
+            return Err(result_protocol_error(
+                "original dormant cleanup source is unavailable",
+            ));
+        };
+        match catch_unwind(AssertUnwindSafe(move || owner.converge(cancellation))) {
+            Ok(mut future) => {
+                // Poll the original F directly. An async-await wrapper would
+                // Drop a Ready(Err) F before this original error can be stored.
+                let capture = std::future::poll_fn(move |cx| {
+                    match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+                        Ok(Poll::Ready(Ok(()))) => Poll::Ready(Ok(())),
+                        Ok(Poll::Ready(Err(failure))) => {
+                            *original =
+                                Some(crate::api::DormantConvergenceFailure::Reported(failure));
+                            Poll::Ready(Err(()))
+                        }
+                        Ok(Poll::Pending) => Poll::Pending,
+                        Err(payload) => {
+                            *original =
+                                Some(crate::api::DormantConvergenceFailure::PollPanic(payload));
+                            Poll::Ready(Err(()))
+                        }
+                    }
+                });
+                await_with_shutdown(capture, shutdown, requester).await
+            }
+            Err(payload) => {
+                *original = Some(crate::api::DormantConvergenceFailure::PollPanic(payload));
+                Err(())
+            }
+        }
+    };
+    if outcome.is_ok() {
+        custody.record_convergence_completed();
+    }
+    if outcome.is_err() || custody.has_failure() {
+        // Do not recreate a panicked cleanup Future or wash an activation
+        // panic into an exit just because the borrowed cleanup returned Ok.
+        return Err(dormant_unproven_error(custody));
+    }
+    Ok(())
 }
 
 async fn converge_supervised_active(
@@ -4615,6 +4821,7 @@ mod tests {
         ) -> NativeAttemptConvergenceFuture<'a> {
             Box::pin(async move {
                 self.residual_converged.store(true, Ordering::SeqCst);
+                Ok(())
             })
         }
     }
@@ -4924,6 +5131,7 @@ mod tests {
         ) -> NativeAttemptConvergenceFuture<'a> {
             Box::pin(async move {
                 self.converged.store(true, Ordering::SeqCst);
+                Ok(())
             })
         }
     }
@@ -5470,8 +5678,9 @@ mod tests {
             Box::pin(async move {
                 signals.convergence_entered.store(true, Ordering::SeqCst);
                 signals.release_convergence.notified().await;
-                self.inner.converge(cancellation).await;
+                self.inner.converge(cancellation).await?;
                 signals.convergence_completed.store(true, Ordering::SeqCst);
+                Ok(())
             })
         }
     }
@@ -5519,6 +5728,372 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct DormantOriginalPanic(Arc<AtomicU64>);
+    impl Drop for DormantOriginalPanic {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[derive(Debug)]
+    struct DormantSecondaryDropPanic;
+    #[derive(Debug)]
+    struct DormantReportedCause(Arc<AtomicU64>);
+    impl fmt::Display for DormantReportedCause {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("injected dormant source-close failure")
+        }
+    }
+    impl std::error::Error for DormantReportedCause {}
+    impl Drop for DormantReportedCause {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[derive(Debug)]
+    struct DormantCaptureOwner {
+        polls: Arc<AtomicU64>,
+        calls: Arc<AtomicU64>,
+        owner_drops: Arc<AtomicU64>,
+        primary_drops: Arc<AtomicU64>,
+        reported: Option<Arc<DormantReportedCause>>,
+        panic_on_future_drop: bool,
+    }
+    impl Drop for DormantCaptureOwner {
+        fn drop(&mut self) {
+            self.owner_drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct DormantCaptureFuture<'a> {
+        owner: &'a mut DormantCaptureOwner,
+        polled: bool,
+    }
+    impl Future for DormantCaptureFuture<'_> {
+        type Output = Result<(), StatementNativeHealthFailure>;
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<Self::Output> {
+            assert!(!self.polled, "the same failed cleanup cannot be re-polled");
+            self.polled = true;
+            self.owner.polls.fetch_add(1, Ordering::SeqCst);
+            if let Some(original) = &self.owner.reported {
+                Poll::Ready(Err(StatementNativeHealthFailure::actual_exit_unproven(
+                    "injected dormant source-close failure",
+                    original.clone(),
+                )))
+            } else {
+                std::panic::panic_any(DormantOriginalPanic(Arc::clone(&self.owner.primary_drops)))
+            }
+        }
+    }
+    impl Drop for DormantCaptureFuture<'_> {
+        fn drop(&mut self) {
+            if self.polled && self.owner.panic_on_future_drop {
+                std::panic::panic_any(DormantSecondaryDropPanic);
+            }
+        }
+    }
+    impl DormantNativeAttemptOwner for DormantCaptureOwner {
+        fn eligible_backends(&self) -> &[BackendProcessId] {
+            &[]
+        }
+        fn activate<'a>(
+            &'a mut self,
+            _: &'a AttemptSchedule,
+            _: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
+            _: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptActivationFuture<'a> {
+            Box::pin(async { panic!("cleanup-only fixture cannot activate") })
+        }
+        fn converge<'a>(
+            &'a mut self,
+            _: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptConvergenceFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(DormantCaptureFuture {
+                owner: self,
+                polled: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dormant_poll_panic_is_stable_before_original_future_drop_panics() {
+        let mut control = {
+            let (control, root) = governance().await;
+            let cancellation = root.owner.scope().cancellation().unwrap();
+            let requester = root.owner.cancellation_requester();
+            let (_sender, mut shutdown) = watch::channel(false);
+            let polls = Arc::new(AtomicU64::new(0));
+            let calls = Arc::new(AtomicU64::new(0));
+            let primary_drops = Arc::new(AtomicU64::new(0));
+            let owner_drops = Arc::new(AtomicU64::new(0));
+            let mut custody = crate::api::NativeDormantCustody::test_owner(DormantCaptureOwner {
+                polls: Arc::clone(&polls),
+                calls: Arc::clone(&calls),
+                primary_drops: Arc::clone(&primary_drops),
+                owner_drops: Arc::clone(&owner_drops),
+                reported: None,
+                panic_on_future_drop: true,
+            });
+            let original_owner = custody.as_mut() as *mut dyn DormantNativeAttemptOwner as *mut ();
+            let secondary = futures::FutureExt::catch_unwind(AssertUnwindSafe(converge_dormant(
+                &mut custody,
+                cancellation.clone(),
+                &mut shutdown,
+                &requester,
+            )))
+            .await
+            .expect_err("the real borrowed Future Drop must panic");
+            assert!(secondary.is::<DormantSecondaryDropPanic>());
+            assert!(
+                custody
+                    .convergence_panic()
+                    .unwrap()
+                    .is::<DormantOriginalPanic>()
+            );
+            assert_eq!(primary_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(owner_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                custody.as_mut() as *mut dyn DormantNativeAttemptOwner as *mut (),
+                original_owner
+            );
+            assert!(
+                converge_dormant(&mut custody, cancellation, &mut shutdown, &requester)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            assert!(custody.retire().is_err());
+            assert_eq!(primary_drops.load(Ordering::SeqCst), 0);
+            // Explicit fixture disposition, never a claimed Native exit.
+            drop(secondary);
+            drop(custody);
+            assert_eq!(primary_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(owner_drops.load(Ordering::SeqCst), 1);
+            root.owner.complete();
+            root.business.release();
+            control
+        };
+        acknowledge_all_control(&control);
+        control.finish().await;
+    }
+
+    #[tokio::test]
+    async fn dormant_typed_failure_is_stable_before_original_future_drop_panics() {
+        let mut control = {
+            let (control, root) = governance().await;
+            let cancellation = root.owner.scope().cancellation().unwrap();
+            let requester = root.owner.cancellation_requester();
+            let (_sender, mut shutdown) = watch::channel(false);
+            let calls = Arc::new(AtomicU64::new(0));
+            let cause_drops = Arc::new(AtomicU64::new(0));
+            let cause = Arc::new(DormantReportedCause(Arc::clone(&cause_drops)));
+            let mut custody = crate::api::NativeDormantCustody::test_owner(DormantCaptureOwner {
+                polls: Arc::new(AtomicU64::new(0)),
+                calls: Arc::clone(&calls),
+                primary_drops: Arc::new(AtomicU64::new(0)),
+                owner_drops: Arc::new(AtomicU64::new(0)),
+                reported: Some(Arc::clone(&cause)),
+                panic_on_future_drop: true,
+            });
+            let secondary = futures::FutureExt::catch_unwind(AssertUnwindSafe(converge_dormant(
+                &mut custody,
+                cancellation.clone(),
+                &mut shutdown,
+                &requester,
+            )))
+            .await
+            .expect_err("the real borrowed Future Drop must panic");
+            assert!(secondary.is::<DormantSecondaryDropPanic>());
+            let original = custody.convergence_failure().unwrap();
+            assert!(std::ptr::eq(
+                original
+                    .cause()
+                    .downcast_ref::<DormantReportedCause>()
+                    .unwrap(),
+                cause.as_ref(),
+            ));
+            assert!(custody.convergence_panic().is_none());
+            assert_eq!(cause_drops.load(Ordering::SeqCst), 0);
+            let error = converge_dormant(&mut custody, cancellation, &mut shutdown, &requester)
+                .await
+                .unwrap_err();
+            assert_eq!(error.message(), "injected dormant source-close failure");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(custody.retire().is_err());
+            drop(secondary);
+            drop(custody);
+            assert_eq!(cause_drops.load(Ordering::SeqCst), 0);
+            drop(cause);
+            assert_eq!(cause_drops.load(Ordering::SeqCst), 1);
+            root.owner.complete();
+            root.business.release();
+            control
+        };
+        acknowledge_all_control(&control);
+        control.finish().await;
+    }
+
+    #[derive(Debug)]
+    struct ReadyActivationDropOwner(Arc<AtomicU64>);
+    impl DormantNativeAttemptOwner for ReadyActivationDropOwner {
+        fn eligible_backends(&self) -> &[BackendProcessId] {
+            &[]
+        }
+        fn activate<'a>(
+            &'a mut self,
+            _: &'a AttemptSchedule,
+            _: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
+            _: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptActivationFuture<'a> {
+            Box::pin(ReadyActivationDropFuture {
+                original: Some(ActivatedNativeAttempt::completion(
+                    ReadyActivationActiveOwner(Arc::clone(&self.0)),
+                )),
+                returned: false,
+            })
+        }
+        fn converge<'a>(
+            &'a mut self,
+            _: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptConvergenceFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+    struct ReadyActivationDropFuture {
+        original: Option<ActivatedNativeAttempt>,
+        returned: bool,
+    }
+    impl Future for ReadyActivationDropFuture {
+        type Output = Result<ActivatedNativeAttempt, NativeAttemptActivationFailure>;
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<Self::Output> {
+            self.returned = true;
+            Poll::Ready(Ok(self
+                .original
+                .take()
+                .expect("one original activated output")))
+        }
+    }
+    impl Drop for ReadyActivationDropFuture {
+        fn drop(&mut self) {
+            if self.returned {
+                std::panic::panic_any(DormantSecondaryDropPanic);
+            }
+        }
+    }
+    #[derive(Debug)]
+    struct ReadyActivationActiveOwner(Arc<AtomicU64>);
+    impl Drop for ReadyActivationActiveOwner {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl ActiveNativeAttemptOwner for ReadyActivationActiveOwner {
+        fn run<'a>(
+            &'a mut self,
+            _: &'a NativeAttemptDrive,
+            _: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptRunFuture<'a> {
+            Box::pin(async { NativeAttemptTerminal::Completed })
+        }
+        fn converge<'a>(
+            &'a mut self,
+            _: NativeActiveConvergenceRequest,
+        ) -> NativeActiveAttemptConvergenceFuture<'a> {
+            Box::pin(async {
+                Ok(NativeActiveConvergenceClosure::Evidence(
+                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                ))
+            })
+        }
+    }
+    #[tokio::test]
+    async fn activation_ready_output_survives_original_future_drop_panic() {
+        let mut control = {
+            let (control, root) = governance().await;
+            let (_, attempts, _, _, _) = failing_native();
+            let request = completion_request(attempts);
+            let scheduling = crate::api::ExecutionSchedulingFacts::from_frozen_description(
+                request.description(),
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap();
+            let execution = QueryExecutionId::new(
+                novarocks_types::QueryId::new(0x72, 0x19),
+                AttemptId::new(1).unwrap(),
+            )
+            .unwrap();
+            let schedule = build_attempt_schedule(
+                execution,
+                FrontendProcessId::new_v7(),
+                &[BackendProcessId::new_v7()],
+                &scheduling,
+                #[cfg(novarocks_dev_controls)]
+                Ok(None),
+            )
+            .unwrap();
+            let drops = Arc::new(AtomicU64::new(0));
+            let mut custody = crate::api::NativeDormantCustody::test_owner(
+                ReadyActivationDropOwner(Arc::clone(&drops)),
+            );
+            // This is the SAME receiving field used by OriginalNativePreparation.
+            let mut pending_activated = None;
+            let failure = futures::FutureExt::catch_unwind(AssertUnwindSafe(activate_dormant(
+                &mut custody,
+                &mut pending_activated,
+                &schedule,
+                None,
+                root.owner.scope().cancellation().unwrap(),
+            )))
+            .await
+            .expect_err("the actual returned Future Drop must panic");
+            assert!(failure.is::<DormantSecondaryDropPanic>());
+            assert!(pending_activated.is_some());
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            assert!(
+                custody.activation_panic().is_none(),
+                "the failure was F Drop, not activation poll"
+            );
+            // Explicit test disposition only, never a fabricated Native receipt.
+            drop(failure);
+            drop(pending_activated.take());
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            drop(custody);
+            drop(request);
+            root.owner.complete();
+            root.business.release();
+            control
+        };
+        acknowledge_all_control(&control);
+        control.finish().await;
+    }
+
+    async fn wait_for_dormant_failure(exit: &mut crate::api::LogicalExecutionExitObserver) {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            std::future::poll_fn(|cx| {
+                match exit.poll_exit(cx) {
+                    Poll::Pending => {}
+                    Poll::Ready(original) => std::panic::panic_any(original),
+                }
+                // Register the original observer before rechecking its level fact.
+                if exit.view().is_some_and(|view| view.native_dormant_failed()) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("the original Source must publish its dormant failure fact");
+    }
+
     async fn initial_terminal_preparation_fixture(phase: InitialTerminalPhase) {
         let mut control = {
             let (control, root) = governance().await;
@@ -5553,14 +6128,29 @@ mod tests {
                 frontend,
                 supervisor_config().with_remote_cleanup_timeout(Duration::from_secs(10)),
             );
+            let mut original_exit = None;
+            let future = if matches!(phase, InitialTerminalPhase::ActivatePanic) {
+                let mut input =
+                    match client.prepare_observed_start(completion_request(attempts), None) {
+                        Ok(input) => Some(input),
+                        Err(original) => std::panic::panic_any(original),
+                    };
+                let mut owner = Some(root.owner);
+                let mut ready = None;
+                client
+                    .start_observed_in(&mut input, &mut owner, &mut ready, &mut original_exit)
+                    .unwrap()
+                    .finish()
+                    .unwrap();
+                ready.take().unwrap()
+            } else {
+                client.start(completion_request(attempts), root.owner)
+            };
             // Capture failure observations without asserting while a real owner waits.
             let observations: Result<(bool, bool, usize), &'static str> = async {
-                let reply = tokio::time::timeout(
-                    Duration::from_secs(1),
-                    client.start(completion_request(attempts), root.owner),
-                )
-                .await
-                .map_err(|_| "initial terminal reply timed out")?;
+                let reply = tokio::time::timeout(Duration::from_secs(1), future)
+                    .await
+                    .map_err(|_| "initial terminal reply timed out")?;
                 match phase {
                     InitialTerminalPhase::CompletionSuccess => {
                         let mut handle = reply.map_err(|_| "exact Establish completion failed")?;
@@ -5615,7 +6205,11 @@ mod tests {
                 .shutdown_until(Instant::now() + Duration::from_secs(2))
                 .await;
             acknowledge_all_control(&control);
-            let settled = tokio::time::timeout(Duration::from_secs(2), scope.wait_released()).await;
+            let settled = if matches!(phase, InitialTerminalPhase::ActivatePanic) {
+                None
+            } else {
+                Some(tokio::time::timeout(Duration::from_secs(2), scope.wait_released()).await)
+            };
             assert!(
                 convergence_exit.is_ok(),
                 "original convergence did not exit: {phase:?}"
@@ -5628,9 +6222,11 @@ mod tests {
                     | InitialTerminalPhase::CompletionFailure,
                 ) => true,
                 (
-                    Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)),
+                    Err(LogicalExecutionSupervisorShutdownError::Registry(
+                        LogicalExecutionRuntimeRegistryError::OriginalExitFailureUnresolved,
+                    )),
                     InitialTerminalPhase::ActivatePanic,
-                ) => error.message() == "Native attempt activation panicked",
+                ) => true,
                 (
                     Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)),
                     InitialTerminalPhase::CompletionPanic,
@@ -5641,7 +6237,34 @@ mod tests {
                 joined_with_expected_outcome,
                 "original supervisor owner did not join with its expected outcome: {phase:?} {shutdown:?}"
             );
-            assert!(settled.is_ok(), "original scope did not settle: {phase:?}");
+            if matches!(phase, InitialTerminalPhase::ActivatePanic) {
+                let mut exit = original_exit.take().expect("same original observed start");
+                wait_for_dormant_failure(&mut exit).await;
+                let view = exit.view().unwrap();
+                assert!(view.native_dormant_failed());
+                assert!(!view.native_preparation_exited());
+                drop(view);
+                let original = exit.dormant_failure().unwrap();
+                assert!(original.activation_panic().is_some());
+                assert!(original.convergence_panic().is_none());
+                assert!(original.reported_failure().is_none());
+                drop(original);
+                assert!(futures::poll!(std::future::poll_fn(|cx| exit.poll_exit(cx))).is_pending());
+                assert!(futures::poll!(Box::pin(scope.wait_released())).is_pending());
+                assert_eq!(capacity.snapshot().held_positions[2], 1);
+                assert!(
+                    supervisor.join.is_none(),
+                    "the original root actually joined"
+                );
+                assert!(supervisor.run_outcome.is_some());
+                assert!(!supervisor.shutdown_complete);
+                drop(exit);
+            } else {
+                assert!(
+                    settled.unwrap().is_ok(),
+                    "original scope did not settle: {phase:?}"
+                );
+            }
             let (factory_exited, convergence_held, held_positions) =
                 observations.expect("bounded terminal facts");
             assert_eq!(original_internal_positions, 1);
@@ -5659,12 +6282,22 @@ mod tests {
                 held_positions, 1,
                 "original attempt guard lost its window: {phase:?}"
             );
-            assert_eq!(capacity.snapshot().held_positions[2], 0);
+            if matches!(phase, InitialTerminalPhase::ActivatePanic) {
+                // This is the existing explicit process disposition, not a
+                // successful cleanup or an invented source-exit receipt.
+                supervisor.abandon_for_process_exit();
+            } else {
+                assert_eq!(capacity.snapshot().held_positions[2], 0);
+            }
 
             control
         };
-        acknowledge_all_control(&control);
-        control.finish().await;
+        if matches!(phase, InitialTerminalPhase::ActivatePanic) {
+            control.finish_for_process_exit().await;
+        } else {
+            acknowledge_all_control(&control);
+            control.finish().await;
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5908,6 +6541,7 @@ mod tests {
         allow_initial_convergence: Arc<tokio::sync::Notify>,
         block_initial_convergence: bool,
         replacement_missing_rows: bool,
+        replacement_activation_panic: bool,
         failures_before_success: u64,
     }
 
@@ -5956,6 +6590,7 @@ mod tests {
                 allow_initial_convergence: Arc::clone(&self.allow_initial_convergence),
                 block_initial_convergence: self.block_initial_convergence,
                 replacement_missing_rows: self.replacement_missing_rows,
+                replacement_activation_panic: self.replacement_activation_panic,
                 failures_before_success: self.failures_before_success,
             };
             request.stage_fixture_owner(owner);
@@ -5976,6 +6611,7 @@ mod tests {
         allow_initial_convergence: Arc<tokio::sync::Notify>,
         block_initial_convergence: bool,
         replacement_missing_rows: bool,
+        replacement_activation_panic: bool,
         failures_before_success: u64,
     }
 
@@ -5998,9 +6634,13 @@ mod tests {
             let allow_initial_convergence = Arc::clone(&self.allow_initial_convergence);
             let block_initial_convergence = self.block_initial_convergence;
             let replacement_missing_rows = self.replacement_missing_rows;
+            let replacement_activation_panic = self.replacement_activation_panic;
             let failures_before_success = self.failures_before_success;
             let window = self.relay_window.clone();
             Box::pin(async move {
+                if replacement_activation_panic && ordinal > 1 {
+                    panic!("injected Native replacement activation panic");
+                }
                 if replacement_missing_rows && ordinal > 1 {
                     return Ok(ActivatedNativeAttempt::completion(PanickingActiveOwner {
                         phase: AttemptPanicPhase::Run,
@@ -6049,6 +6689,7 @@ mod tests {
         ) -> NativeAttemptConvergenceFuture<'a> {
             Box::pin(async move {
                 self.convergences.fetch_add(1, Ordering::SeqCst);
+                Ok(())
             })
         }
     }
@@ -6202,6 +6843,7 @@ mod tests {
                     allow_initial_convergence: Arc::new(tokio::sync::Notify::new()),
                     block_initial_convergence: false,
                     replacement_missing_rows: false,
+                    replacement_activation_panic: false,
                     failures_before_success: 1,
                 },
                 release: Arc::clone(&gate),
@@ -6392,6 +7034,7 @@ mod tests {
                     allow_initial_convergence: Arc::new(tokio::sync::Notify::new()),
                     block_initial_convergence: false,
                     replacement_missing_rows: false,
+                    replacement_activation_panic: false,
                     failures_before_success: 2,
                 },
                 release: Arc::clone(&gate),
@@ -6549,6 +7192,7 @@ mod tests {
                 allow_initial_convergence: Arc::clone(&allow_initial_convergence),
                 block_initial_convergence: true,
                 replacement_missing_rows: false,
+                replacement_activation_panic: false,
                 failures_before_success: 1,
             };
             let replacements = Arc::new(ImmediateReplacementPort::default());
@@ -6641,6 +7285,7 @@ mod tests {
                 allow_initial_convergence: Arc::clone(&allow_initial_convergence),
                 block_initial_convergence: true,
                 replacement_missing_rows: false,
+                replacement_activation_panic: false,
                 failures_before_success: 1,
             };
             let (control, root) = governance().await;
@@ -6742,6 +7387,7 @@ mod tests {
                 allow_initial_convergence: Arc::new(tokio::sync::Notify::new()),
                 block_initial_convergence: false,
                 replacement_missing_rows: true,
+                replacement_activation_panic: false,
                 failures_before_success: 1,
             };
             let (control, root) = governance().await;
@@ -6825,6 +7471,115 @@ mod tests {
         };
         acknowledge_all_control(&control);
         control.finish().await;
+    }
+
+    #[tokio::test]
+    async fn replacement_activation_panic_keeps_the_original_dormant_source_unproven() {
+        let mut control = {
+            let prepares = Arc::new(AtomicU64::new(0));
+            let runs = Arc::new(AtomicU64::new(0));
+            let convergences = Arc::new(AtomicU64::new(0));
+            let attempts = RecoveringRowsPreparationPort {
+                relay_window: None,
+                backends: fixture_recovery_backends(2),
+                prepares: Arc::clone(&prepares),
+                runs: Arc::clone(&runs),
+                convergences: Arc::clone(&convergences),
+                allow_initial_convergence: Arc::new(tokio::sync::Notify::new()),
+                block_initial_convergence: false,
+                replacement_missing_rows: false,
+                replacement_activation_panic: true,
+                failures_before_success: 1,
+            };
+            let (control, root) = governance().await;
+            let scope = root.owner.scope();
+            let (mut supervisor, client) = test_supervisor(
+                &control,
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(0x58),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
+            let request = rows_request(
+                &control,
+                &scope,
+                RecoveryMode::RestartAttemptBeforeVisibility,
+                Some(Arc::new(ImmediateReplacementPort::default())),
+                attempts,
+            );
+            let mut input = match client.prepare_observed_start(request, None) {
+                Ok(original) => Some(original),
+                Err(original) => std::panic::panic_any(original),
+            };
+            let mut owner = Some(root.owner);
+            let mut ready = None;
+            let mut exit = None;
+            client
+                .start_observed_in(&mut input, &mut owner, &mut ready, &mut exit)
+                .unwrap()
+                .finish()
+                .unwrap();
+            let mut handle = ready.take().unwrap().await.unwrap();
+            let mut exit = exit.take().unwrap();
+            let Some(crate::api::ExecutionOutput::Rows(mut stream)) = handle.take_output() else {
+                panic!("the same recoverable Rows output must remain owned");
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            tokio::time::timeout_at(deadline, async {
+                while prepares.load(Ordering::SeqCst) < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the original failed attempt must prepare its replacement");
+            stream.begin_schema().unwrap().complete();
+            let Err(error) = tokio::time::timeout_at(deadline, stream.next())
+                .await
+                .expect("the real replacement panic must terminate its output")
+            else {
+                panic!("the replacement activation cannot return a successful Rows result");
+            };
+            assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+            assert_eq!(
+                error.message(),
+                "Native replacement attempt activation panicked"
+            );
+            assert_eq!(
+                error.execution_failure().unwrap().fact(),
+                QueryFailureReason::NativeFuturePanicked.failure_fact()
+            );
+            wait_for_dormant_failure(&mut exit).await;
+            assert_eq!(prepares.load(Ordering::SeqCst), 2);
+            assert_eq!(runs.load(Ordering::SeqCst), 1);
+            // One original active cleanup and one original replacement cleanup.
+            assert_eq!(convergences.load(Ordering::SeqCst), 2);
+            assert!(exit.view().unwrap().native_dormant_failed());
+            assert!(!exit.view().unwrap().native_preparation_exited());
+            let original = exit.dormant_failure().unwrap();
+            assert!(original.activation_panic().is_some());
+            assert!(original.convergence_panic().is_none());
+            drop(original);
+            assert!(futures::poll!(std::future::poll_fn(|cx| exit.poll_exit(cx))).is_pending());
+            drop(stream);
+            drop(handle);
+            root.business.release();
+            assert!(matches!(
+                supervisor
+                    .shutdown_until(Instant::now() + Duration::from_secs(1))
+                    .await,
+                Err(LogicalExecutionSupervisorShutdownError::StatementNativeUnresolved(_))
+            ));
+            assert!(futures::poll!(Box::pin(scope.wait_released())).is_pending());
+            assert!(
+                supervisor.join.is_some(),
+                "the original root join remains owned"
+            );
+            drop(exit);
+            supervisor.abandon_for_process_exit();
+            control
+        };
+        control.finish_for_process_exit().await;
     }
 
     #[derive(Debug)]
@@ -6920,7 +7675,7 @@ mod tests {
             &'a mut self,
             _cancellation: novarocks_workload_control::CancellationView,
         ) -> NativeAttemptConvergenceFuture<'a> {
-            Box::pin(async {})
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -7113,6 +7868,7 @@ mod tests {
         ) -> NativeAttemptConvergenceFuture<'a> {
             Box::pin(async move {
                 self.convergence_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
             })
         }
     }
@@ -7180,7 +7936,25 @@ mod tests {
 
             let scope = root.owner.scope();
 
-            let error = match client.start(completion_request(attempts), root.owner).await {
+            let mut original_exit = None;
+            let future = if phase == AttemptPanicPhase::Activate {
+                let mut input =
+                    match client.prepare_observed_start(completion_request(attempts), None) {
+                        Ok(input) => Some(input),
+                        Err(original) => std::panic::panic_any(original),
+                    };
+                let mut owner = Some(root.owner);
+                let mut ready = None;
+                client
+                    .start_observed_in(&mut input, &mut owner, &mut ready, &mut original_exit)
+                    .unwrap()
+                    .finish()
+                    .unwrap();
+                ready.take().unwrap()
+            } else {
+                client.start(completion_request(attempts), root.owner)
+            };
+            let error = match future.await {
                 Ok(_) => panic!("a panicking Native attempt must not return an execution handle"),
                 Err(error) => error,
             };
@@ -7198,19 +7972,48 @@ mod tests {
             let shutdown = supervisor
                 .shutdown_until(Instant::now() + Duration::from_secs(1))
                 .await;
-            assert!(matches!(
-                shutdown,
-                Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(_))
-            ));
+            if phase == AttemptPanicPhase::Activate {
+                assert!(matches!(
+                    shutdown,
+                    Err(LogicalExecutionSupervisorShutdownError::Registry(
+                        LogicalExecutionRuntimeRegistryError::OriginalExitFailureUnresolved,
+                    ))
+                ));
+                let mut exit = original_exit.take().expect("same original observed start");
+                wait_for_dormant_failure(&mut exit).await;
+                assert!(exit.view().unwrap().native_dormant_failed());
+                assert!(!exit.view().unwrap().native_preparation_exited());
+                assert!(exit.dormant_failure().unwrap().activation_panic().is_some());
+                assert!(futures::poll!(std::future::poll_fn(|cx| exit.poll_exit(cx))).is_pending());
+                assert!(futures::poll!(Box::pin(scope.wait_released())).is_pending());
+                assert_eq!(control.snapshot().root_responsibilities, 1);
+                assert!(
+                    supervisor.join.is_none(),
+                    "the original root actually joined"
+                );
+                assert!(supervisor.run_outcome.is_some());
+                assert!(!supervisor.shutdown_complete);
+                drop(exit);
+                supervisor.abandon_for_process_exit();
+            } else {
+                assert!(matches!(
+                    shutdown,
+                    Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(_))
+                ));
+                acknowledge_all_control(&control);
+                scope.wait_released().await;
+                assert_eq!(control.snapshot().root_responsibilities, 0);
+            }
             assert_eq!(convergence_calls.load(Ordering::SeqCst), 1);
-            acknowledge_all_control(&control);
-            scope.wait_released().await;
-            assert_eq!(control.snapshot().root_responsibilities, 0);
 
             control
         };
-        acknowledge_all_control(&control);
-        control.finish().await;
+        if phase == AttemptPanicPhase::Activate {
+            control.finish_for_process_exit().await;
+        } else {
+            acknowledge_all_control(&control);
+            control.finish().await;
+        }
     }
 
     #[tokio::test]
@@ -7656,7 +8459,7 @@ mod tests {
             &'a mut self,
             _cancellation: novarocks_workload_control::CancellationView,
         ) -> NativeAttemptConvergenceFuture<'a> {
-            Box::pin(async {})
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -7836,7 +8639,7 @@ mod tests {
             &'a mut self,
             _cancellation: novarocks_workload_control::CancellationView,
         ) -> NativeAttemptConvergenceFuture<'a> {
-            Box::pin(async {})
+            Box::pin(async { Ok(()) })
         }
     }
 

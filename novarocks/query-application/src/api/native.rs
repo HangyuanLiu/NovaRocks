@@ -37,7 +37,7 @@ pub use novarocks_workload_control::CancellationView;
 use novarocks_workload_control::WorkId;
 
 use super::ExecutionSchedulingFacts;
-use super::{QueryExecutionError, QueryExecutionErrorKind};
+use super::{QueryExecutionError, QueryExecutionErrorKind, StatementNativeHealthFailure};
 use crate::admitted_query_context::QueryResultCapacityBinding;
 use crate::coordination::{
     AbortQueryContextEffectPort, AcceptedRootStatusSource, AttemptSchedule, NativeAttemptDrive,
@@ -304,9 +304,11 @@ pub type NativeAttemptRunFuture<'a> =
 /// Borrowed convergence future for a dormant Native owner.
 /// It resolves only after every resource the owner may have made live has
 /// converged. Dropping the future or catching a poll panic leaves the owner
-/// with its supervisor, and a later call must resume the same idempotent
-/// convergence.
-pub type NativeAttemptConvergenceFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+/// with its supervisor. Ordinary cancellation may resume that cleanup;
+/// an original typed health error or captured panic instead retains this same
+/// owner as unproven, without re-polling it into a fabricated later success.
+pub type NativeAttemptConvergenceFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), StatementNativeHealthFailure>> + Send + 'a>>;
 
 /// Positive evidence which closes one exact active query context.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -458,8 +460,9 @@ pub type NativeActiveAttemptConvergenceFuture<'a> = Pin<
 /// Before binding, the owner has no asynchronous convergence responsibility.
 /// The query supervisor calls `activate` only after the logical actor is
 /// atomically installed. The borrowed future leaves this owner in the
-/// supervisor even when polling panics; the supervisor then consumes it
-/// through `converge`. Success transfers all asynchronous responsibility to
+/// supervisor even when polling panics; the supervisor then runs its original
+/// `converge` once, retaining both owner and cause as unproven after a panic.
+/// Successful activation transfers all asynchronous responsibility to
 /// the returned active owner and leaves the dormant owner synchronously
 /// drop-safe.
 pub trait DormantNativeAttemptOwner: fmt::Debug + Send + 'static {
@@ -978,7 +981,7 @@ impl LogicalNativeSession {
         &mut self,
         dormant: &mut NativeDormantCustody,
     ) -> Result<NativePreparedFacts, NativeExecutionContractError> {
-        if dormant.owner.is_some() || dormant.retiring {
+        if dormant.owner.is_some() || dormant.drop_unproven() {
             return Err(NativeExecutionContractError::ForeignAttemptTicket);
         }
         let work = self
@@ -1005,6 +1008,7 @@ impl LogicalNativeSession {
             owner,
         } = prepared;
         dormant.owner = Some(owner);
+        dormant.convergence_completed = false;
         let facts = NativePreparedFacts {
             execution,
             eligible_backends,
@@ -1278,10 +1282,30 @@ impl NativeAttemptPreparationWork {
     }
 }
 
-#[derive(Debug, Default)]
+pub(crate) enum DormantConvergenceFailure {
+    Reported(StatementNativeHealthFailure),
+    PollPanic(Box<dyn std::any::Any + Send>),
+}
+
+#[derive(Default)]
 pub(crate) struct NativeDormantCustody {
     owner: Option<Box<dyn DormantNativeAttemptOwner>>,
     retiring: bool,
+    activation_panic: Option<Box<dyn std::any::Any + Send>>,
+    convergence_failure: Option<DormantConvergenceFailure>,
+    convergence_completed: bool,
+}
+impl fmt::Debug for NativeDormantCustody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Never invoke an opaque cause's formatting or a foreign owner's Debug.
+        f.debug_struct("NativeDormantCustody")
+            .field("has_owner", &self.owner.is_some())
+            .field("retiring", &self.retiring)
+            .field("activation_panicked", &self.activation_panic.is_some())
+            .field("convergence_failed", &self.convergence_failure.is_some())
+            .field("convergence_completed", &self.convergence_completed)
+            .finish()
+    }
 }
 impl NativeDormantCustody {
     pub(crate) fn as_mut(&mut self) -> &mut dyn DormantNativeAttemptOwner {
@@ -1290,13 +1314,74 @@ impl NativeDormantCustody {
             .expect("same stable dormant owner")
             .as_mut()
     }
-    pub(crate) fn retire(&mut self) {
+    /// Pure split borrow of this original owner and its empty receiving slot.
+    pub(crate) fn activation_parts(
+        &mut self,
+    ) -> Option<(
+        &mut (dyn DormantNativeAttemptOwner + 'static),
+        &mut Option<Box<dyn std::any::Any + Send>>,
+    )> {
+        if self.retiring || self.has_failure() || self.convergence_completed {
+            return None;
+        }
+        Some((self.owner.as_mut()?.as_mut(), &mut self.activation_panic))
+    }
+    /// An activation panic still permits the original cleanup once. A typed
+    /// health failure or poll panic in cleanup forbids restarting that source.
+    pub(crate) fn convergence_parts(
+        &mut self,
+    ) -> Option<(
+        &mut (dyn DormantNativeAttemptOwner + 'static),
+        &mut Option<DormantConvergenceFailure>,
+    )> {
+        if self.retiring || self.convergence_failure.is_some() || self.convergence_completed {
+            return None;
+        }
+        Some((self.owner.as_mut()?.as_mut(), &mut self.convergence_failure))
+    }
+    pub(crate) fn convergence_completed(&self) -> bool {
+        self.convergence_completed
+    }
+    pub(crate) fn record_convergence_completed(&mut self) {
+        self.convergence_completed = true;
+    }
+    pub(crate) fn has_failure(&self) -> bool {
+        self.activation_panic.is_some() || self.convergence_failure.is_some()
+    }
+    pub(crate) fn activation_panic(&self) -> Option<&(dyn std::any::Any + Send)> {
+        self.activation_panic.as_deref()
+    }
+    pub(crate) fn convergence_panic(&self) -> Option<&(dyn std::any::Any + Send)> {
+        match self.convergence_failure.as_ref()? {
+            DormantConvergenceFailure::PollPanic(original) => Some(original.as_ref()),
+            DormantConvergenceFailure::Reported(_) => None,
+        }
+    }
+    pub(crate) fn convergence_failure(&self) -> Option<&StatementNativeHealthFailure> {
+        match self.convergence_failure.as_ref()? {
+            DormantConvergenceFailure::Reported(original) => Some(original),
+            DormantConvergenceFailure::PollPanic(_) => None,
+        }
+    }
+    #[must_use = "an unproven original dormant owner must remain in custody"]
+    pub(crate) fn retire(&mut self) -> Result<(), ()> {
+        if self.drop_unproven() {
+            return Err(());
+        }
         self.retiring = true;
         drop(self.owner.take());
         self.retiring = false;
+        Ok(())
     }
     pub(crate) fn drop_unproven(&self) -> bool {
-        self.retiring
+        self.retiring || self.has_failure()
+    }
+    #[cfg(test)]
+    pub(crate) fn test_owner(owner: impl DormantNativeAttemptOwner) -> Self {
+        Self {
+            owner: Some(Box::new(owner)),
+            ..Self::default()
+        }
     }
 }
 #[derive(Debug)]
@@ -1519,7 +1604,7 @@ mod tests {
             &'a mut self,
             _cancellation: CancellationView,
         ) -> NativeAttemptConvergenceFuture<'a> {
-            Box::pin(async {})
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -2042,7 +2127,7 @@ mod tests {
                 &'a mut self,
                 _cancellation: CancellationView,
             ) -> NativeAttemptConvergenceFuture<'a> {
-                Box::pin(async {})
+                Box::pin(async { Ok(()) })
             }
         }
         fn funded(
@@ -2303,6 +2388,7 @@ mod tests {
                 if self.polls == 1 {
                     std::future::pending::<()>().await;
                 }
+                Ok(())
             })
         }
     }
@@ -2322,7 +2408,7 @@ mod tests {
         drop(first);
         assert_eq!(owner.polls, 1);
 
-        owner.converge(cancellation).await;
+        owner.converge(cancellation).await.unwrap();
         assert_eq!(owner.polls, 2);
     }
 

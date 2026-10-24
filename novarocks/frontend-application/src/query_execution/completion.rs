@@ -212,6 +212,15 @@ impl QueryAttemptReservation {
         self,
     ) -> Result<QueryCredentialLeases, crate::query_execution::contract::DistributedQueryError>
     {
+        self.drain_credential_leases()
+    }
+
+    /// The initializer borrows its original reservation through the one-shot
+    /// Native drain. The reservation continues to anchor terminal material.
+    pub(crate) fn drain_credential_leases(
+        &self,
+    ) -> Result<QueryCredentialLeases, crate::query_execution::contract::DistributedQueryError>
+    {
         self.credential_collector.drain_credential_leases()
     }
 }

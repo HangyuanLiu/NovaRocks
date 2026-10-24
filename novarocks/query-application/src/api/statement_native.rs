@@ -178,7 +178,7 @@ impl StatementNativeHealthFailure {
     pub const fn detail(&self) -> &'static str {
         self.detail
     }
-    pub fn cause(&self) -> &(dyn std::error::Error + Send + Sync) {
+    pub fn cause(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
         self.cause.as_ref()
     }
     pub(crate) fn into_parts(self) -> (&'static str, Arc<dyn std::error::Error + Send + Sync>) {

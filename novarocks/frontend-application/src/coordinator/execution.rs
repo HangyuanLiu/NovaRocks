@@ -548,7 +548,7 @@ impl FrontendDistributedQueryCoordinator {
             statement_deadline,
             request,
             None,
-            RoundCredentialLeaseSource::Frozen(QueryCredentialLeases::empty()),
+            RoundCredentialLeaseSource::Frozen(Some(QueryCredentialLeases::empty())),
         )
         .map_err(|error| fail_closed_one_shot_topology_retry(intent, error))
     }
@@ -785,7 +785,7 @@ impl FrontendDistributedQueryCoordinator {
         let binding = parts.result_capacity.as_ref().ok_or_else(|| {
             failed("attempt initialization requires its admitted result capacity")
         })?;
-        let initializing = AttemptInitializing::new(
+        let mut initializing = AttemptInitializing::new(
             execution_id,
             binding.scope().clone(),
             binding.window_alias(),
@@ -804,10 +804,12 @@ impl FrontendDistributedQueryCoordinator {
         // async initializer performs no Connector I/O on that worker and adds
         // no semaphore-waiter helper task, but this bridge still waits on the
         // actor and therefore does not complete the per-query thread cut.
-        let ready = self
-            .data_runtime
+        self.data_runtime
             .block_on(initializing.initialize())
             .map_err(failed)??;
+        let mut ready = None;
+        initializing.take_ready_in(&mut ready);
+        let ready = ready.expect("borrowed initialization installed Ready");
         let (
             ready_execution_id,
             artifacts,

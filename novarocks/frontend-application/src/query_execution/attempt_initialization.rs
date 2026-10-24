@@ -47,10 +47,11 @@ use crate::query_execution::split_assignment_round::{
 };
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::task_execution::blocking_io::{
-    ConnectorBlockingIoJob, ConnectorBlockingIoJoinPin, ConnectorBlockingIoResponsibility,
-    ConnectorBlockingIoSupervisor,
+    ConnectorBlockingIoError, ConnectorBlockingIoJob, ConnectorBlockingIoJoinPin,
+    ConnectorBlockingIoResponsibility, ConnectorBlockingIoSupervisor,
 };
 use crate::task_protocol_config::TaskUpdateRetryPolicy;
+use novarocks_query_application::api::StatementNativeHealthFailure;
 use novarocks_query_application::cancellation::QueryCancellationView;
 use novarocks_workload_control::{ResultWindowAlias, WorkScope};
 
@@ -68,7 +69,7 @@ fn failed_connector(error: ConnectorError) -> DistributedQueryError {
 /// Credential material stays under its planning collector until every split
 /// source of this exact attempt is open.
 pub(crate) enum RoundCredentialLeaseSource {
-    Frozen(QueryCredentialLeases),
+    Frozen(Option<QueryCredentialLeases>),
     Fresh {
         collector: Arc<AttemptCredentialLeaseCollector>,
         request_scope: ConnectorRequestScope,
@@ -85,7 +86,8 @@ impl RoundCredentialLeaseSource {
     pub(crate) fn test_into_credential_leases(
         self,
     ) -> Result<QueryCredentialLeases, DistributedQueryError> {
-        self.into_credential_leases()
+        let mut source = self;
+        source.drain_credential_leases()
     }
 
     #[cfg(novarocks_dev_controls)]
@@ -146,15 +148,17 @@ impl RoundCredentialLeaseSource {
         }
     }
 
-    fn into_credential_leases(mut self) -> Result<QueryCredentialLeases, DistributedQueryError> {
+    fn drain_credential_leases(&mut self) -> Result<QueryCredentialLeases, DistributedQueryError> {
         self.publish_observed();
-        match &mut self {
-            Self::Frozen(leases) => Ok(std::mem::replace(leases, QueryCredentialLeases::empty())),
+        match self {
+            Self::Frozen(leases) => leases
+                .take()
+                .ok_or_else(|| failed("frozen credential source already drained")),
             Self::Fresh { collector, .. } => collector.drain_credential_leases(),
             Self::Reservation { reservation, .. } => reservation
-                .take()
-                .expect("attempt reservation is consumed exactly once")
-                .into_credential_leases(),
+                .as_ref()
+                .expect("original attempt reservation remains installed")
+                .drain_credential_leases(),
         }
     }
 }
@@ -211,7 +215,9 @@ trait SerialAttemptInitialization: Send + Sized + 'static {
 
     fn accept_opened(&mut self, opened: Self::Opened) -> Result<(), DistributedQueryError>;
 
-    fn finish(self) -> Result<Self::Ready, DistributedQueryError>;
+    fn finish_in(&mut self, ready: &mut Option<Self::Ready>) -> Result<(), DistributedQueryError>;
+
+    fn close_in(&mut self, job: &mut Option<ConnectorBlockingIoJob<()>>);
 }
 
 #[derive(Clone)]
@@ -275,61 +281,197 @@ impl AttemptInitializationLifecycle {
         }
         Ok(())
     }
+}
 
-    async fn await_job<T: Send + 'static>(
-        &self,
-        job: ConnectorBlockingIoJob<T>,
-        supervisor: &ConnectorBlockingIoSupervisor,
-    ) -> Result<T, DistributedQueryError> {
-        tokio::select! {
-            outcome = job.finish() => {
-                let outcome = outcome.map_err(|error| {
-                    failed(supervisor.present_and_retire_failure(error))
-                })?;
-                self.check()?;
-                Ok(outcome)
+/// Original serial initialization frame. Every await borrows these same fields;
+/// cancellation never transfers the only job, opened result, or close receipt
+/// into the transient polling future.
+struct InitializationProgress<S: SerialAttemptInitialization> {
+    state: S,
+    supervisor: ConnectorBlockingIoSupervisor,
+    lifecycle: AttemptInitializationLifecycle,
+    expected: Option<AttemptSourceIdentity>,
+    job: Option<
+        ConnectorBlockingIoJob<Result<OpenedAttemptSource<S::Opened>, DistributedQueryError>>,
+    >,
+    outcome: Option<
+        Result<
+            Result<OpenedAttemptSource<S::Opened>, DistributedQueryError>,
+            ConnectorBlockingIoError,
+        >,
+    >,
+    close_job: Option<ConnectorBlockingIoJob<()>>,
+    close_outcome: Option<Result<(), ConnectorBlockingIoError>>,
+    failure: Option<DistributedQueryError>,
+    source_failure: Option<DistributedQueryError>,
+    ready: Option<S::Ready>,
+    closing: bool,
+}
+
+impl<S: SerialAttemptInitialization> InitializationProgress<S> {
+    fn new(
+        supervisor: ConnectorBlockingIoSupervisor,
+        lifecycle: AttemptInitializationLifecycle,
+        state: S,
+    ) -> Self {
+        Self {
+            state,
+            supervisor,
+            lifecycle,
+            expected: None,
+            job: None,
+            outcome: None,
+            close_job: None,
+            close_outcome: None,
+            failure: None,
+            source_failure: None,
+            ready: None,
+            closing: false,
+        }
+    }
+
+    async fn initialize(&mut self) -> Result<(), DistributedQueryError> {
+        if self.closing {
+            return Err(failed("attempt initialization already entered close"));
+        }
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        let result = self.advance().await;
+        if let Err(error) = &result {
+            self.failure = Some(error.clone());
+        }
+        result
+    }
+
+    async fn advance(&mut self) -> Result<(), DistributedQueryError> {
+        loop {
+            self.lifecycle.check()?;
+            if self.ready.is_some() {
+                return Ok(());
             }
-            _ = self.cancellation.cancelled() => {
-                Err(failed("query cancelled while opening an attempt split source"))
+            if self.job.is_none() {
+                let Some(recipe) = self.state.next_source_recipe()? else {
+                    return self.state.finish_in(&mut self.ready);
+                };
+                self.expected = Some(recipe.identity.clone());
+                if recipe.identity.execution_id != self.state.execution_id() {
+                    return Err(failed(
+                        "attempt initializer produced a source recipe for another execution",
+                    ));
+                }
+                let pins = S::source_join_pin(&recipe).into_iter().collect();
+                self.job = Some(
+                    self.supervisor
+                        .spawn_pinned(pins, move || S::open_source(recipe)),
+                );
             }
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(self.deadline)) => {
-                Err(failed("query deadline elapsed while opening an attempt split source"))
+            if self.outcome.is_none() {
+                tokio::select! {
+                    () = self.job.as_ref().unwrap().finish_in(&mut self.outcome) => {}
+                    _ = self.lifecycle.cancellation.cancelled() => {
+                        return Err(failed("query cancelled while opening an attempt split source"));
+                    }
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(self.lifecycle.deadline)) => {
+                        return Err(failed("query deadline elapsed while opening an attempt split source"));
+                    }
+                }
+            }
+            // Keep the actual outcome installed through all fallible checks.
+            self.lifecycle.check()?;
+            let opened = match self.outcome.as_ref().unwrap() {
+                Ok(Ok(opened)) => opened,
+                Ok(Err(error)) => return Err(error.clone()),
+                Err(error) => return Err(failed(error.to_string())),
+            };
+            let expected = self.expected.as_ref().unwrap();
+            if opened.identity != *expected {
+                return Err(failed(format!(
+                    "attempt initializer received a source from another identity: expected={expected:?}, actual={:?}",
+                    opened.identity
+                )));
+            }
+            let Some(Ok(Ok(opened))) = self.outcome.take() else {
+                unreachable!()
+            };
+            // Production acceptance is a pure transfer into the original
+            // pre-reserved source Vec. It invokes no provider callback.
+            self.state.accept_opened(opened.opened)?;
+            self.job = None;
+            self.expected = None;
+        }
+    }
+
+    /// Observe actual original worker joins and source close. A cleanup panic
+    /// stays in its exact outcome and prevents a false successful convergence.
+    async fn close(&mut self) -> Result<(), StatementNativeHealthFailure> {
+        self.closing = true;
+        // Close already accepted sources before waiting for a late provider.
+        self.close_accepted().await?;
+        if let Some(job) = &self.job {
+            if self.outcome.is_none() {
+                job.finish_in(&mut self.outcome).await;
             }
         }
+        if let Some(Err(error)) = &self.outcome {
+            return Err(StatementNativeHealthFailure::actual_exit_unproven(
+                "attempt source-open worker failed before a proven source exit",
+                error.health_cause(),
+            ));
+        }
+        match self.outcome.take() {
+            Some(Ok(Ok(opened))) => {
+                // A rejected identity is never published, but still needs its
+                // real source close under this same original owner.
+                if let Err(error) = self.state.accept_opened(opened.opened) {
+                    self.source_failure = Some(error);
+                }
+            }
+            Some(Ok(Err(error))) => {
+                self.source_failure = Some(error);
+            }
+            Some(Err(_)) => unreachable!("failed worker stays in its original outcome"),
+            None => {}
+        }
+        self.job = None;
+        self.expected = None;
+        self.close_accepted().await
+    }
+
+    async fn close_accepted(&mut self) -> Result<(), StatementNativeHealthFailure> {
+        if self.close_job.is_none() {
+            self.state.close_in(&mut self.close_job);
+        }
+        if let Some(job) = &self.close_job {
+            if self.close_outcome.is_none() {
+                job.finish_in(&mut self.close_outcome).await;
+            }
+            check_source_close(job, self.close_outcome.as_ref().unwrap())?;
+            self.close_job = None;
+            self.close_outcome = None;
+        }
+        Ok(())
     }
 }
 
-async fn drive_attempt_initialization<S: SerialAttemptInitialization>(
-    supervisor: ConnectorBlockingIoSupervisor,
-    lifecycle: AttemptInitializationLifecycle,
-    mut state: S,
-) -> Result<S::Ready, DistributedQueryError> {
-    loop {
-        lifecycle.check()?;
-        let Some(recipe) = state.next_source_recipe()? else {
-            return state.finish();
-        };
-        let expected = recipe.identity.clone();
-        if expected.execution_id != state.execution_id() {
-            return Err(failed(
-                "attempt initializer produced a source recipe for another execution",
-            ));
-        }
-        let pins = S::source_join_pin(&recipe).into_iter().collect();
-        let job = supervisor.spawn_pinned(pins, move || S::open_source(recipe));
-        let opened = lifecycle.await_job(job, &supervisor).await??;
-        if opened.identity != expected {
-            return Err(failed(format!(
-                "attempt initializer received a source from another identity: expected={expected:?}, actual={:?}",
-                opened.identity
-            )));
-        }
-        state.accept_opened(opened.opened)?;
-        // A non-interruptible provider can return after cancellation or the
-        // deadline. Reject that late success before it can become AttemptReady;
-        // dropping the state reaps every opened source through supervised
-        // lifecycle work.
-        lifecycle.check()?;
+pub(super) fn check_source_close(
+    job: &ConnectorBlockingIoJob<()>,
+    outcome: &Result<(), ConnectorBlockingIoError>,
+) -> Result<(), StatementNativeHealthFailure> {
+    if let Some(error) = job.source_close_failure() {
+        // Primary typed error was installed in the original job before any
+        // later source Drop/callback. A secondary JoinError stays in outcome.
+        return Err(StatementNativeHealthFailure::actual_exit_unproven(
+            "attempt source-close returned an original provider failure",
+            error,
+        ));
+    }
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(error) => Err(StatementNativeHealthFailure::actual_exit_unproven(
+            "attempt source-close worker failed before a proven exit",
+            error.health_cause(),
+        )),
     }
 }
 
@@ -337,11 +479,11 @@ struct ProductionInitializationState {
     work_scope: WorkScope,
     result_window: ResultWindowAlias,
     execution_id: QueryExecutionId,
-    artifacts: PreparedDistributedQuery,
-    schedule: ValidatedFragmentSchedule,
+    artifacts: Option<PreparedDistributedQuery>,
+    schedule: Option<ValidatedFragmentSchedule>,
     scan_keys: Vec<(FragmentId, i32)>,
     next_scan: usize,
-    session: novarocks_spi::connector::read_stack::ConnectorSession,
+    session: Option<novarocks_spi::connector::read_stack::ConnectorSession>,
     connector_context: ConnectorRequestContext,
     feedback: Arc<RuntimeFilterFeedbackState>,
     sources: OpenRoundSplitSources,
@@ -371,12 +513,19 @@ impl SerialAttemptInitialization for ProductionInitializationState {
     fn next_source_recipe(
         &mut self,
     ) -> Result<Option<AttemptSourceRecipe<Self::Recipe>>, DistributedQueryError> {
+        if self.session.is_none() {
+            self.session =
+                Some(crate::query_execution::compiler::typed_connector_session().map_err(failed)?);
+        }
         let Some(&(fragment_id, plan_node_id)) = self.scan_keys.get(self.next_scan) else {
             return Ok(None);
         };
-        let source =
-            RoundSplitSourceRecipe::from_artifacts(&self.artifacts, fragment_id, plan_node_id)
-                .map_err(failed)?;
+        let source = RoundSplitSourceRecipe::from_artifacts(
+            self.artifacts.as_ref().unwrap(),
+            fragment_id,
+            plan_node_id,
+        )
+        .map_err(failed)?;
         let identity = AttemptSourceIdentity {
             execution_id: self.execution_id,
             fragment_id: source.fragment_id(),
@@ -392,7 +541,7 @@ impl SerialAttemptInitialization for ProductionInitializationState {
                 )
                 .map_err(|error| failed(error.to_string()))?,
                 source,
-                session: self.session.clone(),
+                session: self.session.as_ref().unwrap().clone(),
                 // Every source belongs to this same admitted attempt. Preserve
                 // its request scope so provider-private capability caches can
                 // coalesce repeated frozen-table access without crossing an
@@ -434,13 +583,13 @@ impl SerialAttemptInitialization for ProductionInitializationState {
         Ok(())
     }
 
-    fn finish(self) -> Result<Self::Ready, DistributedQueryError> {
+    fn finish_in(&mut self, ready: &mut Option<Self::Ready>) -> Result<(), DistributedQueryError> {
         if self.next_scan != self.scan_keys.len() {
             return Err(failed(
                 "attempt initializer cannot become ready with unopened split sources",
             ));
         }
-        let targets = assignment_targets(&self.schedule, &self.scan_keys);
+        let targets = assignment_targets(self.schedule.as_ref().unwrap(), &self.scan_keys);
         for scan in self.sources.scans() {
             if targets.get(&scan).is_none_or(|targets| targets.is_empty()) {
                 return Err(failed(format!(
@@ -451,37 +600,42 @@ impl SerialAttemptInitialization for ProductionInitializationState {
         // No transport gate here any more. It refused to send material over a
         // readable transport; nothing sends material at all now, and what this
         // announces is a scope and an acquisition path (CAD-1 D1, C07b).
-        let credential_leases = self.credential_lease_source.into_credential_leases()?;
+        let credential_leases = self.credential_lease_source.drain_credential_leases()?;
         // Keep the sources under their RAII owner through every fallible
         // readiness check. Once moved into the round plan, normal round
         // teardown becomes their sole close owner.
-        let sources = self.sources.into_sources();
+        let sources = self.sources.take_sources();
         let split_assignment_plan = (!self.scan_keys.is_empty()).then(|| {
             RoundSplitAssignmentPlan::new(
                 targets,
                 sources,
                 self.retry_policy,
                 self.initial_dynamic_filter_wait_cap,
-                self.blocking_io,
+                self.blocking_io.clone(),
             )
         });
-        Ok(AttemptReady {
+        *ready = Some(AttemptReady {
             execution_id: self.execution_id,
-            artifacts: self.artifacts,
-            schedule: self.schedule,
-            feedback: self.feedback,
+            artifacts: Some(self.artifacts.take().unwrap()),
+            schedule: Some(self.schedule.take().unwrap()),
+            feedback: Arc::clone(&self.feedback),
             split_assignment_plan,
-            credential_leases,
-        })
+            credential_leases: Some(credential_leases),
+            close_job: None,
+            close_outcome: None,
+        });
+        Ok(())
+    }
+
+    fn close_in(&mut self, job: &mut Option<ConnectorBlockingIoJob<()>>) {
+        self.sources.close_in(job);
     }
 }
 
 /// The only pre-round state. It owns source recipes and attempt credentials,
 /// but exposes neither until every source has opened under this attempt.
 pub(crate) struct AttemptInitializing {
-    runtime: FrontendDataRuntime,
-    lifecycle: AttemptInitializationLifecycle,
-    state: ProductionInitializationState,
+    progress: InitializationProgress<ProductionInitializationState>,
 }
 
 impl AttemptInitializing {
@@ -505,6 +659,7 @@ impl AttemptInitializing {
     ) -> Result<Self, DistributedQueryError> {
         let lifecycle =
             AttemptInitializationLifecycle::new(connector_context.deadline(), cancellation);
+        let mut credential_lease_source = Some(credential_lease_source);
         Self::from_lifecycle(
             execution_id,
             work_scope,
@@ -516,7 +671,7 @@ impl AttemptInitializing {
             initial_dynamic_filter_wait_cap,
             connector_context,
             runtime,
-            credential_lease_source,
+            &mut credential_lease_source,
             lifecycle,
         )
     }
@@ -536,7 +691,7 @@ impl AttemptInitializing {
         initial_dynamic_filter_wait_cap: Duration,
         connector_context: ConnectorRequestContext,
         runtime: FrontendDataRuntime,
-        credential_lease_source: RoundCredentialLeaseSource,
+        credential_lease_source: &mut Option<RoundCredentialLeaseSource>,
         lifecycle: AttemptInitializationLifecycle,
     ) -> Result<Self, DistributedQueryError> {
         if schedule.execution_id() != execution_id {
@@ -546,29 +701,34 @@ impl AttemptInitializing {
             ));
         }
         let scan_keys = artifacts.typed_scans().collect::<Vec<_>>();
-        let session =
-            crate::query_execution::compiler::typed_connector_session().map_err(failed)?;
         let blocking_io = runtime.connector_blocking_io().clone();
         Ok(Self {
-            runtime,
-            lifecycle,
-            state: ProductionInitializationState {
-                work_scope,
-                result_window,
-                execution_id,
-                artifacts,
-                schedule,
-                sources: OpenRoundSplitSources::with_capacity(scan_keys.len(), blocking_io.clone()),
-                scan_keys,
-                next_scan: 0,
-                session,
-                connector_context,
-                feedback,
-                retry_policy,
-                initial_dynamic_filter_wait_cap,
-                blocking_io,
-                credential_lease_source,
-            },
+            progress: InitializationProgress::new(
+                blocking_io.clone(),
+                lifecycle,
+                ProductionInitializationState {
+                    work_scope,
+                    result_window,
+                    execution_id,
+                    artifacts: Some(artifacts),
+                    schedule: Some(schedule),
+                    sources: OpenRoundSplitSources::with_capacity(
+                        scan_keys.len(),
+                        blocking_io.clone(),
+                    ),
+                    scan_keys,
+                    next_scan: 0,
+                    session: None,
+                    connector_context,
+                    feedback,
+                    retry_policy,
+                    initial_dynamic_filter_wait_cap,
+                    blocking_io,
+                    credential_lease_source: credential_lease_source
+                        .take()
+                        .expect("original credential source stays installed until pure capture"),
+                },
+            ),
         })
     }
 
@@ -580,7 +740,7 @@ impl AttemptInitializing {
         clippy::too_many_arguments,
         reason = "Each input is an independently frozen fact needed before an attempt may become ready."
     )]
-    pub(crate) fn new_governed(
+    pub(crate) fn new_governed_in(
         execution_id: QueryExecutionId,
         work_scope: WorkScope,
         result_window: ResultWindowAlias,
@@ -592,11 +752,16 @@ impl AttemptInitializing {
         connector_context: ConnectorRequestContext,
         cancellation: novarocks_workload_control::CancellationView,
         runtime: FrontendDataRuntime,
-        credential_lease_source: RoundCredentialLeaseSource,
-    ) -> Result<Self, DistributedQueryError> {
+        credential_lease_source: &mut Option<RoundCredentialLeaseSource>,
+        destination: &mut Option<Self>,
+    ) -> Result<(), DistributedQueryError> {
+        assert!(
+            destination.is_none(),
+            "initializer has one stable destination"
+        );
         let lifecycle =
             AttemptInitializationLifecycle::governed(connector_context.deadline(), cancellation);
-        Self::from_lifecycle(
+        *destination = Some(Self::from_lifecycle(
             execution_id,
             work_scope,
             result_window,
@@ -609,16 +774,29 @@ impl AttemptInitializing {
             runtime,
             credential_lease_source,
             lifecycle,
-        )
+        )?);
+        Ok(())
     }
 
-    pub(crate) async fn initialize(self) -> Result<AttemptReady, DistributedQueryError> {
-        drive_attempt_initialization(
-            self.runtime.connector_blocking_io().clone(),
-            self.lifecycle,
-            self.state,
-        )
-        .await
+    pub(crate) async fn initialize(&mut self) -> Result<(), DistributedQueryError> {
+        self.progress.initialize().await
+    }
+
+    /// Pure final transfer after the borrowed initializer has installed Ready.
+    pub(crate) fn take_ready_in(&mut self, ready: &mut Option<AttemptReady>) {
+        assert!(ready.is_none(), "Ready has one original destination");
+        *ready = self.progress.ready.take();
+        assert!(
+            ready.is_some(),
+            "initialization installed Ready before transfer"
+        );
+    }
+
+    pub(crate) async fn close(&mut self) -> Result<(), StatementNativeHealthFailure> {
+        if let Some(ready) = self.progress.ready.as_mut() {
+            ready.close().await?;
+        }
+        self.progress.close().await
     }
 }
 
@@ -626,16 +804,59 @@ impl AttemptInitializing {
 /// sealing all completed before task-round construction.
 pub(crate) struct AttemptReady {
     execution_id: QueryExecutionId,
-    artifacts: PreparedDistributedQuery,
-    schedule: ValidatedFragmentSchedule,
+    artifacts: Option<PreparedDistributedQuery>,
+    schedule: Option<ValidatedFragmentSchedule>,
     feedback: Arc<RuntimeFilterFeedbackState>,
     split_assignment_plan: Option<RoundSplitAssignmentPlan>,
-    credential_leases: QueryCredentialLeases,
+    credential_leases: Option<QueryCredentialLeases>,
+    close_job: Option<ConnectorBlockingIoJob<()>>,
+    close_outcome: Option<Result<(), ConnectorBlockingIoError>>,
 }
 
 impl AttemptReady {
+    pub(crate) fn take_preparation_parts(
+        &mut self,
+    ) -> (
+        QueryExecutionId,
+        PreparedDistributedQuery,
+        ValidatedFragmentSchedule,
+        Arc<RuntimeFilterFeedbackState>,
+        QueryCredentialLeases,
+    ) {
+        (
+            self.execution_id,
+            self.artifacts.take().unwrap(),
+            self.schedule.take().unwrap(),
+            Arc::clone(&self.feedback),
+            self.credential_leases.take().unwrap(),
+        )
+    }
+
+    pub(crate) fn take_split_plan(&mut self) -> Option<RoundSplitAssignmentPlan> {
+        self.split_assignment_plan.take()
+    }
+
+    pub(crate) async fn close(&mut self) -> Result<(), StatementNativeHealthFailure> {
+        if self.close_job.is_none() {
+            if let Some(plan) = self.split_assignment_plan.as_mut() {
+                plan.close_in(&mut self.close_job);
+            }
+        }
+        if let Some(job) = &self.close_job {
+            if self.close_outcome.is_none() {
+                job.finish_in(&mut self.close_outcome).await;
+            }
+            check_source_close(job, self.close_outcome.as_ref().unwrap())?;
+            self.close_job = None;
+            self.close_outcome = None;
+        }
+        Ok(())
+    }
+
+    /// Legacy synchronous coordinator transfer; it already owns this entire
+    /// ready value on its original statement stack.
     pub(crate) fn into_parts(
-        self,
+        mut self,
     ) -> (
         QueryExecutionId,
         PreparedDistributedQuery,
@@ -644,19 +865,21 @@ impl AttemptReady {
         Option<RoundSplitAssignmentPlan>,
         QueryCredentialLeases,
     ) {
+        let (execution, artifacts, schedule, feedback, leases) = self.take_preparation_parts();
         (
-            self.execution_id,
-            self.artifacts,
-            self.schedule,
-            self.feedback,
-            self.split_assignment_plan,
-            self.credential_leases,
+            execution,
+            artifacts,
+            schedule,
+            feedback,
+            self.take_split_plan(),
+            leases,
         )
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::sync::mpsc;
 
     use novarocks_secret::SecretValue;
@@ -885,11 +1108,34 @@ mod tests {
             Ok(())
         }
 
-        fn finish(mut self) -> Result<Self::Ready, DistributedQueryError> {
+        fn finish_in(
+            &mut self,
+            ready: &mut Option<Self::Ready>,
+        ) -> Result<(), DistributedQueryError> {
             for cleanup in &mut self.accepted {
                 cleanup.armed = false;
             }
-            Ok(self.next)
+            *ready = Some(self.next);
+            Ok(())
+        }
+
+        fn close_in(&mut self, job: &mut Option<ConnectorBlockingIoJob<()>>) {
+            assert!(job.is_none());
+            if self.accepted.is_empty() {
+                return;
+            }
+            let supervisor = self.accepted[0].supervisor.clone();
+            let accepted = std::mem::take(&mut self.accepted);
+            *job = Some(supervisor.spawn_pinned_source_close(Vec::new(), move |_| {
+                for mut cleanup in accepted {
+                    cleanup.armed = false;
+                    if let Some(closed) = cleanup.closed.take() {
+                        closed
+                            .send(())
+                            .expect("publish actual original source close");
+                    }
+                }
+            }));
         }
     }
 
@@ -1079,11 +1325,14 @@ mod tests {
         let (closed, _observe_close) = mpsc::channel();
         let state = fixture(execution_id, Vec::new(), supervisor.clone(), closed);
 
-        let ready = drive_attempt_initialization(supervisor, lifecycle(&cancellation), state)
+        let mut initializing =
+            InitializationProgress::new(supervisor, lifecycle(&cancellation), state);
+        initializing
+            .initialize()
             .await
             .expect("scanless attempt becomes ready");
-
-        assert_eq!(ready, 0);
+        assert_eq!(initializing.ready, Some(0));
+        assert!(initializing.job.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1104,7 +1353,10 @@ mod tests {
             .expect("first fixture recipe")
             .started = Some(started);
         cancellation.request(QueryCancellationReason::ClientDisconnected);
-        let error = drive_attempt_initialization(supervisor, lifecycle(&cancellation), state)
+        let mut initializing =
+            InitializationProgress::new(supervisor, lifecycle(&cancellation), state);
+        let error = initializing
+            .initialize()
             .await
             .expect_err("cancelled initializer cannot become ready");
         assert!(error.message().contains("cancelled"), "{error}");
@@ -1131,23 +1383,49 @@ mod tests {
         let recipe = state.recipes[0].as_mut().expect("first fixture recipe");
         recipe.started = Some(started);
         recipe.release = Some(released);
-        let actor = tokio::spawn(drive_attempt_initialization(
-            supervisor,
-            lifecycle(&cancellation),
-            state,
-        ));
+        let lifecycle = lifecycle(&cancellation);
+        let actor = tokio::spawn(async move {
+            let mut initializing = InitializationProgress::new(supervisor, lifecycle, state);
+            let result = initializing.initialize().await;
+            (initializing, result)
+        });
         observe_started
             .recv_timeout(Duration::from_secs(2))
             .expect("source-open call starts");
         cancellation.request(QueryCancellationReason::ClientDisconnected);
 
-        let error = tokio::time::timeout(Duration::from_secs(1), actor)
+        let (mut initializing, result) = tokio::time::timeout(Duration::from_secs(1), actor)
             .await
             .expect("running source-open observes cancellation")
-            .expect("initializer task")
-            .expect_err("cancelled initializer cannot become ready");
+            .expect("initializer task");
+        let error = result.expect_err("cancelled initializer cannot become ready");
         assert!(error.message().contains("cancelled"), "{error}");
+        assert!(
+            initializing.job.is_some(),
+            "the original open job survives cancellation"
+        );
+        assert!(
+            observe_close.try_recv().is_err(),
+            "the blocked source has not exited"
+        );
+        // Drop an actual pending close wait. The same stable job survives and
+        // the next close borrows it; there is no second source open.
+        {
+            let close = initializing.close();
+            tokio::pin!(close);
+            std::future::poll_fn(|cx| {
+                assert!(close.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        assert!(initializing.job.is_some());
         release.send(()).expect("release late source-open success");
+        tokio::time::timeout(Duration::from_secs(2), initializing.close())
+            .await
+            .expect("original cleanup joins")
+            .expect("original source close succeeds");
+        assert!(initializing.job.is_none());
         observe_close
             .recv_timeout(Duration::from_secs(2))
             .expect("late state is reaped after actual source-open exit");
@@ -1183,22 +1461,30 @@ mod tests {
         source_two.connector_context = Some(attempt_context.clone());
         source_two.cleanup.closed = Some(source_two_closed);
         drop(attempt_context);
-        let actor = tokio::spawn(drive_attempt_initialization(
-            supervisor,
-            lifecycle(&cancellation),
-            state,
-        ));
+        let lifecycle = lifecycle(&cancellation);
+        let actor = tokio::spawn(async move {
+            let mut initializing = InitializationProgress::new(supervisor, lifecycle, state);
+            let result = initializing.initialize().await;
+            (initializing, result)
+        });
         observe_source_two_started
             .recv_timeout(Duration::from_secs(2))
             .expect("second source starts after the first was accepted");
 
         cancellation.request(QueryCancellationReason::ClientDisconnected);
-        let error = tokio::time::timeout(Duration::from_secs(1), actor)
+        let (mut initializing, result) = tokio::time::timeout(Duration::from_secs(1), actor)
             .await
             .expect("running second source observes cancellation")
-            .expect("initializer task")
-            .expect_err("cancelled initializer cannot become ready");
+            .expect("initializer task");
+        let error = result.expect_err("cancelled initializer cannot become ready");
         assert!(error.message().contains("cancelled"), "{error}");
+        let close = initializing.close();
+        tokio::pin!(close);
+        std::future::poll_fn(|cx| {
+            assert!(close.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
         observe_source_one_closed
             .recv_timeout(Duration::from_secs(2))
             .expect("accepted first source closes before the second returns");
@@ -1213,6 +1499,10 @@ mod tests {
         release_source_two
             .send(())
             .expect("release second source-open call");
+        tokio::time::timeout(Duration::from_secs(2), close)
+            .await
+            .expect("both original close jobs join")
+            .expect("both original source closes succeed");
         observe_source_two_closed
             .recv_timeout(Duration::from_secs(2))
             .expect("late second source closes independently");
@@ -1242,9 +1532,20 @@ mod tests {
             ..expected
         });
 
-        let error = drive_attempt_initialization(supervisor, lifecycle(&cancellation), state)
+        let mut initializing =
+            InitializationProgress::new(supervisor, lifecycle(&cancellation), state);
+        let error = initializing
+            .initialize()
             .await
             .expect_err("another generation cannot become ready");
+        assert!(
+            initializing.outcome.is_some(),
+            "the rejected source remains in the original result slot"
+        );
+        initializing
+            .close()
+            .await
+            .expect("the original source-close worker joins");
 
         assert!(error.message().contains("another identity"), "{error}");
         observe_close
