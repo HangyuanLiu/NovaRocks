@@ -459,6 +459,33 @@ impl Drop for ApplySendOwner {
     }
 }
 impl ApplySendPort {
+    /// Original fixed record/Core/owner payloads only, not independent input,
+    /// task, reservation or arbitrary failure pointees.
+    pub(crate) fn capacity_sources(
+        &self,
+    ) -> Result<(usize, usize), novarocks_workload_control::WorkError> {
+        use novarocks_workload_control::WorkError;
+        use std::alloc::Layout;
+        let records = self
+            .core
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .records
+            .len();
+        let array = Layout::array::<Option<OriginalRecord>>(records)
+            .map_err(|_| WorkError::ArithmeticOverflow)?;
+        let core =
+            novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<Core>())
+                .map_err(|_| WorkError::ArithmeticOverflow)?;
+        let bytes = array
+            .size()
+            .checked_add(core.size())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<ApplySendOwner>()))
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        Ok((records, bytes))
+    }
+
     /// Called while the ORIGINAL batch still owns its nonempty queue grants.
     /// This derives a bookkeeping slot, not another admission/wallet charge.
     pub(crate) fn reserve_original_slot(

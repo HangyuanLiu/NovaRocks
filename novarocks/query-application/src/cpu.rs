@@ -1005,6 +1005,15 @@ impl QueryBlockingExecutor {
         QueryBlockingQueueGeometry,
         novarocks_type_contract::owned_resources::layout::LayoutResourceError,
     > {
+        Self::queue_geometry_for_composition()
+    }
+
+    /// Pure requested layouts of the original queue types. No pool is opened,
+    /// reserved, or certified finite by reading this value.
+    pub fn queue_geometry_for_composition() -> Result<
+        QueryBlockingQueueGeometry,
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+    > {
         Ok(QueryBlockingQueueGeometry {
             reservation_inline: std::alloc::Layout::new::<QueryBlockingReservation>(),
             prepared_inline: std::alloc::Layout::new::<QueryBlockingPreparedJob>(),

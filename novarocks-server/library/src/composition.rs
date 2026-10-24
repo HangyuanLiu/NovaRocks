@@ -34,9 +34,10 @@ use novarocks_frontend_application::task_protocol_config::{
     CoordinationBudgets, DispatchBudget, TaskUpdateRetryPolicy,
 };
 use novarocks_frontend_application::{
-    ClusterBackendOpenConfig, FrontendApplicationOpenConfig, FrontendExecutionConfig,
-    FrontendLogicalExecutionRuntimeConfig, FrontendManagementConfig, FrontendQueryControlTimeouts,
-    FrontendResultCapacityProfile, FrontendServingConfig,
+    ClusterBackendOpenConfig, FrontendApplicationOpenConfig, FrontendDependencyCustodyLimits,
+    FrontendExecutionConfig, FrontendLogicalExecutionRuntimeConfig, FrontendManagementConfig,
+    FrontendNativeCapacityInputs, FrontendQueryControlTimeouts, FrontendResultCapacityProfile,
+    FrontendServingConfig, FrontendWorkloadCapacityConfig,
 };
 use novarocks_fs::{
     FsAccessResolver, FsAccessResources, ObjectStoreProviderPool, ObjectStoreProviderPoolOptions,
@@ -580,10 +581,6 @@ pub fn compose_frontend_role_config(
     )?;
     let runtime_filter_worker_count = NonZeroUsize::new(runtime_config.actual_exec_threads())
         .ok_or_else(|| anyhow::anyhow!("frontend runtime-filter worker count must be nonzero"))?;
-    let query_blocking_workers = NonZeroUsize::new(runtime_config.actual_query_blocking_workers())
-        .ok_or_else(|| anyhow::anyhow!("runtime.query_blocking_worker_threads must be nonzero"))?;
-    let query_blocking_queue = NonZeroUsize::new(runtime_config.query_blocking_queue_capacity)
-        .ok_or_else(|| anyhow::anyhow!("runtime.query_blocking_queue_capacity must be nonzero"))?;
     let failure_backoff_ms = config
         .standalone_server
         .as_ref()
@@ -594,13 +591,16 @@ pub fn compose_frontend_role_config(
         .ok_or_else(|| anyhow::anyhow!("compose frontend server without catalog source preflight"))?
         .input()?;
     let task_execution_budgets = compose_task_execution_budgets(config)?;
-    let (logical_supervisor, workload, abort_capacity, result_profile) =
+    let (logical_supervisor, workload, abort_capacity, result_profile, capacity_inputs) =
         compose_frontend_workload_runtime(runtime_config)?;
+    // The fifth input and the actual pool consume one frozen configuration.
+    let query_blocking_config = capacity_inputs.query_blocking_capacity();
     let logical_runtime = FrontendLogicalExecutionRuntimeConfig::new(
         logical_supervisor,
         workload,
         abort_capacity,
         result_profile,
+        capacity_inputs,
     );
     let mut execution = FrontendExecutionConfig::new(
         runtime_filter_worker_count,
@@ -664,10 +664,7 @@ pub fn compose_frontend_role_config(
     .with_query_cpu_executor_config(QueryCpuExecutorConfig::with_idle_keepalive(
         Duration::from_millis(runtime_config.frontend_workload.planning_idle_keepalive_ms),
     ))
-    .with_query_blocking_executor_config(QueryBlockingExecutorConfig::new(
-        query_blocking_workers,
-        query_blocking_queue,
-    ));
+    .with_query_blocking_executor_config(query_blocking_config);
     // The frontend freezes the one carrier its island's backends interpret,
     // under the same structural package admission as their receiver.
     execution = execution.with_static_plan_carrier(static_plan.frontend_carrier());
@@ -794,21 +791,42 @@ struct ComposedTaskExecutionBudgets {
     transport: FrontendTaskTransportBudget,
 }
 
+fn compose_frontend_capacity_config(
+    runtime: &crate::app_config::RuntimeConfig,
+) -> anyhow::Result<FrontendWorkloadCapacityConfig> {
+    let input = &runtime.frontend_workload;
+    let custody = &input.dependency_custody;
+    FrontendWorkloadCapacityConfig::try_new(
+        input.scope_slots.declared(),
+        FrontendDependencyCustodyLimits {
+            unreceived_productions: custody.unreceived_productions,
+            publications: custody.publications,
+            residuals: custody.residuals,
+            retained_payload_bytes: custody.retained_payload_bytes,
+        },
+        NonZeroUsize::new(input.joint_progress_turn_budget)
+            .ok_or_else(|| anyhow!("frontend joint progress turn budget must be nonzero"))?,
+        Duration::from_millis(input.retired_backing_recheck_ms),
+    )
+    .context("construct frontend finite workload policy")
+}
+
 fn compose_frontend_workload_policy(
     runtime: &crate::app_config::RuntimeConfig,
 ) -> anyhow::Result<WorkloadConfig> {
     let input = &runtime.frontend_workload;
+    let scope_limit = compose_frontend_capacity_config(runtime)?.scope_limit();
     let workload = WorkloadConfig {
         // These generic bookkeeping ceilings protect finite in-process state.
         // Frontend compute roots use `query_concurrency_limit` below as their
         // single operational queue; these do not form a second FE workload
         // admission policy.
-        root_limit: input.scope_records_limit,
-        business_limit: input.scope_records_limit,
+        root_limit: scope_limit,
+        business_limit: scope_limit,
         query_concurrency_limit: input.concurrency_limit,
-        preparation_limit: input.scope_records_limit,
-        execution_limit: input.scope_records_limit,
-        executions_per_root: input.scope_records_limit,
+        preparation_limit: scope_limit,
+        execution_limit: scope_limit,
+        executions_per_root: scope_limit,
         waiting_limit: input.waiting_limit,
         // Query admission has no retained-byte declaration. Keep the generic
         // stage-accounting invariant valid without exposing a second FE query
@@ -819,7 +837,7 @@ fn compose_frontend_workload_policy(
         old_attempts_per_work: input.old_attempts_per_work,
         old_attempts_limit: input.old_attempts_limit,
         unknown_creates_limit: input.unknown_creates_limit,
-        scope_records_limit: input.scope_records_limit,
+        scope_records_limit: scope_limit,
         obligation_records_limit: input.obligation_records_limit,
         control_inflight_limit: input.control_inflight_limit,
         control_ready_limit: input.control_ready_limit,
@@ -855,6 +873,7 @@ fn compose_frontend_workload_runtime(
     WorkloadConfig,
     NonZeroUsize,
     FrontendResultCapacityProfile,
+    FrontendNativeCapacityInputs,
 )> {
     let input = &runtime.frontend_workload;
     let workload = compose_frontend_workload_policy(runtime)?;
@@ -922,7 +941,24 @@ fn compose_frontend_workload_runtime(
     .with_remote_cleanup_timeout(Duration::from_millis(
         input.logical_remote_cleanup_timeout_ms,
     ));
-    Ok((supervisor, workload, abort_capacity, result_profile))
+    let query_blocking = QueryBlockingExecutorConfig::new(
+        NonZeroUsize::new(runtime.actual_query_blocking_workers())
+            .ok_or_else(|| anyhow!("runtime.query_blocking_worker_threads must be nonzero"))?,
+        NonZeroUsize::new(runtime.query_blocking_queue_capacity)
+            .ok_or_else(|| anyhow!("runtime.query_blocking_queue_capacity must be nonzero"))?,
+    );
+    let capacity_inputs = FrontendNativeCapacityInputs::try_new(
+        compose_frontend_capacity_config(runtime)?,
+        query_blocking,
+    )
+    .context("construct unvalidated frontend Native capacity inputs")?;
+    Ok((
+        supervisor,
+        workload,
+        abort_capacity,
+        result_profile,
+        capacity_inputs,
+    ))
 }
 
 fn compose_task_execution_budgets(
@@ -1368,11 +1404,21 @@ mod tests {
     fn frontend_workload_runtime_is_built_from_validated_server_fields() {
         let mut config = crate::app_config::NovaRocksConfig::default();
         config.runtime.mem_limit = "1G".to_string();
-        let (_, workload, abort_capacity, _) = compose_frontend_workload_runtime(&config.runtime)
-            .expect("explicit frontend workload fields compose");
+        let (_, workload, abort_capacity, _, inputs) =
+            compose_frontend_workload_runtime(&config.runtime)
+                .expect("explicit frontend workload fields compose");
         assert_eq!(workload.query_concurrency_limit, 256);
         assert_eq!(workload.execution_limit, workload.scope_records_limit);
         assert_eq!(abort_capacity.get(), 16);
+        assert_eq!(
+            inputs.policy().slots_per_class(),
+            [4096, 1024, 1024, 1024, 1024]
+        );
+        assert_eq!(inputs.policy().scope_limit(), workload.scope_records_limit);
+        assert_eq!(
+            inputs.query_blocking_capacity().worker_threads().get(),
+            config.runtime.actual_query_blocking_workers()
+        );
 
         config
             .runtime
@@ -1526,7 +1572,7 @@ mod joint_startup_policy_tests {
         runtime.frontend_workload.internal_result_positions = 1;
         runtime.frontend_workload.internal_result_all_objects_bytes = 2 * 1024 * 1024 * 1024;
         let report = validate_frontend_joint_startup(&runtime).unwrap();
-        let (_, _, _, installed) = compose_frontend_workload_runtime(&runtime).unwrap();
+        let (_, _, _, installed, _) = compose_frontend_workload_runtime(&runtime).unwrap();
         assert_eq!(report.result_class_positions[2], 1);
         assert_eq!(installed.declared().positions[2], 1);
         assert_eq!(
@@ -1554,7 +1600,7 @@ mod joint_startup_policy_tests {
         runtime.frontend_workload.concurrency_limit = 16;
         let projected = compose_frontend_workload_policy(&runtime).expect("original workload");
         let report = validate_frontend_joint_startup(&runtime).expect("joint number check");
-        let (_, composed, _, _) =
+        let (_, composed, _, _, _) =
             compose_frontend_workload_runtime(&runtime).expect("pure composition");
         assert_eq!(projected.query_concurrency_limit, 16);
         assert_eq!(
@@ -1582,6 +1628,28 @@ mod joint_startup_policy_tests {
         let mut runtime = crate::app_config::RuntimeConfig::default();
         runtime.frontend_workload.concurrency_limit = 257;
         assert!(validate_frontend_joint_startup(&runtime).is_err());
+        assert!(compose_frontend_workload_runtime(&runtime).is_err());
+    }
+}
+
+#[cfg(test)]
+mod frontend_capacity_input_tests {
+    use super::*;
+    #[test]
+    fn checked_class_sum_is_the_only_scope_total_and_reaches_the_fifth_input() {
+        let mut runtime = crate::app_config::RuntimeConfig::default();
+        runtime.frontend_workload.scope_slots.query = 5000;
+        let (_, workload, _, _, inputs) = compose_frontend_workload_runtime(&runtime).unwrap();
+        assert_eq!(workload.scope_records_limit, 5000 + 4 * 1024);
+        assert_eq!(workload.root_limit, workload.scope_records_limit);
+        assert_eq!(inputs.policy().scope_limit(), workload.scope_records_limit);
+        assert_eq!(
+            inputs.policy().dependency_custody().retained_payload_bytes,
+            4 << 30
+        );
+        runtime.frontend_workload.scope_slots.management = 0;
+        assert!(compose_frontend_workload_runtime(&runtime).is_err());
+        runtime.frontend_workload.scope_slots.management = usize::MAX;
         assert!(compose_frontend_workload_runtime(&runtime).is_err());
     }
 }

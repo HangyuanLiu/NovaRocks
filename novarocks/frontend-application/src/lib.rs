@@ -46,6 +46,11 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
 /// Native Task protocol bounds frozen by frontend process composition.
 pub mod task_protocol_config;
 
+mod native_workload;
+pub use native_workload::{
+    FrontendDependencyCustodyLimits, FrontendNativeCapacityInputs, FrontendWorkloadCapacityConfig,
+};
+
 pub(crate) mod application;
 pub use application::{
     FrontendApplicationError, FrontendApplicationErrorKind, FrontendExecutionConfig,
@@ -68,7 +73,9 @@ mod native;
 pub use query_execution::package_freeze::CompiledPackageCarrier;
 
 /// Known metadata facts of the original closed Internal CPU job factory.
-pub use query_execution::internal_result_cpu::InternalCpuMetadataGeometry;
+pub use query_execution::internal_result_cpu::{
+    InternalCpuActionQuote, InternalCpuMetadataGeometry,
+};
 #[cfg(novarocks_dev_controls)]
 mod preparation_diagnostics;
 pub(crate) mod query;

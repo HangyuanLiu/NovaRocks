@@ -107,6 +107,19 @@ pub(crate) struct NativeTransportSupervisorBudget {
     max_waiters: usize,
 }
 
+/// Limits read from the actual original supervisor, not a second wallet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeTaskOperationCapacityFacts {
+    pub(crate) process_items: usize,
+    pub(crate) process_retained_bytes: usize,
+    pub(crate) target_items: usize,
+    pub(crate) target_retained_bytes: usize,
+    pub(crate) control_reserved_items: usize,
+    pub(crate) control_reserved_bytes: usize,
+    pub(crate) maximum_batch_encoded_bytes: usize,
+    pub(crate) waiter_records: usize,
+}
+
 impl NativeTransportSupervisorBudget {
     pub(crate) fn from_transport(transport: TransportBudget) -> Result<Self, String> {
         let reserved_control_bytes = transport.max_retained_batch_bytes();
@@ -242,6 +255,20 @@ pub(crate) struct NativeTransportSupervisor {
 }
 
 impl NativeTransportSupervisor {
+    pub(crate) fn capacity_sources(&self) -> NativeTaskOperationCapacityFacts {
+        let budget = self.inner.budget;
+        NativeTaskOperationCapacityFacts {
+            process_items: budget.max_items,
+            process_retained_bytes: budget.max_encoded_bytes,
+            target_items: budget.max_target_items,
+            target_retained_bytes: budget.max_target_retained_bytes,
+            control_reserved_items: budget.reserved_control_items,
+            control_reserved_bytes: budget.reserved_control_bytes,
+            maximum_batch_encoded_bytes: budget.max_batch_encoded_bytes,
+            waiter_records: budget.max_waiters,
+        }
+    }
+
     pub(crate) fn from_transport(transport: TransportBudget) -> Result<Self, String> {
         Ok(Self {
             inner: Arc::new(SupervisorInner {

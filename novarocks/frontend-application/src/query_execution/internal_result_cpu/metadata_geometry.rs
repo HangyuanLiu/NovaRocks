@@ -157,16 +157,40 @@ pub(super) fn operation_call_layout() -> Layout {
 /// Packet/header/forwarder aliases outlive this action and still require their
 /// original fixed role envelope; this value does not certify that payment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct InternalCpuActionQuote {
+pub struct InternalCpuActionQuote {
     pub(crate) metadata_bytes: std::num::NonZeroU64,
     pub(crate) physical_queue_bytes: std::num::NonZeroU64,
 }
 pub(super) fn operation_action_quote(
     executor: &QueryBlockingExecutor,
 ) -> Result<InternalCpuActionQuote, super::WorkError> {
-    let geometry = executor
-        .queue_geometry()
-        .map_err(|_| super::WorkError::ArithmeticOverflow)?;
+    action_quote_from_geometry(
+        executor
+            .queue_geometry()
+            .map_err(|_| super::WorkError::ArithmeticOverflow)?,
+    )
+}
+
+pub(super) fn operation_action_quote_for_composition()
+-> Result<InternalCpuActionQuote, super::WorkError> {
+    action_quote_from_geometry(
+        QueryBlockingExecutor::queue_geometry_for_composition()
+            .map_err(|_| super::WorkError::ArithmeticOverflow)?,
+    )
+}
+
+impl InternalCpuActionQuote {
+    pub const fn metadata_bytes(self) -> std::num::NonZeroU64 {
+        self.metadata_bytes
+    }
+    pub const fn physical_queue_bytes(self) -> std::num::NonZeroU64 {
+        self.physical_queue_bytes
+    }
+}
+
+fn action_quote_from_geometry(
+    geometry: novarocks_query_application::cpu::QueryBlockingQueueGeometry,
+) -> Result<InternalCpuActionQuote, super::WorkError> {
     let queue_bytes = geometry
         .queue_record_inline
         .size()

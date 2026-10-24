@@ -1188,7 +1188,11 @@ pub struct FrontendWorkloadRuntimeConfig {
     pub old_attempts_per_work: usize,
     pub old_attempts_limit: usize,
     pub unknown_creates_limit: usize,
-    pub scope_records_limit: usize,
+    /// The checked sum is the sole FE scope inventory.
+    pub scope_slots: FrontendScopeSlotsConfig,
+    pub dependency_custody: FrontendDependencyCustodyConfig,
+    pub joint_progress_turn_budget: usize,
+    pub retired_backing_recheck_ms: u64,
     pub obligation_records_limit: usize,
     pub control_inflight_limit: usize,
     pub control_ready_limit: usize,
@@ -1218,7 +1222,10 @@ impl Default for FrontendWorkloadRuntimeConfig {
             old_attempts_per_work: 2,
             old_attempts_limit: 128,
             unknown_creates_limit: 4096,
-            scope_records_limit: 8192,
+            scope_slots: FrontendScopeSlotsConfig::default(),
+            dependency_custody: FrontendDependencyCustodyConfig::default(),
+            joint_progress_turn_budget: 7,
+            retired_backing_recheck_ms: 25,
             obligation_records_limit: 8192,
             control_inflight_limit: 16,
             control_ready_limit: 256,
@@ -1230,6 +1237,60 @@ impl Default for FrontendWorkloadRuntimeConfig {
             logical_replacement_reservation_ms: 30_000,
             logical_remote_cleanup_timeout_ms: 5_000,
             planning_idle_keepalive_ms: 60_000,
+        }
+    }
+}
+
+/// Explicit Server policy for five classes, not a physical-layout quote.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FrontendScopeSlotsConfig {
+    pub query: usize,
+    pub materialized_view: usize,
+    pub statistics: usize,
+    pub table_maintenance: usize,
+    pub management: usize,
+}
+impl Default for FrontendScopeSlotsConfig {
+    fn default() -> Self {
+        // Deliberate Server policy, never inferred from worker/thread counts.
+        Self {
+            query: 4096,
+            materialized_view: 1024,
+            statistics: 1024,
+            table_maintenance: 1024,
+            management: 1024,
+        }
+    }
+}
+impl FrontendScopeSlotsConfig {
+    pub fn declared(&self) -> [usize; 5] {
+        [
+            self.query,
+            self.materialized_view,
+            self.statistics,
+            self.table_maintenance,
+            self.management,
+        ]
+    }
+}
+/// Independent per-dependency policy, not an actual backing quote.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FrontendDependencyCustodyConfig {
+    pub unreceived_productions: u64,
+    pub publications: u64,
+    pub residuals: u64,
+    pub retained_payload_bytes: u64,
+}
+impl Default for FrontendDependencyCustodyConfig {
+    fn default() -> Self {
+        // Complete supported progress validation may reject stricter policies.
+        Self {
+            unreceived_productions: 256,
+            publications: 256,
+            residuals: 256,
+            retained_payload_bytes: 4 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -3254,6 +3315,7 @@ mod tests {
     fn frontend_workload_rejects_retired_capacity_switches() {
         for field in [
             "root_limit",
+            "scope_records_limit",
             "business_limit",
             "preparation_limit",
             "execution_limit",
@@ -4883,5 +4945,41 @@ mod frontend_constant_policy_tests {
         assert_eq!(policy.max_metadata_bytes, 0);
         assert_eq!(policy.max_library_validation_work, 0);
         assert_eq!(policy.max_library_validation_bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod frontend_joint_policy_config_tests {
+    use super::*;
+    #[test]
+    fn named_shares_and_independent_custody_policy_parse_without_a_solver_matrix() {
+        let configured: FrontendWorkloadRuntimeConfig = toml::from_str(
+            "[scope_slots]\nquery = 20\nmaterialized_view = 6\nstatistics = 7\n\
+             table_maintenance = 8\nmanagement = 9\n\
+             [dependency_custody]\nunreceived_productions = 4\npublications = 5\n\
+             residuals = 6\nretained_payload_bytes = 1073741824\n",
+        )
+        .unwrap();
+        assert_eq!(configured.scope_slots.declared(), [20, 6, 7, 8, 9]);
+        assert_eq!(configured.dependency_custody.unreceived_productions, 4);
+        assert_eq!(configured.dependency_custody.publications, 5);
+        assert_eq!(configured.dependency_custody.residuals, 6);
+        assert_eq!(
+            configured.dependency_custody.retained_payload_bytes,
+            1 << 30
+        );
+        let defaults = FrontendWorkloadRuntimeConfig::default();
+        assert_eq!(
+            defaults.scope_slots.declared(),
+            [4096, 1024, 1024, 1024, 1024]
+        );
+        assert_eq!(defaults.dependency_custody.retained_payload_bytes, 4 << 30);
+        for document in [
+            "scope_records_limit = 8192",
+            "max_claims = 99",
+            "work_per_turn = 7",
+        ] {
+            assert!(toml::from_str::<FrontendWorkloadRuntimeConfig>(document).is_err());
+        }
     }
 }

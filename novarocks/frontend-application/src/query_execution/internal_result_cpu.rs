@@ -52,7 +52,7 @@ use novarocks_workload_control::joint_admission::{
 use std::sync::{Arc, Weak};
 
 mod metadata_geometry;
-pub(crate) use metadata_geometry::InternalCpuActionQuote;
+pub use metadata_geometry::InternalCpuActionQuote;
 pub use metadata_geometry::InternalCpuMetadataGeometry;
 
 // The whole maximum coexistence envelope is authorized before any domain
@@ -164,6 +164,16 @@ impl FrontendResultCapacityProfile {
         novarocks_type_contract::owned_resources::layout::LayoutResourceError,
     > {
         metadata_geometry::geometry()
+    }
+
+    /// Same actual closed call factory and original queue record as dispatch.
+    /// This quote alone does not authorize a CPU action or fund its lifetime.
+    pub fn internal_cpu_action_quote(self) -> Result<InternalCpuActionQuote, WorkError> {
+        metadata_geometry::operation_action_quote_for_composition()
+    }
+
+    pub const fn internal_cpu_capacity(self) -> QueryBlockingExecutorConfig {
+        QueryBlockingExecutorConfig::new(self.internal_positions, self.internal_positions)
     }
 
     pub const fn declared(self) -> ResultCapacityConfig {

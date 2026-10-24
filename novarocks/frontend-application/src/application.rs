@@ -312,6 +312,8 @@ impl std::error::Error for FrontendApplicationError {
 /// supervisor, Registry, workload control, or decode join handles.
 // Design: ADR-0147 (docs/adr/ADR-0147-process-local-work-governance-separates-responsibility-and-resources.md)
 struct FrontendExecutionRuntimeOwner {
+    native_capacity_inputs: crate::native_workload::FrontendNativeCapacityInputs,
+    native_capacity_sources: crate::native_workload::FrontendNativeCapacitySources,
     clock: Arc<dyn novarocks_coordination_contract::MonotonicClock>,
     connector_blocking_io: ConnectorBlockingIoSupervisor,
     supervisor: LogicalExecutionSupervisor,
@@ -429,10 +431,23 @@ impl FrontendExecutionRuntimeOwner {
         result_profile: FrontendResultCapacityProfile,
         query_cpu_config: QueryCpuExecutorConfig,
         query_blocking_config: QueryBlockingExecutorConfig,
+        native_capacity_inputs: crate::native_workload::FrontendNativeCapacityInputs,
     ) -> Result<Self, FrontendApplicationError> {
-        let mut workload = WorkloadControl::try_new_counted(workload_config).map_err(|error| {
-            FrontendApplicationError::new(FrontendApplicationErrorKind::WorkloadControlOpen, error)
-        })?;
+        native_capacity_inputs
+            .validate_pool_declarations(&workload_config, query_blocking_config)
+            .map_err(|error| {
+                FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::WorkloadControlOpen,
+                    error,
+                )
+            })?;
+        let mut workload =
+            WorkloadControl::try_new_counted(workload_config.clone()).map_err(|error| {
+                FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::WorkloadControlOpen,
+                    error,
+                )
+            })?;
         // The frozen result profile must cover computation admission; a
         // concurrency limit beyond its client positions is refused here.
         let result_capacity = workload
@@ -466,6 +481,20 @@ impl FrontendExecutionRuntimeOwner {
                 },
             )?;
         let internal_result_cpu_runtime = internal_result_cpu.runtime();
+        // Actual pool/factory capture precedes starting the logical-role service.
+        let native_capacity_sources = native_capacity_inputs
+            .capture_sources(
+                &workload_config,
+                result_profile,
+                &query_blocking_executor,
+                &internal_result_cpu_runtime,
+            )
+            .map_err(|error| {
+                FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::WorkloadControlOpen,
+                    error,
+                )
+            })?;
         let process_bytes = frontend_process_id.to_bytes();
         let namespace = QueryProcessNamespace::new(
             u64::from_be_bytes(process_bytes[..8].try_into().expect("UUID high half"))
@@ -492,6 +521,8 @@ impl FrontendExecutionRuntimeOwner {
             workload.owner.deadline_expiry_handle(),
         );
         Ok(Self {
+            native_capacity_inputs,
+            native_capacity_sources,
             clock,
             connector_blocking_io,
             supervisor,
@@ -865,6 +896,7 @@ impl Default for FrontendQueryControlTimeouts {
 
 #[derive(Clone)]
 pub struct FrontendLogicalExecutionRuntimeConfig {
+    native_capacity_inputs: crate::native_workload::FrontendNativeCapacityInputs,
     supervisor: LogicalExecutionSupervisorConfig,
     workload: WorkloadConfig,
     result_profile: FrontendResultCapacityProfile,
@@ -877,13 +909,39 @@ impl FrontendLogicalExecutionRuntimeConfig {
         workload: WorkloadConfig,
         abort_effect_capacity: NonZeroUsize,
         result_profile: FrontendResultCapacityProfile,
+        native_capacity_inputs: crate::native_workload::FrontendNativeCapacityInputs,
     ) -> Self {
         Self {
+            native_capacity_inputs,
             supervisor,
             workload,
             result_profile,
             abort_effect_capacity,
         }
+    }
+
+    fn test_capacity_inputs(
+        query_blocking: QueryBlockingExecutorConfig,
+    ) -> crate::native_workload::FrontendNativeCapacityInputs {
+        use crate::native_workload::{
+            FrontendDependencyCustodyLimits, FrontendNativeCapacityInputs,
+            FrontendWorkloadCapacityConfig,
+        };
+        // Explicit in-process convenience policy only; Server supplies its own.
+        let policy = FrontendWorkloadCapacityConfig::try_new(
+            [4096, 1024, 1024, 1024, 1024],
+            FrontendDependencyCustodyLimits {
+                unreceived_productions: 256,
+                publications: 256,
+                residuals: 256,
+                retained_payload_bytes: 4 * 1024 * 1024 * 1024,
+            },
+            NonZeroUsize::new(7).unwrap(),
+            Duration::from_millis(25),
+        )
+        .expect("explicit test policy");
+        FrontendNativeCapacityInputs::try_new(policy, query_blocking)
+            .expect("explicit test pool geometry")
     }
 
     fn for_test() -> Self {
@@ -904,12 +962,17 @@ impl FrontendLogicalExecutionRuntimeConfig {
                 novarocks_workload_control::ResultCapacityConfig::V1,
             )
             .expect("test result profile"),
+            Self::test_capacity_inputs(QueryBlockingExecutorConfig::new(
+                DEFAULT_QUERY_BLOCKING_WORKER_COUNT,
+                DEFAULT_QUERY_BLOCKING_QUEUE_CAPACITY,
+            )),
         )
     }
 }
 
 #[derive(Clone)]
 pub struct FrontendExecutionConfig {
+    native_capacity_inputs: crate::native_workload::FrontendNativeCapacityInputs,
     #[cfg(novarocks_dev_controls)]
     test_session: Option<crate::test_session::FrontendTestSessionConfig>,
     runtime_filter_worker_count: NonZeroUsize,
@@ -1017,6 +1080,7 @@ impl FrontendExecutionConfig {
                 DEFAULT_QUERY_BLOCKING_WORKER_COUNT,
                 DEFAULT_QUERY_BLOCKING_QUEUE_CAPACITY,
             ),
+            native_capacity_inputs: logical_runtime.native_capacity_inputs,
             logical_execution_supervisor: logical_runtime.supervisor,
             workload: logical_runtime.workload,
             result_profile: logical_runtime.result_profile,
@@ -1346,6 +1410,17 @@ impl FrontendApplicationHost {
         .map_err(|error| {
             FrontendApplicationError::new(FrontendApplicationErrorKind::CoordinatorOpen, error)
         })?;
+        // Same original Native owners, checked before any logical-role service.
+        let native_capacity_inputs = execution
+            .native_capacity_inputs
+            .clone()
+            .with_native_sources(&data_runtime)
+            .map_err(|error| {
+                FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::WorkloadControlOpen,
+                    error,
+                )
+            })?;
         let execution_runtime_owner = FrontendExecutionRuntimeOwner::try_new(
             query_runtime,
             data_runtime.connector_blocking_io().clone(),
@@ -1355,6 +1430,7 @@ impl FrontendApplicationHost {
             execution.result_profile,
             execution.query_cpu_executor_config,
             execution.query_blocking_executor_config,
+            native_capacity_inputs,
         )?;
         let catalog_runtime_projection =
             crate::catalog_application::CatalogRuntimeProjection::new();
@@ -2440,6 +2516,12 @@ mod tests {
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
             ),
+            super::FrontendLogicalExecutionRuntimeConfig::test_capacity_inputs(
+                QueryBlockingExecutorConfig::new(
+                    NonZeroUsize::new(1).unwrap(),
+                    NonZeroUsize::new(1).unwrap(),
+                ),
+            ),
         )
         .expect("execution runtime opens");
         runtime.mark_ready().expect("workload authority ready");
@@ -2484,6 +2566,12 @@ mod tests {
             QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
+            ),
+            super::FrontendLogicalExecutionRuntimeConfig::test_capacity_inputs(
+                QueryBlockingExecutorConfig::new(
+                    NonZeroUsize::new(1).unwrap(),
+                    NonZeroUsize::new(1).unwrap(),
+                ),
             ),
         )
         .expect("execution runtime opens");
@@ -2539,6 +2627,12 @@ mod tests {
             QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
+            ),
+            super::FrontendLogicalExecutionRuntimeConfig::test_capacity_inputs(
+                QueryBlockingExecutorConfig::new(
+                    NonZeroUsize::new(1).unwrap(),
+                    NonZeroUsize::new(1).unwrap(),
+                ),
             ),
         )
         .expect("execution runtime opens");

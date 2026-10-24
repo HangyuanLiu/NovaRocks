@@ -262,6 +262,25 @@ impl Drop for SubscriptionLease {
 }
 
 impl NativeSubscriptionOwner {
+    /// Known original owner/Core/header/record container layouts only. The
+    /// OriginalInput, Backing, actual future and arbitrary causes are separate.
+    pub(crate) fn resident_storage_bytes(
+        max_records: usize,
+    ) -> Result<usize, novarocks_workload_control::WorkError> {
+        use novarocks_workload_control::WorkError;
+        use std::alloc::Layout;
+        let records = Layout::array::<Option<Record>>(max_records)
+            .map_err(|_| WorkError::ArithmeticOverflow)?;
+        let core =
+            novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<Core>())
+                .map_err(|_| WorkError::ArithmeticOverflow)?;
+        records
+            .size()
+            .checked_add(core.size())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
+            .ok_or(WorkError::ArithmeticOverflow)
+    }
+
     /// `scope_records_limit` is copied from the SAME configured FE Workload;
     /// production composition must not substitute a default or another owner.
     pub(crate) fn new(
@@ -487,6 +506,22 @@ impl Drop for NativeSubscriptionOwner {
 }
 
 impl NativeSubscriptionPort {
+    pub(crate) fn capacity_sources(
+        &self,
+    ) -> Result<(usize, usize), novarocks_workload_control::WorkError> {
+        let records = self
+            .core
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .records
+            .len();
+        Ok((
+            records,
+            NativeSubscriptionOwner::resident_storage_bytes(records)?,
+        ))
+    }
+
     /// Reserve the original child and fixed role position BEFORE constructing F.
     /// Publisher is Some for every production Covered subscriber; legacy is test-only.
     pub(crate) fn reserve(

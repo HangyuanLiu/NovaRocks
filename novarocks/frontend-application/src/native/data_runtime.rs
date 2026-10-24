@@ -312,6 +312,25 @@ impl Clone for FrontendDataRuntime {
 }
 
 impl FrontendDataRuntime {
+    pub(crate) fn capacity_sources(
+        &self,
+    ) -> Result<
+        crate::native_workload::NativeProcessCapacitySources,
+        novarocks_workload_control::WorkError,
+    > {
+        let (subscription_records, subscription_resident_bytes) =
+            self.subscription_port.capacity_sources()?;
+        let (apply_records, apply_resident_bytes) = self.apply_send_port.capacity_sources()?;
+        Ok(crate::native_workload::NativeProcessCapacitySources {
+            apply_records,
+            apply_resident_bytes,
+            subscription_records,
+            subscription_resident_bytes,
+            transport: self.task_transport_supervisor.capacity_sources(),
+            physical: self.transport_admission.dimensions(),
+        })
+    }
+
     pub(crate) fn handle(&self) -> &Handle {
         &self.handle
     }
@@ -826,6 +845,128 @@ mod tests {
             novarocks_workload_control::WorkloadConfig::default().scope_records_limit,
         )
         .expect("the default task transport budget is valid")
+    }
+
+    #[tokio::test]
+    async fn capacity_capture_reads_the_original_pools_factory_and_subscription_inventory() {
+        use crate::native_workload::{
+            FrontendDependencyCustodyLimits, FrontendNativeCapacityInputs,
+            FrontendWorkloadCapacityConfig,
+        };
+        use crate::query_execution::internal_result_cpu::{
+            FrontendResultCapacityProfile, InternalResultCpuOwner,
+        };
+        use novarocks_query_application::cpu::{
+            QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
+        };
+        use novarocks_workload_control::{WorkError, WorkloadConfig, WorkloadControl};
+        use std::{
+            num::NonZeroUsize,
+            time::{Duration, Instant},
+        };
+        let native = data_runtime(tokio::runtime::Handle::current());
+        let workload = WorkloadConfig::default();
+        let mut control = WorkloadControl::try_new_counted(workload.clone()).unwrap();
+        let result = FrontendResultCapacityProfile::for_test();
+        let mut internal = InternalResultCpuOwner::try_new(result, &mut control.owner).unwrap();
+        let config = QueryBlockingExecutorConfig::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        );
+        let mut blocking = QueryBlockingExecutorOwner::try_new(config).unwrap();
+        let policy = |slots| {
+            FrontendWorkloadCapacityConfig::try_new(
+                slots,
+                FrontendDependencyCustodyLimits {
+                    unreceived_productions: 1,
+                    publications: 2,
+                    residuals: 3,
+                    retained_payload_bytes: 4,
+                },
+                NonZeroUsize::new(7).unwrap(),
+                Duration::from_millis(25),
+            )
+            .unwrap()
+        };
+        let inputs =
+            FrontendNativeCapacityInputs::try_new(policy([4096, 1024, 1024, 1024, 1024]), config)
+                .unwrap()
+                .with_native_sources(&native)
+                .unwrap();
+        let captured = inputs
+            .capture_sources(&workload, result, &blocking.executor(), &internal.runtime())
+            .unwrap();
+        let wrong_pool = FrontendNativeCapacityInputs::try_new(
+            policy([4096, 1024, 1024, 1024, 1024]),
+            QueryBlockingExecutorConfig::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+            ),
+        )
+        .unwrap();
+        let pool_refused = matches!(
+            wrong_pool.capture_sources(
+                &workload,
+                result,
+                &blocking.executor(),
+                &internal.runtime()
+            ),
+            Err(WorkError::InvalidConfig("frontend actual source geometry"))
+        );
+        let wrong_inventory =
+            FrontendNativeCapacityInputs::try_new(policy([4, 1, 1, 1, 1]), config).unwrap();
+        let inventory_refused = matches!(
+            wrong_inventory.with_native_sources(&native),
+            Err(WorkError::InvalidConfig(
+                "frontend actual subscription inventory"
+            ))
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        internal.shutdown_until(deadline).await.unwrap();
+        blocking.shutdown_until(deadline).await.unwrap();
+        control.owner.close_admission();
+        control.owner.shutdown().unwrap_or_else(|failure| {
+            panic!(
+                "empty capacity-capture workload did not close: {}",
+                failure.error()
+            )
+        });
+        assert_eq!(captured.query_blocking, config);
+        assert_eq!(captured.internal_cpu, result.internal_cpu_capacity());
+        assert_eq!(
+            captured.internal_action,
+            result.internal_cpu_action_quote().unwrap()
+        );
+        assert_eq!(
+            captured.native.unwrap().subscription_records,
+            workload.scope_records_limit
+        );
+        assert_eq!(
+            captured.native.unwrap().subscription_resident_bytes,
+            super::NativeSubscriptionOwner::resident_storage_bytes(workload.scope_records_limit)
+                .unwrap()
+        );
+        assert_eq!(
+            captured.native.unwrap().transport,
+            native.task_transport_supervisor().capacity_sources()
+        );
+        assert_eq!(
+            captured.native.unwrap().physical,
+            native.transport_admission().dimensions()
+        );
+        assert_eq!(
+            (
+                captured.native.unwrap().apply_records,
+                captured.native.unwrap().apply_resident_bytes
+            ),
+            native.apply_send_port.capacity_sources().unwrap()
+        );
+        assert_eq!(captured.logical_role,
+            novarocks_query_application::coordination::LogicalExecutionSupervisor::logical_role_poll_geometry().unwrap());
+        assert_eq!(captured.logical_root_custody,
+            novarocks_query_application::coordination::LogicalExecutionSupervisor::logical_root_custody_geometry());
+        assert!(pool_refused);
+        assert!(inventory_refused);
     }
 
     #[test]
