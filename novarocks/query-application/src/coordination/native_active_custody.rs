@@ -76,7 +76,45 @@ struct ActiveSlot {
     original_exit: Weak<super::original_exit::OriginalLogicalExit>,
     contexts: BTreeSet<QueryContextRef>,
     owner: Mutex<Option<ActiveSlotOwner>>,
+    convergence_failure: NativeConvergenceFailureSlot,
     root_ack: Mutex<RootAckTailState>,
+}
+
+/// The original slot receives the primary before the borrowed convergence
+/// future is destroyed. A later destructor panic cannot replace this source.
+#[derive(Default)]
+pub(crate) struct NativeConvergenceFailureSlot {
+    original: Mutex<Option<StatementNativeHealthFailure>>,
+}
+impl NativeConvergenceFailureSlot {
+    fn is_failed(&self) -> bool {
+        self.original
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+    fn failure(&self) -> Option<StatementNativeHealthFailure> {
+        self.original
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    fn retain(&self, failure: StatementNativeHealthFailure) {
+        let mut original = self.original.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(original.is_none(), "one original convergence failure");
+        *original = Some(failure);
+    }
+}
+
+/// A temporary alias of the SAME pre-reserved slot; no new allocation, owner
+/// or registry edge is introduced by observing its convergence source.
+pub(crate) struct NativeConvergenceFailureCustody {
+    slot: Arc<ActiveSlot>,
+}
+impl NativeConvergenceFailureCustody {
+    pub(crate) fn original(&self) -> &NativeConvergenceFailureSlot {
+        &self.slot.convergence_failure
+    }
 }
 type RootAckFuture = Pin<
     Box<
@@ -299,6 +337,7 @@ impl NativeActiveCustodyRegistry {
             original_exit,
             contexts: exact,
             owner: Mutex::new(None),
+            convergence_failure: NativeConvergenceFailureSlot::default(),
             root_ack: Mutex::new(RootAckTailState::default()),
         });
         slots.insert(key, Arc::clone(&slot));
@@ -361,6 +400,7 @@ impl NativeActiveCustodyRegistry {
             if slots
                 .get(&key)
                 .is_some_and(|current| Arc::ptr_eq(current, slot))
+                && slot.convergence_failure.failure().is_none()
                 && slot
                     .root_ack
                     .lock()
@@ -494,10 +534,16 @@ impl NativeActiveCustodyRegistry {
     }
     fn remove(&self, key: NativeActiveCustodyKey) {
         let removed = {
-            self.slots
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&key)
+            let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+            if slots
+                .get(&key)
+                .is_some_and(|slot| slot.convergence_failure.failure().is_some())
+            {
+                // Neither a later closure nor an empty owner field disposes
+                // this original failed source. Explicit process exit does.
+                return;
+            }
+            slots.remove(&key)
         };
         if let Some(removed) = removed {
             if let Some(source) = removed.original_exit.upgrade() {
@@ -526,6 +572,12 @@ impl NativeActiveCustodyRegistry {
             .range(NativeActiveCustodyKey::registration_lower_bound(initial, generation)..)
             .take_while(|(key, _)| key.initial == initial && key.generation == generation)
             .find_map(|(_, slot)| {
+                if let Some(failure) = slot.convergence_failure.failure() {
+                    return Some(QueryExecutionError::new(
+                        QueryExecutionErrorKind::Failed,
+                        failure.detail(),
+                    ));
+                }
                 slot.owner
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -775,6 +827,11 @@ impl fmt::Debug for SupervisedActiveNativeOwner {
     }
 }
 impl SupervisedActiveNativeOwner {
+    pub(crate) fn convergence_failure_custody(&self) -> NativeConvergenceFailureCustody {
+        NativeConvergenceFailureCustody {
+            slot: Arc::clone(&self.custody.slot),
+        }
+    }
     pub(crate) fn as_mut(&mut self) -> &mut dyn ActiveNativeAttemptOwner {
         self.owner
             .as_deref_mut()
@@ -846,6 +903,9 @@ impl SupervisedActiveNativeOwner {
         &mut self,
         closure: NativeActiveConvergenceClosure,
     ) -> Result<(), QueryExecutionError> {
+        if let Some(failure) = self.custody.slot.convergence_failure.failure() {
+            return Err(self.retain_unresolved(failure));
+        }
         let expected = self.custody.slot.contexts.clone();
         let (observed, count) = match &closure {
             NativeActiveConvergenceClosure::Evidence(
@@ -939,25 +999,75 @@ impl fmt::Display for NativeConvergencePanic {
 }
 impl std::error::Error for NativeConvergencePanic {}
 
-pub(crate) async fn catch_native_convergence_panic<F: std::future::Future>(
-    future: F,
-) -> Result<F::Output, StatementNativeHealthFailure> {
-    let mut future = Box::pin(future);
-    std::future::poll_fn(move |cx| {
+pub(crate) async fn catch_native_convergence_panic(
+    owner: &mut dyn ActiveNativeAttemptOwner,
+    request: NativeActiveConvergenceRequest,
+    original: &NativeConvergenceFailureSlot,
+) -> Result<
+    Result<NativeActiveConvergenceClosure, StatementNativeHealthFailure>,
+    StatementNativeHealthFailure,
+> {
+    if original.is_failed() {
+        // CancellationView::drop notifies the original workload authority and
+        // may invoke an external waker. Keep the primary solely in its stable
+        // slot until that notification has returned.
+        drop(request);
+        return Err(original.failure().expect("same failed convergence source"));
+    }
+    // Poll the actual trait future. An async wrapper would destroy that inner
+    // future before its Ready(Err) reaches our original receiving slot.
+    let mut future = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        owner.converge(request)
+    })) {
+        Ok(future) => future,
+        Err(payload) => {
+            original.retain(convergence_panic(payload));
+            return Err(original
+                .failure()
+                .expect("original constructor panic received"));
+        }
+    };
+    let outcome = std::future::poll_fn(|cx| {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx))) {
-            Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
+            Ok(std::task::Poll::Ready(Err(failure))) => {
+                original.retain(failure);
+                std::task::Poll::Ready(Err(false))
+            }
+            Ok(std::task::Poll::Ready(Ok(value))) => std::task::Poll::Ready(Ok(value)),
             Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
             Err(payload) => {
-                std::task::Poll::Ready(Err(StatementNativeHealthFailure::actual_exit_unproven(
-                    "active Native convergence panicked before actual local closure",
-                    Arc::new(NativeConvergencePanic {
-                        _payload: Mutex::new(payload),
-                    }),
-                )))
+                original.retain(convergence_panic(payload));
+                std::task::Poll::Ready(Err(true))
             }
         }
     })
-    .await
+    .await;
+    // Do not place a clone of the primary in an about-to-return async output
+    // before this foreign destructor. Its only cause stays in the original
+    // stable slot if Drop unwinds; the outer role retains the secondary.
+    drop(future);
+    match outcome {
+        Ok(value) => Ok(Ok(value)),
+        Err(panicked) => {
+            let failure = original
+                .failure()
+                .expect("original convergence failure received");
+            if panicked {
+                Err(failure)
+            } else {
+                Ok(Err(failure))
+            }
+        }
+    }
+}
+
+fn convergence_panic(payload: Box<dyn std::any::Any + Send>) -> StatementNativeHealthFailure {
+    StatementNativeHealthFailure::actual_exit_unproven(
+        "active Native convergence panicked before actual local closure",
+        Arc::new(NativeConvergencePanic {
+            _payload: Mutex::new(payload),
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -1011,6 +1121,7 @@ fn root_ack_test_fixture_in(
             root.backend_process_id(),
         )]),
         owner: Mutex::new(None),
+        convergence_failure: NativeConvergenceFailureSlot::default(),
         root_ack: Mutex::new(RootAckTailState::default()),
     });
     registry
@@ -1035,6 +1146,222 @@ fn root_ack_test_fixture_in(
 mod tests {
     use super::*;
     use novarocks_types::{BackendProcessId, FrontendProcessId};
+
+    #[derive(Debug)]
+    struct PrimaryConvergenceCause(Arc<std::sync::atomic::AtomicUsize>);
+    impl fmt::Display for PrimaryConvergenceCause {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("original convergence fixture cause")
+        }
+    }
+    impl std::error::Error for PrimaryConvergenceCause {}
+    impl Drop for PrimaryConvergenceCause {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    struct FailedConvergenceFuture {
+        reported: Option<StatementNativeHealthFailure>,
+        cause_drops: Arc<std::sync::atomic::AtomicUsize>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+        future_drops: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Future for FailedConvergenceFuture {
+        type Output = Result<NativeActiveConvergenceClosure, StatementNativeHealthFailure>;
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            this.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(failure) = this.reported.take() {
+                Poll::Ready(Err(failure))
+            } else {
+                std::panic::panic_any(PrimaryConvergenceCause(Arc::clone(&this.cause_drops)));
+            }
+        }
+    }
+    impl Drop for FailedConvergenceFuture {
+        fn drop(&mut self) {
+            self.future_drops
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("secondary convergence future destructor panic");
+        }
+    }
+
+    struct PanicOnceConvergenceWake(std::sync::atomic::AtomicBool);
+    impl Wake for PanicOnceConvergenceWake {
+        fn wake(self: Arc<Self>) {
+            if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                panic!("failed convergence request-drop notification panic");
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailedConvergenceOwner {
+        reported: bool,
+        cause_drops: Arc<std::sync::atomic::AtomicUsize>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+        future_drops: Arc<std::sync::atomic::AtomicUsize>,
+        factory_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ActiveNativeAttemptOwner for FailedConvergenceOwner {
+        fn run<'a>(
+            &'a mut self,
+            _: &'a crate::coordination::NativeAttemptDrive,
+            _: CancellationView,
+        ) -> crate::api::NativeAttemptRunFuture<'a> {
+            panic!("the convergence fixture must not run an attempt");
+        }
+        fn converge<'a>(
+            &'a mut self,
+            _: NativeActiveConvergenceRequest,
+        ) -> crate::api::NativeActiveAttemptConvergenceFuture<'a> {
+            self.factory_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let reported = self.reported.then(|| {
+                StatementNativeHealthFailure::actual_exit_unproven(
+                    "reported convergence fixture failure",
+                    Arc::new(PrimaryConvergenceCause(Arc::clone(&self.cause_drops))),
+                )
+            });
+            Box::pin(FailedConvergenceFuture {
+                reported,
+                cause_drops: Arc::clone(&self.cause_drops),
+                polls: Arc::clone(&self.polls),
+                future_drops: Arc::clone(&self.future_drops),
+            })
+        }
+    }
+
+    #[test]
+    fn original_convergence_cause_is_in_the_same_slot_before_future_drop_panics() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for reported_mode in [false, true] {
+            let (control, work, capacity, window) = tail_work();
+            let request = NativeActiveConvergenceRequest::new(
+                work.owner.scope().cancellation().unwrap(),
+                Instant::now(),
+            );
+            let (activation, root) = tail_identity(490 + i64::from(reported_mode));
+            let (owner, reservation) = root_ack_test_fixture(activation, root);
+            drop(reservation);
+            let cause_drops = Arc::new(AtomicUsize::new(0));
+            let polls = Arc::new(AtomicUsize::new(0));
+            let future_drops = Arc::new(AtomicUsize::new(0));
+            let factory_calls = Arc::new(AtomicUsize::new(0));
+            let mut actual = FailedConvergenceOwner {
+                reported: reported_mode,
+                cause_drops: Arc::clone(&cause_drops),
+                polls: Arc::clone(&polls),
+                future_drops: Arc::clone(&future_drops),
+                factory_calls: Arc::clone(&factory_calls),
+            };
+            let mut caught = Box::pin(catch_native_convergence_panic(
+                &mut actual,
+                request.clone(),
+                &owner.slot.convergence_failure,
+            ));
+            let secondary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                caught
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+            }))
+            .unwrap_err();
+            assert_eq!(
+                secondary.downcast_ref::<&str>(),
+                Some(&"secondary convergence future destructor panic")
+            );
+            drop(caught);
+            assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            assert_eq!(future_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(cause_drops.load(Ordering::SeqCst), 0);
+            let failure = owner.slot.convergence_failure.failure().unwrap();
+            let original_cause = failure.clone().into_parts().1;
+            if reported_mode {
+                assert!(original_cause.is::<PrimaryConvergenceCause>());
+            } else {
+                let panic = original_cause
+                    .downcast_ref::<NativeConvergencePanic>()
+                    .unwrap();
+                assert!(
+                    panic
+                        ._payload
+                        .lock()
+                        .unwrap()
+                        .is::<PrimaryConvergenceCause>()
+                );
+            }
+            // A failed source refuses before constructing another trait future.
+            let mut retry = Box::pin(catch_native_convergence_panic(
+                &mut actual,
+                request,
+                &owner.slot.convergence_failure,
+            ));
+            let Poll::Ready(Err(repeated)) =
+                retry.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            else {
+                panic!("the original failed source must refuse another poll");
+            };
+            assert!(std::ptr::eq(failure.cause(), repeated.cause()));
+            assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            assert_eq!(future_drops.load(Ordering::SeqCst), 1);
+            drop((retry, repeated, failure, original_cause));
+            // The failed-entry request has a real notifying CancellationView.
+            // No diagnostic alias retains the primary across that callback.
+            let request = NativeActiveConvergenceRequest::new(
+                work.owner.scope().cancellation().unwrap(),
+                Instant::now(),
+            );
+            let wake = Waker::from(Arc::new(PanicOnceConvergenceWake(
+                std::sync::atomic::AtomicBool::new(true),
+            )));
+            let mut progress = Box::pin(control.wait_progress(control.progress_revision()));
+            assert!(
+                progress
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&wake))
+                    .is_pending()
+            );
+            let mut rejected = Box::pin(catch_native_convergence_panic(
+                &mut actual,
+                request,
+                &owner.slot.convergence_failure,
+            ));
+            let notification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rejected
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+            }))
+            .unwrap_err();
+            assert_eq!(
+                notification.downcast_ref::<&str>(),
+                Some(&"failed convergence request-drop notification panic")
+            );
+            drop((rejected, notification, progress));
+            assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            assert_eq!(future_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(cause_drops.load(Ordering::SeqCst), 0);
+            owner.close_native();
+            assert!(owner.retained());
+            assert!(
+                owner
+                    .registry
+                    .registration_health(owner.key.initial, owner.key.generation)
+                    .is_some()
+            );
+            assert_eq!(cause_drops.load(Ordering::SeqCst), 0);
+            owner.registry.abandon_for_process_exit();
+            assert_eq!(cause_drops.load(Ordering::SeqCst), 0);
+            drop(owner);
+            assert_eq!(cause_drops.load(Ordering::SeqCst), 1);
+            drop((window, capacity, actual));
+            work.owner.complete();
+            work.business.release();
+        }
+    }
 
     fn execution(high: i64, low: i64, attempt: u64) -> QueryExecutionId {
         QueryExecutionId::new(QueryId::new(high, low), AttemptId::new(attempt).unwrap()).unwrap()
@@ -1403,6 +1730,7 @@ mod tests {
                             BackendProcessId::new_v7(),
                         )]),
                         owner: Mutex::new(held),
+                        convergence_failure: NativeConvergenceFailureSlot::default(),
                         root_ack: Mutex::new(RootAckTailState::default()),
                     }),
                 );
@@ -1514,6 +1842,7 @@ mod tests {
                             BackendProcessId::new_v7(),
                         )]),
                         owner: Mutex::new(None),
+                        convergence_failure: NativeConvergenceFailureSlot::default(),
                         root_ack: Mutex::new(RootAckTailState::default()),
                     }),
                 );

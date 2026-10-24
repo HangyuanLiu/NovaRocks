@@ -3305,8 +3305,15 @@ async fn converge_supervised_active(
     cleanup_timeout: Duration,
 ) -> ActiveAttemptConvergence {
     let request = owner.request(cancellation, cleanup_timeout);
-    let (outcome, deadline) =
-        converge_active_request(owner.as_mut(), request, shutdown, requester).await;
+    let failure_custody = owner.convergence_failure_custody();
+    let (outcome, deadline) = converge_active_request(
+        owner.as_mut(),
+        request,
+        shutdown,
+        requester,
+        failure_custody.original(),
+    )
+    .await;
     owner.shorten_remote_deadline(deadline);
     let result = match outcome {
         ActiveAttemptConvergence::Evidence(evidence) => {
@@ -3335,11 +3342,13 @@ async fn converge_active(
     requester: &novarocks_workload_control::WorkCancellationRequester,
     cleanup_timeout: Duration,
 ) -> ActiveAttemptConvergence {
+    let original = super::NativeConvergenceFailureSlot::default();
     converge_active_request(
         owner,
         NativeActiveConvergenceRequest::new(cancellation, Instant::now() + cleanup_timeout),
         shutdown,
         requester,
+        &original,
     )
     .await
     .0
@@ -3350,6 +3359,7 @@ async fn converge_active_request(
     request: NativeActiveConvergenceRequest,
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
+    original: &super::NativeConvergenceFailureSlot,
 ) -> (ActiveAttemptConvergence, Instant) {
     let mut deadline = request.remote_observation_deadline();
     let mut shutdown_cut = false;
@@ -3370,15 +3380,13 @@ async fn converge_active_request(
         }
         let turn_deadline = deadline;
         let turn = {
-            let convergence = super::catch_native_convergence_panic(async {
-                owner
-                    .converge(
-                        request
-                            .clone()
-                            .with_remote_observation_deadline(turn_deadline),
-                    )
-                    .await
-            });
+            let convergence = super::catch_native_convergence_panic(
+                owner,
+                request
+                    .clone()
+                    .with_remote_observation_deadline(turn_deadline),
+                original,
+            );
             tokio::pin!(convergence);
             tokio::select! {
                 result = &mut convergence => Turn::Closed(result),
