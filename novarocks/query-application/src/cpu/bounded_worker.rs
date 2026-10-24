@@ -209,7 +209,7 @@ pub enum WorkerActualExitFailure {
     FailedUnproven,
 }
 impl BoundedWorkerActualExit {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             phase: AtomicU8::new(0),
             observer: Mutex::new(ActualExitObserver {
@@ -249,7 +249,7 @@ impl BoundedWorkerActualExit {
             .failure
             .clone()
     }
-    fn publish(
+    pub(super) fn publish(
         &self,
         phase: u8,
         failure: Option<&BoundedWorkerError>,

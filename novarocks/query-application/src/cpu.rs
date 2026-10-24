@@ -33,8 +33,13 @@ use tokio::sync::oneshot;
 use crate::cancellation::{QueryCancellationReason, QueryCancellationView};
 
 pub(crate) mod bounded_worker;
+mod preserving_cpu;
 use bounded_worker::{
     BoundedWorkerConfig, BoundedWorkerHandle, BoundedWorkerJob, BoundedWorkerOwner,
+};
+pub use preserving_cpu::{
+    QueryCpuPrepareRefusal, QueryCpuPreparedJob, QueryCpuPreservingGeometry,
+    QueryCpuPublishRefusal, QueryCpuReceipt,
 };
 
 type CpuResult = Box<dyn Any + Send>;
@@ -159,9 +164,12 @@ pub struct QueryCpuExecutor {
 
 type WorkerId = u64;
 
-struct ElasticPlanningJob {
-    run: Box<dyn FnOnce() -> CpuResult + Send>,
-    result: oneshot::Sender<Result<CpuResult, String>>,
+enum ElasticPlanningJob {
+    Legacy {
+        run: Box<dyn FnOnce() -> CpuResult + Send>,
+        result: oneshot::Sender<Result<CpuResult, String>>,
+    },
+    Preserving(Arc<preserving_cpu::CpuWork>),
 }
 
 enum WorkerCommand {
@@ -175,6 +183,7 @@ enum ElasticWorkerState {
     Idle(Sender<WorkerCommand>),
     Assigned,
     Retiring,
+    Failed(Arc<preserving_cpu::CpuWork>),
 }
 
 struct ElasticPlanningPoolState {
@@ -233,38 +242,11 @@ impl ElasticPlanningPool {
     ) -> Result<oneshot::Receiver<Result<CpuResult, String>>, String> {
         self.reap_finished();
         let (result, receipt) = oneshot::channel();
-        let job = ElasticPlanningJob {
+        let job = ElasticPlanningJob::Legacy {
             run: Box::new(run),
             result,
         };
-        let assignment = {
-            let mut state = self.state.lock().unwrap();
-            if !state.accepting {
-                return Err("query CPU executor closed before admitting work".to_owned());
-            }
-            if let Some((id, sender)) = state.workers.iter().find_map(|(&id, worker)| {
-                matches!(worker, ElasticWorkerState::Idle(_)).then(|| match worker {
-                    ElasticWorkerState::Idle(sender) => (id, sender.clone()),
-                    _ => unreachable!(),
-                })
-            }) {
-                state.workers.insert(id, ElasticWorkerState::Assigned);
-                ElasticAssignment::Idle { id, sender }
-            } else {
-                let id = state
-                    .next_worker_id
-                    .checked_add(1)
-                    .ok_or_else(|| "query CPU worker id overflow".to_owned())?;
-                let unjoined_starts = state
-                    .unjoined_starts
-                    .checked_add(1)
-                    .ok_or_else(|| "query CPU worker join obligation count overflow".to_owned())?;
-                state.next_worker_id = id;
-                state.unjoined_starts = unjoined_starts;
-                state.workers.insert(id, ElasticWorkerState::Starting);
-                ElasticAssignment::Start { id }
-            }
-        };
+        let assignment = self.assign_worker().map_err(|error| error.to_string())?;
         match assignment {
             ElasticAssignment::Idle { id, sender } => match sender.send(WorkerCommand::Run(job)) {
                 Ok(()) => Ok(receipt),
@@ -273,7 +255,10 @@ impl ElasticPlanningPool {
                     let WorkerCommand::Run(job) = error.0 else {
                         unreachable!("only a job is assigned to an idle worker")
                     };
-                    let _ = job.result.send(Err(
+                    let ElasticPlanningJob::Legacy { result, .. } = job else {
+                        unreachable!("legacy submission keeps its original receipt")
+                    };
+                    let _ = result.send(Err(
                         "query CPU worker exited before accepting work".to_owned()
                     ));
                     Ok(receipt)
@@ -313,6 +298,37 @@ impl ElasticPlanningPool {
         }
     }
 
+    fn assign_worker(&self) -> Result<ElasticAssignment, ElasticAssignmentError> {
+        Ok({
+            let mut state = self.state.lock().unwrap();
+            if !state.accepting {
+                return Err(ElasticAssignmentError::Closed);
+            }
+            if let Some((id, sender)) = state.workers.iter().find_map(|(&id, worker)| {
+                matches!(worker, ElasticWorkerState::Idle(_)).then(|| match worker {
+                    ElasticWorkerState::Idle(sender) => (id, sender.clone()),
+                    _ => unreachable!(),
+                })
+            }) {
+                state.workers.insert(id, ElasticWorkerState::Assigned);
+                ElasticAssignment::Idle { id, sender }
+            } else {
+                let id = state
+                    .next_worker_id
+                    .checked_add(1)
+                    .ok_or(ElasticAssignmentError::WorkerIdOverflow)?;
+                let unjoined_starts = state
+                    .unjoined_starts
+                    .checked_add(1)
+                    .ok_or(ElasticAssignmentError::JoinCountOverflow)?;
+                state.next_worker_id = id;
+                state.unjoined_starts = unjoined_starts;
+                state.workers.insert(id, ElasticWorkerState::Starting);
+                ElasticAssignment::Start { id }
+            }
+        })
+    }
+
     fn request_close(&self) {
         let senders = {
             let mut state = self.state.lock().unwrap();
@@ -341,7 +357,12 @@ impl ElasticPlanningPool {
             self.reap_finished();
             let drained = {
                 let state = self.state.lock().unwrap();
-                state.unjoined_starts == 0 && state.joins.is_empty()
+                state.unjoined_starts == 0
+                    && state.joins.is_empty()
+                    && !state
+                        .workers
+                        .values()
+                        .any(|worker| matches!(worker, ElasticWorkerState::Failed(_)))
             };
             if drained {
                 return Ok(());
@@ -403,6 +424,23 @@ impl ElasticPlanningPool {
     }
 }
 
+#[derive(Debug)]
+enum ElasticAssignmentError {
+    Closed,
+    WorkerIdOverflow,
+    JoinCountOverflow,
+}
+
+impl std::fmt::Display for ElasticAssignmentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Closed => "query CPU executor closed before admitting work",
+            Self::WorkerIdOverflow => "query CPU worker id overflow",
+            Self::JoinCountOverflow => "query CPU worker join obligation count overflow",
+        })
+    }
+}
+
 enum ElasticAssignment {
     Idle {
         id: WorkerId,
@@ -439,16 +477,27 @@ fn worker_loop(
             };
             *worker = ElasticWorkerState::Running;
         }
-        let output = catch_unwind(AssertUnwindSafe(job.run));
-        let panicked = output.is_err();
-        let output = output.map_err(|_| "query CPU worker panicked".to_owned());
-        let _ = job.result.send(output);
+        let preserving = match job {
+            ElasticPlanningJob::Legacy { run, result } => {
+                let output = catch_unwind(AssertUnwindSafe(run));
+                let panicked = output.is_err();
+                let output = output.map_err(|_| "query CPU worker panicked".to_owned());
+                let _ = result.send(output);
+                if panicked {
+                    pool.state.lock().unwrap().workers.remove(&id);
+                    return;
+                }
+                None
+            }
+            ElasticPlanningJob::Preserving(work) => {
+                work.run(&pool, id);
+                Some(work)
+            }
+        };
 
-        if panicked {
-            pool.state.lock().unwrap().workers.remove(&id);
-            return;
+        if let Some(work) = &preserving {
+            work.finish_custody(&pool, id);
         }
-
         let should_retire = {
             let mut state = pool.state.lock().unwrap();
             if !state.accepting {
@@ -461,6 +510,11 @@ fn worker_loop(
                 false
             }
         };
+        // The call, captures and undelivered outcome are gone and this
+        // original worker is no longer Running before foreign exit wake.
+        if let Some(work) = preserving {
+            work.publish_exit(&pool, id);
+        }
         if should_retire {
             return;
         }
