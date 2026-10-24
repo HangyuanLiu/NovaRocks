@@ -23,7 +23,10 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+fn fixture_with_productions(
+    changes: usize,
+    production: bool,
+) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     let count = 8;
     let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 2, 2, &[]);
     let mut config = JointCapacityConfig {
@@ -35,13 +38,18 @@ fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
         max_registered_dependencies: (4 * 16 + 2 * 8 * 2 * 4 + 2 * 4 + 1) * 4,
         max_claims: 16,
         max_requests: 16,
-        max_changes_per_request: 4,
+        max_changes_per_request: changes,
         max_snapshot_bytes: 16 * 1024 * 1024,
         max_scratch_bytes: 16 * 1024 * 1024,
         max_residual_arcs: 10000,
         max_total_proof_work: 10000000,
         work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
     };
+    config.max_registered_dependencies =
+        crate::joint_admission::ledger::metadata_geometry::maximum_fact_roots(&config, count * 2)
+            .unwrap()
+            .checked_mul(config.max_dependencies_per_claim)
+            .unwrap();
     let base = storage.base_charge(&config).unwrap();
     let m = base.get(JointResource::MetadataBytes);
     let custody = JointResourceLimits {
@@ -50,13 +58,15 @@ fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
             .with(JointResource::ClaimRecords, 12)
             .with(JointResource::MetadataBytes, m * 16)
             .with(JointResource::PayloadBytes, 64)
-            .with(JointResource::UnreceivedProductions, 1),
+            .with(JointResource::UnreceivedProductions, 1)
+            .with(JointResource::Publications, u64::from(production)),
         per_dependency: JointResources::ZERO
             .with(JointResource::ScopeRecords, 7)
             .with(JointResource::ClaimRecords, 12)
             .with(JointResource::MetadataBytes, m * 8)
             .with(JointResource::PayloadBytes, 64)
-            .with(JointResource::UnreceivedProductions, 1),
+            .with(JointResource::UnreceivedProductions, 1)
+            .with(JointResource::Publications, u64::from(production)),
         protected_progress: base,
     };
     let foreground = JointResourceLimits {
@@ -201,7 +211,21 @@ fn setup(
     WorkOwner,
     Option<RetainedPayloadGrant>,
 ) {
-    let (control, handle, mut driver) = fixture();
+    setup_with_production(unbound_stage, 4, false)
+}
+fn setup_with_production(
+    unbound_stage: bool,
+    changes: usize,
+    production: bool,
+) -> (
+    WorkloadControl,
+    JointAdmissionHandle,
+    JointProgressDriver,
+    crate::RootWork,
+    WorkOwner,
+    Option<RetainedPayloadGrant>,
+) {
+    let (control, handle, mut driver) = fixture_with_productions(changes, production);
     let work = root(&control);
     // Exercise the existing empty-base child only while its parent is empty.
     // Neither branch starts a stage or makes an I/O/execution claim.
@@ -588,4 +612,83 @@ fn complete_finite_refusal_keeps_root_payload_and_existing_compute_without_parti
     work.business.release();
     work.owner.complete();
     drive(&mut driver);
+}
+
+#[test]
+fn root_stage_original_batch_also_installs_its_roots_unknown_production_domains() {
+    let (control, _, mut driver, work, stage, payload) = setup_with_production(false, 5, true);
+    let payload = payload.unwrap();
+    let scope = work.owner.scope();
+    let origin: Arc<dyn Send + Sync> = Arc::new(());
+    let quote = UnreceivedProductionQuote::new(
+        std::num::NonZeroU64::new(1).unwrap(),
+        std::num::NonZeroUsize::new(8).unwrap(),
+    )
+    .unwrap();
+    let mut pending = scope
+        .begin_unreceived_productions(Arc::downgrade(&origin), quote)
+        .unwrap();
+    drive(&mut driver);
+    let mut production_ready =
+        match Pin::new(&mut pending).poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(ready)) => ready,
+            _ => panic!("actual production Ready"),
+        };
+    let mut facts = Some(vec![45; 8].into_boxed_slice());
+    let mut production = None;
+    production_ready
+        .register_in(&mut facts, &mut production)
+        .unwrap()
+        .notify();
+    drop((production_ready, pending));
+    let source = payload.root_stage_source(&scope, &stage).unwrap();
+    assert_eq!(source.required_change_records().unwrap(), 5);
+    drop(source);
+    let mut admission = batch(&payload, &work, &stage, 4);
+    drive(&mut driver);
+    let mut reply = ready(&mut admission);
+    assert!(matches!(
+        production.as_ref().unwrap().check_receive(),
+        Err(WorkError::Conflict)
+    ));
+    let mut compute = None;
+    reply
+        .install_in(&scope, &payload, &stage, &mut compute)
+        .unwrap()
+        .notify();
+    {
+        let state = scope.inner.state.lock().unwrap();
+        let row = state
+            .joint
+            .as_ref()
+            .unwrap()
+            .claims
+            .values()
+            .find(|row| {
+                row.owner == ClaimOwner::PhysicalWork(scope.id)
+                    && matches!(row.custody, ClaimCustody::Production { .. })
+            })
+            .unwrap();
+        assert_eq!(
+            row.active_facts.dependencies.len(),
+            3,
+            "a/b/c follow the complete control union, not narrow payload a/b"
+        );
+        assert_eq!(row.amounts, row.active_amounts);
+        assert!(row.pending.is_none());
+    }
+    production.as_ref().unwrap().receive_in().unwrap().notify();
+    production
+        .as_ref()
+        .unwrap()
+        .owner()
+        .settle_received_in()
+        .unwrap()
+        .notify();
+    drop((production, reply, admission, compute, payload));
+    stage.complete();
+    work.business.release();
+    work.owner.complete();
+    drive(&mut driver);
+    assert_eq!(capacity(&control, JointResource::Computations), 0);
 }

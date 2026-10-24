@@ -28,14 +28,15 @@ mod protection;
 
 pub use driver::{JointProgress, JointProgressDriver};
 pub use ledger::{
-    ControlBindingProposal, InternalComputationAlias, InternalComputationGrant,
-    InternalCpuActionAdmission, InternalCpuActionSource, InternalCpuFactoryBinding,
-    InternalResultClosedFactoryDescriptor, JointAdjustmentReceipt, JointAdmission,
-    JointAdmissionFailure, JointAdmissionHandle, JointClaim, JointClaimView, JointGrantedBatch,
-    JointGrantedClaims, JointLocalGrant, JointLocalOffer, JointProposal, RetainedPayloadAlias,
-    RetainedPayloadGrant, RootStageAdmission, RootStageProposal, RootStageReady, RootStageSource,
-    UnreceivedProductionAdmission, UnreceivedProductionGrant, UnreceivedProductionOwner,
-    UnreceivedProductionQuote, UnreceivedProductionReady,
+    BlockingActionAdmission, BlockingActionSource, ControlBindingProposal,
+    InternalComputationAlias, InternalComputationGrant, InternalCpuActionAdmission,
+    InternalCpuActionSource, InternalCpuFactoryBinding, InternalResultClosedFactoryDescriptor,
+    JointAdjustmentReceipt, JointAdmission, JointAdmissionFailure, JointAdmissionHandle,
+    JointClaim, JointClaimView, JointGrantedBatch, JointGrantedClaims, JointLocalGrant,
+    JointLocalOffer, JointProposal, RetainedPayloadAlias, RetainedPayloadGrant, RootStageAdmission,
+    RootStageProposal, RootStageReady, RootStageSource, UnreceivedProductionAdmission,
+    UnreceivedProductionGrant, UnreceivedProductionOwner, UnreceivedProductionQuote,
+    UnreceivedProductionReady,
 };
 #[cfg(test)]
 pub use ledger::{JointClaimChange, JointDependency};

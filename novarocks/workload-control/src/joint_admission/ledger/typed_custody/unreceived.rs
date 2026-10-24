@@ -354,7 +354,8 @@ impl UnreceivedProductionOwner {
             let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
             if ledger.claims.values().any(|row| {
                 row.production.as_ref().is_some_and(|record| {
-                    record.phase == Phase::Unknown && Weak::ptr_eq(&record.origin, &self.origin)
+                    Weak::ptr_eq(&record.origin, &self.origin)
+                        && (record.phase == Phase::Unknown || row.pending.is_some())
                 })
             }) {
                 return Err(WorkError::Conflict);

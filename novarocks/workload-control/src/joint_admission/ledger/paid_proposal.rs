@@ -22,12 +22,17 @@ use super::*;
 use crate::scope::ReclaimWakeOnExit;
 
 use novarocks_resource_contract::SelectedNetworkOrigin;
+mod blocking_action;
+pub use blocking_action::{BlockingActionAdmission, BlockingActionSource};
+pub(super) use blocking_action::{BlockingActionFence, validate_blocking_action};
 mod cpu_action;
 pub(super) use cpu_action::{CpuActionFence, capture as capture_cpu_action, validate_cpu_action};
 pub use cpu_action::{
     InternalCpuActionAdmission, InternalCpuActionSource, InternalCpuFactoryBinding,
     InternalResultClosedFactoryDescriptor,
 };
+mod production_growth;
+pub(super) use production_growth::{production_change_count, validate_control_productions};
 mod root_stage;
 pub(super) use root_stage::validate_root_stage;
 pub use root_stage::{RootStageAdmission, RootStageProposal, RootStageReady, RootStageSource};
@@ -85,6 +90,7 @@ struct PendingChange {
 pub struct JointProposal {
     root_stage: Option<RootStageFence>,
     cpu_action: Option<CpuActionFence>,
+    blocking_action: Option<BlockingActionFence>,
     records: Vec<ChangeRecord>,
     current: Option<PendingChange>,
     custody: Option<ProposalConstruction>,
@@ -125,6 +131,7 @@ impl JointAdmissionHandle {
         let mut proposal = JointProposal {
             root_stage: None,
             cpu_action: None,
+            blocking_action: None,
             records: Vec::new(),
             current: None,
             custody: Some(custody),
@@ -461,6 +468,7 @@ impl JointProposal {
             if self.current.is_some() || self.records.is_empty() {
                 return Err(WorkError::Conflict);
             }
+            self.append_control_productions()?;
             let handle = JointAdmissionHandle {
                 inner: Arc::clone(&self.scope.inner),
             };
@@ -472,6 +480,7 @@ impl JointProposal {
                 PreparedRequest {
                     root_stage: self.root_stage,
                     cpu_action: self.cpu_action,
+                    blocking_action: self.blocking_action,
                     budget: RequestBudget::Finite { remaining: limit },
                     changes,
                     custody: self.custody.take(),

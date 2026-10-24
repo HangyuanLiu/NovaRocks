@@ -51,7 +51,8 @@ impl ControlBindingProposal {
     ) -> Result<(), WorkError> {
         self.proposal.push_selected_network(selected)
     }
-    /// Exactly one control change was opened by the original constructor.
+    /// Finish the original control change. Its exact existing production rows
+    /// follow the complete dependency union in this same paid batch at submit.
     /// Repeated end or a push after end poisons the original proposal.
     pub fn end_change(&mut self) -> Result<(), WorkError> {
         self.proposal.end_change()
@@ -114,9 +115,17 @@ pub(super) fn validate_control_binding_shape(
     changes: &[ChangeRecord],
 ) -> Result<(), WorkError> {
     validate_active_control_node(state, scope)?;
-    if changes.len() != 1 {
+    if changes.is_empty()
+        || changes.iter().skip(1).any(|change| {
+            change
+                .source
+                .as_ref()
+                .is_none_or(|source| !matches!(source.source, ClaimSource::Production { .. }))
+        })
+    {
         return Err(WorkError::Conflict);
     }
+    validate_control_productions(state, changes)?;
     let change = &changes[0];
     let source = change.source.as_ref().ok_or(WorkError::Conflict)?;
     let ClaimSource::NodeControl { work, slot, .. } = source.source else {
@@ -154,7 +163,7 @@ pub(super) fn validate_control_binding_shape(
 }
 
 impl JointAdjustmentReceipt {
-    /// Silently install exactly one original NodeControl change while borrowing
+    /// Silently install the original NodeControl and all its production D while borrowing
     /// its non-owning scope. Failure keeps this same receipt armed; success
     /// disarms it before returning a token. Notify only after the caller's
     /// original phase is stable and every receiver/State lock has exited.

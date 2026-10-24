@@ -48,7 +48,11 @@ mod dependency_storage;
 mod metadata_geometry;
 mod paid_proposal;
 pub(crate) mod retained_claim;
-use paid_proposal::{CpuActionFence, validate_cpu_action, validate_root_stage};
+pub use paid_proposal::{BlockingActionAdmission, BlockingActionSource};
+use paid_proposal::{
+    BlockingActionFence, CpuActionFence, production_change_count, validate_blocking_action,
+    validate_control_productions, validate_cpu_action, validate_root_stage,
+};
 pub use paid_proposal::{
     InternalCpuActionAdmission, InternalCpuActionSource, InternalCpuFactoryBinding,
     InternalResultClosedFactoryDescriptor,
@@ -147,6 +151,10 @@ pub(super) struct ClaimRecord {
 #[derive(Clone, Copy)]
 enum ClaimSource {
     Physical,
+    Production {
+        work: WorkId,
+        epoch: u64,
+    },
     Payload {
         epoch: u64,
     },
@@ -243,6 +251,7 @@ pub(super) struct RequestRecord {
     // Restricted by closed original sources, never caller-supplied identities.
     root_stage: Option<RootStageFence>,
     cpu_action: Option<CpuActionFence>,
+    blocking_action: Option<BlockingActionFence>,
     pub(super) budget: RequestBudget,
     pub(super) owner: WorkId,
     pub(super) changes: ChangeBody,
@@ -559,6 +568,7 @@ impl JointAdmissionHandle {
         Ok(PreparedRequest {
             root_stage: None,
             cpu_action: None,
+            blocking_action: None,
             budget: RequestBudget::Finite {
                 remaining: work_limit,
             },
@@ -714,6 +724,7 @@ impl JointAdmissionHandle {
         Ok(PreparedRequest {
             root_stage: None,
             cpu_action: None,
+            blocking_action: None,
             // A resident control rekey uses one cumulative finite proof,
             // including later full-domain extensions. It cannot self-park.
             budget: if records.iter().any(|record| {
@@ -759,8 +770,12 @@ impl JointAdmissionHandle {
             id: None,
         };
         self.inner.update(|state| {
+            validate_control_productions(state, records)?;
             if control_only {
                 validate_control_binding_shape(state, scope, records)?;
+            }
+            if let Some(fence) = prepared.blocking_action {
+                validate_blocking_action(state, scope.id, fence, records)?;
             }
             if let Some(fence) = prepared.cpu_action {
                 validate_cpu_action(state, scope.id, fence, records)?;
@@ -842,6 +857,7 @@ impl JointAdmissionHandle {
                 RequestRecord {
                     root_stage: prepared.root_stage,
                     cpu_action: prepared.cpu_action,
+                    blocking_action: prepared.blocking_action,
                     budget: match prepared.budget {
                         RequestBudget::Finite { remaining } => RequestBudget::Finite {
                             remaining: remaining.min(ledger.config.config.max_total_proof_work),
@@ -870,6 +886,7 @@ impl JointAdmissionHandle {
 pub(super) struct PreparedRequest {
     root_stage: Option<RootStageFence>,
     cpu_action: Option<CpuActionFence>,
+    blocking_action: Option<BlockingActionFence>,
     budget: RequestBudget,
     scope: WorkScope,
     changes: ChangeBody,
@@ -912,12 +929,19 @@ impl JointClaimChange {
 }
 fn source_work(root: WorkId, fence: Option<RootStageFence>, source: &JointClaimView) -> WorkId {
     match (fence, source.source) {
-        (Some(fence), ClaimSource::NodeControl { work, .. }) if work == fence.stage => fence.stage,
+        (
+            Some(fence),
+            ClaimSource::NodeControl { work, .. } | ClaimSource::Production { work, .. },
+        ) if work == fence.stage => fence.stage,
         _ => root,
     }
 }
 fn authenticate(record: &ClaimRecord, source: &JointClaimView) -> Result<(), WorkError> {
     let custody = match (source.source, record.custody) {
+        (ClaimSource::Production { epoch, .. }, ClaimCustody::Production { epoch: original }) => {
+            epoch == original && record.production.is_some()
+        }
+        (ClaimSource::Production { .. }, _) => false,
         (
             ClaimSource::Payload { epoch },
             ClaimCustody::Payload {
@@ -983,6 +1007,11 @@ fn authenticate_scope(
     match source.source {
         ClaimSource::Physical | ClaimSource::Payload { .. }
             if record.owner == ClaimOwner::PhysicalWork(work) =>
+        {
+            Ok(())
+        }
+        ClaimSource::Production { work: original, .. }
+            if original == work && record.owner == ClaimOwner::PhysicalWork(work) =>
         {
             Ok(())
         }
@@ -1052,6 +1081,10 @@ pub(super) fn validate_waiting(
     let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
     let request = ledger.requests.get(&id).ok_or(WorkError::Released)?;
     let work = request.owner;
+    validate_control_productions(state, changes)?;
+    if let Some(fence) = request.blocking_action {
+        validate_blocking_action(state, work, fence, changes)?;
+    }
     if let Some(fence) = request.cpu_action {
         validate_cpu_action(state, work, fence, changes)?;
     }
@@ -1877,6 +1910,9 @@ impl JointAdmission {
                     return Err(WorkError::Conflict);
                 }
             }
+            if let Some(fence) = request.blocking_action {
+                validate_blocking_action(state, request.owner, fence, &request.changes)?;
+            }
             if let Some(fence) = request.cpu_action {
                 validate_cpu_action(state, request.owner, fence, &request.changes)?;
             }
@@ -2047,6 +2083,9 @@ impl JointLocalOffer<'_> {
             }
             if let Some(error) = failure {
                 return Err(error.clone());
+            }
+            if let Some(fence) = request.blocking_action {
+                validate_blocking_action(state, request.owner, fence, &request.changes)?;
             }
             if let Some(fence) = request.cpu_action {
                 validate_cpu_action(state, request.owner, fence, &request.changes)?;
@@ -2319,6 +2358,7 @@ impl JointAdjustmentReceipt {
             return Err(WorkError::Closed);
         }
         let changes = request.changes.clone();
+        validate_control_productions(state, &changes)?;
         if control_only {
             let scope = control_scope.ok_or(WorkError::Conflict)?;
             if request.owner != scope.id {
@@ -2369,6 +2409,11 @@ impl JointAdjustmentReceipt {
                         return Err(WorkError::Conflict);
                     }
                 }
+                ClaimSource::Production { work, .. } => {
+                    if control_scope.is_none_or(|scope| scope.id != work || work != request.owner) {
+                        return Err(WorkError::Conflict);
+                    }
+                }
                 ClaimSource::PoolFree { .. } | ClaimSource::Payload { .. } => {
                     return Err(WorkError::Conflict);
                 }
@@ -2377,7 +2422,10 @@ impl JointAdjustmentReceipt {
             if record.pending != Some(id) {
                 return Err(WorkError::Conflict);
             }
-            if matches!(source.source, ClaimSource::NodeControl { .. }) {
+            if matches!(
+                source.source,
+                ClaimSource::NodeControl { .. } | ClaimSource::Production { .. }
+            ) {
                 // The exact pending ticket excludes another control grant,
                 // and control partial release is not exposed. Its sole
                 // intervening structural change is this original grant.

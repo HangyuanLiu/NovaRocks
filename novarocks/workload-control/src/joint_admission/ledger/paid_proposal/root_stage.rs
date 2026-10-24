@@ -131,6 +131,14 @@ impl RetainedPayloadGrant {
     }
 }
 impl RootStageSource {
+    /// Actual current originals in this closed action, including every
+    /// production row of both exact works. This is a fact, not maxL policy.
+    pub fn required_change_records(&self) -> Result<usize, WorkError> {
+        let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
+        let state = inner.state.lock().unwrap();
+        validate_nodes(&state, self.root, self.fence.stage)?;
+        production_change_count(&state, &[self.root, self.fence.stage], 4)
+    }
     /// Reserve the Root's original proposal cell before body allocation. Only
     /// PayloadBytes can grow here; no CPU/queue/physical geometry is guessed.
     pub fn begin(
@@ -150,7 +158,7 @@ impl RootStageSource {
             inner: Arc::clone(&inner),
         };
         let mut proposal = handle.begin_paid_proposal_for_scope(root)?;
-        if proposal.config.config.max_changes_per_request < 4 {
+        if proposal.config.config.max_changes_per_request < self.required_change_records()? {
             return Err(WorkError::Capacity("Root/stage paid batch backing"));
         }
         let stage_facts = {
@@ -356,9 +364,17 @@ pub(in crate::joint_admission::ledger) fn validate_root_stage(
     changes: &[ChangeRecord],
 ) -> Result<(), WorkError> {
     validate_nodes(state, root, fence.stage)?;
-    if changes.len() != 4 {
+    if changes.len() < 4
+        || changes.iter().skip(4).any(|change| {
+            change
+                .source
+                .as_ref()
+                .is_none_or(|source| !matches!(source.source, ClaimSource::Production { .. }))
+        })
+    {
         return Err(WorkError::Conflict);
     }
+    validate_control_productions(state, changes)?;
     let ledger = state.joint.as_ref().unwrap();
     let class = state.nodes[&root].class;
     let payload = &changes[0];
@@ -505,7 +521,7 @@ impl RootStageReady {
             }
             let changes = request.changes.clone();
             validate_root_stage(state, root.id, fence, &changes)?;
-            for change in changes.iter().take(3) {
+            for change in changes.iter().filter(|change| change.old.is_some()) {
                 let source = change.source.as_ref().unwrap();
                 let row = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
                 let mut committed = source.clone();
@@ -549,7 +565,7 @@ impl RootStageReady {
             }
             // All fallible checks precede the first move. No callbacks, raw
             // aliases or old pin changes occur during this original commit.
-            for change in changes.iter().take(3) {
+            for change in changes.iter().filter(|change| change.old.is_some()) {
                 let row = state
                     .joint
                     .as_mut()

@@ -43,6 +43,15 @@ fn fixture_with_cpu_lane_and_productions(
     production_records: u64,
     publications: u64,
 ) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+    fixture_with_production_changes(cpu_jobs, lane, production_records, publications, 2)
+}
+fn fixture_with_production_changes(
+    cpu_jobs: u64,
+    lane: JointLane,
+    production_records: u64,
+    publications: u64,
+    changes: usize,
+) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     let count = 8;
     let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 1, 2, &[]);
     let mut config = JointCapacityConfig {
@@ -54,13 +63,18 @@ fn fixture_with_cpu_lane_and_productions(
         max_registered_dependencies: 266,
         max_claims: 16,
         max_requests: 16,
-        max_changes_per_request: 2,
+        max_changes_per_request: changes,
         max_snapshot_bytes: 16 * 1024 * 1024,
         max_scratch_bytes: 16 * 1024 * 1024,
         max_residual_arcs: 10000,
         max_total_proof_work: 10000000,
         work_per_turn: std::num::NonZeroUsize::new(7).unwrap(),
     };
+    config.max_registered_dependencies =
+        crate::joint_admission::ledger::metadata_geometry::maximum_fact_roots(&config, count * 2)
+            .unwrap()
+            .checked_mul(config.max_dependencies_per_claim)
+            .unwrap();
     let base = storage.base_charge(&config).unwrap();
     let m = base.get(JointResource::MetadataBytes);
     let custody = JointResourceLimits {
@@ -1282,5 +1296,222 @@ fn production_registration_rechecks_cancel_after_real_grant_before_metadata_move
     drive(&mut driver);
     assert_eq!(held(&control, JointResource::UnreceivedProductions), 0);
     assert_eq!(held(&control, JointResource::Publications), 0);
+    finish(work, &mut driver);
+}
+
+fn registered_production(
+    scope: &WorkScope,
+    origin: &Arc<dyn Send + Sync>,
+    driver: &mut JointProgressDriver,
+) -> UnreceivedProductionGrant {
+    let quote = UnreceivedProductionQuote::new(
+        std::num::NonZeroU64::new(1).unwrap(),
+        std::num::NonZeroUsize::new(8).unwrap(),
+    )
+    .unwrap();
+    let mut admission = scope
+        .begin_unreceived_productions(Arc::downgrade(origin), quote)
+        .unwrap();
+    drive(driver);
+    let mut ready = match Pin::new(&mut admission).poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(ready)) => ready,
+        _ => panic!("actual production Ready"),
+    };
+    let mut facts = Some(vec![31; 8].into_boxed_slice());
+    let mut target = None;
+    ready.register_in(&mut facts, &mut target).unwrap().notify();
+    drop((ready, admission));
+    target.unwrap()
+}
+fn production_rows(
+    scope: &WorkScope,
+) -> Vec<(u64, u64, usize, usize, JointResources, JointResources)> {
+    let state = scope.inner.state.lock().unwrap();
+    state
+        .joint
+        .as_ref()
+        .unwrap()
+        .claims
+        .iter()
+        .filter_map(|(&id, row)| {
+            let ClaimCustody::Production { epoch } = row.custody else {
+                return None;
+            };
+            (row.owner == ClaimOwner::PhysicalWork(scope.id)).then_some((
+                id,
+                epoch,
+                row.facts.dependencies.len(),
+                row.active_facts.dependencies.len(),
+                row.amounts,
+                row.active_amounts,
+            ))
+        })
+        .collect()
+}
+#[test]
+fn control_growth_installs_unknown_and_received_productions_in_one_original_receipt() {
+    let (control, _, mut driver) =
+        fixture_with_production_changes(0, JointLane::Foreground, 4, 4, 3);
+    let work = root(&control);
+    let scope = work.owner.scope();
+    bind(&scope, &[fact("original")], &mut driver);
+    let origin: Arc<dyn Send + Sync> = Arc::new(());
+    let received = registered_production(&scope, &origin, &mut driver);
+    received.receive_in().unwrap().notify();
+    let unknown = registered_production(&scope, &origin, &mut driver);
+    let before = production_rows(&scope);
+    assert_eq!(scope.control_binding_change_records().unwrap(), 3);
+    assert_eq!(before.len(), 2);
+    let mut growth = scope.begin_control_binding().unwrap();
+    growth.push_dependency(&fact("additional")).unwrap();
+    growth.end_change().unwrap();
+    let mut admission = growth.submit().unwrap();
+    assert!(matches!(unknown.check_receive(), Err(WorkError::Conflict)));
+    drive(&mut driver);
+    let mut ready = receive(&mut admission);
+    let provisional = production_rows(&scope);
+    assert!(provisional.iter().all(|row| row.2 == 2 && row.3 == 1));
+    assert_eq!(held(&control, JointResource::UnreceivedProductions), 1);
+    assert_eq!(held(&control, JointResource::Publications), 2);
+    ready
+        .adjustment
+        .as_mut()
+        .unwrap()
+        .install_control_scope_in(&scope)
+        .unwrap()
+        .notify();
+    let after = production_rows(&scope);
+    for (old, new) in before.iter().zip(&after) {
+        assert_eq!(
+            (old.0, old.1, old.4, old.5),
+            (new.0, new.1, new.4, new.5),
+            "same row/epoch/charges"
+        );
+        assert_eq!((new.2, new.3), (2, 2));
+    }
+    unknown.receive_in().unwrap().notify(); // Same unique original grant survives D Grow.
+    assert_eq!(unknown.owner().pending_records().unwrap(), 0);
+    drop((ready, admission, received));
+    let owner = unknown.owner();
+    drop(unknown);
+    assert_eq!(held(&control, JointResource::Publications), 2);
+    owner.settle_received_in().unwrap().notify();
+    finish(work, &mut driver);
+}
+#[test]
+fn pending_received_production_refuses_settlement_and_drop_rolls_back_all_domain_delta() {
+    let (control, _, mut driver) =
+        fixture_with_production_changes(0, JointLane::Foreground, 4, 4, 2);
+    let work = root(&control);
+    let scope = work.owner.scope();
+    bind(&scope, &[fact("original")], &mut driver);
+    let origin: Arc<dyn Send + Sync> = Arc::new(());
+    let grant = registered_production(&scope, &origin, &mut driver);
+    grant.receive_in().unwrap().notify();
+    let before = production_rows(&scope);
+    let mut growth = scope.begin_control_binding().unwrap();
+    growth.push_dependency(&fact("additional")).unwrap();
+    growth.end_change().unwrap();
+    let mut admission = growth.submit().unwrap();
+    drive(&mut driver);
+    let reply = receive(&mut admission);
+    assert!(matches!(
+        grant.owner().settle_received_in(),
+        Err(WorkError::Conflict)
+    ));
+    assert_eq!(production_rows(&scope)[0].2, 2);
+    drop((reply, admission));
+    drive(&mut driver);
+    assert_eq!(production_rows(&scope), before);
+    assert_eq!(held(&control, JointResource::Publications), 1);
+    grant.owner().settle_received_in().unwrap().notify();
+    drop(grant);
+    finish(work, &mut driver);
+}
+#[test]
+fn exact_original_production_count_rejects_insufficient_paid_batch_backing() {
+    let (control, _, mut driver) =
+        fixture_with_production_changes(0, JointLane::Foreground, 4, 4, 2);
+    let work = root(&control);
+    let scope = work.owner.scope();
+    bind(&scope, &[fact("original")], &mut driver);
+    let origin: Arc<dyn Send + Sync> = Arc::new(());
+    let first = registered_production(&scope, &origin, &mut driver);
+    first.receive_in().unwrap().notify();
+    let second = registered_production(&scope, &origin, &mut driver);
+    assert_eq!(scope.control_binding_change_records().unwrap(), 3);
+    let before = production_rows(&scope);
+    let mut growth = scope.begin_control_binding().unwrap();
+    growth.push_dependency(&fact("additional")).unwrap();
+    growth.end_change().unwrap();
+    let failure = match growth.submit() {
+        Err(failure) => failure,
+        Ok(_) => panic!("two paid rows cannot hold three actual changes"),
+    };
+    assert!(matches!(
+        failure.error,
+        WorkError::Capacity("control and production joint batch records")
+    ));
+    assert_eq!(production_rows(&scope), before);
+    assert_eq!(held(&control, JointResource::UnreceivedProductions), 1);
+    second.receive_in().unwrap().notify();
+    second.owner().settle_received_in().unwrap().notify();
+    drop((first, second));
+    finish(work, &mut driver);
+}
+
+#[test]
+fn an_already_granted_new_record_cannot_register_across_pending_control_growth() {
+    let (control, _, mut driver) =
+        fixture_with_production_changes(0, JointLane::Foreground, 4, 4, 2);
+    let work = root(&control);
+    let scope = work.owner.scope();
+    bind(&scope, &[fact("original")], &mut driver);
+    let origin: Arc<dyn Send + Sync> = Arc::new(());
+    let quote = UnreceivedProductionQuote::new(
+        std::num::NonZeroU64::new(1).unwrap(),
+        std::num::NonZeroUsize::new(8).unwrap(),
+    )
+    .unwrap();
+    let mut registration = scope
+        .begin_unreceived_productions(Arc::downgrade(&origin), quote)
+        .unwrap();
+    drive(&mut driver);
+    let mut raw_ready =
+        match Pin::new(&mut registration).poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(ready)) => ready,
+            _ => panic!("actual earlier raw New grant"),
+        };
+    let mut growth = scope.begin_control_binding().unwrap();
+    growth.push_dependency(&fact("additional")).unwrap();
+    growth.end_change().unwrap();
+    let mut admission = growth.submit().unwrap();
+    let mut facts = Some(vec![55; 8].into_boxed_slice());
+    let mut destination = None;
+    assert!(raw_ready.register_in(&mut facts, &mut destination).is_err());
+    assert!(facts.is_some() && destination.is_none());
+    assert!(production_rows(&scope).is_empty());
+    drop(facts); // Metadata actual exit precedes its unregistered raw grant.
+    drop((raw_ready, registration));
+    drive(&mut driver);
+    let mut reply = receive(&mut admission);
+    reply
+        .adjustment
+        .as_mut()
+        .unwrap()
+        .install_control_scope_in(&scope)
+        .unwrap()
+        .notify();
+    assert_eq!(held(&control, JointResource::UnreceivedProductions), 0);
+    assert_eq!(held(&control, JointResource::Publications), 0);
+    let grant = registered_production(&scope, &origin, &mut driver);
+    assert_eq!(
+        production_rows(&scope)[0].3,
+        2,
+        "new registration captures the actual installed full union"
+    );
+    grant.receive_in().unwrap().notify();
+    grant.owner().settle_received_in().unwrap().notify();
+    drop((grant, reply, admission));
     finish(work, &mut driver);
 }
