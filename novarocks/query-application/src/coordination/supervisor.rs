@@ -2355,7 +2355,6 @@ async fn drive_rows_attempt_until_pump_decision(
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
     internal: &mut Option<InternalExecutionConsumer>,
-    consumers: &mut JoinSet<Result<(), QueryExecutionError>>,
 ) -> (Result<super::LogicalConclusion, ResultPumpFailure>,) {
     let root_ack = match active.reserve_root_ack_tail(running.identity(), root) {
         Ok(reservation) => reservation,
@@ -2389,18 +2388,19 @@ async fn drive_rows_attempt_until_pump_decision(
                 )),);
             }
         };
-        let consumer = Arc::clone(&internal.consumer);
-        consumers.spawn(async move {
-            let outcome = catch_future_panic(async move { consumer.consume(activation).await })
-                .await
-                .unwrap_or_else(|()| {
-                    Err(internal_consumer_panicked(
-                        "internal computation consumer panicked",
-                    ))
-                });
-            exit.complete(outcome.clone());
-            outcome
+        let mut input = Some(super::native_active_custody::OriginalConsumerStart {
+            consumer: Arc::clone(&internal.consumer),
+            activation,
+            exit,
         });
+        if let Err(error) = active.start_consumer_in(&mut input) {
+            // Refusal has not moved any original input, and no factory was called.
+            drop(input);
+            return (Err(super::result_pump::pump_failure(
+                running,
+                super::result_pump::contract_failure(error),
+            )),);
+        }
         Some(ready)
     } else {
         None
@@ -2524,8 +2524,7 @@ async fn supervise_rows(
     clock: Arc<dyn MonotonicClock>,
     attempt: RowsAttempt,
 ) -> Result<(), QueryExecutionError> {
-    let mut consumers = JoinSet::new();
-    let mut result = supervise_rows_inner(
+    let result = supervise_rows_inner(
         actor,
         session,
         dormant,
@@ -2540,30 +2539,13 @@ async fn supervise_rows(
         requester,
         active_plan,
         &mut internal,
-        &mut consumers,
         clock.as_ref(),
         attempt,
     )
     .await;
-    // Join handles remain owned across replacement and cancellation. Actual
-    // consumer exit is separate from revoking its eligibility or accepting Ready.
-    while let Some(joined) = consumers.join_next().await {
-        match joined {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::debug!(%error, "internal consumer exited with its domain verdict")
-            }
-            Err(error) => {
-                registry.record_native_supervision_join_failure(error);
-                result = first_supervision_error(
-                    result,
-                    Err(native_future_panicked(
-                        "internal consumer supervision failed",
-                    )),
-                );
-            }
-        }
-    }
+    // The original process service joins each consumer in its SAME attempt slot.
+    // This borrowed wait owns no join and survives cancellation without detaching it.
+    registry.wait_registration_consumers(registration).await;
     if let Some(original) = internal.as_ref() {
         if let Some(failure) = original.consumer.local_health_failure() {
             if registry
@@ -2604,7 +2586,6 @@ async fn supervise_rows_inner(
     requester: &novarocks_workload_control::WorkCancellationRequester,
     active_plan: super::ActiveLogicalPlan,
     internal: &mut Option<InternalExecutionConsumer>,
-    consumers: &mut JoinSet<Result<(), QueryExecutionError>>,
     clock: &dyn MonotonicClock,
     mut attempt: RowsAttempt,
 ) -> Result<(), QueryExecutionError> {
@@ -2636,7 +2617,6 @@ async fn supervise_rows_inner(
             shutdown,
             requester,
             internal,
-            consumers,
         )
         .await;
         attempt.active.begin_terminal_cut(Instant::now());
@@ -3684,21 +3664,6 @@ fn retain_native_run_panic(
     }
 }
 
-async fn catch_future_panic<F>(future: F) -> Result<F::Output, ()>
-where
-    F: Future,
-{
-    let mut future = Box::pin(future);
-    std::future::poll_fn(move |context| {
-        match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(context))) {
-            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
-            Ok(Poll::Pending) => Poll::Pending,
-            Err(_payload) => Poll::Ready(Err(())),
-        }
-    })
-    .await
-}
-
 async fn await_with_shutdown<F>(
     future: F,
     shutdown: &mut watch::Receiver<bool>,
@@ -3940,7 +3905,7 @@ fn native_future_panic_input(message: &'static str) -> ExecutionFailureInput {
     )
 }
 
-fn internal_consumer_panicked(message: &'static str) -> QueryExecutionError {
+pub(super) fn internal_consumer_panicked(message: &'static str) -> QueryExecutionError {
     QueryExecutionError::from_execution(ExecutionFailureInput::new(
         QueryFailureReason::InternalConsumerPanicked.failure_fact(),
         SafeDetail::truncating(message),

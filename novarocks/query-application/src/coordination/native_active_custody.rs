@@ -78,6 +78,7 @@ struct ActiveSlot {
     owner: Mutex<Option<ActiveSlotOwner>>,
     convergence_failure: NativeConvergenceFailureSlot,
     root_ack: Mutex<RootAckTailState>,
+    consumer: Mutex<ConsumerTailState>,
 }
 
 /// The original slot receives the primary before the borrowed convergence
@@ -126,6 +127,10 @@ type RootAckFuture = Pin<
 #[derive(Default)]
 struct RootAckTailState {
     native_closed: bool,
+    returned: bool,
+    // One original ready waker shared by the ACK and consumer joins.
+    tail_waker: Option<Waker>,
+    reservation: Option<(AttemptActivationIdentity, TaskIdentity)>,
     phase: RootAckTailPhase,
 }
 #[derive(Default)]
@@ -150,6 +155,135 @@ impl RootAckTailState {
                 RootAckTailPhase::NeverIssued | RootAckTailPhase::Joined
             )
     }
+}
+
+/// Original per-attempt consumer input, not an execution grant or identity.
+pub(super) struct OriginalConsumerStart {
+    pub(super) consumer: Arc<dyn crate::api::InternalComputationConsumer>,
+    pub(super) activation: crate::api::InternalConsumerActivation,
+    pub(super) exit: crate::api::InternalConsumerExitReporter,
+}
+#[derive(Default)]
+struct ConsumerTailState {
+    phase: ConsumerTailPhase,
+    input: Option<OriginalConsumerStart>,
+    panic: Option<Box<dyn std::any::Any + Send>>,
+    cleanup_panic: Option<Box<dyn std::any::Any + Send>>,
+    // The SAME task's join owns an uncaught receipt/outer-tail panic or cancellation.
+    join_failure: Option<tokio::task::JoinError>,
+}
+#[derive(Default)]
+enum ConsumerTailPhase {
+    #[default]
+    NotIssued,
+    Reserved,
+    Running(tokio::task::JoinHandle<Result<(), QueryExecutionError>>),
+    Joined,
+}
+impl ConsumerTailState {
+    fn pending(&self) -> bool {
+        matches!(
+            self.phase,
+            ConsumerTailPhase::Reserved | ConsumerTailPhase::Running(_)
+        )
+    }
+    fn failed(&self) -> bool {
+        self.panic.is_some() || self.cleanup_panic.is_some() || self.join_failure.is_some()
+    }
+}
+impl ActiveSlot {
+    fn retain_consumer_panic(&self, payload: Box<dyn std::any::Any + Send>, cleanup: bool) {
+        let mut incoming = Some(payload);
+        {
+            let mut state = self.consumer.lock().unwrap_or_else(|e| e.into_inner());
+            let target = if cleanup {
+                &mut state.cleanup_panic
+            } else {
+                &mut state.panic
+            };
+            if target.is_none() {
+                *target = incoming.take();
+            }
+        }
+        if let Some(rejected) = incoming {
+            // Illegal duplicate intake cannot silently destroy an original cause.
+            std::panic::panic_any(std::mem::ManuallyDrop::new(rejected));
+        }
+        self.mark_consumer_failure();
+    }
+    fn mark_consumer_failure(&self) {
+        if let Some(source) = self.original_exit.upgrade() {
+            source.consumer_failed_silent();
+        }
+    }
+}
+
+fn retain_original_consumer_panic(
+    slot: &Weak<ActiveSlot>,
+    payload: Box<dyn std::any::Any + Send>,
+    cleanup: bool,
+) {
+    if let Some(original) = slot.upgrade() {
+        original.retain_consumer_panic(payload, cleanup);
+    } else {
+        std::panic::panic_any(std::mem::ManuallyDrop::new(payload));
+    }
+}
+
+async fn run_original_consumer(slot: Weak<ActiveSlot>) -> Result<(), QueryExecutionError> {
+    // Input stays in the original slot even if this task never receives a poll.
+    let OriginalConsumerStart {
+        consumer,
+        activation,
+        exit,
+    } = {
+        let original = slot
+            .upgrade()
+            .expect("canonical consumer slot remains until its actual join");
+        let mut state = original.consumer.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .input
+            .take()
+            .expect("the original reserved consumer input")
+    };
+    let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        consumer.consume(activation)
+    })) {
+        Err(payload) => {
+            retain_original_consumer_panic(&slot, payload, false);
+            Err(super::supervisor::internal_consumer_panicked(
+                "internal computation consumer panicked",
+            ))
+        }
+        Ok(mut future) => {
+            let outcome = std::future::poll_fn(|cx| {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    future.as_mut().poll(cx)
+                })) {
+                    Ok(Poll::Pending) => Poll::Pending,
+                    Ok(Poll::Ready(outcome)) => Poll::Ready(outcome),
+                    Err(payload) => {
+                        retain_original_consumer_panic(&slot, payload, false);
+                        Poll::Ready(Err(super::supervisor::internal_consumer_panicked(
+                            "internal computation consumer panicked",
+                        )))
+                    }
+                }
+            })
+            .await;
+            if let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(future)))
+            {
+                retain_original_consumer_panic(&slot, payload, true);
+            }
+            // A cleanup panic is health; it cannot overwrite a returned domain verdict.
+            outcome
+        }
+    };
+    // A notification panic here is kept by the original slot's actual JoinError.
+    // The two raw slots already own any earlier factory/poll and F-Drop causes.
+    exit.complete(outcome.clone());
+    outcome
 }
 
 const ROOT_ACK_TAIL_TURN_BUDGET: usize = 64;
@@ -267,14 +401,16 @@ impl RootAckTailReservation {
         // A completed task may race this assignment, but its join still owns
         // the completion; no enclosing logical future owns or drops the join.
         let join = tokio::spawn(async move { original.await.map(drop) });
+        let waker = state
+            .tail_waker
+            .as_ref()
+            .expect("original ready waker")
+            .clone();
         state.phase = RootAckTailPhase::Running {
             activation: self.activation,
             root: self.root,
             join,
-            waker: Waker::from(Arc::new(RootAckWake {
-                key: self.key,
-                ready: Arc::downgrade(&self.storage.root_ack_ready),
-            })),
+            waker,
         };
         self.issued = true;
         drop(state);
@@ -290,8 +426,9 @@ impl Drop for RootAckTailReservation {
         assert!(matches!(state.phase, RootAckTailPhase::Reserved));
         state.phase = RootAckTailPhase::NeverIssued;
         drop(state);
-        self.storage.root_ack_ready.complete(self.key);
         self.storage.remove_if_settled(self.key, &self.slot);
+        self.storage
+            .complete_tail_ready_if_joined(self.key, &self.slot);
     }
 }
 
@@ -339,6 +476,7 @@ impl NativeActiveCustodyRegistry {
             owner: Mutex::new(None),
             convergence_failure: NativeConvergenceFailureSlot::default(),
             root_ack: Mutex::new(RootAckTailState::default()),
+            consumer: Mutex::new(ConsumerTailState::default()),
         });
         slots.insert(key, Arc::clone(&slot));
         Some(NativeActiveCustodyReservation {
@@ -373,6 +511,11 @@ impl NativeActiveCustodyRegistry {
             ));
         }
         self.root_ack_ready.register(key);
+        state.tail_waker = Some(Waker::from(Arc::new(RootAckWake {
+            key,
+            ready: Arc::downgrade(&self.root_ack_ready),
+        })));
+        state.reservation = Some((activation, root));
         state.phase = RootAckTailPhase::Reserved;
         Ok(RootAckTailReservation {
             storage: self.clone(),
@@ -395,33 +538,103 @@ impl NativeActiveCustodyRegistry {
         self.remove_if_settled(key, slot);
     }
     fn remove_if_settled(&self, key: NativeActiveCustodyKey, slot: &Arc<ActiveSlot>) {
-        let removed = {
+        let (returned, removed) = {
             let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-            if slots
+            if !slots
                 .get(&key)
                 .is_some_and(|current| Arc::ptr_eq(current, slot))
-                && slot.convergence_failure.failure().is_none()
-                && slot
-                    .root_ack
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .settled()
             {
-                slots.remove(&key)
-            } else {
-                None
+                return;
             }
+            let mut ack = slot.root_ack.lock().unwrap_or_else(|e| e.into_inner());
+            let consumer = slot.consumer.lock().unwrap_or_else(|e| e.into_inner());
+            if !ack.settled() || consumer.pending() {
+                return;
+            }
+            let returned = !ack.returned;
+            ack.returned = true;
+            // Health-only backing stays canonical after all real sources joined.
+            let retain = consumer.failed() || slot.convergence_failure.is_failed();
+            drop(consumer);
+            drop(ack);
+            (returned, (!retain).then(|| slots.remove(&key)).flatten())
         };
-        if let Some(removed) = removed {
-            if let Some(source) = removed.original_exit.upgrade() {
+        if returned {
+            if let Some(source) = slot.original_exit.upgrade() {
                 source.native_return_silent(
                     key,
                     super::LocalExecutionDisposition::OriginalPaidOwnerReturn,
                 );
             }
-            drop(removed);
+        }
+        drop(removed);
+        if returned {
             self.progress.notify_waiters();
         }
+    }
+    fn complete_tail_ready_if_joined(&self, key: NativeActiveCustodyKey, slot: &Arc<ActiveSlot>) {
+        let ack_joined = matches!(
+            slot.root_ack
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .phase,
+            RootAckTailPhase::NeverIssued | RootAckTailPhase::Joined
+        );
+        if ack_joined
+            && !slot
+                .consumer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pending()
+        {
+            self.root_ack_ready.complete(key);
+        }
+    }
+    fn start_consumer_in(
+        &self,
+        key: NativeActiveCustodyKey,
+        slot: &Arc<ActiveSlot>,
+        incoming: &mut Option<OriginalConsumerStart>,
+    ) -> Result<(), QueryExecutionError> {
+        {
+            let ack = slot.root_ack.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = slot.consumer.lock().unwrap_or_else(|e| e.into_inner());
+            let valid = incoming.as_ref().is_some_and(|input| {
+                ack.reservation
+                    == Some((
+                        input.activation.source.activation(),
+                        input.activation.source.root(),
+                    ))
+                    && input.activation.stream.activation().execution() == key.execution
+                    && input.activation.source.activation() == input.activation.stream.activation()
+                    && input.activation.source.root().query_execution_id() == key.execution
+                    && slot.contexts.iter().any(|context| {
+                        context.backend_process_id()
+                            == input.activation.source.root().backend_process_id()
+                    })
+            });
+            if !valid
+                || ack.native_closed
+                || !matches!(ack.phase, RootAckTailPhase::Reserved)
+                || !matches!(state.phase, ConsumerTailPhase::NotIssued)
+            {
+                return Err(QueryExecutionError::new(
+                    QueryExecutionErrorKind::InvalidRequest,
+                    "consumer does not belong to an unused original attempt tail",
+                ));
+            }
+            state.phase = ConsumerTailPhase::Reserved;
+            state.input = incoming.take();
+        }
+        // The original slot already owns input/causes before any task or factory runs.
+        let join = tokio::spawn(run_original_consumer(Arc::downgrade(slot)));
+        {
+            let mut state = slot.consumer.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(matches!(state.phase, ConsumerTailPhase::Reserved));
+            state.phase = ConsumerTailPhase::Running(join);
+        }
+        self.root_ack_ready.enqueue(key);
+        Ok(())
     }
     pub(crate) fn root_ack_tail_count(&self) -> usize {
         self.root_ack_ready.len()
@@ -433,8 +646,6 @@ impl NativeActiveCustodyRegistry {
                 break;
             };
             visited += 1;
-            // Release scheduling and registry locks before polling the same
-            // original join. Its exact waker enqueues only this key on wakeup.
             let slot = self
                 .slots
                 .lock()
@@ -442,44 +653,89 @@ impl NativeActiveCustodyRegistry {
                 .get(&key)
                 .cloned();
             let Some(slot) = slot else { continue };
-            let joined = {
+            let ack_joined = {
                 let mut state = slot.root_ack.lock().unwrap_or_else(|e| e.into_inner());
-                let RootAckTailPhase::Running {
-                    activation,
-                    root,
-                    join,
-                    waker,
-                } = &mut state.phase
-                else {
-                    continue;
-                };
-                let mut context = Context::from_waker(waker);
-                let Poll::Ready(outcome) = Pin::new(join).poll(&mut context) else {
-                    continue;
-                };
-                let joined = (*activation, *root, outcome);
-                state.phase = RootAckTailPhase::Joined;
-                joined
-            };
-            self.root_ack_ready.complete(key);
-            match joined.2 {
-                Ok(Ok(())) => {}
-                Ok(Err(failure)) => {
-                    // Optional ACK diagnostics never re-enter attempt recovery
-                    // or change the actor's already selected EOF/Ready verdict.
-                    tracing::debug!(activation = ?joined.0, root = %joined.1,
-                        failure = ?failure.input(), "optional root ACK exited with a failure");
+                match &mut state.phase {
+                    RootAckTailPhase::Running {
+                        activation,
+                        root,
+                        join,
+                        waker,
+                    } => {
+                        let mut cx = Context::from_waker(waker);
+                        match Pin::new(join).poll(&mut cx) {
+                            Poll::Pending => None,
+                            Poll::Ready(outcome) => {
+                                let joined = (*activation, *root, outcome);
+                                state.phase = RootAckTailPhase::Joined;
+                                Some(joined)
+                            }
+                        }
+                    }
+                    _ => None,
                 }
-                Err(error) => {
-                    // JoinError proves this local task exited. Preserve its
-                    // original panic/cancellation cause in process health.
-                    self.health.record_root_ack_join_failure(error);
+            };
+            let waker = slot
+                .root_ack
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .tail_waker
+                .clone();
+            let (consumer_joined, domain_error, completed_consumer_join) = {
+                let mut state = slot.consumer.lock().unwrap_or_else(|e| e.into_inner());
+                if let ConsumerTailPhase::Running(join) = &mut state.phase {
+                    let mut cx = Context::from_waker(waker.as_ref().expect("original tail waker"));
+                    match Pin::new(join).poll(&mut cx) {
+                        Poll::Pending => (false, None, None),
+                        Poll::Ready(outcome) => {
+                            let completed =
+                                std::mem::replace(&mut state.phase, ConsumerTailPhase::Joined);
+                            let domain_error = match outcome {
+                                Ok(Ok(())) => None,
+                                Ok(Err(error)) => Some(error),
+                                Err(original) => {
+                                    assert!(state.join_failure.is_none());
+                                    state.join_failure = Some(original);
+                                    None
+                                }
+                            };
+                            (true, domain_error, Some(completed))
+                        }
+                    }
+                } else {
+                    (false, None, None)
+                }
+            };
+            if consumer_joined {
+                let failed = slot
+                    .consumer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .failed();
+                if failed {
+                    slot.mark_consumer_failure();
                 }
             }
+            // The exact completed handle/frame drops after every slot lock.
+            drop(completed_consumer_join);
+            if let Some((activation, root, outcome)) = ack_joined {
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(failure)) => {
+                        tracing::debug!(?activation, %root, failure = ?failure.input(), "optional root ACK exited with a failure")
+                    }
+                    Err(error) => self.health.record_root_ack_join_failure(error),
+                }
+            }
+            if let Some(error) = domain_error {
+                tracing::debug!(%error, "internal consumer exited with its domain verdict");
+            }
             self.remove_if_settled(key, &slot);
+            self.complete_tail_ready_if_joined(key, &slot);
+            if consumer_joined {
+                self.progress.notify_waiters();
+            }
         }
-        // A full turn never drains an unbounded queue. Remaining ready keys
-        // wake another fair process-supervisor turn; Pending joins stay asleep.
         self.root_ack_ready.notify_if_ready();
         visited
     }
@@ -517,6 +773,33 @@ impl NativeActiveCustodyRegistry {
             .next()
             .is_some_and(|(key, _)| key.initial == initial && key.generation == generation)
     }
+    pub(crate) fn blocks_registration(&self, initial: QueryExecutionId, generation: u64) -> bool {
+        self.slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .range(NativeActiveCustodyKey::registration_lower_bound(initial, generation)..)
+            .take_while(|(key, _)| key.initial == initial && key.generation == generation)
+            .any(|(_, slot)| {
+                !slot
+                    .root_ack
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .returned
+            })
+    }
+    pub(crate) fn consumers_pending(&self, initial: QueryExecutionId, generation: u64) -> bool {
+        self.slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .range(NativeActiveCustodyKey::registration_lower_bound(initial, generation)..)
+            .take_while(|(key, _)| key.initial == initial && key.generation == generation)
+            .any(|(_, slot)| {
+                slot.consumer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pending()
+            })
+    }
     pub(crate) fn contexts(&self, key: NativeActiveCustodyKey) -> Option<Vec<QueryContextRef>> {
         self.slots
             .lock()
@@ -535,10 +818,10 @@ impl NativeActiveCustodyRegistry {
     fn remove(&self, key: NativeActiveCustodyKey) {
         let removed = {
             let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-            if slots
-                .get(&key)
-                .is_some_and(|slot| slot.convergence_failure.failure().is_some())
-            {
+            if slots.get(&key).is_some_and(|slot| {
+                let consumer = slot.consumer.lock().unwrap_or_else(|e| e.into_inner());
+                slot.convergence_failure.is_failed() || consumer.failed() || consumer.pending()
+            }) {
                 // Neither a later closure nor an empty owner field disposes
                 // this original failed source. Explicit process exit does.
                 return;
@@ -556,6 +839,20 @@ impl NativeActiveCustodyRegistry {
             self.progress.notify_waiters();
         }
     }
+    pub(super) fn consumer_task_frame_layout() -> std::alloc::Layout {
+        fn actual<F: Future<Output = Result<(), QueryExecutionError>>>(
+            _: fn(Weak<ActiveSlot>) -> F,
+        ) -> std::alloc::Layout {
+            std::alloc::Layout::new::<F>()
+        }
+        actual(run_original_consumer)
+    }
+    pub(super) fn tail_wake_layout() -> std::alloc::Layout {
+        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
+            RootAckWake,
+        >())
+        .expect("original shared tail wake layout")
+    }
     pub(super) fn slot_layout() -> std::alloc::Layout {
         novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
             ActiveSlot,
@@ -572,6 +869,16 @@ impl NativeActiveCustodyRegistry {
             .range(NativeActiveCustodyKey::registration_lower_bound(initial, generation)..)
             .take_while(|(key, _)| key.initial == initial && key.generation == generation)
             .find_map(|(_, slot)| {
+                if slot
+                    .consumer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .failed()
+                {
+                    return Some(super::supervisor::internal_consumer_panicked(
+                        "original consumer failure remains in custody",
+                    ));
+                }
                 if let Some(failure) = slot.convergence_failure.failure() {
                     return Some(QueryExecutionError::new(
                         QueryExecutionErrorKind::Failed,
@@ -840,6 +1147,14 @@ impl SupervisedActiveNativeOwner {
             .as_deref_mut()
             .expect("same active owner has not entered unresolved custody")
     }
+    pub(super) fn start_consumer_in(
+        &self,
+        input: &mut Option<OriginalConsumerStart>,
+    ) -> Result<(), QueryExecutionError> {
+        self.custody
+            .storage
+            .start_consumer_in(self.custody.key, &self.custody.slot, input)
+    }
     pub(crate) fn reserve_root_ack_tail(
         &mut self,
         activation: AttemptActivationIdentity,
@@ -1081,6 +1396,42 @@ pub(crate) struct RootAckTestOwner {
 }
 #[cfg(test)]
 impl RootAckTestOwner {
+    pub(crate) fn start_consumer_in(&self, input: &mut Option<OriginalConsumerStart>) {
+        self.registry
+            .start_consumer_in(self.key, &self.slot, input)
+            .unwrap();
+    }
+    pub(crate) async fn join_consumer(&self) {
+        loop {
+            let pending = self.slot.consumer.lock().unwrap().pending();
+            if !pending {
+                return;
+            }
+            self.registry.root_ack_tail_progress().await;
+        }
+    }
+    pub(crate) fn consumer_pending(&self) -> bool {
+        self.slot.consumer.lock().unwrap().pending()
+    }
+    pub(crate) fn consumer_failed(&self) -> bool {
+        self.slot.consumer.lock().unwrap().failed()
+    }
+    pub(crate) fn consumer_join_panicked(&self) -> bool {
+        self.slot
+            .consumer
+            .lock()
+            .unwrap()
+            .join_failure
+            .as_ref()
+            .is_some_and(|e| e.is_panic())
+    }
+    pub(crate) fn live_registration(&self) -> bool {
+        self.registry
+            .blocks_registration(self.key.initial, self.key.generation)
+    }
+    pub(crate) fn dispose_for_process_exit(self) {
+        self.registry.abandon_for_process_exit();
+    }
     pub(crate) fn close_native(&self) {
         self.registry.record_native_closed(self.key, &self.slot);
     }
@@ -1116,6 +1467,36 @@ fn root_ack_test_fixture_in(
         generation: 1,
         execution: activation.execution(),
     };
+    root_ack_test_fixture_for_key(registry, key, activation, root)
+}
+#[cfg(test)]
+pub(crate) fn root_ack_successor_fixture(
+    previous: &RootAckTestOwner,
+    activation: AttemptActivationIdentity,
+    root: TaskIdentity,
+) -> (RootAckTestOwner, RootAckTailReservation) {
+    assert_eq!(
+        previous.key.initial.query_id(),
+        activation.execution().query_id()
+    );
+    root_ack_test_fixture_for_key(
+        previous.registry.clone(),
+        NativeActiveCustodyKey {
+            initial: previous.key.initial,
+            generation: previous.key.generation,
+            execution: activation.execution(),
+        },
+        activation,
+        root,
+    )
+}
+#[cfg(test)]
+fn root_ack_test_fixture_for_key(
+    registry: NativeActiveCustodyRegistry,
+    key: NativeActiveCustodyKey,
+    activation: AttemptActivationIdentity,
+    root: TaskIdentity,
+) -> (RootAckTestOwner, RootAckTailReservation) {
     let slot = Arc::new(ActiveSlot {
         original_exit: Weak::new(),
         contexts: BTreeSet::from([QueryContextRef::new(
@@ -1126,6 +1507,7 @@ fn root_ack_test_fixture_in(
         owner: Mutex::new(None),
         convergence_failure: NativeConvergenceFailureSlot::default(),
         root_ack: Mutex::new(RootAckTailState::default()),
+        consumer: Mutex::new(ConsumerTailState::default()),
     });
     registry
         .slots
@@ -1735,6 +2117,7 @@ mod tests {
                         owner: Mutex::new(held),
                         convergence_failure: NativeConvergenceFailureSlot::default(),
                         root_ack: Mutex::new(RootAckTailState::default()),
+                        consumer: Mutex::new(ConsumerTailState::default()),
                     }),
                 );
             }
@@ -1847,6 +2230,7 @@ mod tests {
                         owner: Mutex::new(None),
                         convergence_failure: NativeConvergenceFailureSlot::default(),
                         root_ack: Mutex::new(RootAckTailState::default()),
+                        consumer: Mutex::new(ConsumerTailState::default()),
                     }),
                 );
             }

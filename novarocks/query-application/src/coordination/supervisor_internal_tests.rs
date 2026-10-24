@@ -1109,6 +1109,40 @@ mod internal_supervisor_tests {
     struct FailingRegisteredConsumer {
         outcome: RegisteredConsumerOutcome,
         end_seen: Arc<AtomicBool>,
+        primary_drops: Arc<AtomicU64>,
+        cleanup_drops: Arc<AtomicU64>,
+        window: TestWindow,
+    }
+
+    struct RegisteredConsumerPanic {
+        drops: Arc<AtomicU64>,
+        _window: Option<TestWindow>,
+    }
+    impl Drop for RegisteredConsumerPanic {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct ConsumerCleanupPanic {
+        future: InternalConsumerFuture,
+        drops: Arc<AtomicU64>,
+    }
+    impl Future for ConsumerCleanupPanic {
+        type Output = Result<(), QueryExecutionError>;
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            self.get_mut().future.as_mut().poll(cx)
+        }
+    }
+    impl Drop for ConsumerCleanupPanic {
+        fn drop(&mut self) {
+            std::panic::panic_any(RegisteredConsumerPanic {
+                drops: Arc::clone(&self.drops),
+                _window: None,
+            });
+        }
     }
 
     impl InternalComputationConsumer for FailingRegisteredConsumer {
@@ -1126,7 +1160,11 @@ mod internal_supervisor_tests {
             let (mut stream, source) = activation.into_parts();
             let outcome = self.outcome.clone();
             let end_seen = Arc::clone(&self.end_seen);
-            Box::pin(async move {
+            let primary_drops = Arc::clone(&self.primary_drops);
+            let cleanup_drops = Arc::clone(&self.cleanup_drops);
+            let window = self.window.clone();
+            let panics = matches!(&outcome, RegisteredConsumerOutcome::Panic);
+            let future: InternalConsumerFuture = Box::pin(async move {
                 // Keep both source and original End owned until the actual
                 // future outcome unwinds them. No CPU receipt or Ready is sent.
                 let _source = source;
@@ -1144,10 +1182,21 @@ mod internal_supervisor_tests {
                         Err(QueryExecutionError::from_execution(input))
                     }
                     RegisteredConsumerOutcome::Panic => {
-                        panic!("injected registered computation consumer panic")
+                        std::panic::panic_any(RegisteredConsumerPanic {
+                            drops: primary_drops,
+                            _window: Some(window),
+                        })
                     }
                 }
-            })
+            });
+            if panics {
+                Box::pin(ConsumerCleanupPanic {
+                    future,
+                    drops: cleanup_drops,
+                })
+            } else {
+                future
+            }
         }
     }
 
@@ -1156,6 +1205,7 @@ mod internal_supervisor_tests {
         expected: ExecutionFailureInput,
         namespace: u64,
     ) {
+        let is_panic = matches!(&outcome, RegisteredConsumerOutcome::Panic);
         let mut control = {
             let (control, root) = governance().await;
             let scope = root.owner.scope();
@@ -1169,6 +1219,9 @@ mod internal_supervisor_tests {
                 .unwrap();
             let signals = Arc::new(InternalAttemptSignals::default());
             let end_seen = Arc::new(AtomicBool::new(false));
+            let panics = matches!(&outcome, RegisteredConsumerOutcome::Panic);
+            let primary_drops = Arc::new(AtomicU64::new(0));
+            let cleanup_drops = Arc::new(AtomicU64::new(0));
             let request = internal_count_request(InternalCountPreparation {
                 backend: BackendProcessId::new_v7(),
                 window: TestWindow(window.retain_alias()),
@@ -1177,6 +1230,9 @@ mod internal_supervisor_tests {
             .with_internal_consumer(Arc::new(FailingRegisteredConsumer {
                 outcome,
                 end_seen: Arc::clone(&end_seen),
+                primary_drops: Arc::clone(&primary_drops),
+                cleanup_drops: Arc::clone(&cleanup_drops),
+                window: TestWindow(window.retain_alias()),
             }))
             .unwrap();
             drop(window);
@@ -1191,12 +1247,21 @@ mod internal_supervisor_tests {
                     Duration::from_secs(92),
                 ))),
             );
-            let result =
-                tokio::time::timeout(Duration::from_secs(2), client.start(request, root.owner))
-                    .await
-                    .expect(
-                        "actual consumer failure must be delivered while Native cleanup is held",
-                    );
+            let mut source_input = Some(
+                client
+                    .prepare_observed_start(request, None)
+                    .unwrap_or_else(|original| std::panic::panic_any(original)),
+            );
+            let mut work = Some(root.owner);
+            let (mut ready, mut original_exit) = (None, None);
+            client
+                .start_observed_in(&mut source_input, &mut work, &mut ready, &mut original_exit)
+                .unwrap()
+                .finish()
+                .unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(2), ready.take().unwrap())
+                .await
+                .expect("actual consumer failure must be delivered while Native cleanup is held");
             let error = match result {
                 Err(error) => error,
                 Ok(_) => panic!("failed registered computation consumer cannot produce Ready"),
@@ -1212,23 +1277,60 @@ mod internal_supervisor_tests {
 
             signals.release_cleanup.notify_one();
             root.business.release();
-            supervisor
+            let shutdown = supervisor
                 .shutdown_until(Instant::now() + Duration::from_secs(5))
-                .await
-                .unwrap();
-            acknowledge_all_control(&control);
-            tokio::time::timeout(Duration::from_secs(2), scope.wait_released())
-                .await
-                .unwrap();
+                .await;
             assert!(signals.cleanup_entered.load(Ordering::SeqCst));
             assert!(signals.cleanup_completed.load(Ordering::SeqCst));
             assert!(signals.active_dropped.load(Ordering::SeqCst));
-            assert_eq!(supervisor.registry.active_native_custody_count(), 0);
-
+            let exit = original_exit.take().expect("the same actual Source");
+            let view = exit.view().unwrap();
+            assert!(view.native_preparation_exited());
+            assert_eq!(
+                view.pending_native_returns(),
+                0,
+                "ACK, Native and consumer actual joins returned once"
+            );
+            assert!(!view.role_failed());
+            assert_eq!(view.internal_consumer_failed(), panics);
+            drop(view);
+            if panics {
+                assert!(matches!(
+                    shutdown,
+                    Err(LogicalExecutionSupervisorShutdownError::Registry(
+                        LogicalExecutionRuntimeRegistryError::OriginalExitFailureUnresolved
+                    ))
+                ));
+                assert_eq!(
+                    supervisor.registry.active_native_custody_count(),
+                    1,
+                    "only canonical health backing remains"
+                );
+                assert_eq!(primary_drops.load(Ordering::SeqCst), 0);
+                assert_eq!(cleanup_drops.load(Ordering::SeqCst), 0);
+                assert!(futures::poll!(Box::pin(scope.wait_released())).is_pending());
+                drop(exit);
+                supervisor.abandon_for_process_exit();
+                assert_eq!(primary_drops.load(Ordering::SeqCst), 1);
+                assert_eq!(cleanup_drops.load(Ordering::SeqCst), 1);
+            } else {
+                shutdown.unwrap();
+                assert_eq!(supervisor.registry.active_native_custody_count(), 0);
+                drop(exit);
+                acknowledge_all_control(&control);
+                tokio::time::timeout(Duration::from_secs(2), scope.wait_released())
+                    .await
+                    .unwrap();
+            }
             control
         };
         acknowledge_all_control(&control);
-        control.finish().await;
+        // This fixture covers both ordinary completion and explicit health disposition.
+        if is_panic {
+            control.finish_for_process_exit().await;
+        } else {
+            control.finish().await;
+        }
     }
 
     #[tokio::test]

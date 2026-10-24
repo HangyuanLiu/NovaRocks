@@ -63,6 +63,7 @@ struct State {
     native_failure: Option<Box<dyn std::any::Any + Send>>,
     run_panic: Option<Box<dyn std::any::Any + Send>>,
     run_cleanup_panic: Option<Box<dyn std::any::Any + Send>>,
+    consumer_failed: bool,
     native_dormant_failed: bool,
     native_closure_seen: bool,
     native_return_disposition: Option<LocalExecutionDisposition>,
@@ -102,6 +103,7 @@ impl OriginalLogicalExit {
                 native_failure: None,
                 run_panic: None,
                 run_cleanup_panic: None,
+                consumer_failed: false,
                 native_dormant_failed: false,
                 native_closure_seen: false,
                 native_return_disposition: None,
@@ -302,6 +304,9 @@ impl OriginalLogicalExit {
             *destination = incoming.take();
         }
     }
+    pub(super) fn consumer_failed_silent(&self) {
+        self.lock().consumer_failed = true;
+    }
     pub(super) fn run_failed(&self) -> bool {
         let state = self.lock();
         state.run_panic.is_some() || state.run_cleanup_panic.is_some()
@@ -313,6 +318,7 @@ impl OriginalLogicalExit {
                 || s.native_failure.is_some()
                 || s.run_panic.is_some()
                 || s.run_cleanup_panic.is_some()
+                || s.consumer_failed
                 || matches!(&s.actor, Some(Err(_))))
     }
     pub(super) fn receive_role_silent(&self, packet: &mut Option<RoleResult>) {
@@ -331,6 +337,7 @@ impl OriginalLogicalExit {
             || s.native_failure.is_some()
             || s.run_panic.is_some()
             || s.run_cleanup_panic.is_some()
+            || s.consumer_failed
             || matches!(&s.actor, Some(Err(_)))
     }
     pub(super) fn pending_actor(&self) -> bool {
@@ -473,6 +480,10 @@ impl LogicalExecutionExitView<'_> {
     /// Diagnostic facts only; none substitutes for an actual local return.
     pub fn native_preparation_failure(&self) -> Option<&(dyn std::any::Any + Send)> {
         self.state.native_failure.as_deref()
+    }
+    /// Health fact only; each raw consumer cause stays in its original attempt slot.
+    pub fn internal_consumer_failed(&self) -> bool {
+        self.state.consumer_failed
     }
     /// Raw run causes stay in this Source independently of a positive Active
     /// close. These borrows never transfer the original payload or its charge.

@@ -137,6 +137,8 @@ pub struct LogicalExecutionRegistryEntryGeometry {
     actor_join_wake: std::alloc::Layout,
     close_wait_frame: std::alloc::Layout,
     native_active_slot: std::alloc::Layout,
+    native_consumer_task_frame: std::alloc::Layout,
+    native_tail_wake: std::alloc::Layout,
 }
 impl LogicalExecutionRegistryEntryGeometry {
     pub const fn record_layout(self) -> std::alloc::Layout {
@@ -156,6 +158,12 @@ impl LogicalExecutionRegistryEntryGeometry {
     }
     pub const fn close_wait_frame_layout(self) -> std::alloc::Layout {
         self.close_wait_frame
+    }
+    pub const fn native_consumer_task_frame_layout(self) -> std::alloc::Layout {
+        self.native_consumer_task_frame
+    }
+    pub const fn native_tail_wake_layout(self) -> std::alloc::Layout {
+        self.native_tail_wake
     }
     pub const fn native_active_slot_layout(self) -> std::alloc::Layout {
         self.native_active_slot
@@ -192,6 +200,9 @@ impl LogicalExecutionRuntimeRegistry {
             .expect("fixed original join failure layout"),
             close_wait_frame: original_close_wait_layout(original_close_wait),
             native_active_slot: super::NativeActiveCustodyRegistry::slot_layout(),
+            native_consumer_task_frame:
+                super::NativeActiveCustodyRegistry::consumer_task_frame_layout(),
+            native_tail_wake: super::NativeActiveCustodyRegistry::tail_wake_layout(),
         }
     }
 }
@@ -837,6 +848,25 @@ impl LogicalExecutionRuntimeRegistryHandle {
         })
     }
 
+    pub(crate) async fn wait_registration_consumers(
+        &self,
+        registration: &LogicalExecutionRegistration,
+    ) {
+        loop {
+            let changed = self.inner.progress.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self
+                .inner
+                .active_native
+                .consumers_pending(registration.initial_execution, registration.generation)
+            {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     /// Preserve the same NoRecovery consumer in its exact original record.
     /// All receiver inputs are borrowed until the empty stable field is known.
     pub(crate) fn retain_internal_consumer_health(
@@ -1026,7 +1056,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
             if !self
                 .inner
                 .active_native
-                .contains_registration(registration.initial_execution, registration.generation)
+                .blocks_registration(registration.initial_execution, registration.generation)
             {
                 return;
             }
@@ -1123,7 +1153,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
             if !self
                 .inner
                 .active_native
-                .contains_registration(initial_execution, generation)
+                .blocks_registration(initial_execution, generation)
             {
                 drop(actor.request_registry_close_for_join(RegistryClose::Shutdown));
             }
@@ -1193,7 +1223,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
             let registrations = registrations
                 .into_iter()
                 .filter(|registration| {
-                    !self.inner.active_native.contains_registration(
+                    !self.inner.active_native.blocks_registration(
                         registration.initial_execution,
                         registration.generation,
                     )
@@ -1400,7 +1430,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
         if self
             .inner
             .active_native
-            .contains_registration(registration.initial_execution, registration.generation)
+            .blocks_registration(registration.initial_execution, registration.generation)
         {
             return Ok(LogicalExecutionJoinReadiness::WaitingForConvergence);
         }
@@ -1670,7 +1700,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
             if self
                 .inner
                 .active_native
-                .contains_registration(initial, generation)
+                .blocks_registration(initial, generation)
             {
                 continue;
             }

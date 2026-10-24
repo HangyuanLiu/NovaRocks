@@ -1515,3 +1515,199 @@ async fn internal_failure_ack_revokes_the_other_contexts_pre_transport_permit() 
 async fn internal_failure_watch_revokes_the_other_contexts_pre_transport_permit() {
     internal_failure_revokes_original_issue_authority(false).await;
 }
+
+struct AttemptConsumerCause(Arc<AtomicUsize>);
+impl Drop for AttemptConsumerCause {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+#[derive(Debug)]
+struct HeldAttemptConsumer {
+    entered: Mutex<Option<oneshot::Sender<()>>>,
+    gate: Mutex<Option<oneshot::Receiver<()>>>,
+    drops: Arc<AtomicUsize>,
+}
+impl crate::api::InternalComputationConsumer for HeldAttemptConsumer {
+    fn begin_local_close(&self) {}
+    fn poll_local_closed(
+        &self,
+        _: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), crate::api::StatementNativeHealthFailure>> {
+        // This actor fixture never issues a CPU job.
+        Poll::Ready(Ok(()))
+    }
+    fn consume(
+        &self,
+        activation: InternalConsumerActivation,
+    ) -> crate::api::InternalConsumerFuture {
+        let entered = self.entered.lock().unwrap().take().unwrap();
+        let gate = self.gate.lock().unwrap().take().unwrap();
+        let drops = Arc::clone(&self.drops);
+        Box::pin(async move {
+            let _original = activation;
+            let _ = entered.send(());
+            let _ = gate.await;
+            std::panic::panic_any(AttemptConsumerCause(drops));
+        })
+    }
+}
+
+#[tokio::test]
+async fn original_old_and_successor_consumers_keep_distinct_causes_after_their_real_joins() {
+    use crate::coordination::native_active_custody::{
+        OriginalConsumerStart, root_ack_successor_fixture, root_ack_test_fixture,
+    };
+    let first = execution(12_599);
+    let port = Arc::new(DelayedQualificationPort::default());
+    let (owner, initial, _output) =
+        spawn_logical_execution_actor(&Handle::current(), internal_config(first, port.clone()))
+            .unwrap()
+            .into_parts();
+    let running = Arc::new(owner.actor().activate(initial.ready()).await.unwrap());
+    let root = root_task(first, 1);
+    let mut old = running.bind_internal_consumer(root).await.unwrap();
+    let old_exit = old.supervise_exit().await.unwrap();
+    let observer = running.bind_root_result(root).await.unwrap();
+    observer
+        .observe_local_root_end(root, result_end(0))
+        .await
+        .unwrap();
+    let sender = Arc::clone(&running);
+    let delivery =
+        tokio::spawn(async move { sender.deliver_internal_end(root, result_end(0)).await });
+    let InternalResultDelivery::End(end) = old.stream.next().await.unwrap().unwrap() else {
+        panic!("original End")
+    };
+    drop(end);
+    assert_internal_exit_is_pending(owner.actor(), &old.ready).await;
+    delivery.abort();
+    assert!(delivery.await.unwrap_err().is_cancelled());
+    let (old_record, old_ack) = root_ack_test_fixture(running.identity(), root);
+    let (old_release, old_gate) = oneshot::channel();
+    let (old_entered, old_entry) = oneshot::channel();
+    let old_drops = Arc::new(AtomicUsize::new(0));
+    let mut old_input = Some(OriginalConsumerStart {
+        consumer: Arc::new(HeldAttemptConsumer {
+            entered: Mutex::new(Some(old_entered)),
+            gate: Mutex::new(Some(old_gate)),
+            drops: Arc::clone(&old_drops),
+        }),
+        activation: old,
+        exit: old_exit,
+    });
+    old_record.start_consumer_in(&mut old_input);
+    old_entry.await.unwrap();
+    let running = Arc::try_unwrap(running).expect("the real old delivery joined");
+    let successor = replace_internal_attempt(&owner, running, &port).await;
+    let next_root = root_task(successor.identity().execution(), 1);
+    let next = successor.bind_internal_consumer(next_root).await.unwrap();
+    let next_exit = next.supervise_exit().await.unwrap();
+    let _next_observer = successor.bind_root_result(next_root).await.unwrap();
+    let (next_record, next_ack) =
+        root_ack_successor_fixture(&old_record, successor.identity(), next_root);
+    let (next_release, next_gate) = oneshot::channel();
+    let (next_entered, next_entry) = oneshot::channel();
+    let next_drops = Arc::new(AtomicUsize::new(0));
+    let mut next_input = Some(OriginalConsumerStart {
+        consumer: Arc::new(HeldAttemptConsumer {
+            entered: Mutex::new(Some(next_entered)),
+            gate: Mutex::new(Some(next_gate)),
+            drops: Arc::clone(&next_drops),
+        }),
+        activation: next,
+        exit: next_exit,
+    });
+    next_record.start_consumer_in(&mut next_input);
+    next_entry.await.unwrap();
+    // These metadata-only fixture slots never issued a Native source or ACK.
+    drop((old_ack, next_ack));
+    old_record.close_native();
+    next_record.close_native();
+    let both_pending = old_record.consumer_pending() && next_record.consumer_pending();
+    let both_held = old_record.retained() && next_record.retained();
+    let _ = old_release.send(());
+    old_record.join_consumer().await;
+    let old_joined_before_successor =
+        !old_record.consumer_pending() && next_record.consumer_pending();
+    let _ = next_release.send(());
+    next_record.join_consumer().await;
+    wait_for_conclusion(owner.actor(), LogicalConclusion::Failed).await;
+    drop((successor, observer, _next_observer, _output));
+    join_original_internal_actor(owner).await;
+    assert!(both_pending && both_held && old_joined_before_successor);
+    assert!(old_record.consumer_failed() && next_record.consumer_failed());
+    assert!(!old_record.live_registration() && !next_record.live_registration());
+    assert!(
+        old_record.retained() && next_record.retained(),
+        "only the original finite health headers remain"
+    );
+    assert_eq!(old_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(next_drops.load(Ordering::SeqCst), 0);
+    old_record.dispose_for_process_exit();
+    drop(next_record);
+    assert_eq!(old_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(next_drops.load(Ordering::SeqCst), 1);
+}
+
+#[derive(Debug)]
+struct ExitTailPanicConsumer(Arc<AtomicUsize>);
+impl Drop for ExitTailPanicConsumer {
+    fn drop(&mut self) {
+        std::panic::panic_any(AttemptConsumerCause(Arc::clone(&self.0)));
+    }
+}
+impl crate::api::InternalComputationConsumer for ExitTailPanicConsumer {
+    fn begin_local_close(&self) {}
+    fn poll_local_closed(
+        &self,
+        _: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), crate::api::StatementNativeHealthFailure>> {
+        Poll::Ready(Ok(()))
+    }
+    fn consume(
+        &self,
+        activation: InternalConsumerActivation,
+    ) -> crate::api::InternalConsumerFuture {
+        Box::pin(async move {
+            drop(activation);
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn actual_consumer_join_keeps_the_opaque_receipt_tail_cause_in_its_original_attempt() {
+    use crate::coordination::native_active_custody::{
+        OriginalConsumerStart, root_ack_test_fixture,
+    };
+    let InternalFixture {
+        owner,
+        running,
+        observer,
+        activation,
+        _output,
+    } = InternalFixture::new(12_600).await;
+    let exit = activation.supervise_exit().await.unwrap();
+    let (record, ack) = root_ack_test_fixture(running.identity(), observer.root);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut input = Some(OriginalConsumerStart {
+        consumer: Arc::new(ExitTailPanicConsumer(Arc::clone(&drops))),
+        activation,
+        exit,
+    });
+    record.start_consumer_in(&mut input);
+    drop(ack);
+    record.close_native();
+    record.join_consumer().await;
+    wait_for_conclusion(owner.actor(), LogicalConclusion::Failed).await;
+    drop((running, observer, _output));
+    join_original_internal_actor(owner).await;
+    assert!(record.consumer_join_panicked());
+    assert!(record.consumer_failed());
+    assert!(!record.live_registration());
+    assert!(record.retained());
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    record.dispose_for_process_exit();
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
