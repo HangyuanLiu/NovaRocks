@@ -134,6 +134,45 @@ impl<'a> CaptureBudget<'a> {
         }
         self.active()
     }
+    /// Counting is a pure preflight, not permission to form the graph. The
+    /// original caller must admit the returned prospective amount first.
+    pub(crate) fn json_size<T: serde::Serialize + ?Sized>(
+        &self,
+        value: &T,
+    ) -> Result<u64, ReadFailure> {
+        struct Counter<'a, 'b> {
+            budget: &'a CaptureBudget<'b>,
+            bytes: u64,
+            error: Option<ReadFailure>,
+        }
+        impl std::io::Write for Counter<'_, '_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if let Err(error) = self.budget.active() {
+                    self.error = Some(error);
+                    return Err(std::io::Error::other("original read preflight stopped"));
+                }
+                self.bytes = self
+                    .bytes
+                    .checked_add(bytes.len() as u64)
+                    .ok_or_else(|| std::io::Error::other("read preflight overflow"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut counter = Counter {
+            budget: self,
+            bytes: 0,
+            error: None,
+        };
+        let result = serde_json::to_writer(&mut counter, value);
+        if let Some(error) = counter.error {
+            return Err(error);
+        }
+        result.map_err(|e| ReadFailure::Semantic(e.to_string()))?;
+        Ok(counter.bytes)
+    }
     pub(crate) fn json<T: serde::Serialize + ?Sized>(&self, value: &T) -> Result<u64, ReadFailure> {
         self.active()?;
         let mut counter = CountWriter {
@@ -153,6 +192,9 @@ impl<'a> CaptureBudget<'a> {
     /// parsed SDK field/index pair, and escaped/string buffers per source byte.
     /// This is pinned layout arithmetic, not an empirically fitted coefficient.
     pub(crate) fn json_working(&self, bytes: u64) -> Result<(), ReadFailure> {
+        self.charge(Self::json_working_upper(bytes)?)
+    }
+    pub(crate) fn json_working_upper(bytes: u64) -> Result<u64, ReadFailure> {
         use crate::iceberg::spec::NestedField;
         let node = recipe(geometry::btree_node::<
             ConnectorCowBeginCause,
@@ -166,7 +208,7 @@ impl<'a> CaptureBudget<'a> {
                 + 4 * size_of::<(String, std::sync::Arc<NestedField>)>()
                 + 16) as u64,
         ))?;
-        self.charge(recipe(mul::<ConnectorCowBeginCause>(bytes, per_byte))?)
+        recipe(mul::<ConnectorCowBeginCause>(bytes, per_byte))
     }
     /// Iceberg schema decode additionally builds qualified-name maps and
     /// cloned accessor chains. Those can grow faster than the JSON byte count.
@@ -174,6 +216,12 @@ impl<'a> CaptureBudget<'a> {
         &self,
         schema: &crate::iceberg::spec::Schema,
     ) -> Result<(), ReadFailure> {
+        self.charge(self.schema_indexes_upper(schema)?)
+    }
+    pub(crate) fn schema_indexes_upper(
+        &self,
+        schema: &crate::iceberg::spec::Schema,
+    ) -> Result<u64, ReadFailure> {
         use crate::iceberg::spec::{NestedField, PrimitiveType, Type};
         fn field(
             budget: &CaptureBudget<'_>,
@@ -239,13 +287,19 @@ impl<'a> CaptureBudget<'a> {
                 field(self, node, 0, 1)?,
             ))?;
         }
-        self.charge(total)
+        Ok(total)
     }
     pub(crate) fn delete_structures(
         &self,
         manifests: usize,
         members: usize,
     ) -> Result<(), ReadFailure> {
+        self.charge(Self::delete_structures_upper(manifests, members)?)
+    }
+    pub(crate) fn delete_structures_upper(
+        manifests: usize,
+        members: usize,
+    ) -> Result<u64, ReadFailure> {
         use crate::delete_semantics::*;
         let mut upper = recipe(hash_max::<ConnectorCowBeginCause, std::sync::Arc<str>>(
             manifests,
@@ -284,7 +338,7 @@ impl<'a> CaptureBudget<'a> {
         }
         // Insert-only tables/Vecs may coexist with their previous backing,
         // and each bucket's minimum capacity can be four even for one member.
-        self.charge(recipe(mul::<ConnectorCowBeginCause>(upper, 8))?)
+        recipe(mul::<ConnectorCowBeginCause>(upper, 8))
     }
 }
 struct CountWriter<'a, 'b> {

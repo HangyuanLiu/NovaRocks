@@ -16,6 +16,8 @@
 // under the License.
 
 //! Stable action custody in the original registered statement, never a Work role.
+//!
+//! Design: ADR-0198 (docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md).
 
 use super::*;
 /// An action cannot return a second governed owner through its value slot.
@@ -212,7 +214,11 @@ impl StatementActionReceipt {
                 drop(state);
                 return Err(self);
             }
-            let mut owner = state.owner.take().expect("checked original owner");
+            let mut owner = state
+                .owner
+                .take()
+                .expect("checked original owner")
+                .into_sql();
             owner.restore_control_link(&self.service);
             let result = state.result.take().expect("checked original result");
             state.delivered = true;
@@ -288,15 +294,101 @@ impl Drop for StatementActionWaiter {
     }
 }
 
+enum ActionOwner {
+    Sql(GovernedQueryStatementOwner),
+    Background(super::background_source::BackgroundActionCustody),
+}
+impl ActionOwner {
+    fn sql_mut(&mut self) -> &mut GovernedQueryStatementOwner {
+        match self {
+            Self::Sql(owner) => owner,
+            Self::Background(_) => panic!("SQL facade requires its original SQL owner"),
+        }
+    }
+    fn into_sql(self) -> GovernedQueryStatementOwner {
+        match self {
+            Self::Sql(owner) => owner,
+            Self::Background(_) => panic!("SQL receipt requires its original SQL owner"),
+        }
+    }
+    fn is_background(&self) -> bool {
+        matches!(self, Self::Background(_))
+    }
+    fn execution_owner_slot(&mut self) -> &mut Option<WorkOwner> {
+        match self {
+            Self::Sql(owner) => owner.execution_owner_slot(),
+            Self::Background(owner) => &mut owner.owner,
+        }
+    }
+}
+enum ActionBody {
+    Sql(Box<dyn GovernedStatementAction>),
+    Background(Box<dyn super::background_source::GovernedBackgroundAction>),
+}
+impl ActionBody {
+    fn publication_disposition(&self) -> Option<LakePublicationDisposition> {
+        match self {
+            Self::Sql(a) => a.publication_disposition(),
+            Self::Background(a) => a.publication_disposition(),
+        }
+    }
+    fn local_health_failure(&self) -> Option<crate::api::StatementNativeHealthFailure> {
+        match self {
+            Self::Sql(a) => a.local_health_failure(),
+            Self::Background(a) => a.local_health_failure(),
+        }
+    }
+    fn handoff_residual_in(
+        &mut self,
+        target: &mut Option<Box<dyn GovernedStatementResidual>>,
+    ) -> Result<(), crate::api::StatementNativeHealthFailure> {
+        match self {
+            Self::Sql(a) => a.handoff_residual_in(target),
+            Self::Background(a) => a.handoff_residual_in(target),
+        }
+    }
+    fn poll_action(
+        &mut self,
+        owner: &mut ActionOwner,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<StatementActionValue, QueryServiceError>> {
+        match (self, owner) {
+            (Self::Sql(action), ActionOwner::Sql(owner)) => {
+                let window = owner.result_window_alias();
+                let mut context = owner.action_context(window.as_ref());
+                action.poll_action(&mut context, cx)
+            }
+            (Self::Background(action), ActionOwner::Background(owner)) => owner
+                .poll(action.as_mut(), cx)
+                .map(|result| result.map(|()| StatementActionValue::Ok)),
+            _ => panic!("same original action and owner kind"),
+        }
+    }
+}
+#[derive(Clone)]
+enum ActionCancellation {
+    Sql(GovernedStatementCancellation),
+    Background(novarocks_workload_control::WorkCancellationRequester),
+}
+impl ActionCancellation {
+    fn requester(&self) -> &novarocks_workload_control::WorkCancellationRequester {
+        match self {
+            Self::Sql(c) => c.requester(),
+            Self::Background(c) => c,
+        }
+    }
+}
+
 struct StatementActionState {
-    owner: Option<GovernedQueryStatementOwner>,
-    action: Option<Box<dyn GovernedStatementAction>>,
+    // Passive result backing drops before its original owner/window/payload.
+    result: Option<Result<StatementActionValue, QueryServiceError>>,
+    owner: Option<ActionOwner>,
+    action: Option<ActionBody>,
     residual: Option<Box<dyn GovernedStatementResidual>>,
     residual_work: Option<WorkOwner>,
     retirement_complete: bool,
     delivered: bool,
-    cancellation: Option<GovernedStatementCancellation>,
-    result: Option<Result<StatementActionValue, QueryServiceError>>,
+    cancellation: Option<ActionCancellation>,
     failure: Option<Arc<StatementActionFailure>>,
     // Retirement health retains the source without vetoing completed business.
     business_failed: bool,
@@ -316,6 +408,7 @@ pub struct StatementActionSource {
 }
 struct StatementActionWake {
     root: Weak<StatementProgressSlot>,
+    background: AtomicWaker,
 }
 impl Wake for StatementActionWake {
     fn wake(self: Arc<Self>) {
@@ -325,10 +418,14 @@ impl Wake for StatementActionWake {
         if let Some(root) = self.root.upgrade() {
             root.notify();
         }
+        self.background.wake();
     }
 }
 impl StatementActionSource {
     fn empty(root: &Arc<StatementProgressSlot>) -> Arc<Self> {
+        Self::empty_with_root(Arc::downgrade(root))
+    }
+    fn empty_with_root(root: Weak<StatementProgressSlot>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(StatementActionState {
                 owner: None,
@@ -351,7 +448,8 @@ impl StatementActionSource {
             abandoned: AtomicBool::new(false),
             cancel_requested: AtomicBool::new(false),
             wake: Arc::new(StatementActionWake {
-                root: Arc::downgrade(root),
+                root,
+                background: AtomicWaker::new(),
             }),
         })
     }
@@ -369,9 +467,9 @@ impl StatementActionSource {
             .as_mut()
             .expect("checked original owner")
             .park_control_link();
-        state.owner = owner.take();
-        state.action = action.take();
-        state.cancellation = Some(cancellation.clone());
+        state.owner = owner.take().map(ActionOwner::Sql);
+        state.action = action.take().map(ActionBody::Sql);
+        state.cancellation = Some(ActionCancellation::Sql(cancellation.clone()));
     }
     fn abandon(&self) {
         self.abandoned.store(true, Ordering::Release);
@@ -408,7 +506,8 @@ impl StatementActionSource {
         if let Some(work) = residual_work {
             work.complete_after_terminal_cancel_settled();
         }
-        if let Some(mut owner) = owner {
+        if let Some(owner) = owner {
+            let mut owner = owner.into_sql();
             owner.restore_control_link(service);
             if !settled {
                 assert!(service.port.detach_statement_action(owner.token(), self));
@@ -466,7 +565,7 @@ impl StatementActionSource {
             std::panic::panic_any(packet);
         }
     }
-    fn retain_local_health(&self, action: &dyn GovernedStatementAction) -> bool {
+    fn retain_local_health(&self, action: &ActionBody) -> bool {
         // Borrow foreign metadata outside State. The original action remains
         // in its restoration loan on panic and on an actual-exit refusal.
         match catch_unwind(AssertUnwindSafe(|| action.local_health_failure())) {
@@ -481,7 +580,7 @@ impl StatementActionSource {
             }
         }
     }
-    fn retain_publication(&self, action: &dyn GovernedStatementAction) -> bool {
+    fn retain_publication(&self, action: &ActionBody) -> bool {
         // Foreign code runs outside the metadata lock, while the original
         // action/owner loan and its first raw failure remain retained.
         let fact = match catch_unwind(AssertUnwindSafe(|| action.publication_disposition())) {
@@ -550,20 +649,17 @@ impl StatementActionSource {
         let waker = std::task::Waker::from(Arc::clone(&self.wake));
         let mut cx = Context::from_waker(&waker);
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let owner = loan.owner.as_mut().unwrap();
-            let window = owner.result_window_alias();
-            let mut context = owner.action_context(window.as_ref());
             loan.action
                 .as_mut()
                 .unwrap()
-                .poll_action(&mut context, &mut cx)
+                .poll_action(loan.owner.as_mut().unwrap(), &mut cx)
         }));
         match result {
             Ok(Poll::Pending) => {
                 let healthy =
-                    self.retain_local_health(loan.action.as_deref().expect("same original action"));
+                    self.retain_local_health(loan.action.as_ref().expect("same original action"));
                 if !healthy {
-                    self.retain_publication(loan.action.as_deref().expect("same original action"));
+                    self.retain_publication(loan.action.as_ref().expect("same original action"));
                 }
                 drop(loan);
                 if !healthy {
@@ -574,7 +670,7 @@ impl StatementActionSource {
                 // The same original cause becomes stable BEFORE any action/F
                 // cleanup. The poisoned action is retained and never repolled.
                 self.record_failure(primary);
-                self.retain_publication(loan.action.as_deref().expect("same original action"));
+                self.retain_publication(loan.action.as_ref().expect("same original action"));
                 drop(loan);
                 self.waiter.wake();
             }
@@ -585,16 +681,15 @@ impl StatementActionSource {
                 }
                 // A close failure preserves the whole action/owner even when
                 // its safe business result is Ready. It is not a fake panic.
-                if !self.retain_local_health(loan.action.as_deref().expect("same original action"))
-                {
-                    self.retain_publication(loan.action.as_deref().expect("same original action"));
+                if !self.retain_local_health(loan.action.as_ref().expect("same original action")) {
+                    self.retain_publication(loan.action.as_ref().expect("same original action"));
                     drop(loan);
                     self.waiter.wake();
                     return;
                 }
                 // The value is stable before reading the original effect fact,
                 // which must survive a subsequent action destructor panic.
-                if !self.retain_publication(loan.action.as_deref().expect("same original action")) {
+                if !self.retain_publication(loan.action.as_ref().expect("same original action")) {
                     drop(loan);
                     self.waiter.wake();
                     return;
@@ -644,7 +739,26 @@ impl StatementActionSource {
                 drop(loan);
                 let cleanup = catch_unwind(AssertUnwindSafe(|| drop(action)));
                 match cleanup {
-                    Ok(()) => self.state.lock().unwrap_or_else(|p| p.into_inner()).closed = true,
+                    Ok(()) => {
+                        // The residual is stable and the action actually exited.
+                        // Release query concurrency at business terminal, without
+                        // dropping the original Root or waiting for unrelated GC.
+                        let query_permit = {
+                            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                            match state.owner.as_mut() {
+                                Some(ActionOwner::Background(owner)) => {
+                                    owner.take_business_query_permit()
+                                }
+                                _ => None,
+                            }
+                        };
+                        match catch_unwind(AssertUnwindSafe(|| drop(query_permit))) {
+                            Ok(()) => {
+                                self.state.lock().unwrap_or_else(|p| p.into_inner()).closed = true
+                            }
+                            Err(primary) => self.record_failure(primary),
+                        }
+                    }
                     Err(primary) => self.record_failure(primary),
                 }
                 let has_residual = {
@@ -700,6 +814,30 @@ impl StatementActionSource {
                     self.record_retirement_cause(StatementActionFailureCause::Panic(Mutex::new(
                         primary,
                     )));
+                    self.waiter.wake();
+                    return;
+                }
+                let background_restored = {
+                    let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    if matches!(state.owner, Some(ActionOwner::Background(_))) {
+                        let work = state.residual_work.take();
+                        if let Some(ActionOwner::Background(owner)) = state.owner.as_mut() {
+                            assert!(owner.owner.is_none());
+                            owner.owner = work;
+                            if owner.owner.is_some() {
+                                state.retirement_complete = true;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            unreachable!()
+                        }
+                    } else {
+                        false
+                    }
+                };
+                if background_restored {
                     self.waiter.wake();
                     return;
                 }
@@ -759,6 +897,7 @@ impl StatementActionSource {
                 || state.business_failed
                 || state.polling
                 || state.owner.is_none()
+                || state.owner.as_ref().is_some_and(ActionOwner::is_background)
             {
                 return;
             }
@@ -773,17 +912,24 @@ impl StatementActionSource {
         let Some(mut loan) = StatementCleanupLoan::take(Arc::clone(self)) else {
             return;
         };
-        let token = loan.owner.as_ref().expect("same original owner").token();
+        let token = loan
+            .owner
+            .as_mut()
+            .expect("same original owner")
+            .sql_mut()
+            .token();
         let port = loan
             .owner
-            .as_ref()
+            .as_mut()
             .expect("same original owner")
+            .sql_mut()
             .service
             .port();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             loan.owner
                 .as_mut()
                 .expect("same original owner")
+                .sql_mut()
                 .cleanup_abandoned_action_in_place()
         }));
         if let Err(primary) = outcome {
@@ -809,6 +955,174 @@ impl StatementActionSource {
         );
         self.waiter.wake();
     }
+    pub(crate) fn empty_background() -> Arc<Self> {
+        Self::empty_with_root(Weak::new())
+    }
+    pub(crate) fn install_background(
+        &self,
+        custody: super::background_source::BackgroundActionCustody,
+        requester: novarocks_workload_control::WorkCancellationRequester,
+        action: &mut Option<Box<dyn super::background_source::GovernedBackgroundAction>>,
+    ) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(state.owner.is_none() && state.action.is_none());
+            state.owner = Some(ActionOwner::Background(custody));
+            state.action = action.take().map(ActionBody::Background);
+            state.cancellation = Some(ActionCancellation::Background(requester));
+        }
+    }
+    pub(crate) fn install_background_owner(&self, owner: &mut Option<WorkOwner>) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(ActionOwner::Background(custody)) = state.owner.as_mut() else {
+            panic!("original background custody is installed before its bank mount");
+        };
+        custody.install_owner(owner);
+    }
+    pub(crate) fn validate_background_owner(&self, owner: &WorkOwner) -> bool {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        matches!(&state.owner, Some(ActionOwner::Background(c))
+            if c.owner.is_none() && c.cancellation().is_for_scope(&owner.scope()))
+    }
+    pub(crate) fn poll_background(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), crate::api::QueryExecutionError>> {
+        self.wake.background.register(cx.waker());
+        self.poll();
+        if self.failure().is_some() {
+            return Poll::Ready(Err(super::background_source::background_failed()));
+        }
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.closed
+            && !state.polling
+            && state.retirement_complete
+            && state.residual.is_none()
+            && state.residual_work.is_none()
+            && matches!(&state.owner, Some(ActionOwner::Background(_)))
+        {
+            // The original business receipt already retains an ordinary Err.
+            // This role reports supervision health: clean action/residual exit
+            // cannot poison the process supervisor for a domain failure.
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+    pub(crate) fn finish_background_after_bank_exit(self: &Arc<Self>) {
+        {
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if !state.closed
+                || state.polling
+                || state.failure.is_some()
+                || !state.retirement_complete
+                || state.residual.is_some()
+                || state.residual_work.is_some()
+                || !matches!(&state.owner, Some(ActionOwner::Background(c)) if !c.finished())
+            {
+                return;
+            }
+        }
+        // Keep the canonical business result in this SAME Source through the
+        // original bank footer; acknowledgement never destroys its raw error.
+        let Some(mut loan) = StatementCleanupLoan::take(Arc::clone(self)) else {
+            return;
+        };
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let Some(ActionOwner::Background(custody)) = loan.owner.as_mut() else {
+                panic!("same background owner cleanup loan");
+            };
+            custody.close();
+        }));
+        if let Err(primary) = outcome {
+            // Same common first-cause slots precede restoration/foreign Drop.
+            self.record_failure(primary);
+        }
+        drop(loan);
+        // The original bank receiver publishes its footer before notifying.
+        // No arbitrary receiver wake is permitted in this silent close cut.
+    }
+    pub(crate) fn background_actual_exit(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.failure.is_none()
+            && !state.polling
+            && state.closed
+            && state.retirement_complete
+            && state.residual.is_none()
+            && state.residual_work.is_none()
+            && matches!(&state.owner, Some(ActionOwner::Background(c)) if c.finished())
+    }
+    pub(crate) fn poll_background_ready(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Arc<StatementActionFailure>>> {
+        self.waiter.register(cx.waker());
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.polling {
+            return Poll::Pending;
+        }
+        if state.business_failed {
+            return Poll::Ready(Err(Arc::clone(state.failure.as_ref().unwrap())));
+        }
+        if state.closed && state.result.is_some() {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+    pub(crate) fn try_background_result(&self) -> Option<BackgroundActionResultGuard<'_>> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        (state.closed && state.result.is_some()).then_some(BackgroundActionResultGuard { state })
+    }
+    pub(crate) fn background_result(&self) -> BackgroundActionResultGuard<'_> {
+        BackgroundActionResultGuard {
+            state: self.state.lock().unwrap_or_else(|p| p.into_inner()),
+        }
+    }
+    pub(crate) fn acknowledge_background(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(state.closed && state.result.is_some() && !state.delivered);
+        // Delivery is a pure acknowledgement. It does not wake or gate the
+        // independent original execution/retirement path.
+        state.delivered = true;
+    }
+    pub(crate) fn abandon_background(&self) {
+        if !self.background_actual_exit() {
+            self.abandon();
+        }
+    }
+    pub(crate) fn stop_background(&self) {
+        self.stop();
+        self.notify_root();
+    }
+    pub(crate) fn background_geometry() -> super::background_source::BackgroundActionSourceGeometry
+    {
+        use novarocks_type_contract::owned_resources::layout::arc_layout;
+        use std::alloc::Layout;
+        super::background_source::BackgroundActionSourceGeometry {
+            source: arc_layout(Layout::new::<Self>()).expect("actual common action Source"),
+            wake: arc_layout(Layout::new::<StatementActionWake>())
+                .expect("actual common action wake"),
+            failure: arc_layout(Layout::new::<StatementActionFailure>())
+                .expect("actual original failure"),
+            // Exact Arc<str> allocation made by the same background_failed author.
+            summary: arc_layout(
+                Layout::array::<u8>(super::background_source::BACKGROUND_FAILURE_DETAIL.len())
+                    .expect("actual background failure detail"),
+            )
+            .expect("actual background failure Arc"),
+            ready: Layout::new::<super::background_source::BackgroundActionReady>(),
+            receipt: Layout::new::<super::background_source::BackgroundActionReceipt>(),
+            custody: Layout::new::<super::background_source::BackgroundActionCustody>(),
+            mutex_backing: if cfg!(all(target_os = "macos", target_pointer_width = "64")) {
+                Layout::new::<(isize, [u8; 56])>()
+            } else if cfg!(target_os = "linux") {
+                Layout::new::<()>()
+            } else {
+                panic!("unsupported common action Source Mutex backing")
+            },
+        }
+    }
     pub(crate) fn is_settled(&self) -> bool {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).settled
     }
@@ -826,7 +1140,7 @@ fn publication_code(fact: Option<LakePublicationDisposition>) -> u8 {
 // the original owner on every unwind BEFORE the root can retain its packet.
 struct StatementCleanupLoan {
     source: Arc<StatementActionSource>,
-    owner: Option<GovernedQueryStatementOwner>,
+    owner: Option<ActionOwner>,
 }
 impl StatementCleanupLoan {
     fn take(source: Arc<StatementActionSource>) -> Option<Self> {
@@ -851,8 +1165,8 @@ impl Drop for StatementCleanupLoan {
 }
 struct StatementPollLoan {
     source: Arc<StatementActionSource>,
-    action: Option<Box<dyn GovernedStatementAction>>,
-    owner: Option<GovernedQueryStatementOwner>,
+    action: Option<ActionBody>,
+    owner: Option<ActionOwner>,
     residual: Option<Box<dyn GovernedStatementResidual>>,
     residual_work: Option<WorkOwner>,
 }
@@ -1126,4 +1440,24 @@ pub struct StatementProgressGeometry {
     pub observer: std::alloc::Layout,
     pub receipt: std::alloc::Layout,
     pub failure: std::alloc::Layout,
+}
+
+pub struct BackgroundActionResultGuard<'a> {
+    state: std::sync::MutexGuard<'a, StatementActionState>,
+}
+impl BackgroundActionResultGuard<'_> {
+    pub fn result(&self) -> super::background_source::BackgroundActionResultView<'_> {
+        match self
+            .state
+            .result
+            .as_ref()
+            .expect("live original background business receipt")
+        {
+            Ok(StatementActionValue::Ok) => {
+                super::background_source::BackgroundActionResultView::Succeeded
+            }
+            Err(error) => super::background_source::BackgroundActionResultView::Failed(error),
+            _ => unreachable!("closed Background action returns no SQL output"),
+        }
+    }
 }

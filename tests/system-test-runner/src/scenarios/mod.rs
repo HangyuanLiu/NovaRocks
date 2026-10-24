@@ -35,6 +35,7 @@ mod mv_uea7_handover;
 mod mv_uea7_incarnation;
 mod mv_uea7_storage;
 mod native_compatibility;
+mod native_create_hold;
 mod native_creation;
 mod native_direct_controls;
 mod native_ingress;

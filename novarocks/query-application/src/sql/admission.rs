@@ -124,7 +124,11 @@ pub fn requires_lake_publication_deadline(statement: &ParsedStatement) -> bool {
 /// path. Plain queries and session commands must use their dedicated routes.
 pub fn typed_statement_work_class(statement: &ParsedStatement) -> WorkClass {
     match statement {
-        ParsedStatement::Dml(_) | ParsedStatement::ExplainQuery(_) => WorkClass::Query,
+        ParsedStatement::Dml(_)
+        | ParsedStatement::ExplainQuery(_)
+        | ParsedStatement::Statistics(ast::StatisticsStatement::AnalyzeTable(_)) => {
+            WorkClass::Query
+        }
         ParsedStatement::Session(_) | ParsedStatement::Query(_) => {
             unreachable!("session and plain query statements do not use the typed route")
         }
@@ -405,16 +409,53 @@ mod tests {
             typed_statement_work_class(&management),
             WorkClass::Management
         );
-        // A waiting submitting statement must not hold the warehouse query
-        // slot needed by its independently governed statistics/optimize job.
+        // OPTIMIZE retains its existing management admission policy.
+        let optimize = parse_single_statement("ALTER TABLE lake.db.events OPTIMIZE")
+            .expect("parse job-submitting statement");
+        assert_eq!(typed_statement_work_class(&optimize), WorkClass::Management);
+    }
+
+    #[test]
+    fn analyze_reserves_the_original_query_permit_for_its_job_handoff() {
+        // Capture closes before moving this same grant into the job. It must
+        // not enter the management route with an empty query-permit slot.
         for sql in [
             "ANALYZE TABLE lake.db.events",
-            "ALTER TABLE lake.db.events OPTIMIZE",
+            "ANALYZE FULL TABLE lake.db.events (event_id) WITH SYNC MODE",
+            "ANALYZE SAMPLE TABLE lake.db.events",
         ] {
-            let statement = parse_single_statement(sql).expect("parse job-submitting statement");
+            let statement = parse_single_statement(sql).expect("parse ANALYZE");
+            assert!(matches!(
+                statement,
+                ParsedStatement::Statistics(ast::StatisticsStatement::AnalyzeTable(_))
+            ));
             assert_eq!(
                 typed_statement_work_class(&statement),
-                WorkClass::Management
+                WorkClass::Query,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn statistics_observation_cancellation_and_drop_remain_management() {
+        for sql in [
+            "SHOW ANALYZE JOBS",
+            "SHOW TABLE STATS lake.db.events",
+            "SHOW BASIC STATS META",
+            "SHOW HISTOGRAM STATS META",
+            "CANCEL ANALYZE 018f8c30-8a95-7b4e-b515-4da6f2aeb419",
+            "KILL ANALYZE 018f8c30-8a95-7b4e-b515-4da6f2aeb419",
+            "DROP STATS lake.db.events",
+            "DROP HISTOGRAM ON lake.db.events (event_id)",
+            "DROP MULTIPLE COLUMNS STATS lake.db.events",
+        ] {
+            let statement = parse_single_statement(sql).expect("parse statistics management");
+            assert!(matches!(statement, ParsedStatement::Statistics(_)));
+            assert_eq!(
+                typed_statement_work_class(&statement),
+                WorkClass::Management,
+                "{sql}"
             );
         }
     }

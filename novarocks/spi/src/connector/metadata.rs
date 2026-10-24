@@ -1558,6 +1558,14 @@ pub type ConnectorTablePreparationFuture<'a> = std::pin::Pin<
 >;
 
 pub trait ConnectorMetadata: Send + Sync {
+    /// Pure selected first-party metadata CPU author, authenticated with the
+    /// original planning lease before any closed phase is accepted.
+    fn provider_metadata_cpu_author(
+        &self,
+    ) -> Option<(super::ConnectorProviderBindingKey, std::any::TypeId)> {
+        None
+    }
+
     fn instance_id(&self) -> &ConnectorInstanceId;
 
     /// Await the original provider's real I/O before borrowing any synchronous
@@ -1814,6 +1822,48 @@ pub trait ConnectorMetadata: Send + Sync {
             Err(ConnectorError::new(
                 super::ConnectorErrorKind::Unsupported,
                 "connector metadata does not support asynchronous physical table object rebinding",
+            ))
+        })
+    }
+
+    /// Statistics-only schema creation with the same original scoped CPU.
+    /// No implementation may fall back to an unqualified synchronous creator.
+    fn capture_table_object_binding_for_statistics_async(
+        &self,
+        _request: ConnectorTableObjectCaptureRequest,
+        _cpu: Arc<dyn super::StatisticsCpuPort>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorTableObjectBinding, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata has no scoped Statistics binding creator",
+            ))
+        })
+    }
+
+    /// Statistics-only schema creation with the same original scoped CPU.
+    /// No implementation may fall back to an unqualified synchronous creator.
+    fn rebind_table_object_binding_for_statistics_async(
+        &self,
+        _request: ConnectorTableObjectRebindRequest,
+        _cpu: Arc<dyn super::StatisticsCpuPort>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorTableObjectBinding, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata has no scoped Statistics binding creator",
             ))
         })
     }

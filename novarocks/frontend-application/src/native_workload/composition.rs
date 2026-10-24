@@ -26,11 +26,11 @@ use crate::query_execution::maintenance::command::MaintenanceCommandExecutor;
 use novarocks_native_adapter::FrontendTaskTransportBudget;
 use novarocks_query_application::coordination::LogicalExecutionSupervisor;
 use novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry;
+use novarocks_workload_control::ControlStorageConfig;
 use novarocks_workload_control::joint_admission::{
     JointCapacityConfig, JointLane, JointResource as R, JointResourceLimits as Limits,
     JointResources as V, RequiredJointProgress, RootStageSource,
 };
-use novarocks_workload_control::ControlStorageConfig;
 
 /// Original Server/MySQL facts. These are bounds, not a new listener quota or
 /// a substitute for the original ingress author enforcing its same limits.
@@ -846,6 +846,20 @@ fn process_source_backing(
         complete_dependency_limit,
     )?)
     .map_err(|_| WorkError::ArithmeticOverflow)?;
+    let statistics_job_bytes = usize::try_from(
+        crate::statistics_jobs::attempt_executor::fixed_source_bytes(
+            metadata,
+            complete_dependency_limit,
+        )?,
+    )
+    .map_err(|_| WorkError::ArithmeticOverflow)?;
+    let statistics_submission_bytes = usize::try_from(
+        crate::statistics_jobs::service::submission_fixed_source_bytes(
+            metadata,
+            complete_dependency_limit,
+        )?,
+    )
+    .map_err(|_| WorkError::ArithmeticOverflow)?;
     let statement_family = Layout::array::<u8>(
         explain_bytes
             .max(insert_bytes)
@@ -853,7 +867,17 @@ fn process_source_backing(
             .max(ctas_bytes)
             .max(read_bytes)
             .max(mutation_bytes)
-            .max(maintenance_bytes),
+            .max(maintenance_bytes)
+            .max(statistics_job_bytes)
+            .max(statistics_submission_bytes)
+            // Each original statement Root can independently observe the
+            // repository. Its list/get/cancel copies and safe String delta
+            // are NOT included in the one shared cache quote below.
+            .max(
+                novarocks_statistics_application::publication_failure_geometry()?
+                    .observation_backing
+                    .size(),
+            ),
     )
     .map_err(|_| WorkError::ArithmeticOverflow)?;
     let apply = NativeTaskOperationSink::source_geometry_for_composition(transport.into_codec())?;
@@ -908,6 +932,9 @@ fn process_source_backing(
             progress.custody_arc,
             progress.worker_frame,
             progress.owned_sleep,
+            // These fixed facts outlive their original Root and belong to
+            // the SAME process repository; never charge them per Root.
+            novarocks_statistics_application::publication_failure_geometry()?.backing,
             // The moved JointProgressDriver itself is already included once
             // by its original metadata_backing_bytes author.
         ],
@@ -1273,6 +1300,10 @@ mod tests {
         // have already paid the full actual INSERT and metadata family peak.
         let per_root = (paid.bytes(2).unwrap() - paid.bytes(1).unwrap())
             - (role.bytes(2).unwrap() - role.bytes(1).unwrap());
+        let history = novarocks_statistics_application::publication_failure_geometry().unwrap();
+        assert!(per_root >= history.observation_backing.size());
+        let shared = paid.bytes(1).unwrap() - role.bytes(1).unwrap() - per_root;
+        assert!(shared >= history.backing.size());
         assert!(
             per_root as u64
                 >= crate::query::insert_action::fixed_source_bytes(&geometry, 3).unwrap()
@@ -1280,6 +1311,16 @@ mod tests {
         assert!(
             per_root as u64
                 >= crate::query::metadata_statement_fixed_source_bytes(&geometry, 3).unwrap()
+        );
+        assert!(
+            per_root as u64
+                >= crate::statistics_jobs::attempt_executor::fixed_source_bytes(&geometry, 3)
+                    .unwrap()
+        );
+        assert!(
+            per_root as u64
+                >= crate::statistics_jobs::service::submission_fixed_source_bytes(&geometry, 3)
+                    .unwrap()
         );
     }
 

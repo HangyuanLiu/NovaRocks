@@ -76,6 +76,7 @@ struct State {
 pub(super) struct OriginalLogicalExit {
     state: Mutex<State>,
     pub(super) native: Arc<tokio::sync::Mutex<OriginalNativePreparation>>,
+    pub(super) background: Option<Arc<crate::session_control::StatementActionSource>>,
     changed: futures::task::AtomicWaker,
 }
 impl fmt::Debug for OriginalLogicalExit {
@@ -114,12 +115,20 @@ impl OriginalLogicalExit {
                 health_disposed: false,
             }),
             native: Arc::new(tokio::sync::Mutex::new(OriginalNativePreparation::default())),
+            background: None,
             changed: futures::task::AtomicWaker::new(),
         });
         // Initialize the one quoted platform backing before any alias can
         // race its lazy initialization through a newly published Source.
         drop(source.state.lock().unwrap_or_else(|p| p.into_inner()));
         source
+    }
+    pub(super) fn with_background(
+        source: Arc<crate::session_control::StatementActionSource>,
+    ) -> Arc<Self> {
+        let mut original = Self::new();
+        Arc::get_mut(&mut original).unwrap().background = Some(source);
+        original
     }
     pub(super) fn with_native(
         request: crate::api::QueryExecutionRequest,
@@ -316,6 +325,13 @@ impl OriginalLogicalExit {
         state.run_panic.is_some() || state.run_cleanup_panic.is_some()
     }
     pub(super) fn has_unhandled_failure(&self) -> bool {
+        if self
+            .background
+            .as_ref()
+            .is_some_and(|source| source.failure().is_some())
+        {
+            return true;
+        }
         let s = self.lock();
         !s.health_disposed
             && (s.role_failed
@@ -324,6 +340,17 @@ impl OriginalLogicalExit {
                 || s.run_cleanup_panic.is_some()
                 || s.consumer_failed
                 || matches!(&s.actor, Some(Err(_))))
+    }
+    pub(super) fn retire_background_after_bank_exit_silent(&self, packet: &RoleResult) {
+        let actual_frame_exit = match packet {
+            PollCompletion::Ready(_) => true,
+            PollCompletion::Panicked(original) => original.value().cleanup().is_none(),
+        };
+        if actual_frame_exit {
+            if let Some(source) = &self.background {
+                source.finish_background_after_bank_exit();
+            }
+        }
     }
     pub(super) fn receive_role_silent(&self, packet: &mut Option<RoleResult>) {
         let mut s = self.lock();
@@ -336,6 +363,13 @@ impl OriginalLogicalExit {
         s.role = packet.take();
     }
     pub(super) fn has_failure(&self) -> bool {
+        if self
+            .background
+            .as_ref()
+            .is_some_and(|source| source.failure().is_some())
+        {
+            return true;
+        }
         let s = self.lock();
         s.role_failed
             || s.native_failure.is_some()
@@ -353,6 +387,13 @@ impl OriginalLogicalExit {
             )
     }
     fn disposition(&self) -> Option<LocalExecutionDisposition> {
+        if self
+            .background
+            .as_ref()
+            .is_some_and(|source| !source.background_actual_exit())
+        {
+            return None;
+        }
         let s = self.lock();
         let cleared = match &s.role {
             Some(PollCompletion::Ready(_)) => true,
@@ -543,6 +584,21 @@ impl LogicalDormantFailureView<'_> {
     }
 }
 impl LogicalExecutionExitObserver {
+    /// Borrow the canonical background business result without cloning its cause.
+    pub fn background_result(
+        &self,
+    ) -> Option<crate::session_control::BackgroundActionResultGuard<'_>> {
+        self.source
+            .as_ref()?
+            .background
+            .as_ref()?
+            .try_background_result()
+    }
+    pub fn background_failure(
+        &self,
+    ) -> Option<Arc<crate::session_control::StatementActionFailure>> {
+        self.source.as_ref()?.background.as_ref()?.failure()
+    }
     pub(crate) fn dormant_failure(&self) -> Option<LogicalDormantFailureView<'_>> {
         let body = self.source.as_ref()?.native.try_lock().ok()?;
         if !body.dormant.has_failure() {
@@ -588,6 +644,17 @@ impl Drop for LogicalExecutionExitObserver {
     }
 }
 impl LogicalExecutionExitReceipt {
+    /// The same original Source survives the bank footer and retains raw facts.
+    pub fn background_result(
+        &self,
+    ) -> Option<crate::session_control::BackgroundActionResultGuard<'_>> {
+        self.source.background.as_ref()?.try_background_result()
+    }
+    pub fn background_failure(
+        &self,
+    ) -> Option<Arc<crate::session_control::StatementActionFailure>> {
+        self.source.background.as_ref()?.failure()
+    }
     pub const fn local_disposition(&self) -> LocalExecutionDisposition {
         self.local
     }
@@ -635,11 +702,21 @@ impl LogicalExecutionExitGeometry {
                 "unsupported logical Source Mutex backing",
             ));
         };
+        let background = crate::session_control::StatementActionSource::background_geometry();
         novarocks_workload_control::PollRoleSourceBacking::from_layouts(
             &[
                 self.source,
                 self.native_body,
                 self.health_wrapper,
+                mutex_backing,
+                background.source,
+                background.wake,
+                background.failure,
+                background.failure,
+                background.summary,
+                // Common source State plus its two possible raw-cause mutexes.
+                mutex_backing,
+                mutex_backing,
                 mutex_backing,
             ],
             &[],
@@ -662,7 +739,7 @@ impl LogicalExecutionExitObserver {
             )?,
             observer: Layout::new::<Self>(),
             receipt: Layout::new::<LogicalExecutionExitReceipt>(),
-            input_header: Layout::new::<super::supervisor::OriginalLogicalStartInput>(),
+            input_header: Layout::new::<super::supervisor::OriginalStartHeader>(),
             publication_tail: Layout::new::<super::supervisor::LogicalExecutionStartAttempt>(),
             health_wrapper: Layout::new::<LogicalExitHealthCustody>(),
         })

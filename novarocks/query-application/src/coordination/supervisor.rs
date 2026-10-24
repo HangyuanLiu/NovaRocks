@@ -22,6 +22,8 @@
 //! a future to the caller. The same supervisor task polls every logical role;
 //! dropping a caller reply cannot detach its original frame or input. Actor
 //! and statement Native residual owners retain their existing exit contracts.
+//!
+//! Design: ADR-0198 (docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md).
 
 use super::LogicalExecutionExitObserver;
 use super::original_exit::OriginalLogicalExit;
@@ -479,6 +481,11 @@ impl LogicalExecutionSupervisor {
         geometry.with_source_backing(Self::logical_role_source_backing()?)
     }
 
+    pub fn background_action_source_geometry()
+    -> crate::session_control::BackgroundActionSourceGeometry {
+        crate::session_control::StatementActionSource::background_geometry()
+    }
+
     fn logical_role_source_backing()
     -> Result<novarocks_workload_control::PollRoleSourceBacking, WorkError> {
         LogicalExecutionExitObserver::metadata_geometry()
@@ -815,7 +822,7 @@ impl QueryExecutionDriver for QueryExecutionDriverHandle {
         let internal_cut = request.description().finish_boundary()
             == crate::preparation::ExecutionFinishBoundary::ComputationReady;
         let source = OriginalLogicalExit::with_native(request, Arc::clone(&self.native));
-        let input = LogicalRoleInput {
+        let input = LogicalRoleInput::Native(NativeLogicalRoleInput {
             reply,
             reserved,
             query_ids: Arc::clone(&self.query_ids),
@@ -825,7 +832,7 @@ impl QueryExecutionDriver for QueryExecutionDriverHandle {
             registry: self.registry.clone(),
             shutdown: self.shutdown.clone(),
             original_exit: Arc::downgrade(&source),
-        };
+        });
         Ok(OriginalLogicalStartInput {
             input: Some(input),
             response: Some(response),
@@ -913,11 +920,173 @@ impl QueryExecutionDriver for QueryExecutionDriverHandle {
         // No foreign callback between actual mount and both stable receivers.
         *ready = Some(future);
         *exit = Some(LogicalExecutionExitObserver::new(source));
-        let header = input.take();
+        let header = input.take().map(OriginalStartHeader::Native);
         Ok(LogicalExecutionStartAttempt {
             attempt: Some(attempt),
             cancellation: None,
             header,
+        })
+    }
+
+    fn prepare_background_action_in(
+        &self,
+        owner: &Option<WorkOwner>,
+        context: &mut Option<crate::admitted_query_context::QueryExecutionContext>,
+        permit: &mut Option<novarocks_workload_control::QueryConcurrencyPermit>,
+        payload: &mut Option<novarocks_workload_control::joint_admission::RetainedPayloadGrant>,
+        action: &mut Option<Box<dyn crate::session_control::GovernedBackgroundAction>>,
+        destination: &mut Option<OriginalBackgroundActionInput>,
+    ) -> Result<(), QueryExecutionError> {
+        use crate::session_control::{BackgroundActionCustody, StatementActionSource};
+        if destination.is_some() || action.is_none() || context.is_none() || permit.is_none() {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "background original source or destination is unavailable",
+            ));
+        }
+        if *self.shutdown.borrow() || self.shutdown.has_changed().is_err() {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::Rejected,
+                "logical execution supervisor is shutting down",
+            ));
+        }
+        let owner = owner.as_ref().ok_or_else(|| {
+            QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "original background Root is absent",
+            )
+        })?;
+        let timeout = BackgroundActionCustody::validate(
+            owner,
+            context.as_ref().unwrap(),
+            permit.as_ref().unwrap(),
+            payload.as_ref(),
+        )
+        .map_err(work_error)?;
+        // Actual dyn pointee Layout, never a guessed or caller-declared size.
+        // FA separately authors the real variable backing of this action.
+        let action_layout = std::alloc::Layout::for_value(action.as_ref().unwrap().as_ref());
+        let source_bytes = StatementActionSource::background_geometry()
+            .fixed_source_bytes()
+            .map_err(work_error)?
+            .checked_add(action_layout.size())
+            .ok_or_else(|| work_error(WorkError::ArithmeticOverflow))?;
+        context
+            .as_ref()
+            .unwrap()
+            .result_capacity()
+            .unwrap()
+            .window_alias()
+            .check_backing_total(
+                u64::try_from(source_bytes)
+                    .map_err(|_| work_error(WorkError::ArithmeticOverflow))?,
+            )
+            .map_err(work_error)?;
+        if let Some(payload) = payload.as_ref() {
+            if payload
+                .capacity_bytes()
+                .map_err(|_| work_error(WorkError::Conflict))?
+                < u64::try_from(source_bytes)
+                    .map_err(|_| work_error(WorkError::ArithmeticOverflow))?
+            {
+                return Err(work_error(WorkError::Capacity(
+                    "background original payload backing",
+                )));
+            }
+        }
+        let requester = owner.cancellation_requester();
+        // Allocate all fixed shared headers while the caller's original slots
+        // remain intact. There is no callback or asynchronous work here.
+        let source = StatementActionSource::empty_background();
+        let original = OriginalLogicalExit::with_background(Arc::clone(&source));
+        let custody = BackgroundActionCustody::take_in(owner, context, permit, payload, timeout)
+            .map_err(work_error)?;
+        source.install_background(custody, requester, action);
+        *destination = Some(OriginalBackgroundActionInput {
+            input: Some(LogicalRoleInput::Background {
+                original_exit: Arc::downgrade(&original),
+                shutdown: self.shutdown.clone(),
+            }),
+            context: Some(original),
+            issuer: Arc::clone(&self.query_ids.issuer),
+        });
+        Ok(())
+    }
+    fn start_background_action_in(
+        &self,
+        input: &mut Option<OriginalBackgroundActionInput>,
+        owner: &mut Option<WorkOwner>,
+        ready: &mut Option<crate::session_control::BackgroundActionReady>,
+        exit: &mut Option<LogicalExecutionExitObserver>,
+    ) -> Result<LogicalExecutionStartAttempt, QueryExecutionError> {
+        if ready.is_some() || exit.is_some() {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "original background receiver is occupied",
+            ));
+        }
+        if *self.shutdown.borrow() || self.shutdown.has_changed().is_err() {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::Rejected,
+                "logical execution supervisor is shutting down",
+            ));
+        }
+        let original = input.as_mut().ok_or_else(|| {
+            QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "original background source is absent",
+            )
+        })?;
+        if !Arc::ptr_eq(&original.issuer, &self.query_ids.issuer)
+            || original.input.is_none()
+            || original.context.is_none()
+        {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "original background source belongs to another supervisor or is mounted",
+            ));
+        }
+        let context = Arc::clone(original.context.as_ref().unwrap());
+        let source = Arc::clone(
+            context
+                .background
+                .as_ref()
+                .expect("typed background context"),
+        );
+        if !owner
+            .as_ref()
+            .is_some_and(|owner| source.validate_background_owner(owner))
+        {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "background source requires its exact original Root",
+            ));
+        }
+        let cancellation = owner
+            .as_ref()
+            .unwrap()
+            .scope()
+            .cancellation()
+            .map_err(work_error)?;
+        let attempt = self
+            .ingress
+            .try_mount_in(owner, &mut original.input, &mut original.context);
+        if attempt.result().is_err() {
+            return Ok(LogicalExecutionStartAttempt {
+                attempt: Some(attempt),
+                cancellation: Some(cancellation),
+                header: None,
+            });
+        }
+        *ready = Some(crate::session_control::BackgroundActionReady {
+            source,
+            completed: false,
+        });
+        *exit = Some(LogicalExecutionExitObserver::new(context));
+        Ok(LogicalExecutionStartAttempt {
+            attempt: Some(attempt),
+            cancellation: None,
+            header: input.take().map(OriginalStartHeader::Background),
         })
     }
 
@@ -977,13 +1146,34 @@ pub struct OriginalLogicalStartInput {
     internal_cut: bool,
     issuer: Arc<()>,
 }
+pub(super) enum OriginalStartHeader {
+    Native(OriginalLogicalStartInput),
+    Background(OriginalBackgroundActionInput),
+}
+impl OriginalStartHeader {
+    fn exit(self) {
+        match self {
+            Self::Native(input) => drop(input),
+            Self::Background(input) => drop(input),
+        }
+    }
+}
+
+/// Move-only original background preparation. Keep this in the job's stable
+/// input field through acceptance; it owns no second Root or runtime.
+pub struct OriginalBackgroundActionInput {
+    input: Option<LogicalRoleInput>,
+    context: Option<Arc<OriginalLogicalExit>>,
+    issuer: Arc<()>,
+}
+
 #[must_use = "Finish the original publication tail after caller locks exit"]
 pub struct LogicalExecutionStartAttempt {
     attempt: Option<
         novarocks_workload_control::MountAttempt<LogicalRoleInput, Arc<OriginalLogicalExit>>,
     >,
     cancellation: Option<novarocks_workload_control::CancellationView>,
-    header: Option<OriginalLogicalStartInput>,
+    header: Option<OriginalStartHeader>,
 }
 impl LogicalExecutionStartAttempt {
     pub fn result(&self) -> Result<(), QueryExecutionError> {
@@ -998,7 +1188,9 @@ impl LogicalExecutionStartAttempt {
     pub fn finish(mut self) -> Result<(), QueryExecutionError> {
         let result = self.attempt.take().unwrap().finish().map_err(work_error);
         drop(self.cancellation.take());
-        drop(self.header.take());
+        if let Some(header) = self.header.take() {
+            header.exit();
+        }
         result
     }
 }
@@ -1046,7 +1238,14 @@ fn rejected_start(owner: WorkOwner, message: &'static str) -> QueryExecutionFutu
 /// Input to the one concrete logical role factory. The original WorkOwner is
 /// supplied separately; these aliases retain their existing runtime owners.
 /// This type alone is not a complete byte quote or a startup admission grant.
-struct LogicalRoleInput {
+enum LogicalRoleInput {
+    Native(NativeLogicalRoleInput),
+    Background {
+        original_exit: Weak<OriginalLogicalExit>,
+        shutdown: watch::Receiver<bool>,
+    },
+}
+struct NativeLogicalRoleInput {
     original_exit: Weak<OriginalLogicalExit>,
     reply: oneshot::Sender<Result<ExecutionHandle, QueryExecutionError>>,
     reserved: Option<ReservedExecutionIdentity>,
@@ -1164,6 +1363,7 @@ fn observe_logical_completion<F, M>(
     }
     let source = Arc::clone(completion.context());
     source.role_ended_silent(failed);
+    source.retire_background_after_bank_exit_silent(completion.completion());
     source.retire_native_body_silent();
     // An accepted wrapper is installed BEFORE stripping C. Rejection keeps
     // the unchanged whole packet in its SAME original finite bank position.
@@ -1359,9 +1559,54 @@ where
 // This noncapturing function item is the actual production future factory.
 // Its concrete input, future and output can be quoted and installed together;
 // no dummy future type or caller-provided async closure describes this role.
-async fn make_logical_role(
+fn make_logical_role(
     owner: WorkOwner,
     input: LogicalRoleInput,
+) -> impl Future<Output = Result<(), QueryExecutionError>> + Send {
+    match input {
+        LogicalRoleInput::Native(input) => {
+            futures::future::Either::Left(make_native_logical_role(owner, input))
+        }
+        LogicalRoleInput::Background {
+            original_exit,
+            shutdown,
+        } => {
+            let source = original_exit
+                .upgrade()
+                .expect("original background bank context");
+            let action = Arc::clone(
+                source
+                    .background
+                    .as_ref()
+                    .expect("background source installed"),
+            );
+            // Synchronous pure move from MountedInput to the stable context,
+            // before the borrowed role F exists or any background action poll.
+            action.install_background_owner(&mut Some(owner));
+            futures::future::Either::Right(run_background_action_role(action, shutdown))
+        }
+    }
+}
+async fn run_background_action_role(
+    source: Arc<crate::session_control::StatementActionSource>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), QueryExecutionError> {
+    let mut stopping = false;
+    loop {
+        if !stopping && (*shutdown.borrow() || shutdown.has_changed().is_err()) {
+            stopping = true;
+            source.stop_background();
+        }
+        tokio::select! {
+            biased;
+            result = std::future::poll_fn(|cx| source.poll_background(cx)) => return result,
+            _ = shutdown.changed(), if !stopping => {},
+        }
+    }
+}
+async fn make_native_logical_role(
+    owner: WorkOwner,
+    input: NativeLogicalRoleInput,
 ) -> Result<(), QueryExecutionError> {
     let original_exit = input.original_exit.clone();
     let consumer = {
@@ -1400,9 +1645,9 @@ async fn make_logical_role(
 
 async fn run_logical_role(
     owner: WorkOwner,
-    input: LogicalRoleInput,
+    input: NativeLogicalRoleInput,
 ) -> Result<(), QueryExecutionError> {
-    let LogicalRoleInput {
+    let NativeLogicalRoleInput {
         original_exit,
         reply,
         reserved,
@@ -4115,6 +4360,7 @@ fn native_future_panicked(message: &'static str) -> QueryExecutionError {
 #[cfg(test)]
 mod tests {
     include!("supervisor_internal_tests.rs");
+    include!("supervisor_background_tests.rs");
     include!("supervisor_role_bank_fixture.rs");
     include!("supervisor_original_exit_tests.rs");
     include!("supervisor_qualification_binding_tests.rs");

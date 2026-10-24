@@ -26,9 +26,17 @@
 //! MySQL adaptation, and connector-private publication mechanics stay outside
 //! this crate.
 
+use novarocks_query_application::api::{
+    LocalExecutionDisposition, LogicalExecutionExitObserver, LogicalExecutionExitReceipt,
+};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_workload_control::{
@@ -163,6 +171,8 @@ impl StatisticsJobState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatisticsPublicationFact {
     NotStarted,
+    /// The Provider completed without applying an external mutation.
+    NoOp,
     KnownUncommitted,
     KnownCommitted,
     CommitUnknown,
@@ -199,6 +209,205 @@ pub struct StatisticsFailure {
     pub compile_control: Option<novarocks_type_contract::CompileControlError>,
 }
 
+#[cfg(test)]
+fn test_publication_failure(message: &str) -> StatisticsPublicationFailure {
+    use novarocks_failure_contract::FailureProjection;
+    let original = novarocks_type_contract::CompileControlError::ResourceExhausted;
+    StatisticsPublicationFailure::capture(
+        original.failure_fact(),
+        Some(original.provenance()),
+        &message,
+    )
+}
+
+/// One bounded observation, not the originating Provider resource owner.
+/// The actual Session keeps that original cause until its real close.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct StatisticsPublicationFailure {
+    fact: novarocks_failure_contract::FailureFact,
+    compile_control: Option<novarocks_type_contract::CompileControlProvenance>,
+    diagnostic: [u8; novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES],
+    diagnostic_len: u16,
+}
+impl StatisticsPublicationFailure {
+    pub const PUBLIC_MESSAGE_BYTES: usize =
+        "statistics publication failed (reason 65535:65535)".len();
+    pub const PUBLIC_KIND_BYTES: usize = "FINALIZATION".len();
+    pub fn public_message(&self) -> String {
+        use fmt::Write;
+        let mut message = String::with_capacity(Self::PUBLIC_MESSAGE_BYTES);
+        write!(&mut message, "{self}").expect("fixed String write");
+        debug_assert!(message.len() <= Self::PUBLIC_MESSAGE_BYTES);
+        message
+    }
+
+    /// Called outside repository locks while borrowing the actual Provider
+    /// outcome. Formatting is diagnostic only and cannot change its facts.
+    pub fn capture(
+        fact: novarocks_failure_contract::FailureFact,
+        compile_control: Option<novarocks_type_contract::CompileControlProvenance>,
+        diagnostic: &dyn fmt::Display,
+    ) -> Self {
+        struct Writer<'a> {
+            bytes: &'a mut [u8],
+            len: usize,
+        }
+        impl fmt::Write for Writer<'_> {
+            fn write_str(&mut self, text: &str) -> fmt::Result {
+                let mut len = text.len().min(self.bytes.len() - self.len);
+                while !text.is_char_boundary(len) {
+                    len -= 1;
+                }
+                self.bytes[self.len..self.len + len].copy_from_slice(&text.as_bytes()[..len]);
+                self.len += len;
+                if len == text.len() {
+                    Ok(())
+                } else {
+                    Err(fmt::Error)
+                }
+            }
+        }
+        let mut record = Self {
+            fact,
+            compile_control,
+            diagnostic: [0; novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES],
+            diagnostic_len: 0,
+        };
+        let mut writer = Writer {
+            bytes: &mut record.diagnostic,
+            len: 0,
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = fmt::write(&mut writer, format_args!("{diagnostic}"));
+        }));
+        record.diagnostic_len = writer.len as u16;
+        record
+    }
+    pub const fn fact(&self) -> novarocks_failure_contract::FailureFact {
+        self.fact
+    }
+    pub const fn compile_control(
+        &self,
+    ) -> Option<novarocks_type_contract::CompileControlProvenance> {
+        self.compile_control
+    }
+    /// Private process diagnostics. Never pass this text to SHOW or SQL errors.
+    pub fn local_diagnostic(&self) -> &str {
+        std::str::from_utf8(&self.diagnostic[..usize::from(self.diagnostic_len)])
+            .expect("bounded formatter copied complete UTF-8 characters")
+    }
+}
+impl fmt::Display for StatisticsPublicationFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "statistics publication failed (reason {})",
+            self.fact.reason()
+        )
+    }
+}
+impl fmt::Debug for StatisticsPublicationFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Even incidental Debug does not publish the private diagnostic.
+        f.debug_struct("StatisticsPublicationFailure")
+            .field("fact", &self.fact)
+            .field("compile_control", &self.compile_control)
+            .finish()
+    }
+}
+
+/// Geometry of ONLY the three inline publication failure assets. Existing
+/// target/column pointees, ordinary failure trees and container metadata are
+/// separate pre-existing repository custody and are not claimed by this quote.
+#[derive(Clone, Copy, Debug)]
+pub struct StatisticsPublicationFailureGeometry {
+    pub active_records: usize,
+    pub terminal_records: usize,
+    pub insertion_records: usize,
+    pub storage_records_peak: usize,
+    pub observation_records_peak: usize,
+    pub observation_backing: std::alloc::Layout,
+    pub backing: std::alloc::Layout,
+}
+pub fn publication_failure_geometry()
+-> Result<StatisticsPublicationFailureGeometry, novarocks_workload_control::WorkError> {
+    use novarocks_type_contract::owned_resources::hashmap::fresh_table_layout;
+    use novarocks_workload_control::WorkError;
+    use std::alloc::Layout;
+    let active = MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS;
+    let terminal = MAX_RECENT_TERMINAL_STATISTICS_JOBS;
+    // This repository exclusively owns new/insert/remove; it never reserves,
+    // shrinks or escapes either container. Under the locked hashbrown model,
+    // churn may grow once past the insertion-only bound. At a full-capacity
+    // >= 2*active table, reserve_rehash_inner can only rehash in place: at
+    // most active live records fit below its half-full rehash threshold.
+    // The existing original RawTable layout author checks toolchain/target;
+    // its numerical bucket shape is not a retained-map custody certificate.
+    let map = fresh_table_layout::<StatisticsJobId, LiveJob>(
+        active.checked_mul(2).ok_or(WorkError::ArithmeticOverflow)?,
+    )
+    .map_err(|_| WorkError::InvalidConfig("statistics fixed failure table geometry"))?
+    .buckets;
+    // VecDeque::new + push_back/pop/remove shares RawVec's power-of-two
+    // growth for this non-ZST record. Push precedes terminal trim; the old
+    // half-capacity backing can coexist with the new allocation at that cut.
+    let deque = terminal
+        .checked_add(1)
+        .and_then(usize::checked_next_power_of_two)
+        .ok_or(WorkError::ArithmeticOverflow)?;
+    let active_growth = map.checked_add(map / 2).and_then(|n| n.checked_add(deque));
+    let terminal_growth = deque
+        .checked_add(deque / 2)
+        .and_then(|n| n.checked_add(map));
+    let storage_records_peak = active_growth
+        .zip(terminal_growth)
+        .map(|(a, b)| a.max(b))
+        .ok_or(WorkError::ArithmeticOverflow)?;
+    // Three independent inline assets, including empty capacity slots. Their
+    // alignment is no greater than the existing LiveJob's pointer alignment.
+    let backing = Layout::array::<[Option<StatisticsPublicationFailure>; 3]>(storage_records_peak)
+        .map_err(|_| WorkError::ArithmeticOverflow)?;
+    // list() collects an exact-sized Chain of the two original iterators,
+    // then stable-sorts in place. The locked sort's heap scratch is at most
+    // one full input extent. get/cancel/wait move at most a few individual
+    // snapshots; their inline F/header storage is covered by this same,
+    // larger per-observer delta, never by the shared repository allocation.
+    // No public mutable Vec escapes back into the repository.
+    let listed = active
+        .checked_add(terminal)
+        .ok_or(WorkError::ArithmeticOverflow)?;
+    let observation_records_peak = listed.checked_mul(2).ok_or(WorkError::ArithmeticOverflow)?;
+    let observation_records =
+        Layout::array::<[Option<StatisticsPublicationFailure>; 3]>(observation_records_peak)
+            .map_err(|_| WorkError::ArithmeticOverflow)?;
+    // job_view consumes each Job and creates one fixed public message and kind. These
+    // Strings are moved through the row adapter; Arrow output storage is
+    // independently owned by the existing LocalTableBuilder/result window.
+    let public_text = listed
+        .checked_mul(
+            StatisticsPublicationFailure::PUBLIC_MESSAGE_BYTES
+                + StatisticsPublicationFailure::PUBLIC_KIND_BYTES,
+        )
+        .ok_or(WorkError::ArithmeticOverflow)?;
+    let observation_backing = Layout::from_size_align(
+        observation_records
+            .size()
+            .checked_add(public_text)
+            .ok_or(WorkError::ArithmeticOverflow)?,
+        observation_records.align(),
+    )
+    .map_err(|_| WorkError::ArithmeticOverflow)?;
+    Ok(StatisticsPublicationFailureGeometry {
+        active_records: active,
+        terminal_records: terminal,
+        insertion_records: 1,
+        storage_records_peak,
+        observation_records_peak,
+        observation_backing,
+        backing,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsJob {
     pub id: StatisticsJobId,
@@ -209,9 +418,12 @@ pub struct StatisticsJob {
     pub query_attempt_id: Option<StatisticsQueryAttemptId>,
     pub publication_id: StatisticsPublicationId,
     pub publication: StatisticsPublicationFact,
-    /// A definite publication remains a fact when cleanup or projection fails; that
-    /// failure must not authorize another provider mutation.
-    pub publication_finalization_failure: Option<StatisticsFailure>,
+    /// The provider publication refusal, independent of cleanup diagnostics.
+    pub publication_failure: Option<StatisticsPublicationFailure>,
+    /// Necessary finalization preserves the actual Applied or NoOp effect.
+    pub publication_finalization_failure: Option<StatisticsPublicationFailure>,
+    /// Optional GC/close diagnostics never change the selected business result.
+    pub publication_cleanup_failure: Option<StatisticsPublicationFailure>,
     pub convergence: StatisticsConvergence,
     pub cancel_requested: bool,
     pub failure: Option<StatisticsFailure>,
@@ -231,7 +443,9 @@ impl StatisticsJob {
             query_attempt_id: None,
             publication_id: StatisticsPublicationId::new_v7(),
             publication: StatisticsPublicationFact::NotStarted,
+            publication_failure: None,
             publication_finalization_failure: None,
+            publication_cleanup_failure: None,
             convergence: StatisticsConvergence::default(),
             cancel_requested: false,
             failure: None,
@@ -285,10 +499,23 @@ pub struct StatisticsJobAdmission {
         Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
     owner: WorkOwner,
     query_concurrency: QueryConcurrencyPermit,
-    result_capacity: QueryResultCapacityBinding,
+    result_capacity: Option<QueryResultCapacityBinding>,
     root_payload: Option<novarocks_workload_control::joint_admission::RetainedPayloadGrant>,
 }
 impl StatisticsJobAdmission {
+    pub fn scope(&self) -> WorkScope {
+        self.owner.scope()
+    }
+    pub fn into_originals(self) -> StatisticsJobOriginals {
+        StatisticsJobOriginals {
+            owner: Some(self.owner),
+            query_concurrency: Some(self.query_concurrency),
+            result_capacity: self.result_capacity,
+            root_payload: self.root_payload,
+            #[cfg(novarocks_dev_controls)]
+            test_statement_nomination: self.test_statement_nomination,
+        }
+    }
     pub fn try_new(
         owner: WorkOwner,
         query_concurrency: QueryConcurrencyPermit,
@@ -313,7 +540,7 @@ impl StatisticsJobAdmission {
         Ok(Self {
             owner,
             query_concurrency,
-            result_capacity,
+            result_capacity: Some(result_capacity),
             root_payload: None,
             #[cfg(novarocks_dev_controls)]
             test_statement_nomination: None,
@@ -367,7 +594,7 @@ impl StatisticsJobAdmission {
         *destination = Some(Self {
             owner: owner.take().expect("checked original Root"),
             query_concurrency: query_concurrency.take().expect("checked original permit"),
-            result_capacity,
+            result_capacity: Some(result_capacity),
             root_payload: payload.take(),
             #[cfg(novarocks_dev_controls)]
             test_statement_nomination: None,
@@ -382,6 +609,16 @@ impl StatisticsJobAdmission {
         mut self,
         nomination: Arc<novarocks_failpoint::target_binding::StatementWorkNomination>,
     ) -> Result<Self, StatisticsRepositoryError> {
+        self.install_test_statement_nomination_in(nomination)?;
+        Ok(self)
+    }
+
+    /// Preserve the actual receiver when nomination validation refuses it.
+    #[cfg(novarocks_dev_controls)]
+    pub fn install_test_statement_nomination_in(
+        &mut self,
+        nomination: Arc<novarocks_failpoint::target_binding::StatementWorkNomination>,
+    ) -> Result<(), StatisticsRepositoryError> {
         nomination.validate().map_err(|error| {
             StatisticsRepositoryError::new(
                 StatisticsRepositoryErrorKind::Conflict,
@@ -399,19 +636,33 @@ impl StatisticsJobAdmission {
             ));
         }
         self.test_statement_nomination = Some(nomination);
-        Ok(self)
+        Ok(())
     }
+}
+
+/// Stable slots consumed by the original background host. None is not an
+/// exit fact: the repository retains the exact observer after these move.
+pub struct StatisticsJobOriginals {
+    pub owner: Option<WorkOwner>,
+    pub query_concurrency: Option<QueryConcurrencyPermit>,
+    pub result_capacity: Option<QueryResultCapacityBinding>,
+    pub root_payload: Option<novarocks_workload_control::joint_admission::RetainedPayloadGrant>,
+    #[cfg(novarocks_dev_controls)]
+    pub test_statement_nomination:
+        Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
 }
 
 /// A phase's cancellation/attribution scope and the independently owned job's
 /// original capacity are separate facts. Preparation may exit before collect.
-pub struct StatisticsAttemptContext {
+#[cfg(test)]
+struct StatisticsAttemptContext {
     #[cfg(novarocks_dev_controls)]
     test_statement_nomination:
         Mutex<Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>>,
     stage_scope: WorkScope,
     root_result_capacity: QueryResultCapacityBinding,
 }
+#[cfg(test)]
 impl StatisticsAttemptContext {
     /// Move the one preparation nomination into its actual collection request.
     #[cfg(novarocks_dev_controls)]
@@ -441,6 +692,11 @@ impl StatisticsAttemptContext {
 }
 
 struct LiveJob {
+    cancellation: novarocks_workload_control::WorkCancellationRequester,
+    transferred: bool,
+    exit: Option<LogicalExecutionExitObserver>,
+    exit_failure: Option<novarocks_query_application::api::QueryExecutionError>,
+    retained_exit: Option<LogicalExecutionExitReceipt>,
     #[cfg(novarocks_dev_controls)]
     test_statement_nomination:
         Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
@@ -502,6 +758,7 @@ impl LiveJob {
 struct RuntimeState {
     active: HashMap<StatisticsJobId, LiveJob>,
     terminal: VecDeque<LiveJob>,
+    exit_cursor: Option<StatisticsJobId>,
 }
 
 /// Bounded, process-local observation of statistics jobs.  It deliberately
@@ -543,7 +800,12 @@ impl StatisticsJobRepository {
                 "statistics admission source is absent",
             )
         })?;
-        if original.root_payload.is_none() || !original.result_capacity.is_root_backed_internal() {
+        if original.root_payload.is_none()
+            || !original
+                .result_capacity
+                .as_ref()
+                .is_some_and(QueryResultCapacityBinding::is_root_backed_internal)
+        {
             return Err(StatisticsRepositoryError::new(
                 StatisticsRepositoryErrorKind::Conflict,
                 "stable Root receiver requires its original typed payload",
@@ -551,7 +813,14 @@ impl StatisticsJobRepository {
         }
         let job = StatisticsJob::new(request);
         let mut state = self.lock()?;
-        if state.active.len() >= MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS {
+        if state.active.len()
+            + state
+                .terminal
+                .iter()
+                .filter(|e| !e.job.convergence.is_complete())
+                .count()
+            >= MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS
+        {
             return Err(StatisticsRepositoryError::new(
                 StatisticsRepositoryErrorKind::Capacity,
                 "statistics runtime active or queued job capacity exhausted",
@@ -576,10 +845,15 @@ impl StatisticsJobRepository {
         state.active.insert(
             job.id,
             LiveJob {
+                cancellation: owner.cancellation_requester(),
+                transferred: false,
+                exit: None,
+                exit_failure: None,
+                retained_exit: None,
                 job: job.clone(),
                 owner: Some(owner),
                 query_concurrency: Some(query_concurrency),
-                result_capacity: Some(result_capacity),
+                result_capacity,
                 root_payload,
                 stage_computation: None,
                 #[cfg(novarocks_dev_controls)]
@@ -616,7 +890,14 @@ impl StatisticsJobRepository {
             test_statement_nomination,
         } = admission;
         let mut state = self.lock()?;
-        if state.active.len() >= MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS {
+        if state.active.len()
+            + state
+                .terminal
+                .iter()
+                .filter(|e| !e.job.convergence.is_complete())
+                .count()
+            >= MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS
+        {
             return Err(StatisticsRepositoryError::new(
                 StatisticsRepositoryErrorKind::Capacity,
                 "statistics runtime active or queued job capacity exhausted",
@@ -626,12 +907,17 @@ impl StatisticsJobRepository {
         state.active.insert(
             job.id,
             LiveJob {
+                cancellation: owner.cancellation_requester(),
+                transferred: false,
+                exit: None,
+                exit_failure: None,
+                retained_exit: None,
                 #[cfg(novarocks_dev_controls)]
                 test_statement_nomination,
                 job: job.clone(),
                 owner: Some(owner),
                 query_concurrency: Some(query_concurrency),
-                result_capacity: Some(result_capacity),
+                result_capacity,
                 root_payload,
                 stage_computation: None,
             },
@@ -763,7 +1049,7 @@ impl StatisticsJobRepository {
             tokio::pin!(notified);
             notified.as_mut().enable();
             let job = self.get(id).await?.ok_or_else(|| Self::not_found(id))?;
-            if job.state.is_terminal() && job.convergence.is_complete() {
+            if job.state.is_terminal() {
                 return Ok(job);
             }
             notified.await;
@@ -875,13 +1161,11 @@ impl StatisticsJobRepository {
             self.changed.notify_waiters();
             return Ok(job);
         }
-        let requester = entry.owner.as_ref().map(WorkOwner::cancellation_requester);
+        let requester = entry.cancellation.clone();
         let job = entry.job.clone();
         state.active.insert(id, entry);
         drop(state);
-        if let Some(requester) = requester {
-            let _ = requester.request(novarocks_workload_control::CancellationReason::Requested);
-        }
+        let _ = requester.request(novarocks_workload_control::CancellationReason::Requested);
         self.changed.notify_waiters();
         Ok(job)
     }
@@ -903,8 +1187,8 @@ impl StatisticsJobRepository {
             entry.job.updated_at_ms = at_ms;
             if entry.job.state == StatisticsJobState::Active(StatisticsJobPhase::Submitted) {
                 queued.push(*id);
-            } else if let Some(owner) = entry.owner.as_ref() {
-                cancellation_requesters.push(owner.cancellation_requester());
+            } else {
+                cancellation_requesters.push(entry.cancellation.clone());
             }
         }
         for id in queued {
@@ -938,6 +1222,16 @@ impl StatisticsJobRepository {
     }
 
     pub async fn phase(
+        &self,
+        id: StatisticsJobId,
+        expected: StatisticsJobPhase,
+        next: StatisticsJobPhase,
+        at_ms: i64,
+    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        self.phase_now(id, expected, next, at_ms)
+    }
+
+    fn phase_now(
         &self,
         id: StatisticsJobId,
         expected: StatisticsJobPhase,
@@ -990,6 +1284,31 @@ impl StatisticsJobRepository {
         failure: Option<StatisticsFailure>,
         at_ms: i64,
     ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        self.conclude_now(
+            id,
+            expected,
+            conclusion,
+            publication,
+            failure,
+            None,
+            None,
+            None,
+            at_ms,
+        )
+    }
+
+    fn conclude_now(
+        &self,
+        id: StatisticsJobId,
+        expected: StatisticsJobPhase,
+        conclusion: StatisticsJobConclusion,
+        publication: StatisticsPublicationFact,
+        failure: Option<StatisticsFailure>,
+        publication_failure: Option<StatisticsPublicationFailure>,
+        finalization_failure: Option<StatisticsPublicationFailure>,
+        cleanup_failure: Option<StatisticsPublicationFailure>,
+        at_ms: i64,
+    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
         let mut state = self.lock()?;
         let mut entry = state
             .active
@@ -1014,6 +1333,9 @@ impl StatisticsJobRepository {
         entry.job.state = StatisticsJobState::Terminal(conclusion);
         entry.job.publication = publication;
         entry.job.failure = failure;
+        entry.job.publication_failure = publication_failure;
+        entry.job.publication_finalization_failure = finalization_failure;
+        entry.job.publication_cleanup_failure = cleanup_failure;
         entry.job.updated_at_ms = at_ms;
         entry.job.completed_at_ms = Some(at_ms);
         state.terminal.push_back(entry);
@@ -1072,6 +1394,87 @@ impl StatisticsJobRepository {
         Ok(job)
     }
 
+    /// The existing sequential process worker polls these original observers.
+    /// Each observer is taken out of the repository mutex before foreign poll
+    /// and receipt Drop. One finite pass visits the existing bounded records.
+    pub(crate) fn poll_exits(
+        &self,
+        cx: &mut Context<'_>,
+        at_ms: i64,
+    ) -> Poll<Result<(), StatisticsRepositoryError>> {
+        let (id, mut observer, more) = {
+            let mut state = self.lock()?;
+            let next = state
+                .active
+                .values()
+                .chain(state.terminal.iter())
+                .filter(|e| {
+                    e.exit.is_some() && state.exit_cursor.is_none_or(|after| e.job.id > after)
+                })
+                .map(|e| e.job.id)
+                .min();
+            let Some(id) = next else {
+                state.exit_cursor = None;
+                return Poll::Pending;
+            };
+            state.exit_cursor = Some(id);
+            let more = state
+                .active
+                .values()
+                .chain(state.terminal.iter())
+                .any(|e| e.exit.is_some() && e.job.id > id);
+            let original = find_entry_mut(&mut state, id)?
+                .exit
+                .take()
+                .expect("selected exact observer");
+            if !more {
+                state.exit_cursor = None;
+            }
+            (id, Some(original), more)
+        };
+        let result = observer.as_mut().unwrap().poll_exit(cx);
+        let mut retired = None;
+        let mut changed = false;
+        {
+            let mut state = self.lock()?;
+            let entry = find_entry_mut(&mut state, id)?;
+            match result {
+                Poll::Pending => entry.exit = observer.take(),
+                Poll::Ready(Ok(actual)) => {
+                    if actual.local_disposition() == LocalExecutionDisposition::ActualSourcesExited
+                    {
+                        entry.job.convergence = StatisticsConvergence {
+                            collection_stopped: true,
+                            execution_resources_released: true,
+                            provider_session_closed: true,
+                        };
+                        entry.job.updated_at_ms = at_ms;
+                        retired = Some(actual);
+                    } else {
+                        // Return to an original paid owner is not actual exit.
+                        entry.retained_exit = Some(actual);
+                    }
+                    changed = true;
+                }
+                Poll::Ready(Err(error)) => {
+                    entry.exit_failure = Some(error);
+                    changed = true;
+                }
+            }
+        }
+        drop(retired);
+        drop(observer);
+        if more {
+            cx.waker().wake_by_ref();
+        }
+        if changed {
+            self.changed.notify_waiters();
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, RuntimeState>, StatisticsRepositoryError> {
         self.state.lock().map_err(|_| {
             StatisticsRepositoryError::new(
@@ -1096,11 +1499,12 @@ impl StatisticsJobRepository {
         // responsibility.  Capacity is bounded by refusing later submissions
         // if an implementation cannot converge old jobs.
         while state.terminal.len() > MAX_RECENT_TERMINAL_STATISTICS_JOBS {
-            let Some(index) = state
-                .terminal
-                .iter()
-                .position(|entry| entry.owner.is_none())
-            else {
+            let Some(index) = state.terminal.iter().position(|entry| {
+                entry.job.convergence.is_complete()
+                    && entry.exit.is_none()
+                    && entry.exit_failure.is_none()
+                    && entry.retained_exit.is_none()
+            }) else {
                 break;
             };
             state.terminal.remove(index);
@@ -1108,44 +1512,182 @@ impl StatisticsJobRepository {
     }
 }
 
-/// Product adapter to the generic query application.  Implementations create
-/// a single `QueryExecutionClient` request from the frozen provider facts and
-/// consume the exact result before returning from `collect`.
-///
-/// Every method is a convergence boundary: on either `Ok` or `Err`, the
-/// adapter has stopped its phase-local query work and released phase-local
-/// resources before returning. `collect` must also close a provider session
-/// when it cannot hand its exact artifacts to `publish`. A successful
-/// `collect` may retain only the provider publication session needed by the
-/// following `publish`; `publish` closes that session before it returns. This
-/// makes the worker's convergence records evidence from the phase contract,
-/// rather than an inference from the terminal business conclusion.
+/// One original job handoff. The role adapter mounts the original admission,
+/// installs its actual observer through Progress, then awaits only NeededReady.
+/// The product worker never owns a second runner or a per-phase execution root.
 pub trait StatisticsAttemptExecutor: Send + Sync + 'static {
-    fn prepare(
-        &self,
-        job: &StatisticsJob,
-        context: &StatisticsAttemptContext,
-    ) -> Result<(), StatisticsAttemptError>;
-
-    fn collect(
-        &self,
-        job: &StatisticsJob,
-        context: &StatisticsAttemptContext,
-    ) -> Result<(), StatisticsAttemptError>;
-
-    fn publish(
-        &self,
-        job: &StatisticsJob,
-        context: &StatisticsAttemptContext,
-    ) -> Result<StatisticsPublicationOutcome, StatisticsAttemptError>;
+    fn execute<'a>(
+        &'a self,
+        job: StatisticsJob,
+        admission: StatisticsJobAdmission,
+        progress: StatisticsJobProgress,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StatisticsAttemptError>> + Send + 'a>>;
 }
 
-/// Exact provider publication result. A known commit with a finalization
-/// failure is neither an uncommitted effect nor an unknown effect.
+/// Product-owned phase and business result reducer. It observes no transport
+/// facts and does not manufacture actual-exit evidence from business success.
+#[derive(Clone)]
+pub struct StatisticsJobProgress {
+    repository: StatisticsJobRepository,
+    id: StatisticsJobId,
+}
+impl StatisticsJobProgress {
+    pub fn prepared(&self, at_ms: i64) -> Result<(), StatisticsRepositoryError> {
+        self.repository
+            .phase_now(
+                self.id,
+                StatisticsJobPhase::Preparing,
+                StatisticsJobPhase::Collecting,
+                at_ms,
+            )
+            .map(|_| ())
+    }
+    pub fn collected(&self, at_ms: i64) -> Result<(), StatisticsRepositoryError> {
+        self.repository
+            .phase_now(
+                self.id,
+                StatisticsJobPhase::Collecting,
+                StatisticsJobPhase::Publishing,
+                at_ms,
+            )
+            .map(|_| ())
+    }
+    /// The source slots stay unchanged on refusal. No callback occurs while
+    /// the sole original observer is moved into this existing job record.
+    pub fn install_exit_in(
+        &self,
+        source: &mut Option<LogicalExecutionExitObserver>,
+    ) -> Result<(), StatisticsRepositoryError> {
+        let mut state = self.repository.lock()?;
+        // The same bank may select business Ready immediately after start;
+        // its exact original record can already be in the terminal deque.
+        let entry = find_entry_mut(&mut state, self.id)?;
+        if !entry.transferred || entry.exit.is_some() || source.is_none() {
+            return Err(work_error(novarocks_workload_control::WorkError::Conflict));
+        }
+        entry.exit = source.take();
+        Ok(())
+    }
+    /// No background role was mounted. The adapter returns the unchanged
+    /// original Root only after its startup proof has stopped; no Provider F
+    /// is allowed before mount. Complete/drop all originals outside the table.
+    pub fn retire_unmounted(
+        &self,
+        mut originals: StatisticsJobOriginals,
+        at_ms: i64,
+    ) -> Result<(), StatisticsRepositoryError> {
+        let owner = originals
+            .owner
+            .take()
+            .ok_or_else(|| work_error(novarocks_workload_control::WorkError::Conflict))?;
+        {
+            let state = self.repository.lock()?;
+            let entry = state
+                .active
+                .get(&self.id)
+                .or_else(|| state.terminal.iter().find(|e| e.job.id == self.id))
+                .ok_or_else(|| StatisticsJobRepository::not_found(self.id))?;
+            if entry.exit.is_some() || entry.retained_exit.is_some() {
+                return Err(work_error(novarocks_workload_control::WorkError::Conflict));
+            }
+        }
+        drop(originals);
+        owner.complete_after_terminal_cancel_settled();
+        {
+            let mut state = self.repository.lock()?;
+            let entry = find_entry_mut(&mut state, self.id)?;
+            entry.job.convergence = StatisticsConvergence {
+                collection_stopped: true,
+                execution_resources_released: true,
+                provider_session_closed: true,
+            };
+            entry.job.updated_at_ms = at_ms;
+        }
+        self.repository.changed.notify_waiters();
+        Ok(())
+    }
+    pub fn record_publication_cleanup_failure(
+        &self,
+        failure: StatisticsPublicationFailure,
+    ) -> Result<(), StatisticsRepositoryError> {
+        let mut state = self.repository.lock()?;
+        let entry = find_entry_mut(&mut state, self.id)?;
+        if entry.job.publication_cleanup_failure.is_some() {
+            return Ok(());
+        }
+        entry.job.publication_cleanup_failure = Some(failure);
+        drop(state);
+        self.repository.changed.notify_waiters();
+        Ok(())
+    }
+    pub fn finish(
+        &self,
+        result: Result<StatisticsPublicationOutcome, StatisticsAttemptError>,
+        at_ms: i64,
+    ) -> Result<(), StatisticsRepositoryError> {
+        let phase = {
+            let state = self.repository.lock()?;
+            let entry = state
+                .active
+                .get(&self.id)
+                .ok_or_else(|| StatisticsJobRepository::not_found(self.id))?;
+            let StatisticsJobState::Active(phase) = entry.job.state else {
+                unreachable!()
+            };
+            phase
+        };
+        let (
+            conclusion,
+            publication,
+            failure,
+            publication_failure,
+            finalization_failure,
+            cleanup_failure,
+        ) = publication_result(result);
+        self.repository.conclude_now(
+            self.id,
+            phase,
+            conclusion,
+            publication,
+            failure,
+            publication_failure,
+            finalization_failure,
+            cleanup_failure,
+            at_ms,
+        )?;
+        Ok(())
+    }
+}
+
+/// Only legal publication combinations cross the product boundary. Pre-dispatch
+/// failure is StatisticsAttemptError, never a fabricated publication verdict.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StatisticsPublicationOutcome {
-    pub fact: StatisticsPublicationFact,
-    pub finalization_failure: Option<StatisticsFailure>,
+pub enum StatisticsPublicationOutcome {
+    NoOp {
+        finalization_failure: Option<StatisticsPublicationFailure>,
+        cleanup_failure: Option<StatisticsPublicationFailure>,
+    },
+    KnownCommitted {
+        finalization_failure: Option<StatisticsPublicationFailure>,
+        cleanup_failure: Option<StatisticsPublicationFailure>,
+    },
+    KnownUncommitted {
+        failure: StatisticsPublicationFailure,
+        cleanup_failure: Option<StatisticsPublicationFailure>,
+    },
+    CommitUnknown {
+        failure: StatisticsPublicationFailure,
+    },
+}
+impl StatisticsPublicationOutcome {
+    pub const fn fact(&self) -> StatisticsPublicationFact {
+        match self {
+            Self::NoOp { .. } => StatisticsPublicationFact::NoOp,
+            Self::KnownCommitted { .. } => StatisticsPublicationFact::KnownCommitted,
+            Self::KnownUncommitted { .. } => StatisticsPublicationFact::KnownUncommitted,
+            Self::CommitUnknown { .. } => StatisticsPublicationFact::CommitUnknown,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1189,7 +1731,6 @@ impl StatisticsWorker {
             executor,
         }
     }
-
     pub async fn run_one(
         &self,
         at_ms: i64,
@@ -1197,273 +1738,128 @@ impl StatisticsWorker {
         let Some(job) = self.repository.claim_next(at_ms).await? else {
             return Ok(None);
         };
-        let (root_scope, result_capacity) = self.root_scope_and_capacity(job.id)?;
-        #[cfg(novarocks_dev_controls)]
-        let nomination = self.take_preparation_nomination(job.id)?;
-        let preparation = root_scope
-            .child(WorkRequest::new(WorkClass::Statistics))
-            .map_err(work_error)?;
-        let preparation_scope = StatisticsAttemptContext {
-            #[cfg(novarocks_dev_controls)]
-            test_statement_nomination: Mutex::new(nomination),
-            stage_scope: preparation.scope(),
-            root_result_capacity: result_capacity.clone(),
+        let admission = {
+            let mut state = self.repository.lock()?;
+            let entry = state.active.get_mut(&job.id).expect("claimed original job");
+            if entry.transferred {
+                return Err(work_error(novarocks_workload_control::WorkError::Conflict));
+            }
+            entry.transferred = true;
+            StatisticsJobAdmission {
+                owner: entry.owner.take().expect("original Root"),
+                query_concurrency: entry.query_concurrency.take().expect("original permit"),
+                result_capacity: entry.result_capacity.take(),
+                root_payload: entry.root_payload.take(),
+                #[cfg(novarocks_dev_controls)]
+                test_statement_nomination: entry.test_statement_nomination.take(),
+            }
         };
-        let prepared = self.executor.prepare(&job, &preparation_scope);
-        drop(preparation_scope);
-        preparation.complete();
-        if let Err(error) = prepared {
-            return self
-                .conclude_error(job, StatisticsJobPhase::Preparing, error, at_ms)
-                .await
-                .map(Some);
-        }
-        self.repository
-            .phase(
-                job.id,
-                StatisticsJobPhase::Preparing,
-                StatisticsJobPhase::Collecting,
-                at_ms,
-            )
-            .await?;
-        let collection = root_scope
-            .child(WorkRequest::new(WorkClass::Statistics))
-            .map_err(work_error)?;
-        let collection_scope = StatisticsAttemptContext {
-            #[cfg(novarocks_dev_controls)]
-            test_statement_nomination: Mutex::new(None),
-            stage_scope: collection.scope(),
-            root_result_capacity: result_capacity.clone(),
+        let progress = StatisticsJobProgress {
+            repository: self.repository.clone(),
+            id: job.id,
         };
-        if let Err(error) = self.executor.collect(&job, &collection_scope) {
-            collection.complete();
-            self.repository
-                .record_convergence(
-                    job.id,
-                    StatisticsConvergence {
-                        collection_stopped: true,
-                        execution_resources_released: true,
-                        provider_session_closed: false,
-                    },
-                    at_ms,
-                )
-                .await?;
-            return self
-                .conclude_error(job, StatisticsJobPhase::Collecting, error, at_ms)
-                .await
-                .map(Some);
+        let result = self
+            .executor
+            .execute(job.clone(), admission, progress.clone())
+            .await;
+        if let Err(error) = result {
+            // A host refusal must not overwrite the domain's earlier NeededReady.
+            if self
+                .repository
+                .get(job.id)
+                .await?
+                .is_some_and(|job| !job.state.is_terminal())
+            {
+                progress.finish(Err(error), at_ms)?;
+            }
         }
-        collection.complete();
-        self.repository
-            .record_convergence(
-                job.id,
-                StatisticsConvergence {
-                    collection_stopped: true,
-                    execution_resources_released: true,
-                    provider_session_closed: false,
-                },
-                at_ms,
-            )
-            .await?;
-        self.repository
-            .phase(
-                job.id,
-                StatisticsJobPhase::Collecting,
-                StatisticsJobPhase::Publishing,
-                at_ms,
-            )
-            .await?;
-        let publication = root_scope
-            .child(WorkRequest::new(WorkClass::Statistics))
-            .map_err(work_error)?;
-        let publication_scope = StatisticsAttemptContext {
-            #[cfg(novarocks_dev_controls)]
-            test_statement_nomination: Mutex::new(None),
-            stage_scope: publication.scope(),
-            root_result_capacity: result_capacity.clone(),
-        };
-        let result = self.executor.publish(&job, &publication_scope);
-        publication.complete();
-        let (conclusion, publication_fact, failure, finalization_failure) = match result {
-            Ok(StatisticsPublicationOutcome {
-                fact: StatisticsPublicationFact::KnownCommitted,
-                finalization_failure,
-            }) => (
-                StatisticsJobConclusion::Succeeded,
-                StatisticsPublicationFact::KnownCommitted,
-                None,
-                finalization_failure,
-            ),
-            Ok(StatisticsPublicationOutcome {
-                fact: StatisticsPublicationFact::CommitUnknown,
-                ..
-            }) => (
-                StatisticsJobConclusion::CommitUnknown,
-                StatisticsPublicationFact::CommitUnknown,
-                Some(StatisticsFailure {
-                    compile_control: None,
-                    message: Arc::from("provider returned an unknown publication outcome"),
-                }),
-                None,
-            ),
-            Ok(StatisticsPublicationOutcome {
-                fact: StatisticsPublicationFact::KnownUncommitted,
-                finalization_failure,
-            }) => (
-                StatisticsJobConclusion::Failed,
-                StatisticsPublicationFact::KnownUncommitted,
-                Some(StatisticsFailure {
-                    compile_control: None,
-                    message: Arc::from("provider publication was not committed"),
-                }),
-                finalization_failure,
-            ),
-            Ok(StatisticsPublicationOutcome {
-                fact: StatisticsPublicationFact::NotStarted,
-                ..
-            }) => (
-                StatisticsJobConclusion::Failed,
-                StatisticsPublicationFact::NotStarted,
-                Some(StatisticsFailure {
-                    compile_control: None,
-                    message: Arc::from("publication executor returned no publication fact"),
-                }),
-                None,
-            ),
-            Err(error) => (
-                error.conclusion(),
-                StatisticsPublicationFact::NotStarted,
-                Some(error.failure()),
-                None,
-            ),
-        };
-        self.repository
-            .conclude(
-                job.id,
-                StatisticsJobPhase::Publishing,
-                conclusion,
-                publication_fact,
-                failure,
-                at_ms,
-            )
-            .await?;
-        if let Some(failure) = finalization_failure {
-            self.record_finalization_failure(job.id, failure, at_ms)
-                .await?;
-        }
-        let terminal = self
-            .repository
-            .record_convergence(
-                job.id,
-                StatisticsConvergence {
-                    collection_stopped: false,
-                    execution_resources_released: false,
-                    provider_session_closed: true,
-                },
-                at_ms,
-            )
-            .await?;
-        Ok(Some(terminal))
+        self.repository.get(job.id).await
     }
+}
 
-    #[cfg(novarocks_dev_controls)]
-    fn take_preparation_nomination(
-        &self,
-        id: StatisticsJobId,
-    ) -> Result<
-        Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
-        StatisticsRepositoryError,
-    > {
-        let mut state = self.repository.lock()?;
-        let entry = state
-            .active
-            .get_mut(&id)
-            .ok_or_else(|| StatisticsJobRepository::not_found(id))?;
-        if entry.job.state != StatisticsJobState::Active(StatisticsJobPhase::Preparing) {
-            return Err(StatisticsRepositoryError::new(
-                StatisticsRepositoryErrorKind::Conflict,
-                "statistics nomination requires its exact preparing job",
-            ));
-        }
-        Ok(entry.test_statement_nomination.take())
+fn publication_result(
+    result: Result<StatisticsPublicationOutcome, StatisticsAttemptError>,
+) -> (
+    StatisticsJobConclusion,
+    StatisticsPublicationFact,
+    Option<StatisticsFailure>,
+    Option<StatisticsPublicationFailure>,
+    Option<StatisticsPublicationFailure>,
+    Option<StatisticsPublicationFailure>,
+) {
+    match result {
+        Ok(StatisticsPublicationOutcome::NoOp {
+            finalization_failure,
+            cleanup_failure,
+        }) => (
+            if finalization_failure.is_some() {
+                StatisticsJobConclusion::Failed
+            } else {
+                StatisticsJobConclusion::Succeeded
+            },
+            StatisticsPublicationFact::NoOp,
+            None,
+            None,
+            finalization_failure,
+            cleanup_failure,
+        ),
+        Ok(StatisticsPublicationOutcome::KnownCommitted {
+            finalization_failure,
+            cleanup_failure,
+        }) => (
+            if finalization_failure.is_some() {
+                StatisticsJobConclusion::Failed
+            } else {
+                StatisticsJobConclusion::Succeeded
+            },
+            StatisticsPublicationFact::KnownCommitted,
+            None,
+            None,
+            finalization_failure,
+            cleanup_failure,
+        ),
+        Ok(StatisticsPublicationOutcome::CommitUnknown { failure }) => (
+            StatisticsJobConclusion::CommitUnknown,
+            StatisticsPublicationFact::CommitUnknown,
+            None,
+            Some(failure),
+            None,
+            None,
+        ),
+        Ok(StatisticsPublicationOutcome::KnownUncommitted {
+            failure,
+            cleanup_failure,
+        }) => (
+            StatisticsJobConclusion::Failed,
+            StatisticsPublicationFact::KnownUncommitted,
+            None,
+            Some(failure),
+            None,
+            cleanup_failure,
+        ),
+        Err(error) => (
+            error.conclusion(),
+            StatisticsPublicationFact::NotStarted,
+            Some(error.failure()),
+            None,
+            None,
+            None,
+        ),
     }
+}
 
-    fn root_scope_and_capacity(
-        &self,
-        id: StatisticsJobId,
-    ) -> Result<(WorkScope, QueryResultCapacityBinding), StatisticsRepositoryError> {
-        let state = self.repository.lock()?;
-        state
-            .active
-            .get(&id)
-            .map(|entry| {
-                (
-                    entry.owner.as_ref().expect("active job owns root").scope(),
-                    entry
-                        .result_capacity
-                        .as_ref()
-                        .expect("active job owns its result capacity")
-                        .clone(),
-                )
-            })
-            .ok_or_else(|| StatisticsJobRepository::not_found(id))
+fn find_entry_mut(
+    state: &mut RuntimeState,
+    id: StatisticsJobId,
+) -> Result<&mut LiveJob, StatisticsRepositoryError> {
+    if state.active.contains_key(&id) {
+        return Ok(state.active.get_mut(&id).unwrap());
     }
-
-    async fn conclude_error(
-        &self,
-        job: StatisticsJob,
-        phase: StatisticsJobPhase,
-        error: StatisticsAttemptError,
-        at_ms: i64,
-    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
-        self.repository
-            .conclude(
-                job.id,
-                phase,
-                error.conclusion(),
-                StatisticsPublicationFact::NotStarted,
-                Some(error.failure()),
-                at_ms,
-            )
-            .await?;
-        self.repository
-            .record_convergence(
-                job.id,
-                StatisticsConvergence {
-                    collection_stopped: true,
-                    execution_resources_released: true,
-                    provider_session_closed: true,
-                },
-                at_ms,
-            )
-            .await
-    }
-
-    async fn record_finalization_failure(
-        &self,
-        id: StatisticsJobId,
-        failure: StatisticsFailure,
-        at_ms: i64,
-    ) -> Result<(), StatisticsRepositoryError> {
-        let mut state = self.repository.lock()?;
-        let entry = state
-            .terminal
-            .iter_mut()
-            .find(|entry| entry.job.id == id)
-            .ok_or_else(|| StatisticsJobRepository::not_found(id))?;
-        if !matches!(
-            entry.job.publication,
-            StatisticsPublicationFact::KnownCommitted | StatisticsPublicationFact::KnownUncommitted
-        ) {
-            return Err(StatisticsRepositoryError::new(
-                StatisticsRepositoryErrorKind::InvalidTransition,
-                "only a definite provider publication outcome can retain a finalization failure",
-            ));
-        }
-        entry.job.publication_finalization_failure = Some(failure);
-        entry.job.updated_at_ms = at_ms;
-        Ok(())
-    }
+    state
+        .terminal
+        .iter_mut()
+        .find(|entry| entry.job.id == id)
+        .ok_or_else(|| StatisticsJobRepository::not_found(id))
 }
 
 fn work_error(error: novarocks_workload_control::WorkError) -> StatisticsRepositoryError {
@@ -1471,6 +1867,103 @@ fn work_error(error: novarocks_workload_control::WorkError) -> StatisticsReposit
         StatisticsRepositoryErrorKind::Conflict,
         format!("statistics child work scope admission failed: {error}"),
     )
+}
+
+#[cfg(test)]
+trait StatisticsPhaseFixture: Send + Sync + 'static {
+    fn prepare(
+        &self,
+        job: &StatisticsJob,
+        context: &StatisticsAttemptContext,
+    ) -> Result<(), StatisticsAttemptError>;
+    fn collect(
+        &self,
+        job: &StatisticsJob,
+        context: &StatisticsAttemptContext,
+    ) -> Result<(), StatisticsAttemptError>;
+    fn publish(
+        &self,
+        job: &StatisticsJob,
+        context: &StatisticsAttemptContext,
+    ) -> Result<StatisticsPublicationOutcome, StatisticsAttemptError>;
+}
+#[cfg(test)]
+impl<T: StatisticsPhaseFixture> StatisticsAttemptExecutor for T {
+    fn execute<'a>(
+        &'a self,
+        job: StatisticsJob,
+        admission: StatisticsJobAdmission,
+        progress: StatisticsJobProgress,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StatisticsAttemptError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut original = admission.into_originals();
+            let root = original.owner.as_ref().unwrap().scope();
+            let capacity = original.result_capacity.as_ref().unwrap().clone();
+            let failed = |error: StatisticsRepositoryError| {
+                StatisticsAttemptError::Failed(StatisticsFailure {
+                    compile_control: None,
+                    message: Arc::from(error.to_string()),
+                })
+            };
+            let work = |error: novarocks_workload_control::WorkError| {
+                StatisticsAttemptError::Cancelled(StatisticsFailure {
+                    compile_control: None,
+                    message: Arc::from(error.to_string()),
+                })
+            };
+            let result = (|| {
+                let prepare = root
+                    .child(WorkRequest::new(WorkClass::Statistics))
+                    .map_err(work)?;
+                let context = StatisticsAttemptContext {
+                    stage_scope: prepare.scope(),
+                    root_result_capacity: capacity.clone(),
+                    #[cfg(novarocks_dev_controls)]
+                    test_statement_nomination: Mutex::new(
+                        original.test_statement_nomination.take(),
+                    ),
+                };
+                let prepared = self.prepare(&job, &context);
+                drop(context);
+                prepare.complete();
+                prepared?;
+                progress.prepared(job.updated_at_ms).map_err(failed)?;
+                let collect = root
+                    .child(WorkRequest::new(WorkClass::Statistics))
+                    .map_err(work)?;
+                let context = StatisticsAttemptContext {
+                    stage_scope: collect.scope(),
+                    root_result_capacity: capacity.clone(),
+                    #[cfg(novarocks_dev_controls)]
+                    test_statement_nomination: Mutex::new(None),
+                };
+                let collected = self.collect(&job, &context);
+                drop(context);
+                collect.complete();
+                collected?;
+                progress.collected(job.updated_at_ms).map_err(failed)?;
+                let publish = root
+                    .child(WorkRequest::new(WorkClass::Statistics))
+                    .map_err(work)?;
+                let context = StatisticsAttemptContext {
+                    stage_scope: publish.scope(),
+                    root_result_capacity: capacity.clone(),
+                    #[cfg(novarocks_dev_controls)]
+                    test_statement_nomination: Mutex::new(None),
+                };
+                let result = self.publish(&job, &context);
+                drop(context);
+                publish.complete();
+                result
+            })();
+            drop(capacity);
+            progress
+                .retire_unmounted(original, job.updated_at_ms)
+                .map_err(failed)?;
+            progress.finish(result, job.updated_at_ms).map_err(failed)?;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1486,6 +1979,122 @@ mod tests {
     use novarocks_workload_control::{ResourceConfig, WorkloadConfig, WorkloadControl};
 
     use super::*;
+
+    #[test]
+    fn bounded_publication_observation_keeps_facts_but_not_original_custody() {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureProjection, FailureReason, FailureRowPosition,
+            OuterFailureProjection, ResourceDimension, ResourceFacts,
+        };
+        use novarocks_type_contract::{CompileControlError, CompileControlProvenance};
+        use std::num::NonZeroU16;
+        #[derive(Debug)]
+        struct Original {
+            fact: FailureFact,
+            dropped: Arc<AtomicUsize>,
+        }
+        impl fmt::Display for Original {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("private-token=secret;")?;
+                for _ in 0..1024 {
+                    f.write_str("原")?;
+                }
+                Ok(())
+            }
+        }
+        impl std::error::Error for Original {}
+        impl FailureProjection for Original {
+            fn failure_fact(&self) -> FailureFact {
+                self.fact
+            }
+        }
+        impl OuterFailureProjection for Original {}
+        impl Drop for Original {
+            fn drop(&mut self) {
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let fact = FailureFact::new(
+            FailureClass::Resource,
+            FailureReason::new(
+                NonZeroU16::new(u16::MAX).unwrap(),
+                NonZeroU16::new(u16::MAX).unwrap(),
+            ),
+        )
+        .with_resource(ResourceFacts {
+            request_scope: None,
+            constraint_scope: None,
+            dimension: ResourceDimension::Bytes,
+            requested: Some(99),
+            required_growth: Some(9),
+            limit: Some(90),
+            live: Some(81),
+            committed: Some(3),
+        })
+        .with_row_position(FailureRowPosition {
+            selected_ordinal: 7,
+            batch_row: 11,
+        });
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let original = CompileControlError::from_domain(Original {
+            fact,
+            dropped: dropped.clone(),
+        });
+        let record = StatisticsPublicationFailure::capture(
+            original.failure_fact(),
+            Some(original.provenance()),
+            &original,
+        );
+        assert_eq!(record.fact(), fact);
+        assert_eq!(
+            record.compile_control(),
+            Some(CompileControlProvenance::Source(fact))
+        );
+        assert!(record.local_diagnostic().contains("private-token=secret"));
+        assert!(
+            record.local_diagnostic().len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES
+        );
+        assert!(record.local_diagnostic().ends_with('原'));
+        assert!(!record.public_message().contains("secret"));
+        assert!(!format!("{record:?}").contains("secret"));
+        assert!(
+            record.public_message().len() <= StatisticsPublicationFailure::PUBLIC_MESSAGE_BYTES
+        );
+        let historical = record;
+        drop(original);
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            1,
+            "history must not pin the Provider tree"
+        );
+        assert_eq!(historical.fact(), fact);
+        assert_eq!(
+            historical.compile_control(),
+            Some(CompileControlProvenance::Source(fact))
+        );
+    }
+
+    #[test]
+    fn diagnostic_formatter_panic_cannot_change_publication_facts() {
+        use novarocks_failure_contract::FailureProjection;
+        struct PanickingDiagnostic;
+        impl fmt::Display for PanickingDiagnostic {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("private-prefix")?;
+                panic!("diagnostic formatter failure")
+            }
+        }
+        let original = novarocks_type_contract::CompileControlError::DeadlineExceeded;
+        let record = StatisticsPublicationFailure::capture(
+            original.failure_fact(),
+            Some(original.provenance()),
+            &PanickingDiagnostic,
+        );
+        assert_eq!(record.fact(), original.failure_fact());
+        assert_eq!(record.compile_control(), Some(original.provenance()));
+        assert_eq!(record.local_diagnostic(), "private-prefix");
+        assert!(!record.public_message().contains("private"));
+    }
 
     fn create(at_ms: i64) -> StatisticsJobCreate {
         StatisticsJobCreate {
@@ -1627,52 +2236,48 @@ mod tests {
 
     struct BlockingExecutor {
         started: mpsc::Sender<()>,
-        release: Mutex<mpsc::Receiver<()>>,
+        release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     }
 
     impl StatisticsAttemptExecutor for BlockingExecutor {
-        fn prepare(
-            &self,
-            _job: &StatisticsJob,
-            context: &StatisticsAttemptContext,
-        ) -> Result<(), StatisticsAttemptError> {
-            self.started
-                .send(())
-                .expect("test observes the background preparation");
-            self.release
-                .lock()
-                .expect("release lock")
-                .recv()
-                .expect("test releases the background preparation");
-            context.stage_scope().check().map_err(|error| {
-                StatisticsAttemptError::Cancelled(StatisticsFailure {
-                    compile_control: None,
-                    message: Arc::from(error.to_string()),
-                })
-            })
-        }
-
-        fn collect(
-            &self,
-            _job: &StatisticsJob,
-            _context: &StatisticsAttemptContext,
-        ) -> Result<(), StatisticsAttemptError> {
-            Ok(())
-        }
-
-        fn publish(
-            &self,
-            _job: &StatisticsJob,
-            _context: &StatisticsAttemptContext,
-        ) -> Result<StatisticsPublicationOutcome, StatisticsAttemptError> {
-            Ok(StatisticsPublicationOutcome {
-                fact: StatisticsPublicationFact::KnownCommitted,
-                finalization_failure: None,
+        fn execute<'a>(
+            &'a self,
+            job: StatisticsJob,
+            admission: StatisticsJobAdmission,
+            progress: StatisticsJobProgress,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StatisticsAttemptError>> + Send + 'a>> {
+            Box::pin(async move {
+                let original = admission.into_originals();
+                let root = original.owner.as_ref().unwrap().scope();
+                self.started
+                    .send(())
+                    .expect("test observes actual preparation");
+                let release = self.release.lock().unwrap().take().unwrap();
+                release.await.expect("test releases original preparation");
+                let result = match root.check() {
+                    Err(error) => Err(StatisticsAttemptError::Cancelled(StatisticsFailure {
+                        compile_control: None,
+                        message: Arc::from(error.to_string()),
+                    })),
+                    Ok(()) => {
+                        progress.prepared(job.updated_at_ms).unwrap();
+                        progress.collected(job.updated_at_ms).unwrap();
+                        Ok(StatisticsPublicationOutcome::KnownCommitted {
+                            finalization_failure: None,
+                            cleanup_failure: None,
+                        })
+                    }
+                };
+                progress
+                    .retire_unmounted(original, job.updated_at_ms)
+                    .unwrap();
+                progress.finish(result, job.updated_at_ms).unwrap();
+                Ok(())
             })
         }
     }
 
-    impl StatisticsAttemptExecutor for RecordingExecutor {
+    impl StatisticsPhaseFixture for RecordingExecutor {
         fn prepare(
             &self,
             _job: &StatisticsJob,
@@ -1757,17 +2362,17 @@ mod tests {
             })?;
             self.publications.fetch_add(1, Ordering::SeqCst);
             if self.finalization_fails {
-                Ok(StatisticsPublicationOutcome {
-                    fact: StatisticsPublicationFact::KnownCommitted,
-                    finalization_failure: Some(StatisticsFailure {
-                        compile_control: None,
-                        message: Arc::from("accelerator finalization failed"),
-                    }),
+                Ok(StatisticsPublicationOutcome::KnownCommitted {
+                    cleanup_failure: None,
+                    finalization_failure: Some(test_publication_failure(
+                        "accelerator finalization failed",
+                    )),
                 })
             } else {
-                Ok(StatisticsPublicationOutcome {
-                    fact: StatisticsPublicationFact::CommitUnknown,
-                    finalization_failure: None,
+                Ok(StatisticsPublicationOutcome::CommitUnknown {
+                    failure: crate::test_publication_failure(
+                        "original provider publication unknown",
+                    ),
                 })
             }
         }
@@ -1842,12 +2447,12 @@ mod tests {
     async fn runtime_returns_submission_before_its_background_attempt_concludes() {
         let service = StatisticsJobService::new();
         let (started, started_rx) = mpsc::channel();
-        let (release, release_rx) = mpsc::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
         let runtime = StatisticsJobRuntime::start(
             service.clone(),
             Arc::new(BlockingExecutor {
                 started,
-                release: Mutex::new(release_rx),
+                release: Mutex::new(Some(release_rx)),
             }),
             tokio::runtime::Handle::current(),
         );
@@ -1907,12 +2512,12 @@ mod tests {
     async fn runtime_cancellation_reaches_an_active_attempt_root() {
         let service = StatisticsJobService::new();
         let (started, started_rx) = mpsc::channel();
-        let (release, release_rx) = mpsc::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
         let runtime = StatisticsJobRuntime::start(
             service.clone(),
             Arc::new(BlockingExecutor {
                 started,
-                release: Mutex::new(release_rx),
+                release: Mutex::new(Some(release_rx)),
             }),
             tokio::runtime::Handle::current(),
         );
@@ -1972,12 +2577,12 @@ mod tests {
     async fn process_stop_cancels_the_active_root_and_waits_for_convergence() {
         let service = StatisticsJobService::new();
         let (started, started_rx) = mpsc::channel();
-        let (release, release_rx) = mpsc::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
         let runtime = StatisticsJobRuntime::start(
             service.clone(),
             Arc::new(BlockingExecutor {
                 started,
-                release: Mutex::new(release_rx),
+                release: Mutex::new(Some(release_rx)),
             }),
             tokio::runtime::Handle::current(),
         );
@@ -2122,7 +2727,7 @@ mod tests {
         let terminal = worker.run_one(2).await.expect("run").expect("terminal");
         assert_eq!(
             terminal.state,
-            StatisticsJobState::Terminal(StatisticsJobConclusion::Succeeded)
+            StatisticsJobState::Terminal(StatisticsJobConclusion::Failed)
         );
         assert_eq!(
             terminal.publication,
@@ -2130,10 +2735,7 @@ mod tests {
         );
         assert_eq!(
             terminal.publication_finalization_failure,
-            Some(StatisticsFailure {
-                compile_control: None,
-                message: Arc::from("accelerator finalization failed"),
-            })
+            Some(test_publication_failure("accelerator finalization failed"))
         );
         assert!(terminal.convergence.execution_resources_released);
         assert!(terminal.convergence.provider_session_closed);
@@ -2152,7 +2754,7 @@ mod tests {
     async fn stale_is_a_reachable_business_conclusion() {
         struct StaleExecutor;
 
-        impl StatisticsAttemptExecutor for StaleExecutor {
+        impl StatisticsPhaseFixture for StaleExecutor {
             fn prepare(
                 &self,
                 _job: &StatisticsJob,
@@ -2239,38 +2841,61 @@ mod tests {
         assert!(converged.convergence.is_complete());
     }
     #[tokio::test]
-    async fn conclusion_wait_requires_all_actual_convergence_facts() {
+    async fn conclusion_wait_returns_business_before_actual_convergence_releases_root() {
         let repository = StatisticsJobRepository::new();
+        let (admission, capacity) = root_with_capacity().await;
+        let scope = admission.scope();
         let job = repository
-            .create_admitted(create(1), root().await)
+            .create_admitted(create(1), admission)
             .await
             .unwrap();
-        repository.claim_next(2).await.unwrap().unwrap();
+        let claimed = repository.claim_next(2).await.unwrap().unwrap();
+        assert_eq!(
+            claimed.state,
+            StatisticsJobState::Active(StatisticsJobPhase::Preparing)
+        );
         let wait = repository.wait_for_conclusion(job.id);
         tokio::pin!(wait);
         assert!(
             std::future::poll_fn(|cx| std::task::Poll::Ready(wait.as_mut().poll(cx).is_pending()))
                 .await
         );
-        repository
+        scope.check().unwrap();
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        let failure = StatisticsFailure {
+            compile_control: None,
+            message: Arc::from("failed"),
+        };
+        let concluded = repository
             .conclude(
                 job.id,
                 StatisticsJobPhase::Preparing,
                 StatisticsJobConclusion::Failed,
                 StatisticsPublicationFact::NotStarted,
-                Some(StatisticsFailure {
-                    compile_control: None,
-                    message: Arc::from("failed"),
-                }),
+                Some(failure.clone()),
                 3,
             )
             .await
             .unwrap();
-        assert!(
-            std::future::poll_fn(|cx| std::task::Poll::Ready(wait.as_mut().poll(cx).is_pending()))
-                .await
+        let terminal = std::future::poll_fn(|cx| match wait.as_mut().poll(cx) {
+            std::task::Poll::Ready(result) => std::task::Poll::Ready(result.unwrap()),
+            std::task::Poll::Pending => {
+                panic!("the original business waiter must not wait for resource convergence")
+            }
+        })
+        .await;
+        assert_eq!(terminal, concluded);
+        assert_eq!(
+            terminal.state,
+            StatisticsJobState::Terminal(StatisticsJobConclusion::Failed)
         );
-        repository
+        assert_eq!(terminal.publication, StatisticsPublicationFact::NotStarted);
+        assert_eq!(terminal.failure, Some(failure.clone()));
+        assert_eq!(terminal.convergence, StatisticsConvergence::default());
+        scope.check().unwrap();
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+
+        let partial = repository
             .record_convergence(
                 job.id,
                 StatisticsConvergence {
@@ -2282,11 +2907,20 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            std::future::poll_fn(|cx| std::task::Poll::Ready(wait.as_mut().poll(cx).is_pending()))
-                .await
+        assert!(partial.convergence.collection_stopped);
+        assert!(partial.convergence.execution_resources_released);
+        assert!(!partial.convergence.provider_session_closed);
+        assert!(!partial.convergence.is_complete());
+        assert_eq!(partial.state, terminal.state);
+        assert_eq!(partial.failure, Some(failure.clone()));
+        assert_eq!(
+            repository.wait_for_conclusion(job.id).await.unwrap(),
+            partial
         );
-        repository
+        scope.check().unwrap();
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+
+        let converged = repository
             .record_convergence(
                 job.id,
                 StatisticsConvergence {
@@ -2298,15 +2932,17 @@ mod tests {
             )
             .await
             .unwrap();
-        let terminal = wait.await.unwrap();
-        assert_eq!(
-            terminal.state,
-            StatisticsJobState::Terminal(StatisticsJobConclusion::Failed)
-        );
-        assert!(terminal.convergence.is_complete());
+        assert_eq!(converged.state, terminal.state);
+        assert_eq!(converged.failure, Some(failure));
+        assert!(converged.convergence.is_complete());
+        assert!(matches!(
+            scope.check(),
+            Err(novarocks_workload_control::WorkError::Released)
+        ));
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
         assert_eq!(
             repository.wait_for_conclusion(job.id).await.unwrap(),
-            terminal
+            converged
         );
     }
 
@@ -2345,6 +2981,127 @@ mod tests {
             StatisticsJobState::Terminal(StatisticsJobConclusion::Cancelled)
         );
         assert!(terminal.convergence.is_complete());
+    }
+    #[tokio::test]
+    async fn business_completion_allows_next_job_without_inventing_original_exit() {
+        struct HoldingExecutor(Mutex<Vec<StatisticsJobOriginals>>);
+        impl StatisticsAttemptExecutor for HoldingExecutor {
+            fn execute<'a>(
+                &'a self,
+                job: StatisticsJob,
+                admission: StatisticsJobAdmission,
+                progress: StatisticsJobProgress,
+            ) -> Pin<Box<dyn Future<Output = Result<(), StatisticsAttemptError>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    // This product fixture retains actual original owners. It
+                    // supplies no bank/exit receipt and must remain unresolved.
+                    self.0.lock().unwrap().push(admission.into_originals());
+                    progress.prepared(job.updated_at_ms).unwrap();
+                    progress.collected(job.updated_at_ms).unwrap();
+                    progress
+                        .finish(
+                            Ok(StatisticsPublicationOutcome::KnownCommitted {
+                                finalization_failure: None,
+                                cleanup_failure: None,
+                            }),
+                            job.updated_at_ms,
+                        )
+                        .unwrap();
+                    Ok(())
+                })
+            }
+        }
+        let repository = StatisticsJobRepository::new();
+        let first = repository
+            .create_admitted(create(1), root().await)
+            .await
+            .unwrap();
+        let second = repository
+            .create_admitted(create(2), root().await)
+            .await
+            .unwrap();
+        let executor = Arc::new(HoldingExecutor(Mutex::new(Vec::new())));
+        let worker = StatisticsWorker::new(repository.clone(), executor.clone());
+        assert_eq!(worker.run_one(3).await.unwrap().unwrap().id, first.id);
+        assert_eq!(worker.run_one(4).await.unwrap().unwrap().id, second.id);
+        for id in [first.id, second.id] {
+            let business = repository.wait_for_conclusion(id).await.unwrap();
+            assert_eq!(
+                business.state,
+                StatisticsJobState::Terminal(StatisticsJobConclusion::Succeeded)
+            );
+            assert!(
+                !business.convergence.is_complete(),
+                "business cannot fabricate original exit"
+            );
+        }
+        let mut state = repository.lock().unwrap();
+        StatisticsJobRepository::trim_terminal(&mut state);
+        assert_eq!(state.terminal.len(), 2);
+        assert!(state.terminal.iter().all(|entry| entry.transferred
+            && entry.owner.is_none()
+            && !entry.job.convergence.is_complete()));
+        drop(state);
+        let originals = std::mem::take(&mut *executor.0.lock().unwrap());
+        for mut original in originals {
+            let owner = original.owner.take().unwrap();
+            owner.scope().check().unwrap();
+            drop(original);
+            owner.complete_after_terminal_cancel_settled();
+        }
+        // Fixture cleanup is not published as a fabricated observer receipt.
+        assert!(
+            repository
+                .list()
+                .await
+                .unwrap()
+                .iter()
+                .all(|job| !job.convergence.is_complete())
+        );
+    }
+    #[tokio::test]
+    async fn late_cleanup_diagnostic_preserves_business_and_original_convergence() {
+        let repository = StatisticsJobRepository::new();
+        let created = repository
+            .create_admitted(create(1), root().await)
+            .await
+            .unwrap();
+        let job = repository.claim_next(2).await.unwrap().unwrap();
+        let progress = StatisticsJobProgress {
+            repository: repository.clone(),
+            id: job.id,
+        };
+        progress.prepared(3).unwrap();
+        progress.collected(4).unwrap();
+        progress
+            .finish(
+                Ok(StatisticsPublicationOutcome::KnownCommitted {
+                    finalization_failure: None,
+                    cleanup_failure: None,
+                }),
+                5,
+            )
+            .unwrap();
+        let before = repository.get(created.id).await.unwrap().unwrap();
+        assert!(!before.convergence.is_complete());
+        let cleanup = test_publication_failure("late original GC failure");
+        progress
+            .record_publication_cleanup_failure(cleanup.clone())
+            .unwrap();
+        progress
+            .record_publication_cleanup_failure(cleanup.clone())
+            .unwrap();
+        let after = repository.get(created.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.state,
+            StatisticsJobState::Terminal(StatisticsJobConclusion::Succeeded)
+        );
+        assert_eq!(after.publication, StatisticsPublicationFact::KnownCommitted);
+        assert_eq!(after.convergence, before.convergence);
+        assert!(after.failure.is_none());
+        assert_eq!(after.publication_cleanup_failure, Some(cleanup));
+        assert_eq!(after.completed_at_ms, before.completed_at_ms);
     }
 }
 

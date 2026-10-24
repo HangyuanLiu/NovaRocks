@@ -1603,6 +1603,79 @@ impl QueryConcurrencyPermit {
             .is_some_and(|held| held.id == scope.id && Arc::ptr_eq(&held.inner, &scope.inner))
     }
 
+    /// Move one existing warehouse grant between two original root owners.
+    /// Both source and receiver remain unchanged on refusal. No queue entry,
+    /// grant or concurrency gap is created; callbacks belong to the caller
+    /// after every receiving slot and lock has been settled.
+    pub fn handoff_in(
+        source: &mut Option<Self>,
+        expected_source: &WorkScope,
+        receiver: &WorkOwner,
+        destination: &mut Option<Self>,
+    ) -> Result<WorkloadProgressNotification, WorkError> {
+        if destination.is_some() {
+            return Err(WorkError::Conflict);
+        }
+        let original = source.as_ref().ok_or(WorkError::Released)?;
+        if !original.is_for_scope(expected_source) {
+            return Err(WorkError::Conflict);
+        }
+        let receiving_scope = receiver.scope();
+        if expected_source.id == receiving_scope.id
+            || !Arc::ptr_eq(&expected_source.inner, &receiving_scope.inner)
+        {
+            return Err(WorkError::Conflict);
+        }
+        let inner = Arc::clone(&expected_source.inner);
+        let mut retired_view = None;
+        inner.update_facts_silent(|state| {
+            if state.closed {
+                return Err(WorkError::Closed);
+            }
+            let sending = state
+                .nodes
+                .get(&expected_source.id)
+                .ok_or(WorkError::Released)?;
+            sending.check(&state.cancellations)?;
+            let receiving = state
+                .nodes
+                .get(&receiving_scope.id)
+                .ok_or(WorkError::Released)?;
+            receiving.check(&state.cancellations)?;
+            if sending.parent.is_some()
+                || sending.root != expected_source.id
+                || !sending.class.uses_warehouse_concurrency()
+                || !sending.query_admitted
+                || sending.pending_query
+                || receiving.parent.is_some()
+                || receiving.root != receiving_scope.id
+                || !receiving.class.uses_warehouse_concurrency()
+                || receiving.query_admitted
+                || receiving.pending_query
+                || state.admitted_queries == 0
+            {
+                return Err(WorkError::Conflict);
+            }
+            state
+                .nodes
+                .get_mut(&expected_source.id)
+                .unwrap()
+                .query_admitted = false;
+            state
+                .nodes
+                .get_mut(&receiving_scope.id)
+                .unwrap()
+                .query_admitted = true;
+            // The global count is intentionally untouched.
+            let mut original = source.take().expect("validated original query grant");
+            retired_view = original.scope.replace(receiving_scope);
+            *destination = Some(original);
+            Ok(())
+        })?;
+        drop(retired_view);
+        Ok(WorkloadProgressNotification::new(inner))
+    }
+
     pub fn release(self) {
         drop(self);
     }
@@ -1670,6 +1743,124 @@ mod tests {
         .owner;
         control.mark_ready().unwrap();
         control
+    }
+
+    fn single_query_controller() -> WorkloadControl {
+        let control = WorkloadControl::try_new_split(
+            WorkloadConfig {
+                query_concurrency_limit: 1,
+                ..WorkloadConfig::default()
+            },
+            ResourceConfig {
+                total_bytes: 128,
+                control_bytes: 16,
+                per_scope_bytes: 112,
+            },
+        )
+        .unwrap()
+        .owner;
+        control.mark_ready().unwrap();
+        control
+    }
+
+    #[tokio::test]
+    async fn query_handoff_has_no_gap_and_only_the_receiving_root_releases_the_grant() {
+        let control = single_query_controller();
+        let sql = control
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let job = control
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Statistics))
+            .unwrap();
+        let next = control
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let source_scope = sql.owner.scope();
+        let mut source = Some(source_scope.admit_query().unwrap().await.unwrap());
+        let mut target = None;
+        let mut pending = Box::pin(next.owner.scope().admit_query().unwrap());
+        let wake = Waker::from(Arc::new(InspectWake(Arc::clone(&source_scope.inner))));
+        let mut cx = Context::from_waker(&wake);
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        let notice =
+            QueryConcurrencyPermit::handoff_in(&mut source, &source_scope, &job.owner, &mut target)
+                .unwrap();
+        assert!(source.is_none());
+        assert!(target.as_ref().unwrap().is_for_scope(&job.owner.scope()));
+        assert_eq!(control.observation().snapshot().admitted_queries, 1);
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        notice.notify();
+        sql.owner.complete_after_terminal_cancel_settled();
+        assert_eq!(control.observation().snapshot().admitted_queries, 1);
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        drop(target.take());
+        let next_permit = pending.await.unwrap();
+        assert_eq!(control.observation().snapshot().admitted_queries, 1);
+        drop(next_permit);
+        job.owner.complete_after_terminal_cancel_settled();
+        next.owner.complete_after_terminal_cancel_settled();
+        assert_eq!(control.observation().snapshot().admitted_queries, 0);
+    }
+
+    #[tokio::test]
+    async fn query_handoff_foreign_or_cancelled_receiver_preserves_both_slots() {
+        let control = single_query_controller();
+        let other = single_query_controller();
+        let sql = control
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let other_root = other
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let foreign = other
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Statistics))
+            .unwrap();
+        let job = control
+            .begin_warehouse_root(WorkRequest::new(WorkClass::Statistics))
+            .unwrap();
+        assert_eq!(foreign.owner.scope().id(), job.owner.scope().id());
+        let scope = sql.owner.scope();
+        let mut source = Some(scope.admit_query().unwrap().await.unwrap());
+        let mut destination = Some(foreign.owner.scope().admit_query().unwrap().await.unwrap());
+        assert!(matches!(
+            QueryConcurrencyPermit::handoff_in(&mut source, &scope, &job.owner, &mut destination),
+            Err(WorkError::Conflict)
+        ));
+        assert!(source.as_ref().unwrap().is_for_scope(&scope));
+        assert!(
+            destination
+                .as_ref()
+                .unwrap()
+                .is_for_scope(&foreign.owner.scope())
+        );
+        assert_eq!(control.observation().snapshot().admitted_queries, 1);
+        assert_eq!(other.observation().snapshot().admitted_queries, 1);
+        drop(destination.take());
+        assert!(matches!(
+            QueryConcurrencyPermit::handoff_in(
+                &mut source,
+                &scope,
+                &foreign.owner,
+                &mut destination
+            ),
+            Err(WorkError::Conflict)
+        ));
+        assert!(source.as_ref().unwrap().is_for_scope(&scope));
+        assert!(destination.is_none());
+        assert_eq!(control.observation().snapshot().admitted_queries, 1);
+        assert_eq!(other.observation().snapshot().admitted_queries, 0);
+        job.owner.cancel(CancellationReason::Requested);
+        assert!(matches!(
+            QueryConcurrencyPermit::handoff_in(&mut source, &scope, &job.owner, &mut destination),
+            Err(WorkError::Cancelled(CancellationReason::Requested))
+        ));
+        assert!(source.as_ref().unwrap().is_for_scope(&scope));
+        assert!(destination.is_none());
+        drop(source);
+        sql.owner.complete_after_terminal_cancel_settled();
+        job.owner.complete_after_terminal_cancel_settled();
+        foreign.owner.complete_after_terminal_cancel_settled();
+        other_root.owner.complete_after_terminal_cancel_settled();
     }
 
     #[test]

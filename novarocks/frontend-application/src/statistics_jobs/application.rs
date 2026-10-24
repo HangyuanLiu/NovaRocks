@@ -95,6 +95,34 @@ pub struct StatisticsAttemptBinding {
 
 /// The frontend captures a logical ANALYZE target before job creation.
 pub trait StatisticsTargetResolver: Send + Sync {
+    fn planning_lease(
+        &self,
+        _target: &StatisticsTableTarget,
+    ) -> Result<ConnectorControlPlanningLease, StatisticsApplicationError> {
+        Err(StatisticsApplicationError::new(
+            "statistics capture has no governed planning lease",
+        ))
+    }
+    fn capture_table_object_async<'a>(
+        &'a self,
+        _target: &'a StatisticsTableTarget,
+        _context: ConnectorRequestContext,
+        _lease: &'a ConnectorControlPlanningLease,
+        _cpu: Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<StatisticsTargetCapture, StatisticsApplicationError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Err(StatisticsApplicationError::new(
+                "statistics capture has no asynchronous source",
+            ))
+        })
+    }
     fn capture_table_object(
         &self,
         target: &StatisticsTableTarget,
@@ -182,6 +210,86 @@ impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
             sql_columns: sql_visible_column_names(captured.metadata.schema()),
         })
     }
+    fn planning_lease(
+        &self,
+        target: &StatisticsTableTarget,
+    ) -> Result<ConnectorControlPlanningLease, StatisticsApplicationError> {
+        let id = ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
+        self.controls
+            .acquire_current(&id)
+            .map_err(StatisticsApplicationError::from_connector_error)
+    }
+    fn capture_table_object_async<'a>(
+        &'a self,
+        target: &'a StatisticsTableTarget,
+        context: ConnectorRequestContext,
+        lease: &'a ConnectorControlPlanningLease,
+        cpu: Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<StatisticsTargetCapture, StatisticsApplicationError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let instance_id = ConnectorInstanceId::parse(&target.catalog)
+                .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
+            if lease.binding().statistics().is_none() {
+                return Err(StatisticsApplicationError::from_connector_error(
+                    ConnectorError::new(
+                        novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                        "connector control generation has no statistics capability",
+                    ),
+                ));
+            }
+            let captured = lease
+                .binding()
+                .metadata()
+                .capture_table_object_binding_for_statistics_async(
+                    ConnectorTableObjectCaptureRequest {
+                        table: ConnectorTableIdentity {
+                            instance_id,
+                            namespace: Arc::from(target.namespace.as_str()),
+                            table: Arc::from(target.table.as_str()),
+                        },
+                        resolution: ConnectorTableResolution::StrictBaseTable,
+                        selector: ConnectorTableObjectSelector::Current,
+                        context: context.clone(),
+                    },
+                    cpu,
+                )
+                .await
+                .map_err(StatisticsApplicationError::from_connector_error)?;
+            let job_admission = lease
+                .binding()
+                .metadata()
+                .admit_table_job(
+                    novarocks_spi::connector::ConnectorTableJobAdmissionRequest {
+                        table: ConnectorTableIdentity {
+                            instance_id: ConnectorInstanceId::parse(&target.catalog).map_err(
+                                |error| StatisticsApplicationError::new(error.to_string()),
+                            )?,
+                            namespace: Arc::from(target.namespace.as_str()),
+                            table: Arc::from(target.table.as_str()),
+                        },
+                        job: novarocks_spi::connector::ConnectorTableJobKind::Statistics,
+                        context: context.clone(),
+                    },
+                )
+                .map_err(StatisticsApplicationError::from_connector_error)?;
+            Ok(StatisticsTargetCapture {
+                job_admission,
+                connector_instance_id: captured.metadata.table.owner().as_str().to_string(),
+                namespace: target.namespace.clone(),
+                table: target.table.clone(),
+                object_id: captured.object_id.as_bytes().to_vec(),
+                sql_columns: sql_visible_column_names(captured.metadata.schema()),
+            })
+        })
+    }
 }
 
 /// Rebind a durable request through the caller's existing planning lease.
@@ -212,6 +320,49 @@ pub(crate) fn rebind_table_object(
             selector: ConnectorTableObjectSelector::Current,
             context,
         })
+        .map_err(StatisticsApplicationError::from_connector_error)?;
+    let data_version = metadata.statistics_data_version.clone().ok_or_else(|| {
+        StatisticsApplicationError::new(
+            "connector metadata did not provide a statistics data-version for rebound table",
+        )
+    })?;
+    let sql_columns = sql_visible_columns(metadata.schema());
+    Ok(StatisticsAttemptBinding {
+        table: metadata.table,
+        data_version,
+        sql_columns,
+    })
+}
+
+pub(crate) async fn rebind_table_object_async(
+    lease: &ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+    request: &StatisticsAttemptRequest,
+    cpu: Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
+) -> Result<StatisticsAttemptBinding, StatisticsApplicationError> {
+    let instance_id = ConnectorInstanceId::parse(&request.connector_instance_id)
+        .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
+    let expected_object_id =
+        ConnectorTableObjectId::try_new(Bytes::copy_from_slice(&request.object_id))
+            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
+    let ConnectorTableObjectBinding { metadata, .. } = lease
+        .binding()
+        .metadata()
+        .rebind_table_object_binding_for_statistics_async(
+            ConnectorTableObjectRebindRequest {
+                table: ConnectorTableIdentity {
+                    instance_id,
+                    namespace: Arc::from(request.namespace.as_str()),
+                    table: Arc::from(request.table.as_str()),
+                },
+                expected_object_id,
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                selector: ConnectorTableObjectSelector::Current,
+                context,
+            },
+            cpu,
+        )
+        .await
         .map_err(StatisticsApplicationError::from_connector_error)?;
     let data_version = metadata.statistics_data_version.clone().ok_or_else(|| {
         StatisticsApplicationError::new(
@@ -368,7 +519,7 @@ fn load_statistics_table_metadata(
 /// Placeholder for the per-metric columns of a row that has no measured value.
 const NO_OBSERVATION: &str = "-";
 
-fn statistics_table_stat_view(
+pub(crate) fn statistics_table_stat_view(
     metric: StatisticsMetric,
     state: StatisticsMetricState,
     queried_version: &StatisticsDataVersion,
@@ -513,19 +664,43 @@ pub enum StatisticsApplicationResult {
 }
 
 pub trait StatisticsApplicationPort: Send + Sync {
-    fn execute(
+    fn prepare_statement_action(
         &self,
+        _command: StatisticsApplicationCommand,
+        _execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+        _context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        StatisticsApplicationError,
+    > {
+        Err(StatisticsApplicationError::new(
+            "statistics application has no governed statement source",
+        ))
+    }
+    fn execute<'a>(
+        &'a self,
         command: StatisticsApplicationCommand,
         execution: Option<
-            &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+            &'a novarocks_query_application::admitted_query_context::QueryExecutionContext,
         >,
-    ) -> Result<StatisticsApplicationResult, StatisticsApplicationError>;
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<StatisticsApplicationResult, StatisticsApplicationError>,
+                > + Send
+                + 'a,
+        >,
+    >;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsApplicationError {
     message: String,
     target_binding_failure: Option<ConnectorTableObjectBindingFailure>,
+    source: Option<ConnectorError>,
+    statistics_failure: Option<novarocks_statistics_application::StatisticsFailure>,
+    publication_failure: Option<novarocks_statistics_application::StatisticsPublicationFailure>,
+    publication_terminal: Option<novarocks_spi::connector::LakePublicationTerminal>,
 }
 
 impl StatisticsApplicationError {
@@ -533,15 +708,146 @@ impl StatisticsApplicationError {
         Self {
             message: message.into(),
             target_binding_failure: None,
+            source: None,
+            statistics_failure: None,
+            publication_failure: None,
+            publication_terminal: None,
         }
     }
 
-    fn from_connector_error(error: ConnectorError) -> Self {
+    pub(crate) fn from_connector_error(error: ConnectorError) -> Self {
         let target_binding_failure = error.table_object_binding_failure();
         Self {
             message: error.to_string(),
             target_binding_failure,
+            source: Some(error),
+            statistics_failure: None,
+            publication_failure: None,
+            publication_terminal: None,
         }
+    }
+
+    pub(crate) fn from_statistics_job(
+        job: &novarocks_statistics_application::StatisticsJob,
+    ) -> Self {
+        use novarocks_spi::connector::{
+            LakePublicationDisposition as D, LakePublicationFamily, LakePublicationMarkerHeader,
+            LakePublicationNextAction, LakePublicationTarget, LakePublicationTerminal,
+        };
+        use novarocks_statistics_application::StatisticsPublicationFact as P;
+        let failure = job.failure.clone();
+        let publication_failure = job
+            .publication_failure
+            .or(job.publication_finalization_failure);
+        let disposition = match job.publication {
+            P::KnownUncommitted => Some(D::KnownUncommitted),
+            P::KnownCommitted => Some(D::KnownCommitted),
+            P::CommitUnknown => Some(D::CommitUnknown),
+            P::NotStarted | P::NoOp => None,
+        };
+        let publication_terminal = disposition.map(|disposition| {
+            LakePublicationTerminal::new(
+                LakePublicationMarkerHeader::new(
+                    LakePublicationId::try_from_uuid(job.publication_id.as_uuid())
+                        .expect("original statistics UUIDv7"),
+                    LakePublicationFamily::Statistics,
+                ),
+                LakePublicationTarget::try_new(
+                    job.target.catalog.as_ref().to_owned(),
+                    job.target.namespace.as_ref().to_owned(),
+                    Some(job.target.table.as_ref().to_owned()),
+                    None,
+                )
+                .expect("published statistics retained its provider-admitted target"),
+                disposition,
+                if disposition.do_not_retry() {
+                    LakePublicationNextAction::InspectPublishedState
+                } else {
+                    LakePublicationNextAction::RetryStatement
+                },
+                None,
+            )
+        });
+        Self {
+            message: publication_failure
+                .as_ref()
+                .map(|failure| failure.public_message())
+                .or_else(|| failure.as_ref().map(|f| f.message.to_string()))
+                .unwrap_or_else(|| format!("statistics job completed with {:?}", job.state)),
+            target_binding_failure: None,
+            source: None,
+            statistics_failure: failure,
+            publication_failure,
+            publication_terminal,
+        }
+    }
+
+    pub(crate) fn publication_disposition(
+        &self,
+    ) -> Option<novarocks_spi::connector::LakePublicationDisposition> {
+        self.publication_terminal
+            .as_ref()
+            .map(|terminal| terminal.disposition())
+    }
+
+    pub(crate) fn with_observer_message(mut self, message: impl Into<String>) -> Self {
+        self.message = message.into();
+        self
+    }
+
+    pub(crate) fn to_query_service_error(
+        &self,
+    ) -> novarocks_query_application::session_error::QueryServiceError {
+        use novarocks_query_application::{
+            execution_error::{ExecutionFailureInput, ExecutionFailureSite},
+            session_error::{QueryServiceError, QueryServiceErrorKind},
+        };
+        let mut error = if let Some(failure) = &self.publication_failure {
+            QueryServiceError::from_execution_failure(ExecutionFailureInput::new(
+                failure.fact(),
+                novarocks_execution_contract::SafeDetail::new(failure.public_message())
+                    .expect("fixed statistics publication detail fits safe boundary"),
+                ExecutionFailureSite::Coordinator,
+            ))
+            .with_compile_control_provenance(failure.compile_control())
+        } else if let Some(control) = self
+            .statistics_failure
+            .as_ref()
+            .and_then(|f| f.compile_control.as_ref())
+        {
+            QueryServiceError::from_compile_control(control.clone())
+        } else {
+            QueryServiceError::new(QueryServiceErrorKind::Internal, &self.message)
+        };
+        if let Some(terminal) = &self.publication_terminal {
+            if error.execution_failure().is_none() && terminal.do_not_retry() {
+                let header = terminal.header();
+                let disposition = match terminal.disposition() {
+                    novarocks_spi::connector::LakePublicationDisposition::KnownCommitted => {
+                        "KnownCommitted"
+                    }
+                    novarocks_spi::connector::LakePublicationDisposition::CommitUnknown => {
+                        "CommitUnknown"
+                    }
+                    novarocks_spi::connector::LakePublicationDisposition::KnownUncommitted => {
+                        unreachable!()
+                    }
+                };
+                let message = format!(
+                    "{} (lake publication id={} family={} disposition={} do_not_retry=true; do not retry statement)",
+                    error.message(),
+                    header.publication_id(),
+                    header.family().as_str(),
+                    disposition
+                );
+                error = QueryServiceError::with_publication_terminal(message, terminal.clone())
+                    .with_compile_control(error.compile_control_error())
+                    .with_compile_control_provenance(error.compile_control_provenance());
+            } else {
+                error = error.attach_publication_terminal(terminal.clone());
+            }
+        }
+        error
     }
 
     pub const fn target_binding_failure(&self) -> Option<ConnectorTableObjectBindingFailure> {
@@ -555,4 +861,10 @@ impl fmt::Display for StatisticsApplicationError {
     }
 }
 
-impl std::error::Error for StatisticsApplicationError {}
+impl std::error::Error for StatisticsApplicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}

@@ -272,9 +272,11 @@ fn two_retained_catalog_custodies_leave_progress_on_a_shared_healthy_origin() {
         {
             let state = control.inner.state.lock().unwrap();
             let records = &state.joint.as_ref().unwrap().claims;
-            assert!(records
-                .values()
-                .all(|record| record.facts.dependencies.len() == 2));
+            assert!(
+                records
+                    .values()
+                    .all(|record| record.facts.dependencies.len() == 2)
+            );
             let retained_a = records
                 .values()
                 .filter(|record| {
@@ -585,15 +587,19 @@ async fn idle_revision_has_no_self_wake_and_covers_both_notify_orderings() {
     let expiry = control.deadline_expiry_handle();
     let waiting = expiry.wait_state_change(revision);
     tokio::pin!(waiting);
-    assert!(waiting
-        .as_mut()
-        .poll(&mut Context::from_waker(Waker::noop()))
-        .is_pending());
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
     let first = request(&handle, &scope, &[&a], JointLane::Foreground, 1);
-    assert!(waiting
-        .as_mut()
-        .poll(&mut Context::from_waker(Waker::noop()))
-        .is_ready());
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+    );
     drop(first);
     drive(&mut driver);
     let JointProgress::Idle(revision) = driver.step() else {
@@ -603,10 +609,12 @@ async fn idle_revision_has_no_self_wake_and_covers_both_notify_orderings() {
     let second = request(&handle, &scope, &[&a], JointLane::Foreground, 1);
     let waiting = expiry.wait_state_change(revision);
     tokio::pin!(waiting);
-    assert!(waiting
-        .as_mut()
-        .poll(&mut Context::from_waker(Waker::noop()))
-        .is_ready());
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+    );
     drop(second);
     drive(&mut driver);
 }
@@ -1556,16 +1564,18 @@ fn request_publication_preserves_original_cancel_and_drop_errors() {
         }
         drive(&mut driver);
         assert_eq!(held(&control), (0, 0));
-        assert!(control
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .joint
-            .as_ref()
-            .unwrap()
-            .requests
-            .is_empty());
+        assert!(
+            control
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .joint
+                .as_ref()
+                .unwrap()
+                .requests
+                .is_empty()
+        );
     }
 }
 
@@ -1721,12 +1731,31 @@ fn finite_growth_refuses_self_held_shortage_without_parking_or_releasing_base() 
         )
         .unwrap();
     drive(&mut driver);
-    assert!(matches!(
-        poll(&mut growth),
-        Poll::Ready(Err(JointAdmissionFailure {
-            error: WorkError::Capacity("joint protected intersections")
-        }))
-    ));
+    let Poll::Ready(Err(JointAdmissionFailure { error })) = poll(&mut growth) else {
+        panic!("the original finite growth must refuse the self-held shortage");
+    };
+    assert_eq!(
+        error,
+        WorkError::JointCapacity(JointCapacityFailure {
+            resource: JointResource::PayloadBytes,
+            projection: JointCapacityProjection::Lane(JointLane::Foreground),
+            constraint: JointCapacityConstraint::Dependency,
+        })
+    );
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let fact = error.failure_fact();
+    assert_eq!(fact.class(), FailureClass::Resource);
+    assert_eq!(
+        fact.reason(),
+        WorkError::Capacity("original capacity")
+            .failure_fact()
+            .reason()
+    );
+    assert_eq!(fact.resource(), None);
+    assert_eq!(
+        error.to_string(),
+        "Work capacity exhausted: joint protected intersections [resource=PayloadBytes, projection=Lane(Foreground), constraint=Dependency]"
+    );
     assert_eq!(original.amounts().unwrap(), bytes(2));
     assert_eq!(held(&control), (1, 2));
     let mut healthy = handle
@@ -1898,16 +1927,18 @@ fn continuous_new_requests_cannot_overtake_a_finite_reobservation_forever() {
             break;
         }
     }
-    assert!(control
-        .inner
-        .state
-        .lock()
-        .unwrap()
-        .joint
-        .as_ref()
-        .unwrap()
-        .active
-        .is_some());
+    assert!(
+        control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .joint
+            .as_ref()
+            .unwrap()
+            .active
+            .is_some()
+    );
     drop(receipt);
     driver.step();
     let mut newcomer = request(&handle, &scope, &[&b], JointLane::Foreground, 1);
@@ -1979,16 +2010,18 @@ fn reobservation_rechecks_actual_stop_and_source_facts_before_budget_failure() {
                 break;
             }
         }
-        assert!(control
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .joint
-            .as_ref()
-            .unwrap()
-            .active
-            .is_some());
+        assert!(
+            control
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .joint
+                .as_ref()
+                .unwrap()
+                .active
+                .is_some()
+        );
         // This is the real gap after the unlocked validity observation and
         // before reobserve acquires the final authority transaction.
         if cancel {
@@ -2036,17 +2069,19 @@ fn finite_pass_cannot_swallow_new_ticket_or_cancellation_before_its_last_skip() 
         let mut delivered_later = request(&handle, &scope, &[], JointLane::Settlement, 0);
         drive(&mut driver);
         assert!(poll(&mut blocked).is_pending());
-        assert!(control
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .joint
-            .as_ref()
-            .unwrap()
-            .requests
-            .values()
-            .any(|r| matches!(r.phase, ledger::RequestPhase::Granted { .. })));
+        assert!(
+            control
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .joint
+                .as_ref()
+                .unwrap()
+                .requests
+                .values()
+                .any(|r| matches!(r.phase, ledger::RequestPhase::Granted { .. }))
+        );
         // Start a new read-only pass. Its first ticket is blocked at the
         // current release epoch; leave the granted final ticket to be skipped.
         assert_eq!(driver.step(), JointProgress::More);
@@ -2091,7 +2126,7 @@ impl std::task::Wake for QueueHandoffPanicWake {
 
 #[test]
 fn queue_handoff_panic_withdraws_the_original_ticket() {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     for fixed in [false, true] {
         let (control, handle, mut driver) = if fixed {
             crate::scope::fixed_control_storage_tests::prototype_profile(3, 1, 1, 1)
@@ -2124,10 +2159,12 @@ fn queue_handoff_panic_withdraws_the_original_ticket() {
             std::sync::atomic::AtomicBool::new(true),
         )));
         let mut waiter = Box::pin(control.wait_progress(control.progress_revision()));
-        assert!(waiter
-            .as_mut()
-            .poll(&mut Context::from_waker(&wake))
-            .is_pending());
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&wake))
+                .is_pending()
+        );
         assert!(catch_unwind(AssertUnwindSafe(|| handle.queue_request(prepared))).is_err());
         drop(waiter);
         let (requests, waiters) = {
@@ -2153,7 +2190,7 @@ fn queue_handoff_panic_withdraws_the_original_ticket() {
 
 #[test]
 fn reply_handoff_panic_preserves_an_existing_physical_claim() {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     let (control, handle, mut driver) = control();
     let work = control
         .try_begin_root(WorkRequest::new(WorkClass::Management))
@@ -2180,10 +2217,12 @@ fn reply_handoff_panic_preserves_an_existing_physical_claim() {
         std::sync::atomic::AtomicBool::new(true),
     )));
     let mut waiter = Box::pin(control.wait_progress(control.progress_revision()));
-    assert!(waiter
-        .as_mut()
-        .poll(&mut Context::from_waker(&wake))
-        .is_pending());
+    assert!(
+        waiter
+            .as_mut()
+            .poll(&mut Context::from_waker(&wake))
+            .is_pending()
+    );
     assert!(catch_unwind(AssertUnwindSafe(|| poll(&mut mixed))).is_err());
     drop((waiter, mixed));
     assert_eq!(
@@ -2454,9 +2493,11 @@ fn local_refusal_keeps_original_ticket_budget_and_waits_for_original_timer_pass(
     assert_eq!(local_request_state(&control), (ticket, first, true));
     drive(&mut driver);
     assert_eq!(local_request_state(&control), (ticket, first, true));
-    assert!(request
-        .poll_local_offer(&mut Context::from_waker(Waker::noop()))
-        .is_pending());
+    assert!(
+        request
+            .poll_local_offer(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
     driver.recheck_retired_backing();
     drive(&mut driver);
     let (same, second, blocked) = local_request_state(&control);
@@ -2478,16 +2519,18 @@ fn local_refusal_keeps_original_ticket_budget_and_waits_for_original_timer_pass(
         .notify();
     drop(offer);
     assert!(physical.is_none());
-    assert!(control
-        .inner
-        .state
-        .lock()
-        .unwrap()
-        .joint
-        .as_ref()
-        .unwrap()
-        .requests
-        .is_empty());
+    assert!(
+        control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .joint
+            .as_ref()
+            .unwrap()
+            .requests
+            .is_empty()
+    );
     assert_eq!(destination.as_ref().unwrap().claims().len(), 1);
     drop(destination);
     assert_eq!(seen.lock().unwrap().as_slice(), &[(true, 1), (true, 1)]);
@@ -2498,7 +2541,7 @@ fn local_refusal_keeps_original_ticket_budget_and_waits_for_original_timer_pass(
 
 #[test]
 fn local_accept_stable_destination_survives_real_post_state_wake_panic() {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     let (control, handle, mut driver) = control();
     let work = control
         .try_begin_root(WorkRequest::new(WorkClass::Management))
@@ -2514,10 +2557,12 @@ fn local_accept_stable_destination_survives_real_post_state_wake_panic() {
         std::sync::atomic::AtomicBool::new(true),
     )));
     let mut progress = Box::pin(control.wait_progress(control.progress_revision()));
-    assert!(progress
-        .as_mut()
-        .poll(&mut Context::from_waker(&wake))
-        .is_pending());
+    assert!(
+        progress
+            .as_mut()
+            .poll(&mut Context::from_waker(&wake))
+            .is_pending()
+    );
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut physical = Some(LocalPhysicalDrop {
         control: control.inner.clone(),
@@ -2556,11 +2601,13 @@ fn local_accept_stable_destination_survives_real_post_state_wake_panic() {
     // physical owner's stable slots. Its explicit cleanup is physical first.
     let mut physical_owner = None;
     let mut claim_owner = None;
-    assert!(destination
-        .take()
-        .unwrap()
-        .transfer_in(&mut physical_owner, &mut claim_owner)
-        .is_ok());
+    assert!(
+        destination
+            .take()
+            .unwrap()
+            .transfer_in(&mut physical_owner, &mut claim_owner)
+            .is_ok()
+    );
     assert_eq!(claim_owner.as_ref().unwrap().len(), 1);
     assert_eq!(held(&control), (1, 1));
     drop(physical_owner.take());
@@ -2612,16 +2659,18 @@ fn local_cancel_records_failure_but_cannot_free_an_in_flight_physical_offer() {
         }))
     ));
     drop(request);
-    assert!(control
-        .inner
-        .state
-        .lock()
-        .unwrap()
-        .joint
-        .as_ref()
-        .unwrap()
-        .requests
-        .is_empty());
+    assert!(
+        control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .joint
+            .as_ref()
+            .unwrap()
+            .requests
+            .is_empty()
+    );
     work.business.release();
     work.owner.complete();
 }
@@ -2683,7 +2732,7 @@ fn local_refusal_does_not_replenish_exhausted_proof_or_soften_finite_infeasibili
     assert!(matches!(
         infeasible.poll_local_offer(&mut Context::from_waker(Waker::noop())),
         Poll::Ready(Err(JointAdmissionFailure {
-            error: WorkError::Capacity("joint protected intersections")
+            error: WorkError::JointCapacity(_)
         }))
     ));
     drop(infeasible);
@@ -2695,7 +2744,7 @@ fn local_refusal_does_not_replenish_exhausted_proof_or_soften_finite_infeasibili
 
 #[test]
 fn local_physical_drop_unwind_keeps_same_offer_and_cannot_retry_or_refund() {
-    use std::panic::{catch_unwind, panic_any, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
     #[derive(Debug)]
     struct OriginalPhysicalExitPanic;
     struct PanickingPhysical {
@@ -2903,4 +2952,119 @@ fn local_offer_refuses_unbounded_wait_and_old_adjustment_without_mutating_source
     drop(original);
     work.business.release();
     work.owner.complete();
+}
+
+#[test]
+fn registered_cpu_floor_admits_one_native_queue_record_across_eight_domains() {
+    // Source identity uses the same original registration seam as the CPU
+    // custody fixture. This proves WC composition-to-admission arithmetic,
+    // not the implementation or physical liveness of the closed CPU factory.
+    let pool: std::sync::Arc<dyn Send + Sync> = std::sync::Arc::new(());
+    let descriptor = InternalResultClosedFactoryDescriptor::for_composition(
+        std::sync::Arc::downgrade(&pool),
+        std::any::TypeId::of::<fn()>(),
+        std::num::NonZeroU64::new(64).unwrap(),
+    );
+    let mut control = WorkloadControl::try_new_counted(WorkloadConfig::default())
+        .unwrap()
+        .owner;
+    let _binding = control
+        .bind_internal_result_closed_factory_for_composition(descriptor)
+        .unwrap();
+    let progress = JointResources::ZERO
+        .with(JointResource::InternalCpuJobs, 1)
+        .with(JointResource::PhysicalQueueRecords, 3)
+        .with(JointResource::PhysicalQueueBytes, 64 + 2 * 11);
+    let limits = JointResourceLimits {
+        global: JointResources::ZERO
+            .with(JointResource::InternalCpuJobs, 4)
+            .with(JointResource::PhysicalQueueRecords, 24)
+            .with(JointResource::PhysicalQueueBytes, 4 * 64 + 20 * 11),
+        per_dependency: JointResources::ZERO
+            .with(JointResource::InternalCpuJobs, 4)
+            .with(JointResource::PhysicalQueueRecords, 22)
+            .with(JointResource::PhysicalQueueBytes, 4 * 64 + 18 * 11),
+        protected_progress: progress,
+    };
+    let (mut config, mut required) = profile();
+    config.global = limits;
+    config.classes = [JointResourceLimits::default(); CLASS_COUNT];
+    config.lanes = [JointResourceLimits::default(); LANE_COUNT];
+    config.class_lanes = [[JointResourceLimits::default(); LANE_COUNT]; CLASS_COUNT];
+    config.classes[0] = limits;
+    config.lanes[1] = limits;
+    config.class_lanes[0][1] = limits;
+    config.max_dependencies_per_claim = 9;
+    config.max_registered_dependencies = 32;
+    required.global = progress;
+    required.classes = [JointResources::ZERO; CLASS_COUNT];
+    required.lanes = [JointResources::ZERO; LANE_COUNT];
+    required.class_lanes = [[JointResources::ZERO; LANE_COUNT]; CLASS_COUNT];
+    required.classes[0] = progress;
+    required.lanes[1] = progress;
+    required.class_lanes[0][1] = progress;
+    // An unregistered declaration cannot acquire the closed-source privilege.
+    assert!(config.clone().validate(&required).is_err());
+    let validated = control
+        .validate_joint_capacity_for_registered_sources(config, &required)
+        .unwrap();
+    assert_eq!(validated.declared().global, limits);
+    let (handle, mut driver) = control.configure_joint_capacity(validated).unwrap();
+    control.mark_ready().unwrap();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let scope = root.owner.scope();
+    let domains: Vec<_> = (0..8)
+        .map(|index| dependency(&handle, &format!("native-queue-{index}")))
+        .collect();
+    let request_queue = |domains: &[JointDependency], amount| {
+        handle
+            .request_finite(
+                &scope,
+                vec![JointClaimChange::New {
+                    dependencies: domains.to_vec(),
+                    lane: JointLane::Foreground,
+                    amounts: JointResources::ZERO
+                        .with(JointResource::PhysicalQueueRecords, amount)
+                        .with(JointResource::PhysicalQueueBytes, amount * 11),
+                }],
+                std::num::NonZeroU64::new(1_000_000).unwrap(),
+            )
+            .unwrap()
+    };
+    let mut first = request_queue(&domains, 1);
+    drive(&mut driver);
+    let first_grant = granted(&mut first);
+    {
+        let state = control.inner.state.lock().unwrap();
+        let rows = &state.joint.as_ref().unwrap().claims;
+        assert_eq!(rows.len(), 1);
+        let row = rows.values().next().unwrap();
+        assert_eq!(row.amounts.get(JointResource::PhysicalQueueRecords), 1);
+        assert_eq!(row.facts.dependencies.len(), 8);
+        assert!(
+            !row.facts
+                .key
+                .causal
+                .finite(JointResource::PhysicalQueueRecords as usize)
+        );
+    }
+    // Global and domain hard totals still fit at 22. The causal source may
+    // use 21, but cannot consume the one complete finite-source reserve.
+    let mut fill = request_queue(&domains[..1], 20);
+    drive(&mut driver);
+    let fill_grant = granted(&mut fill);
+    let mut steal_finite = request_queue(&domains[..1], 1);
+    drive(&mut driver);
+    assert!(matches!(
+        poll(&mut steal_finite),
+        Poll::Ready(Err(JointAdmissionFailure {
+            error: WorkError::JointCapacity(_),
+        }))
+    ));
+    drop((steal_finite, fill_grant, fill, first_grant, first));
+    drive(&mut driver);
+    root.owner.complete();
+    root.business.release();
 }

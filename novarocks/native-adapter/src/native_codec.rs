@@ -26,10 +26,39 @@ use prost::Message;
 use tonic::Status;
 use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 
+/// The original uncompressed unary operation encoder's requested backing.
+/// This is a pure source fact, not a resource grant. The same plan sizes the
+/// actual Tonic buffer before it exists and rejects a different message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeUnaryEncodingPlan {
+    message_bytes: usize,
+    buffer_bytes: usize,
+}
+impl NativeUnaryEncodingPlan {
+    pub fn for_original_operation(message_bytes: usize) -> Option<Self> {
+        if message_bytes == 0 {
+            return None;
+        }
+        Some(Self {
+            message_bytes,
+            buffer_bytes: message_bytes.checked_add(5)?,
+        })
+    }
+    /// Exact protobuf frame content; the process encoding wallet counts this
+    /// independently of the payload backing's five-byte gRPC prefix.
+    pub fn protobuf_bytes(self) -> usize {
+        self.message_bytes
+    }
+    pub fn retained_bytes(self) -> usize {
+        self.buffer_bytes
+    }
+}
+
 /// Native protobuf codec used by generated NovaRocks clients and servers.
 #[derive(Debug, Clone)]
 pub struct NativeProstCodec<T, U> {
     operation_reply_plan: Option<resource_preflight::OperationReplyDecodePlan>,
+    operation_encoding_plan: Option<NativeUnaryEncodingPlan>,
     marker: PhantomData<(T, U)>,
 }
 
@@ -37,6 +66,7 @@ impl<T, U> Default for NativeProstCodec<T, U> {
     fn default() -> Self {
         Self {
             operation_reply_plan: None,
+            operation_encoding_plan: None,
             marker: PhantomData,
         }
     }
@@ -46,6 +76,22 @@ impl<T, U> NativeProstCodec<T, U> {
     pub fn with_operation_reply_plan(plan: resource_preflight::OperationReplyDecodePlan) -> Self {
         Self {
             operation_reply_plan: Some(plan),
+            operation_encoding_plan: None,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<T, U> NativeProstCodec<T, U> {
+    /// The original Apply caller uses one uncompressed unary message. Keep its
+    /// paid encoding plan on this same codec through actual frame exit.
+    pub fn with_original_operation_plans(
+        reply: resource_preflight::OperationReplyDecodePlan,
+        encoding: NativeUnaryEncodingPlan,
+    ) -> Self {
+        Self {
+            operation_reply_plan: Some(reply),
+            operation_encoding_plan: Some(encoding),
             marker: PhantomData,
         }
     }
@@ -62,7 +108,15 @@ where
     type Decoder = NativeProstDecoder<U>;
 
     fn encoder(&mut self) -> Self::Encoder {
-        NativeProstEncoder::default()
+        let mut encoder = NativeProstEncoder::default();
+        if let Some(plan) = self.operation_encoding_plan {
+            // Tonic's uncompressed unary stream owns one eagerly allocated
+            // buffer. Exact preallocation includes its five-byte gRPC header;
+            // the checked message fits without an old/new growth allocation.
+            encoder.buffer_settings = BufferSettings::new(plan.buffer_bytes, plan.buffer_bytes);
+            encoder.original_operation = Some(plan);
+        }
+        encoder
     }
 
     fn decoder(&mut self) -> Self::Decoder {
@@ -77,6 +131,15 @@ where
 pub struct NativeProstEncoder<T> {
     marker: PhantomData<T>,
     buffer_settings: BufferSettings,
+    original_operation: Option<NativeUnaryEncodingPlan>,
+    original_encoded: bool,
+}
+
+/// This first-party header lives inside Tonic's encoded Body pointee,
+/// separately from the original Apply future's inline codec value.
+pub fn original_operation_encoder_layout() -> std::alloc::Layout {
+    // Both Apply methods use this same encoder with only a zero-sized T marker.
+    std::alloc::Layout::new::<NativeProstEncoder<proto::ApplyTaskOperationsRequest>>()
 }
 
 impl<T> Default for NativeProstEncoder<T> {
@@ -84,6 +147,8 @@ impl<T> Default for NativeProstEncoder<T> {
         Self {
             marker: PhantomData,
             buffer_settings: BufferSettings::default(),
+            original_operation: None,
+            original_encoded: false,
         }
     }
 }
@@ -97,6 +162,14 @@ impl<T: Message> Encoder for NativeProstEncoder<T> {
         item: Self::Item,
         destination: &mut EncodeBuf<'_>,
     ) -> Result<(), Self::Error> {
+        if let Some(plan) = self.original_operation {
+            if self.original_encoded || item.encoded_len() != plan.message_bytes {
+                return Err(Status::internal(
+                    "original operation encoding invoice changed",
+                ));
+            }
+            self.original_encoded = true;
+        }
         item.encode(destination)
             .expect("Message only errors if not enough space");
         Ok(())
@@ -208,6 +281,99 @@ fn check_resource_shape<U: 'static>(raw: &[u8]) -> Result<(), Status> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn original_unary_plan_encodes_a_real_frame_and_keeps_its_backing_after_body_exit() {
+        use hyper::body::Body;
+        use tonic::codec::EncodeBody;
+        let request = proto::ApplyTaskOperationsRequest {
+            operations: vec![proto::TaskOperation {
+                envelope: Some(proto::TaskOperationEnvelope {
+                    operation_id: Some(proto::TaskOperationId {
+                        value: vec![0x71; 16],
+                    }),
+                    max_wait_millis: 1000,
+                }),
+                operation: Some(proto::task_operation::Operation::CreateTask(
+                    proto::CreateTaskRequest {
+                        frozen_fragment: bytes::Bytes::from(vec![0x31; 9000]),
+                        creation_metadata: bytes::Bytes::from(vec![0x42; 128]),
+                    },
+                )),
+            }],
+        };
+        let expected = request.encode_to_vec();
+        let plan = NativeUnaryEncodingPlan::for_original_operation(expected.len()).unwrap();
+        assert_eq!(plan.retained_bytes(), expected.len() + 5);
+        let reply = resource_preflight::OperationReplyDecodePlan::for_transport(
+            novarocks_task_codec::TransportBudget::DEFAULT,
+        );
+        let mut codec = NativeProstCodec::<
+            proto::ApplyTaskOperationsRequest,
+            proto::ApplyTaskOperationsResponse,
+        >::with_original_operation_plans(reply, plan);
+        let encoder = codec.encoder();
+        let source = tokio_stream::iter([Ok::<_, Status>(request)]);
+        let mut body = Box::pin(EncodeBody::new_client(
+            encoder,
+            source,
+            None,
+            Some(expected.len()),
+        ));
+        let frame = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx))
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert_eq!(frame.len(), plan.retained_bytes());
+        assert_eq!(&frame[5..], expected.as_slice());
+        let retained = frame.clone();
+        let pointer = retained.as_ptr();
+        drop(body);
+        drop(frame);
+        assert_eq!(retained.as_ptr(), pointer);
+        assert_eq!(&retained[5..], expected.as_slice());
+        assert_eq!(
+            proto::ApplyTaskOperationsRequest::decode(retained.slice(5..))
+                .unwrap()
+                .operations
+                .len(),
+            1
+        );
+        drop(retained);
+    }
+
+    #[tokio::test]
+    async fn original_unary_plan_rejects_a_different_message_before_any_encoding_growth() {
+        use hyper::body::Body;
+        use tonic::codec::EncodeBody;
+        let plan = NativeUnaryEncodingPlan::for_original_operation(1).unwrap();
+        let reply = resource_preflight::OperationReplyDecodePlan::for_transport(
+            novarocks_task_codec::TransportBudget::DEFAULT,
+        );
+        let mut codec = NativeProstCodec::<
+            proto::ApplyTaskOperationsRequest,
+            proto::ApplyTaskOperationsResponse,
+        >::with_original_operation_plans(reply, plan);
+        let request = proto::ApplyTaskOperationsRequest {
+            operations: vec![proto::TaskOperation::default(); 32],
+        };
+        let mut body = Box::pin(EncodeBody::new_client(
+            codec.encoder(),
+            tokio_stream::iter([Ok::<_, Status>(request)]),
+            None,
+            None,
+        ));
+        let error = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Internal);
+        // The original unary caller drops a failed body; it does not repoll
+        // a failed encoder or publish any partial gRPC frame.
+        drop(body);
+    }
 
     #[test]
     fn decoder_dispatches_resource_checks_by_message_type() {

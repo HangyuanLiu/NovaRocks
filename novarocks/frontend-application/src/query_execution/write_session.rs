@@ -67,6 +67,13 @@ pub(crate) use computation::{
 };
 pub(crate) use production::WriteProductionQuote;
 pub(crate) use publication_call::WritePublicationCall;
+
+#[cfg(test)]
+pub(crate) fn production_work_error_for_test(
+    error: novarocks_workload_control::WorkError,
+) -> ConnectorError {
+    production::production_work_error(error)
+}
 #[path = "write_session/begin_receiving.rs"]
 mod begin_receiving;
 pub(crate) use begin_receiving::WriteBeginReceiving;
@@ -337,6 +344,31 @@ impl ConnectorWriteSession {
             return Ok(novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Retained);
         }
         Ok(provider)
+    }
+
+    /// An aborted, never-accepted formation owns no decoded payload in this
+    /// session. Unknown production records and original Provider/credential
+    /// custody remain intact; this grants neither deletion nor cleanup Complete.
+    pub(crate) fn has_no_accepted_formation(&self) -> Result<bool, ConnectorError> {
+        let terminal = self.lock_terminal()?;
+        if *terminal != Some(TerminalDecision::Aborted) {
+            return Ok(false);
+        }
+        let union = self.lock_accumulated()?;
+        let publication = self.publication_input.lock().map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "write publication input is poisoned",
+            )
+        })?;
+        Ok(union.rows.get() == 0
+            && union.fragments.is_empty()
+            && union.statistics.is_empty()
+            && union.statistics_identities.is_empty()
+            && union.statistics_body_bytes == 0
+            && union.statistics_property_bytes == 0
+            && union.retention.is_none()
+            && publication.is_none())
     }
 
     fn abort_production(
@@ -1779,6 +1811,12 @@ pub(crate) mod tests {
         cow_begin_upper: Option<u64>,
         pub(crate) finish: usize,
         pub(crate) abort: usize,
+        pub(crate) abort_outcome: Option<ConnectorWriteAbortOutcome>,
+        pub(crate) enforce_cleanup_responsibility: bool,
+        terminal_committed: Option<(
+            Arc<novarocks_spi::connector::write_stack::ConnectorWriteNeededReady>,
+            novarocks_spi::connector::write_stack::ConnectorWriteCleanupState,
+        )>,
         pub(crate) abort_production:
             Option<novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction>,
         pub(crate) abort_received_rows: Option<u64>,
@@ -1892,8 +1930,13 @@ pub(crate) mod tests {
             let mut outcome = outcome.map(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::from_outcome);
             if let Ok(committed) = &outcome {
                 if let novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, .. } = committed {
-                    receiving.publish(Arc::clone(needed))?;
                     let deferred = self.recorded.lock().unwrap().defer_finish_cleanup;
+                    self.recorded.lock().unwrap().terminal_committed = Some((
+                        Arc::clone(needed),
+                        if deferred { novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Pending }
+                        else { novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(novarocks_spi::connector::ExternalMutationFinalization::Complete) },
+                    ));
+                    receiving.publish(Arc::clone(needed))?;
                     if deferred {
                         let Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { cleanup, .. }) = &mut outcome else { unreachable!() };
                         *cleanup = novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Pending;
@@ -1918,6 +1961,9 @@ pub(crate) mod tests {
                         }
                     }
                 }
+            }
+            if let Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, cleanup }) = &outcome {
+                self.recorded.lock().unwrap().terminal_committed = Some((Arc::clone(needed), cleanup.clone()));
             }
             outcome
         }
@@ -2111,6 +2157,22 @@ pub(crate) mod tests {
         ) -> Result<novarocks_spi::connector::ConnectorMetadataCleanupResponsibility, ConnectorError>
         {
             self.adapter.commit_handle(commit)?;
+            let recorded = self.recorded.lock().unwrap();
+            if recorded.enforce_cleanup_responsibility
+                && !matches!(
+                    &recorded.terminal_committed,
+                    Some((
+                        _,
+                        novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(
+                            novarocks_spi::connector::ExternalMutationFinalization::Complete
+                        )
+                    ))
+                )
+            {
+                return Ok(
+                    novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Retained,
+                );
+            }
             Ok(novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Disposed)
         }
 
@@ -2290,6 +2352,15 @@ pub(crate) mod tests {
             recorded.abort_received_rows = request.received.map(|set| set.row_count());
             recorded.abort_received_fragments = request.received.map(|set| set.fragments().len());
             recorded.terminal_storage = Some(probe_vended_storage(&request.context));
+            if let Some(outcome) = recorded.abort_outcome.take() {
+                return Ok(outcome);
+            }
+            if let Some((needed, cleanup)) = &recorded.terminal_committed {
+                return Ok(ConnectorWriteAbortOutcome::KnownCommitted {
+                    needed: Arc::clone(needed),
+                    cleanup: cleanup.clone(),
+                });
+            }
             Ok(ConnectorWriteAbortOutcome::KnownUncommitted {
                 cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             })
@@ -2367,6 +2438,20 @@ pub(crate) mod tests {
     pub(crate) struct Fixture {
         pub(crate) session: Arc<ConnectorWriteSession>,
         pub(crate) recorded: Arc<Mutex<Recorded>>,
+    }
+
+    impl Fixture {
+        pub(crate) async fn release_provider_direct(
+            &self,
+            context: ConnectorRequestContext,
+        ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
+            let control = self.session.lease.session();
+            control.abort_write_async(ConnectorWriteSessionAbortRequest {
+                commit: self.session.plan.commit_handle(), context,
+                production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::Unproven,
+                received: None,
+            }).await
+        }
     }
 
     fn fixture(targets: usize, payload_bytes: usize) -> Fixture {

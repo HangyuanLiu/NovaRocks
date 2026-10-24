@@ -63,7 +63,9 @@ pub(crate) fn known_input_layouts_for_composition(
     Ok(NativeApplyKnownInputLayouts {
         original: original(apply_operations)?,
         operation_slots: array::<(bool, proto::TaskOperation)>(items)?,
-        method_runs: array::<EncodedMethodBatch>(items)?,
+        // The positive Native boundary accepts one exact method/deadline run.
+        // encode_method_batches allocates its method container with runs=1.
+        method_runs: array::<EncodedMethodBatch>(1)?,
         receipts: array::<SentOperation>(items)?,
         unencodable_slots: array::<Unencodable>(items)?,
         queue_pointers: array::<Box<dyn crate::task_execution::intent::TaskOperationQueuePermit>>(

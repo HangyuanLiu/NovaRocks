@@ -2845,6 +2845,14 @@ pub trait ServerHandle: Send {
     ) -> Result<()> {
         bail!("selected Native fault is unsupported by this server mode")
     }
+    fn end_selected_query_lifecycle_fault(
+        &mut self,
+        _index: usize,
+        _kind: &'static str,
+        _run_token: &str,
+    ) -> Result<()> {
+        bail!("selected Native fault end is unsupported by this server mode")
+    }
     fn activate_selected_deferred_query_lifecycle_fault(
         &mut self,
         _index: usize,
@@ -5259,6 +5267,26 @@ impl ServerHandle for CrossProcessServerHandle {
             .validate_native_fault_target(index, kind, run_token)?;
         self.query_lifecycle_fault_tokens
             .insert((index, kind), run_token.to_owned());
+        Ok(())
+    }
+    fn end_selected_query_lifecycle_fault(
+        &mut self,
+        index: usize,
+        kind: &'static str,
+        run_token: &str,
+    ) -> Result<()> {
+        self.ensure_be_index(index)?;
+        ensure!(
+            self.query_lifecycle_fault_tokens
+                .get(&(index, kind))
+                .is_some_and(|token| token == run_token),
+            "selected Native action end differs from its original armed token"
+        );
+        self.test_sessions
+            .as_ref()
+            .context("Native action end has no original role session")?
+            .end_selected_native_fault(index, kind, run_token)?;
+        self.query_lifecycle_fault_tokens.remove(&(index, kind));
         Ok(())
     }
     fn activate_selected_deferred_query_lifecycle_fault(

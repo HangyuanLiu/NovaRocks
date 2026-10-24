@@ -1990,9 +1990,7 @@ mod joint_queue_tests {
         assert!(matches!(
             blocked.poll_local_offer(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Err(JointAdmissionFailure {
-                error: novarocks_workload_control::WorkError::Capacity(
-                    "joint protected intersections"
-                )
+                error: novarocks_workload_control::WorkError::JointCapacity(_)
             }))
         ));
         // This paid request has one finite verdict. It cannot self-convert to
@@ -2371,9 +2369,7 @@ mod joint_queue_tests {
         assert!(matches!(
             blocked.poll_local_offer(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Err(JointAdmissionFailure {
-                error: novarocks_workload_control::WorkError::Capacity(
-                    "joint protected intersections"
-                )
+                error: novarocks_workload_control::WorkError::JointCapacity(_)
             }))
         ));
         drop(blocked);

@@ -194,11 +194,199 @@ fn encode_completed_packages(
     write_targets: Option<&WriteTargetFacts<'_>>,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
-    let semantic_candidate = paired.candidate().clone();
     let (candidate, reads) = paired.into_parts();
+    let (encodings, capabilities) = split_frozen_reads(reads);
+    let parts = encode_static_packages(
+        candidate,
+        &encodings,
+        carrier,
+        statement_constant_policy,
+        write_targets,
+        control,
+    )?;
+    parts.bind_capabilities(capabilities)
+}
+
+/// Static output only. The original linear Provider access stays in its
+/// caller's stable Source throughout the closed worker call and its unwind.
+pub(crate) struct EncodedStaticPlan {
+    candidate: novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
+    native: NativeFragmentAttachment,
+    #[cfg(test)]
+    topology: CompletedPlanTopology,
+    plan_facts: AttemptPlanFacts,
+}
+/// A neutral static plan with its exact linear-read mapping checked while the
+/// original access still resides in the caller's stable source.
+pub(crate) struct PreparedStaticPlan {
+    encoded: EncodedStaticPlan,
+    access: crate::query_execution::preparation::attempt_access::PreparedAttemptAccess,
+}
+impl PreparedStaticPlan {
+    pub(crate) fn candidate(
+        &self,
+    ) -> &novarocks_query_application::preparation::CompletedPhysicalPlanCandidate {
+        &self.encoded.candidate
+    }
+    pub(crate) fn scheduling_facts(
+        &self,
+        version: PlanVersionId,
+    ) -> Result<novarocks_query_application::api::ExecutionSchedulingFacts, String> {
+        self.encoded
+            .plan_facts
+            .scheduling()
+            .attempt_scheduling_facts(novarocks_query_application::api::PlanSeal::Version(version))
+    }
+    pub(crate) fn bind_access(
+        self,
+        access: novarocks_query_application::preparation::FinalPlanRuntimeAccess<
+            FrozenProviderRead,
+        >,
+    ) -> EncodedCompletedPlan {
+        let (_, capabilities) = split_frozen_reads(access);
+        let access = self
+            .access
+            .bind(self.encoded.candidate.plan(), capabilities);
+        EncodedCompletedPlan {
+            semantic_candidate: self.encoded.candidate,
+            native: self.encoded.native,
+            #[cfg(test)]
+            topology: self.encoded.topology,
+            plan_facts: self.encoded.plan_facts,
+            access,
+        }
+    }
+}
+impl EncodedStaticPlan {
+    pub(crate) fn prepare_access(
+        self,
+        access: &novarocks_query_application::preparation::FinalPlanRuntimeAccess<
+            FrozenProviderRead,
+        >,
+    ) -> Result<PreparedStaticPlan, novarocks_plan_codec::PhysicalEncodeError> {
+        let mapping =
+            crate::query_execution::preparation::attempt_access::PreparedAttemptAccess::prepare(
+                self.candidate.plan(),
+                access,
+            )?;
+        Ok(PreparedStaticPlan {
+            encoded: self,
+            access: mapping,
+        })
+    }
+    pub(crate) fn bind_access(
+        self,
+        access: novarocks_query_application::preparation::FinalPlanRuntimeAccess<
+            FrozenProviderRead,
+        >,
+    ) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
+        let (_, capabilities) = split_frozen_reads(access);
+        self.bind_capabilities(capabilities)
+    }
+    fn bind_capabilities(
+        self,
+        capabilities: BTreeMap<ProviderReadOccurrenceId, FrozenReadCapability>,
+    ) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
+        let access = attempt_access_for_completed_plan(self.candidate.plan(), capabilities)?;
+        Ok(EncodedCompletedPlan {
+            semantic_candidate: self.candidate,
+            native: self.native,
+            #[cfg(test)]
+            topology: self.topology,
+            plan_facts: self.plan_facts,
+            access,
+        })
+    }
+}
+
+/// The same encoder with borrowed original access. Only neutral encoding facts
+/// are copied; no Provider access/generation owner moves onto the CPU stack.
+pub(crate) fn encode_completed_plan_borrowed(
+    candidate: novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
+    access: &novarocks_query_application::preparation::FinalPlanRuntimeAccess<FrozenProviderRead>,
+    carrier: &CompiledPackageCarrier,
+    policy: novarocks_physical_plan::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<EncodedStaticPlan, novarocks_plan_codec::PhysicalEncodeError> {
+    encode_borrowed_original(candidate, access, carrier, policy, None, control)
+}
+
+pub(crate) fn encode_completed_write_plan_borrowed(
+    candidate: novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
+    access: &novarocks_query_application::preparation::FinalPlanRuntimeAccess<FrozenProviderRead>,
+    carrier: &CompiledPackageCarrier,
+    policy: novarocks_physical_plan::ConstantPolicy,
+    write_targets: &WriteTargetFacts<'_>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<EncodedStaticPlan, novarocks_plan_codec::PhysicalEncodeError> {
+    encode_borrowed_original(
+        candidate,
+        access,
+        carrier,
+        policy,
+        Some(write_targets),
+        control,
+    )
+}
+
+fn encode_borrowed_original(
+    candidate: novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
+    access: &novarocks_query_application::preparation::FinalPlanRuntimeAccess<FrozenProviderRead>,
+    carrier: &CompiledPackageCarrier,
+    policy: novarocks_physical_plan::ConstantPolicy,
+    write_targets: Option<&WriteTargetFacts<'_>>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<EncodedStaticPlan, novarocks_plan_codec::PhysicalEncodeError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Encode, 0)?;
+    let mut encodings = BTreeMap::new();
+    for fragment in candidate.plan().fragments().values() {
+        for node in fragment.nodes().values() {
+            if let NodeKind::Scan { occurrence, .. } = &node.kind {
+                let read = access.get(*occurrence).ok_or_else(|| {
+                    novarocks_plan_codec::PhysicalEncodeError::from(
+                        "completed plan has no original read access".to_owned(),
+                    )
+                })?;
+                encodings
+                    .entry(*occurrence)
+                    .or_insert_with(|| read.access.encoding.clone());
+            }
+        }
+    }
+    if encodings.len() != access.len() {
+        return Err("completed plan has unused original read access"
+            .to_owned()
+            .into());
+    }
+    let result = encode_static_packages(
+        candidate,
+        &encodings,
+        carrier,
+        policy,
+        write_targets,
+        control,
+    );
+    if matches!(
+        &result,
+        Err(novarocks_plan_codec::PhysicalEncodeError::Control(_))
+    ) {
+        return result;
+    }
+    control.checkpoint(novarocks_type_contract::CompilePhase::Encode, 0)?;
+    result
+}
+
+// Sole package/Native fact author for both consuming and borrowing callers.
+fn encode_static_packages(
+    candidate: novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
+    encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
+    carrier: &CompiledPackageCarrier,
+    statement_constant_policy: novarocks_physical_plan::ConstantPolicy,
+    write_targets: Option<&WriteTargetFacts<'_>>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<EncodedStaticPlan, novarocks_plan_codec::PhysicalEncodeError> {
     let plan = candidate.plan();
     refuse_uncompiled_plan_shapes(plan)?;
-    let (encodings, capabilities) = split_frozen_reads(reads);
     let topology = completed_plan_topology(plan)?;
     // Each written target's frozen recipe comes from the session that sealed
     // it; a plan that writes with no sealing session has no recipe author.
@@ -250,14 +438,12 @@ fn encode_completed_packages(
         // that is what the commit is taken over; a read plan says none.
         Some(written).filter(|targets| !targets.is_empty()),
     );
-    let access = attempt_access_for_completed_plan(plan, capabilities)?;
-    Ok(EncodedCompletedPlan {
-        semantic_candidate,
+    Ok(EncodedStaticPlan {
+        candidate,
         native,
         #[cfg(test)]
         topology,
         plan_facts,
-        access,
     })
 }
 

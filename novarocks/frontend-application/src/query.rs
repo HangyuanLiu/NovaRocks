@@ -124,7 +124,7 @@ pub(crate) mod mutation_action;
 pub(crate) mod read_action;
 mod statement_action;
 pub(crate) mod statement_computation;
-mod statement_publication;
+pub(crate) mod statement_publication;
 pub(crate) mod write_action;
 pub(crate) use explain_action::{
     ExplainStatementGeometry, statement_action_geometry as explain_statement_geometry,
@@ -353,10 +353,29 @@ impl CatalogCommandConsumer for FrontendCatalogCommandConsumer {
 #[derive(Clone)]
 struct FrontendStatisticsCommandConsumer {
     statistics: StatisticsCommandExecutor,
-    executor: QueryBlockingExecutor,
 }
 
 impl StatisticsCommandConsumer for FrontendStatisticsCommandConsumer {
+    fn prepare_statement_action(
+        &self,
+        command: novarocks_sql::semantic::StatisticsSqlCommand,
+        request_context: RequestContext,
+        command_context: CommandContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        CommandError,
+    > {
+        self.statistics
+            .prepare_statement_action(
+                &command,
+                request_context.session().current_catalog(),
+                request_context.session().current_database(),
+                request_context.execution(),
+                command_context.connector_context(),
+            )
+            .map_err(|e| CommandError::new(CommandErrorKind::Rejected, e))
+    }
+
     fn execute(
         &self,
         command: novarocks_sql::semantic::StatisticsSqlCommand,
@@ -364,19 +383,32 @@ impl StatisticsCommandConsumer for FrontendStatisticsCommandConsumer {
         command_context: CommandContext,
     ) -> CommandFuture {
         let statistics = self.statistics.clone();
-        execute_product_command_edge(
-            self.executor.clone(),
-            request_context,
-            command_context,
-            move |context, _command_context| {
-                statistics.execute_command(
-                    &command,
-                    context.session().current_catalog(),
-                    context.session().current_database(),
-                    Some(context.execution()),
+        Box::pin(async move {
+            if request_context.execution().cancellation().is_cancelled() {
+                return Err(command_error(
+                    CommandErrorKind::Cancelled,
+                    "statistics command was cancelled before asynchronous admission",
+                ));
+            }
+            command_context.scope().check().map_err(|error| {
+                command_error(
+                    CommandErrorKind::Cancelled,
+                    format!("statistics command scope is no longer active: {error}"),
                 )
-            },
-        )
+            })?;
+            let result = statistics
+                .execute_command(
+                    &command,
+                    request_context.session().current_catalog(),
+                    request_context.session().current_database(),
+                    Some(request_context.execution()),
+                )
+                .await
+                .map_err(|e| CommandError::new(CommandErrorKind::Rejected, e))?;
+            // Keep the admitted command context through the borrowed operation.
+            drop(command_context);
+            Ok(result)
+        })
     }
 }
 
@@ -506,10 +538,7 @@ pub(crate) fn product_command_router(
             iceberg_ref,
             executor: executor.clone(),
         }),
-        Arc::new(FrontendStatisticsCommandConsumer {
-            statistics,
-            executor: executor.clone(),
-        }),
+        Arc::new(FrontendStatisticsCommandConsumer { statistics }),
         Arc::new(FrontendMaintenanceCommandConsumer {
             maintenance,
             maintenance_read,
@@ -2250,6 +2279,28 @@ impl FrontendQuerySession {
             },
             None => command_context,
         };
+        if let Ok(Some(ProductSqlCommand::Statistics(
+            command @ (novarocks_sql::semantic::StatisticsSqlCommand::AnalyzeTable { .. }
+            | novarocks_sql::semantic::StatisticsSqlCommand::ShowTableStats { .. }),
+        ))) = lower_product_sql_command(&parsed_statement)
+        {
+            let action = match self
+                .service
+                .product_command_router
+                .prepare_statistics_statement_action(command, context, command_context)
+            {
+                Ok(action) => action,
+                Err(error) => {
+                    return Ok(self.governed_typed_error(
+                        routed_execution_service_error(product_command_error(error)),
+                        statement,
+                    ));
+                }
+            };
+            return self
+                .execute_observed_statement_action(statement, action)
+                .await;
+        }
         if let Ok(Some(ProductSqlCommand::Maintenance(command))) =
             lower_product_sql_command(&parsed_statement)
         {

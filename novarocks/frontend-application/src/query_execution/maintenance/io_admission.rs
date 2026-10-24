@@ -129,6 +129,9 @@ struct Body {
     payload_slot_wait: Option<JointProposalSlotWait>,
     initial: Option<RootDomainInitialAdmission>,
     payload: Option<RetainedPayloadGrant>,
+    // An actually admitted Provider peak remains a conservative retained
+    // floor even after its request cell exits. Formation may not consume it.
+    provider_owned_floor: u64,
     growth: Option<RootPayloadAdmission>,
     growth_ready: Option<RootPayloadReady>,
     growth_cell: Option<usize>,
@@ -137,6 +140,7 @@ struct Body {
     cells: Box<[Arc<RequestCell>]>,
     cursor: usize,
     started: bool,
+    adopted_initial: bool,
     first_ready: bool,
     settlement: bool,
     failure: Option<WorkError>,
@@ -196,7 +200,9 @@ fn error(error: &WorkError) -> ConnectorError {
     ConnectorError::new(
         match error {
             WorkError::Cancelled(_) => ConnectorErrorKind::Cancelled,
-            WorkError::Capacity(_) => ConnectorErrorKind::ResourceExhausted,
+            WorkError::Capacity(_) | WorkError::JointCapacity(_) => {
+                ConnectorErrorKind::ResourceExhausted
+            }
             _ => ConnectorErrorKind::Internal,
         },
         format!("original metadata I/O admission refused: {error:?}"),
@@ -478,6 +484,19 @@ impl ConnectorIoRequestSource for RequestCell {
         result
     }
 }
+/// The same original Source has observed every request/frame and last alias
+/// exit. An ordinary admission refusal remains a product fact, not evidence
+/// that a physical source is still running. Only this owner constructs it.
+#[derive(Debug)]
+pub(crate) struct MetadataIoQuiescence {
+    ordinary_failure: Option<WorkError>,
+}
+impl MetadataIoQuiescence {
+    pub(crate) fn into_ordinary_failure(self) -> Option<WorkError> {
+        self.ordinary_failure
+    }
+}
+
 impl MetadataIoAdmission {
     pub(crate) const fn request_metadata_bytes() -> u64 {
         std::mem::size_of::<CellBody>() as u64
@@ -510,6 +529,7 @@ impl MetadataIoAdmission {
         bound
             .try_reserve_exact(k)
             .map_err(|_| WorkError::Capacity("metadata original complete union"))?;
+        let provider_owned_floor = profile.initial_owned_bytes().get();
         Ok(Arc::new(Self {
             wake,
             cleanup: Mutex::new(CleanupReceipt::default()),
@@ -525,6 +545,7 @@ impl MetadataIoAdmission {
                 payload_slot_wait: None,
                 initial: None,
                 payload: None,
+                provider_owned_floor,
                 growth: None,
                 growth_ready: None,
                 growth_cell: None,
@@ -533,6 +554,7 @@ impl MetadataIoAdmission {
                 cells: cells.into_boxed_slice(),
                 cursor: 0,
                 started: false,
+                adopted_initial: false,
                 first_ready: false,
                 settlement: false,
                 failure: None,
@@ -540,6 +562,49 @@ impl MetadataIoAdmission {
                 reobserve: false,
             })),
         }))
+    }
+    /// Move the same queued Root payload into its original I/O author. The
+    /// caller paid this source's fixed/variable envelope before job publication.
+    /// No initial grant is recreated; the original LocalHost D grows through
+    /// the same paid Root proposal before the provider can observe Ready.
+    pub(crate) fn adopt_original_payload_in(
+        &self,
+        source: &mut Option<RetainedPayloadGrant>,
+    ) -> Result<(), WorkError> {
+        let mut original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let body = original.body.as_mut().ok_or(WorkError::Released)?;
+        let payload = source.as_ref().ok_or(WorkError::NotReady)?;
+        if body.started
+            || body.initial.is_some()
+            || body.payload.is_some()
+            || !payload.is_for_scope(&body.root)
+        {
+            return Err(WorkError::Conflict);
+        }
+        if payload.metadata_bytes().map_err(|_| WorkError::Released)? < body.source_metadata_bytes {
+            return Err(WorkError::Capacity(
+                "metadata source exceeds its original queued envelope",
+            ));
+        }
+        // Authenticate the positive canonical incarnation, not a scope number.
+        // Authenticate the same positive payload through an active run-source
+        // view; this capture does not change its original Custody charge.
+        payload.root_domain_source(&body.root, JointLane::Foreground)?;
+        if payload.capacity_bytes().map_err(|_| WorkError::Released)?
+            < body.profile.initial_owned_bytes().get()
+        {
+            return Err(WorkError::Capacity(
+                "statistics original queued payload envelope",
+            ));
+        }
+        body.provider_owned_floor = payload.capacity_bytes().map_err(|_| WorkError::Released)?;
+        body.bound.push(SharedDependency::LocalHost);
+        body.full = Some(body.bound.clone().into());
+        body.payload = source.take();
+        body.started = true;
+        body.adopted_initial = true;
+        body.changed = true;
+        Ok(())
     }
     /// Actual Source containers plus all finite loan/fence/fact replacement scratch.
     /// This is owned first-party backing, not a recursive SDK/allocator/RSS quote.
@@ -791,6 +856,24 @@ impl MetadataIoAdmission {
             body.changed = true;
             notice.notify();
         }
+        if body.adopted_initial
+            && !body.first_ready
+            && body.growth.is_none()
+            && body.growth_ready.is_none()
+            && body.growth_cell.is_none()
+        {
+            let route = body
+                .profile
+                .initial_dependencies()
+                .iter()
+                .find(|route| !body.bound.contains(route))
+                .cloned()
+                .unwrap_or(SharedDependency::LocalHost);
+            let mut first = loan(&body.cells[0].original).ok_or(WorkError::Conflict)?;
+            let first = first.body.as_mut().unwrap();
+            first.extension = (!body.bound.contains(&route)).then(|| route.clone());
+            first.requested = Some(route);
+        }
         if body.growth.is_none() && body.growth_ready.is_none() && body.growth_cell.is_none() {
             for original in &mut body.cells {
                 if !original.stream_clear() || Arc::get_mut(original).is_none() {
@@ -870,7 +953,11 @@ impl MetadataIoAdmission {
             body.full = Some(body.bound.clone().into());
             let i = body.growth_cell.take().unwrap();
             if body.growth_bytes != 0 {
-                cells[i].body.as_mut().unwrap().owned_admitted = true;
+                let cell = cells[i].body.as_mut().unwrap();
+                cell.owned_admitted = true;
+                if let Some(required) = cell.owned {
+                    body.provider_owned_floor = body.provider_owned_floor.max(required.get());
+                }
             }
             for cell in &mut cells {
                 let cell = cell.body.as_mut().unwrap();
@@ -922,6 +1009,7 @@ impl MetadataIoAdmission {
                 .map_err(|_| WorkError::Conflict)?;
             let bytes = required.saturating_sub(capacity);
             if required != 0 && bytes == 0 {
+                body.provider_owned_floor = body.provider_owned_floor.max(required);
                 let cell = cells[i].body.as_mut().unwrap();
                 cell.owned_admitted = true;
                 cell.full = body.full.clone();
@@ -1109,7 +1197,13 @@ impl MetadataIoAdmission {
             }
         }
         body.cursor = (body.cursor + 1) % body.cells.len();
-        body.first_ready |= cells[0].body.as_ref().unwrap().grant.is_some();
+        body.first_ready |= cells[0].body.as_ref().unwrap().grant.is_some()
+            && (!body.adopted_initial
+                || body
+                    .profile
+                    .initial_dependencies()
+                    .iter()
+                    .all(|route| body.bound.contains(route)));
         if !body.first_ready {
             if let Some(error) = &body.failure {
                 return Err(error.clone());
@@ -1117,8 +1211,59 @@ impl MetadataIoAdmission {
         }
         Ok(body.first_ready)
     }
-    /// Borrow the original Root payload; this neither exposes a raw claim nor
-    /// creates a second budget. The caller owns the original direct stage.
+    /// Borrow the same positive Root payload; no computation position is retained.
+    pub(crate) fn root_capacity(
+        &self,
+    ) -> Result<
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        WorkError,
+    > {
+        let loan = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let body = loan.body.as_ref().ok_or(WorkError::NotReady)?;
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::from_internal_payload(
+            &body.root, &body.root, body.payload.as_ref().ok_or(WorkError::NotReady)?)
+    }
+
+    /// The caller has retired the failed computation's original producer,
+    /// output and aliases. Keep every actually admitted Provider peak, and
+    /// subtract at most that computation's formation increment. No domain or
+    /// unreceived production responsibility is released here.
+    pub(crate) fn retire_unaccepted_formation_in(
+        &self,
+        formation: &mut Option<u64>,
+    ) -> Result<Option<novarocks_workload_control::WorkloadProgressNotification>, WorkError> {
+        let Some(bytes) = *formation else {
+            return Ok(None);
+        };
+        let mut original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let body = original.body.as_mut().ok_or(WorkError::Released)?;
+        if body.growth.is_some()
+            || body.growth_ready.is_some()
+            || body.growth_cell.is_some()
+            || body.payload_slot_wait.is_some()
+            || body
+                .cells
+                .iter()
+                .any(|cell| !cell.stream_clear() || Arc::strong_count(cell) != 1)
+        {
+            return Err(WorkError::NotReady);
+        }
+        let payload = body.payload.as_ref().ok_or(WorkError::NotReady)?;
+        let current = payload.capacity_bytes().map_err(|_| WorkError::Released)?;
+        let floor = current
+            .checked_sub(bytes)
+            .ok_or(WorkError::Conflict)?
+            .max(body.provider_owned_floor);
+        let floor = NonZeroU64::new(floor).ok_or(WorkError::Conflict)?;
+        let notice = payload.retire_unused_to(floor)?;
+        // Stable disposition precedes any foreign notification. Re-poll and
+        // notification panic cannot subtract the original increment twice.
+        *formation = None;
+        Ok(Some(notice))
+    }
+
+    /// Borrow the original Root payload without exposing its raw claim or
+    /// creating another budget. The caller owns the original direct stage.
     pub(crate) fn root_stage_source(
         &self,
         stage: &WorkOwner,
@@ -1189,11 +1334,50 @@ impl MetadataIoAdmission {
     ) -> Poll<Result<(), WorkError>> {
         self.poll_quiescent_with_owner(None, cx)
     }
+    /// A migrated residual consumes actual exit separately from the original
+    /// business refusal. Raw health and structural custody failures still
+    /// refuse retirement; absence of a health flag is never an exit receipt.
+    pub(crate) fn poll_actual_quiescent_continuing(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<
+        Result<
+            MetadataIoQuiescence,
+            novarocks_query_application::api::StatementNativeHealthFailure,
+        >,
+    > {
+        if let Some(failure) = self.health_failure() {
+            return Poll::Ready(Err(failure));
+        }
+        let observed = self.poll_quiescence_with_owner(None, cx);
+        // Progress may just have observed the original stream poll/Drop panic.
+        // Preserve that same Source/cause even when the normal exit is Pending.
+        if let Some(failure) = self.health_failure() {
+            return Poll::Ready(Err(failure));
+        }
+        observed.map(|result| {
+            result.map_err(|error| {
+                novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
+                    "metadata original quiescence could not be established",
+                    Arc::new(error),
+                )
+            })
+        })
+    }
     fn poll_quiescent_with_owner(
         &self,
         owner: Option<&WorkOwner>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), WorkError>> {
+        // Keep the original business-error contract for unmigrated callers.
+        self.poll_quiescence_with_owner(owner, cx)
+            .map(|result| result.and_then(|observed| observed.ordinary_failure.map_or(Ok(()), Err)))
+    }
+    fn poll_quiescence_with_owner(
+        &self,
+        owner: Option<&WorkOwner>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<MetadataIoQuiescence, WorkError>> {
         if let Err(error) = self.poll_with_original_owner(owner, cx) {
             return Poll::Ready(Err(error));
         }
@@ -1216,7 +1400,9 @@ impl MetadataIoAdmission {
             let retired = std::mem::take(cell.body.as_mut().unwrap());
             drop(retired);
         }
-        Poll::Ready(body.failure.clone().map_or(Ok(()), Err))
+        Poll::Ready(Ok(MetadataIoQuiescence {
+            ordinary_failure: body.failure.clone(),
+        }))
     }
     fn request_in(
         &self,
@@ -1542,6 +1728,240 @@ mod original_governor_tests {
     }
 
     #[test]
+    fn retired_formation_preserves_admitted_provider_peak_and_actual_request_exit() {
+        let (control, mut driver, root) = original_governor();
+        let source_bytes = MetadataIoAdmission::fixed_backing_bytes(2, 1).unwrap();
+        let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU64::new(source_bytes).unwrap(),
+            NonZeroU64::new(128).unwrap(),
+            vec![SharedDependency::LocalHost],
+        )
+        .unwrap();
+        let source = MetadataIoAdmission::new(root.owner.scope(), profile, source_bytes).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut ready = false;
+        for _ in 0..256 {
+            ready = source.poll_progress(&root.owner, &mut cx).unwrap();
+            if ready {
+                break;
+            }
+            drive_original(&mut driver);
+        }
+        assert!(ready);
+        // Same original Root author as Stage's positive payload growth.
+        let mut growth = {
+            let original = source.original.lock().unwrap();
+            let body = original.as_ref().unwrap();
+            let author = body
+                .payload
+                .as_ref()
+                .unwrap()
+                .root_domain_source(&body.root, JointLane::Foreground)
+                .unwrap();
+            let JointTryBegin::Started(mut proposal) = author.try_begin(1024).unwrap() else {
+                panic!("same original Root Q available");
+            };
+            proposal.end_change().unwrap();
+            proposal.submit().unwrap()
+        };
+        drive_original(&mut driver);
+        let Poll::Ready(Ok(mut result)) = Pin::new(&mut growth).poll(&mut cx) else {
+            panic!("original Root growth proof");
+        };
+        {
+            let original = source.original.lock().unwrap();
+            let body = original.as_ref().unwrap();
+            result
+                .install_domains_in(&body.root, body.payload.as_ref().unwrap())
+                .unwrap()
+                .notify();
+        }
+        drop((result, growth));
+        drive_original(&mut driver);
+        let alias = {
+            let original = source.original.lock().unwrap();
+            original
+                .as_ref()
+                .unwrap()
+                .payload
+                .as_ref()
+                .unwrap()
+                .retain_alias()
+                .unwrap()
+        };
+        assert_eq!(alias.capacity_bytes().unwrap(), 1152);
+        // This actual Provider request fits inside formation, so causes no
+        // growth. Its original admitted peak must nevertheless survive release.
+        let mut request = Box::pin(
+            source
+                .request_owned(NonZeroU64::new(768).unwrap())
+                .unwrap()
+                .admitted(),
+        );
+        let mut permit = None;
+        for _ in 0..256 {
+            source.poll_progress(&root.owner, &mut cx).unwrap();
+            drive_original(&mut driver);
+            if let Poll::Ready(result) = request.as_mut().poll(&mut cx) {
+                permit = Some(result.unwrap());
+                break;
+            }
+        }
+        let permit = permit.expect("actual original Provider peak admitted");
+        let mut formation = Some(1024);
+        assert!(
+            matches!(
+                source.retire_unaccepted_formation_in(&mut formation),
+                Err(WorkError::NotReady)
+            ),
+            "a live original request refuses formation retirement"
+        );
+        assert_eq!(formation, Some(1024));
+        assert_eq!(alias.capacity_bytes().unwrap(), 1152);
+        drop((request, permit));
+        assert!(source.poll_quiescent(&root.owner, &mut cx).is_ready());
+        let notice = source
+            .retire_unaccepted_formation_in(&mut formation)
+            .unwrap()
+            .unwrap();
+        assert!(formation.is_none());
+        notice.notify();
+        assert_eq!(
+            alias.capacity_bytes().unwrap(),
+            768,
+            "keep the admitted Provider peak, not only the pre-stage 128 bytes"
+        );
+        alias.check_backing_total(768).unwrap();
+        assert!(
+            source
+                .retire_unaccepted_formation_in(&mut formation)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            alias.capacity_bytes().unwrap(),
+            768,
+            "no repeated subtraction"
+        );
+        {
+            let original = source.original.lock().unwrap();
+            let body = original.as_ref().unwrap();
+            assert_eq!(body.bound, vec![SharedDependency::LocalHost]);
+            assert_eq!(body.provider_owned_floor, 768);
+        }
+        drop((alias, source));
+        root.business.release();
+        root.owner.complete();
+        control.close_admission();
+        drive_original(&mut driver);
+        assert!(control.shutdown().is_ok());
+    }
+
+    #[test]
+    fn queued_root_payload_is_adopted_and_provider_domains_are_proved_before_ready() {
+        let (control, mut driver, root) = original_governor_with_domains(2);
+        let scope = root.owner.scope();
+        let source_bytes = MetadataIoAdmission::fixed_backing_bytes(2, 2).unwrap();
+        let route = SharedDependency::Network(
+            novarocks_resource_contract::NetworkServiceOrigin::from_selected_url(
+                &url::Url::parse("https://statistics-rebind.invalid").unwrap(),
+            )
+            .unwrap(),
+        );
+        let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU64::new(source_bytes).unwrap(),
+            NonZeroU64::new(128).unwrap(),
+            vec![SharedDependency::LocalHost, route.clone()],
+        )
+        .unwrap();
+        let domains = scope.prepare_root_domains().unwrap();
+        let initial = domains
+            .initial_payload_source(&scope, JointLane::Custody)
+            .unwrap();
+        let JointTryBegin::Started(mut proposal) = initial
+            .try_begin(
+                NonZeroU64::new(source_bytes).unwrap(),
+                NonZeroU64::new(128).unwrap(),
+            )
+            .unwrap()
+        else {
+            panic!("original queued Root Q");
+        };
+        proposal
+            .push_dependency(&SharedDependency::LocalHost)
+            .unwrap();
+        let mut admission = proposal.submit().unwrap();
+        let mut payload = None;
+        let mut cx = Context::from_waker(Waker::noop());
+        drive_original(&mut driver);
+        let Poll::Ready(Ok(notice)) = admission.poll_install_in(&mut cx, &scope, &mut payload)
+        else {
+            panic!("original queued payload proof");
+        };
+        notice.notify();
+        drop(admission);
+        drive_original(&mut driver);
+        let source = MetadataIoAdmission::new(scope.clone(), profile, source_bytes).unwrap();
+        source.adopt_original_payload_in(&mut payload).unwrap();
+        assert!(
+            payload.is_none(),
+            "the exact original was moved, not copied"
+        );
+        assert_eq!(source.root_capacity().unwrap().scope().id(), scope.id());
+        assert!(
+            !source.poll_progress(&root.owner, &mut cx).unwrap(),
+            "queued LocalHost capacity is not the newly selected Provider route"
+        );
+        {
+            let original = source.original.lock().unwrap();
+            assert!(!original.as_ref().unwrap().bound.contains(&route));
+        }
+        let mut ready = false;
+        for _ in 0..256 {
+            drive_original(&mut driver);
+            if source.poll_progress(&root.owner, &mut cx).unwrap() {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready);
+        assert_original_healthy(&source);
+        {
+            let original = source.original.lock().unwrap();
+            let body = original.as_ref().unwrap();
+            assert!(body.bound.contains(&route));
+            assert!(
+                body.initial.is_none(),
+                "adoption never creates a second initial payload"
+            );
+            assert_eq!(
+                body.payload.as_ref().unwrap().capacity_bytes().unwrap(),
+                128
+            );
+        }
+        let mut exited = false;
+        for _ in 0..256 {
+            match source.poll_quiescent(&root.owner, &mut cx) {
+                Poll::Ready(result) => {
+                    result.unwrap();
+                    exited = true;
+                    break;
+                }
+                Poll::Pending => drive_original(&mut driver),
+            }
+        }
+        assert!(exited);
+        drop(source);
+        root.business.release();
+        root.owner.complete_after_terminal_cancel_settled();
+        control.close_admission();
+        drive_original(&mut driver);
+        assert!(control.shutdown().is_ok());
+    }
+
+    #[test]
     fn reused_bootstrap_grant_cannot_dispatch_a_new_route_before_full_domain_install() {
         let (control, mut driver, root) = original_governor_with_domains(2);
         let source_bytes = MetadataIoAdmission::fixed_backing_bytes(2, 2).unwrap();
@@ -1710,6 +2130,197 @@ mod original_governor_tests {
         control.close_admission();
         drive_original(&mut driver);
         assert!(control.shutdown().is_ok());
+    }
+
+    #[test]
+    fn ordinary_resource_refusal_retains_its_fact_after_actual_io_and_alias_exit() {
+        use std::sync::atomic::AtomicBool;
+
+        struct ActualIo {
+            released: Arc<AtomicBool>,
+            exits: Arc<AtomicUsize>,
+        }
+        impl Future for ActualIo {
+            type Output = Result<(), ConnectorError>;
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                if self.released.load(Ordering::SeqCst) {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+        impl Drop for ActualIo {
+            fn drop(&mut self) {
+                self.exits.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (control, mut driver, root) = original_governor();
+        let source_bytes = MetadataIoAdmission::fixed_backing_bytes(2, 1).unwrap();
+        let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU64::new(source_bytes).unwrap(),
+            NonZeroU64::new(128).unwrap(),
+            vec![SharedDependency::LocalHost],
+        )
+        .unwrap();
+        let source = MetadataIoAdmission::new(root.owner.scope(), profile, source_bytes).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut ready = false;
+        for _ in 0..256 {
+            ready = source.poll_progress(&root.owner, &mut cx).unwrap();
+            if ready {
+                break;
+            }
+            drive_original(&mut driver);
+        }
+        assert!(ready);
+        let mut request = Box::pin(
+            source
+                .request(SharedDependency::LocalHost)
+                .unwrap()
+                .admitted(),
+        );
+        let mut permit = None;
+        for _ in 0..256 {
+            drive_original(&mut driver);
+            source.poll_progress(&root.owner, &mut cx).unwrap();
+            if let Poll::Ready(result) = request.as_mut().poll(&mut cx) {
+                permit = Some(result.unwrap());
+                break;
+            }
+        }
+        let permit = permit.expect("one actual positive AsyncIo grant");
+        drop(request);
+        let released = Arc::new(AtomicBool::new(false));
+        let exits = Arc::new(AtomicUsize::new(0));
+        let mut original: Option<ConnectorIoCleanupFuture> = Some(Box::pin(ActualIo {
+            released: Arc::clone(&released),
+            exits: Arc::clone(&exits),
+        }));
+        permit
+            .begin_stream()
+            .unwrap()
+            .install_cleanup_in(&mut original)
+            .unwrap_or_else(|_| panic!("same original stream accepts its actual F"));
+        assert!(original.is_none());
+
+        // The original component has a 4096 hard custody cap and promises no
+        // positive next-payload increment. The real Source rejects this whole
+        // growth request before dispatch; no error or grant is injected.
+        let mut refused = Box::pin(
+            source
+                .request_owned(NonZeroU64::new(4097).unwrap())
+                .unwrap()
+                .admitted(),
+        );
+        let mut refusal = None;
+        for _ in 0..256 {
+            source.poll_progress(&root.owner, &mut cx).unwrap();
+            drive_original(&mut driver);
+            match refused.as_mut().poll(&mut cx) {
+                Poll::Ready(Err(error)) => {
+                    refusal = Some(error);
+                    break;
+                }
+                Poll::Ready(Ok(_)) => panic!("the original custody cap cannot grant 4097"),
+                Poll::Pending => {}
+            }
+        }
+        assert!(matches!(
+            refusal.unwrap().kind(),
+            ConnectorErrorKind::ResourceExhausted
+        ));
+        drop(refused);
+        assert!(matches!(
+            source.failure(),
+            Some(WorkError::Capacity(_) | WorkError::JointCapacity(_))
+        ));
+        assert!(source.health_failure().is_none());
+        assert!(
+            source
+                .poll_actual_quiescent_continuing(&mut cx)
+                .is_pending()
+        );
+        assert_eq!(exits.load(Ordering::SeqCst), 0);
+        released.store(true, Ordering::SeqCst);
+        source.poll_continuing(&mut cx).unwrap();
+        assert_eq!(
+            exits.load(Ordering::SeqCst),
+            1,
+            "actual original F Drop occurred"
+        );
+        assert!(
+            source
+                .poll_actual_quiescent_continuing(&mut cx)
+                .is_pending(),
+            "the actual permit alias still holds its source"
+        );
+        drop(permit);
+        let observed = match source.poll_actual_quiescent_continuing(&mut cx) {
+            Poll::Ready(Ok(observed)) => observed,
+            _ => panic!("all actual requests and aliases exited with their ordinary refusal"),
+        };
+        assert!(matches!(
+            observed.into_ordinary_failure(),
+            Some(WorkError::Capacity(_) | WorkError::JointCapacity(_))
+        ));
+        assert!(
+            source.failure().is_some(),
+            "the original failure was observed, not erased"
+        );
+        assert!(source.health_failure().is_none());
+        assert!(
+            matches!(
+                source.poll_quiescent(&root.owner, &mut cx),
+                Poll::Ready(Err(_))
+            ),
+            "legacy callers keep their original business-error contract"
+        );
+
+        // An absent original loan is still a custody refusal, not success.
+        let borrowed = loan(&source.original).unwrap();
+        assert!(matches!(
+            source.poll_actual_quiescent_continuing(&mut cx),
+            Poll::Ready(Err(_))
+        ));
+        drop(borrowed);
+        drop(source);
+        root.business.release();
+        root.owner.complete_after_terminal_cancel_settled();
+        control.close_admission();
+        drive_original(&mut driver);
+        assert!(
+            control.shutdown().is_ok(),
+            "same WC really drains; ordinary refusal is not fake running"
+        );
+    }
+
+    #[test]
+    fn actual_quiescence_does_not_dispose_or_reclassify_raw_cleanup_panic() {
+        let (source, primary_drops, _) = super::cleanup_tests::two_failures(true);
+        let mut cx = Context::from_waker(Waker::noop());
+        let failure = match source.poll_actual_quiescent_continuing(&mut cx) {
+            Poll::Ready(Err(failure)) => failure,
+            _ => panic!("the same raw cleanup panic must still refuse actual retirement"),
+        };
+        assert!(std::ptr::eq(
+            failure
+                .cause()
+                .downcast_ref::<MetadataIoAdmission>()
+                .unwrap(),
+            source.as_ref(),
+        ));
+        assert_eq!(primary_drops.load(Ordering::SeqCst), 0);
+        drop(source);
+        assert_eq!(
+            primary_drops.load(Ordering::SeqCst),
+            0,
+            "the exact health source still owns its primary cause"
+        );
+        drop(failure);
+        assert_eq!(primary_drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

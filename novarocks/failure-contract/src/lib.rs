@@ -30,12 +30,17 @@ pub const DIAGNOSTIC_MAX_BYTES: usize = 512;
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct BoundedDetail(String);
 impl BoundedDetail {
-    pub fn truncating(value: &str) -> Self {
+    /// Exact allocation extent of the owned UTF-8 prefix made by truncating.
+    /// Unlike Display formatting, this path performs one str::to_owned copy.
+    pub fn truncating_backing_len(value: &str) -> usize {
         let mut end = value.len().min(DIAGNOSTIC_MAX_BYTES);
         while !value.is_char_boundary(end) {
             end -= 1;
         }
-        Self(value[..end].to_owned())
+        end
+    }
+    pub fn truncating(value: &str) -> Self {
+        Self(value[..Self::truncating_backing_len(value)].to_owned())
     }
     pub fn truncating_display(value: impl fmt::Display) -> Self {
         struct Bounded(String);

@@ -602,7 +602,7 @@ fn complete_finite_refusal_keeps_root_payload_and_existing_compute_without_parti
     assert!(matches!(
         Pin::new(&mut refused).poll(&mut Context::from_waker(Waker::noop())),
         Poll::Ready(Err(JointAdmissionFailure {
-            error: WorkError::Capacity(_),
+            error: WorkError::JointCapacity(_),
             ..
         }))
     ));

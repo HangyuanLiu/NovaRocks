@@ -49,7 +49,10 @@ impl ExactProfile {
 #[derive(Clone, Debug)]
 pub(super) struct CoordinateLimit {
     pub(super) global: u128,
+    // Per-dependency increment of the stallable source contribution.
     pub(super) protected_increment: u128,
+    // One complete registered finite contribution, never a hard-cap refund.
+    pub(super) finite_reserve: u128,
     pub(super) domains: Vec<u128>,
 }
 
@@ -439,6 +442,12 @@ impl ProtectionProof {
             None => limit.global,
             Some(index) => limit.domains[self.input.affected_dependencies[index]],
         }
+    }
+
+    fn protected_constraint_limit(&self) -> Result<u128, CheckError> {
+        self.constraint_limit()
+            .checked_sub(self.input.limits[self.coordinate].finite_reserve)
+            .ok_or(CheckError::MalformedSnapshot)
     }
 
     fn add_edge(&mut self, from: usize, to: usize, capacity: u128) -> Result<(), CheckError> {
@@ -896,7 +905,7 @@ impl ProtectionProof {
                 }
             }
             Phase::BeginConstraint => {
-                let limit = self.constraint_limit();
+                let limit = self.protected_constraint_limit()?;
                 // Global total is cached from the immutable snapshot. It is an
                 // upper bound for every domain's total; use it only to PASS.
                 if self.required_domain.is_none() && self.cached_global_total > limit {
@@ -997,7 +1006,7 @@ impl ProtectionProof {
                 }
             }
             Phase::FinishTotal { total } => {
-                if total > self.constraint_limit() {
+                if total > self.protected_constraint_limit()? {
                     // Exact singleton cap (or the empty-set global cap).
                     self.fail_capacity();
                 } else if total <= self.allowance {
@@ -1343,6 +1352,7 @@ mod tests {
         CoordinateLimit {
             global,
             protected_increment: p,
+            finite_reserve: 0,
             domains: vec![local; domains],
         }
     }
@@ -1403,11 +1413,17 @@ mod tests {
                     })
                     .map(|profile| profile.amounts[coordinate])
                     .sum();
-                if amount + (selected.len() as u128) * limit.protected_increment > limit.global {
+                if amount
+                    + (selected.len() as u128) * limit.protected_increment
+                    + limit.finite_reserve
+                    > limit.global
+                {
                     return false;
                 }
                 for &domain in &selected {
-                    if amount + ((selected.len() - 1) as u128) * limit.protected_increment
+                    if amount
+                        + ((selected.len() - 1) as u128) * limit.protected_increment
+                        + limit.finite_reserve
                         > limit.domains[domain]
                     {
                         return false;
@@ -1552,6 +1568,41 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn finite_reserve_is_once_while_actual_finite_rows_keep_global_and_domain_caps() {
+        let mut limits = limit(8, 24, 22, 2);
+        limits.finite_reserve = 1;
+        let native = row(&[0, 1, 2, 3, 4, 5, 6, 7], &[1]);
+        let post = input(
+            vec![native],
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+            vec![limits.clone()],
+        );
+        assert!(oracle(&post, &post.affected_dependencies));
+        assert!(is_feasible(run(post, bounds(), 1)));
+        for (finite_amount, expected_constraint) in [
+            (1, None),
+            (2, Some(ConstraintKind::Domain)),
+            (4, Some(ConstraintKind::Global)),
+        ] {
+            let mut finite = row(&[0], &[finite_amount]);
+            finite.causal = CausalMask(1);
+            let post = input(vec![row(&[0], &[21]), finite], &[0], vec![limits.clone()]);
+            assert_eq!(oracle(&post, &[0]), expected_constraint.is_none());
+            let result = run(post, bounds(), 1).unwrap();
+            match expected_constraint {
+                None => assert_eq!(result, Feasibility::Feasible),
+                Some(expected) => assert_eq!(
+                    result,
+                    Feasibility::Infeasible {
+                        coordinate: 0,
+                        constraint: expected,
+                    }
+                ),
+            }
+        }
     }
 
     #[test]
@@ -1809,11 +1860,13 @@ mod tests {
             CoordinateLimit {
                 global: 12,
                 protected_increment: 2,
+                finite_reserve: 0,
                 domains: vec![5, 7, 9],
             },
             CoordinateLimit {
                 global: 17,
                 protected_increment: 3,
+                finite_reserve: 0,
                 domains: vec![8, 10, 12],
             },
         ];

@@ -449,6 +449,7 @@ impl ConnectorReadRequestControlFactory for LateRequestFactory {
     }
 }
 struct LateEncoder {
+    relation_allowed: bool,
     catalog: CatalogHandle,
     relation_calls: Arc<AtomicUsize>,
 }
@@ -470,7 +471,25 @@ impl ConnectorReadWireEncoder for LateEncoder {
         _: &ConnectorReadRelation,
     ) -> Result<ConnectorReadRelationPayload, ConnectorCodecError> {
         self.relation_calls.fetch_add(1, Ordering::AcqRel);
-        Err(Self::unused())
+        if !self.relation_allowed {
+            return Err(Self::unused());
+        }
+        let payload = |category, body| {
+            ConnectorEncodedPayload::new(
+                ConnectorEnvelopeHeader::new(
+                    ConnectorProviderId::parse("iceberg").unwrap(),
+                    self.catalog.clone(),
+                    category,
+                    ConnectorCodecRevision::try_new(1).unwrap(),
+                ),
+                Bytes::from_static(body),
+            )
+        };
+        Ok(ConnectorReadRelationPayload::new(
+            ConnectorReadRelationKind::Table,
+            payload(ConnectorCodecCategory::ReadTable, b"fixture-table-orders"),
+            payload(ConnectorCodecCategory::ReadView, b"fixture-view-orders"),
+        ))
     }
     fn encode_column_payload(
         &self,
@@ -502,15 +521,28 @@ impl ConnectorReadWireEncoder for LateEncoder {
 
 #[test]
 fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit() {
-    original_provider_completion_fixture(false);
+    original_provider_completion_fixture(false, None);
 }
 
 #[test]
 fn actual_provider_panic_reaches_completion_health_and_only_fixture_disposition_releases_it() {
-    original_provider_completion_fixture(true);
+    original_provider_completion_fixture(true, None);
 }
 
-fn original_provider_completion_fixture(panic_after_release: bool) {
+#[test]
+fn statistics_plan_failure_returns_real_access_before_cpu_input_retirement() {
+    original_provider_completion_fixture(false, Some(false));
+}
+
+#[test]
+fn statistics_plan_cancel_returns_real_access_before_provider_close() {
+    original_provider_completion_fixture(false, Some(true));
+}
+
+fn original_provider_completion_fixture(
+    panic_after_release: bool,
+    statistics_cancel: Option<bool>,
+) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .max_blocking_threads(2)
@@ -595,6 +627,7 @@ fn original_provider_completion_fixture(panic_after_release: bool) {
                     sealer,
                 })),
                 Arc::new(LateEncoder {
+                    relation_allowed: statistics_cancel.is_some(),
                     catalog: catalog.clone(),
                     relation_calls: relation_calls.clone(),
                 }),
@@ -704,10 +737,114 @@ fn original_provider_completion_fixture(panic_after_release: bool) {
         let sink = ReadAccessSink::new();
         let answer = waiter_port.resolve_provider_reads(&[need], &sink).await;
         published.store(true, Ordering::Release);
-        (answer, sink.into_taken())
+        (answer, sink)
     });
     let entered = seal_entered.recv_timeout(Duration::from_secs(2)).is_ok();
     let schema_was_published = provider.public_schemas.load(Ordering::Acquire) == 1;
+    if let Some(cancel_plan) = statistics_cancel {
+        use crate::query_execution::statistics::preparation::{
+            StatisticsPlanCpuInput, StatisticsPreparationCustody, StatisticsPreparationFailure,
+        };
+        // Resolve through the same real Provider/sealer/deposit path first.
+        // Neither a fabricated access nor an empty capability set can pass.
+        release_seal.send(()).unwrap();
+        let (facts, sink) = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), &mut waiter).await })
+            .expect("actual Provider resolution deadline")
+            .expect("actual Provider waiter");
+        let mut facts = facts.expect("actual Provider facts");
+        assert_eq!(facts.len(), 1);
+        let access = sink
+            .try_into_access()
+            .unwrap_or_else(|(error, _)| panic!("actual exact read access: {error}"));
+        assert_eq!(access.len(), 1);
+        let input =
+            StatisticsPlanCpuInput::fixture_with_access(binding, facts.pop().unwrap(), access);
+        let cancellation =
+            novarocks_query_application::cancellation::QueryCancellationSource::new();
+        let wake = Arc::new(ProviderCreatorWake(AtomicWaker::new()));
+        let mut plan = provider_cpu.runtime().submit_statistics_plan_fixture(
+            input,
+            window.retain_alias(),
+            cancellation.view(),
+            runtime.handle(),
+            wake,
+        );
+        let mut custody = StatisticsPreparationCustody::default();
+        let mut outcome = None;
+        if cancel_plan {
+            cancellation.request(novarocks_query_application::cancellation::QueryCancellationReason::ExecutionCancellationRequested);
+            runtime
+                .block_on(plan.close(&mut custody))
+                .expect("same CPU actual exit");
+            assert!(outcome.is_none());
+        } else {
+            runtime
+                .block_on(std::future::poll_fn(|cx| {
+                    plan.poll_finish_in(cx, &mut outcome, &mut custody)
+                }))
+                .expect("same CPU actual exit");
+            assert!(matches!(
+                outcome,
+                Some(Err(StatisticsPreparationFailure::Domain(_)))
+            ));
+            runtime
+                .block_on(plan.close(&mut custody))
+                .expect("idempotent actual close");
+        }
+        // Drop the original CPU source after actual exit. The returned linear
+        // access must remain in the Action's original custody through close.
+        drop(plan);
+        assert!(
+            drop_entered.try_recv().is_err(),
+            "CPU retirement dropped Provider access"
+        );
+        runtime
+            .block_on(custody.close(&completion_source))
+            .expect("actual Provider close");
+        assert!(
+            drop_entered.try_recv().is_err(),
+            "Provider close dropped returned access"
+        );
+        assert!(!destroyed.load(Ordering::Acquire));
+        let release_original = std::thread::spawn(move || drop(custody));
+        let original_drop_started = drop_entered.recv_timeout(Duration::from_secs(2)).is_ok();
+        let held = !destroyed.load(Ordering::Acquire);
+        release_drop.send(()).unwrap();
+        release_original
+            .join()
+            .expect("original capability destructor");
+        disarm.send(()).unwrap();
+        watchdog.join().unwrap();
+        assert!(entered && schema_was_published && original_drop_started && held);
+        assert!(destroyed.load(Ordering::Acquire));
+        assert_eq!(provider.opens.load(Ordering::Acquire), 1);
+        assert_eq!(provider.freezes.load(Ordering::Acquire), 1);
+        assert_eq!(seals.load(Ordering::Acquire), 1);
+        assert_eq!(relation_calls.load(Ordering::Acquire), 1);
+        assert!(delivered.load(Ordering::Acquire));
+        assert!(completion_source.local_health_failure().is_none());
+        runtime
+            .block_on(provider_cpu.shutdown_until(Instant::now() + Duration::from_secs(2)))
+            .unwrap();
+        drop(outcome);
+        drop(port);
+        drop(completion_source);
+        drop(capacity);
+        drop(bindings);
+        drop(lease);
+        drop(window);
+        root.owner.complete();
+        root.business.release();
+        crate::task_execution::blocking_io::tests::settle_control(&control);
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
+        drop(adapter);
+        drop(host);
+        drop(blocking);
+        drop(runtime);
+        return;
+    }
     stop.request_stop();
     root.owner.cancel(CancellationReason::Requested);
     control.expire_deadlines();
@@ -972,6 +1109,7 @@ fn frozen_mv_target_routing_preserves_exact_provider_facts_and_generic_history()
                 adapter.clone(),
                 None,
                 Arc::new(LateEncoder {
+                    relation_allowed: false,
                     catalog: catalog.clone(),
                     relation_calls: Arc::new(AtomicUsize::new(0)),
                 }),

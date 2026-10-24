@@ -32,16 +32,21 @@ use crate::commit::staging::{PreparedChange, Preparer, StagedView};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-fn preparation_error(error: ConnectorError) -> crate::iceberg::Error {
+pub(super) fn preparation_error(error: ConnectorError) -> crate::iceberg::Error {
     crate::iceberg::Error::new(crate::iceberg::ErrorKind::Unexpected, error.message())
         .with_source(error)
 }
 
 /// Measurements and aggregate bodies never change when catalog metadata moves.
-struct StatisticsDraftPreparer {
-    snapshot_id: i64,
-    sequence_number: i64,
-    drafts: Vec<StatisticsArtifactDraft>,
+pub(super) struct StatisticsDraftPreparer {
+    pub(super) snapshot_id: i64,
+    pub(super) sequence_number: i64,
+    pub(super) drafts: Arc<[StatisticsArtifactDraft]>,
+    pub(super) cpu: Option<std::sync::Weak<dyn novarocks_spi::connector::StatisticsCpuPort>>,
+    pub(super) cpu_owner: Option<(
+        novarocks_spi::connector::ConnectorInstanceDescriptor,
+        novarocks_spi::connector::ProviderBindingEpoch,
+    )>,
 }
 
 #[async_trait]
@@ -61,13 +66,31 @@ impl StatisticsDraftPreparer {
         writer: &dyn ArtifactWriter,
     ) -> crate::iceberg::Result<PreparedChange> {
         writer.check_active()?;
-        let written = crate::stats_assembler::write_puffin_artifacts_allocated(
-            writer,
-            self.snapshot_id,
-            self.sequence_number,
-            &self.drafts,
-        )
-        .await;
+        let written = if self.cpu.is_some() {
+            let cpu = scoped_cpu::original_cpu(&self.cpu).map_err(preparation_error)?;
+            let (descriptor, incarnation) = self
+                .cpu_owner
+                .as_ref()
+                .expect("scoped statistics preparer retains its Provider owner");
+            crate::stats_assembler::write_puffin_artifacts_allocated_scoped(
+                writer,
+                self.snapshot_id,
+                self.sequence_number,
+                Arc::clone(&self.drafts),
+                cpu,
+                descriptor,
+                *incarnation,
+            )
+            .await
+        } else {
+            crate::stats_assembler::write_puffin_artifacts_allocated(
+                writer,
+                self.snapshot_id,
+                self.sequence_number,
+                &self.drafts,
+            )
+            .await
+        };
         // Keep a typed late cancellation even if the writer's String result
         // also reports it. The operation waits for actual writer exit.
         writer.check_active()?;
@@ -98,20 +121,20 @@ struct StatisticsRecovery {
 }
 
 #[derive(Clone)]
-struct Projection {
-    descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
-    incarnation: novarocks_spi::connector::ProviderBindingEpoch,
-    operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
-    target: crate::iceberg::TableIdent,
-    uuid: uuid::Uuid,
-    snapshot_id: i64,
-    sequence_number: i64,
-    data_version: StatisticsDataVersion,
-    revision: StatisticsEvidenceRevision,
+pub(super) struct Projection {
+    pub(super) descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
+    pub(super) incarnation: novarocks_spi::connector::ProviderBindingEpoch,
+    pub(super) operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
+    pub(super) target: crate::iceberg::TableIdent,
+    pub(super) uuid: uuid::Uuid,
+    pub(super) snapshot_id: i64,
+    pub(super) sequence_number: i64,
+    pub(super) data_version: StatisticsDataVersion,
+    pub(super) revision: StatisticsEvidenceRevision,
 }
 
 impl Projection {
-    fn intent(&self) -> crate::iceberg::Result<OperationIntent> {
+    pub(super) fn intent(&self) -> crate::iceberg::Result<OperationIntent> {
         OperationIntent::new(OperationIntentParts {
             target: TableTarget {
                 ident: self.target.clone(),
@@ -137,6 +160,14 @@ impl Projection {
         operation: &IcebergCommitOperation,
         journal: &PublicationJournal<StatisticsReceipt>,
     ) -> crate::iceberg::Result<()> {
+        let (evidence, receipt) = self.prepare_evidence(request, operation)?;
+        journal.record(evidence, receipt, request)
+    }
+    pub(super) fn prepare_evidence(
+        &self,
+        request: &FrozenRequest,
+        operation: &IcebergCommitOperation,
+    ) -> crate::iceberg::Result<(ExternalMutationEvidence, StatisticsReceipt)> {
         if request.shape() != RequestShape::MetadataOnly
             || request.identifier() != &self.target
             || request.target_ref() != "main"
@@ -166,11 +197,25 @@ impl Projection {
             statistics_path: statistics.statistics_path.clone(),
             publication: FrozenPublicationFacts::from_request(request, operation)?,
         };
-        let bytes = serde_json::to_vec(&payload).map_err(|error| {
-            preparation_error(internal(format!(
-                "Encode complete statistics recovery ledger: {error}"
-            )))
-        })?;
+        let mut encoded = StatisticsEvidenceWriter {
+            bytes: Vec::with_capacity(
+                novarocks_spi::connector::MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+            ),
+            limit_exceeded: false,
+        };
+        if let Err(error) = serde_json::to_writer(&mut encoded, &payload) {
+            return Err(preparation_error(if encoded.limit_exceeded {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "External mutation evidence payload exceeds its original limit",
+                )
+            } else {
+                internal(format!(
+                    "Encode complete statistics recovery ledger: {error}"
+                ))
+            }));
+        }
+        let bytes = encoded.bytes;
         let evidence = ExternalMutationEvidence::try_new(
             STATISTICS_PUBLICATION_EVIDENCE_VERSION,
             self.descriptor.clone(),
@@ -189,16 +234,43 @@ impl Projection {
             Bytes::from(statistics.statistics_path.clone()),
         )
         .map_err(preparation_error)?;
-        journal.record(evidence, receipt, request)
+        Ok((evidence, receipt))
     }
 
-    fn preflight_callback(
+    pub(super) fn preflight_callback(
         &self,
         journal: &PublicationJournal<StatisticsReceipt>,
     ) -> RecoveryPreflight {
         let projection = self.clone();
         let journal = journal.clone();
         Arc::new(move |request, operation| projection.preflight(request, operation, &journal))
+    }
+}
+
+// One bounded first-party encoding buffer. This does not change the evidence
+// format or its existing public limit; refusal still precedes dispatch.
+struct StatisticsEvidenceWriter {
+    bytes: Vec<u8>,
+    limit_exceeded: bool,
+}
+impl std::io::Write for StatisticsEvidenceWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .is_none_or(|n| n > novarocks_spi::connector::MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES)
+        {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::other(
+                "Statistics recovery evidence exceeds its original limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -266,7 +338,7 @@ pub(super) fn publish(
         uuid: session.physical_table.metadata().uuid(),
         snapshot_id,
         sequence_number,
-        data_version: session.data_version,
+        data_version: session.data_version.clone(),
         revision,
     };
     let intent = projection
@@ -286,7 +358,7 @@ pub(super) fn publish(
             .resources()
             .planning_binding()
             .clone(),
-        session.context,
+        session.context.clone(),
         session
             .provider
             .runtime()
@@ -320,7 +392,9 @@ pub(super) fn publish(
     let preparer = Arc::new(StatisticsDraftPreparer {
         snapshot_id,
         sequence_number,
-        drafts,
+        drafts: drafts.into(),
+        cpu: None,
+        cpu_owner: None,
     });
     let outcome = run_publication(
         &operation,
@@ -460,7 +534,9 @@ mod tests {
             Arc::new(StatisticsDraftPreparer {
                 snapshot_id: 7,
                 sequence_number: 1,
-                drafts: drafts(),
+                drafts: drafts().into(),
+                cpu: None,
+                cpu_owner: None,
             })
         }
 
@@ -654,6 +730,89 @@ mod tests {
             }
             CatalogOutcome::committed(CommitProof::applied(None), ExternalMutationEffect::Applied)
         }
+    }
+
+    fn borrowed_source(
+        rig: &Rig,
+        publisher: &Arc<TestPublisher>,
+    ) -> async_publication::StatisticsPublicationSource {
+        async_publication::StatisticsPublicationSource::from_original(
+            rig.operation.clone(),
+            rig.projection.intent().unwrap(),
+            rig.preparer(),
+            Arc::new(publisher.journal.observe(publisher.clone())),
+            publisher.journal.clone(),
+            RetryPolicy::from_properties(rig.metadata.properties()).unwrap(),
+        )
+    }
+
+    #[test]
+    fn borrowed_statistics_source_retains_needed_ready_before_original_gc() {
+        let rig = Rig::new();
+        let publisher = rig.publisher(rig.metadata.clone(), Behavior::Commit);
+        let mut source = borrowed_source(&rig, &publisher);
+        rig._runtime.block_on(async {
+            let ready = source.finish().await.unwrap();
+            let StatisticsPublicationReady::Committed {
+                ref receipt,
+                finalization: ExternalMutationFinalization::Complete,
+                ..
+            } = ready
+            else {
+                panic!("actual committed frontier must retain its needed receipt");
+            };
+            assert_eq!(receipt.operation_id(), rig.projection.operation_id);
+            assert!(!publisher.journal.cleanup_inventory_is_disposed());
+            assert!(exists(&publisher.paths.lock().unwrap()[0]));
+            assert_eq!(source.finish().await.unwrap(), ready);
+            assert_eq!(publisher.dispatches.load(Ordering::SeqCst), 1);
+            // This original fixture predates MIO. The new API must refuse its
+            // missing source and retain the positive fact; no sync fallback.
+            assert!(source.close(rig.operation.request_context()).await.is_err());
+            assert_eq!(source.finish().await.unwrap(), ready);
+            publisher
+                .journal
+                .settle_committed_cleanup_in(&rig.operation, rig.operation.request_context())
+                .await
+                .unwrap();
+            assert!(publisher.journal.cleanup_inventory_is_disposed());
+            assert!(exists(&publisher.paths.lock().unwrap()[0]));
+            assert_eq!(publisher.dispatches.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn borrowed_statistics_source_unwind_keeps_same_unknown_and_never_republishes() {
+        use futures::FutureExt;
+        let rig = Rig::new();
+        let publisher = rig.publisher(rig.metadata.clone(), Behavior::PanicAfterIssue);
+        let mut source = borrowed_source(&rig, &publisher);
+        rig._runtime.block_on(async {
+            assert!(
+                std::panic::AssertUnwindSafe(source.finish())
+                    .catch_unwind()
+                    .await
+                    .is_err()
+            );
+            assert!(source.finish().await.is_err());
+            assert_eq!(publisher.dispatches.load(Ordering::SeqCst), 1);
+            let outcome = publisher
+                .journal
+                .recover_bridge_in(
+                    &rig.operation,
+                    rig.operation.request_context(),
+                    "original borrowed publication panicked".into(),
+                )
+                .await;
+            let ExternalMutationOutcome::CommitUnknown { evidence, .. } = outcome else {
+                panic!("issued mutation without conclusion must retain Unknown");
+            };
+            assert_eq!(evidence.operation_id(), rig.projection.operation_id);
+            assert!(!publisher.journal.cleanup_inventory_is_disposed());
+            assert!(exists(&publisher.paths.lock().unwrap()[0]));
+            assert!(source.finish().await.is_err());
+            assert_eq!(publisher.dispatches.load(Ordering::SeqCst), 1);
+        });
     }
 
     fn exists(path: &str) -> bool {
@@ -1010,7 +1169,9 @@ mod tests {
             inner: StatisticsDraftPreparer {
                 snapshot_id: 7,
                 sequence_number: 1,
-                drafts: drafts(),
+                drafts: drafts().into(),
+                cpu: None,
+                cpu_owner: None,
             },
             stop: None,
             path: path.clone(),
@@ -1031,7 +1192,9 @@ mod tests {
             inner: StatisticsDraftPreparer {
                 snapshot_id: 7,
                 sequence_number: 1,
-                drafts: drafts(),
+                drafts: drafts().into(),
+                cpu: None,
+                cpu_owner: None,
             },
             stop: Some(rig.stop.clone()),
             path: path.clone(),

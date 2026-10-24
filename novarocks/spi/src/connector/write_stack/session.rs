@@ -67,6 +67,22 @@ pub struct ConnectorWriteNeededReady {
     finalization: crate::connector::ExternalMutationFinalization,
 }
 impl ConnectorWriteNeededReady {
+    /// Seal the actual provider verdict after its necessary finalization.
+    pub fn new(
+        effect: crate::connector::ExternalMutationEffect,
+        receipt: ConnectorWriteReceipt,
+        finalization: crate::connector::ExternalMutationFinalization,
+    ) -> Self {
+        Self {
+            effect,
+            receipt,
+            finalization,
+        }
+    }
+    /// Only a unique, not-yet-published fact can record a local settle failure.
+    pub fn finalization_mut(&mut self) -> &mut crate::connector::ExternalMutationFinalization {
+        &mut self.finalization
+    }
     pub const fn effect(&self) -> crate::connector::ExternalMutationEffect {
         self.effect
     }
@@ -108,11 +124,11 @@ impl ConnectorWritePublicationCompletion {
         finalization: crate::connector::ExternalMutationFinalization,
     ) -> Self {
         Self::KnownCommitted {
-            needed: Arc::new(ConnectorWriteNeededReady {
+            needed: Arc::new(ConnectorWriteNeededReady::new(
                 effect,
                 receipt,
                 finalization,
-            }),
+            )),
             cleanup: ConnectorWriteCleanupState::Pending,
         }
     }
@@ -125,11 +141,11 @@ impl ConnectorWritePublicationCompletion {
                 finalization,
                 cleanup,
             } => Self::KnownCommitted {
-                needed: Arc::new(ConnectorWriteNeededReady {
+                needed: Arc::new(ConnectorWriteNeededReady::new(
                     effect,
                     receipt,
                     finalization,
-                }),
+                )),
                 cleanup: ConnectorWriteCleanupState::Observed(cleanup),
             },
             ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {

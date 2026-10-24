@@ -19,7 +19,7 @@ under the License.
 
 # 维护 / 治理
 
-> Iceberg 的运维操作包括压缩小文件、清理历史 snapshot、回收孤儿文件、重写 manifest 与重写 deletion vector。NovaRocks 支持 whole-table OPTIMIZE、EXPIRE SNAPSHOTS、REWRITE MANIFESTS 与 V3 Puffin deletion-vector repack；扫描型回收的已接受契约要求 Provider 安全证明，现有 REST/Hadoop 组合缺证，应受限；完整接线与原生验收尚待完成，不能据本文认定某个二进制已实施限制。增量压缩、sort-order rewrite 和通用定时调度仍待补。
+> Iceberg 的运维操作包括压缩小文件、清理历史 snapshot、回收孤儿文件、重写 manifest 与重写 deletion vector。NovaRocks 支持 whole-table OPTIMIZE、EXPIRE SNAPSHOTS、REWRITE MANIFESTS 与 V3 Puffin deletion-vector repack；扫描型回收要求 Provider 安全证明；当前源码用 `ConnectorCleanupScanSafety::Unproven` 在扫描/删除前明确拒绝 REST/Hadoop 缺证路径。完整调用面与原生验收仍需独立核对，不能据本文宣称全部迁移完成。增量压缩、sort-order rewrite 和通用定时调度仍待补。
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
@@ -128,7 +128,9 @@ ALTER TABLE orders EXPIRE SNAPSHOTS OLDER THAN '2026-04-01 00:00:00' RETAIN LAST
 ## 受限：REMOVE ORPHAN FILES 与其它扫描回收
 
 本节记录 [ADR-0198](../../adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 已接受的准入契约。
-限制的代码接线与原生验证尚待完成；不能据本文推断某个二进制已经实施该限制。
+当前 `ConnectorCleanupMaintenance::scan_gc_safety` 默认缺证；Iceberg 的 prepare、执行与原 orphan
+候选入口调用同一 `require_scanned_object_gc`，Table Maintenance 的扫描清理入口也先核该能力。
+这是当前源码锚点，不能替代目标二进制及全部手动/自动调用面的原生验收。
 
 ### 安全准入与缺证拒绝
 
@@ -188,7 +190,9 @@ publication，也不能把该扫描的 unsupported 错误投成新 CTAS 的 Appl
 
 `novarocks/connector/iceberg/src/catalog_control/{cleanup_maintenance,cleanup_candidates,unanchored_ctas_cleanup}.rs`，
 owned-ref 选择位于同目录的 `owned_ref_cleanup.rs`，first-observation 位于
-`novarocks/table-maintenance/src/gc_observation.rs`。这些是迁移入口，安全准入与拒绝接线仍须实际验收。
+`novarocks/table-maintenance/src/gc_observation.rs`。SPI 的能力作者位于 `novarocks/spi/src/connector/cleanup_maintenance.rs`，Table Maintenance
+入口位于 `novarocks/table-maintenance/src/product.rs`。原安全准入与拒绝仍须对实际二进制验收；
+普通提交、精确 operation-owned 清理与独立安全 metadata 维护不因该扫描限制而停用。
 
 ## ✅ REWRITE MANIFESTS
 

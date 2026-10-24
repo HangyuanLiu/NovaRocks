@@ -1840,9 +1840,9 @@ pub enum ConnectorWriteAbortOutcome {
         cleanup: ExternalMutationFinalization,
     },
     KnownCommitted {
-        receipt: ConnectorWriteReceipt,
-        finalization: ExternalMutationFinalization,
-        cleanup: ExternalMutationFinalization,
+        /// The same exact business fact retained by the original session.
+        needed: std::sync::Arc<crate::connector::write_stack::ConnectorWriteNeededReady>,
+        cleanup: crate::connector::write_stack::ConnectorWriteCleanupState,
     },
     CommitUnknown {
         failure: ConnectorMutationFailure,

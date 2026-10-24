@@ -52,7 +52,7 @@ pub struct WriteTransactionSpec {
 pub struct WriteTransactionOutcome {
     pub committed_receipt: Option<ConnectorWriteReceipt>,
     /// Preserved cleanup diagnostics do not turn a necessary-finalized commit into failure.
-    pub cleanup: ExternalMutationFinalization,
+    pub cleanup: novarocks_spi::connector::write_stack::ConnectorWriteCleanupState,
 }
 
 #[derive(Debug)]
@@ -140,7 +140,9 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
                     &mut attempt,
                     None,
                     ExternalMutationFinalization::Complete,
-                    ExternalMutationFinalization::Complete,
+                    novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(
+                        ExternalMutationFinalization::Complete,
+                    ),
                 )
             }
             CoordinatedWriteReport::CommitRequired(handle) => {
@@ -166,18 +168,15 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
                             &attempt,
                         ))
                     }
-                    Ok(ConnectorWriteAbortOutcome::KnownCommitted {
-                        receipt,
-                        finalization,
-                        cleanup,
-                        ..
-                    }) => {
+                    Ok(ConnectorWriteAbortOutcome::KnownCommitted { needed, cleanup }) => {
                         attempt.mark_dispatch_possible().map_err(attempt_error)?;
                         let settled = self.finish_committed(
                             &spec,
                             &mut attempt,
-                            Some(receipt),
-                            finalization,
+                            (needed.effect()
+                                == novarocks_spi::connector::ExternalMutationEffect::Applied)
+                                .then(|| needed.receipt().clone()),
+                            needed.finalization().clone(),
                             cleanup,
                         );
                         if reason.execution_failure().is_some() {
@@ -224,11 +223,21 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
     ) -> Result<WriteTransactionOutcome, DmlError> {
         match outcome {
             ExternalMutationOutcome::KnownCommitted {
+                effect,
                 receipt,
                 finalization,
                 cleanup,
                 ..
-            } => self.finish_committed(spec, attempt, Some(receipt), finalization, cleanup),
+            } => self.finish_committed(
+                spec,
+                attempt,
+                (effect == novarocks_spi::connector::ExternalMutationEffect::Applied)
+                    .then_some(receipt),
+                finalization,
+                novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(
+                    cleanup,
+                ),
+            ),
             ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
                 attempt
                     .terminal_known_uncommitted()
@@ -244,6 +253,7 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
                 let token = attempt.begin_adjudication().map_err(attempt_error)?;
                 match self.executor.adjudicate_publication(spec, handle, evidence) {
                     Ok(ExternalMutationOutcome::KnownCommitted {
+                        effect,
                         receipt,
                         finalization,
                         cleanup,
@@ -273,8 +283,8 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
                             ));
                         }
                         Ok(WriteTransactionOutcome {
-                            committed_receipt: Some(receipt),
-                            cleanup,
+                            committed_receipt: (effect == novarocks_spi::connector::ExternalMutationEffect::Applied).then_some(receipt),
+                            cleanup: novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(cleanup),
                         })
                     }
                     Ok(ExternalMutationOutcome::KnownUncommitted { failure, cleanup }) => {
@@ -325,9 +335,12 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
         attempt: &mut DmlPublicationAttempt,
         receipt: Option<ConnectorWriteReceipt>,
         provider_finalization: ExternalMutationFinalization,
-        cleanup: ExternalMutationFinalization,
+        cleanup: novarocks_spi::connector::write_stack::ConnectorWriteCleanupState,
     ) -> Result<WriteTransactionOutcome, DmlError> {
-        if let ExternalMutationFinalization::Failed(error) = &cleanup {
+        if let novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(
+            ExternalMutationFinalization::Failed(error),
+        ) = &cleanup
+        {
             tracing::warn!(%error, "known committed write retains incomplete cleanup");
         }
         let finalized = combine_finalization(provider_finalization, self.executor.finalize(spec));
@@ -709,9 +722,17 @@ mod tests {
     fn selected_task_failure_survives_abort_known_committed_and_finalization() {
         for fail_finalize in [false, true] {
             let mut executor = selected_executor(Ok(ConnectorWriteAbortOutcome::KnownCommitted {
-                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
-                receipt: UnknownCommitExecutor::receipt(),
-                finalization: ExternalMutationFinalization::Complete,
+                cleanup:
+                    novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(
+                        novarocks_spi::connector::ExternalMutationFinalization::Complete,
+                    ),
+                needed: std::sync::Arc::new(
+                    novarocks_spi::connector::write_stack::ConnectorWriteNeededReady::new(
+                        novarocks_spi::connector::ExternalMutationEffect::Applied,
+                        UnknownCommitExecutor::receipt(),
+                        ExternalMutationFinalization::Complete,
+                    ),
+                ),
             }));
             executor.fail_finalize = fail_finalize;
             let error =
@@ -768,9 +789,16 @@ mod tests {
     #[test]
     fn legacy_abort_known_committed_keeps_its_original_success_verdict() {
         let mut executor = selected_executor(Ok(ConnectorWriteAbortOutcome::KnownCommitted {
-            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
-            receipt: UnknownCommitExecutor::receipt(),
-            finalization: ExternalMutationFinalization::Complete,
+            cleanup: novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(
+                novarocks_spi::connector::ExternalMutationFinalization::Complete,
+            ),
+            needed: std::sync::Arc::new(
+                novarocks_spi::connector::write_stack::ConnectorWriteNeededReady::new(
+                    novarocks_spi::connector::ExternalMutationEffect::Applied,
+                    UnknownCommitExecutor::receipt(),
+                    ExternalMutationFinalization::Complete,
+                ),
+            ),
         }));
         executor.legacy = true;
         let result = StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::Write)
@@ -781,6 +809,36 @@ mod tests {
             Some(UnknownCommitExecutor::receipt())
         );
         assert_eq!(executor.stages.load(Ordering::SeqCst), 1);
+        assert_eq!(executor.aborts.load(Ordering::SeqCst), 1);
+        assert_eq!(executor.commits.load(Ordering::SeqCst), 0);
+        assert_eq!(executor.finalizations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn legacy_abort_returns_pending_cleanup_without_erasing_the_actual_commit() {
+        use novarocks_spi::connector::write_stack::{
+            ConnectorWriteCleanupState, ConnectorWriteNeededReady,
+        };
+        let mut executor = selected_executor(Ok(ConnectorWriteAbortOutcome::KnownCommitted {
+            needed: std::sync::Arc::new(ConnectorWriteNeededReady::new(
+                novarocks_spi::connector::ExternalMutationEffect::Applied,
+                UnknownCommitExecutor::receipt(),
+                ExternalMutationFinalization::Complete,
+            )),
+            cleanup: ConnectorWriteCleanupState::Pending,
+        }));
+        executor.legacy = true;
+        let result = StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::Write)
+            .run(spec())
+            .unwrap();
+        assert_eq!(
+            result.committed_receipt,
+            Some(UnknownCommitExecutor::receipt())
+        );
+        assert!(matches!(
+            result.cleanup,
+            ConnectorWriteCleanupState::Pending
+        ));
         assert_eq!(executor.aborts.load(Ordering::SeqCst), 1);
         assert_eq!(executor.commits.load(Ordering::SeqCst), 0);
         assert_eq!(executor.finalizations.load(Ordering::SeqCst), 1);
@@ -853,7 +911,10 @@ mod tests {
             attempt.finalization(),
             Some(DmlPublicationFinalization::Succeeded)
         );
-        let ExternalMutationFinalization::Failed(cleanup) = outcome.cleanup else {
+        let novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(
+            ExternalMutationFinalization::Failed(cleanup),
+        ) = outcome.cleanup
+        else {
             panic!("cleanup diagnostic lost")
         };
         assert!(cleanup.message().contains("prior attempt artifacts remain"));
@@ -876,7 +937,10 @@ mod tests {
                 "only safe cleanup failed; the publication and required finalization succeeded",
             );
         assert!(outcome.committed_receipt.is_some());
-        let ExternalMutationFinalization::Failed(cleanup) = outcome.cleanup else {
+        let novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(
+            ExternalMutationFinalization::Failed(cleanup),
+        ) = outcome.cleanup
+        else {
             panic!("cleanup diagnostic lost")
         };
         assert!(

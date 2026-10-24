@@ -17,7 +17,7 @@
 
 //! Attempt-local internal consumption and actor-issued readiness receipts.
 //!
-//! Design: ADR-0195 (docs/adr/ADR-0195-one-logical-execution-owner-for-every-distributed-intent.md).
+//! Design: ADR-0198 (docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md).
 
 use std::{future::Future, num::NonZeroUsize, pin::Pin, sync::Arc, time::Duration};
 

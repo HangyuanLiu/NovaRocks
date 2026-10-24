@@ -16,6 +16,8 @@
 // under the License.
 
 //! Fixed Frontend launch boundary for client and internal logical execution.
+//!
+//! Design: ADR-0198 (docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md).
 
 use super::internal_consumer::attempt_handoff::AttemptHandoffOfferPort;
 use crate::query_execution::{
@@ -102,7 +104,7 @@ pub(crate) struct OriginalComputationStart {
     pub(crate) exit: Option<novarocks_query_application::api::LogicalExecutionExitObserver>,
 }
 
-/// Original first-attempt ownership established before effectful preparation.
+/// Original first-attempt ownership established before domain preparation.
 /// Credentials remain FA-owned; the QA token is moved unchanged into start.
 pub(crate) struct InitialComputationReservation {
     reserved: Option<ReservedExecutionIdentity>,
@@ -302,6 +304,34 @@ pub(crate) enum ComputationDiagnostics {
     Profile,
 }
 
+/// Authenticate the original pair without consuming either input. A reserved
+/// identity describes first-attempt custody, independently of external effects.
+/// QA still checks the move-only token's issuing process when start takes it.
+pub(super) fn validate_initial_computation_start(
+    description: &FrozenExecutionDescription,
+    diagnostics: ComputationDiagnostics,
+    credentials: Option<&Arc<InitialComputationCredentials>>,
+    reservation: Option<&ReservedExecutionIdentity>,
+) -> Result<(), &'static str> {
+    match (credentials, reservation) {
+        (None, None)
+            if description.effect() == novarocks_coordination_contract::ExecutionEffect::None =>
+        {
+            Ok(())
+        }
+        (Some(credentials), Some(reservation))
+            if description.recovery() == RecoveryMode::NoRecovery
+                && diagnostics == ComputationDiagnostics::None
+                && credentials.execution() == reservation.execution() =>
+        {
+            Ok(())
+        }
+        _ => Err(
+            "initial computation requires its matching original reserved NoRecovery execution without Profile diagnostics",
+        ),
+    }
+}
+
 /// One frozen computation and its registered application's exact handoff pair.
 /// Domain payload/proof construction stays in the fixed FA consumer.
 pub(crate) struct PreparedLogicalComputation {
@@ -487,6 +517,251 @@ mod initial_reservation_tests {
         ));
         assert!(stable.verify_native_storage(&original_table).is_err());
         drop((stable, terminal, original_table));
+        owner
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    #[tokio::test]
+    async fn reserved_statistics_start_retains_the_original_collector_through_native_drain() {
+        use crate::query_execution::internal_consumer::test_fixture::{
+            internal_statistics_description, offer_original_credentials,
+        };
+        let (mut owner, client) = process();
+        let (description, _) = internal_statistics_description();
+        assert_eq!(
+            description.effect(),
+            novarocks_coordination_contract::ExecutionEffect::None
+        );
+        assert_eq!(description.recovery(), RecoveryMode::NoRecovery);
+        let initial =
+            InitialComputationReservation::new(client.reserve_identity().unwrap()).unwrap();
+        // The domain's stable state keeps this original Arc after the initial
+        // assembly transfers its token and the Native seed retains only Weak.
+        let stable = initial.credentials();
+        let prepared = initial.connector_request_context(context(), None).unwrap();
+        let marker =
+            prepared.request_scope_extension_or_insert_with(|| String::from("statistics-original"));
+        offer_original_credentials(prepared.vended_credential_lease_sink().unwrap().as_ref());
+        let (reservation, transferred) = initial.into_start_parts();
+        let original = OriginalComputationStart {
+            reservation: Some(reservation),
+            ..Default::default()
+        };
+        validate_initial_computation_start(
+            &description,
+            ComputationDiagnostics::None,
+            Some(&transferred),
+            original.reservation.as_ref(),
+        )
+        .unwrap();
+        let factory_view = Arc::downgrade(&transferred);
+        drop(transferred);
+        assert!(Arc::ptr_eq(&factory_view.upgrade().unwrap(), &stable));
+        let source = factory_view
+            .upgrade()
+            .unwrap()
+            .take_source(stable.execution())
+            .unwrap();
+        let native = source.connector_request_context(context()).unwrap();
+        assert!(Arc::ptr_eq(
+            &marker,
+            &native.request_scope_extension_or_insert_with(|| String::from("foreign")),
+        ));
+        assert!(Arc::ptr_eq(
+            prepared.vended_credential_lease_sink().unwrap(),
+            native.vended_credential_lease_sink().unwrap(),
+        ));
+        let storage = source
+            .test_into_credential_leases()
+            .unwrap()
+            .into_attempt_storage_resolver()
+            .expect("the original vended table");
+        stable.verify_native_storage(&storage).unwrap();
+        stable.seal_for_terminal().unwrap();
+        assert!(Arc::ptr_eq(
+            &storage,
+            &stable
+                .terminal_storage_resolver()
+                .seal_for_terminal()
+                .unwrap()
+        ));
+        stable.verify_native_storage(&storage).unwrap();
+        assert!(stable.take_source(stable.execution()).is_err());
+        drop((native, prepared, original));
+        assert!(
+            factory_view.upgrade().is_some(),
+            "Native's weak view cannot retire domain custody"
+        );
+        drop(stable);
+        assert!(factory_view.upgrade().is_none());
+        drop((storage, marker, factory_view));
+        owner
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    #[tokio::test]
+    async fn reserved_start_rejection_preserves_both_inputs_and_original_request_scope() {
+        use crate::query_execution::internal_consumer::test_fixture::{
+            internal_statistics_description, internal_write_description,
+        };
+        let (mut owner, client) = process();
+        let (statistics, _) = internal_statistics_description();
+        let (write, _) = internal_write_description();
+        let initial =
+            InitialComputationReservation::new(client.reserve_identity().unwrap()).unwrap();
+        let prepared = initial.connector_request_context(context(), None).unwrap();
+        let marker = prepared.request_scope_extension_or_insert_with(|| String::from("original"));
+        let (reservation, credentials) = initial.into_start_parts();
+        let execution = reservation.execution();
+        let original = OriginalComputationStart {
+            reservation: Some(reservation),
+            ..Default::default()
+        };
+        let foreign = client.reserve_identity().unwrap();
+        for description in [&statistics, &write] {
+            assert!(
+                validate_initial_computation_start(
+                    description,
+                    ComputationDiagnostics::None,
+                    Some(&credentials),
+                    None
+                )
+                .is_err()
+            );
+            assert!(
+                validate_initial_computation_start(
+                    description,
+                    ComputationDiagnostics::None,
+                    None,
+                    original.reservation.as_ref()
+                )
+                .is_err()
+            );
+            assert!(
+                validate_initial_computation_start(
+                    description,
+                    ComputationDiagnostics::None,
+                    Some(&credentials),
+                    Some(&foreign)
+                )
+                .is_err()
+            );
+            assert!(
+                validate_initial_computation_start(
+                    description,
+                    ComputationDiagnostics::Profile,
+                    Some(&credentials),
+                    original.reservation.as_ref()
+                )
+                .is_err()
+            );
+            // The actual launch guard borrowed both original slots. No failure
+            // consumed either identity or sealed/changed the collector.
+            assert_eq!(
+                original.reservation.as_ref().unwrap().execution(),
+                execution
+            );
+            assert_eq!(credentials.execution(), execution);
+            validate_initial_computation_start(
+                description,
+                ComputationDiagnostics::None,
+                Some(&credentials),
+                original.reservation.as_ref(),
+            )
+            .unwrap();
+        }
+        assert!(
+            validate_initial_computation_start(&write, ComputationDiagnostics::None, None, None)
+                .is_err()
+        );
+        validate_initial_computation_start(&statistics, ComputationDiagnostics::None, None, None)
+            .unwrap();
+        let source = credentials
+            .take_source(execution)
+            .expect("all rejected starts preserve the one original source");
+        let native = source.connector_request_context(context()).unwrap();
+        assert!(Arc::ptr_eq(
+            &marker,
+            &native.request_scope_extension_or_insert_with(|| String::from("foreign"))
+        ));
+        assert!(Arc::ptr_eq(
+            prepared.vended_credential_lease_sink().unwrap(),
+            native.vended_credential_lease_sink().unwrap()
+        ));
+        assert!(credentials.take_source(execution).is_err());
+        drop(source);
+        credentials.seal_for_terminal().unwrap();
+        drop((native, prepared, original, foreign, credentials, marker));
+        owner
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    #[tokio::test]
+    async fn original_profile_recovery_stays_unreserved_and_refuses_reserved_inputs() {
+        use crate::query_execution::internal_consumer::test_fixture::internal_profile_recovery_description;
+        use novarocks_workload_control::{
+            ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+        };
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1 << 20,
+                control_bytes: 1 << 10,
+                per_scope_bytes: 1 << 18,
+            },
+        )
+        .unwrap();
+        control.mark_ready().unwrap();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let (description, _) = internal_profile_recovery_description(&root.owner.scope()).await;
+        assert_eq!(
+            description.recovery(),
+            RecoveryMode::RestartAttemptBeforeVisibility
+        );
+        validate_initial_computation_start(
+            &description,
+            ComputationDiagnostics::Profile,
+            None,
+            None,
+        )
+        .unwrap();
+        let (mut owner, client) = process();
+        let initial =
+            InitialComputationReservation::new(client.reserve_identity().unwrap()).unwrap();
+        let (reservation, credentials) = initial.into_start_parts();
+        let execution = reservation.execution();
+        // Reject recovery even if diagnostics are None; Profile is a separate
+        // refusal from the reserved NoRecovery constraint.
+        for diagnostics in [
+            ComputationDiagnostics::None,
+            ComputationDiagnostics::Profile,
+        ] {
+            assert!(
+                validate_initial_computation_start(
+                    &description,
+                    diagnostics,
+                    Some(&credentials),
+                    Some(&reservation)
+                )
+                .is_err()
+            );
+            assert_eq!(reservation.execution(), execution);
+        }
+        let source = credentials.take_source(execution).unwrap();
+        drop(source);
+        credentials.seal_for_terminal().unwrap();
+        drop((reservation, credentials, root, control));
         owner
             .shutdown_until(Instant::now() + Duration::from_secs(5))
             .await

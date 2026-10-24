@@ -230,8 +230,7 @@ pub(super) fn geometry() -> Result<InternalCpuMetadataGeometry, LayoutResourceEr
         forwarder_failure: arc_layout(Layout::new::<tokio::task::JoinError>())?,
         domain_slot: Layout::new::<InternalDomainSlot>(),
         operation: Layout::new::<InternalResultOperation>(),
-        provider_input:
-            super::super::provider_read_facts::ProviderReadCreatorInput::known_input_layout(),
+        provider_input: Layout::new::<super::scoped_statistics::ClosedCreatorInput>(),
         provider_job: Layout::new::<super::ProviderReadCpuJob>(),
     })
 }

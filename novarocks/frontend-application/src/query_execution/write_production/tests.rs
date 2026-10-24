@@ -225,6 +225,14 @@ fn checked_writer_prefix_without_end_keeps_actual_record_and_refuses_cleanup_com
     ));
     assert_eq!(owner.pending_records().unwrap(), 2);
     assert!(owner.retains_facts(&facts).unwrap());
+    assert!(
+        session.has_no_accepted_formation().unwrap(),
+        "actual abort may retire decoded formation without disposing unknown production"
+    );
+    assert_eq!(
+        session.cleanup_responsibility().unwrap(),
+        novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Retained
+    );
     let retired = work.owner.retirement_observer().unwrap();
     drop(session);
     work.business.release();
@@ -359,6 +367,10 @@ fn complete_original_end_transfers_same_union_to_abort_call_and_retires_canonica
     assert_eq!(owner.pending_records().unwrap(), 0);
     assert!(owner.retains_facts(&facts).unwrap());
     let mut call = session.prepare_abort_call(request_context()).unwrap();
+    assert!(
+        !session.has_no_accepted_formation().unwrap(),
+        "accepted output in the original abort input still owns its complete payload"
+    );
     assert_eq!(session.accumulated_row_count().unwrap(), 3);
     let mut cx = Context::from_waker(Waker::noop());
     assert!(call.poll_completed(&mut cx).is_ready());

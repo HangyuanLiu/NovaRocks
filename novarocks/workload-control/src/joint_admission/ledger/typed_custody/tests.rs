@@ -347,7 +347,7 @@ fn one_computation_position_reuses_after_actual_compute_alias_exit_with_payload_
         assert!(matches!(
             Pin::new(&mut next).poll(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Err(JointAdmissionFailure {
-                error: WorkError::Capacity("joint protected intersections")
+                error: WorkError::JointCapacity(_)
             }))
         ));
         assert_eq!(held(&control, JointResource::Computations), 1);
@@ -1148,7 +1148,7 @@ fn failed_cpu_action_keeps_original_refusal_after_the_producer_source_exits() {
     assert!(matches!(
         action.poll_local_offer(&mut Context::from_waker(Waker::noop())),
         Poll::Ready(Err(JointAdmissionFailure {
-            error: WorkError::Capacity("joint protected intersections")
+            error: WorkError::JointCapacity(_)
         }))
     ));
     assert_eq!(held(&control, JointResource::InternalCpuJobs), 0);
@@ -1602,6 +1602,27 @@ fn provider_control_cpu_source_uses_exact_bound_node_without_computation_custody
     assert!(physical.is_none());
     assert_eq!(held(&control, JointResource::InternalCpuJobs), 1);
     assert_eq!(held(&control, JointResource::Computations), 0);
+    // The registered finite source still occupies its exact hard CPU/queue
+    // capacity until the original physical holder exits. Qualification does
+    // not let a second real source borrow or refund that occupied position.
+    let mut second = binding
+        .provider_creator_source(&scope)
+        .unwrap()
+        .begin(
+            std::num::NonZeroU64::new(17).unwrap(),
+            std::num::NonZeroU64::new(23).unwrap(),
+        )
+        .unwrap();
+    drive(&mut driver);
+    assert!(matches!(
+        second.poll_local_offer(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Err(JointAdmissionFailure {
+            error: WorkError::JointCapacity(_),
+        }))
+    ));
+    assert_eq!(held(&control, JointResource::InternalCpuJobs), 1);
+    assert_eq!(held(&control, JointResource::PhysicalQueueRecords), 1);
+    drop(second);
     drop(installed);
     assert_eq!(held(&control, JointResource::InternalCpuJobs), 0);
     let stale = binding.provider_creator_source(&scope).unwrap();
@@ -1616,4 +1637,71 @@ fn provider_control_cpu_source_uses_exact_bound_node_without_computation_custody
     );
     work.business.release();
     drive(&mut driver);
+}
+
+#[test]
+fn original_payload_disposal_preserves_live_alias_metadata_domains_and_next_capacity() {
+    let (control, handle, mut driver) = fixture();
+    let work = root(&control);
+    let scope = work.owner.scope();
+    let facts = [fact("formation")];
+    bind(&scope, &facts, &mut driver);
+    let mut raw = Some(claim(
+        &handle,
+        &work.owner,
+        &facts,
+        JointLane::Custody,
+        amounts(JointResource::PayloadBytes, 64),
+        &mut driver,
+    ));
+    let mut payload = None;
+    RetainedPayloadGrant::adopt_in(&scope, &mut raw, &mut payload)
+        .unwrap()
+        .notify();
+    let payload = payload.unwrap();
+    let kept = (vec![9u8; 8], payload.retain_alias().unwrap());
+    let forming = vec![7u8; 56];
+    let key = payload.pin.key.unwrap();
+    let (old_facts, old_metadata, old_epoch) = {
+        let state = control.inner.state.lock().unwrap();
+        let row = &state.joint.as_ref().unwrap().claims[&key[0]];
+        (
+            Arc::clone(&row.facts),
+            row.amounts.get(JointResource::MetadataBytes),
+            key[1],
+        )
+    };
+    assert!(matches!(
+        payload.retire_unused_to(std::num::NonZeroU64::new(65).unwrap()),
+        Err(WorkError::Conflict)
+    ));
+    assert_eq!(kept.1.capacity_bytes().unwrap(), 64);
+    drop(forming); // Actual original formation backing exits first.
+    payload
+        .retire_unused_to(std::num::NonZeroU64::new(8).unwrap())
+        .unwrap()
+        .notify();
+    assert_eq!(kept.0.len(), 8);
+    kept.1.check_backing_total(8).unwrap();
+    assert!(kept.1.check_backing_total(9).is_err());
+    {
+        let state = control.inner.state.lock().unwrap();
+        let row = &state.joint.as_ref().unwrap().claims[&key[0]];
+        assert!(Arc::ptr_eq(&old_facts, &row.facts));
+        assert_eq!(row.amounts.get(JointResource::MetadataBytes), old_metadata);
+        assert!(matches!(row.custody, ClaimCustody::Payload { epoch, pins:2 } if epoch==old_epoch));
+        assert_eq!(row.active_amounts.get(JointResource::PayloadBytes), 8);
+    }
+    let next = claim(
+        &handle,
+        &work.owner,
+        &facts,
+        JointLane::Custody,
+        amounts(JointResource::PayloadBytes, 32),
+        &mut driver,
+    );
+    assert_eq!(held(&control, JointResource::PayloadBytes), 40);
+    drop((next, kept, payload));
+    finish(work, &mut driver);
+    assert_eq!(held(&control, JointResource::PayloadBytes), 0);
 }

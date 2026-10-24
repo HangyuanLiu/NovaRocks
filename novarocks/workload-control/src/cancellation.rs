@@ -507,6 +507,20 @@ impl CancellationView {
             .expect("cancellation view retains its original capability")
     }
 
+    /// Exact original cell identity only; this grants no cancellation or Work.
+    pub fn is_for_scope(&self, scope: &crate::WorkScope) -> bool {
+        if !std::sync::Weak::ptr_eq(&self.reclaim, &std::sync::Arc::downgrade(&scope.inner)) {
+            return false;
+        }
+        let state = scope.inner.state.lock().unwrap();
+        let Some(node) = state.nodes.get(&scope.id) else {
+            return false;
+        };
+        self.inner.as_ref().is_some_and(|cell| {
+            std::sync::Arc::ptr_eq(cell, state.cancellations.cell(node.cancellation))
+        })
+    }
+
     pub fn reason(&self) -> Option<CancellationReason> {
         self.cancellation().reason(&self.reclaim)
     }

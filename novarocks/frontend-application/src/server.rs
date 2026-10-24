@@ -527,13 +527,27 @@ async fn build_frontend_role_products(
             crate::statistics_jobs::service::table_statistics_reader_for_role(Arc::clone(
                 &statistics_connector_control,
             )),
-            core_capabilities::statistics_three_phase_attempt_executor(
+            core_capabilities::statistics_attempt_executor(
                 core_capabilities::StatisticsAttemptExecutorPorts::new(
                     role,
                     statistics_connector_control,
                     Arc::clone(&typed_connector_control),
                     topology.clone(),
-                    query_execution.clone(),
+                    host.logical_execution_client(),
+                    logical_execution_launcher.clone(),
+                    crate::query_execution::completion_facts::CompletionFactOwners::new(
+                        catalog_service.clone(),
+                        Some(catalog_application.clone()),
+                        typed_connector_control.clone(),
+                        unified_statistics.clone(),
+                        mv_candidate_reader.clone(),
+                        mv_storage_observation.clone(),
+                        host.connector_blocking_io_supervisor(),
+                    ),
+                    (
+                        host.connector_blocking_io_supervisor(),
+                        host.write_data_runtime(),
+                    ),
                     Arc::clone(&function_catalog),
                     host.lake_publication_runtime_policy()
                         .max_attempt_duration(),
@@ -543,6 +557,7 @@ async fn build_frontend_role_products(
                 ),
             ),
             Handle::current(),
+            host.connector_blocking_io_supervisor(),
         ),
     );
     // No fallible product construction follows these transfers. Keeping them

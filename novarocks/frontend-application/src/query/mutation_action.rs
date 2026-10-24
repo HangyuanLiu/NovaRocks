@@ -567,12 +567,16 @@ impl MutationAction {
                     self.phase = Phase::Compute;
                 }
                 Phase::Compute => {
-                    match self.computation.as_mut().unwrap().poll_ready(
-                        &self.original.kernel,
-                        self.io.as_ref().unwrap(),
-                        owner,
-                        cx,
-                    ) {
+                    let computation = match self.original.kernel.write_runtime() {
+                        Ok(runtime) => self.computation.as_mut().unwrap().poll_ready(
+                            runtime,
+                            self.io.as_ref().unwrap(),
+                            owner,
+                            cx,
+                        ),
+                        Err(error) => Poll::Ready(Err(internal_error(error))),
+                    };
+                    match computation {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Err(error)) => {
                             self.fail(error);

@@ -186,6 +186,7 @@ pub(crate) struct CowComputationOutput {
 }
 pub(crate) struct StatisticsComputationOutput {
     holder: Arc<Holder>,
+    binding: QueryResultCapacityBinding,
 }
 
 pub(crate) struct ReadyCowComputation {
@@ -196,6 +197,7 @@ pub(crate) struct ReadyCowComputation {
 }
 pub(crate) struct ReadyStatisticsComputation {
     pub(crate) ready: ComputationReadyToken,
+    pub(crate) binding: QueryResultCapacityBinding,
     pub(crate) artifacts: Vec<StatisticsArtifactDraft>,
     pub(crate) credentials: Option<Arc<AttemptCredentialStorage>>,
 }
@@ -238,12 +240,31 @@ impl StatisticsComputationOutput {
         token: ComputationReadyToken,
     ) -> Result<ReadyStatisticsComputation, QueryExecutionError> {
         let staged = self.holder.take(token, Domain::Statistics)?;
+        // Project the original positive payload before releasing the decoded
+        // value's carrier. No manifest/compute authority crosses publication.
+        let binding = self
+            .binding
+            .clone()
+            .into_statement_retention()
+            .map_err(|error| {
+                use novarocks_execution_contract::failure::FailureProjection;
+                QueryExecutionError::from_execution(
+                novarocks_query_application::execution_error::ExecutionFailureInput::new(
+                    error.failure_fact(),
+                    novarocks_execution_contract::SafeDetail::truncating(
+                        "statistics result could not retain its original statement payload",
+                    ),
+                    novarocks_query_application::execution_error::ExecutionFailureSite::Coordinator,
+                ),
+            )
+            })?;
         let artifacts = staged.payload.hand_off(|payload, _| match payload {
             Payload::Statistics(artifacts) => artifacts,
             _ => unreachable!("closed statistics receiver checked its payload before transfer"),
         });
         Ok(ReadyStatisticsComputation {
             ready: token,
+            binding,
             artifacts,
             credentials: staged._credentials,
         })
@@ -375,6 +396,7 @@ pub(crate) fn statistics_computation_consumer(
     ),
     QueryExecutionError,
 > {
+    let binding = runtime.binding.clone();
     let decoder = program
         .result_decoder_with_capacity(&runtime.binding)
         .map_err(|_| domain_error("statistics decoder has no complete admitted capacity"))?;
@@ -385,7 +407,11 @@ pub(crate) fn statistics_computation_consumer(
         InternalDomainState::Statistics(decoder),
         runtime,
     )?;
-    Ok((consumer, offers, StatisticsComputationOutput { holder }))
+    Ok((
+        consumer,
+        offers,
+        StatisticsComputationOutput { holder, binding },
+    ))
 }
 
 /// Closed preparation keeps the decoder, Native offer and no-diagnostics

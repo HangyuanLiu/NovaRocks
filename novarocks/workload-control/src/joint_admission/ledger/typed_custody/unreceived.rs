@@ -134,6 +134,11 @@ impl WorkScope {
             Arc::clone(control_facts(&state, self)?)
         };
         proposal.begin_new(JointLane::Custody, quote.required_progress())?;
+        // This closed constructor delegates the original active control's
+        // exact canonical relationship, not just its local S. The existing
+        // proof FactCapture expands S union Root D and preserves later Grow.
+        // queue_request_mode authenticates this exact Root against our scope.
+        proposal.current.as_mut().ok_or(WorkError::Conflict)?.origin = facts.key.origin;
         for dependency in facts.dependencies.iter() {
             proposal.push_dependency(&dependency.fact)?;
         }
@@ -247,6 +252,7 @@ impl UnreceivedProductionReady {
                 || row.facts.key != row.active_facts.key
                 || row.active_facts.class != full.class
                 || row.active_facts.lane != JointLane::Custody
+                || row.active_facts.key.origin != full.key.origin
                 || row.active_facts.key.dependencies != full.key.dependencies
                 || !row.active_facts.key.causal.is_empty()
             {
@@ -423,3 +429,7 @@ impl UnreceivedProductionOwner {
         Ok(WorkloadProgressNotification::new(inner))
     }
 }
+
+#[cfg(test)]
+#[path = "unreceived/canonical_tests.rs"]
+mod canonical_tests;

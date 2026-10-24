@@ -52,8 +52,11 @@ use novarocks_workload_control::joint_admission::{
 use std::sync::{Arc, Weak};
 
 mod metadata_geometry;
+mod scoped_statistics;
 pub use metadata_geometry::InternalCpuActionQuote;
 pub use metadata_geometry::InternalCpuMetadataGeometry;
+use scoped_statistics::ClosedCreatorInput;
+pub(crate) use scoped_statistics::StatisticsPlanCpuJob;
 
 // The whole maximum coexistence envelope is authorized before any domain
 // decoder/collector construction. Nested stages reuse it, never acquire again.
@@ -435,7 +438,7 @@ struct CpuActionState {
 struct InternalCpuRetirementState<T> {
     closed_input: Option<InternalResultValue<InternalDomainSlot>>,
     closed_operation: Option<InternalResultOperation>,
-    provider_input: Option<Box<super::provider_read_facts::ProviderReadCreatorInput>>,
+    provider_input: Option<Box<ClosedCreatorInput>>,
     provider_backing: Option<crate::task_execution::blocking_io::ConnectorBlockingIoBacking>,
     provider_marker_failure: Option<QueryBlockingFailure>,
     provider_retirement_failure: Option<QueryBlockingFailure>,
@@ -838,7 +841,7 @@ impl ProviderReadCpuJob {
                     .provider_input
                     .as_mut()
                     .expect("same retained Provider input")
-                    .take_result_in(destination)
+                    .take_read_result_in(destination)
                     .expect("one stable Provider result receiver");
             } else {
                 let detail = match self.marker.as_ref() {
@@ -997,13 +1000,34 @@ impl InternalResultCpu {
             #[cfg(test)]
             ProviderCreatorCpuSource::UnqualifiedFixture => None,
         };
+        self.submit_creator_input(
+            ClosedCreatorInput::Read(input),
+            window,
+            Some(backing),
+            source,
+            cancellation,
+            runtime,
+            wake,
+        )
+    }
+
+    fn submit_creator_input(
+        &self,
+        input: ClosedCreatorInput,
+        window: ResultWindowAlias,
+        backing: Option<crate::task_execution::blocking_io::ConnectorBlockingIoBacking>,
+        source: Option<InternalCpuActionSource>,
+        cancellation: QueryCancellationView,
+        runtime: &tokio::runtime::Handle,
+        wake: Arc<dyn StatusIntakeWake>,
+    ) -> ProviderReadCpuJob {
         let (completed, completion) = oneshot::channel();
         let retirement = Arc::new(InternalCpuRetirement::new(window, None));
         {
             let mut state = retirement.state.lock().unwrap_or_else(|e| e.into_inner());
             state.closed_operation = Some(InternalResultOperation::ProviderCreator);
             state.provider_input = Some(Box::new(input));
-            state.provider_backing = Some(backing);
+            state.provider_backing = backing;
             state.action = Some(CpuActionState::default());
         }
         let forwarder = runtime.spawn(make_operation_forwarder(
@@ -1233,7 +1257,7 @@ fn action_failure(
 
 struct ProviderCreatorInputLoan<'a> {
     packet: &'a InternalCpuRetirement<OperationOutput>,
-    input: Option<Box<super::provider_read_facts::ProviderReadCreatorInput>>,
+    input: Option<Box<ClosedCreatorInput>>,
 }
 impl<'a> ProviderCreatorInputLoan<'a> {
     fn take(packet: &'a InternalCpuRetirement<OperationOutput>) -> Self {

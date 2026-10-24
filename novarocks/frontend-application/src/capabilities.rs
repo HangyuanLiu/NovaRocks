@@ -785,19 +785,31 @@ pub struct StatisticsAttemptExecutorPorts {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
     backend_topology: BackendTopologyService,
-    query_execution: QueryExecutionService,
+    client: novarocks_query_application::api::QueryExecutionClient,
+    launcher: Arc<dyn crate::query_execution::logical_execution::LogicalExecutionLauncher>,
+    completion: crate::query_execution::completion_facts::CompletionFactOwners,
+    execution_runtime: (
+        crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+        crate::native::data_runtime::FrontendDataRuntime,
+    ),
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     attempt_timeout: Duration,
     runtime: tokio::runtime::Handle,
 }
 
 impl StatisticsAttemptExecutorPorts {
-    pub fn new(
+    pub(crate) fn new(
         execution_role: novarocks_types::ClusterRole,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
         backend_topology: BackendTopologyService,
-        query_execution: QueryExecutionService,
+        client: novarocks_query_application::api::QueryExecutionClient,
+        launcher: Arc<dyn crate::query_execution::logical_execution::LogicalExecutionLauncher>,
+        completion: crate::query_execution::completion_facts::CompletionFactOwners,
+        execution_runtime: (
+            crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+            crate::native::data_runtime::FrontendDataRuntime,
+        ),
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
         attempt_timeout: Duration,
         runtime: tokio::runtime::Handle,
@@ -811,7 +823,10 @@ impl StatisticsAttemptExecutorPorts {
             connector_control,
             typed_connector_control,
             backend_topology,
-            query_execution,
+            client,
+            launcher,
+            completion,
+            execution_runtime,
             function_catalog,
             attempt_timeout,
             runtime,
@@ -822,17 +837,20 @@ impl StatisticsAttemptExecutorPorts {
 /// Build the product worker's explicit prepare/collect/publish adapter from
 /// the same role-owned leaves. This is constructed before SQL serving opens;
 /// it is deliberately not a late-bound sink on the product port.
-pub(crate) fn statistics_three_phase_attempt_executor(
+pub(crate) fn statistics_attempt_executor(
     ports: StatisticsAttemptExecutorPorts,
 ) -> Arc<dyn novarocks_statistics_application::StatisticsAttemptExecutor> {
     Arc::new(
-        crate::statistics_jobs::attempt_executor::FrontendThreePhaseStatisticsAttemptExecutor::new(
+        crate::statistics_jobs::attempt_executor::FrontendStatisticsAttemptExecutor::new(
             crate::statistics_jobs::attempt_executor::StatisticsAttemptExecutionPorts::new(
                 ports.execution_role,
                 ports.connector_control,
                 ports.typed_connector_control,
                 ports.backend_topology,
-                ports.query_execution,
+                ports.client,
+                ports.launcher,
+                ports.completion,
+                ports.execution_runtime,
                 ports.function_catalog,
                 ports.attempt_timeout,
                 ports.runtime,

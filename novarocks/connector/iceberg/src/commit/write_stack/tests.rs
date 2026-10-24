@@ -812,7 +812,14 @@ fn a_session_dispatches_at_most_one_snapshot_commit() {
 
     handle
         .settle(IcebergWriteSessionState::KnownCommitted {
-            snapshot_id: Some(42),
+            needed: std::sync::Arc::new(
+                novarocks_spi::connector::write_stack::ConnectorWriteNeededReady::new(
+                    ExternalMutationEffect::Applied,
+                    crate::write_codec::connector_write_receipt_with_partitioning(42, None, None)
+                        .expect("actual fixture receipt"),
+                    novarocks_spi::connector::ExternalMutationFinalization::Complete,
+                ),
+            ),
         })
         .expect("settle committed");
     assert!(
@@ -879,7 +886,14 @@ fn a_known_committed_session_cannot_be_aborted_into_uncommitted() {
     handle.begin_commit().expect("commit attempt");
     handle
         .settle(IcebergWriteSessionState::KnownCommitted {
-            snapshot_id: Some(7),
+            needed: std::sync::Arc::new(
+                novarocks_spi::connector::write_stack::ConnectorWriteNeededReady::new(
+                    ExternalMutationEffect::Applied,
+                    crate::write_codec::connector_write_receipt_with_partitioning(7, None, None)
+                        .expect("actual fixture receipt"),
+                    novarocks_spi::connector::ExternalMutationFinalization::Complete,
+                ),
+            ),
         })
         .expect("settle committed");
     let outcome = release_session_state(
@@ -2944,7 +2958,26 @@ fn an_empty_prepared_set_commits_or_aborts_by_the_publication_disposition() {
     );
     // Terminating without an external commit needs no catalog at all: every
     // fact it reports was frozen at begin.
-    let outcome = settle_empty_write_without_commit(&aborts).expect("settle the empty write");
+    let completion = settle_empty_write_without_commit(&aborts).expect("settle the empty write");
+    let novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, .. } = &completion else {
+        panic!("actual empty author must seal its exact NoOp");
+    };
+    let ConnectorWriteAbortOutcome::KnownCommitted {
+        needed: released, ..
+    } = release_session_state(
+        &descriptor("unit"),
+        ProviderBindingEpoch::from_bytes([9; 16]),
+        &aborts,
+    )
+    .expect("release exact empty fact")
+    else {
+        panic!("NoOp fact lost on release");
+    };
+    assert!(std::sync::Arc::ptr_eq(needed, &released));
+    assert_eq!(released.effect(), ExternalMutationEffect::NoOp);
+    let outcome = completion
+        .into_legacy_outcome()
+        .expect("observed empty cleanup");
     match outcome {
         ExternalMutationOutcome::KnownCommitted {
             effect, receipt, ..

@@ -39,7 +39,11 @@ fn assert_finite_stage_refused(
             eprintln!("Client finite P=1 probe {phase}: {failure:?}");
             assert_eq!(
                 failure.error,
-                WorkError::Capacity("joint protected intersections"),
+                WorkError::JointCapacity(novarocks_workload_control::joint_admission::JointCapacityFailure {
+                    resource: JointResource::Computations,
+                    projection: novarocks_workload_control::joint_admission::JointCapacityProjection::Global,
+                    constraint: novarocks_workload_control::joint_admission::JointCapacityConstraint::Global,
+                }),
                 "only the actual saturated resource proof is the expected refusal",
             );
         }

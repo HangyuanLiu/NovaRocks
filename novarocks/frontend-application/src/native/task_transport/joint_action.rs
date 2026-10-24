@@ -133,7 +133,7 @@ fn context_domain(
         D::Credential(value) => credential(invoice, value.material().as_ref()),
     }
 }
-fn clone_input_backing(operations: &[OperationIntent]) -> Result<usize, WorkError> {
+pub(super) fn clone_input_backing(operations: &[OperationIntent]) -> Result<usize, WorkError> {
     let mut invoice = CloneInvoice { owned: 0 };
     for operation in operations {
         // Every operation envelope/target projection allocates at most four
@@ -203,6 +203,7 @@ fn nonzero(value: usize) -> Result<std::num::NonZeroU64, WorkError> {
 fn make_quote(
     items: usize,
     input_bytes: usize,
+    queue_bytes: usize,
     budget: TransportBudget,
 ) -> Result<NativeAsyncActionQuote, WorkError> {
     let layouts = known_input_layouts_for_composition(
@@ -243,6 +244,13 @@ fn make_quote(
             )?,
         )
         .ok_or(WorkError::ArithmeticOverflow)?;
+    // The real unary encoder header is inside Tonic's Body pointee, not
+    // established by the outer F's Box pointer or inline codec size alone.
+    metadata = metadata
+        .checked_add(
+            novarocks_native_adapter::native_codec::original_operation_encoder_layout().size(),
+        )
+        .ok_or(WorkError::ArithmeticOverflow)?;
     let reply_meta = Layout::array::<std::sync::OnceLock<OperationAcknowledgement>>(items)
         .map_err(|_| WorkError::ArithmeticOverflow)?
         .size();
@@ -255,11 +263,57 @@ fn make_quote(
         nonzero(items)?,
         nonzero(metadata)?,
         nonzero(input_bytes.max(1))?,
-        nonzero(budget.max_batch_encoded_bytes())?,
+        nonzero(queue_bytes)?,
         nonzero(reply_meta)?,
         nonzero(reply_bytes)?,
     ))
 }
+/// Borrow the same original operation facts that the codec will encode. The
+/// codec owns protobuf field sizes, including the control method projection.
+pub(super) fn original_run_encoding(
+    operations: &[OperationIntent],
+    budget: TransportBudget,
+) -> Result<novarocks_native_adapter::native_codec::NativeUnaryEncodingPlan, WorkError> {
+    use novarocks_task_codec::operation::wire_size as size;
+    let mut bytes = 0usize;
+    for operation in operations {
+        let control = is_small_control(operation);
+        let item = match operation {
+            OperationIntent::AcquireQueryContextAdmissionTicket(value) => size::acquire(*value),
+            OperationIntent::EstablishQueryContext(value) => size::establish(value),
+            OperationIntent::CreateTask(value) => size::create(
+                value.envelope(),
+                value.parts().fragment().content().len(),
+                value.parts().metadata().len(),
+            ),
+            OperationIntent::UpdateTask(value) => size::update(value, control),
+            OperationIntent::UpdateQueryContext(value) => match value.as_ref() {
+                UpdateQueryContext::Establish(value) => size::establish(value),
+                UpdateQueryContext::AdvanceDomain(value) => size::advance(value),
+                UpdateQueryContext::RenewLease(value) => size::renew(value, control),
+            },
+            OperationIntent::CancelTask(value) => size::cancel(*value, control),
+            OperationIntent::QuiesceQueryContext(value) => size::quiesce(*value, control),
+            OperationIntent::AbortQueryContext(value) => size::abort(*value, control),
+            OperationIntent::ReleaseQueryContext(value) => size::release(*value, control),
+            #[cfg(test)]
+            OperationIntent::FetchTaskDynamicFilters(_) => return Err(WorkError::Conflict),
+        }
+        .map_err(|error| match error {
+            size::WireSizeError::Overflow => WorkError::ArithmeticOverflow,
+            size::WireSizeError::NotCodecProduced => WorkError::Conflict,
+        })?;
+        bytes = bytes
+            .checked_add(size::batch_item(item).map_err(|_| WorkError::ArithmeticOverflow)?)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+    }
+    if !budget.batch_fits(operations.len(), bytes) {
+        return Err(WorkError::Capacity("Native original encoded method run"));
+    }
+    novarocks_native_adapter::native_codec::NativeUnaryEncodingPlan::for_original_operation(bytes)
+        .ok_or(WorkError::ArithmeticOverflow)
+}
+
 /// Complete requested backing of one actual original RPC method run. This is
 /// not a budget-only promise for every possible input or a capacity grant.
 #[derive(Clone, Copy, Debug)]
@@ -320,18 +374,19 @@ impl NativeTaskOperationSink {
             return Err(WorkError::Conflict);
         }
         let cloned = clone_input_backing(operations)?;
-        // Encoder old/new backing may coexist. This is wire backing only;
-        // actual owned DTO clones were independently visited above.
-        let wire = budget
-            .max_batch_encoded_bytes()
-            .checked_mul(2)
-            .ok_or(WorkError::ArithmeticOverflow)?;
+        // The real unary encoder consumes this exact plan and preallocates
+        // one complete gRPC frame, avoiding a buffer-growth coexistence peak.
+        // Previously queued immutable backing is retained by its own claim;
+        // new DTO clones are the independent generated invoice above.
+        let encoding = original_run_encoding(operations, budget)?;
+        let wire = encoding.retained_bytes();
         Ok(NativeMethodRunProgress {
             original: make_quote(
                 plan.items(),
                 cloned
                     .checked_add(wire)
                     .ok_or(WorkError::ArithmeticOverflow)?,
+                encoding.protobuf_bytes(),
                 budget,
             )?,
         })
@@ -377,6 +432,7 @@ impl NativeTaskOperationSink {
             owned
                 .checked_add(wire)
                 .ok_or(WorkError::ArithmeticOverflow)?,
+            budget.max_batch_encoded_bytes(),
             budget,
         )?;
         let reply = original.custody();
@@ -506,6 +562,7 @@ impl NativeTaskOperationSink {
         let supervisor_lane = supervisor_lane(batch);
         let method = batch.operations()[0].native_method();
         let items = batch.operations().len();
+        let encoding = original_run_encoding(batch.operations(), self.transport)?;
         let pending = batch
             .native_pending
             .as_mut()
@@ -544,6 +601,7 @@ impl NativeTaskOperationSink {
             backend,
             supervisor_lane,
             method,
+            encoding,
             &mut cx,
         ) {
             Poll::Pending => {
@@ -558,7 +616,7 @@ impl NativeTaskOperationSink {
                 let notification = offer.reobserve_after_drop(&mut None::<NativePhysicalOffer>)?;
                 drop(offer);
                 notification.notify();
-                return Err(NativeAdmissionFailure::Unsent(error.to_string()));
+                return Err(error);
             }
             Poll::Ready(Ok(physical)) => Some(physical),
         };
@@ -589,19 +647,41 @@ impl NativeTaskOperationSink {
         backend: BackendProcessId,
         lane: NativeTransportLane,
         method: NativeRpcMethod,
+        encoding_plan: novarocks_native_adapter::native_codec::NativeUnaryEncodingPlan,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<NativePhysicalOffer, ChannelAcquisitionError>> {
+    ) -> Poll<Result<NativePhysicalOffer, NativeAdmissionFailure>> {
         let encoding = match self
             .data_runtime
             .task_transport_supervisor()
-            .try_reserve_encoding(&self.transport_waiter, backend, lane)
-        {
+            .try_reserve_original_encoding(
+                &self.transport_waiter,
+                backend,
+                lane,
+                encoding_plan.protobuf_bytes(),
+            ) {
             Ok(value) => value,
-            Err(_) => return Poll::Pending,
+            Err(
+                super::super::transport_supervisor::NativeEncodingReservationFailure::Backpressured(
+                    _,
+                ),
+            ) => return Poll::Pending,
+            Err(
+                super::super::transport_supervisor::NativeEncodingReservationFailure::InvalidBytes,
+            ) => {
+                return Poll::Ready(Err(
+                    WorkError::Capacity("Native original encoding bytes").into()
+                ));
+            }
         };
-        let mut selected = Some(client.prepare_channel_source(method)?);
+        let mut selected = Some(
+            client
+                .prepare_channel_source(method)
+                .map_err(|e| NativeAdmissionFailure::Unsent(e.to_string()))?,
+        );
         let mut handoff = None;
-        match NativeChannelSource::try_reserve_in(&mut selected, &mut handoff)? {
+        match NativeChannelSource::try_reserve_in(&mut selected, &mut handoff)
+            .map_err(|e| NativeAdmissionFailure::Unsent(e.to_string()))?
+        {
             NativeDialAttempt::Pending => return Poll::Pending,
             NativeDialAttempt::Installed => {}
         }
@@ -610,15 +690,13 @@ impl NativeTaskOperationSink {
                 let call = match acquired.channel.select_local_call().try_reserve(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(error)) => {
-                        return Poll::Ready(Err(ChannelAcquisitionError::retryable_network(
-                            error.to_string(),
-                        )));
+                        return Poll::Ready(Err(NativeAdmissionFailure::Unsent(error.to_string())));
                     }
                     Poll::Ready(Ok(call)) => call,
                 };
                 if acquired.is_retired() {
-                    return Poll::Ready(Err(ChannelAcquisitionError::retryable_network(
-                        "selected Native generation retired",
+                    return Poll::Ready(Err(NativeAdmissionFailure::Unsent(
+                        "selected Native generation retired".into(),
                     )));
                 }
                 NativeCallSource::Warm { acquired, call }

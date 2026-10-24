@@ -1045,7 +1045,7 @@ impl IcebergWriteSessionControl {
                 "publication_empty_exit",
                 phase_started,
             );
-            return settle_empty_write_without_commit(handle).map(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::from_outcome);
+            return settle_empty_write_without_commit(handle);
         }
 
         #[cfg(novarocks_dev_controls)]
@@ -1118,14 +1118,11 @@ impl IcebergWriteSessionControl {
             "publication_dispatch_exit",
             phase_started,
         );
+        let mut outcome = outcome.map(publication::WritePublicationVerdict::into_completion);
+        use novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion as Completion;
         let terminal = match &outcome {
-            Ok(publication::WritePublicationVerdict::KnownCommitted {
-                receipt,
-                finalization,
-                cleanup,
-                ..
-            }) => {
-                handle.retain_finalization(finalization.clone());
+            Ok(Completion::KnownCommitted { needed, cleanup }) => {
+                handle.retain_finalization(needed.finalization().clone());
                 if let novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(
                     actual,
                 ) = cleanup
@@ -1133,18 +1130,16 @@ impl IcebergWriteSessionControl {
                     handle.retain_cleanup(actual.clone());
                 }
                 IcebergWriteSessionState::KnownCommitted {
-                    snapshot_id: receipt
-                        .committed_version()
-                        .and_then(|version| version.snapshot_id()),
+                    needed: Arc::clone(needed),
                 }
             }
-            Ok(publication::WritePublicationVerdict::KnownUncommitted { failure, cleanup }) => {
+            Ok(Completion::KnownUncommitted { failure, cleanup }) => {
                 handle.retain_finalization(cleanup.clone());
                 IcebergWriteSessionState::KnownUncommitted {
                     message: failure.message().to_string(),
                 }
             }
-            Ok(publication::WritePublicationVerdict::CommitUnknown { failure, .. }) => {
+            Ok(Completion::CommitUnknown { failure, .. }) => {
                 IcebergWriteSessionState::CommitUnknown {
                     message: failure.message().to_string(),
                     staging_dir: handle.staging_dir(),
@@ -1156,17 +1151,15 @@ impl IcebergWriteSessionControl {
         };
         if let Err(error) = handle.settle(terminal) {
             // Local state recording cannot erase an already proven publication verdict.
-            if let Ok(publication::WritePublicationVerdict::KnownCommitted {
-                finalization, ..
-            }) = &mut outcome
-            {
-                *finalization = add_finalization_failure(finalization.clone(), error.message());
-                handle.retain_finalization(finalization.clone());
-            } else if let Ok(publication::WritePublicationVerdict::KnownUncommitted {
-                cleanup,
-                ..
-            }) = &mut outcome
-            {
+            if let Ok(Completion::KnownCommitted { needed, .. }) = &mut outcome {
+                // settle failed before storing its alias; no observer received this fact.
+                let original =
+                    Arc::get_mut(needed).expect("failed settle retains no session alias");
+                let finalization =
+                    add_finalization_failure(original.finalization().clone(), error.message());
+                *original.finalization_mut() = finalization.clone();
+                handle.retain_finalization(finalization);
+            } else if let Ok(Completion::KnownUncommitted { cleanup, .. }) = &mut outcome {
                 *cleanup = add_finalization_failure(cleanup.clone(), error.message());
                 handle.retain_finalization(cleanup.clone());
             }
@@ -1180,7 +1173,6 @@ impl IcebergWriteSessionControl {
             "publication_settle_exit",
             phase_started,
         );
-        let mut outcome = outcome.map(publication::WritePublicationVerdict::into_completion);
         if let Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, .. }) = &outcome {
             if let Some(receiving) = needed_ready {
                 receiving.publish(Arc::clone(needed))?;
@@ -1223,10 +1215,7 @@ impl IcebergWriteSessionControl {
             }
         }
         if let Some(entry) = journal.current_entry() {
-            if let ExternalMutationOutcome::KnownCommitted {
-                cleanup: actual, ..
-            } = journal.catalog_entry_outcome(entry)
-            {
+            if let Some(actual) = journal.observed_entry_cleanup(entry) {
                 if let Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { cleanup, .. }) = outcome {
                     *cleanup = novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(actual.clone());
                 }
@@ -1540,7 +1529,10 @@ fn validate_document_records(
 /// fails closed there instead of claiming a commit against nothing.
 pub(crate) fn settle_empty_write_without_commit(
     handle: &IcebergCommitHandle,
-) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+) -> Result<
+    novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion,
+    ConnectorError,
+> {
     handle.record_empty_cleanup_disposed();
     let Some(unchanged_snapshot_id) = handle.table().base_snapshot_id() else {
         let message = format!(
@@ -1550,7 +1542,7 @@ pub(crate) fn settle_empty_write_without_commit(
         handle.settle(IcebergWriteSessionState::KnownUncommitted {
             message: message.clone(),
         })?;
-        return Ok(ExternalMutationOutcome::KnownUncommitted {
+        return Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownUncommitted {
             failure: failure(ConnectorMutationFailureKind::Conflict, message),
             cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
         });
@@ -1561,14 +1553,19 @@ pub(crate) fn settle_empty_write_without_commit(
         None,
     )
     .map_err(invalid)?;
+    let needed = Arc::new(
+        novarocks_spi::connector::write_stack::ConnectorWriteNeededReady::new(
+            ExternalMutationEffect::NoOp,
+            receipt,
+            ExternalMutationFinalization::Complete,
+        ),
+    );
     handle.settle(IcebergWriteSessionState::KnownCommitted {
-        snapshot_id: Some(unchanged_snapshot_id),
+        needed: Arc::clone(&needed),
     })?;
-    Ok(ExternalMutationOutcome::KnownCommitted {
-        cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
-        effect: ExternalMutationEffect::NoOp,
-        receipt,
-        finalization: ExternalMutationFinalization::Complete,
+    Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted {
+        needed,
+        cleanup: novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(ExternalMutationFinalization::Complete),
     })
 }
 
@@ -1605,24 +1602,10 @@ pub(crate) fn release_session_state(
             IcebergWriteSessionState::Sealed => Ok(ConnectorWriteAbortOutcome::KnownUncommitted {
                 cleanup: ExternalMutationFinalization::Complete,
             }),
-            IcebergWriteSessionState::KnownCommitted { snapshot_id } => {
-                // Abort cannot undo a proven commit.
-                let receipt = match snapshot_id {
-                    Some(id) => {
-                        committed_write_receipt(
-                            id,
-                            None,
-                            None,
-                            None,
-                            handle.terminal_finalization(),
-                        )
-                        .0
-                    }
-                    None => unprojected_committed_receipt(),
-                };
+            IcebergWriteSessionState::KnownCommitted { needed } => {
+                // Abort borrows the original exact fact; it cannot undo or reproject it.
                 Ok(ConnectorWriteAbortOutcome::KnownCommitted {
-                    receipt,
-                    finalization: handle.terminal_finalization(),
+                    needed,
                     cleanup: handle.terminal_cleanup(),
                 })
             }
@@ -1666,6 +1649,19 @@ impl IcebergWriteSessionControl {
     }
 
     pub async fn adjudicate_session_async(
+        &self,
+        handle: &IcebergCommitHandle,
+        evidence: &ExternalMutationEvidence,
+        context: &ConnectorRequestContext,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        let mut outcome = self
+            .adjudicate_session_inner_async(handle, evidence, context)
+            .await?;
+        retain_reconciled_committed_fact(handle, &mut outcome);
+        Ok(outcome)
+    }
+
+    async fn adjudicate_session_inner_async(
         &self,
         handle: &IcebergCommitHandle,
         evidence: &ExternalMutationEvidence,
@@ -1850,14 +1846,6 @@ impl IcebergWriteSessionControl {
         {
             return Ok(journal.catalog_entry_outcome(entry));
         }
-        if let Err(error) = handle.settle(IcebergWriteSessionState::KnownCommitted {
-            snapshot_id: Some(snapshot_id),
-        }) {
-            let finalization =
-                add_finalization_failure(handle.terminal_finalization(), error.message());
-            journal.record_entry_finalization(entry, finalization.clone());
-            handle.retain_finalization(finalization);
-        }
         let projection = journal
             .finalization_context(entry, self.runtime.novarocks_catalog().evidence_policy())
             .and_then(|grant| grant.for_io(context));
@@ -1872,6 +1860,86 @@ impl IcebergWriteSessionControl {
             snapshot_id,
             projection.map(|_| metadata),
         ))
+    }
+}
+
+fn retained_committed_completion(
+    handle: &IcebergCommitHandle,
+    outcome: ExternalMutationOutcome<ConnectorWriteReceipt>,
+) -> novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion {
+    use novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion;
+    match outcome {
+        ExternalMutationOutcome::KnownCommitted {
+            effect,
+            receipt,
+            finalization,
+            cleanup: _,
+        } => {
+            if let Ok(IcebergWriteSessionState::KnownCommitted { needed }) = handle.state()
+                && needed.effect() == effect
+                && needed.receipt() == &receipt
+                && needed.finalization() == &finalization
+            {
+                return ConnectorWritePublicationCompletion::KnownCommitted {
+                    needed,
+                    cleanup: handle.terminal_cleanup(),
+                };
+            }
+            // A failed local state lock cannot erase the actual journal verdict.
+            ConnectorWritePublicationCompletion::KnownCommitted {
+                needed: Arc::new(
+                    novarocks_spi::connector::write_stack::ConnectorWriteNeededReady::new(
+                        effect,
+                        receipt,
+                        finalization,
+                    ),
+                ),
+                cleanup: handle.terminal_cleanup(),
+            }
+        }
+        other => ConnectorWritePublicationCompletion::from_outcome(other),
+    }
+}
+
+fn retain_reconciled_committed_fact(
+    handle: &IcebergCommitHandle,
+    outcome: &mut ExternalMutationOutcome<ConnectorWriteReceipt>,
+) {
+    let ExternalMutationOutcome::KnownCommitted {
+        effect,
+        receipt,
+        finalization,
+        cleanup: _,
+    } = outcome
+    else {
+        return;
+    };
+    // Reuse an unchanged canonical fact; a newly enriched original verdict is sealed once.
+    let needed = match handle.state() {
+        Ok(IcebergWriteSessionState::KnownCommitted { needed })
+            if needed.effect() == *effect
+                && needed.receipt() == receipt
+                && needed.finalization() == finalization =>
+        {
+            needed
+        }
+        _ => Arc::new(
+            novarocks_spi::connector::write_stack::ConnectorWriteNeededReady::new(
+                *effect,
+                receipt.clone(),
+                finalization.clone(),
+            ),
+        ),
+    };
+    if let Err(error) = handle.settle(IcebergWriteSessionState::KnownCommitted { needed }) {
+        *finalization = add_finalization_failure(finalization.clone(), error.message());
+    }
+    handle.retain_finalization(finalization.clone());
+    if let Ok(Some((_, journal))) = handle.retained_publication()
+        && let Some(entry) = journal.current_entry()
+        && let Some(actual) = journal.observed_entry_cleanup(entry)
+    {
+        handle.retain_cleanup(actual);
     }
 }
 
@@ -1923,7 +1991,9 @@ fn reconciled_known_committed_outcome(
     };
     journal.record_entry_finalization(entry, finalization.clone());
     handle.retain_finalization(finalization.clone());
-    handle.retain_cleanup(cleanup.clone());
+    if let Some(actual) = journal.observed_entry_cleanup(entry) {
+        handle.retain_cleanup(actual);
+    }
     ExternalMutationOutcome::KnownCommitted {
         cleanup,
         effect,
@@ -5153,7 +5223,12 @@ mod terminal_finalization_tests {
                 proof: CommitProof::applied(Some(77)),
             },
         );
-        journal.record_entry_cleanup(entry, handle.terminal_cleanup());
+        let novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(actual) =
+            handle.terminal_cleanup()
+        else {
+            panic!("fixture previously recorded its actual cleanup failure");
+        };
+        journal.record_entry_cleanup(entry, actual);
         let ExternalMutationOutcome::KnownCommitted {
             finalization,
             cleanup,
@@ -5175,10 +5250,90 @@ mod terminal_finalization_tests {
         assert!(
             matches!(&cleanup, ExternalMutationFinalization::Failed(error) if error.message() == "old attempt cleanup failed")
         );
-        assert_eq!(handle.terminal_cleanup(), cleanup);
+        assert_eq!(
+            handle.terminal_cleanup(),
+            novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(cleanup)
+        );
         assert!(error.message().contains("row count reload failed"));
         assert_eq!(handle.terminal_finalization(), finalization);
     }
+    #[test]
+    fn committed_release_borrows_the_original_effect_receipt_and_finalization() {
+        for effect in [
+            ExternalMutationEffect::Applied,
+            ExternalMutationEffect::NoOp,
+        ] {
+            let handle = handle();
+            let (receipt, finalization) = committed_write_receipt(
+                77,
+                None,
+                None,
+                None,
+                ExternalMutationFinalization::Complete,
+            );
+            let needed = Arc::new(
+                novarocks_spi::connector::write_stack::ConnectorWriteNeededReady::new(
+                    effect,
+                    receipt,
+                    finalization,
+                ),
+            );
+            handle
+                .settle(IcebergWriteSessionState::KnownCommitted {
+                    needed: Arc::clone(&needed),
+                })
+                .unwrap();
+            let descriptor = ConnectorInstanceDescriptor {
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .unwrap(),
+                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("terminal-test")
+                    .unwrap(),
+            };
+            for _ in 0..2 {
+                let ConnectorWriteAbortOutcome::KnownCommitted {
+                    needed: released, ..
+                } = release_session_state(
+                    &descriptor,
+                    ProviderBindingEpoch::from_bytes([1; 16]),
+                    &handle,
+                )
+                .unwrap()
+                else {
+                    panic!("committed fact erased");
+                };
+                assert!(Arc::ptr_eq(&needed, &released));
+                assert_eq!(released.effect(), effect);
+                assert!(std::ptr::eq(needed.receipt(), released.receipt()));
+                assert_eq!(released.finalization(), needed.finalization());
+                assert!(matches!(
+                    handle.terminal_cleanup(),
+                    novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Pending
+                ));
+            }
+            handle.retain_cleanup(ExternalMutationFinalization::Complete);
+            let ConnectorWriteAbortOutcome::KnownCommitted {
+                needed: released,
+                cleanup,
+            } = release_session_state(
+                &descriptor,
+                ProviderBindingEpoch::from_bytes([1; 16]),
+                &handle,
+            )
+            .unwrap()
+            else {
+                panic!("committed fact erased after GC report");
+            };
+            assert!(Arc::ptr_eq(&needed, &released));
+            assert!(matches!(
+                cleanup,
+                novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(
+                    ExternalMutationFinalization::Complete
+                )
+            ));
+            assert!(handle.begin_commit().is_err());
+        }
+    }
+
     #[test]
     fn committed_release_without_version_does_not_invent_snapshot_zero() {
         let handle = handle();
@@ -5193,7 +5348,15 @@ mod terminal_finalization_tests {
         ));
         handle.retain_cleanup(cleanup.clone());
         handle
-            .settle(IcebergWriteSessionState::KnownCommitted { snapshot_id: None })
+            .settle(IcebergWriteSessionState::KnownCommitted {
+                needed: Arc::new(
+                    novarocks_spi::connector::write_stack::ConnectorWriteNeededReady::new(
+                        ExternalMutationEffect::Applied,
+                        unprojected_committed_receipt(),
+                        finalization.clone(),
+                    ),
+                ),
+            })
             .unwrap();
         let descriptor = ConnectorInstanceDescriptor {
             provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap(),
@@ -5202,8 +5365,7 @@ mod terminal_finalization_tests {
         };
         let ConnectorWriteAbortOutcome::KnownCommitted {
             cleanup: actual_cleanup,
-            receipt,
-            finalization: actual,
+            needed,
         } = release_session_state(
             &descriptor,
             ProviderBindingEpoch::from_bytes([1; 16]),
@@ -5213,9 +5375,13 @@ mod terminal_finalization_tests {
         else {
             panic!("committed proof lost")
         };
-        assert!(receipt.committed_version().is_none());
-        assert_eq!(actual, finalization);
-        assert_eq!(actual_cleanup, cleanup);
+        assert!(needed.receipt().committed_version().is_none());
+        assert_eq!(needed.effect(), ExternalMutationEffect::Applied);
+        assert_eq!(needed.finalization(), &finalization);
+        assert_eq!(
+            actual_cleanup,
+            novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(cleanup)
+        );
     }
 }
 
@@ -5338,22 +5504,12 @@ impl IcebergWriteSessionControl {
             .adjudicate_session_async(handle, &request.evidence, &request.context)
             .await;
         let cleanup = if let Ok(ExternalMutationOutcome::KnownCommitted {
-            receipt,
             finalization,
             cleanup,
             ..
         }) = &mut outcome
         {
             handle.retain_finalization(finalization.clone());
-            handle.retain_cleanup(cleanup.clone());
-            if let Err(error) = handle.settle(IcebergWriteSessionState::KnownCommitted {
-                snapshot_id: receipt
-                    .committed_version()
-                    .and_then(|version| version.snapshot_id()),
-            }) {
-                *finalization = add_finalization_failure(finalization.clone(), error.message());
-                handle.retain_finalization(finalization.clone());
-            }
             match handle.retained_publication() {
                 Ok(original) => original,
                 Err(error) => {
@@ -5367,7 +5523,7 @@ impl IcebergWriteSessionControl {
         } else {
             None
         };
-        let mut outcome = outcome.map(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::from_outcome);
+        let mut outcome = outcome.map(|outcome| retained_committed_completion(handle, outcome));
         if let Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, cleanup: state }) = &mut outcome {
             if cleanup.is_some() { *state = novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Pending; }
             receiving.publish(Arc::clone(needed))?;

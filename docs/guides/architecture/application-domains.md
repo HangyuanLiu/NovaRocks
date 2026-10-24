@@ -33,6 +33,11 @@ ADR-0198 的统一执行契约已接受，代码切换与原生验收尚待完�
 `read_action.rs`、`write_action.rs`、`mutation_action.rs` 和 `ctas_action.rs` 的实际 Action，以及
 `statement_computation.rs`、`statement_publication.rs` 的共享接缝核对。旧 `coordinator/**`
 和 `dml/runner.rs` 仍在；全部调用面迁移与删旧尚未完成，不能把上述源码存在解释为已贯通或已验收。
+Statistics 的现有 Action 入口在 `statistics_jobs/{service,attempt_executor}.rs`：前台 capture 实际关闭
+CPU/Provider 后，把原 query permit 移交给同 job 稳定槽，再通知原 worker；后台沿共享计算 owner
+推进。`query_execution/internal_result_cpu/scoped_statistics.rs` 持封闭 scoped CPU source，
+`query_execution/statistics/preparation.rs` 保留原准备访问，`query_execution/internal_consumer/decoded.rs`
+在 Ready payload 移交前取得原 statement retention。整族 Rewrite/MV 与旧调用面退役仍待完成。
 
 ## 先判定 owner，再选 crate
 
@@ -175,6 +180,12 @@ metadata 结算沿同 Root 已取得的保管能力继续推进；scope 身份�
 不自行授予新容量，也不证明前一个阶段已退出。网络控制 I/O 异步，真正阻塞调用使用隔离的
 有界执行器；超时或取消等待不证明动作实际退出。
 永久卡住者仍占额，多个坏域或共享宿主耗尽时保留明确不可用边界。
+
+普通资源或领域拒绝不等于 process health。原 `MetadataIoAdmission` 的 actual quiescence 观察
+只有在 growth、真实 I/O 与最后 cell alias 均已退出后才成立，并单独携带原普通失败；panic、
+loan 冲突或退出不足仍保原健康原因与 source。业务结果与实际退出不能互相覆盖。
+形成期临时展开、仍活 Provider backing、累计产物与 Unknown/未接收责任分别保管：即使原形成
+增量已可归还，也不能退掉仍被持有的 Provider 峰值、metadata 或完整故障域账。
 
 客户端取消经 query-control owner 进入，会话 generation fencing 等本语句的本地受监督编排
 退出；不等远端 Unknown 责任消失。后者继续由原 owner 持有真实义务与容量。

@@ -990,6 +990,11 @@ impl TaskOperationSink for NativeTaskOperationSink {
                 return TaskOperationSubmit::Accepted;
             }
         };
+        let encoding_plan =
+            match joint_action::original_run_encoding(batch.operations(), self.transport) {
+                Ok(plan) => plan,
+                Err(error) => return TaskOperationSubmit::AdmissionFailed { batch, error },
+            };
         let target = target.clone();
         let joint_action = match self.admit_original_batch(&mut batch, &target.client) {
             Ok(Some(action)) => action,
@@ -1078,7 +1083,18 @@ impl TaskOperationSink for NativeTaskOperationSink {
                 return TaskOperationSubmit::Accepted;
             }
         };
-        let encoded_bytes = requests.iter().map(EncodedMethodBatch::encoded_len).sum();
+        let encoded_bytes: usize = requests.iter().map(EncodedMethodBatch::encoded_len).sum();
+        // A dispatcher batch is one exact method/deadline run. Recheck the
+        // borrowed invoice before Tonic can allocate its encoding buffer;
+        // malformed codec facts cannot turn an underestimated size into growth.
+        if requests.len() != 1
+            || novarocks_native_adapter::native_codec::NativeUnaryEncodingPlan::for_original_operation(encoded_bytes) != Some(encoding_plan)
+        {
+            return TaskOperationSubmit::AdmissionFailed {
+                batch,
+                error: novarocks_workload_control::WorkError::Conflict,
+            };
+        }
         original_slot
             .shrink_native_encoding(encoded_bytes)
             .expect("original paid encoding source remains installed");
@@ -1164,6 +1180,15 @@ fn is_small_control(intent: &OperationIntent) -> bool {
 enum EncodedMethodRequest {
     Ordinary(proto::ApplyTaskOperationsRequest),
     Control(proto::ApplyTaskControlOperationsRequest),
+}
+
+impl EncodedMethodRequest {
+    fn encoded_len(&self) -> usize {
+        match self {
+            Self::Ordinary(value) => prost::Message::encoded_len(value),
+            Self::Control(value) => prost::Message::encoded_len(value),
+        }
+    }
 }
 
 struct EncodedMethodBatch {
@@ -1657,6 +1682,13 @@ async fn send_operations_in(
         client.invalidate_channel_if_current(method, &acquired);
         return Err(OperationDispatchResult::TransportUnknown);
     }
+    // Reconstruct the pure plan from the now-formed DTO and require the same
+    // source bound used before its first clone. No Joint refund occurs here.
+    let encoding_plan =
+        novarocks_native_adapter::native_codec::NativeUnaryEncodingPlan::for_original_operation(
+            request.encoded_len(),
+        )
+        .expect("one nonempty original unary method run fits its source invoice");
     let call = async {
         match request {
             EncodedMethodRequest::Ordinary(request) => {
@@ -1664,7 +1696,7 @@ async fn send_operations_in(
                 wire.set_timeout(remaining);
                 wire.extensions_mut().insert(novarocks_native_adapter::native_lane::NativeRequestCustody::from_retained_action(
                     action_tail.take().expect("one original unary method run retains its action source")));
-                let codec=novarocks_native_adapter::native_codec::NativeProstCodec::with_operation_reply_plan(reply_plan);
+                let codec=novarocks_native_adapter::native_codec::NativeProstCodec::with_original_operation_plans(reply_plan, encoding_plan);
                 let rpc = grpc.unary(
                     wire,
                     tonic::codegen::http::uri::PathAndQuery::from_static(
@@ -1691,7 +1723,7 @@ async fn send_operations_in(
                 wire.set_timeout(remaining);
                 wire.extensions_mut().insert(novarocks_native_adapter::native_lane::NativeRequestCustody::from_retained_action(
                     action_tail.take().expect("one original unary method run retains its action source")));
-                let codec=novarocks_native_adapter::native_codec::NativeProstCodec::with_operation_reply_plan(reply_plan);
+                let codec=novarocks_native_adapter::native_codec::NativeProstCodec::with_original_operation_plans(reply_plan, encoding_plan);
                 let rpc = grpc.unary(
                     wire,
                     tonic::codegen::http::uri::PathAndQuery::from_static(
@@ -3613,7 +3645,9 @@ mod tests {
         assert_eq!(foreground.get(JointResource::PhysicalQueueRecords), 1);
         assert_eq!(
             foreground.get(JointResource::PhysicalQueueBytes),
-            budget.max_batch_encoded_bytes() as u64
+            joint_action::original_run_encoding(&operations, budget)
+                .unwrap()
+                .protobuf_bytes() as u64
         );
         assert_eq!(
             quote.custody().get(JointResource::ReplyRecords),
@@ -3640,6 +3674,71 @@ mod tests {
         let mixed = [cancel_intent(1, backend), update_intent(2, backend, 1)];
         assert_ne!(mixed[0].native_run_key(), mixed[1].native_run_key());
         assert!(NativeTaskOperationSink::progress_for_original_method_run(&mixed, budget).is_err());
+    }
+
+    #[test]
+    fn original_small_method_runs_invoice_the_actual_codec_and_keep_the_support_envelope() {
+        use novarocks_workload_control::joint_admission::JointResource;
+        let budget = TransportBudget::DEFAULT;
+        let backend = BackendProcessId::new_v7();
+        let runs = [
+            vec![cancel_intent(1, backend), abort_intent(context(backend))],
+            vec![renew_intent(backend)],
+            vec![update_intent(1, backend, 128)],
+            (1..=budget.max_batch_items())
+                .map(|id| cancel_intent(id as u32, backend))
+                .collect(),
+        ];
+        for operations in runs {
+            let plan = joint_action::original_run_encoding(&operations, budget).unwrap();
+            let encoded = operations
+                .iter()
+                .map(|item| {
+                    (
+                        is_small_control(item),
+                        encode_operation(item, &test_attempt_facts()).unwrap(),
+                    )
+                })
+                .collect();
+            let batches = encode_method_batches(encoded, budget).unwrap();
+            assert_eq!(batches.len(), 1);
+            assert_eq!(plan.retained_bytes(), batches[0].encoded_len() + 5);
+            let actual =
+                NativeTaskOperationSink::progress_for_original_method_run(&operations, budget)
+                    .unwrap();
+            let payload = actual
+                .foreground()
+                .unwrap()
+                .get(JointResource::PayloadBytes);
+            assert_eq!(
+                payload,
+                plan.retained_bytes() as u64
+                    + joint_action::clone_input_backing(&operations).unwrap() as u64
+            );
+            assert!(
+                payload < 64 * 1024,
+                "small full runs must not reserve the maximum 96 MiB wire envelope"
+            );
+            assert_eq!(
+                actual.custody().get(JointResource::ReplyRecords),
+                operations.len() as u64
+            );
+            assert_eq!(
+                actual
+                    .foreground()
+                    .unwrap()
+                    .get(JointResource::PhysicalQueueRecords),
+                1
+            );
+            assert_eq!(
+                actual
+                    .foreground()
+                    .unwrap()
+                    .get(JointResource::PhysicalQueueBytes),
+                plan.protobuf_bytes() as u64
+            );
+            assert_eq!(plan.retained_bytes(), plan.protobuf_bytes() + 5);
+        }
     }
 
     #[test]
@@ -4016,6 +4115,13 @@ mod tests {
 
         let encoded = encode_query_context_operation(&request, &test_attempt_facts())
             .expect("the establish is codec-owned");
+        let UpdateQueryContext::Establish(original) = &request else {
+            unreachable!()
+        };
+        assert_eq!(
+            novarocks_task_codec::operation::wire_size::establish(original).unwrap(),
+            prost::Message::encoded_len(&encoded)
+        );
         let Some(proto::task_operation::Operation::UpdateQueryContext(update)) = encoded.operation
         else {
             panic!("an establish encodes as UpdateQueryContext");
@@ -5720,25 +5826,62 @@ mod tests {
     async fn an_observation_read_is_refused_before_the_wire() {
         let backend = BackendProcessId::new_v7();
         let fixture = sink_fixture(Loopback::start().await, backend);
-        let batch = released_batch(
+        let supervisor = fixture.sink.data_runtime.task_transport_supervisor();
+        let before = supervisor.snapshot();
+        let mut batch = released_batch(
             backend,
             vec![OperationIntent::FetchTaskDynamicFilters(
                 FetchTaskDynamicFilters::new(TaskOperationId::new_v7(), identity(1, backend), None),
             )],
         );
+        let original_id = batch.operations()[0].operation_id();
+        let original_bytes = batch.queued_bytes();
+        let permits = batch
+            .operations()
+            .iter()
+            .map(|intent| fixture.governed.reserve(&fixture.sink, intent))
+            .collect();
+        batch.replace_fixture_permits(permits);
+        let held = supervisor.snapshot();
+        assert_eq!(held.retained_items, before.retained_items + 1);
+        assert!(held.retained_queued_and_encoded_bytes > before.retained_queued_and_encoded_bytes);
 
-        submit_batch(&fixture, batch);
-        let acks = settled(&fixture.acks, 1).await;
-
-        assert_eq!(acks[0].kind(), OperationKind::FetchTaskDynamicFilters);
+        let returned = match fixture.sink.try_submit(batch) {
+            TaskOperationSubmit::AdmissionFailed {
+                batch,
+                error: novarocks_workload_control::WorkError::Conflict,
+            } => batch,
+            other => panic!("a read must be refused by the closed batch vocabulary: {other:?}"),
+        };
+        assert_eq!(returned.operations().len(), 1);
+        assert_eq!(returned.operations()[0].operation_id(), original_id);
         assert_eq!(
-            acks[0].worker_outcome(),
-            Some(OperationOutcome::InvalidStateOrRequest)
+            returned.operations()[0].kind(),
+            OperationKind::FetchTaskDynamicFilters
+        );
+        assert_eq!(returned.queued_bytes(), original_bytes);
+        assert_eq!(
+            supervisor.snapshot(),
+            held,
+            "the caller still owns its exact paid input"
+        );
+        assert!(
+            fixture.acks.drain_events().is_empty(),
+            "refusal cannot manufacture an ACK"
         );
         assert!(
             fixture.loopback.peer.applied().is_empty(),
             "a read has its own RPC and never becomes a batch item"
         );
+        assert_eq!(fixture.loopback.peer.control_requests(), 0);
+        drop(returned);
+        fixture.governed.drive();
+        assert_eq!(
+            supervisor.snapshot(),
+            before,
+            "only actual input drop returns the queue charge"
+        );
+        assert!(fixture.acks.drain_events().is_empty());
     }
 
     #[test]
@@ -8152,6 +8295,10 @@ mod tests {
             &test_attempt_facts(),
         )
         .expect("the admission request is encodable");
+        assert_eq!(
+            codec::wire_size::acquire(request).unwrap(),
+            prost::Message::encoded_len(&encoded)
+        );
         let Some(proto::task_operation::Operation::AcquireQueryContextAdmissionTicket(encoded)) =
             encoded.operation
         else {

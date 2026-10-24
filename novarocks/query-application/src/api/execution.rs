@@ -271,7 +271,7 @@ impl Error for QueryExecutionError {}
 pub use crate::coordination::{
     LocalExecutionDisposition, LogicalActorExitPhase, LogicalExecutionExitObserver,
     LogicalExecutionExitReceipt, LogicalExecutionExitView, LogicalExecutionStartAttempt,
-    OriginalLogicalStartInput, RemoteExecutionDisposition,
+    OriginalBackgroundActionInput, OriginalLogicalStartInput, RemoteExecutionDisposition,
 };
 
 pub type QueryExecutionFuture =
@@ -359,6 +359,32 @@ pub(crate) trait QueryExecutionDriver: Send + Sync + 'static {
             "this driver has no original observed-start source",
         ))
     }
+    fn prepare_background_action_in(
+        &self,
+        _owner: &Option<WorkOwner>,
+        _context: &mut Option<crate::admitted_query_context::QueryExecutionContext>,
+        _permit: &mut Option<novarocks_workload_control::QueryConcurrencyPermit>,
+        _payload: &mut Option<novarocks_workload_control::joint_admission::RetainedPayloadGrant>,
+        _action: &mut Option<Box<dyn crate::session_control::GovernedBackgroundAction>>,
+        _destination: &mut Option<crate::coordination::OriginalBackgroundActionInput>,
+    ) -> Result<(), QueryExecutionError> {
+        Err(QueryExecutionError::new(
+            QueryExecutionErrorKind::InvalidRequest,
+            "this driver has no original background action source",
+        ))
+    }
+    fn start_background_action_in(
+        &self,
+        _input: &mut Option<crate::coordination::OriginalBackgroundActionInput>,
+        _owner: &mut Option<WorkOwner>,
+        _ready: &mut Option<crate::session_control::BackgroundActionReady>,
+        _exit: &mut Option<LogicalExecutionExitObserver>,
+    ) -> Result<LogicalExecutionStartAttempt, QueryExecutionError> {
+        Err(QueryExecutionError::new(
+            QueryExecutionErrorKind::InvalidRequest,
+            "this driver has no original background action source",
+        ))
+    }
     fn start(
         &self,
         request: QueryExecutionRequest,
@@ -419,6 +445,38 @@ impl QueryExecutionClient {
         exit: &mut Option<LogicalExecutionExitObserver>,
     ) -> Result<LogicalExecutionStartAttempt, QueryExecutionError> {
         self.driver.start_observed_in(input, owner, ready, exit)
+    }
+    /// Install exact already-admitted job inputs in their stable original Source.
+    /// Refusal preserves all source and destination slots; no Root is acquired.
+    pub fn prepare_background_action_in(
+        &self,
+        owner: &Option<WorkOwner>,
+        context: &mut Option<crate::admitted_query_context::QueryExecutionContext>,
+        permit: &mut Option<novarocks_workload_control::QueryConcurrencyPermit>,
+        payload: &mut Option<novarocks_workload_control::joint_admission::RetainedPayloadGrant>,
+        action: &mut Option<Box<dyn crate::session_control::GovernedBackgroundAction>>,
+        destination: &mut Option<crate::coordination::OriginalBackgroundActionInput>,
+    ) -> Result<(), QueryExecutionError> {
+        self.driver.prepare_background_action_in(
+            owner,
+            context,
+            permit,
+            payload,
+            action,
+            destination,
+        )
+    }
+    /// Move the original Root into the same bank. Finish the returned tail only
+    /// after every publisher lock exits and both receivers are stable.
+    pub fn start_background_action_in(
+        &self,
+        input: &mut Option<crate::coordination::OriginalBackgroundActionInput>,
+        owner: &mut Option<WorkOwner>,
+        ready: &mut Option<crate::session_control::BackgroundActionReady>,
+        exit: &mut Option<LogicalExecutionExitObserver>,
+    ) -> Result<LogicalExecutionStartAttempt, QueryExecutionError> {
+        self.driver
+            .start_background_action_in(input, owner, ready, exit)
     }
     pub fn start(&self, request: QueryExecutionRequest, owner: WorkOwner) -> QueryExecutionFuture {
         self.driver.start(request, owner, None)

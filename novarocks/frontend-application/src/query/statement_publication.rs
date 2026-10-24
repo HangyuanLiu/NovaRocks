@@ -36,6 +36,12 @@ use novarocks_spi::connector::{
 };
 use std::task::{Context, Poll};
 
+/// Borrowed exact effect of the original committed business fact.
+pub(crate) enum CommittedWriteEffect<'a> {
+    Applied(&'a novarocks_spi::connector::ConnectorWriteReceipt),
+    NoOp,
+}
+
 pub(crate) struct StatementPublication {
     pub(crate) attempt: DmlPublicationAttempt,
     pub(crate) call: Option<WritePublicationCall>,
@@ -233,6 +239,31 @@ impl StatementPublication {
         }
         Poll::Ready(())
     }
+    /// None means no committed fact; only the actual NoOp variant means no effect.
+    pub(crate) fn committed_effect(&self) -> Option<CommittedWriteEffect<'_>> {
+        let needed =
+            self.needed
+                .as_deref()
+                .or_else(|| match (&self.outcome, &self.abort_outcome) {
+                    (
+                        Some(Ok(ConnectorWritePublicationCompletion::KnownCommitted {
+                            needed,
+                            ..
+                        })),
+                        _,
+                    ) => Some(needed.as_ref()),
+                    (_, Some(Ok(ConnectorWriteAbortOutcome::KnownCommitted { needed, .. }))) => {
+                        Some(needed.as_ref())
+                    }
+                    _ => None,
+                })?;
+        Some(match needed.effect() {
+            novarocks_spi::connector::ExternalMutationEffect::Applied => {
+                CommittedWriteEffect::Applied(needed.receipt())
+            }
+            novarocks_spi::connector::ExternalMutationEffect::NoOp => CommittedWriteEffect::NoOp,
+        })
+    }
     pub(crate) fn committed(&self) -> bool {
         self.disposition() == Some(LakePublicationDisposition::KnownCommitted)
     }
@@ -261,10 +292,9 @@ impl StatementPublication {
             Some(Ok(ConnectorWriteAbortOutcome::CommitUnknown { failure, .. })) => {
                 Err(internal_error(failure.message()))
             }
-            Some(Ok(ConnectorWriteAbortOutcome::KnownCommitted {
-                finalization: ExternalMutationFinalization::Failed(failure),
-                ..
-            })) => Err(internal_error(failure.message())),
+            Some(Ok(ConnectorWriteAbortOutcome::KnownCommitted { needed, .. })) => {
+                select_needed_publication(needed, self.local_finalization.as_ref(), cancellation)
+            }
             _ => cancellation.map(cancellation_error).map_or(Ok(()), Err),
         }
     }
@@ -309,8 +339,8 @@ impl StatementPublication {
                     })),
                     _,
                 ) => Some(needed.finalization()),
-                (_, Some(Ok(ConnectorWriteAbortOutcome::KnownCommitted { finalization, .. }))) => {
-                    Some(finalization)
+                (_, Some(Ok(ConnectorWriteAbortOutcome::KnownCommitted { needed, .. }))) => {
+                    Some(needed.finalization())
                 }
                 _ => None,
             });
@@ -563,5 +593,177 @@ mod tests {
                 .is_ready()
         );
         assert_eq!(fixture.recorded.lock().unwrap().abort, 1);
+    }
+    #[test]
+    fn original_abort_call_preserves_exact_applied_or_noop_fact() {
+        use novarocks_spi::connector::ExternalMutationEffect;
+        for effect in [
+            ExternalMutationEffect::Applied,
+            ExternalMutationEffect::NoOp,
+        ] {
+            let fixture = fixture_with_outcome(1, 16, known_committed());
+            let ExternalMutationOutcome::KnownCommitted {
+                receipt,
+                finalization,
+                ..
+            } = known_committed()
+            else {
+                panic!("actual scripted committed fact");
+            };
+            let needed = Arc::new(ConnectorWriteNeededReady::new(
+                effect,
+                receipt,
+                finalization,
+            ));
+            fixture.recorded.lock().unwrap().abort_outcome =
+                Some(ConnectorWriteAbortOutcome::KnownCommitted {
+                    needed: Arc::clone(&needed),
+                    cleanup:
+                        novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(
+                            ExternalMutationFinalization::Complete,
+                        ),
+                });
+            let mut publication = StatementPublication::new(original_attempt());
+            assert!(publication.committed_effect().is_none());
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(
+                publication
+                    .poll_settle(Some(&fixture.session), &request_context(), true, &mut cx)
+                    .is_ready()
+            );
+            let Some(Ok(ConnectorWriteAbortOutcome::KnownCommitted {
+                needed: returned, ..
+            })) = &publication.abort_outcome
+            else {
+                panic!("actual original abort Call result");
+            };
+            assert!(Arc::ptr_eq(&needed, returned));
+            match (effect, publication.committed_effect()) {
+                (ExternalMutationEffect::Applied, Some(CommittedWriteEffect::Applied(receipt))) => {
+                    assert!(std::ptr::eq(receipt, needed.receipt()));
+                    assert!(
+                        publication
+                            .select(Some(QueryCancellationReason::ClientDisconnected))
+                            .is_ok()
+                    );
+                }
+                (ExternalMutationEffect::NoOp, Some(CommittedWriteEffect::NoOp)) => {
+                    assert!(
+                        publication
+                            .select(Some(QueryCancellationReason::ClientDisconnected))
+                            .is_err()
+                    );
+                }
+                _ => panic!("exact effect erased"),
+            }
+            publication.freeze_terminal().unwrap();
+            assert!(publication.poll_retirement(&mut cx).is_ready());
+            assert!(
+                publication
+                    .poll_settle(Some(&fixture.session), &request_context(), true, &mut cx)
+                    .is_ready()
+            );
+            assert_eq!(fixture.recorded.lock().unwrap().abort, 1);
+            assert_eq!(fixture.recorded.lock().unwrap().finish, 0);
+        }
+    }
+
+    #[test]
+    fn direct_provider_release_keeps_pending_until_same_original_gc_exits() {
+        use crate::query_execution::write_result::DecodedPreparedWriteSet;
+        use novarocks_spi::connector::write_stack::ConnectorWriteCleanupState;
+        use novarocks_spi::connector::{
+            ConnectorMetadataCleanupResponsibility, ExternalMutationEffect,
+        };
+        use std::future::Future;
+        for effect in [
+            ExternalMutationEffect::Applied,
+            ExternalMutationEffect::NoOp,
+        ] {
+            let (_control, root, binding, _capacity) =
+                crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+            let ExternalMutationOutcome::KnownCommitted {
+                receipt,
+                finalization,
+                cleanup,
+                ..
+            } = known_committed()
+            else {
+                unreachable!()
+            };
+            let fixture = fixture_with_outcome(
+                1,
+                16,
+                ExternalMutationOutcome::KnownCommitted {
+                    effect,
+                    receipt,
+                    finalization,
+                    cleanup,
+                },
+            );
+            fixture
+                .session
+                .accumulate(DecodedPreparedWriteSet::for_test(
+                    7,
+                    vec![(
+                        WriteTargetOrdinal::try_new(0).unwrap(),
+                        commit_fragment_bytes(),
+                    )],
+                ))
+                .unwrap();
+            {
+                let mut state = fixture.recorded.lock().unwrap();
+                state.defer_finish_cleanup = true;
+                state.enforce_cleanup_responsibility = true;
+            }
+            let context = request_context();
+            let mut publication = StatementPublication::new(original_attempt());
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(
+                publication
+                    .poll_settle(Some(&fixture.session), &context, false, &mut cx)
+                    .is_ready()
+            );
+            let needed = Arc::clone(publication.needed.as_ref().unwrap());
+            assert_eq!(needed.effect(), effect);
+            assert_eq!(
+                fixture.session.cleanup_responsibility().unwrap(),
+                ConnectorMetadataCleanupResponsibility::Retained
+            );
+            let mut release = std::pin::pin!(fixture.release_provider_direct(context.clone()));
+            let Poll::Ready(Ok(ConnectorWriteAbortOutcome::KnownCommitted {
+                needed: released,
+                cleanup,
+            })) = release.as_mut().poll(&mut cx)
+            else {
+                panic!("actual provider release result");
+            };
+            assert!(Arc::ptr_eq(&needed, &released));
+            assert!(matches!(cleanup, ConnectorWriteCleanupState::Pending));
+            assert!(publication.poll_retirement(&mut cx).is_pending());
+            assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
+            fixture.recorded.lock().unwrap().allow_cleanup_exit = true;
+            assert!(publication.poll_retirement(&mut cx).is_ready());
+            let mut release = std::pin::pin!(fixture.release_provider_direct(context.clone()));
+            let Poll::Ready(Ok(ConnectorWriteAbortOutcome::KnownCommitted {
+                needed: released,
+                cleanup,
+            })) = release.as_mut().poll(&mut cx)
+            else {
+                panic!("actual provider release result");
+            };
+            assert!(Arc::ptr_eq(&needed, &released));
+            assert!(matches!(
+                cleanup,
+                ConnectorWriteCleanupState::Observed(ExternalMutationFinalization::Complete)
+            ));
+            assert_eq!(
+                fixture.session.cleanup_responsibility().unwrap(),
+                ConnectorMetadataCleanupResponsibility::Disposed
+            );
+            assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
+            drop(binding);
+            root.owner.complete();
+        }
     }
 }

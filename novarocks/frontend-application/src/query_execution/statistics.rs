@@ -23,6 +23,7 @@
 //! validates the Root result stream before the provider session may finish.
 
 pub(crate) mod completion;
+pub(crate) mod preparation;
 
 use novarocks_native_adapter::root_record_assembly::{RootRecordAssembly, RootRecordDomain};
 use std::collections::{BTreeMap, BTreeSet};
@@ -344,9 +345,7 @@ pub fn prepare_completed_statistics_collection(
     program: StatisticsCollectionProgram,
     planning_lease: ConnectorControlPlanningLease,
 ) -> Result<DistributedQueryRequest, DistributedQueryError> {
-    use novarocks_query_application::preparation::{
-        CompletedPhysicalPlanCandidate, CompletedPlanWithAccess, ReadAccessSink,
-    };
+    use novarocks_query_application::preparation::ReadAccessSink;
 
     let CompletedStatisticsPlanningServices {
         typed_connector_control,
@@ -354,39 +353,8 @@ pub fn prepare_completed_statistics_collection(
         constant_policy,
         static_plan_carrier,
     } = services;
-    let live = execution.topology().targets().len();
-    if live == 0 {
-        return Err(DistributedQueryError::new(
-            DistributedQueryErrorKind::Rejected,
-            "statistics collection requires at least one live backend",
-        ));
-    }
-    if planning_lease.binding().descriptor().instance_id != *program.table().owner() {
-        return Err(contract_violation(
-            "statistics collection planning lease does not own its resolved table handle",
-        ));
-    }
-    if planning_lease.binding().descriptor().instance_id.as_str() != identity.catalog {
-        return Err(contract_violation(format!(
-            "statistics collection of `{}` was planned through connector instance `{}`",
-            identity.fqn(),
-            planning_lease.binding().descriptor().instance_id.as_str()
-        )));
-    }
-    let bindings = Arc::new(
-        crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()
-            .map_err(contract_violation)?,
-    );
-    let binding =
-        admit_statistics_scan_binding(bindings.as_ref(), identity, &program, planning_lease)?;
-    let scan = novarocks_sql::planning::dml::StatisticsConnectorScan {
-        binding,
-        catalog: identity.catalog.clone(),
-        namespace: identity.namespace.clone(),
-        table: identity.table.clone(),
-        version_ordinal: program.read_version_ordinal(),
-        columns: program.scan_columns(),
-    };
+    let (bindings, scan) =
+        preparation::prepare_statistics_scan(execution, identity, &program, planning_lease)?;
 
     // Freeze the read. The capability this leaves is deposited as it is taken,
     // so the plan and what performs its read are accounted for together.
@@ -408,95 +376,17 @@ pub fn prepare_completed_statistics_collection(
         .try_into_access()
         .map_err(|(error, _returned)| contract_violation(error.to_string()))?;
 
-    let completion_control =
-        crate::query_execution::planning::sql_compile_control_from_execution(execution);
-    let plan = novarocks_sql::planning::dml::build_final_statistics_connector_plan(
-        scan,
-        program.required_aggregations(),
-        functions,
-        execution.optimizer_settings(),
-        novarocks_sql::planning::dml::DmlFinalPlanContext::new(
-            crate::query_execution::physical_encoding::mint_plan_version(),
-            crate::query_execution::contract::completed_plan_dop_domain(None)
-                .map_err(contract_violation)?,
-            novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new([
-                novarocks_sql::planning::dml::DmlFinalizedProviderRead {
-                    fact,
-                    read_budget: statistics_scan_read_budget(),
-                },
-            ])
-            .map_err(contract_violation)?,
-        ),
-        execution
-            .sql_semantics()
-            .sql_mode()
-            .decimal_overflow_policy(),
-        execution.sql_semantics().sql_mode().allow_throw_exception(),
-        constant_policy,
-        &completion_control,
-    )
-    .map_err(DistributedQueryError::from_compile)?;
-    let version = plan.plan().version();
-    let candidate = CompletedPhysicalPlanCandidate::for_sql_program(plan, &completion_control)
-        .and_then(|candidate| {
-            candidate.freeze_root_output(
-                novarocks_result_contract::FrozenRootOutput::InternalFacts(
-                    novarocks_result_contract::InternalResultDomain::StatisticsArtifactV1,
-                ),
-            )
-        })
-        .map_err(|error| contract_violation(error.to_string()))?;
-    let output =
-        novarocks_query_application::preparation::OutputContract::from_completed_candidate(
-            novarocks_query_application::api::QueryExecutionKind::Statistics,
-            &candidate,
-        )
-        .map_err(contract_violation)?;
-    let paired = CompletedPlanWithAccess::try_pair(candidate, access)
-        .map_err(|(error, _returned)| contract_violation(error.to_string()))?;
-    let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
-        paired,
-        static_plan_carrier,
-        constant_policy,
-        None,
-        &completion_control,
-    )
-    .map_err(DistributedQueryError::from_encode)?;
-    let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
-    let description =
-        novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
-            novarocks_query_application::api::QueryExecutionKind::Statistics,
-            candidate,
-            template
-                .attempt_scheduling_facts()
-                .map_err(contract_violation)?
-                .fragments
-                .iter()
-                .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
-                .collect(),
-            output,
-            novarocks_coordination_contract::ExecutionEffect::None,
-            novarocks_coordination_contract::RecoveryMode::NoRecovery,
-            Vec::new(),
-            novarocks_query_application::preparation::FrozenCostEstimate::unknown(
-                novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
-            ),
-            novarocks_query_application::preparation::ExecutionResourceRequirements::unknown(
-                novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
-            ),
-        )
-        .map_err(contract_violation)?;
-    let options = crate::query_execution::contract::synthetic_statement_query_options(execution);
-    crate::query_execution::contract::build_request_from_finalized_execution(
-        crate::query_execution::post_compile::FinalizedDistributedExecution::for_completed_plan(
-            description,
-            template,
-        ),
-        Some(options),
-        crate::query_execution::contract::DistributedQueryIntent::Statistics,
+    let assembly = preparation::build_statistics_assembly(
         execution,
-        Some(program),
-    )
+        scan,
+        fact,
+        access,
+        program,
+        functions,
+        constant_policy,
+        static_plan_carrier,
+    )?;
+    assembly.into_legacy_request(execution)
 }
 
 /// How much one collection's scan may return in a batch.

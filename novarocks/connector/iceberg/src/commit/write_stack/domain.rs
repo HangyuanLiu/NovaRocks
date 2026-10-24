@@ -1754,7 +1754,8 @@ pub struct IcebergCommitHandle {
         BTreeMap<WriteTargetOrdinal, Vec<novarocks_spi::connector::StatisticsArtifactIdentity>>,
     document_records: std::sync::Mutex<Option<BTreeMap<String, String>>>,
     terminal_finalization: std::sync::Mutex<novarocks_spi::connector::ExternalMutationFinalization>,
-    terminal_cleanup: std::sync::Mutex<novarocks_spi::connector::ExternalMutationFinalization>,
+    terminal_cleanup:
+        std::sync::Mutex<novarocks_spi::connector::write_stack::ConnectorWriteCleanupState>,
     recovery_evidence:
         Arc<std::sync::Mutex<Option<novarocks_spi::connector::ExternalMutationEvidence>>>,
     // The original session retains the actual operation and journal before
@@ -1839,7 +1840,9 @@ pub enum IcebergWriteSessionState {
     /// A commit is in flight. A second terminal call must not start another.
     Committing,
     /// The external commit is proven to have happened.
-    KnownCommitted { snapshot_id: Option<i64> },
+    KnownCommitted {
+        needed: Arc<novarocks_spi::connector::write_stack::ConnectorWriteNeededReady>,
+    },
     /// The prepared write set was sealed into a receipt and no external commit
     /// was attempted. Only a staged-create session reaches this: the single
     /// external effect belongs to the publication that owns the staged target,
@@ -2017,7 +2020,7 @@ impl IcebergCommitHandle {
                 novarocks_spi::connector::ExternalMutationFinalization::Complete,
             ),
             terminal_cleanup: std::sync::Mutex::new(
-                novarocks_spi::connector::ExternalMutationFinalization::Complete,
+                novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Pending,
             ),
             recovery_evidence: Arc::new(std::sync::Mutex::new(None)),
             publication: std::sync::Mutex::new(None),
@@ -2435,6 +2438,7 @@ impl IcebergCommitHandle {
     }
 
     pub(crate) fn record_empty_cleanup_disposed(&self) {
+        self.retain_cleanup(novarocks_spi::connector::ExternalMutationFinalization::Complete);
         self.empty_cleanup_disposed
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -2557,14 +2561,17 @@ impl IcebergCommitHandle {
                 .terminal_cleanup
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            std::mem::replace(&mut *current, result)
+            std::mem::replace(
+                &mut *current,
+                novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(result),
+            )
         };
         drop(retired);
     }
 
     pub(crate) fn terminal_cleanup(
         &self,
-    ) -> novarocks_spi::connector::ExternalMutationFinalization {
+    ) -> novarocks_spi::connector::write_stack::ConnectorWriteCleanupState {
         self.terminal_cleanup
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2899,7 +2906,16 @@ mod tests {
         assert!(handle.begin_commit().is_err());
         handle
             .settle(IcebergWriteSessionState::KnownCommitted {
-                snapshot_id: Some(7),
+                needed: Arc::new(
+                    novarocks_spi::connector::write_stack::ConnectorWriteNeededReady::new(
+                        novarocks_spi::connector::ExternalMutationEffect::Applied,
+                        crate::write_codec::connector_write_receipt_with_partitioning(
+                            7, None, None,
+                        )
+                        .expect("actual fixture receipt"),
+                        novarocks_spi::connector::ExternalMutationFinalization::Complete,
+                    ),
+                ),
             })
             .expect("settle");
         assert!(handle.begin_commit().is_err());

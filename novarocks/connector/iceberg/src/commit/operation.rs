@@ -305,6 +305,20 @@ impl IcebergCommitOperation {
         self.cleanup_records(records, &self.inner.request).await
     }
 
+    /// Same selected ledger and cleanup algorithm, borrowing the original
+    /// action's current settlement context. Caller must prove uncommitted.
+    pub(crate) async fn cleanup_in(
+        &self,
+        scope: CleanupScope,
+        current: &ConnectorRequestContext,
+    ) -> IcebergCleanupReport {
+        let records = match self.inner.ledger.lock() {
+            Ok(ledger) => ledger.selected(scope),
+            Err(_) => return IcebergCleanupReport::NotAttempted,
+        };
+        self.cleanup_records(records, current).await
+    }
+
     /// Only a known committed request authorizes deletion of unreachable owned objects.
     /// Physical identity is used here: a carried blob keeps its entire shared Puffin alive.
     pub(crate) async fn cleanup_after_commit(

@@ -115,6 +115,7 @@ pub enum WorkError {
     ForeignAuthority,
     Cancelled(CancellationReason),
     Capacity(&'static str),
+    JointCapacity(joint_admission::JointCapacityFailure),
     /// Only this capacity wait expired; the logical work remains active.
     CapacityWaitTimeout,
     AlreadyAdmitted,
@@ -134,6 +135,11 @@ impl std::fmt::Display for WorkError {
             Self::ForeignAuthority => f.write_str("Scope belongs to a different local authority"),
             Self::Cancelled(reason) => write!(f, "Work is cancelled: {reason:?}"),
             Self::Capacity(resource) => write!(f, "Work capacity exhausted: {resource}"),
+            Self::JointCapacity(cause) => write!(
+                f,
+                "Work capacity exhausted: joint protected intersections [resource={:?}, projection={:?}, constraint={:?}]",
+                cause.resource, cause.projection, cause.constraint,
+            ),
             Self::CapacityWaitTimeout => f.write_str("Capacity wait deadline exceeded"),
             Self::AlreadyAdmitted => f.write_str("Work already holds or awaits this stage"),
             Self::AlreadyWaitingForResource(class) => {

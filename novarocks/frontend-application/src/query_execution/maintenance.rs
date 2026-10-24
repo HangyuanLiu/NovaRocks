@@ -26,6 +26,8 @@ use std::sync::Arc;
 mod action_state;
 pub mod command;
 pub(crate) mod io_admission;
+pub(crate) mod rewrite_computation;
+pub(crate) mod rewrite_preparation;
 pub use action_state::MaintenanceActionState;
 pub(crate) mod iceberg;
 #[cfg(test)]
@@ -107,6 +109,39 @@ impl PreparedDistributedRewriteCohort {
         })
     }
 
+    /// Consume this exact frozen cohort through the common governed Write
+    /// consumer. Its receiving port appends once to this SAME session; the
+    /// returned Ready is not an input to legacy accumulate(prepared).
+    pub(crate) fn prepare_computation(
+        self,
+        initial: crate::query_execution::logical_execution::InitialComputationReservation,
+        runtime: crate::query_execution::internal_consumer::decoded::DecodedConsumerRuntime,
+    ) -> Result<
+        (
+            crate::query_execution::logical_execution::PreparedLogicalComputation,
+            novarocks_query_application::api::ReservedExecutionIdentity,
+            crate::query_execution::internal_consumer::write::WriteComputationOutput,
+        ),
+        novarocks_query_application::api::QueryExecutionError,
+    > {
+        let options =
+            crate::query_execution::contract::synthetic_statement_query_options(&self.execution);
+        crate::query_execution::internal_consumer::write::prepare_write_computation(
+            self.description,
+            self.template,
+            Arc::new(
+                crate::query_execution::contract::ResolvedQueryOptions::from_upstream(Some(
+                    options,
+                )),
+            ),
+            self.write_session,
+            initial,
+            runtime,
+        )
+    }
+
+    /// Explicit legacy entry for product callers not yet mounted on the
+    /// governed background Source. No governed adapter calls this method.
     /// Submit the sealed connector write.
     pub fn finish(
         self,
@@ -1524,6 +1559,52 @@ fn prepare_frozen_rewrite_cohort_with_ports(
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &novarocks_sql::compiler::SqlCompileControl,
 ) -> Result<PreparedDistributedRewriteCohort, novarocks_sql::compiler::SqlCompileError> {
+    let recipe = prepare_rewrite_cohort_recipe(session, cohort_id, execution, context)?;
+    let connector_session = crate::query_execution::compiler::typed_connector_session()?;
+    let sink_access = novarocks_query_application::preparation::ReadAccessSink::new();
+    let fact = crate::query_execution::provider_read_facts::freeze_one_read(
+        &recipe.need,
+        typed_connector_control.as_ref(),
+        recipe.bindings.as_ref(),
+        &connector_session,
+        context,
+        &sink_access.deposits(),
+    )?;
+    let access = sink_access
+        .try_into_access()
+        .map_err(|(e, _)| e.to_string())?;
+    let parts = freeze_rewrite_cohort_recipe(
+        &recipe,
+        fact,
+        &access,
+        function_catalog,
+        static_plan_carrier,
+        constant_policy,
+        control,
+    )?;
+    finish_rewrite_cohort_recipe(&recipe, parts, access, query_execution)
+}
+
+pub(super) struct RewriteCohortRecipe {
+    bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
+    physical_plan: novarocks_sql::planning::query_execution::FrozenConnectorScanPlan,
+    sink: novarocks_sql::planning::dml::DmlWritePlanInput,
+    need: novarocks_sql::compiler::ProviderReadNeed,
+    session: crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
+    cohort_id: ConnectorWriteCohortId,
+    execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
+}
+struct RewriteCohortPlanParts {
+    encoded: crate::query_execution::physical_encoding::PreparedStaticPlan,
+    description: novarocks_query_application::preparation::FrozenExecutionDescription,
+    version: novarocks_physical_plan::PlanVersionId,
+}
+fn prepare_rewrite_cohort_recipe(
+    session: &crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
+    cohort_id: ConnectorWriteCohortId,
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<RewriteCohortRecipe, novarocks_sql::compiler::SqlCompileError> {
     let cohort = session
         .plan()
         .cohorts()
@@ -1612,10 +1693,6 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
         )?;
     crate::connector::validate_request_context(context)?;
-    let optimizer_settings = execution.optimizer_settings().clone();
-    let write_session = session
-        .write_session()
-        .ok_or_else(|| "distributed rewrite no-op has no write session".to_string())?;
 
     // Freeze the read. The capability it leaves is deposited as it is taken,
     // so the plan and what performs its read are accounted for together.
@@ -1624,20 +1701,37 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         cohort.scan_execution_schema(),
         &cohort_read,
     )?;
-    let connector_session = crate::query_execution::compiler::typed_connector_session()?;
-    let sink_access = novarocks_query_application::preparation::ReadAccessSink::new();
-    let read_fact = crate::query_execution::provider_read_facts::freeze_one_read(
-        &need,
-        typed_connector_control.as_ref(),
-        table_bindings.as_ref(),
-        &connector_session,
-        context,
-        &sink_access.deposits(),
-    )?;
-    let access = sink_access
-        .try_into_access()
-        .map_err(|(error, _returned)| error.to_string())?;
+    Ok(RewriteCohortRecipe {
+        bindings: table_bindings,
+        physical_plan,
+        sink,
+        need,
+        session: session.clone(),
+        cohort_id,
+        execution: execution.clone(),
+    })
+}
 
+fn freeze_rewrite_cohort_recipe(
+    recipe: &RewriteCohortRecipe,
+    read_fact: novarocks_sql::compiler::ProviderReadFact,
+    access: &novarocks_query_application::preparation::FinalPlanRuntimeAccess<
+        crate::query_execution::provider_read_facts::FrozenProviderRead,
+    >,
+    function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
+    static_plan_carrier: &crate::query_execution::package_freeze::CompiledPackageCarrier,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &novarocks_sql::compiler::SqlCompileControl,
+) -> Result<RewriteCohortPlanParts, novarocks_sql::compiler::SqlCompileError> {
+    let session = &recipe.session;
+    let execution = &recipe.execution;
+    let write_session = session
+        .write_session()
+        .ok_or("rewrite no-op has no write session")?;
+    let write_target = session
+        .write_target(recipe.cohort_id)
+        .map_err(|e| e.to_string())?;
+    let optimizer_settings = execution.optimizer_settings().clone();
     // The handle the plan states is the same one the session sealed, encoded
     // as the payload a plan carries rather than as the wire form the encoder
     // stamps. Both come from this session's own handle encoder, so a plan
@@ -1656,8 +1750,8 @@ fn prepare_frozen_rewrite_cohort_with_ports(
     };
 
     let plan = novarocks_sql::planning::dml::build_final_frozen_connector_write_plan(
-        physical_plan,
-        sink,
+        recipe.physical_plan.clone(),
+        recipe.sink.clone(),
         write_target.ordinal(),
         write_target.statistics().requirements(),
         function_catalog.clone(),
@@ -1701,26 +1795,72 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             )
         })
         .map_err(|error| error.to_string())?;
-    let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
-        candidate, access,
-    )
-    .map_err(|(error, _returned)| error.to_string())?;
-    let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
-        paired,
+    let encoded = crate::query_execution::physical_encoding::encode_completed_write_plan_borrowed(
+        candidate,
+        access,
         static_plan_carrier,
         constant_policy,
-        Some(&write_target_facts),
+        &write_target_facts,
         control,
     )
     .map_err(crate::query_execution::mv_native_write::encode_compile_error)?;
-    PreparedDistributedRewriteCohort::new(
+    // Every fallible pairing/description check still borrows the unique access
+    // held in the original CPU Source. The final receiving step only moves it.
+    let encoded = encoded
+        .prepare_access(access)
+        .map_err(crate::query_execution::mv_native_write::encode_compile_error)?;
+    let scheduling = encoded.scheduling_facts(version)?;
+    let description =
+        novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
+            novarocks_query_application::api::QueryExecutionKind::Write,
+            encoded.candidate().clone(),
+            scheduling
+                .fragments
+                .iter()
+                .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
+                .collect(),
+            novarocks_query_application::preparation::OutputContract::CompletionOnly,
+            novarocks_coordination_contract::ExecutionEffect::External,
+            novarocks_coordination_contract::RecoveryMode::NoRecovery,
+            Vec::new(),
+            novarocks_query_application::preparation::FrozenCostEstimate::unknown(
+                novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+            ),
+            novarocks_query_application::preparation::ExecutionResourceRequirements::unknown(
+                novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+            ),
+        )?;
+    Ok(RewriteCohortPlanParts {
         encoded,
+        description,
         version,
-        query_execution.clone(),
-        execution.clone(),
-        write_session.clone(),
-    )
-    .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
+    })
+}
+
+fn finish_rewrite_cohort_recipe(
+    recipe: &RewriteCohortRecipe,
+    parts: RewriteCohortPlanParts,
+    access: novarocks_query_application::preparation::FinalPlanRuntimeAccess<
+        crate::query_execution::provider_read_facts::FrozenProviderRead,
+    >,
+    query_execution: &crate::query_execution::service::QueryExecutionService,
+) -> Result<PreparedDistributedRewriteCohort, novarocks_sql::compiler::SqlCompileError> {
+    // Same access was already checked by prepare_access; bind is infallible.
+    let template = parts
+        .encoded
+        .bind_access(access)
+        .into_attempt_template(parts.version);
+    Ok(PreparedDistributedRewriteCohort {
+        description: parts.description,
+        template,
+        query_execution: query_execution.clone(),
+        execution: recipe.execution.clone(),
+        write_session: recipe
+            .session
+            .write_session()
+            .expect("same non-noop Rewrite recipe")
+            .clone(),
+    })
 }
 
 /// How much one rewrite cohort's scan may return in a batch.

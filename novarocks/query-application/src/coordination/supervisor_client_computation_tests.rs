@@ -513,8 +513,7 @@ mod client_computation_tests {
                     {
                         Err(failure) => {
                             eprintln!("Client held activity finite P=1 probe: {failure:?}");
-                            if failure.error != WorkError::Capacity("joint protected intersections")
-                            {
+                            if !matches!(failure.error, WorkError::JointCapacity(_)) {
                                 return Err(ClientObservationFailure::Admission {
                                     phase: "held activity finite P=1 refusal",
                                     error: failure.error,

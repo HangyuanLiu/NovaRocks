@@ -121,6 +121,7 @@ pub(crate) struct FrozenProviderRead {
 /// name provider columns, and the two domains are what the provider said it
 /// would and would not enforce. Nothing downstream can recover them from the
 /// plan, so they are kept from the moment the read stops being negotiable.
+#[derive(Clone)]
 pub(crate) struct FrozenReadEncoding {
     /// Each provider column this read projects, paired with how the request
     /// named it. The plan addresses these columns by provider reference; what

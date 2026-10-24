@@ -220,6 +220,12 @@ enum Phase<R> {
     Unknown(Checked<R>, ConnectorMutationFailure),
 }
 impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
+    pub(crate) const fn retained_evidence_backing_bytes() -> usize {
+        // The original journal evidence plus ProcessLocalPayload's Arc<Arc<T>>.
+        std::mem::size_of::<RetainedJournalEvidence<R>>()
+            + std::mem::size_of::<Arc<RetainedJournalEvidence<R>>>()
+            + 2 * std::mem::size_of::<[usize; 2]>()
+    }
     pub(crate) const fn fixed_backing_bytes() -> usize {
         // Exactly one original Arc-backed empty journal state. Variable
         // entries and reports retain their original formation-point receipts.
@@ -494,7 +500,7 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
             .and_then(|key| state.entries.get(key))
             .map(|entry| entry.checked.clone())
     }
-    fn bind_preparation(&self, preparation: ConnectorRequestContext) -> Result<()> {
+    pub(super) fn bind_preparation(&self, preparation: ConnectorRequestContext) -> Result<()> {
         let mut state = self
             .state
             .lock()
@@ -818,6 +824,22 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
             }
         };
         drop(retired);
+    }
+
+    /// Absence of the actual cleanup report is not a completed cleanup.
+    /// A separately recorded failure is itself an actual observed diagnostic.
+    pub(crate) fn observed_entry_cleanup(
+        &self,
+        entry_ref: JournalEntryRef,
+    ) -> Option<ExternalMutationFinalization> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state.entries.get(&entry_ref.0)?;
+        (entry.cleanup_report.is_some()
+            || matches!(&entry.cleanup, ExternalMutationFinalization::Failed(_)))
+        .then(|| entry.cleanup.clone())
     }
 
     fn entry_cleanup(&self, entry_ref: JournalEntryRef) -> ExternalMutationFinalization {
@@ -1187,6 +1209,18 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
         operation: &IcebergCommitOperation,
         message: String,
     ) -> ExternalMutationOutcome<R> {
+        self.recover_bridge_in(operation, operation.request_context(), message)
+            .await
+    }
+    /// The source keeps the same journal and operation across local future
+    /// exit. Existing evidence selects cleanup rights; current grants no
+    /// publication or object ownership of its own.
+    pub(crate) async fn recover_bridge_in(
+        &self,
+        operation: &IcebergCommitOperation,
+        current: &ConnectorRequestContext,
+        message: String,
+    ) -> ExternalMutationOutcome<R> {
         let failure =
             ConnectorMutationFailure::new(ConnectorMutationFailureKind::Unavailable, message);
         match self.phase() {
@@ -1199,7 +1233,9 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                 evidence: self.retained_evidence(checked),
             },
             Phase::Committed(proof, checked, owner_finalization) => {
-                let cleanup = operation.cleanup_after_commit(&checked.retained).await;
+                let cleanup = operation
+                    .cleanup_after_commit_in(&checked.retained, current)
+                    .await;
                 let cleanup = if matches!(cleanup, IcebergCleanupReport::NotAttempted) {
                     remaining_after_bridge(operation, &checked.retained, failure.message())
                 } else {
@@ -1220,7 +1256,9 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                 }
             }
             Phase::Rejected(original, finalization) => {
-                let cleanup = operation.cleanup(CleanupScope::EntireOperation).await;
+                let cleanup = operation
+                    .cleanup_in(CleanupScope::EntireOperation, current)
+                    .await;
                 ExternalMutationOutcome::KnownUncommitted {
                     failure: original,
                     cleanup: merge_finalization(
@@ -1230,7 +1268,9 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
                 }
             }
             Phase::Undispatched | Phase::Ready | Phase::Waiting => {
-                let cleanup = operation.cleanup(CleanupScope::EntireOperation).await;
+                let cleanup = operation
+                    .cleanup_in(CleanupScope::EntireOperation, current)
+                    .await;
                 ExternalMutationOutcome::KnownUncommitted {
                     failure: failure.clone(),
                     cleanup: unconfirmed_cleanup_finalization(
@@ -1472,6 +1512,15 @@ impl<R: Clone + Send + Sync + 'static> Publisher for ObservedPublisher<R> {
         self.inner.preflight_recovery(request, operation)?;
         self.journal
             .bind_preparation(operation.request_context().clone())
+    }
+    fn preflight_recovery_in<'a>(
+        &'a self,
+        request: &'a mut Option<crate::commit::model::FrozenRequest>,
+        operation: &'a IcebergCommitOperation,
+    ) -> crate::commit::attempt::RecoveryPreflightFuture<'a> {
+        self.inner
+            .preflight_recovery_in(request, operation)
+            .bind_preparation(&self.journal, operation)
     }
     async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
         let preparation = self
@@ -2734,8 +2783,16 @@ mod tests {
             CommitProof::applied(None),
             ExternalMutationEffect::Applied,
         ));
+        assert!(
+            journal.observed_entry_cleanup(entry).is_none(),
+            "initial Complete is not an observed cleanup report"
+        );
         let exact = IcebergCleanupReport::Complete { deleted: 2 };
         journal.record_entry_cleanup_report(entry, exact.clone());
+        assert_eq!(
+            journal.observed_entry_cleanup(entry),
+            Some(ExternalMutationFinalization::Complete)
+        );
         assert!(journal.cleanup_is_complete());
         let absent = || Report {
             publication: PublicationOutcome::Committed(CommitProof::applied(None)),

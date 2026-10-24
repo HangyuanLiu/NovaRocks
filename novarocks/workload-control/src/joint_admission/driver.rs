@@ -851,7 +851,7 @@ impl JointProgressDriver {
             return JointProgress::More;
         }
         if !matches!(turn.preparation, Preparation::Ready) {
-            if let Err(error) = turn.prepare_one(&self.config.config) {
+            if let Err(error) = turn.prepare_one(&self.config) {
                 self.finish(turn, Err(error), false);
                 return JointProgress::More;
             }
@@ -875,10 +875,17 @@ impl JointProgressDriver {
                     };
                     match result {
                         Ok(Feasibility::Feasible) => turn.input = Some(proof.into_input()),
-                        Ok(Feasibility::Infeasible { .. }) => {
+                        Ok(Feasibility::Infeasible {
+                            coordinate,
+                            constraint,
+                        }) => {
                             self.finish(
                                 turn,
-                                Err(WorkError::Capacity("joint protected intersections")),
+                                Err(WorkError::JointCapacity(
+                                    super::JointCapacityFailure::from_coordinate(
+                                        coordinate, constraint,
+                                    ),
+                                )),
                                 true,
                             );
                             return JointProgress::More;
@@ -1034,7 +1041,7 @@ impl JointProgressDriver {
                     return fail_request(
                         state,
                         turn.id,
-                        WorkError::Capacity("joint protected intersections"),
+                        verdict.expect_err("an infeasible proof retains its exact refusal"),
                     );
                 }
                 let epoch = ledger.release_epoch;
@@ -1126,7 +1133,8 @@ impl Turn {
         self.records.push(record);
         Ok(())
     }
-    fn prepare_one(&mut self, config: &JointCapacityConfig) -> Result<(), WorkError> {
+    fn prepare_one(&mut self, validated: &ValidatedJointCapacityConfig) -> Result<(), WorkError> {
+        let config = &validated.config;
         match self.preparation {
             Preparation::Allocate => {
                 let per_record = std::mem::size_of::<SnapshotRecord>();
@@ -1240,9 +1248,19 @@ impl Turn {
                     self.pending_domain_limits
                         .push(u128::from(limits.per_dependency.0[index]));
                 } else {
+                    let finite = validated.finite_progress(projection, index)?;
+                    // A complete finite source needs one reserved increment,
+                    // not one copy for every causal dependency intersection.
+                    let external = limits.protected_progress.0[index]
+                        .checked_sub(finite)
+                        .ok_or(WorkError::Conflict)?;
+                    if finite > limits.global.0[index] || finite > limits.per_dependency.0[index] {
+                        return Err(WorkError::Conflict);
+                    }
                     self.input.as_mut().unwrap().limits.push(CoordinateLimit {
                         global: u128::from(limits.global.0[index]),
-                        protected_increment: u128::from(limits.protected_progress.0[index]),
+                        protected_increment: u128::from(external),
+                        finite_reserve: u128::from(finite),
                         domains: std::mem::take(&mut self.pending_domain_limits),
                     });
                     self.preparation = Preparation::Limits(coordinate + 1);

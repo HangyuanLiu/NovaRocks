@@ -365,7 +365,7 @@ fn refused_complete_proof_releases_uncommitted_edges_before_the_failed_ticket_ex
         let state = control.inner.state.lock().unwrap();
         assert!(matches!(
             state.joint.as_ref().unwrap().requests[&refused.id.unwrap()].phase,
-            RequestPhase::Failed(WorkError::Capacity("joint protected intersections"))
+            RequestPhase::Failed(WorkError::JointCapacity(_))
         ));
     }
     // Keep the failed ticket unconsumed while an independent original Q
@@ -375,7 +375,7 @@ fn refused_complete_proof_releases_uncommitted_edges_before_the_failed_ticket_ex
     assert!(matches!(
         Pin::new(&mut refused).poll(&mut Context::from_waker(Waker::noop())),
         Poll::Ready(Err(JointAdmissionFailure {
-            error: WorkError::Capacity("joint protected intersections")
+            error: WorkError::JointCapacity(_)
         }))
     ));
     drop(refused);

@@ -45,9 +45,21 @@ pub struct ConnectorOperationControlView {
     deadline: Instant,
     stop: ConnectorStopView,
 }
+const OPERATION_CANCELLED_DETAIL: &str = "connector operation was cancelled";
+const OPERATION_DEADLINE_DETAIL: &str = "connector operation deadline elapsed";
+
 impl ConnectorOperationControlView {
     pub const fn deadline(&self) -> Instant {
         self.deadline
+    }
+    /// One failed check creates one String from one of these closed literals.
+    /// This excludes the inline ConnectorError and grants no capacity.
+    pub const fn failure_backing_bytes() -> usize {
+        if OPERATION_CANCELLED_DETAIL.len() > OPERATION_DEADLINE_DETAIL.len() {
+            OPERATION_CANCELLED_DETAIL.len()
+        } else {
+            OPERATION_DEADLINE_DETAIL.len()
+        }
     }
 }
 impl ConnectorOperationControl for ConnectorOperationControlView {
@@ -63,13 +75,13 @@ fn check_operation_control(
     if stop.is_stopped() {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Cancelled,
-            "connector operation was cancelled",
+            OPERATION_CANCELLED_DETAIL,
         ));
     }
     if Instant::now() >= deadline {
         return Err(ConnectorError::new(
             ConnectorErrorKind::DeadlineExceeded,
-            "connector operation deadline elapsed",
+            OPERATION_DEADLINE_DETAIL,
         ));
     }
     Ok(())
@@ -1124,5 +1136,31 @@ mod tests {
         .expect("collection")
         .without_attempt_capabilities();
         assert!(ConnectorPlanningContext::try_from_request(projected).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod control_failure_geometry_tests {
+    use super::*;
+    #[test]
+    fn original_control_failure_strings_fit_their_actual_author_quote() {
+        let stopped = super::super::ConnectorStopOwner::new();
+        stopped.request_stop();
+        let cancelled = check_operation_control(
+            Instant::now() + std::time::Duration::from_secs(60),
+            &stopped.view(),
+        )
+        .unwrap_err();
+        let running = super::super::ConnectorStopOwner::new();
+        let deadline = check_operation_control(Instant::now(), &running.view()).unwrap_err();
+        assert_eq!(cancelled.kind(), ConnectorErrorKind::Cancelled);
+        assert_eq!(deadline.kind(), ConnectorErrorKind::DeadlineExceeded);
+        assert_eq!(cancelled.message(), OPERATION_CANCELLED_DETAIL);
+        assert_eq!(deadline.message(), OPERATION_DEADLINE_DETAIL);
+        for error in [cancelled, deadline] {
+            assert!(
+                error.message().len() <= ConnectorOperationControlView::failure_backing_bytes()
+            );
+        }
     }
 }

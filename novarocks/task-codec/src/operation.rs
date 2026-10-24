@@ -22,6 +22,8 @@
 //! atomicity, no shared revision, and no batch-global success, and this codec
 //! never collapses their outcomes.
 
+pub mod wire_size;
+
 use novarocks_execution_contract::operation::{
     DomainFailureOutcome, OperationDomainFailure, OperationResult,
 };
@@ -3449,7 +3451,7 @@ mod covered_wire_tests {
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
 
-    fn context_and_task() -> (QueryContextRef, TaskIdentity) {
+    pub(super) fn context_and_task() -> (QueryContextRef, TaskIdentity) {
         let execution =
             QueryExecutionId::new(QueryId::new(13, 14), AttemptId::new(1).unwrap()).unwrap();
         let backend = BackendProcessId::new_v7();
@@ -3648,3 +3650,7 @@ mod canonical_assignment_size_tests {
         assert!(check_canonical_assignment_size(&assignment, usize::MAX, budget, path).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "operation/wire_size_tests.rs"]
+mod wire_size_tests;

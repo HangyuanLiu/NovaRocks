@@ -463,13 +463,19 @@ impl NativeTransportSupervisor {
     ///
     /// Queue admission keeps one maximum encoded batch free in each lane's
     /// process window, so a retained head batch can always make this transition.
-    pub(crate) fn try_reserve_encoding(
+    /// Reserve the original run's exact protobuf bytes before its first DTO
+    /// clone/encoding. Invalid input is permanent; physical saturation alone
+    /// registers the same waiter and returns typed backpressure.
+    pub(crate) fn try_reserve_original_encoding(
         &self,
         waiter: &NativeTransportWaiter,
         target: BackendProcessId,
         lane: NativeTransportLane,
-    ) -> Result<NativeTransportEncodingPermit, NativeTransportBackpressure> {
-        let encoded_bytes = self.inner.budget.max_batch_encoded_bytes;
+        encoded_bytes: usize,
+    ) -> Result<NativeTransportEncodingPermit, NativeEncodingReservationFailure> {
+        if encoded_bytes == 0 || encoded_bytes > self.inner.budget.max_batch_encoded_bytes {
+            return Err(NativeEncodingReservationFailure::InvalidBytes);
+        }
         let mut state = self
             .inner
             .state
@@ -514,7 +520,7 @@ impl NativeTransportSupervisor {
             if state.waiters.contains_key(&waiter.id) {
                 state.waiting.insert(waiter.id);
             }
-            return Err(refused);
+            return Err(NativeEncodingReservationFailure::Backpressured(refused));
         }
         // As for queue admission, a success never clears a subscription an
         // earlier refusal registered.
@@ -536,6 +542,27 @@ impl NativeTransportSupervisor {
     }
 
     #[cfg(test)]
+    pub(crate) fn try_reserve_encoding(
+        &self,
+        waiter: &NativeTransportWaiter,
+        target: BackendProcessId,
+        lane: NativeTransportLane,
+    ) -> Result<NativeTransportEncodingPermit, NativeTransportBackpressure> {
+        match self.try_reserve_original_encoding(
+            waiter,
+            target,
+            lane,
+            self.inner.budget.max_batch_encoded_bytes,
+        ) {
+            Ok(permit) => Ok(permit),
+            Err(NativeEncodingReservationFailure::Backpressured(reason)) => Err(reason),
+            Err(NativeEncodingReservationFailure::InvalidBytes) => {
+                unreachable!("original configured maximum is valid")
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> NativeTransportSnapshot {
         let state = self
             .inner
@@ -550,6 +577,13 @@ impl NativeTransportSupervisor {
             waiting_attempts: state.waiting.len(),
         }
     }
+}
+
+/// The original encoder never turns a malformed invoice into a capacity wait.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NativeEncodingReservationFailure {
+    InvalidBytes,
+    Backpressured(NativeTransportBackpressure),
 }
 
 /// Why process transport refused a reservation.
@@ -871,6 +905,96 @@ mod tests {
         encoded.shrink_to(encoded_bytes);
         queued.mark_in_flight();
         (queued, encoded)
+    }
+
+    #[test]
+    fn actual_small_encoding_invoices_are_reserved_before_allocation_and_live_until_actual_drop() {
+        use novarocks_proto_models::novarocks as wire;
+        use prost::Message;
+        let supervisor = NativeTransportSupervisor::new(
+            NativeTransportSupervisorBudget::new(16, 1000, 1, 200, 4).unwrap(),
+        );
+        let target = BackendProcessId::new_v7();
+        let wake = Arc::new(CountingWake::default());
+        let waiter = supervisor.register_waiter(wake.clone()).unwrap();
+        let actual = wire::ApplyTaskOperationsRequest {
+            operations: vec![wire::TaskOperation {
+                envelope: Some(wire::TaskOperationEnvelope {
+                    operation_id: Some(wire::TaskOperationId {
+                        value: vec![0x71; 16],
+                    }),
+                    max_wait_millis: 1000,
+                }),
+                operation: Some(wire::task_operation::Operation::CreateTask(
+                    wire::CreateTaskRequest {
+                        frozen_fragment: bytes::Bytes::from_static(b"f"),
+                        creation_metadata: bytes::Bytes::from_static(b"m"),
+                    },
+                )),
+            }],
+        };
+        let plan = novarocks_native_adapter::native_codec::NativeUnaryEncodingPlan::for_original_operation(
+            actual.encoded_len(),
+        )
+        .unwrap();
+        let bytes = plan.protobuf_bytes();
+        assert_eq!(plan.retained_bytes(), bytes + 5);
+        assert!(bytes < supervisor.inner.budget.max_batch_encoded_bytes);
+        let unchanged = supervisor.snapshot();
+        for invalid in [0, supervisor.inner.budget.max_batch_encoded_bytes + 1] {
+            assert_eq!(
+                supervisor
+                    .try_reserve_original_encoding(
+                        &waiter,
+                        target,
+                        NativeTransportLane::Ordinary,
+                        invalid
+                    )
+                    .unwrap_err(),
+                NativeEncodingReservationFailure::InvalidBytes
+            );
+            assert_eq!(supervisor.snapshot(), unchanged);
+        }
+        assert_eq!(wake.0.load(Ordering::SeqCst), 0);
+        let mut queues = Vec::new();
+        let mut encodings = Vec::new();
+        for _ in 0..8 {
+            let mut queued = supervisor
+                .try_reserve_queue(&waiter, target, NativeTransportLane::Ordinary, 1, bytes)
+                .unwrap();
+            let encoding = supervisor
+                .try_reserve_original_encoding(
+                    &waiter,
+                    target,
+                    NativeTransportLane::Ordinary,
+                    bytes,
+                )
+                .unwrap();
+            assert_eq!(encoding.retained_bytes, bytes);
+            queued.mark_in_flight();
+            queues.push(queued);
+            encodings.push(encoding);
+        }
+        assert_eq!(supervisor.snapshot().retained_items, 8);
+        assert_eq!(
+            supervisor.snapshot().retained_queued_and_encoded_bytes,
+            16 * bytes
+        );
+        // The old maximum reservation would not admit these same held inputs.
+        assert!(
+            8 * (bytes + supervisor.inner.budget.max_batch_encoded_bytes)
+                > supervisor.inner.budget.max_encoded_bytes
+                    - supervisor.inner.budget.reserved_control_bytes
+        );
+        drop(queues);
+        assert_eq!(supervisor.snapshot().retained_items, 0);
+        assert_eq!(
+            supervisor.snapshot().retained_queued_and_encoded_bytes,
+            8 * bytes,
+            "queue exit does not fabricate encoding exit"
+        );
+        drop(encodings);
+        assert_eq!(supervisor.snapshot(), NativeTransportSnapshot::default());
     }
 
     #[test]

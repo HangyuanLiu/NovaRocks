@@ -347,6 +347,23 @@ impl IcebergMetadata {
 }
 
 impl ConnectorMetadata for IcebergMetadata {
+    fn provider_metadata_cpu_author(
+        &self,
+    ) -> Option<(
+        novarocks_spi::connector::ConnectorProviderBindingKey,
+        std::any::TypeId,
+    )> {
+        Some((
+            novarocks_spi::connector::ConnectorProviderBindingKey {
+                instance_id: self.descriptor.instance_id.clone(),
+                incarnation: self.incarnation,
+            },
+            std::any::TypeId::of::<
+                crate::catalog_control::statistics::scoped_cpu::IcebergMetadataCpuOriginal,
+            >(),
+        ))
+    }
+
     fn admit_table_job(
         &self,
         request: novarocks_spi::connector::ConnectorTableJobAdmissionRequest,
@@ -843,44 +860,53 @@ impl ConnectorMetadata for IcebergMetadata {
         })
     }
 
+    fn capture_table_object_binding_for_statistics_async(
+        &self,
+        request: ConnectorTableObjectCaptureRequest,
+        cpu: Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorTableObjectBinding, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self.statistics_table_object_binding_original(
+            request.table,
+            request.resolution,
+            request.selector,
+            request.context,
+            None,
+            cpu,
+        ))
+    }
+
+    fn rebind_table_object_binding_for_statistics_async(
+        &self,
+        request: ConnectorTableObjectRebindRequest,
+        cpu: Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorTableObjectBinding, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self.statistics_table_object_binding_original(
+            request.table,
+            request.resolution,
+            request.selector,
+            request.context,
+            Some(request.expected_object_id),
+            cpu,
+        ))
+    }
+
     fn prepare_table(
         &self,
         request: ConnectorTableRequest,
     ) -> novarocks_spi::connector::ConnectorTablePreparationFuture<'_> {
-        Box::pin(async move {
-            self.validate_context(&request.context)?;
-            self.ensure_owner(&request.table.instance_id)?;
-            let (table_name, metadata_table_type) =
-                resolve_table_request(&request.table.table, request.resolution)?;
-            self.runtime
-                .control_state()
-                .invalidate_table(&request.table.namespace, &table_name);
-            let loaded = self
-                .runtime
-                .observe_table_classified_for_request_with_snapshots_async(
-                    &request.table.namespace,
-                    &table_name,
-                    &request.context,
-                    if metadata_table_type.is_none() {
-                        crate::catalog::SnapshotLoading::Refs
-                    } else {
-                        crate::catalog::SnapshotLoading::All
-                    },
-                )
-                .await
-                .map_err(classified_control_error)?;
-            Ok(novarocks_spi::connector::ConnectorTablePreparation::new(
-                self.descriptor.instance_id.clone(),
-                IcebergPreparedTableFacts {
-                    request,
-                    loaded,
-                    table_name,
-                    metadata_table_type,
-                    incarnation: self.incarnation,
-                    generation_owner: Arc::clone(&self.generation_owner),
-                },
-            ))
-        })
+        Box::pin(self.prepare_table_original(request))
     }
 
     fn create_prepared_table(
@@ -954,7 +980,8 @@ impl ConnectorMetadata for IcebergMetadata {
     }
 }
 
-struct IcebergPreparedTableFacts {
+#[derive(Clone)]
+pub(crate) struct IcebergPreparedTableFacts {
     request: ConnectorTableRequest,
     loaded: crate::loaded_table::IcebergPhysicalTable,
     table_name: String,
@@ -964,6 +991,160 @@ struct IcebergPreparedTableFacts {
 }
 
 impl IcebergMetadata {
+    async fn statistics_table_object_binding_original(
+        &self,
+        table: ConnectorTableIdentity,
+        resolution: ConnectorTableResolution,
+        selector: ConnectorTableObjectSelector,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+        expected: Option<ConnectorTableObjectId>,
+        cpu: Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
+    ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
+        self.require_current_table_object_selector(selector)?;
+        let preparation = self
+            .prepare_table(ConnectorTableRequest {
+                table,
+                resolution,
+                context,
+            })
+            .await
+            .map_err(|error| {
+                if expected.is_some() && error.kind() == ConnectorErrorKind::NotFound {
+                    ConnectorError::table_object_binding(
+                        ConnectorTableObjectBindingFailure::Missing,
+                        "Iceberg table no longer resolves for its durable object binding",
+                    )
+                } else {
+                    error
+                }
+            })?;
+        // The one physical preparation is transferred, never cloned out of
+        // an opaque Any. The worker only borrows this stable typed source.
+        let facts =
+            preparation.into_facts::<IcebergPreparedTableFacts>(&self.descriptor.instance_id)?;
+        if facts.incarnation != self.incarnation
+            || !Arc::ptr_eq(&facts.generation_owner, &self.generation_owner)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Statistics table preparation belongs to another exact generation",
+            ));
+        }
+        let source =
+            crate::catalog_control::statistics::scoped_cpu::StatisticsCpuOriginal::metadata_binding(
+                self.clone(),
+                facts,
+                expected,
+            );
+        crate::catalog_control::statistics::scoped_cpu::run_binding(&cpu, &source).await?;
+        source.take_binding_result()
+    }
+    pub(crate) fn create_statistics_binding_borrowed(
+        &self,
+        facts: &IcebergPreparedTableFacts,
+        expected: &Option<ConnectorTableObjectId>,
+    ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
+        if facts.incarnation != self.incarnation
+            || !Arc::ptr_eq(&facts.generation_owner, &self.generation_owner)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Statistics table preparation belongs to another exact generation",
+            ));
+        }
+        let metadata = with_pure_schema_creation(&facts.request.context, |creation| {
+            self.create_table_from_observation(facts.clone(), creation)
+                .map_err(metadata_creation_error)
+        })?;
+        let binding = self.table_object_binding_from_metadata(metadata)?;
+        if expected.as_ref().is_some_and(|id| id != &binding.object_id) {
+            return Err(ConnectorError::table_object_binding(
+                ConnectorTableObjectBindingFailure::Replaced,
+                "Iceberg table no longer matches its durable object binding",
+            ));
+        }
+        Ok(binding)
+    }
+    async fn prepare_table_original(
+        &self,
+        request: ConnectorTableRequest,
+    ) -> Result<novarocks_spi::connector::ConnectorTablePreparation, ConnectorError> {
+        self.validate_context(&request.context)?;
+        self.ensure_owner(&request.table.instance_id)?;
+        let (table_name, metadata_table_type) =
+            resolve_table_request(&request.table.table, request.resolution)?;
+        self.runtime
+            .control_state()
+            .invalidate_table(&request.table.namespace, &table_name);
+        let loaded = self
+            .runtime
+            .observe_table_classified_for_request_with_snapshots_async(
+                &request.table.namespace,
+                &table_name,
+                &request.context,
+                if metadata_table_type.is_none() {
+                    crate::catalog::SnapshotLoading::Refs
+                } else {
+                    crate::catalog::SnapshotLoading::All
+                },
+            )
+            .await
+            .map_err(classified_control_error)?;
+        Ok(novarocks_spi::connector::ConnectorTablePreparation::new(
+            self.descriptor.instance_id.clone(),
+            IcebergPreparedTableFacts {
+                request,
+                loaded,
+                table_name,
+                metadata_table_type,
+                incarnation: self.incarnation,
+                generation_owner: Arc::clone(&self.generation_owner),
+            },
+        ))
+    }
+    pub(crate) fn statistics_read_preparation_bytes() -> Result<usize, ConnectorError> {
+        fn bytes<A, B, F>(_: fn(A, B) -> F) -> usize {
+            std::mem::size_of::<F>()
+        }
+        bytes(Self::prepare_table_original)
+            .checked_add(std::mem::size_of::<IcebergPreparedTableFacts>())
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "statistics preparation layout overflow",
+                )
+            })
+    }
+    pub(crate) fn statistics_read_metadata(
+        &self,
+        facts: &IcebergPreparedTableFacts,
+    ) -> Result<ConnectorTableMetadata, ConnectorError> {
+        if facts.incarnation != self.incarnation
+            || !Arc::ptr_eq(&facts.generation_owner, &self.generation_owner)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Statistics read preparation has a foreign exact generation",
+            ));
+        }
+        with_pure_schema_creation(&facts.request.context, |creation| {
+            self.create_table_from_observation(facts.clone(), creation)
+                .map_err(metadata_creation_error)
+        })
+    }
+    pub(crate) fn statistics_read_physical(
+        facts: &IcebergPreparedTableFacts,
+    ) -> &crate::iceberg::table::Table {
+        &facts.loaded.table
+    }
+    pub(crate) fn statistics_binding_future_bytes() -> usize {
+        fn bytes<A, B, C, D, E, F, G, H: std::future::Future>(
+            _: fn(A, B, C, D, E, F, G) -> H,
+        ) -> usize {
+            std::mem::size_of::<H>()
+        }
+        bytes(Self::statistics_table_object_binding_original)
+    }
     fn create_table_from_observation(
         &self,
         facts: IcebergPreparedTableFacts,

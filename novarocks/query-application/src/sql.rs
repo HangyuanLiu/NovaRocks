@@ -171,9 +171,19 @@ impl ProductCommandRouter {
         }
     }
 
-    /// The same closed product dispatcher selects the injected maintenance
-    /// author. The admitted caller publishes its result into its original
-    /// statement source before polling the action.
+    /// The closed product dispatcher selects the statistics author under the
+    /// admitted caller's original statement source.
+    pub fn prepare_statistics_statement_action(
+        &self,
+        command: StatisticsSqlCommand,
+        request_context: RequestContext,
+        command_context: CommandContext,
+    ) -> Result<Box<dyn crate::session_control::GovernedStatementAction>, crate::api::CommandError>
+    {
+        self.statistics
+            .prepare_statement_action(command, request_context, command_context)
+    }
+
     pub fn prepare_maintenance_statement_action(
         &self,
         command: MaintenanceSqlCommand,

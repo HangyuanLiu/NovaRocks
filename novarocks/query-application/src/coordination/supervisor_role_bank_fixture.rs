@@ -143,6 +143,12 @@ fn governance_empty() -> TestGovernance<impl Future<Output = Result<(), QueryExe
 fn governance_with_client_compute(
     client: bool,
 ) -> TestGovernance<impl Future<Output = Result<(), QueryExecutionError>> + Send> {
+    governance_with_query_limit(client, None)
+}
+fn governance_with_query_limit(
+    client: bool,
+    query_limit: Option<usize>,
+) -> TestGovernance<impl Future<Output = Result<(), QueryExecutionError>> + Send> {
     // This function pointer names the SAME actual opaque async factory. Quote
     // its real M too (a pointer here, not the production zero-sized item).
     let factory: TestRoleFactory<_> = make_logical_role;
@@ -294,7 +300,7 @@ fn governance_with_client_compute(
         WorkloadConfig {
             root_limit: count,
             business_limit: count,
-            query_concurrency_limit: slots[0],
+            query_concurrency_limit: query_limit.unwrap_or(slots[0]),
             scope_records_limit: count,
             ..WorkloadConfig::default()
         },

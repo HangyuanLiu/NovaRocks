@@ -505,7 +505,7 @@ fn first_bind_is_finite_under_one_bad_domain_and_preserves_healthy_progress() {
     else {
         panic!("a self-held first binding must fail rather than park");
     };
-    assert!(matches!(failure.error, WorkError::Capacity(_)));
+    assert!(matches!(failure.error, WorkError::JointCapacity(_)));
     assert_eq!(snapshot(&control), before);
     let mut request = first_bind(&handle, &c.owner, &healthy);
     drain(&mut driver);
@@ -848,7 +848,7 @@ fn control_union_refusal_is_finite_and_never_discards_its_old_domain() {
     assert!(matches!(
         std::pin::Pin::new(&mut extension).poll(&mut Context::from_waker(Waker::noop())),
         Poll::Ready(Err(crate::joint_admission::JointAdmissionFailure {
-            error: WorkError::Capacity(_)
+            error: WorkError::JointCapacity(_)
         }))
     ));
     assert_eq!(snapshot(&control), before);
@@ -1283,7 +1283,7 @@ fn refused_pool_proof_preserves_the_real_free_head_for_a_healthy_root() {
     assert!(matches!(
         std::pin::Pin::new(&mut rejected).poll(&mut Context::from_waker(Waker::noop())),
         Poll::Ready(Err(crate::joint_admission::JointAdmissionFailure {
-            error: WorkError::Capacity(_)
+            error: WorkError::JointCapacity(_)
         }))
     ));
     for child in children {
@@ -2542,7 +2542,7 @@ fn one_slot_progress_invoice_cannot_protect_a_healthy_root_and_its_child_on_shar
         assert!(matches!(
             std::pin::Pin::new(&mut child).poll(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Err(crate::joint_admission::JointAdmissionFailure {
-                error: WorkError::Capacity("joint protected intersections")
+                error: WorkError::JointCapacity(_)
             }))
         ));
         assert_eq!(

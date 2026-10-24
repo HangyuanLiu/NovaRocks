@@ -339,6 +339,110 @@ pub(crate) async fn build_cow_read_files_at_with_original_scope(
     observe_read_files::<FrozenCowDataFileProjection>(table, domain, None, Some(budget)).await
 }
 
+/// Same checked capture, with the exact complete delete observation retained
+/// before the original index consumes it. Rewrite must account for unattached
+/// live deletes as well as each data file's applicable load view.
+pub(crate) async fn build_rewrite_read_files_with_original_scope(
+    table: &Table,
+    snapshot_id: i64,
+    budget: &CaptureBudget<'_>,
+    all_deletes: &mut Vec<Arc<crate::delete_semantics::DeleteFact>>,
+) -> Result<Vec<IcebergReadFile>, ReadFailure> {
+    budget.active()?;
+    let metadata = table.metadata();
+    let snapshot = metadata
+        .snapshot_by_id(snapshot_id)
+        .ok_or_else(|| format!("snapshot {snapshot_id} not found"))?;
+    let schema = snapshot.schema(metadata).map_err(|e| e.to_string())?;
+    let serialized = budget.json(metadata)?;
+    budget.json_working(serialized)?;
+    let schema_bytes = budget.json(schema.as_ref())?;
+    budget.json_working(schema_bytes)?;
+    let domain = mint_read_domain(metadata, snapshot_id, &schema)?;
+    observe_read_files_with_delete_receiving::<FrozenCowDataFileProjection>(
+        table,
+        domain,
+        None,
+        Some(budget),
+        Some(all_deletes),
+    )
+    .await
+}
+
+pub(crate) async fn make_scoped_read_snapshot(
+    table: Table,
+    snapshot_id: i64,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    original: novarocks_spi::connector::ConnectorOriginalResultScope,
+    base_upper: u64,
+    kind: crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::SnapshotReadKind,
+    io: Arc<crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::SnapshotIoGate>,
+) -> Result<
+    crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::ScopedReadSnapshot,
+    ReadFailure,
+> {
+    let budget = CaptureBudget::new(&original, base_upper)?;
+    let metadata = table.metadata();
+    let snapshot = metadata
+        .snapshot_by_id(snapshot_id)
+        .ok_or_else(|| format!("snapshot {snapshot_id} not found"))?;
+    let schema = snapshot.schema(metadata).map_err(|e| e.to_string())?;
+    let metadata_bytes = budget.json_size(metadata)?;
+    let schema_bytes = budget.json_size(schema.as_ref())?;
+    let mut required = base_upper;
+    for amount in [
+        CaptureBudget::json_working_upper(metadata_bytes)?,
+        CaptureBudget::json_working_upper(metadata_bytes)?,
+        CaptureBudget::json_working_upper(schema_bytes)?,
+        CaptureBudget::json_working_upper(schema_bytes)?,
+        budget.schema_indexes_upper(schema.as_ref())?,
+    ] {
+        required = required
+            .checked_add(amount)
+            .ok_or_else(|| ReadFailure::Semantic("snapshot prospective upper overflow".into()))?;
+    }
+    io.reserve(required).await?;
+    let bytes = budget.json(metadata)?;
+    budget.json_working(bytes)?;
+    let bytes = budget.json(schema.as_ref())?;
+    budget.json_working(bytes)?;
+    let domain = mint_read_domain(metadata, snapshot_id, &schema)?;
+    let mut all_deletes = Vec::new();
+    use crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::SnapshotReadKind;
+    let files = match kind {
+        SnapshotReadKind::Statistics => {
+            observe_read_files_original::<FrozenCowDataFileProjection>(
+                &table,
+                domain,
+                Some(&context),
+                Some(&budget),
+                None,
+                Some(io.as_ref()),
+            )
+            .await?
+        }
+        SnapshotReadKind::Rewrite => {
+            observe_read_files_original::<FrozenCowDataFileProjection>(
+                &table,
+                domain,
+                Some(&context),
+                Some(&budget),
+                Some(&mut all_deletes),
+                Some(io.as_ref()),
+            )
+            .await?
+        }
+    };
+    Ok(
+        crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::ScopedReadSnapshot {
+            files,
+            all_deletes,
+            simultaneous_upper: budget.upper(),
+            retention_guard: original.retention_guard(),
+        },
+    )
+}
+
 /// One common observation retains the original entry, delete and lineage checks.
 /// Only the data-file storage projection differs between scan and COW callers.
 async fn observe_read_files<P: ObservedDataFileProjection>(
@@ -346,6 +450,27 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
     domain: Arc<ReadDomain>,
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
     budget: Option<&CaptureBudget<'_>>,
+) -> Result<Vec<P::File>, ReadFailure> {
+    observe_read_files_with_delete_receiving::<P>(table, domain, control, budget, None).await
+}
+
+async fn observe_read_files_with_delete_receiving<P: ObservedDataFileProjection>(
+    table: &Table,
+    domain: Arc<ReadDomain>,
+    control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
+    budget: Option<&CaptureBudget<'_>>,
+    all_deletes: Option<&mut Vec<Arc<crate::delete_semantics::DeleteFact>>>,
+) -> Result<Vec<P::File>, ReadFailure> {
+    observe_read_files_original::<P>(table, domain, control, budget, all_deletes, None).await
+}
+
+async fn observe_read_files_original<P: ObservedDataFileProjection>(
+    table: &Table,
+    domain: Arc<ReadDomain>,
+    control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
+    budget: Option<&CaptureBudget<'_>>,
+    all_deletes: Option<&mut Vec<Arc<crate::delete_semantics::DeleteFact>>>,
+    io: Option<&crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::SnapshotIoGate>,
 ) -> Result<Vec<P::File>, ReadFailure> {
     check_read_control(control)?;
     check_cow_active(budget)?;
@@ -389,9 +514,17 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
         .iter()
         .map(|f| (f.id, f.name.clone()))
         .collect();
-    let manifest_list = crate::manifest::load_manifest_list(snapshot, table.file_io(), metadata)
-        .await
-        .map_err(|e| format!("load manifest list: {e}"))?;
+    let manifest_list = match io {
+        Some(io) => {
+            let bytes = io.read(snapshot.manifest_list(), budget).await?;
+            crate::manifest::decode_manifest_list(&bytes, metadata).map_err(|error| {
+                ReadFailure::Original(crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::raw_read_failure(error).into())
+            })?
+        }
+        None => crate::manifest::load_manifest_list(snapshot, table.file_io(), metadata)
+            .await
+            .map_err(|e| format!("load manifest list: {e}"))?,
+    };
     let mut seen_manifests = HashSet::new();
     let mut delete_manifests = Vec::new();
     let mut observed_data = Vec::new();
@@ -404,14 +537,22 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
         if !seen_manifests.insert(manifest_file.manifest_path.as_str()) {
             continue;
         }
-        let manifest = crate::manifest::load_manifest(manifest_file, table.file_io())
-            .await
-            .map_err(|e| {
-                crate::manifest::with_variant_statistics_hint(
-                    format!("load manifest: {e}"),
-                    metadata,
-                )
-            })?;
+        let manifest = match io {
+            Some(io) => {
+                let bytes = io.read(&manifest_file.manifest_path, budget).await?;
+                crate::manifest::decode_manifest(&bytes, manifest_file).map_err(|error| {
+                    ReadFailure::Original(crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::raw_read_failure(error).into())
+                })?
+            }
+            None => crate::manifest::load_manifest(manifest_file, table.file_io())
+                .await
+                .map_err(|e| {
+                    crate::manifest::with_variant_statistics_hint(
+                        format!("load manifest: {e}"),
+                        metadata,
+                    )
+                })?,
+        };
         check_read_control(control)?;
         check_cow_active(budget)?;
         let spec = metadata
@@ -442,6 +583,89 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
             .partition_type(spec.spec_id())
             .map_err(|e| e.to_string())?;
         let mut delete_entries = Vec::new();
+        if let (Some(io), Some(budget)) = (io, budget) {
+            use cow_capture::geometry::{add, arc_bytes, mul, slots};
+            use novarocks_spi::connector::ConnectorCowBeginCause as Cause;
+            let mut additional = 0;
+            for entry in manifest.entries() {
+                if entry.status == ManifestStatus::Deleted {
+                    continue;
+                }
+                let df = entry.data_file();
+                let partition = recipe(cow_capture::partition::prospective::<Cause>(
+                    df.partition(),
+                    &partition_type,
+                    &mut || budget.scope.check_active().map_err(Into::into),
+                ))?;
+                let metrics = recipe(cow_capture::metrics::prospective::<Cause>(
+                    df,
+                    &schema,
+                    &mut || budget.scope.check_active().map_err(Into::into),
+                ))?;
+                let stats = recipe(cow_capture::stats::prospective::<Cause>(
+                    df,
+                    &field_id_to_name,
+                    &mut || budget.scope.check_active().map_err(Into::into),
+                ))?;
+                for part in [
+                    partition.canonical_constructor_upper,
+                    partition.resolved_struct_upper,
+                    partition.debug_key_upper,
+                    metrics.constructor_upper,
+                    stats.constructor_upper,
+                    frozen_manifest_projection_upper(df, budget)?,
+                    recipe(arc_bytes::<Cause>(df.file_path().len()))?,
+                    df.file_path().len() as u64,
+                    manifest_file.manifest_path.len() as u64,
+                    df.key_metadata().unwrap_or_default().len() as u64,
+                ] {
+                    additional = recipe(add::<Cause>(additional, part))?;
+                }
+                if let Some(target) = df.referenced_data_file() {
+                    additional = recipe(add::<Cause>(
+                        additional,
+                        recipe(arc_bytes::<Cause>(target.len()))?,
+                    ))?;
+                }
+                if let Some(ids) = df.equality_ids() {
+                    additional = recipe(add::<Cause>(
+                        additional,
+                        recipe(mul::<Cause>(
+                            recipe(slots::<Cause, (i32, PrimitiveType)>(ids.len()))?,
+                            3,
+                        ))?,
+                    ))?;
+                }
+            }
+            // Geometric old/new Vec backings remain covered while the reader
+            // holds the canonical data/delete receivers across manifests.
+            let n = manifest.entries().len();
+            let vector = recipe(slots::<
+                Cause,
+                (
+                    FrozenCowDataFileProjection,
+                    DataFileFact,
+                    Struct,
+                    String,
+                    Option<i64>,
+                ),
+            >(
+                n.checked_add(observed_data.len())
+                    .ok_or_else(|| ReadFailure::Semantic("manifest entry count overflow".into()))?
+                    .max(8),
+            ))?;
+            let deletes = recipe(slots::<Cause, RawDeleteEntry>(
+                n.checked_add(delete_entries.len())
+                    .ok_or_else(|| ReadFailure::Semantic("manifest delete count overflow".into()))?
+                    .max(8),
+            ))?;
+            additional = recipe(add::<Cause>(
+                additional,
+                recipe(mul::<Cause>(recipe(add::<Cause>(vector, deletes))?, 4))?,
+            ))?;
+            let required = recipe(add::<Cause>(budget.upper(), additional))?;
+            io.reserve(required).await?;
+        }
         let mut next_first_row_id = manifest_file
             .first_row_id
             .map(|v| i64::try_from(v).map_err(|_| format!("manifest first_row_id too large: {v}")))
@@ -710,6 +934,28 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
             .iter()
             .try_fold(0usize, |sum, m| sum.checked_add(m.entries.len()))
             .ok_or_else(|| ReadFailure::Semantic("COW delete member upper overflow".into()))?;
+        if let Some(io) = io {
+            use cow_capture::geometry::{add, arc_slice, mul, slots};
+            use novarocks_spi::connector::ConnectorCowBeginCause as Cause;
+            let mut amount =
+                CaptureBudget::delete_structures_upper(delete_manifests.len(), members)?;
+            for manifest in &delete_manifests {
+                for entry in &manifest.entries {
+                    if let DeleteKind::Equality(group) = &entry.file.kind {
+                        let n = group.fields().len();
+                        for part in [
+                            recipe(mul::<Cause>(recipe(slots::<Cause, i32>(n))?, 2))?,
+                            recipe(slots::<Cause, (i32, PrimitiveType)>(n))?,
+                            recipe(arc_slice::<Cause, (i32, PrimitiveType)>(n))?,
+                        ] {
+                            amount = recipe(add::<Cause>(amount, part))?;
+                        }
+                    }
+                }
+            }
+            io.reserve(recipe(add::<Cause>(budget.upper(), amount))?)
+                .await?;
+        }
         budget.delete_structures(delete_manifests.len(), members)?;
         for manifest in &delete_manifests {
             for entry in &manifest.entries {
@@ -768,6 +1014,20 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
                 }
                 crate::delete_semantics::ConstructionFailure::Original(e) => e,
             })?;
+    if let Some(receiving) = all_deletes {
+        if !receiving.is_empty() {
+            return Err(ReadFailure::Semantic(
+                "Rewrite delete receiver is occupied".into(),
+            ));
+        }
+        if let Some(budget) = budget {
+            budget.charge(recipe(cow_capture::geometry::slots::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+                Arc<crate::delete_semantics::DeleteFact>,
+            >(observation.facts().len()))?)?;
+        }
+        receiving.extend(observation.facts().iter().cloned());
+    }
     let index =
         DeleteCandidateIndex::try_new_checked(domain, observation, || check_cow_active(budget))
             .map_err(|e| match e {
@@ -776,6 +1036,37 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
                 }
                 crate::delete_semantics::ConstructionFailure::Original(e) => e,
             })?;
+    if let (Some(io), Some(budget)) = (io, budget) {
+        use cow_capture::geometry::{add, mul, slots};
+        use novarocks_spi::connector::ConnectorCowBeginCause as Cause;
+        let mut amount = recipe(slots::<Cause, P::File>(observed_data.len()))?;
+        for (_, data, partition_values, _, _) in &observed_data {
+            let metrics = recipe(cow_capture::metrics::retained::<Cause>(&data.metrics))?;
+            let views = recipe(slots::<Cause, crate::delete_semantics::BucketView>(
+                index.size().buckets.checked_add(2).ok_or_else(|| {
+                    ReadFailure::Semantic("snapshot bucket upper overflow".into())
+                })?,
+            ))?;
+            let debug = recipe(cow_capture::partition::prospective::<Cause>(
+                partition_values,
+                &crate::iceberg::spec::StructType::new(Vec::new()),
+                &mut || budget.scope.check_active().map_err(Into::into),
+            ))?;
+            for part in [
+                recipe(mul::<Cause>(views, 4))?,
+                metrics.own_upper,
+                (std::mem::size_of::<DataFileFact>() + 2 * std::mem::size_of::<usize>()) as u64,
+                debug.debug_key_upper,
+                recipe(slots::<Cause, usize>(
+                    MAX_STATS_DELETE_MEMBERS.saturating_mul(4),
+                ))?,
+            ] {
+                amount = recipe(add::<Cause>(amount, part))?;
+            }
+        }
+        io.reserve(recipe(add::<Cause>(budget.upper(), amount))?)
+            .await?;
+    }
     if let Some(budget) = budget {
         budget.charge(recipe(cow_capture::geometry::slots::<
             novarocks_spi::connector::ConnectorCowBeginCause,
@@ -1033,6 +1324,53 @@ struct FrozenCowDataFileProjection {
     stats: CowDataFileProjection,
     manifest: Arc<IcebergDataFileMetadata>,
 }
+fn frozen_manifest_projection_upper(
+    df: &DataFile,
+    budget: &CaptureBudget<'_>,
+) -> Result<u64, ReadFailure> {
+    use cow_capture::geometry::{add, arc_slice, hash_max, slots};
+    use novarocks_spi::connector::ConnectorCowBeginCause;
+    let mut upper = recipe(arc_slice::<ConnectorCowBeginCause, IcebergDataFileMetadata>(1))?;
+    upper = recipe(add::<ConnectorCowBeginCause>(
+        upper,
+        recipe(slots::<ConnectorCowBeginCause, i64>(
+            df.split_offsets().unwrap_or_default().len(),
+        ))?,
+    ))?;
+    upper = recipe(add::<ConnectorCowBeginCause>(
+        upper,
+        df.key_metadata().unwrap_or_default().len() as u64,
+    ))?;
+    for counts in [
+        df.value_counts(),
+        df.null_value_counts(),
+        df.nan_value_counts(),
+    ] {
+        upper = recipe(add::<ConnectorCowBeginCause>(
+            upper,
+            recipe(hash_max::<ConnectorCowBeginCause, (i32, u64)>(counts.len()))?,
+        ))?;
+    }
+    for bounds in [df.lower_bounds(), df.upper_bounds()] {
+        upper = recipe(add::<ConnectorCowBeginCause>(
+            upper,
+            recipe(hash_max::<
+                ConnectorCowBeginCause,
+                (i32, crate::iceberg::spec::Datum),
+            >(bounds.len()))?,
+        ))?;
+        for datum in bounds.values() {
+            budget.active()?;
+            let bytes = match datum.literal() {
+                PrimitiveLiteral::String(value) => value.len(),
+                PrimitiveLiteral::Binary(value) => value.len(),
+                _ => 0,
+            };
+            upper = recipe(add::<ConnectorCowBeginCause>(upper, bytes as u64))?;
+        }
+    }
+    Ok(upper)
+}
 impl ObservedDataFileProjection for FrozenCowDataFileProjection {
     type File = IcebergReadFile;
     fn capture(
@@ -1044,48 +1382,9 @@ impl ObservedDataFileProjection for FrozenCowDataFileProjection {
         use novarocks_spi::connector::ConnectorCowBeginCause;
         let stats = CowDataFileProjection::capture(df, names, budget)?;
         if let Some(budget) = budget {
-            let mut upper =
-                recipe(arc_slice::<ConnectorCowBeginCause, IcebergDataFileMetadata>(1))?;
-            upper = recipe(add::<ConnectorCowBeginCause>(
-                upper,
-                recipe(slots::<ConnectorCowBeginCause, i64>(
-                    df.split_offsets().unwrap_or_default().len(),
-                ))?,
-            ))?;
-            upper = recipe(add::<ConnectorCowBeginCause>(
-                upper,
-                df.key_metadata().unwrap_or_default().len() as u64,
-            ))?;
-            for counts in [
-                df.value_counts(),
-                df.null_value_counts(),
-                df.nan_value_counts(),
-            ] {
-                upper = recipe(add::<ConnectorCowBeginCause>(
-                    upper,
-                    recipe(hash_max::<ConnectorCowBeginCause, (i32, u64)>(counts.len()))?,
-                ))?;
-            }
-            for bounds in [df.lower_bounds(), df.upper_bounds()] {
-                upper = recipe(add::<ConnectorCowBeginCause>(
-                    upper,
-                    recipe(hash_max::<
-                        ConnectorCowBeginCause,
-                        (i32, crate::iceberg::spec::Datum),
-                    >(bounds.len()))?,
-                ))?;
-                for datum in bounds.values() {
-                    budget.active()?;
-                    let bytes = match datum.literal() {
-                        PrimitiveLiteral::String(value) => value.len(),
-                        PrimitiveLiteral::Binary(value) => value.len(),
-                        _ => 0,
-                    };
-                    upper = recipe(add::<ConnectorCowBeginCause>(upper, bytes as u64))?;
-                }
-            }
-            budget.charge(upper)?;
+            budget.charge(frozen_manifest_projection_upper(df, budget)?)?;
         }
+
         // Rebuild insert-only maps from the exact original pairs. This gives a
         // prospective layout from their known lengths even if the SDK input
         // maps retained spare buckets or tombstones from prior construction.

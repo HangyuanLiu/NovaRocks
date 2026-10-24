@@ -265,6 +265,9 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
 }
 
 impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
+    pub(crate) fn prepared_publisher_backing_bytes() -> usize {
+        std::mem::size_of::<PreparedObservedPublisher<R>>() + std::mem::size_of::<[usize; 2]>()
+    }
     pub(crate) fn observe_prepared(
         &self,
         inner: Arc<dyn super::super::prepared::PublicationPreparer>,
@@ -324,6 +327,15 @@ impl<R: Clone + Send + Sync + 'static> Publisher for PreparedObservedPublisher<R
         self.inner.preflight_recovery(request, operation)?;
         self.journal
             .bind_preparation(operation.request_context().clone())
+    }
+    fn preflight_recovery_in<'a>(
+        &'a self,
+        request: &'a mut Option<crate::commit::model::FrozenRequest>,
+        operation: &'a IcebergCommitOperation,
+    ) -> crate::commit::attempt::RecoveryPreflightFuture<'a> {
+        self.inner
+            .preflight_recovery_in(request, operation)
+            .bind_preparation(&self.journal, operation)
     }
     async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
         let Some(preparation) = self
@@ -1182,5 +1194,13 @@ mod tests {
                 ..
             }
         ));
+    }
+}
+
+impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
+    /// Actual Box pointee of the original observed preflight wrapper. The
+    /// inner producer's actual Box pointee is quoted by that producer.
+    pub(crate) fn prepared_preflight_future_bytes() -> usize {
+        crate::commit::attempt::RecoveryPreflightFuture::binding_future_bytes::<R>()
     }
 }

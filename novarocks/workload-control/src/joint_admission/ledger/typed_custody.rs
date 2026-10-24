@@ -199,6 +199,13 @@ fn drop_pin(inner: &Inner, key: [u64; 2], kind: Kind) {
     }
 }
 fn payload_capacity(inner: &Inner, key: [u64; 2]) -> Result<u64, RetentionPinError> {
+    payload_resource(inner, key, JointResource::PayloadBytes)
+}
+fn payload_resource(
+    inner: &Inner,
+    key: [u64; 2],
+    resource: JointResource,
+) -> Result<u64, RetentionPinError> {
     let state = inner.state.lock().unwrap();
     let row = state
         .joint
@@ -212,7 +219,7 @@ fn payload_capacity(inner: &Inner, key: [u64; 2]) -> Result<u64, RetentionPinErr
         | ClaimCustody::NativeInput { epoch, pins, .. }
             if epoch == key[1] && pins != 0 =>
         {
-            Ok(row.active_amounts.get(JointResource::PayloadBytes))
+            Ok(row.active_amounts.get(resource))
         }
         _ => Err(RetentionPinError::Conflict),
     }
@@ -648,6 +655,66 @@ impl RetainedPayloadGrant {
             &self.pin.inner,
             self.pin.key.ok_or(RetentionPinError::Released)?,
         )
+    }
+    /// Exact active metadata amount of this same live original pin.
+    pub fn metadata_bytes(&self) -> Result<u64, RetentionPinError> {
+        payload_resource(
+            &self.pin.inner,
+            self.pin.key.ok_or(RetentionPinError::Released)?,
+            JointResource::MetadataBytes,
+        )
+    }
+    /// Report original payload backing which has actually exited. The holder
+    /// must preserve the complete remaining backing floor, including aliases.
+    /// This changes only PayloadBytes; identity, domains and metadata stay paid.
+    /// Neither cancellation nor a remote terminal is a disposal proof.
+    pub fn retire_unused_to(
+        &self,
+        retained_bytes: std::num::NonZeroU64,
+    ) -> Result<WorkloadProgressNotification, WorkError> {
+        let key = self.pin.key.ok_or(WorkError::Released)?;
+        self.pin.inner.update_facts_silent(|state| {
+            let ledger = state.joint.as_mut().ok_or(WorkError::NotReady)?;
+            let row = ledger.claims.get(&key[0]).ok_or(WorkError::Released)?;
+            if !matches!(row.custody, ClaimCustody::Payload { epoch, pins }
+                if epoch == key[1] && pins != 0)
+                || !matches!(row.owner, ClaimOwner::PhysicalWork(_))
+                || row.pending.is_some()
+                || row.amounts != row.active_amounts
+            {
+                return Err(WorkError::Conflict);
+            }
+            let current = row.active_amounts.get(JointResource::PayloadBytes);
+            let released = current
+                .checked_sub(retained_bytes.get())
+                .ok_or(WorkError::Conflict)?;
+            let revision = row
+                .release_revision
+                .checked_add(1)
+                .ok_or(WorkError::ArithmeticOverflow)?;
+            let delta = JointResources::ZERO.with(JointResource::PayloadBytes, released);
+            let active = row.active_amounts.checked_sub(delta)?;
+            let charged = row.amounts.checked_sub(delta)?;
+            let profile = ledger
+                .profiles
+                .get(&row.facts.key)
+                .ok_or(WorkError::Conflict)?
+                .amounts
+                .checked_sub(delta)?;
+            if released == 0 {
+                return Ok(());
+            }
+            let row = ledger.claims.get_mut(&key[0]).unwrap();
+            ledger.profiles.get_mut(&row.facts.key).unwrap().amounts = profile;
+            row.active_amounts = active;
+            row.amounts = charged;
+            row.release_revision = revision;
+            ledger.released();
+            Ok(())
+        })?;
+        Ok(WorkloadProgressNotification::new(Arc::clone(
+            &self.pin.inner,
+        )))
     }
     /// Inspect the original paid record without retaining or notifying.
     pub fn is_for_scope(&self, scope: &WorkScope) -> bool {

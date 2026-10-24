@@ -21,7 +21,10 @@ use super::*;
 use crate::query_execution::{
     compiler::PreparedDmlWriteAssembly,
     internal_consumer::{
-        decoded::{CowComputationOutput, DecodedConsumerRuntime, ReadyCowComputation},
+        decoded::{
+            CowComputationOutput, DecodedConsumerRuntime, ReadyCowComputation,
+            ReadyStatisticsComputation, StatisticsComputationOutput,
+        },
         domain_cpu::DomainCpuCustody,
         write::{ReadyWriteComputation, WriteComputationOutput},
     },
@@ -326,6 +329,19 @@ impl StatementComputationOutput for CowComputationOutput {
     }
 }
 
+impl StatementComputationOutput for StatisticsComputationOutput {
+    type Ready = ReadyStatisticsComputation;
+    fn cpu_custody(&self) -> Arc<DomainCpuCustody> {
+        StatisticsComputationOutput::cpu_custody(self)
+    }
+    fn take_ready(
+        &mut self,
+        token: ComputationReadyToken,
+    ) -> Result<Self::Ready, QueryExecutionError> {
+        StatisticsComputationOutput::take_ready(self, token)
+    }
+}
+
 pub(crate) trait StatementComputationAssembly: Send + 'static {
     type Output: StatementComputationOutput;
     fn prepare(
@@ -343,6 +359,26 @@ pub(crate) trait StatementComputationAssembly: Send + 'static {
 }
 impl StatementComputationAssembly for PreparedDmlWriteAssembly {
     type Output = WriteComputationOutput;
+    fn prepare(
+        self,
+        initial: InitialComputationReservation,
+        runtime: DecodedConsumerRuntime,
+    ) -> Result<
+        (
+            PreparedLogicalComputation,
+            ReservedExecutionIdentity,
+            Self::Output,
+        ),
+        QueryExecutionError,
+    > {
+        self.prepare_computation(initial, runtime)
+    }
+}
+
+impl StatementComputationAssembly
+    for crate::query_execution::statistics::preparation::PreparedStatisticsComputationAssembly
+{
+    type Output = StatisticsComputationOutput;
     fn prepare(
         self,
         initial: InitialComputationReservation,
@@ -447,6 +483,31 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
     pub(crate) fn retained_health(&self) -> StatementNativeHealthFailure {
         self.admission.health.clone()
     }
+    pub(crate) fn preparation_connector_context(
+        &self,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+        #[cfg(novarocks_dev_controls)] nomination: Option<
+            &Arc<novarocks_failpoint::target_binding::StatementWorkNomination>,
+        >,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorRequestContext,
+        crate::query_execution::contract::DistributedQueryError,
+    > {
+        self.initial
+            .as_ref()
+            .ok_or_else(|| {
+                crate::query_execution::contract::DistributedQueryError::new(
+                    crate::query_execution::contract::DistributedQueryErrorKind::Rejected,
+                    "computation preparation no longer owns its initial reservation",
+                )
+            })?
+            .connector_request_context(
+                context,
+                #[cfg(novarocks_dev_controls)]
+                nomination,
+            )
+    }
+
     pub(crate) fn computation_context(
         &self,
         original: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
@@ -484,7 +545,10 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
     }
     pub(crate) fn poll_ready(
         &mut self,
-        kernel: &crate::query_execution::kernels::DmlExecutionKernel,
+        runtime: &(
+            crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+            crate::native::data_runtime::FrontendDataRuntime,
+        ),
         io: &MetadataIoAdmission,
         owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
@@ -493,13 +557,16 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
             return Poll::Pending;
         }
         self.busy = true;
-        let polled = self.poll_ready_inner(kernel, io, owner, cx);
+        let polled = self.poll_ready_inner(runtime, io, owner, cx);
         self.busy = false;
         polled
     }
     fn poll_ready_inner(
         &mut self,
-        kernel: &crate::query_execution::kernels::DmlExecutionKernel,
+        runtime: &(
+            crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+            crate::native::data_runtime::FrontendDataRuntime,
+        ),
         io: &MetadataIoAdmission,
         owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
@@ -516,7 +583,7 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(result) => result?,
             }
-            let (blocking, data) = kernel.write_runtime().map_err(internal_error)?;
+            let (blocking, data) = runtime;
             let runtime = DecodedConsumerRuntime {
                 binding: self.admission.capacity().unwrap().clone(),
                 computation: self.admission.take_compute(),
@@ -710,6 +777,17 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
         drop(self.computation.take());
         self.admission.retire_unlaunched();
         Poll::Ready(Ok(()))
+    }
+    /// Only the original failed stage may identify its formation increment.
+    /// Its result holders must then actually Drop before this can be retired.
+    pub(crate) fn refused_formation_bytes(&self) -> Option<u64> {
+        (self.admission.admitted
+            && self.local_exit_observed
+            && self.original.exit.is_none()
+            && !self.exit_receipt.as_ref().is_some_and(Result::is_err)
+            && !self.ready_confirmed
+            && self.close_failure.is_none())
+        .then_some(self.admission.peak_bytes)
     }
     pub(crate) fn release_result_aliases(&mut self) -> Result<(), StatementNativeHealthFailure> {
         if !self.local_exit_observed || self.ready.is_some() {

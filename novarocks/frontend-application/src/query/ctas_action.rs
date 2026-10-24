@@ -854,10 +854,13 @@ impl CtasSource {
                         // Install before the sole foreign launch call; unwind
                         // cannot turn a possibly started Native action inert.
                         self.native_launch_attempted = true;
-                        match self
-                            .computation
-                            .poll_ready(&self.kernel, &self.io, owner, cx)
-                        {
+                        let computation = match self.kernel.write_runtime() {
+                            Ok(runtime) => {
+                                self.computation.poll_ready(runtime, &self.io, owner, cx)
+                            }
+                            Err(error) => Poll::Ready(Err(internal_error(error))),
+                        };
+                        match computation {
                             Poll::Pending => return Poll::Pending,
                             Poll::Ready(Err(error)) => {
                                 self.fail(error);

@@ -303,10 +303,12 @@ impl<P: WriteStatementFamily> WriteStatementAction<P> {
             self.assembly_installed = true;
         }
         if self.ready.is_none() {
-            match self
-                .computation
-                .poll_ready(&self.kernel, self.io.as_ref().unwrap(), owner, cx)
-            {
+            match self.computation.poll_ready(
+                self.kernel.write_runtime().map_err(internal_error)?,
+                self.io.as_ref().unwrap(),
+                owner,
+                cx,
+            ) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(result) => result?,
             }
@@ -621,7 +623,25 @@ impl<P: WriteStatementFamily> GovernedStatementAction for WriteStatementAction<P
         if session.is_none() {
             return Ok(());
         }
+        // The original session checks accepted ownership, not a public error
+        // classification. A later accepted/Unknown publication retains its
+        // complete envelope. QA Drops this entire Action before polling residual.
+        let formation = if session
+            .as_ref()
+            .unwrap()
+            .has_no_accepted_formation()
+            .map_err(|error| {
+                StatementNativeHealthFailure::actual_exit_unproven(
+                    "write formation ownership could not be established",
+                    Arc::new(error),
+                )
+            })? {
+            self.computation.refused_formation_bytes()
+        } else {
+            None
+        };
         let mut residual = Box::new(WriteCleanupResidual {
+            formation,
             publication: None,
             native_tail: None,
             continuation_error: None,
@@ -656,6 +676,9 @@ fn health(detail: &'static str) -> StatementNativeHealthFailure {
     )
 }
 struct WriteCleanupResidual {
+    // Original stage amount only; never a new grant. Consumed after actual
+    // Action destruction and Provider/MIO retirement, before unknown custody.
+    formation: Option<u64>,
     publication: Option<StatementPublication>,
     native_tail: Option<StatementNativeTail>,
     continuation_error: Option<WorkError>,
@@ -703,6 +726,22 @@ impl GovernedStatementResidual for WriteCleanupResidual {
                     return Poll::Ready(Err(self.health.clone()));
                 }
                 Poll::Ready(Ok(())) => {}
+            }
+        }
+        if self.formation.is_some() {
+            let Some(io) = self.io.as_ref() else {
+                return Poll::Ready(Err(health("write formation lost its original IO owner")));
+            };
+            let notice = match io.retire_unaccepted_formation_in(&mut self.formation) {
+                Ok(notice) => notice,
+                Err(WorkError::NotReady) => return Poll::Pending,
+                Err(error) => {
+                    self.continuation_error = Some(error);
+                    return Poll::Ready(Err(self.health.clone()));
+                }
+            };
+            if let Some(notice) = notice {
+                notice.notify();
             }
         }
         match self
@@ -799,6 +838,7 @@ mod tests {
         );
         let same = Arc::downgrade(&fixture.session);
         let mut residual = WriteCleanupResidual {
+            formation: None,
             publication: None,
             native_tail: None,
             continuation_error: None,

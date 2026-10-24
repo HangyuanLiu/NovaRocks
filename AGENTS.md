@@ -203,6 +203,14 @@ SQL client
   共享 publication 在 `query/statement_publication.rs`。计算就绪、必要业务就绪与真实退出分别取证；
   成功和失败路径保留累计外部效果，seal/NoOp 不冒充最终 CREATE 或真实提交。
 
+- `novarocks/frontend-application/src/statistics_jobs/{service,attempt_executor}.rs`
+  Stats 的前台 capture 与后台 governed Action：capture 的 CPU/Provider 实际关闭后，原 query permit
+  静默移交给同 job 的稳定接收格，再通知原串行 worker。计算沿共享 `statement_computation.rs`，
+  Ready 在 payload 移交前保留原 statement retention；publication 与 residual 继续保管同原 Session。
+  scoped CPU 作者在 `query_execution/internal_result_cpu/scoped_statistics.rs`，准备访问保管在
+  `query_execution/statistics/preparation.rs`。普通业务拒绝、actual quiescence 与 raw health 分别保留，
+  不能用其中一项代替另一项；这些源码入口不证明整族或原生验收完成。
+
 - `novarocks/frontend-application/src/dml/runner.rs` 与 `novarocks/frontend-application/src/coordinator/**`
   旧同步 runner 和协调路径仍在，调用面迁移与删旧尚未完成；不能把新 Action 文件存在或局部检查
   当作全路径实现、退役或原生验收通过。ADR-0198 保持 implementation pending。
@@ -1015,6 +1023,12 @@ suspected case against a clean server before attributing it to the change.
   `novarocks/execution/src/runtime/fragment/io/**`,
   `novarocks/execution/src/exec/operators/exchange_source.rs`, and
   `novarocks/native-adapter/src/{exchange_data_plane,exchange_transmitter,fragment_exchange_receiver}.rs`.
+- **Statistics collection/publication**: inspect
+  `novarocks/frontend-application/src/statistics_jobs/{service,attempt_executor}.rs`,
+  `query_execution/statistics/preparation.rs`, and `query_execution/internal_result_cpu/scoped_statistics.rs`.
+  Follow the original Root, query-permit handoff, CPU/Provider source and retained result through actual exit;
+  `query_execution/maintenance/io_admission.rs` separates ordinary refusal from actual quiescence.
+  This does not establish completion of Rewrite/MV migration or coordinator retirement.
 - **Materialized views**: inspect `novarocks/mv-application/src/**` and
   `novarocks/frontend-application/src/mv/**`; MV query rewrite is an optimizer
   concern under `novarocks/sql/src/optimizer/**`.

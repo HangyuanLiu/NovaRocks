@@ -19,12 +19,18 @@
 
 use std::sync::{Arc, Weak};
 
+mod background_source;
 mod statement_action;
+pub use background_source::{
+    BackgroundActionCustody, BackgroundActionReady, BackgroundActionReceipt,
+    BackgroundActionResultView, BackgroundActionSourceGeometry, GovernedBackgroundAction,
+};
 pub(crate) use statement_action::StatementProgressCursor;
 pub use statement_action::{
-    GovernedStatementAction, GovernedStatementResidual, StatementActionAttempt,
-    StatementActionFailure, StatementActionReady, StatementActionReceipt, StatementActionValue,
-    StatementActionWaitError, StatementActionWaiter, StatementProgressGeometry,
+    BackgroundActionResultGuard, GovernedStatementAction, GovernedStatementResidual,
+    StatementActionAttempt, StatementActionFailure, StatementActionReady, StatementActionReceipt,
+    StatementActionValue, StatementActionWaitError, StatementActionWaiter,
+    StatementProgressGeometry,
 };
 #[doc(hidden)]
 pub use statement_action::{StatementActionSource, StatementProgressSlot};
@@ -840,6 +846,7 @@ pub struct GovernedActionContext<'a> {
     cancellation: &'a CancellationView,
     timeout_ms: Option<u64>,
     result_window: Option<&'a ResultWindowAlias>,
+    query_permit: Option<&'a mut Option<QueryConcurrencyPermit>>,
 }
 
 impl<'a> GovernedActionContext<'a> {
@@ -856,7 +863,30 @@ impl<'a> GovernedActionContext<'a> {
             cancellation,
             timeout_ms,
             result_window,
+            query_permit: None,
         }
+    }
+
+    fn with_query_permit(mut self, permit: &'a mut Option<QueryConcurrencyPermit>) -> Self {
+        self.query_permit = Some(permit);
+        self
+    }
+
+    /// A synchronous handoff from this exact SQL source after its active
+    /// preparation has actually exited. A plain observer/context has no grant.
+    pub fn handoff_query_permit_in(
+        &mut self,
+        receiver: &WorkOwner,
+        destination: &mut Option<QueryConcurrencyPermit>,
+    ) -> Result<novarocks_workload_control::WorkloadProgressNotification, WorkError> {
+        QueryConcurrencyPermit::handoff_in(
+            self.query_permit
+                .as_deref_mut()
+                .ok_or(WorkError::NotReady)?,
+            self.scope,
+            receiver,
+            destination,
+        )
     }
 
     pub fn scope(&self) -> &WorkScope {
@@ -912,6 +942,7 @@ impl GovernedQueryStatementOwner {
             self.timeout_ms,
             result_window,
         )
+        .with_query_permit(&mut self.query_concurrency)
     }
 
     fn park_control_link(&mut self) {

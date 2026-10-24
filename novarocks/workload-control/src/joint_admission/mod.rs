@@ -161,6 +161,86 @@ pub enum JointLane {
     Settlement,
 }
 
+/// Projection of the original charged quantity; this is diagnostic data only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JointCapacityProjection {
+    Global,
+    Class(WorkClass),
+    Lane(JointLane),
+    ClassLane { class: WorkClass, lane: JointLane },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JointCapacityConstraint {
+    Global,
+    Dependency,
+}
+
+/// Original infeasible coordinate. No payload, endpoint, identity, allocation,
+/// or new proof traversal is needed to retain this bounded failure cause.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JointCapacityFailure {
+    pub resource: JointResource,
+    pub projection: JointCapacityProjection,
+    pub constraint: JointCapacityConstraint,
+}
+impl JointCapacityFailure {
+    fn from_coordinate(coordinate: usize, constraint: protection::ConstraintKind) -> Self {
+        const RESOURCES: [JointResource; RESOURCE_COUNT] = [
+            JointResource::ScopeRecords,
+            JointResource::ClaimRecords,
+            JointResource::ReplyRecords,
+            JointResource::QueueRecords,
+            JointResource::MetadataBytes,
+            JointResource::PayloadBytes,
+            JointResource::UnreceivedProductions,
+            JointResource::Publications,
+            JointResource::Residuals,
+            JointResource::Computations,
+            JointResource::AsyncIo,
+            JointResource::BlockingJobs,
+            JointResource::InternalCpuJobs,
+            JointResource::PhysicalQueueRecords,
+            JointResource::PhysicalQueueBytes,
+        ];
+        const CLASSES: [WorkClass; CLASS_COUNT] = [
+            WorkClass::Query,
+            WorkClass::MaterializedView,
+            WorkClass::Statistics,
+            WorkClass::TableMaintenance,
+            WorkClass::Management,
+        ];
+        const LANES: [JointLane; LANE_COUNT] = [
+            JointLane::Custody,
+            JointLane::Foreground,
+            JointLane::Settlement,
+        ];
+        assert!(coordinate < COORDINATE_COUNT, "validated proof coordinate");
+        let projection = coordinate / RESOURCE_COUNT;
+        let projection = if projection == 0 {
+            JointCapacityProjection::Global
+        } else if projection <= CLASS_COUNT {
+            JointCapacityProjection::Class(CLASSES[projection - 1])
+        } else if projection <= CLASS_COUNT + LANE_COUNT {
+            JointCapacityProjection::Lane(LANES[projection - 1 - CLASS_COUNT])
+        } else {
+            let index = projection - 1 - CLASS_COUNT - LANE_COUNT;
+            JointCapacityProjection::ClassLane {
+                class: CLASSES[index / LANE_COUNT],
+                lane: LANES[index % LANE_COUNT],
+            }
+        };
+        Self {
+            resource: RESOURCES[coordinate % RESOURCE_COUNT],
+            projection,
+            constraint: match constraint {
+                protection::ConstraintKind::Global => JointCapacityConstraint::Global,
+                protection::ConstraintKind::Domain => JointCapacityConstraint::Dependency,
+            },
+        }
+    }
+}
+
 fn class_index(class: WorkClass) -> usize {
     match class {
         WorkClass::Query => 0,
@@ -217,6 +297,8 @@ pub struct ValidatedJointCapacityConfig {
     config: JointCapacityConfig,
     internal_cpu_factory: Option<InternalResultClosedFactoryDescriptor>,
     source_authority: Option<std::sync::Weak<crate::scope::Inner>>,
+    // Exact required jobs from the registered source, once per projection.
+    finite_internal_cpu_jobs: [u64; PROJECTION_COUNT],
 }
 
 impl JointCapacityConfig {
@@ -261,10 +343,28 @@ impl JointCapacityConfig {
                 .as_ref()
                 .map(|source| source.queue_bytes()),
         )?;
+        let finite_internal_cpu_jobs = if internal_cpu_factory.is_some() {
+            std::array::from_fn(|projection| {
+                let minimum = if projection == 0 {
+                    required.global
+                } else if projection <= CLASS_COUNT {
+                    required.classes[projection - 1]
+                } else if projection <= CLASS_COUNT + LANE_COUNT {
+                    required.lanes[projection - 1 - CLASS_COUNT]
+                } else {
+                    let slot = projection - 1 - CLASS_COUNT - LANE_COUNT;
+                    required.class_lanes[slot / LANE_COUNT][slot % LANE_COUNT]
+                };
+                minimum.get(JointResource::InternalCpuJobs)
+            })
+        } else {
+            [0; PROJECTION_COUNT]
+        };
         Ok(ValidatedJointCapacityConfig {
             config: self,
             internal_cpu_factory,
             source_authority,
+            finite_internal_cpu_jobs,
         })
     }
 
@@ -409,21 +509,10 @@ fn source_progress_floor(
             "joint protected progress geometry",
         ));
     }
-    // Only the exact registered source's complete CPU contribution is finite.
-    // Shared queue bytes belonging to other sources keep the original floor.
-    let finite = if let Some(queue_bytes) = finite_queue_bytes {
-        let jobs = minimum.get(JointResource::InternalCpuJobs);
-        JointResources::ZERO
-            .with(JointResource::InternalCpuJobs, jobs)
-            .with(JointResource::PhysicalQueueRecords, jobs)
-            .with(
-                JointResource::PhysicalQueueBytes,
-                jobs.checked_mul(queue_bytes.get())
-                    .ok_or(WorkError::ArithmeticOverflow)?,
-            )
-    } else {
-        JointResources::ZERO
-    };
+    let finite = source_finite_progress(
+        minimum.get(JointResource::InternalCpuJobs),
+        finite_queue_bytes,
+    )?;
     if !minimum.covers(finite) {
         return Err(WorkError::InvalidConfig(
             "joint closed CPU progress source shape",
@@ -452,6 +541,28 @@ fn source_progress_floor(
     })
 }
 
+// Keep composition floors and runtime protection on the same source facts.
+fn source_finite_progress(
+    jobs: u64,
+    finite_queue_bytes: Option<NonZeroU64>,
+) -> Result<JointResources, WorkError> {
+    // Only the exact registered source's complete CPU contribution is finite.
+    // Shared queue bytes belonging to other sources keep the original floor.
+    let finite = if let Some(queue_bytes) = finite_queue_bytes {
+        JointResources::ZERO
+            .with(JointResource::InternalCpuJobs, jobs)
+            .with(JointResource::PhysicalQueueRecords, jobs)
+            .with(
+                JointResource::PhysicalQueueBytes,
+                jobs.checked_mul(queue_bytes.get())
+                    .ok_or(WorkError::ArithmeticOverflow)?,
+            )
+    } else {
+        JointResources::ZERO
+    };
+    Ok(finite)
+}
+
 impl Clone for ValidatedJointCapacityConfig {
     fn clone(&self) -> Self {
         Self {
@@ -461,6 +572,7 @@ impl Clone for ValidatedJointCapacityConfig {
                 .as_ref()
                 .map(|source| source.duplicate()),
             source_authority: self.source_authority.clone(),
+            finite_internal_cpu_jobs: self.finite_internal_cpu_jobs,
         }
     }
 }
@@ -468,6 +580,17 @@ impl Clone for ValidatedJointCapacityConfig {
 impl ValidatedJointCapacityConfig {
     pub fn declared(&self) -> &JointCapacityConfig {
         &self.config
+    }
+
+    fn finite_progress(&self, projection: usize, resource: usize) -> Result<u64, WorkError> {
+        let Some(factory) = &self.internal_cpu_factory else {
+            return Ok(0);
+        };
+        Ok(source_finite_progress(
+            self.finite_internal_cpu_jobs[projection],
+            Some(factory.queue_bytes()),
+        )?
+        .0[resource])
     }
 
     fn solver_bounds(&self) -> protection::SolverBounds {

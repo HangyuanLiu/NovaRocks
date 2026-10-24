@@ -165,7 +165,7 @@ pub use distributed_rewrite::{
     ConnectorFrozenRewriteGroup, ConnectorRewriteCohortRead,
     MAX_CONNECTOR_DISTRIBUTED_REWRITE_COHORTS,
     MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES, REWRITE_DATA_FILES_KIND,
-    REWRITE_POSITION_DELETES_KIND,
+    REWRITE_POSITION_DELETES_KIND, RewriteCpuInput, RewriteCpuPort, RewritePlanCpuSource,
 };
 pub use distribution::ProviderBindingEpoch;
 pub use document_storage::*;
@@ -334,20 +334,25 @@ pub use staged_create::{
     ConnectorStagedWriteProof, ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupLease,
 };
 pub use statistics::{
-    ConnectorStatistics, ConnectorStatisticsLease, ConnectorStatisticsResolver,
+    AsyncStatisticsCollectionSession, AsyncStatisticsCollectionStart, ConnectorStatistics,
+    ConnectorStatisticsLease, ConnectorStatisticsResolver,
     MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES, MAX_CONNECTOR_STATISTICS_ARTIFACTS,
     MAX_CONNECTOR_STATISTICS_COLUMNS, MAX_CONNECTOR_STATISTICS_METRICS,
     MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES,
     MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES, StatisticsArtifactDraft,
-    StatisticsArtifactIdentity, StatisticsArtifactParts, StatisticsBasisRelation,
-    StatisticsCollection, StatisticsCollectionSession, StatisticsCollectionStart,
-    StatisticsCollectionStartRequest, StatisticsColumnSelection, StatisticsDataVersion,
-    StatisticsEvidence, StatisticsEvidenceRevision, StatisticsInterval, StatisticsMetric,
-    StatisticsMetricError, StatisticsMetricErrorKind, StatisticsMetricObservation,
-    StatisticsMetricRequest, StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue,
-    StatisticsMissing, StatisticsMissingKind, StatisticsNumericNature, StatisticsReadRequest,
-    StatisticsReader, StatisticsReceipt, StatisticsRequiredAggregation, StatisticsRowCoverage,
-    StatisticsScanColumn,
+    StatisticsArtifactIdentity, StatisticsArtifactParts, StatisticsArtifactsCpuSource,
+    StatisticsBasisRelation, StatisticsBindingCpuSource, StatisticsCollection,
+    StatisticsCollectionSession, StatisticsCollectionStart, StatisticsCollectionStartRequest,
+    StatisticsColumnSelection, StatisticsCpuInput, StatisticsCpuPort, StatisticsDataVersion,
+    StatisticsEvidence, StatisticsEvidenceCpuSource, StatisticsEvidenceRevision,
+    StatisticsInterval, StatisticsMetric, StatisticsMetricError, StatisticsMetricErrorKind,
+    StatisticsMetricObservation, StatisticsMetricRequest, StatisticsMetricSource,
+    StatisticsMetricState, StatisticsMetricValue, StatisticsMissing, StatisticsMissingKind,
+    StatisticsNumericNature, StatisticsPublicationClose, StatisticsPublicationReady,
+    StatisticsReadCpuSource, StatisticsReadOriginal, StatisticsReadRequest, StatisticsReader,
+    StatisticsReceipt, StatisticsRequiredAggregation,
+    StatisticsRowCoverage, StatisticsScanColumn, StatisticsSchemaCpuSource,
+    StatisticsSessionFuture,
 };
 pub use view_metadata::{
     ConnectorListViewsRequest, ConnectorViewMetadata, ConnectorViewMetadataValue,
@@ -375,3 +380,6 @@ pub use write::{
 };
 
 pub use process_local::ConnectorProcessLocalPayload;
+
+mod provider_metadata_cpu;
+pub use provider_metadata_cpu::*;

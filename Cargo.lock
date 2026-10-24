@@ -4716,6 +4716,7 @@ name = "novarocks-statistics-application"
 version = "0.1.0"
 dependencies = [
  "novarocks-failpoint",
+ "novarocks-failure-contract",
  "novarocks-query-application",
  "novarocks-resource-contract",
  "novarocks-type-contract",

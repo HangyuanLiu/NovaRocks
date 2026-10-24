@@ -70,12 +70,92 @@ pub(crate) trait Publisher: Send + Sync {
         request: &FrozenRequest,
         operation: &IcebergCommitOperation,
     ) -> Result<()>;
+    /// Borrow the original request slot. A scoped producer may move it only
+    /// into its stable original Source while the same CPU receipt is awaited.
+    /// Other existing families keep their original pure preflight author until
+    /// their P06 interface retirement; no network or refused CPU fallback.
+    fn preflight_recovery_in<'a>(
+        &'a self,
+        request: &'a mut Option<crate::commit::model::FrozenRequest>,
+        operation: &'a IcebergCommitOperation,
+    ) -> crate::commit::attempt::RecoveryPreflightFuture<'a> {
+        crate::commit::attempt::RecoveryPreflightFuture::ready(
+            request
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::new(ErrorKind::DataInvalid, "Original frozen request is absent")
+                })
+                .and_then(|request| self.preflight_recovery(request, operation)),
+        )
+    }
     /// Consume one complete request and issue at most one external mutation.
     async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof>;
 }
 
 /// The retained OCC entrance has one direct catalog dispatch per attempt.
 /// It shares staging and retry with owner publication without changing topology.
+/// Pure preflight stays inline. Only a real asynchronous scoped phase owns
+/// an independently quoted Box pointee; forwarding creates no hidden heap work.
+pub(crate) enum RecoveryPreflightFuture<'a> {
+    Ready(Option<Result<()>>),
+    Pending(std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>),
+}
+impl<'a> RecoveryPreflightFuture<'a> {
+    pub(crate) fn ready(result: Result<()>) -> Self {
+        Self::Ready(Some(result))
+    }
+    pub(crate) fn pending(
+        original: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>,
+    ) -> Self {
+        Self::Pending(original)
+    }
+    pub(crate) fn bind_preparation<R: Clone + Send + Sync + 'static>(
+        self,
+        journal: &'a observation::PublicationJournal<R>,
+        operation: &'a IcebergCommitOperation,
+    ) -> Self {
+        match self {
+            Self::Ready(mut result) => Self::ready(
+                result
+                    .take()
+                    .expect("one original preflight observation")
+                    .and_then(|()| journal.bind_preparation(operation.request_context().clone())),
+            ),
+            pending => Self::pending(Box::pin(bind_preparation_original(
+                pending, journal, operation,
+            ))),
+        }
+    }
+    pub(crate) fn binding_future_bytes<R: Clone + Send + Sync + 'static>() -> usize {
+        fn bytes<A, B, C, F: std::future::Future>(_: fn(A, B, C) -> F) -> usize {
+            std::mem::size_of::<F>()
+        }
+        bytes(bind_preparation_original::<R>)
+    }
+}
+impl std::future::Future for RecoveryPreflightFuture<'_> {
+    type Output = Result<()>;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match self.get_mut() {
+            Self::Ready(result) => {
+                std::task::Poll::Ready(result.take().expect("one original preflight observation"))
+            }
+            Self::Pending(original) => original.as_mut().poll(cx),
+        }
+    }
+}
+async fn bind_preparation_original<R: Clone + Send + Sync + 'static>(
+    original: RecoveryPreflightFuture<'_>,
+    journal: &observation::PublicationJournal<R>,
+    operation: &IcebergCommitOperation,
+) -> Result<()> {
+    original.await?;
+    journal.bind_preparation(operation.request_context().clone())
+}
+
 pub(crate) type RecoveryPreflight =
     std::sync::Arc<dyn Fn(&FrozenRequest, &IcebergCommitOperation) -> Result<()> + Send + Sync>;
 
@@ -103,6 +183,13 @@ impl Publisher for PinnedExpiryPublisher<'_> {
         operation: &IcebergCommitOperation,
     ) -> Result<()> {
         self.inner.preflight_recovery(request, operation)
+    }
+    fn preflight_recovery_in<'a>(
+        &'a self,
+        request: &'a mut Option<crate::commit::model::FrozenRequest>,
+        operation: &'a IcebergCommitOperation,
+    ) -> crate::commit::attempt::RecoveryPreflightFuture<'a> {
+        self.inner.preflight_recovery_in(request, operation)
     }
     async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
         self.inner.dispatch_once(request).await
@@ -302,9 +389,17 @@ pub(crate) async fn run_in_phase(
                         prepare(&attempt, intent, base, prefix, preparers).await?;
                     check_window(operation, started, policy)
                         .map_err(|error| before_dispatch_failure(&error))?;
+                    let mut original_request = Some(request);
                     publisher
-                        .preflight_recovery(&request, operation)
+                        .preflight_recovery_in(&mut original_request, operation)
+                        .await
                         .map_err(|error| before_dispatch_failure(&error))?;
+                    let request = original_request.ok_or_else(|| {
+                        before_dispatch_failure(&Error::new(
+                            ErrorKind::DataInvalid,
+                            "Preflight did not return its original frozen request",
+                        ))
+                    })?;
                     check_window(operation, started, policy)
                         .map_err(|error| before_dispatch_failure(&error))?;
                     Ok::<_, ConnectorMutationFailure>((attempt, request, retained))

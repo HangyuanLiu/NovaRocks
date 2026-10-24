@@ -35,6 +35,13 @@ code-anchors:
   - "novarocks/frontend-application/src/query/write_action.rs (common write family action; migration anchor)"
   - "novarocks/frontend-application/src/query/mutation_action.rs (multi-stage mutation action; migration anchor)"
   - "novarocks/frontend-application/src/query/ctas_action.rs (staged CREATE and final catalog publication; migration anchor)"
+  - "novarocks/frontend-application/src/statistics_jobs/service.rs (stable foreground capture, original query-permit handoff and installed job observation)"
+  - "novarocks/frontend-application/src/statistics_jobs/attempt_executor.rs (Statistics background Action, ComputationReady and retained cleanup responsibility)"
+  - "novarocks/frontend-application/src/query_execution/internal_result_cpu/scoped_statistics.rs (closed scoped Statistics CPU source and actual worker custody)"
+  - "novarocks/frontend-application/src/query_execution/statistics/preparation.rs (original preparation access and completion custody)"
+  - "novarocks/frontend-application/src/query_execution/internal_consumer/decoded.rs (Statistics Ready transfers original statement retention before payload)"
+  - "novarocks/statistics-application/src/job_service.rs (same installed job, serial worker notification and original admission)"
+  - "novarocks/frontend-application/src/query_execution/maintenance/io_admission.rs (original Root payload, ordinary refusal and actual quiescence observation)"
   - "novarocks/frontend-application/src/dml/runner.rs (legacy synchronous runner still present; retirement pending)"
   - "novarocks/frontend-application/src/query_execution/write_session.rs (provider session and retained access; migration anchor)"
   - "novarocks/frontend-application/src/query_execution/write_session/publication_call.rs (original Provider Future, needed-ready receiving and actual exit; migration anchor)"
@@ -54,7 +61,9 @@ code-anchors:
 
 本条记录已接受的目标契约；代码切换与原生验证尚待完成。上列锚点是已有迁移入口，集成时须核对最终模块和承重注释，不能用本条的 active 状态证明实现或测试通过。
 
-当前源码已有普通 Read 与 Internal 写入的 governed Action 接缝；旧 `coordinator/**`、同步 runner 与旧调用面仍须逐项退役。新入口存在、局部检查通过和所有生产调用面完成迁移是不同事实；本条保持 implementation pending，不能据这些入口宣称删旧或原生验收完成。
+当前源码已有普通 Read、Internal 写入与 Statistics 的 governed Action 接缝。Statistics 的前台 capture 保留原请求与 CPU/Provider source，capture 实际关闭后才把同一 query permit 交给 job 的稳定接收格，再通知原串行 worker；不是先持一个许可等待第二个许可。后台计算沿同一逻辑执行 owner，统计 Ready 在移走 payload 前续接原 statement retention，计算退出与后续 publication/清理分别观察。
+
+这些是实际源码接缝，不是各语句族的完整验收结论。整族 Rewrite、MV 与旧 `coordinator/**`、同步 runner 的调用面迁移和删旧仍未完成；本条保持 implementation pending，不能据新入口存在或局部检查宣称原生验收完成。
 
 | 责任 | 唯一 owner | 不拥有的权力 |
 |---|---|---|
@@ -167,13 +176,17 @@ operation-owned cleanup 仅删除 ledger 内精确归属且已证明不再使用
 
 ### 7. 有界运行、真实保管与公平推进
 
-受影响的网络控制 I/O 沿异步 SPI/Provider future 推进，字段读取和纯验证仍同步；规划 CPU 留在 CPU owner。真正只能阻塞的 SDK/JVM/本地调用进入有界执行器，分别记录排队、真实开始和退出。取消等待不释放已开始动作的名额，不用无界线程掩盖永久卡住。
+受影响的网络控制 I/O 沿异步 SPI/Provider future 推进，字段读取和纯验证仍同步；规划 CPU 留在 CPU owner；Statistics 的 schema、计划与产物处理使用经原 lease/session 认证的封闭 scoped CPU source，不能从纯创建 context 或空 ownership pin 取得运行资格。真正只能阻塞的 SDK/JVM/本地调用进入有界执行器，分别记录排队、真实开始和退出。取消等待不释放已开始动作的名额，不用无界线程掩盖永久卡住。
 
 全局、工作类别、真实外部故障域与物理执行位置作为完整资源向量联合准入，不先拿一部分运行许可等另一部分。域键按共享依赖规范化，catalog 别名不能增加额度；多依赖动作同时约束相关域，全局物理占用只计一次。调度跳过暂不可运行项，对持续可运行项提供有限轮数推进；严格全局 FIFO 不能让坏域队首阻断健康域。
 
 启动不可逆动作前先预留保管、回报位与队列记录，运行许可按阶段取得。故障域限制同时覆盖长期 Unknown/未接收产物、payload 字节和运行位置；转为 residual 或移交 supervisor 不能洗掉归属。至少单个坏域隔离的保留份额不得被该域不可撤回地借走，既有结算另有保管和运行保护；不满足此约束的配置必须拒绝。
 
 内部结果 positions/bytes 可配置，按实际 holder 转移；多段业务释放上段计算位置后，以业务预算保有仍需的 payload，再启动下段。整句 union 共用累计字节上界，还需容纳下一段最低运行/接收空间；不足且释放依赖自己后续完成时明确报资源不足，不等待自己、不丢 union、不隐式 spill。失败保留已有外部效果与已封存产物责任。
+
+普通业务拒绝与实际退出是两项事实：原 I/O/CPU 已退出时可以观察实际 quiescence，同时保留原 Resource/Control/领域失败；不能把所有普通 Err 包成 process health，也不能因没有 health 就推断已退出。poll/Drop panic、原 source loan 冲突或退出证据不足仍由原健康与保管路径处理。
+
+形成期的临时展开额度、仍活 Provider/backing 的保管和 Unknown/未接收责任分别计费。原形成 backing 及其别名实际退出、且原接收方未持有该形成产物后，只能由原 holder 报告不再使用的增量；不能因此退掉仍活 Provider 的已准入峰值、累计 payload 或未收记录的 metadata/完整故障域归属。失败、取消、Stage 终态与回收未决都不是自动退款或删除证明。
 
 公平性覆盖 actor 输入、supervisor 的启动/完成回收及结算调度；持续 starts 不能饿死 completed joins。活性以依赖可返回/可退出且调度持续为前提；永久不退出仍占额，多坏域或共享宿主耗尽时明确不可用，不承诺无限故障隔离。
 

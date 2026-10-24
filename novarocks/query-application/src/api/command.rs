@@ -239,6 +239,18 @@ pub trait CatalogCommandConsumer: Send + Sync + 'static {
 }
 
 pub trait StatisticsCommandConsumer: Send + Sync + 'static {
+    fn prepare_statement_action(
+        &self,
+        _command: StatisticsSqlCommand,
+        _request_context: RequestContext,
+        _command_context: CommandContext,
+    ) -> Result<Box<dyn crate::session_control::GovernedStatementAction>, CommandError> {
+        Err(CommandError::new(
+            CommandErrorKind::Unsupported,
+            "statistics consumer does not provide a governed statement action",
+        ))
+    }
+
     fn execute(
         &self,
         command: StatisticsSqlCommand,

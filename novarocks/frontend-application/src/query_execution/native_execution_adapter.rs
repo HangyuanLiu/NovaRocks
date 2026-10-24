@@ -97,7 +97,7 @@ use crate::query_execution::internal_consumer::attempt_handoff::{
 use crate::query_execution::lifecycle_plan::QueryInitOptions;
 use crate::query_execution::logical_execution::{
     ComputationDiagnostics, InitialComputationCredentials, LogicalExecutionLauncher,
-    PreparedLogicalComputation,
+    PreparedLogicalComputation, validate_initial_computation_start,
 };
 use crate::query_execution::split_assignment_round::SplitAssignmentRoundGuard;
 use crate::runtime_filter::compiler::{
@@ -1155,30 +1155,14 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
             {
                 return Err(refused("observed computation has a foreign finish boundary"));
             }
-            // Check the original identity before moving any caller-owned input.
-            // Effectful computation cannot borrow a newly minted execution or a
-            // recovery policy that could replay its external production.
-            match prepared.description.effect() {
-                novarocks_coordination_contract::ExecutionEffect::External => {
-                    if prepared.description.recovery() != RecoveryMode::NoRecovery
-                        || prepared.diagnostics != ComputationDiagnostics::None
-                        || prepared.initial_credentials.as_ref().map(|c| c.execution())
-                            != original.reservation.as_ref().map(|r| r.execution())
-                        || prepared.initial_credentials.is_none()
-                    {
-                        return Err(refused(
-                            "effectful computation requires its matching original reserved NoRecovery execution",
-                        ));
-                    }
-                }
-                novarocks_coordination_contract::ExecutionEffect::None => {
-                    if prepared.initial_credentials.is_some() || original.reservation.is_some() {
-                        return Err(refused(
-                            "effect-free computation cannot consume an effectful initial reservation",
-                        ));
-                    }
-                }
-            }
+            // Validate both original inputs before moving caller-owned custody.
+            validate_initial_computation_start(
+                &prepared.description,
+                prepared.diagnostics,
+                prepared.initial_credentials.as_ref(),
+                original.reservation.as_ref(),
+            )
+            .map_err(refused)?;
             if !prepared
                 .description
                 .matches_plan_seal(prepared.template.native_manifest_template().plan())
@@ -1398,18 +1382,17 @@ impl FrontendNativeLogicalExecutionLauncher {
             ),
             None => (None, None, ComputationDiagnostics::None, None),
         };
-        if initial_credentials.as_ref().is_some_and(|credentials| {
-            description.recovery() != RecoveryMode::NoRecovery
-                || reservation.as_ref().map(|reserved| reserved.execution())
-                    != Some(credentials.execution())
-        }) {
-            return Box::pin(async {
+        if let Err(detail) = validate_initial_computation_start(
+            &description,
+            diagnostics,
+            initial_credentials.as_ref(),
+            reservation.as_ref(),
+        ) {
+            return Box::pin(async move {
                 Err(QueryExecutionError::from_execution(
                     ExecutionFailureInput::new(
                         QueryFailureReason::PreparationProtocol.failure_fact(),
-                        SafeDetail::truncating(
-                            "initial computation credentials require the matching reserved NoRecovery execution",
-                        ),
+                        SafeDetail::truncating(detail),
                         ExecutionFailureSite::Coordinator,
                     ),
                 ))
@@ -2131,7 +2114,7 @@ impl ProductionManifestAttemptProjection {
             session
                 .register_manifest_productions(manifest, &self.work_scope)
                 .await
-                .map_err(|error| projection_message(error.to_string()))?;
+                .map_err(write_production_failure)?;
             Some(session)
         } else {
             None
@@ -2429,6 +2412,20 @@ fn handoff_failure(error: QueryExecutionError) -> NativeAttemptPreparationFailur
         Some(input) => NativeAttemptPreparationFailure::from_input(input.clone()),
         None => attempt_runtime_failure(QueryFailureReason::PreparationProtocol, error),
     }
+}
+
+/// Preserve the production owner's real refusal; capacity is not a Native protocol invariant.
+fn write_production_failure(
+    error: novarocks_spi::connector::ConnectorError,
+) -> NativeAttemptActivationFailure {
+    tracing::debug!(error = %error, "Native write production registration failed");
+    NativeAttemptActivationFailure::new(NativeAttemptPreparationFailure::from_input(
+        ExecutionFailureInput::new(
+            error.failure_fact(),
+            SafeDetail::truncating("native write production responsibility was refused"),
+            ExecutionFailureSite::Coordinator,
+        ),
+    ))
 }
 
 fn projection_failure(error: DistributedQueryError) -> NativeAttemptActivationFailure {
@@ -4595,4 +4592,38 @@ pub(crate) fn native_control_binding_layouts() -> [std::alloc::Layout; 7] {
         source_wait,
         source_arc,
     ]
+}
+
+#[cfg(test)]
+mod production_failure_projection_tests {
+    use super::*;
+
+    #[test]
+    fn original_production_capacity_refusal_preserves_resource_fact_and_safe_client_detail() {
+        let original = crate::query_execution::write_session::production_work_error_for_test(
+            novarocks_workload_control::WorkError::Capacity(
+                "private original production capacity diagnostic",
+            ),
+        );
+        let fact = original.failure_fact();
+        let projected = write_production_failure(original);
+        let input = projected.failure().input();
+        assert_eq!(input.fact(), fact);
+        assert_eq!(
+            projected.failure().class(),
+            AttemptFailureClass::ResourceGovernance
+        );
+        assert_ne!(
+            input.fact(),
+            QueryFailureReason::PreparationProtocol.failure_fact()
+        );
+        assert_eq!(
+            input.detail(),
+            &SafeDetail::truncating("native write production responsibility was refused")
+        );
+        assert_eq!(
+            input.topology_requirement(),
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
+        );
+    }
 }

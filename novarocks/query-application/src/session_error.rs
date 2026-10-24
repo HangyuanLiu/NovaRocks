@@ -70,6 +70,7 @@ pub struct QueryServiceError {
     publication_terminal: Option<LakePublicationTerminal>,
     maintenance_publication_disposition: Option<LakePublicationDisposition>,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
+    compile_provenance: Option<novarocks_type_contract::CompileControlProvenance>,
 }
 
 impl QueryServiceError {
@@ -92,6 +93,7 @@ impl QueryServiceError {
             publication_terminal: None,
             maintenance_publication_disposition: None,
             compile_control: None,
+            compile_provenance: None,
         }
     }
 
@@ -103,6 +105,7 @@ impl QueryServiceError {
             publication_terminal: None,
             maintenance_publication_disposition: None,
             compile_control: None,
+            compile_provenance: None,
         }
     }
 
@@ -120,6 +123,7 @@ impl QueryServiceError {
             publication_terminal: None,
             maintenance_publication_disposition: None,
             compile_control: None,
+            compile_provenance: None,
         }
     }
 
@@ -142,6 +146,7 @@ impl QueryServiceError {
             publication_terminal: Some(terminal),
             maintenance_publication_disposition: None,
             compile_control: None,
+            compile_provenance: None,
         }
     }
 
@@ -219,6 +224,7 @@ impl QueryServiceError {
         mut self,
         cause: Option<novarocks_type_contract::CompileControlError>,
     ) -> Self {
+        self.compile_provenance = cause.as_ref().map(|cause| cause.provenance());
         self.compile_control = cause;
         self
     }
@@ -241,8 +247,60 @@ impl QueryServiceError {
             SafeDetail::truncating(detail),
             ExecutionFailureSite::Coordinator,
         ));
+        failure.compile_provenance = Some(error.provenance());
         failure.compile_control = Some(error);
         failure
+    }
+    /// Storage-only geometry for the existing execution projection followed
+    /// by attach_publication_terminal. The caller pays real target String
+    /// lengths separately. No Provider diagnostics or source graphs enter it.
+    pub fn bounded_publication_projection_backing_bytes(
+        family: novarocks_spi::connector::LakePublicationFamily,
+        detail_bytes: usize,
+    ) -> Result<usize, novarocks_workload_control::WorkError> {
+        use crate::execution_error::{EXECUTION_ERROR_CODE_DESCRIPTORS, ExecutionFailureInput};
+        use novarocks_workload_control::WorkError;
+        let code = EXECUTION_ERROR_CODE_DESCRIPTORS
+            .iter()
+            .map(|d| d.code.as_str().len())
+            .max()
+            .unwrap_or(0);
+        // UUID display is exactly 36 bytes. The original caller supplies
+        // the publication family; disposition uses the
+        // longest existing label. Target text is not rendered in this suffix.
+        let suffix = " (lake publication id=".len()
+            + 36
+            + " family=".len()
+            + family.as_str().len()
+            + " disposition=KnownCommitted do_not_retry=true; do not retry statement)".len();
+        let rendered = code
+            .checked_add(3)
+            .and_then(|n| n.checked_add(detail_bytes))
+            .and_then(|n| n.checked_add(suffix))
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        // Existing String formatting can double RawVec capacity. Count the
+        // old rendering, reset rendering, and one reallocation peak together;
+        // the two exact detail copies belong to SafeDetail and UserError.
+        rendered
+            .max(8)
+            .checked_mul(6)
+            .and_then(|n| detail_bytes.checked_mul(2).and_then(|d| n.checked_add(d)))
+            .and_then(|n| n.checked_add(std::mem::size_of::<ExecutionFailureInput>()))
+            .ok_or(WorkError::ArithmeticOverflow)
+    }
+    /// A historical fact carries its real compiler provenance without keeping
+    /// the original Provider tree alive or manufacturing a rich Source error.
+    pub fn with_compile_control_provenance(
+        mut self,
+        provenance: Option<novarocks_type_contract::CompileControlProvenance>,
+    ) -> Self {
+        self.compile_provenance = provenance;
+        self
+    }
+    pub fn compile_control_provenance(
+        &self,
+    ) -> Option<novarocks_type_contract::CompileControlProvenance> {
+        self.compile_provenance
     }
     pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
         self.compile_control.clone()

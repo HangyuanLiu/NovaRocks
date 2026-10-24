@@ -34,6 +34,9 @@ use super::{
     ConnectorWriteReceipt, ProviderBindingEpoch,
 };
 
+mod async_plan;
+pub use async_plan::{RewriteCpuInput, RewriteCpuPort, RewritePlanCpuSource};
+
 pub const CONNECTOR_DISTRIBUTED_REWRITE_CONTRACT_VERSION: u16 = 1;
 pub const MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_CONNECTOR_DISTRIBUTED_REWRITE_COHORTS: usize = 4096;
@@ -816,6 +819,9 @@ impl ConnectorDistributedRewriteLease {
     }
     pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
+    }
+    pub const fn incarnation(&self) -> ProviderBindingEpoch {
+        self.provider_binding_key.incarnation
     }
     pub const fn control_runtime_id(&self) -> ConnectorControlRuntimeId {
         self.control_runtime_id

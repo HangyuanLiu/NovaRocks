@@ -6253,10 +6253,18 @@ mod tests {
 
         let outcomes = [
             ConnectorWriteAbortOutcome::KnownCommitted {
-                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
-                receipt: ConnectorWriteReceipt::try_new(bytes::Bytes::from_static(b"committed"))
-                    .expect("receipt"),
-                finalization: ExternalMutationFinalization::Complete,
+                cleanup:
+                    novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(
+                        novarocks_spi::connector::ExternalMutationFinalization::Complete,
+                    ),
+                needed: Arc::new(
+                    novarocks_spi::connector::write_stack::ConnectorWriteNeededReady::new(
+                        novarocks_spi::connector::ExternalMutationEffect::Applied,
+                        ConnectorWriteReceipt::try_new(bytes::Bytes::from_static(b"committed"))
+                            .expect("receipt"),
+                        ExternalMutationFinalization::Complete,
+                    ),
+                ),
             },
             ConnectorWriteAbortOutcome::CommitUnknown {
                 failure: ConnectorMutationFailure::new(

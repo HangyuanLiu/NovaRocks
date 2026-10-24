@@ -33,7 +33,7 @@ impl FailureProjection for WorkError {
             Self::Released => (FailureClass::Control, 4, true),
             Self::ForeignAuthority => (FailureClass::Invariant, 5, false),
             Self::Cancelled(_) => (FailureClass::Control, 6, true),
-            Self::Capacity(_) => (FailureClass::Resource, 7, false),
+            Self::Capacity(_) | Self::JointCapacity(_) => (FailureClass::Resource, 7, false),
             Self::CapacityWaitTimeout => (FailureClass::Resource, 8, false),
             Self::AlreadyAdmitted => (FailureClass::Invariant, 9, false),
             Self::AlreadyWaitingForResource(_) => (FailureClass::Invariant, 10, false),

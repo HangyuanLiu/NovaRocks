@@ -2828,7 +2828,7 @@ impl Scenario for DistributedWriterFaults {
                     error.code == 1317
                         && error.state == "70100"
                         && error.message
-                            == "[query.execution.deadline_exceeded] statement execution was stopped by its control owner",
+                            == "[query.execution.deadline_exceeded] logical execution deadline expired before success EOF",
                     "{case} lost its original deadline descriptor, errno, SQLSTATE or safe detail: {error:?}"
                 );
             }
@@ -2911,6 +2911,57 @@ impl Scenario for DistributedWriterFaults {
     }
 }
 
+/// Exact original test controls, owned after the writer so unwind releases
+/// every parked Create before joining the client. This grants no new action.
+struct SeveredWriterRendezvous<'a> {
+    context: &'a mut ScenarioContext,
+    listener: Option<crate::scenarios::native_create_hold::HoldListener>,
+    held: Vec<crate::scenarios::native_create_hold::HeldCreate>,
+    token: String,
+    closed: bool,
+}
+impl SeveredWriterRendezvous<'_> {
+    fn close(&mut self) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        let mut released = Ok(());
+        for create in &mut self.held {
+            released = writer_statement_actor::combine(released, create.release());
+        }
+        // End only the hold, keeping this query's task failure active. A
+        // replay or late connection cannot park after the observed releases.
+        let ended = match self
+            .context
+            .handle()
+            .armed_query_lifecycle_fault_token(SEVERED_BACKEND, "create-task-before-worker-hold")
+        {
+            Ok(Some(token)) if token == self.token => {
+                self.context.handle().end_selected_query_lifecycle_fault(
+                    SEVERED_BACKEND,
+                    "create-task-before-worker-hold",
+                    &self.token,
+                )
+            }
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => Err(anyhow::anyhow!(
+                "severed writer cleanup encountered a foreign hold token"
+            )),
+            Err(error) => Err(error),
+        };
+        self.closed = ended.is_ok();
+        drop(self.listener.take());
+        writer_statement_actor::combine(released, ended)
+    }
+}
+impl Drop for SeveredWriterRendezvous<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.close() {
+            eprintln!("severed writer rendezvous cleanup failed: {error:#}");
+        }
+    }
+}
+
 /// A closed observation interval for one writer, before any reentry SQL.
 struct OriginalWriteWindow {
     publication: PublicationTerminals,
@@ -2969,6 +3020,97 @@ fn run_faulted_write(
 )> {
     let insert = fault.statement(statements);
     match fault {
+        WriteFault::SeveredWriterStream => {
+            let baseline = all_write_counters(context)?;
+            let required_healthy = baseline
+                .len()
+                .checked_sub(1)
+                .filter(|count| *count >= 2)
+                .context("severed writer fixture needs its original three or more backends")?;
+            let listener = crate::scenarios::native_create_hold::HoldListener::bind(
+                &selected.token,
+                context.process_ids().backends.len(),
+            )?;
+            let write = WriterActor::start(context, insert, selected.clone(), None)?;
+            // Move the already-bound listener behind the actual writer in
+            // declaration order. This guard releases accepted/unobserved and
+            // future holds before WriterActor can cancel/join during unwind.
+            let mut gate = SeveredWriterRendezvous {
+                context,
+                listener: Some(listener),
+                held: Vec::new(),
+                token: selected.token.clone(),
+                closed: false,
+            };
+            let primary = (|| {
+                loop {
+                    while let Some(create) = gate
+                        .listener
+                        .as_ref()
+                        .unwrap()
+                        .try_receive(&selected.token, gate.context.deadline())?
+                    {
+                        anyhow::ensure!(
+                            create.backend == SEVERED_BACKEND
+                                && create.outbound_edges > 0
+                                && create.process
+                                    == gate
+                                        .context
+                                        .handle()
+                                        .backend_process_id(SEVERED_BACKEND)?
+                                        .to_string()
+                                && create.execution.ends_with(":1")
+                                && gate.held.iter().all(|old| old.execution == create.execution
+                                    && old.stage == create.stage
+                                    && old.task == create.task),
+                            "severed writer hold is not its exact original remote sender: {}",
+                            create.payload
+                        );
+                        gate.held.push(create);
+                    }
+                    let current = all_write_counters(gate.context)?;
+                    let delta = write_delta(&baseline, &current);
+                    let healthy = delta
+                        .writing_backends
+                        .iter()
+                        .filter(|index| **index != SEVERED_BACKEND)
+                        .count();
+                    if !gate.held.is_empty() && healthy >= required_healthy {
+                        gate.context.action(format!("{healthy} healthy writer backends opened before releasing original sender {}", gate.held[0].identity_marker()));
+                        break;
+                    }
+                    match write.done.try_recv() {
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        Ok(outcome) => bail!(
+                            "severed writer became terminal before its live-sender fixture existed: {outcome:?}"
+                        ),
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            bail!("severed writer actor disconnected before its held sender")
+                        }
+                    }
+                    thread::sleep(
+                        gate.context
+                            .remaining(
+                                "observe original held sender and two healthy writer backends",
+                            )?
+                            .min(Duration::from_millis(20)),
+                    );
+                }
+                gate.close()?;
+                write
+                    .done
+                    .recv_timeout(gate.context.remaining("await the severed writer result")?)
+                    .context("severed writer session did not finish")
+            })();
+            let cleanup = gate.close();
+            drop(gate);
+            settle_observed_writer(
+                write,
+                context,
+                retain_write_result(primary, cleanup),
+                before_reentry,
+            )
+        }
         WriteFault::FetchAbort => {
             let created_baseline = backend_marker_total(context, TASK_CREATE_APPLIED)?;
             let write = WriterActor::start(context, insert, selected, None)?;
@@ -3222,7 +3364,10 @@ fn writer_fault_specs(cluster_size: usize) -> Vec<StatementSpec> {
                 faults: kind
                     .map(|kind| {
                         if matches!(fault, WriteFault::SeveredWriterStream) {
-                            vec![(SEVERED_BACKEND, kind)]
+                            vec![
+                                (SEVERED_BACKEND, kind),
+                                (SEVERED_BACKEND, "create-task-before-worker-hold"),
+                            ]
                         } else {
                             (0..cluster_size).map(|index| (index, kind)).collect()
                         }
@@ -3393,7 +3538,7 @@ mod controlled_writer_tests {
         }));
         assert_eq!(
             specs.iter().map(|spec| spec.faults.len()).sum::<usize>(),
-            22
+            23
         );
         assert_eq!(
             specs
@@ -3404,14 +3549,17 @@ mod controlled_writer_tests {
         );
         assert_eq!(
             specs[6].faults,
-            vec![(SEVERED_BACKEND, TASK_EXECUTION_FAILURE)]
+            vec![
+                (SEVERED_BACKEND, TASK_EXECUTION_FAILURE),
+                (SEVERED_BACKEND, "create-task-before-worker-hold")
+            ]
         );
         assert!(specs[7].faults.is_empty());
         assert!(specs[7].sql.ends_with("WHERE sleep(delay_s)"));
         assert!(specs.iter().flat_map(|spec| &spec.faults).all(|(_, kind)| {
             novarocks_failpoint::QueryLifecycleFaultKind::parse(kind).is_some()
         }));
-        // This is 26 FE grants: the statement owner plus 22 binds and three
+        // This is 27 FE grants: the statement owner plus 23 binds and three
         // Task observations. Seed/setup and the healthy post-matrix write
         // deliberately receive no permission.
         assert_eq!(
@@ -3419,7 +3567,7 @@ mod controlled_writer_tests {
                 .iter()
                 .map(|spec| spec.faults.len() + spec.observations.len())
                 .sum::<usize>(),
-            26
+            27
         );
     }
 }

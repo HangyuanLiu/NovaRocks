@@ -106,7 +106,9 @@ pub(super) fn production_error(message: &'static str) -> ConnectorError {
 }
 pub(super) fn production_work_error(error: WorkError) -> ConnectorError {
     let kind = match error {
-        WorkError::Capacity(_) => ConnectorErrorKind::ResourceExhausted,
+        WorkError::Capacity(_) | WorkError::JointCapacity(_) => {
+            ConnectorErrorKind::ResourceExhausted
+        }
         WorkError::Closed | WorkError::Released => ConnectorErrorKind::Cancelled,
         _ => ConnectorErrorKind::InvalidRequest,
     };
