@@ -131,6 +131,25 @@ fn write_transaction_spec(prepared: &PreparedDelete) -> WriteTransactionSpec {
 }
 
 impl DmlService {
+    /// Validate the parser-owned shape before forming a governed write action.
+    pub(crate) fn admit_delete_shape(
+        &self,
+        statement: DeleteStatement<'_>,
+        source: &str,
+    ) -> Result<(), DmlError> {
+        if let DeleteStatement::Predicate(delete) = statement
+            && delete.selection.is_none()
+        {
+            return Err(DmlError::admit(DmlAdmissionError::DeleteRequiresWhere.to_user_error(
+                source,
+                delete.span,
+                "DELETE requires a WHERE clause; for full table replacement use INSERT OVERWRITE t SELECT * FROM t WHERE FALSE",
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Prepares a parser-owned DELETE variant without beginning its write.
     /// `source` is carried only for AST-span slices during preparation; it is
     /// never reparsed here.
@@ -142,15 +161,7 @@ impl DmlService {
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
     ) -> Result<PreparedDeleteAttempt, DmlError> {
-        if let DeleteStatement::Predicate(delete) = statement
-            && delete.selection.is_none()
-        {
-            return Err(DmlError::admit(DmlAdmissionError::DeleteRequiresWhere.to_user_error(
-                source,
-                delete.span,
-                "DELETE requires a WHERE clause; for full table replacement use INSERT OVERWRITE t SELECT * FROM t WHERE FALSE",
-            )));
-        }
+        self.admit_delete_shape(statement, source)?;
 
         let publication_id = LakePublicationId::new_v7();
         let session = context.session();
@@ -206,6 +217,16 @@ mod execution_error_tests {
         source: PhysicalEncodeError,
     }
     impl DeleteEngine for RefusingEngine {
+        fn prepare_statement_action(
+            &self,
+            _: crate::query_execution::dml::delete::DeleteStatementInput,
+        ) -> Result<
+            Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+            String,
+        > {
+            Err("legacy encoding fixture has no governed DELETE source".into())
+        }
+
         fn prepare_delete(&self, _: PrepareDeleteRequest<'_>) -> Result<PreparedDelete, String> {
             panic!("already prepared");
         }

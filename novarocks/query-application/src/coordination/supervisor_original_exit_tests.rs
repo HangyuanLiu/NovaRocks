@@ -777,6 +777,14 @@ impl Drop for CompletedActivationDropDormant {
     }
 }
 impl DormantNativeAttemptOwner for CompletedActivationDropDormant {
+    fn poll_bind_qualification(
+        &mut self,
+        schedule: &crate::coordination::AttemptSchedule,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+        self.inner.poll_bind_qualification(schedule, cx)
+    }
+
     fn eligible_backends(&self) -> &[BackendProcessId] {
         self.inner.eligible_backends()
     }
@@ -998,22 +1006,32 @@ async fn actual_root_cancel_closes_bank_ingress_after_statement_wake_panics() {
             unpolled_test_driver(&control, Arc::new(PanickingOpenNativePort));
         let statements = crate::session_control::StatementProgressSlot::empty();
         statements
-            .install(crate::query_control::QueryApplicationControl::service())
+            .install(
+                crate::query_control::QueryApplicationControl::service(),
+                control.statement_source_slots,
+            )
             .unwrap();
         let statement_waker = std::task::Waker::from(Arc::new(StopWake {
             payload: std::sync::Mutex::new(Some(StatementStopCause)),
         }));
         let mut cursor = crate::session_control::StatementProgressCursor::default();
         let budget = NonZeroUsize::new(7).unwrap();
-        assert!(
-            statements
-                .poll_turn(
-                    &mut cursor,
-                    budget,
-                    &mut std::task::Context::from_waker(&statement_waker)
-                )
-                .is_ready()
-        );
+        // Prime the real finite scanner using an inert waker. Register the
+        // throwing waker only once idle, so it still fails at the actual
+        // stop notification rather than an ordinary bounded scan yield.
+        let idle_waker = futures::task::noop_waker();
+        let mut idle_cx = std::task::Context::from_waker(&idle_waker);
+        let mut idle = false;
+        for _ in 0..=control.statement_source_slots.get() {
+            if statements
+                .poll_turn(&mut cursor, budget, &mut idle_cx)
+                .is_pending()
+            {
+                idle = true;
+                break;
+            }
+        }
+        assert!(idle, "the actual finite scanner must reach idle");
         assert!(
             statements
                 .poll_turn(

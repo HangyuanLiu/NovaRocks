@@ -199,6 +199,10 @@ pub struct DmlExecutionKernel {
     connector_runtime: Option<tokio::runtime::Handle>,
     lake_publication_runtime_policy:
         Option<novarocks_query_application::publication::LakePublicationRuntimePolicy>,
+    write_runtime: Option<(
+        crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+        crate::native::data_runtime::FrontendDataRuntime,
+    )>,
 }
 
 /// Immutable SQL planning authorities shared by every DML statement.
@@ -256,8 +260,50 @@ impl DmlExecutionKernel {
             mv_readiness,
             query_execution,
             connector_runtime: None,
+            write_runtime: None,
             lake_publication_runtime_policy: None,
         }
+    }
+
+    /// Original role-owned handles, installed before any INSERT action.
+    pub(crate) fn with_write_runtime(
+        mut self,
+        blocking: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+        data: crate::native::data_runtime::FrontendDataRuntime,
+    ) -> Self {
+        self.write_runtime = Some((blocking, data));
+        self
+    }
+
+    pub(crate) fn write_runtime(
+        &self,
+    ) -> Result<
+        &(
+            crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+            crate::native::data_runtime::FrontendDataRuntime,
+        ),
+        String,
+    > {
+        self.write_runtime
+            .as_ref()
+            .ok_or_else(|| "INSERT original execution handles are not installed".to_owned())
+    }
+
+    pub(crate) fn completion_fact_owners(
+        &self,
+    ) -> Result<crate::query_execution::completion_facts::CompletionFactOwners, String> {
+        let (blocking, _) = self.write_runtime()?;
+        Ok(
+            crate::query_execution::completion_facts::CompletionFactOwners::new(
+                Arc::clone(&self.catalog_service),
+                self.catalog_application.clone(),
+                Arc::clone(&self.typed_connector_control),
+                Arc::clone(&self.unified_statistics),
+                self.mv_readiness.candidate_reader().clone(),
+                Arc::clone(&self.mv_storage_observation),
+                blocking.clone(),
+            ),
+        )
     }
 
     pub(crate) fn with_connector_runtime(mut self, runtime: tokio::runtime::Handle) -> Self {

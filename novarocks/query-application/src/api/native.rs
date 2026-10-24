@@ -482,6 +482,17 @@ pub trait DormantNativeAttemptOwner: fmt::Debug + Send + 'static {
     /// keeping the already-issued schedule.
     fn eligible_backends(&self) -> &[BackendProcessId];
 
+    /// Install the exact successor manifest's complete dependency union before
+    /// Query Application may issue any replacement qualification RPC. The
+    /// original dormant owner retains its paid proposal, wait and reply across
+    /// Pending, cancellation and unwind. This does not activate Tasks or return
+    /// Worker admission evidence. Later activation consumes the same manifest.
+    fn poll_bind_qualification(
+        &mut self,
+        schedule: &AttemptSchedule,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), NativeAttemptActivationFailure>>;
+
     fn activate<'a>(
         &'a mut self,
         schedule: &'a AttemptSchedule,
@@ -909,6 +920,15 @@ impl LogicalNativeOpenAcceptance {
 }
 
 impl LogicalNativeSession {
+    pub(crate) fn client_computation_cut_handle(
+        &self,
+    ) -> Option<crate::admitted_query_context::ClientComputationCutHandle> {
+        self.attempts
+            .as_ref()?
+            .result_capacity
+            .as_ref()?
+            .client_computation_cut_handle()
+    }
     pub(crate) fn set_result_capacity_in(
         &mut self,
         capacity: &mut Option<QueryResultCapacityBinding>,
@@ -1587,6 +1607,15 @@ mod tests {
     }
 
     impl DormantNativeAttemptOwner for Dormant {
+        fn poll_bind_qualification(
+            &mut self,
+            _schedule: &crate::coordination::AttemptSchedule,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+            // This fixture owns no external dependency or qualification transport.
+            std::task::Poll::Ready(Ok(()))
+        }
+
         fn eligible_backends(&self) -> &[BackendProcessId] {
             &self.eligible_backends
         }
@@ -2112,6 +2141,16 @@ mod tests {
             }
         }
         impl DormantNativeAttemptOwner for FundedDormant {
+            fn poll_bind_qualification(
+                &mut self,
+                _schedule: &crate::coordination::AttemptSchedule,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), crate::api::NativeAttemptActivationFailure>>
+            {
+                // This fixture owns no external dependency or qualification transport.
+                std::task::Poll::Ready(Ok(()))
+            }
+
             fn eligible_backends(&self) -> &[BackendProcessId] {
                 std::slice::from_ref(&self.backend)
             }
@@ -2366,6 +2405,15 @@ mod tests {
     }
 
     impl DormantNativeAttemptOwner for RetryableBorrowedConvergence {
+        fn poll_bind_qualification(
+            &mut self,
+            _schedule: &crate::coordination::AttemptSchedule,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+            // This fixture owns no external dependency or qualification transport.
+            std::task::Poll::Ready(Ok(()))
+        }
+
         fn eligible_backends(&self) -> &[BackendProcessId] {
             &[]
         }

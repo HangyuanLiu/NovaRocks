@@ -1,0 +1,567 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! The original write Call and publication evidence across statement phases.
+
+use super::write_action::{
+    WriteOutcome, disposition, select_needed_publication, select_publication,
+};
+use super::*;
+use crate::dml::attempt::{
+    DmlPublicationAdjudication, DmlPublicationAdjudicationOutcome, DmlPublicationAttempt,
+    DmlPublicationFinalization,
+};
+use crate::query_execution::write_session::{ConnectorWriteSession, WritePublicationCall};
+use novarocks_query_application::api::StatementNativeHealthFailure;
+use novarocks_spi::connector::write_stack::{
+    ConnectorWriteNeededReady, ConnectorWritePublicationCompletion,
+};
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorRequestContext, ConnectorWriteAbortOutcome,
+    ExternalMutationFinalization, ExternalMutationOutcome, LakePublicationDisposition,
+};
+use std::task::{Context, Poll};
+
+pub(crate) struct StatementPublication {
+    pub(crate) attempt: DmlPublicationAttempt,
+    pub(crate) call: Option<WritePublicationCall>,
+    pub(crate) refusal: Option<ConnectorError>,
+    pub(crate) outcome: Option<WriteOutcome>,
+    needed: Option<Arc<ConnectorWriteNeededReady>>,
+    pub(crate) abort_outcome: Option<Result<ConnectorWriteAbortOutcome, ConnectorError>>,
+    pub(crate) local_finalization: Option<Result<(), String>>,
+    adjudication: Option<DmlPublicationAdjudication>,
+    reconciled: bool,
+    finished: bool,
+    poisoned: bool,
+    verdict: Option<LakePublicationDisposition>,
+    health: Option<StatementNativeHealthFailure>,
+}
+impl StatementPublication {
+    pub(crate) fn new(attempt: DmlPublicationAttempt) -> Self {
+        Self {
+            attempt,
+            call: None,
+            refusal: None,
+            outcome: None,
+            needed: None,
+            abort_outcome: None,
+            local_finalization: None,
+            adjudication: None,
+            reconciled: false,
+            finished: false,
+            poisoned: false,
+            verdict: None,
+            health: None,
+        }
+    }
+    pub(crate) fn disposition(&self) -> Option<LakePublicationDisposition> {
+        match self.verdict {
+            Some(
+                LakePublicationDisposition::KnownCommitted
+                | LakePublicationDisposition::KnownUncommitted,
+            ) => self.verdict,
+            _ => self
+                .call
+                .as_ref()
+                .and_then(WritePublicationCall::publication_disposition)
+                .or(self.verdict),
+        }
+    }
+    pub(crate) fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
+        self.health.clone().or_else(|| {
+            self.call
+                .as_ref()
+                .and_then(WritePublicationCall::local_health_failure)
+        })
+    }
+    fn poison(&mut self, error: impl std::error::Error + Send + Sync + 'static) {
+        self.poisoned = true;
+        self.health = Some(StatementNativeHealthFailure::actual_exit_unproven(
+            "statement publication transition did not complete",
+            Arc::new(error),
+        ));
+    }
+    /// Caller has already observed local CPU exit and stores every refusal in
+    /// its original source. This never invents another session or operation.
+    pub(crate) fn poll_settle(
+        &mut self,
+        session: Option<&Arc<ConnectorWriteSession>>,
+        context: &ConnectorRequestContext,
+        abort: bool,
+        cx: &mut Context<'_>,
+    ) -> Poll<()> {
+        if self.poisoned {
+            return Poll::Pending;
+        }
+        if self.finished {
+            return Poll::Ready(());
+        }
+        if self.call.is_none() {
+            let Some(session) = session else {
+                self.finished = true;
+                return Poll::Ready(());
+            };
+            let prepared = if abort {
+                session
+                    .prepare_abort_call(context.clone())
+                    .map(|call| self.call = Some(call))
+            } else {
+                session.prepare_finish_or_abort_call_in(
+                    context.clone(),
+                    &mut self.call,
+                    &mut self.refusal,
+                )
+            };
+            if let Err(error) = prepared {
+                self.poison(error);
+                return Poll::Pending;
+            }
+        }
+        let call = self.call.as_mut().expect("original publication Call");
+        if call.poll_needed_ready(cx).is_pending() {
+            return Poll::Pending;
+        }
+        if call.needed_ready().is_some() {
+            if let Err(error) = call.take_needed_ready_in(&mut self.needed) {
+                self.poison(error);
+                return Poll::Pending;
+            }
+            self.verdict = Some(LakePublicationDisposition::KnownCommitted);
+            self.finished = true;
+            return Poll::Ready(());
+        }
+        if !self.reconciled {
+            let evidence = match (call.outcome(), call.abort_outcome()) {
+                (
+                    Some(Ok(ConnectorWritePublicationCompletion::CommitUnknown {
+                        evidence, ..
+                    })),
+                    _,
+                ) => Some(evidence.clone()),
+                (_, Some(Ok(ConnectorWriteAbortOutcome::CommitUnknown { evidence, .. }))) => {
+                    Some(evidence.clone())
+                }
+                _ => None,
+            };
+            if let Some(evidence) = evidence {
+                self.verdict = Some(LakePublicationDisposition::CommitUnknown);
+                if let Err(error) = self.attempt.mark_dispatch_possible() {
+                    self.poison(error);
+                    return Poll::Pending;
+                }
+                match self.attempt.begin_adjudication() {
+                    Ok(token) => self.adjudication = Some(token),
+                    Err(error) => {
+                        self.poison(error);
+                        return Poll::Pending;
+                    }
+                }
+                if let Err(error) = call.start_reconciliation(evidence, context.clone()) {
+                    self.poison(error);
+                    return Poll::Pending;
+                }
+                self.reconciled = true;
+                if call.poll_needed_ready(cx).is_pending() {
+                    return Poll::Pending;
+                }
+            }
+        }
+        if call.needed_ready().is_some() {
+            if let Err(error) = call.take_needed_ready_in(&mut self.needed) {
+                self.poison(error);
+                return Poll::Pending;
+            }
+            self.verdict = Some(LakePublicationDisposition::KnownCommitted);
+            self.finished = true;
+            return Poll::Ready(());
+        }
+        let transferred = if call.outcome().is_some() {
+            self.verdict = Some(disposition(call.outcome().unwrap()));
+            call.take_outcome_in(&mut self.outcome)
+        } else if call.abort_outcome().is_some() {
+            self.verdict = Some(match call.abort_outcome().unwrap() {
+                Ok(ConnectorWriteAbortOutcome::KnownCommitted { .. }) => {
+                    LakePublicationDisposition::KnownCommitted
+                }
+                Ok(ConnectorWriteAbortOutcome::KnownUncommitted { .. }) => {
+                    LakePublicationDisposition::KnownUncommitted
+                }
+                _ => LakePublicationDisposition::CommitUnknown,
+            });
+            call.take_abort_outcome_in(&mut self.abort_outcome)
+        } else {
+            return Poll::Pending;
+        };
+        if let Err(error) = transferred {
+            self.poison(error);
+            return Poll::Pending;
+        }
+        self.finished = true;
+        Poll::Ready(())
+    }
+    /// The business fact does not retire the original Call, cleanup or Drop.
+    pub(crate) fn poll_retirement(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.poisoned {
+            return Poll::Pending;
+        }
+        let Some(call) = self.call.as_mut() else {
+            return Poll::Ready(());
+        };
+        if call.poll_retirement(cx).is_pending() {
+            return Poll::Pending;
+        }
+        if self.outcome.is_none() && call.outcome().is_some() {
+            if let Err(error) = call.take_outcome_in(&mut self.outcome) {
+                self.poison(error);
+                return Poll::Pending;
+            }
+        }
+        Poll::Ready(())
+    }
+    pub(crate) fn committed(&self) -> bool {
+        self.disposition() == Some(LakePublicationDisposition::KnownCommitted)
+    }
+    pub(crate) fn select(
+        &self,
+        cancellation: Option<QueryCancellationReason>,
+    ) -> Result<(), QueryServiceError> {
+        if let Some(error) = &self.refusal {
+            return Err(internal_error(error.to_string()));
+        }
+        if let Some(needed) = &self.needed {
+            return select_needed_publication(
+                needed,
+                self.local_finalization.as_ref(),
+                cancellation,
+            );
+        }
+        if let Some(outcome) = &self.outcome {
+            return select_publication(outcome, self.local_finalization.as_ref(), cancellation);
+        }
+        if let Some(Err(error)) = &self.local_finalization {
+            return Err(internal_error(error.clone()));
+        }
+        match &self.abort_outcome {
+            Some(Err(error)) => Err(internal_error(error.to_string())),
+            Some(Ok(ConnectorWriteAbortOutcome::CommitUnknown { failure, .. })) => {
+                Err(internal_error(failure.message()))
+            }
+            Some(Ok(ConnectorWriteAbortOutcome::KnownCommitted {
+                finalization: ExternalMutationFinalization::Failed(failure),
+                ..
+            })) => Err(internal_error(failure.message())),
+            _ => cancellation.map(cancellation_error).map_or(Ok(()), Err),
+        }
+    }
+    pub(crate) fn freeze_terminal(&mut self) -> Result<(), QueryServiceError> {
+        if self.attempt.terminal().is_some() {
+            return Ok(());
+        }
+        let verdict = if self.needed.is_some() {
+            Some(LakePublicationDisposition::KnownCommitted)
+        } else if let Some(outcome) = self.outcome.as_ref() {
+            Some(disposition(outcome))
+        } else {
+            self.abort_outcome.as_ref().map(|outcome| match outcome {
+                Ok(ConnectorWriteAbortOutcome::KnownUncommitted { .. }) => {
+                    LakePublicationDisposition::KnownUncommitted
+                }
+                Ok(ConnectorWriteAbortOutcome::KnownCommitted { .. }) => {
+                    LakePublicationDisposition::KnownCommitted
+                }
+                _ => LakePublicationDisposition::CommitUnknown,
+            })
+        };
+        let Some(verdict) = verdict else {
+            // A refusal before any provider publication call has an exact
+            // pre-dispatch verdict, even after local preparation was observed.
+            if self.call.is_none() && self.finished {
+                self.attempt
+                    .terminal_pre_dispatch_uncommitted()
+                    .map_err(|e| internal_error(e.to_string()))?;
+                self.verdict = Some(LakePublicationDisposition::KnownUncommitted);
+            }
+            return Ok(());
+        };
+        let provider_finalization = self
+            .needed
+            .as_ref()
+            .map(|needed| needed.finalization())
+            .or_else(|| match (&self.outcome, &self.abort_outcome) {
+                (
+                    Some(Ok(ConnectorWritePublicationCompletion::KnownCommitted {
+                        needed, ..
+                    })),
+                    _,
+                ) => Some(needed.finalization()),
+                (_, Some(Ok(ConnectorWriteAbortOutcome::KnownCommitted { finalization, .. }))) => {
+                    Some(finalization)
+                }
+                _ => None,
+            });
+        let finalized = if provider_finalization
+            .is_some_and(|f| matches!(f, ExternalMutationFinalization::Failed(_)))
+            || self.local_finalization.as_ref().is_some_and(Result::is_err)
+        {
+            DmlPublicationFinalization::Failed
+        } else {
+            DmlPublicationFinalization::Succeeded
+        };
+        if let Some(token) = self.adjudication.take() {
+            let fact = match verdict {
+                LakePublicationDisposition::KnownCommitted => {
+                    DmlPublicationAdjudicationOutcome::KnownCommitted
+                }
+                LakePublicationDisposition::KnownUncommitted => {
+                    DmlPublicationAdjudicationOutcome::KnownUncommitted
+                }
+                LakePublicationDisposition::CommitUnknown => {
+                    DmlPublicationAdjudicationOutcome::CommitUnknown
+                }
+            };
+            self.attempt
+                .finish_adjudication(
+                    token,
+                    fact,
+                    if verdict == LakePublicationDisposition::KnownCommitted {
+                        finalized
+                    } else {
+                        DmlPublicationFinalization::NotApplicable
+                    },
+                )
+                .map_err(|e| internal_error(e.to_string()))?;
+        } else {
+            match verdict {
+                LakePublicationDisposition::KnownUncommitted => {
+                    self.attempt
+                        .terminal_known_uncommitted()
+                        .map_err(|e| internal_error(e.to_string()))?;
+                }
+                LakePublicationDisposition::KnownCommitted => {
+                    self.attempt
+                        .mark_dispatch_possible()
+                        .map_err(|e| internal_error(e.to_string()))?;
+                    self.attempt
+                        .terminal_known_committed(finalized)
+                        .map_err(|e| internal_error(e.to_string()))?;
+                }
+                LakePublicationDisposition::CommitUnknown => {
+                    self.attempt
+                        .mark_dispatch_possible()
+                        .map_err(|e| internal_error(e.to_string()))?;
+                    self.attempt
+                        .terminal_commit_unknown()
+                        .map_err(|e| internal_error(e.to_string()))?;
+                }
+            }
+        }
+        self.verdict = Some(verdict);
+        Ok(())
+    }
+}
+
+#[cfg(all(test, novarocks_dev_controls))]
+mod tests {
+    use super::*;
+    use crate::query_execution::write_result::{RootWriteDecodeContract, RootWriteResultDecoder};
+    use crate::query_execution::write_session::tests::{
+        commit_fragment_bytes, fixture_with_outcome, known_committed, request_context,
+    };
+    use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
+    use novarocks_spi::connector::{
+        LakePublicationFamily, LakePublicationId, LakePublicationTarget,
+    };
+    fn original_attempt() -> DmlPublicationAttempt {
+        DmlPublicationAttempt::new(
+            LakePublicationId::new_v7(),
+            LakePublicationFamily::DataMutation,
+            LakePublicationTarget::try_new(
+                "catalog".to_owned(),
+                "namespace".to_owned(),
+                Some("table".to_owned()),
+                None,
+            )
+            .unwrap(),
+            None,
+        )
+    }
+    #[test]
+    fn complete_receiving_segments_feed_one_original_session_and_one_actual_call() {
+        let (_control, root, binding, _capacity) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let fixture = fixture_with_outcome(1, 16, known_committed());
+        let target = WriteTargetOrdinal::try_new(0).unwrap();
+        for _ in 0..2 {
+            let mut decoder = RootWriteResultDecoder::new_with_capacity(
+                RootWriteDecodeContract::try_new(&[target], fixture.session.targets()).unwrap(),
+                &binding,
+            )
+            .unwrap();
+            decoder
+                .apply_relay_body(
+                    &crate::query_execution::write_result::tests::component_write_body(
+                        commit_fragment_bytes(),
+                    ),
+                )
+                .unwrap();
+            // A body/summary prefix cannot authorize a publication.
+            assert_eq!(fixture.recorded.lock().unwrap().finish, 0);
+            decoder.observe_root_eof().unwrap();
+            let decoded = fixture
+                .session
+                .computation_decode(&[target])
+                .unwrap()
+                .interpret(decoder.finish().unwrap())
+                .unwrap();
+            let accepted = fixture.session.receiving_port().accept(decoded).unwrap();
+            assert!(accepted.belongs_to(&fixture.session));
+            assert_eq!(accepted.row_count(), 3);
+        }
+        assert_eq!(fixture.session.accumulated_row_count().unwrap(), 6);
+        let mut publication = StatementPublication::new(original_attempt());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(
+            publication
+                .poll_settle(Some(&fixture.session), &request_context(), false, &mut cx)
+                .is_ready()
+        );
+        assert!(
+            publication
+                .select(Some(QueryCancellationReason::ClientDisconnected))
+                .is_ok(),
+            "an actual Applied result survives late cancel"
+        );
+        publication.freeze_terminal().unwrap();
+        assert_eq!(
+            publication.attempt.terminal().unwrap().disposition(),
+            LakePublicationDisposition::KnownCommitted
+        );
+        assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
+        assert_eq!(fixture.session.accumulated_row_count().unwrap(), 6);
+        assert!(
+            publication
+                .poll_settle(Some(&fixture.session), &request_context(), false, &mut cx)
+                .is_ready()
+        );
+        assert_eq!(
+            fixture.recorded.lock().unwrap().finish,
+            1,
+            "settled original Call is never reissued"
+        );
+        drop(publication);
+        drop(fixture);
+        drop(binding);
+        root.owner.complete();
+    }
+    #[test]
+    fn actual_needed_ready_returns_before_gc_and_same_publication_retires_later() {
+        use crate::query_execution::write_result::DecodedPreparedWriteSet;
+        let fixture = fixture_with_outcome(1, 16, known_committed());
+        fixture
+            .session
+            .accumulate(DecodedPreparedWriteSet::for_test(
+                7,
+                vec![(
+                    WriteTargetOrdinal::try_new(0).unwrap(),
+                    commit_fragment_bytes(),
+                )],
+            ))
+            .unwrap();
+        fixture.recorded.lock().unwrap().defer_finish_cleanup = true;
+        let mut publication = StatementPublication::new(original_attempt());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(
+            publication
+                .poll_settle(Some(&fixture.session), &request_context(), false, &mut cx)
+                .is_ready()
+        );
+        assert!(
+            publication.outcome.is_none(),
+            "whole Call is still owned and pending"
+        );
+        let ready = publication.needed.as_ref().unwrap().clone();
+        assert_eq!(fixture.recorded.lock().unwrap().cleanup_started, 0);
+        assert_eq!(fixture.recorded.lock().unwrap().finish_future_drops, 0);
+        publication.freeze_terminal().unwrap();
+        assert!(
+            publication
+                .select(Some(QueryCancellationReason::ClientDisconnected))
+                .is_ok()
+        );
+        assert!(publication.poll_retirement(&mut cx).is_pending());
+        assert_eq!(fixture.recorded.lock().unwrap().cleanup_started, 1);
+        assert!(
+            publication
+                .poll_settle(Some(&fixture.session), &request_context(), true, &mut cx)
+                .is_ready()
+        );
+        assert_eq!(fixture.recorded.lock().unwrap().finish, 1);
+        {
+            let mut state = fixture.recorded.lock().unwrap();
+            state.fail_safe_cleanup = true;
+            state.allow_cleanup_exit = true;
+        }
+        assert!(publication.poll_retirement(&mut cx).is_ready());
+        assert_eq!(fixture.recorded.lock().unwrap().finish_future_drops, 1);
+        let Some(Ok(ConnectorWritePublicationCompletion::KnownCommitted { needed, cleanup })) =
+            publication.outcome.as_ref()
+        else {
+            panic!("actual original completion");
+        };
+        assert!(Arc::ptr_eq(&ready, needed));
+        assert!(matches!(
+            cleanup,
+            novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(
+                ExternalMutationFinalization::Failed(_)
+            )
+        ));
+        assert!(
+            publication
+                .select(Some(QueryCancellationReason::ClientDisconnected))
+                .is_ok()
+        );
+        assert_eq!(
+            publication.attempt.terminal().unwrap().disposition(),
+            LakePublicationDisposition::KnownCommitted
+        );
+    }
+    #[test]
+    fn original_pre_dispatch_refusal_aborts_same_session_once() {
+        let fixture = fixture_with_outcome(1, 16, known_committed());
+        let mut publication = StatementPublication::new(original_attempt());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(
+            publication
+                .poll_settle(Some(&fixture.session), &request_context(), true, &mut cx)
+                .is_ready()
+        );
+        publication.freeze_terminal().unwrap();
+        assert_eq!(fixture.recorded.lock().unwrap().finish, 0);
+        assert_eq!(fixture.recorded.lock().unwrap().abort, 1);
+        assert_eq!(
+            publication.attempt.terminal().unwrap().disposition(),
+            LakePublicationDisposition::KnownUncommitted
+        );
+        assert!(
+            publication
+                .poll_settle(Some(&fixture.session), &request_context(), true, &mut cx)
+                .is_ready()
+        );
+        assert_eq!(fixture.recorded.lock().unwrap().abort, 1);
+    }
+}

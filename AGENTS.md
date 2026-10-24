@@ -197,10 +197,15 @@ SQL client
   `truncate.rs`, `add_files.rs`, `ctas.rs` / `iceberg_ctas.rs`,
   `iceberg_writer.rs` (INSERT INTO / INSERT OVERWRITE).
 
-- `novarocks/frontend-application/src/dml/runner.rs`
-  语句级写入编排的迁移入口；受监督任务覆盖 prepare、计算、publication 和必要 finalize。
-  计算就绪后即可推进领域提交，诊断与安全清理独立；成功和失败路径均保留累计外部效果。
-  seal/NoOp 不冒充真实提交，取消不得覆盖已取得的提交事实。契约见 ADR-0198。
+- `novarocks/frontend-application/src/query/{statement_action,read_action,write_action,mutation_action,ctas_action}.rs`
+  当前 governed 语句接缝：普通 Read 保留 Client 窗口与流式 handle；Internal 写入由稳定 Action
+  编排 prepare、计算、publication 和必要 finalize。共享阶段/计算在 `query/statement_computation.rs`，
+  共享 publication 在 `query/statement_publication.rs`。计算就绪、必要业务就绪与真实退出分别取证；
+  成功和失败路径保留累计外部效果，seal/NoOp 不冒充最终 CREATE 或真实提交。
+
+- `novarocks/frontend-application/src/dml/runner.rs` 与 `novarocks/frontend-application/src/coordinator/**`
+  旧同步 runner 和协调路径仍在，调用面迁移与删旧尚未完成；不能把新 Action 文件存在或局部检查
+  当作全路径实现、退役或原生验收通过。ADR-0198 保持 implementation pending。
 
 - `novarocks/frontend-application/src/catalog_application/statement.rs`
   Catalog, database and table DDL against the projected catalog.
@@ -470,7 +475,8 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    per participating backend. A context exists only where the scheduler placed
    a task, so the number of participants is a property of the plan and the
    splits, never of the cluster size.
-2. 各分布式意图由 Query Application 的统一逻辑执行 owner 管理恢复、结果与就绪；
+2. ADR-0198 的目标是由 Query Application 的统一逻辑执行 owner 管理各分布式意图的恢复、结果与就绪；
+   当前 Read/Internal Action 接缝与旧协调路径并存，完整迁移、删旧和原生验收仍待完成。
    Frontend 领域提供完整结果的 typed proof，Task 驱动只提供协议事实。
    ADR-0198 将内部计算就绪、publication、诊断和收敛分开；就绪不等于语句成功。
    `execute_round_on_task_protocol` establishes every context and creates every
@@ -984,8 +990,11 @@ suspected case against a clean server before attributing it to the change.
   `delete/**`, `mutation_flow.rs`, `truncate.rs`, `add_files.rs`,
   `iceberg_writer.rs`); catalog/table DDL is in
   `novarocks/frontend-application/src/catalog_application/statement.rs`.
-  Statement supervision/publication starts at `novarocks/frontend-application/src/dml/runner.rs`;
-  common execution is in `novarocks/query-application/src/coordination/**`.
+  Current governed statement custody starts at `novarocks/frontend-application/src/query/statement_action.rs`;
+  inspect the read/write/mutation/CTAS Actions, shared `statement_computation.rs` and
+  `statement_publication.rs` in that directory. The synchronous `dml/runner.rs` and
+  `coordinator/**` still exist; their retirement and complete caller migration remain pending.
+  Common logical execution policy is in `novarocks/query-application/src/coordination/**`.
   Preserve cumulative effects through `novarocks/query-application/src/api/result.rs`
   and MySQL success/error projection; consult ADR-0198 before changing these boundaries.
 - **Iceberg 提交、冲突与清理**：从 `novarocks/connector/iceberg/src/commit/{model,dependency,staging}/**`、
@@ -995,6 +1004,9 @@ suspected case against a clean server before attributing it to the change.
   读 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)、[ADR-0179](docs/adr/ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 与 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 后再改身份、字段继承、派发或清理授权。
   BE seal 先不可回退撤销 writer 删除权；FE 收齐后做本地交接。缺产物清单不能报 cleanup Complete。
   精确 operation-owned cleanup 与扫描 GC 分开；REST/Hadoop 扫描安全仍为 UNPROVEN，手动/自动入口共用缺证限制，不能以本地 deadline 或年龄授予删除权。
+  必要业务事实与原 receipt/cause 由同 canonical `ConnectorWriteNeededReady` Arc 保管；
+  `query_execution/write_session/publication_call.rs` 保留同一 Provider F 到真实退出，安全 GC 由同 Call 的残留继续驱动。
+  NeededReady、cleanup Pending/Observed、实际 F 退出及库存 Disposed 不可互换；封存必要 finalize 失败不能授权最终 CTAS publication。
 - **Execution semantics/operator behavior**：先核对 `novarocks/local-compiler/src/**` 和
   `novarocks/local-program/src/**`，再看 Execution `exec/pipeline/builder/compiled.rs`、
   `exec/operators/**`；`exec/node/**` 仍有共享值类型和运行能力，不能当旧树整片删除。

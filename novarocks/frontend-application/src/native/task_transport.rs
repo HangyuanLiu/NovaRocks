@@ -927,7 +927,14 @@ impl TaskOperationSink for NativeTaskOperationSink {
         request: crate::task_execution::intent::TaskOperationQueueRequest,
         preparation: &mut crate::task_execution::intent::TaskOperationQueuePreparation,
     ) -> TaskOperationQueueAdmission {
-        self.reserve_paid_queue_in(request, preparation)
+        let result = self.reserve_paid_queue_in(request, preparation);
+        if matches!(
+            &result,
+            TaskOperationQueueAdmission::Rejected(novarocks_workload_control::WorkError::Conflict)
+        ) {
+            tracing::warn!("Native queued input source reported conflicting work facts");
+        }
+        result
     }
 
     fn try_submit(&self, mut batch: DispatchBatch) -> TaskOperationSubmit {
@@ -988,6 +995,9 @@ impl TaskOperationSink for NativeTaskOperationSink {
             Ok(Some(action)) => action,
             Ok(None) => return TaskOperationSubmit::Backpressured(batch),
             Err(joint_action::NativeAdmissionFailure::Governance(error)) => {
+                if matches!(&error, novarocks_workload_control::WorkError::Conflict) {
+                    tracing::warn!("Native action source reported conflicting work facts");
+                }
                 return TaskOperationSubmit::AdmissionFailed { batch, error };
             }
             Err(joint_action::NativeAdmissionFailure::Unsent(reason)) => {
@@ -1366,6 +1376,16 @@ impl AcceptedOperationReceipts {
         self.publish_canonical(ack);
     }
 
+    fn publish_recorded_dispatch_rejection(&mut self) {
+        assert!(
+            self.canonical
+                .as_ref()
+                .is_some_and(|p| p.dispatch_rejected())
+        );
+        // The original typed fact precedes every acknowledgement and wake.
+        self.publish_uniform(OperationDispatchResult::NonWorkerRejected);
+    }
+
     fn publish_uniform(&mut self, result: OperationDispatchResult) {
         while let Some(item) = self.pending.pop_front() {
             observe_dispatch_result(item.kind, item.lease_renewal, result);
@@ -1402,7 +1422,18 @@ impl Drop for AcceptedOperationReceipts {
                 operations = self.pending.len(),
                 "accepted task operation send dropped before settlement"
             );
-            self.publish_uniform(OperationDispatchResult::TransportUnknown);
+            let result = if self
+                .canonical
+                .as_ref()
+                .is_some_and(|p| p.dispatch_rejected())
+            {
+                // A wake/Drop unwind cannot erase the already installed
+                // whole-batch no-RPC fact or authorize an Unknown replay.
+                OperationDispatchResult::NonWorkerRejected
+            } else {
+                OperationDispatchResult::TransportUnknown
+            };
+            self.publish_uniform(result);
         }
     }
 }
@@ -1413,6 +1444,25 @@ async fn apply_operations(
     requests: Vec<EncodedMethodBatch>,
     submitted_at: tokio::time::Instant,
 ) {
+    let last_expiry = requests
+        .iter()
+        .map(|batch| batch.expires_at(submitted_at))
+        .max()
+        .expect("the original Native Apply has at least one encoded method run");
+    let frozen = {
+        let publisher = send
+            .receipts
+            .canonical
+            .as_ref()
+            .expect("governed Native dispatch retains its original canonical backing");
+        publisher.freeze_dispatch(last_expiry).await
+    };
+    if let Err(()) = frozen {
+        send.receipts.publish_recorded_dispatch_rejection();
+        return;
+    }
+    // The same original F crosses the atomic dispatch cut before any RPC
+    // body poll. Every run keeps its own unchanged absolute deadline.
     for batch in requests {
         let expires_at = batch.expires_at(submitted_at);
         let establishes = send.receipts.prefix_establishes(batch.items);
@@ -2464,13 +2514,48 @@ async fn open_subscription(
 /// One covered observation stream per Context. Its request is always built
 /// from cursors the serial owner has applied; receiving a frame does not make
 /// that frame a safe reconnect cursor.
+fn covered_protocol(site: &'static str) -> crate::task_execution::error::TaskExecutionError {
+    crate::task_execution::error::TaskExecutionError::Schedule(site.to_owned())
+}
+fn covered_registration(
+    error: super::subscription_owner::RegistrationError,
+) -> crate::task_execution::error::TaskExecutionError {
+    use super::subscription_owner::RegistrationError;
+    match error {
+        RegistrationError::Work(error) => {
+            if matches!(&error, novarocks_workload_control::WorkError::Conflict) {
+                tracing::warn!(
+                    "Native covered subscription source reported conflicting work facts"
+                );
+            }
+            crate::task_execution::error::TaskExecutionError::Workload(error)
+        }
+        RegistrationError::Closed => covered_protocol("Native subscription source closed"),
+        RegistrationError::Storage => {
+            covered_protocol("Native subscription source positions exhausted")
+        }
+        RegistrationError::Generation => {
+            covered_protocol("Native subscription generation exhausted")
+        }
+        RegistrationError::SpawnUnjoinable => {
+            covered_protocol("Native subscription original spawn unjoinable")
+        }
+    }
+}
+
+enum CoveredSourceChildren {
+    LegacyIndividual,
+    Cohort(crate::query_execution::native_execution_adapter::source_cohort::NativeSourceCohort),
+}
+
 pub(crate) struct CoveredTaskStatusSubscriber {
     targets: BTreeMap<BackendProcessId, TaskBackendTarget>,
     intake: Arc<ObservationIntake>,
     error_budget: u32,
     data_runtime: FrontendDataRuntime,
     work_scope: novarocks_workload_control::WorkScope,
-    active: Mutex<BTreeMap<QueryContextRef, CoveredSubscription>>,
+    active: Mutex<BTreeMap<QueryContextRef, CoveredEntry>>,
+    source_children: CoveredSourceChildren,
 }
 
 impl fmt::Debug for CoveredTaskStatusSubscriber {
@@ -2483,6 +2568,11 @@ impl fmt::Debug for CoveredTaskStatusSubscriber {
     }
 }
 
+enum CoveredEntry {
+    Pending(super::subscription_owner::SubscriptionReservation),
+    Starting(super::subscription_owner::SubscriptionLease),
+    Running(CoveredSubscription),
+}
 struct CoveredSubscription {
     state: Arc<Mutex<SubscriptionState>>,
     applied_snapshot: Arc<Mutex<DecodedCoveredSubscription>>,
@@ -2497,6 +2587,7 @@ impl Drop for CoveredSubscription {
 }
 
 impl CoveredTaskStatusSubscriber {
+    /// Explicit old coordinator/fixture API; production manifest uses the cohort constructor.
     pub(crate) fn new(
         backends: &[BackendProcessDescriptor],
         intake: Arc<ObservationIntake>,
@@ -2514,108 +2605,249 @@ impl CoveredTaskStatusSubscriber {
             data_runtime,
             work_scope,
             active: Mutex::new(BTreeMap::new()),
+            source_children: CoveredSourceChildren::LegacyIndividual,
         })
     }
 
-    pub(crate) fn ensure(&self, request: DecodedCoveredSubscription) -> Result<(), String> {
-        let context = request.context;
-        let mut active = self
-            .active
-            .lock()
-            .map_err(|_| "covered subscription lock poisoned".to_owned())?;
-        if let Some(subscription) = active.get(&context) {
-            Self::replace_applied_snapshot(subscription, request)?;
-            return Ok(());
+    pub(crate) fn new_with_source_cohort(
+        backends: &[BackendProcessDescriptor],
+        intake: Arc<ObservationIntake>,
+        error_budget: u32,
+        data_runtime: FrontendDataRuntime,
+        work_scope: novarocks_workload_control::WorkScope,
+        source_cohort: crate::query_execution::native_execution_adapter::source_cohort::NativeSourceCohort,
+    ) -> Result<Self, NativeTaskTransportCreationError> {
+        if error_budget == 0 {
+            return Err(NativeTaskTransportCreationError::ZeroStatusErrorBudget);
         }
-        active.insert(context, self.start(request)?);
-        Ok(())
+        Ok(Self {
+            targets: freeze_targets(backends, &data_runtime)?,
+            intake,
+            error_budget,
+            data_runtime,
+            work_scope,
+            active: Mutex::new(BTreeMap::new()),
+            source_children: CoveredSourceChildren::Cohort(source_cohort),
+        })
     }
 
-    /// Updates only the replay snapshot used by the next automatic reconnect.
-    /// The current stream keeps running so ordinary cursor progress cannot
-    /// induce an unnecessary new physical subscription generation.
-    pub(crate) fn update_applied_request(
+    /// Reserve only the existing finite source header. The SAME subscription
+    /// service polls child admission; Pending never suspends the serial fold.
+    /// Call before constructing covered_request or its request/watch/F captures.
+    pub(crate) fn prepare(
+        &self,
+        context: QueryContextRef,
+    ) -> Result<bool, crate::task_execution::error::TaskExecutionError> {
+        if !self.targets.contains_key(&context.backend_process_id()) {
+            return Err(covered_protocol(
+                "covered context is outside the frozen topology",
+            ));
+        }
+        let port = self.data_runtime.subscription_port();
+        let runner_wake = self.intake.progress_wake();
+        let mut created = false;
+        let result = {
+            let mut active = self
+                .active
+                .lock()
+                .map_err(|_| covered_protocol("covered subscription lock poisoned"))?;
+            if let std::collections::btree_map::Entry::Vacant(entry) = active.entry(context) {
+                // Both constructors only record metadata under caller/Core locks.
+                // The original service consumes the paid cohort outside them.
+                let original = match &self.source_children {
+                    CoveredSourceChildren::Cohort(cohort) => {
+                        port.prepare_from_cohort(&self.work_scope, cohort.clone(), None, None)
+                    }
+                    CoveredSourceChildren::LegacyIndividual => {
+                        #[cfg(not(test))]
+                        let original = port.prepare(&self.work_scope, None, None);
+                        #[cfg(test)]
+                        let original = if self.work_scope.joint_dependency_limit()
+                            == Err(novarocks_workload_control::WorkError::NotReady)
+                        {
+                            port.reserve(&self.work_scope, None, None)
+                        } else {
+                            port.prepare(&self.work_scope, None, None)
+                        };
+                        original
+                    }
+                }
+                .map_err(covered_registration)?;
+                entry.insert(CoveredEntry::Pending(original));
+                created = true;
+            }
+            match active.get(&context).expect("same original source entry") {
+                CoveredEntry::Pending(original) => {
+                    original.ready(&runner_wake).map_err(covered_registration)
+                }
+                CoveredEntry::Starting(_) => Ok(false),
+                CoveredEntry::Running(_) => Ok(true),
+            }
+        };
+        // Source is stable before any callback; no active/Core lock escapes.
+        if created {
+            port.notify();
+        }
+        result
+    }
+    pub(crate) fn ensure(
         &self,
         request: DecodedCoveredSubscription,
-    ) -> Result<(), String> {
-        let active = self
-            .active
-            .lock()
-            .map_err(|_| "covered subscription lock poisoned".to_owned())?;
-        let subscription = active
-            .get(&request.context)
-            .ok_or_else(|| "covered subscription is not active".to_owned())?;
-        Self::replace_applied_snapshot(subscription, request)
+    ) -> Result<(), crate::task_execution::error::TaskExecutionError> {
+        self.apply_request(request, false)
     }
-
-    fn replace_applied_snapshot(
-        subscription: &CoveredSubscription,
+    pub(crate) fn reconcile(
+        &self,
         request: DecodedCoveredSubscription,
-    ) -> Result<(), String> {
-        encode_covered_subscribe_task_status(&request).map_err(|error| error.to_string())?;
-        *subscription
-            .applied_snapshot
-            .lock()
-            .map_err(|_| "covered applied snapshot lock poisoned".to_owned())? = request;
-        Ok(())
-    }
-
-    pub(crate) fn reconcile(&self, request: DecodedCoveredSubscription) -> Result<(), String> {
-        let context = request.context;
-        encode_covered_subscribe_task_status(&request).map_err(|error| error.to_string())?;
-        let mut active = self
-            .active
-            .lock()
-            .map_err(|_| "covered subscription lock poisoned".to_owned())?;
-        if let Some(subscription) = active.get(&context) {
-            Self::replace_applied_snapshot(subscription, request.clone())?;
-            subscription.reconciliation.send_replace(request);
-        } else {
-            active.insert(context, self.start(request)?);
-        }
+    ) -> Result<(), crate::task_execution::error::TaskExecutionError> {
+        self.apply_request(request, true)?;
         observe_resubscribe();
         Ok(())
     }
-
-    pub(crate) fn stop(&self, context: QueryContextRef) {
-        if let Ok(mut active) = self.active.lock() {
-            active.remove(&context);
+    /// Existing Running aliases only; no pending source creates an SDK request.
+    pub(crate) fn update_applied_request(
+        &self,
+        request: DecodedCoveredSubscription,
+    ) -> Result<(), crate::task_execution::error::TaskExecutionError> {
+        encode_covered_subscribe_task_status(&request)
+            .map_err(|_| covered_protocol("covered subscription encoding refused"))?;
+        let snapshot = {
+            let active = self
+                .active
+                .lock()
+                .map_err(|_| covered_protocol("covered subscription lock poisoned"))?;
+            match active.get(&request.context) {
+                Some(CoveredEntry::Running(original)) => Arc::clone(&original.applied_snapshot),
+                _ => return Err(covered_protocol("covered subscription is not running")),
+            }
+        };
+        *snapshot
+            .lock()
+            .map_err(|_| covered_protocol("covered applied snapshot lock poisoned"))? = request;
+        Ok(())
+    }
+    fn apply_request(
+        &self,
+        request: DecodedCoveredSubscription,
+        reconcile: bool,
+    ) -> Result<(), crate::task_execution::error::TaskExecutionError> {
+        encode_covered_subscribe_task_status(&request)
+            .map_err(|_| covered_protocol("covered subscription encoding refused"))?;
+        let context = request.context;
+        #[cfg(test)]
+        if !self
+            .active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&context)
+        {
+            // The old unbound wire fixtures called ensure directly. Production
+            // serial turns always run the explicit prepare gate before captures.
+            if !self.prepare(context)? {
+                return Err(covered_protocol("covered child not ready"));
+            }
         }
+        // Copy only existing handles. watch callbacks and old request destruction
+        // are outside active; a concurrent stop cannot resurrect this incarnation.
+        let running = {
+            let active = self
+                .active
+                .lock()
+                .map_err(|_| covered_protocol("covered subscription lock poisoned"))?;
+            match active.get(&context) {
+                Some(CoveredEntry::Running(original)) => Some((
+                    Arc::clone(&original.applied_snapshot),
+                    original.reconciliation.clone(),
+                )),
+                _ => None,
+            }
+        };
+        if let Some((snapshot, sender)) = running {
+            *snapshot
+                .lock()
+                .map_err(|_| covered_protocol("covered applied snapshot lock poisoned"))? =
+                request.clone();
+            if reconcile {
+                drop(sender.send_replace(request));
+            }
+            return Ok(());
+        }
+        let (reservation, publication) = {
+            let mut active = self
+                .active
+                .lock()
+                .map_err(|_| covered_protocol("covered subscription lock poisoned"))?;
+            if !matches!(active.get(&context), Some(CoveredEntry::Pending(_))) {
+                return Err(covered_protocol(
+                    "covered subscription requires prepared original child",
+                ));
+            }
+            let Some(CoveredEntry::Pending(reservation)) = active.remove(&context) else {
+                unreachable!()
+            };
+            let publication = reservation.stop_view();
+            let replacement = reservation.stop_view();
+            active.insert(context, CoveredEntry::Starting(replacement));
+            (reservation, publication)
+        };
+        // Original Core/header and the Starting stop view already exist. All
+        // input construction, user spawn, wake and Drop are outside active.
+        let started = self.start(reservation, request)?;
+        let displaced = {
+            let mut active = self
+                .active
+                .lock()
+                .map_err(|_| covered_protocol("covered subscription lock poisoned"))?;
+            let same = matches!(active.get(&context), Some(CoveredEntry::Starting(original)) if original.same_original(&publication));
+            if same {
+                active.insert(context, CoveredEntry::Running(started))
+            } else {
+                drop(active);
+                drop(started);
+                drop(publication);
+                return Ok(());
+            }
+        };
+        if let Some(CoveredEntry::Starting(original)) = displaced {
+            original.disarm();
+        }
+        publication.disarm();
+        Ok(())
     }
-
+    pub(crate) fn stop(&self, context: QueryContextRef) {
+        let original = self
+            .active
+            .lock()
+            .ok()
+            .and_then(|mut active| active.remove(&context));
+        drop(original);
+    }
     pub(crate) fn state(&self, context: QueryContextRef) -> Option<SubscriptionState> {
-        let active = self.active.lock().ok()?;
-        active.get(&context)?.state.lock().ok().map(|state| *state)
+        let state = {
+            let active = self.active.lock().ok()?;
+            match active.get(&context)? {
+                CoveredEntry::Running(original) => Arc::clone(&original.state),
+                CoveredEntry::Pending(_) | CoveredEntry::Starting(_) => return None,
+            }
+        };
+        state.lock().ok().map(|state| *state)
     }
-
-    fn start(&self, request: DecodedCoveredSubscription) -> Result<CoveredSubscription, String> {
-        encode_covered_subscribe_task_status(&request).map_err(|error| error.to_string())?;
+    fn start(
+        &self,
+        reservation: super::subscription_owner::SubscriptionReservation,
+        request: DecodedCoveredSubscription,
+    ) -> Result<CoveredSubscription, crate::task_execution::error::TaskExecutionError> {
         let target = self
             .targets
             .get(&request.context.backend_process_id())
-            .ok_or_else(|| {
-                format!(
-                    "query context {} addresses a backend process outside the frozen topology",
-                    request.context.backend_process_id()
-                )
-            })?;
-        let publisher = self
-            .intake
-            .subscribe()
-            .map_err(|_| "covered observation subscription capacity exhausted".to_owned())?;
+            .ok_or_else(|| covered_protocol("covered context is outside the frozen topology"))?;
+        let publisher = Arc::new(self.intake.subscribe().map_err(|_| {
+            covered_protocol("covered observation subscription capacity exhausted")
+        })?);
         let state = Arc::new(Mutex::new(SubscriptionState::Opening));
         let applied_snapshot = Arc::new(Mutex::new(request.clone()));
         let (reconciliation, receiver) = tokio::sync::watch::channel(request);
-        let publisher = Arc::new(publisher);
-        let reservation = self
-            .data_runtime
-            .subscription_port()
-            .reserve(
-                &self.work_scope,
-                Some(Arc::clone(&publisher)),
-                Some(Arc::clone(&state)),
-            )
-            .map_err(|_| "Native subscription original responsibility refused".to_owned())?;
+        reservation.attach(Arc::clone(&publisher), Arc::clone(&state));
         let task = reservation
             .start(run_covered_subscription(
                 target.client.clone(),
@@ -2625,7 +2857,7 @@ impl CoveredTaskStatusSubscriber {
                 self.error_budget,
                 Arc::clone(&state),
             ))
-            .map_err(|_| "Native subscription original start failed".to_owned())?;
+            .map_err(covered_registration)?;
         Ok(CoveredSubscription {
             state,
             applied_snapshot,
@@ -2841,6 +3073,23 @@ async fn open_covered_subscription(
         .await
         .map(tonic::Response::into_inner)
         .map_err(CoveredSubscriptionOpenError::Rpc)
+}
+
+/// Actual same-factory F layout; does not construct a client, request or F.
+pub(super) fn covered_subscription_future_layout() -> std::alloc::Layout {
+    fn layout<F: Future<Output = ()>>(
+        _: fn(
+            Client,
+            tokio::sync::watch::Receiver<DecodedCoveredSubscription>,
+            Arc<Mutex<DecodedCoveredSubscription>>,
+            Arc<ObservationPublisher>,
+            u32,
+            Arc<Mutex<SubscriptionState>>,
+        ) -> F,
+    ) -> std::alloc::Layout {
+        std::alloc::Layout::new::<F>()
+    }
+    layout(run_covered_subscription)
 }
 
 async fn run_covered_subscription(
@@ -4307,13 +4556,15 @@ mod tests {
         loopback: Loopback,
         sink: NativeTaskOperationSink,
         acks: TaskAckIntake,
+        // Only this original retains joins; the sink receives a projection.
+        runtime: FrontendDataRuntime,
         governed: governed_wire::GovernedWireRole,
     }
 
     mod governed_wire;
 
     fn sink_fixture(loopback: Loopback, backend: BackendProcessId) -> SinkFixture {
-        let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
         let acks = TaskAckIntake::new(Arc::new(CountingWake::default()));
         let governed = governed_wire::GovernedWireRole::new(&loopback);
         let sink = NativeTaskOperationSink::new(
@@ -4321,7 +4572,7 @@ mod tests {
             TransportBudget::DEFAULT,
             test_attempt_facts(),
             acks.handle(),
-            data_runtime,
+            runtime.clone(),
             governed.authority(),
         )
         .expect("one frozen backend target");
@@ -4329,7 +4580,196 @@ mod tests {
             loopback,
             sink,
             acks,
+            runtime,
             governed,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_one_input_capability_rejects_the_original_before_any_rpc() {
+        use crate::task_execution::intent::{OriginalOperationPacking, TaskOperationQueuePermit};
+        use novarocks_workload_control::WorkError;
+
+        #[derive(Debug)]
+        struct HiddenInput(Box<dyn TaskOperationQueuePermit>);
+        impl TaskOperationQueuePermit for HiddenInput {
+            fn mark_in_flight(&mut self) {
+                self.0.mark_in_flight()
+            }
+            fn packing_support(
+                &self,
+                input: &OperationIntent,
+            ) -> Result<OriginalOperationPacking, WorkError> {
+                self.0.packing_support(input)
+            }
+            // Deliberately no typed capability. The actual paid original
+            // remains owned by this wrapper through physical retirement.
+        }
+
+        let backend = BackendProcessId::new_v7();
+        let fixture = sink_fixture(Loopback::start().await, backend);
+        let intents = (1..=3)
+            .map(|id| cancel_intent(id, backend))
+            .collect::<Vec<_>>();
+        assert!(intents.len() > governed_wire::FIXTURE_CHANGES_PER_REQUEST);
+        let permits = intents
+            .iter()
+            .enumerate()
+            .map(|(index, intent)| {
+                let original = fixture.governed.reserve(&fixture.sink, intent);
+                if index == 1 {
+                    Box::new(HiddenInput(original)) as Box<dyn TaskOperationQueuePermit>
+                } else {
+                    original
+                }
+            })
+            .collect();
+        let mut batch = released_batch(backend, intents);
+        batch.replace_fixture_permits(permits);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                batch = match fixture.sink.try_submit(batch) {
+                    TaskOperationSubmit::Accepted => break,
+                    TaskOperationSubmit::Backpressured(original) => original,
+                    other => panic!("original source refused before the actual gate: {other:?}"),
+                };
+                fixture.governed.drive();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the same finite original source must reach its dispatch gate");
+
+        let received = tokio::time::timeout_at(deadline, async {
+            loop {
+                if fixture.acks.queued() == 3 {
+                    break fixture.acks.drain();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all original operations retain their local typed refusal");
+        let clone = received[0].clone();
+        for ack in &received {
+            assert_eq!(
+                ack.dispatch_result(),
+                OperationDispatchResult::NonWorkerRejected
+            );
+            assert_eq!(ack.worker_outcome(), None);
+            assert_eq!(ack.governance_failure(), Some(&WorkError::Conflict));
+            assert_eq!(
+                crate::task_execution::error::dispatch_rejection(ack, ack.kind()),
+                crate::task_execution::error::TaskExecutionError::Workload(WorkError::Conflict)
+            );
+        }
+        assert!(std::ptr::eq(
+            received[0].governance_failure().unwrap(),
+            clone.governance_failure().unwrap()
+        ));
+        assert!(received[0].shares_original_canonical_with(&clone));
+        drop(received);
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                if fixture
+                    .sink
+                    .data_runtime
+                    .task_transport_supervisor()
+                    .snapshot()
+                    .retained_items
+                    == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the actual original F and physical input cleanup must exit");
+        assert_eq!(clone.governance_failure(), Some(&WorkError::Conflict));
+        assert!(fixture.loopback.peer.applied().is_empty());
+        assert_eq!(fixture.loopback.peer.control_requests(), 0);
+        drop(clone);
+
+        let SinkFixture {
+            mut loopback,
+            sink,
+            acks,
+            mut runtime,
+            governed,
+        } = fixture;
+        drop((sink, acks));
+        governed.drive();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let subscriptions = runtime.drain_original_subscriptions_until(deadline).await;
+        governed.drive();
+        let apply = runtime.drain_original_apply_until(deadline).await;
+        governed.drive();
+        let outgoing = runtime.drain_native_outgoing_until(deadline).await;
+        let peer_exit = loopback.settle().await;
+        drop((runtime, loopback));
+        let shutdown = governed.finish();
+        if subscriptions.is_err()
+            || apply.is_err()
+            || outgoing.is_err()
+            || !peer_exit
+            || shutdown.is_err()
+        {
+            std::panic::panic_any((subscriptions, apply, outgoing, peer_exit, shutdown));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn actual_dispatch_freezes_more_inputs_than_the_original_change_body() {
+        let backend = BackendProcessId::new_v7();
+        let fixture = sink_fixture(Loopback::start().await, backend);
+        let intents = (1..=3)
+            .map(|id| cancel_intent(id, backend))
+            .collect::<Vec<_>>();
+        assert!(intents.len() > governed_wire::FIXTURE_CHANGES_PER_REQUEST);
+        fixture
+            .loopback
+            .peer
+            .expect_apply(ApplyAnswer::Outcomes(vec![
+            OperationOutcome::ResourceExhausted; 3
+        ]));
+        submit_batch(&fixture, released_batch(backend, intents));
+        let received = settled(&fixture.acks, 3).await;
+        for ack in &received {
+            assert_eq!(
+                ack.worker_outcome(),
+                Some(OperationOutcome::ResourceExhausted)
+            );
+            assert!(ack.governance_failure().is_none());
+        }
+        assert_eq!(fixture.loopback.peer.control_requests(), 1);
+        drop(received);
+        let SinkFixture {
+            mut loopback,
+            sink,
+            acks,
+            mut runtime,
+            governed,
+        } = fixture;
+        drop((sink, acks));
+        governed.drive();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let subscriptions = runtime.drain_original_subscriptions_until(deadline).await;
+        governed.drive();
+        let apply = runtime.drain_original_apply_until(deadline).await;
+        governed.drive();
+        let outgoing = runtime.drain_native_outgoing_until(deadline).await;
+        let peer_exit = loopback.settle().await;
+        drop((runtime, loopback));
+        let shutdown = governed.finish();
+        if subscriptions.is_err()
+            || apply.is_err()
+            || outgoing.is_err()
+            || !peer_exit
+            || shutdown.is_err()
+        {
+            std::panic::panic_any((subscriptions, apply, outgoing, peer_exit, shutdown));
         }
     }
 

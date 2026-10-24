@@ -65,6 +65,55 @@ impl FrontendCompletionCustody {
         state.provider = Some(provider);
         Ok(())
     }
+    /// Borrow the already installed catalog port; no second fact source is created.
+    pub(crate) async fn resolve_catalog_relations(
+        &self,
+        needs: &[novarocks_sql::compiler::CatalogRelationNeed],
+    ) -> Result<Vec<novarocks_sql::compiler::CatalogRelationFact>, String> {
+        use novarocks_query_application::preparation::SqlCompletionFactSource;
+        let facts = {
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.joined || state.health.is_some() {
+                return Err("completion fact source is closed or unhealthy".into());
+            }
+            state
+                .facts
+                .clone()
+                .ok_or_else(|| "completion fact source is not installed".to_owned())?
+        };
+        let batch = novarocks_sql::compiler::SqlNeedBatch::CatalogRelations(
+            needs.to_vec().into_boxed_slice(),
+        );
+        let taken = novarocks_query_application::preparation::ReadAccessSink::new();
+        match facts.resolve(&batch, &taken).await? {
+            novarocks_sql::compiler::SqlFactBatch::CatalogRelations(answer) => {
+                Ok(answer.into_vec())
+            }
+            _ => Err("completion catalog port returned another fact family".into()),
+        }
+    }
+
+    /// The original statement retains this Provider across the borrowed wait.
+    /// A failed or cancelled compiler borrow must still be closed by that owner.
+    pub(crate) async fn resolve_provider_reads(
+        &self,
+        needs: &[novarocks_sql::compiler::ProviderReadNeed],
+        taken: &novarocks_query_application::preparation::ReadAccessSink<FrozenProviderRead>,
+    ) -> Result<Vec<novarocks_sql::compiler::ProviderReadFact>, String> {
+        use novarocks_query_application::preparation::ProviderReadFactPort;
+        let provider = {
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.joined || state.health.is_some() {
+                return Err("completion Provider source is closed or unhealthy".into());
+            }
+            state
+                .provider
+                .clone()
+                .ok_or_else(|| "completion Provider source is not installed".to_owned())?
+        };
+        provider.resolve_provider_reads(needs, taken).await
+    }
+
     pub(crate) fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
         self.state
             .lock()
@@ -132,7 +181,7 @@ impl FrontendCompletionCustody {
         Ok(())
     }
     pub(crate) fn known_layouts() -> Result<
-        [std::alloc::Layout; 8],
+        [std::alloc::Layout; 10],
         novarocks_type_contract::owned_resources::layout::LayoutResourceError,
     > {
         use novarocks_type_contract::owned_resources::layout::arc_layout;
@@ -153,6 +202,8 @@ impl FrontendCompletionCustody {
             arc_layout(std::alloc::Layout::new::<Facts>())?,
             provider[0],
             provider[1],
+            provider[2],
+            provider[3],
             arc_layout(std::alloc::Layout::new::<FrontendCatalogFacts>())?,
             arc_layout(std::alloc::Layout::new::<FrontendStatisticsFacts>())?,
             arc_layout(std::alloc::Layout::new::<FrontendMaterializedViewFacts>())?,

@@ -168,6 +168,24 @@ enum AttemptCredentialCollectionPhase {
     TerminalOnly,
 }
 
+/// Fixed headers allocated by the original first-attempt collector/terminal
+/// construction. Lease/table payloads remain their original admitted backing.
+pub(crate) fn initial_credential_layouts() -> Result<
+    [std::alloc::Layout; 5],
+    novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+> {
+    use novarocks_type_contract::owned_resources::layout::arc_layout;
+    use std::alloc::Layout;
+    Ok([
+        arc_layout(Layout::new::<AttemptCredentialLeaseCollector>())?,
+        arc_layout(Layout::new::<AttemptCredentialLeaseStorageRoute>())?,
+        arc_layout(Layout::new::<AttemptCredentialLeaseSinkRoute>())?,
+        arc_layout(Layout::new::<AttemptTerminalCredentialResolver>())?,
+        // The one later seal moves the same leases into this fixed header.
+        arc_layout(Layout::new::<AttemptCredentialStorage>())?,
+    ])
+}
+
 impl AttemptCredentialLeaseCollector {
     pub(crate) fn new(execution_id: QueryExecutionId) -> Arc<Self> {
         Arc::new_cyclic(|collector| Self {

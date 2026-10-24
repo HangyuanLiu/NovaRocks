@@ -391,6 +391,26 @@ impl PreparedLogicalRead {
         }
     }
 
+    pub(crate) fn validate_client_start(&self) -> Result<(), &'static str> {
+        use novarocks_coordination_contract::{ExecutionEffect, RecoveryMode};
+        use novarocks_query_application::preparation::ExecutionFinishBoundary;
+        if self.description.finish_boundary() != ExecutionFinishBoundary::ClientEof
+            || self.description.effect() != ExecutionEffect::None
+            || self.description.recovery() != RecoveryMode::RestartAttemptBeforeVisibility
+            || !self
+                .description
+                .matches_plan_seal(self.attempt_template.native_manifest_template().plan())
+        {
+            return Err("ordinary Read has a foreign output, recovery, or plan seal");
+        }
+        Ok(())
+    }
+    pub(crate) fn client_row_carrier(
+        &self,
+    ) -> Result<novarocks_query_application::api::ResultRowCarrier, String> {
+        self.description.row_carrier()
+    }
+
     pub(crate) fn scalar_schema(&self) -> Option<&novarocks_result_contract::ScalarSchema> {
         self.description.scalar_schema()
     }

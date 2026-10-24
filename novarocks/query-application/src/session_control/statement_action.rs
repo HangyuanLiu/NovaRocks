@@ -20,6 +20,7 @@
 use super::*;
 /// An action cannot return a second governed owner through its value slot.
 pub enum StatementActionValue {
+    Rows(crate::api::ExecutionHandle),
     Local(crate::api::OwnedLocalResult),
     Ok,
 }
@@ -32,6 +33,16 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::task::{Context, Poll, Wake};
+
+/// An original accepted responsibility after its business result is delivered.
+/// Pending retains that exact responsibility; only actual retirement is Ready.
+/// This source has no default timeout disposition and grants no new capacity.
+pub trait GovernedStatementResidual: Send + 'static {
+    fn poll_retirement(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), crate::api::StatementNativeHealthFailure>>;
+}
 
 /// FA implements the business state machine. Polling may only borrow its same
 /// stable inputs. Ready means all local action futures/jobs were actually
@@ -50,9 +61,19 @@ pub trait GovernedStatementAction: Send + 'static {
         None
     }
 
+    /// Silently install the actual residual before any business/action exit.
+    /// The original synchronous loan restores this slot even if handoff panics.
+    /// Implementations must leave an occupied target and their input unchanged.
+    fn handoff_residual_in(
+        &mut self,
+        _target: &mut Option<Box<dyn GovernedStatementResidual>>,
+    ) -> Result<(), crate::api::StatementNativeHealthFailure> {
+        Ok(())
+    }
+
     fn poll_action(
         &mut self,
-        owner: &mut GovernedQueryStatementOwner,
+        owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<StatementActionValue, QueryServiceError>>;
 }
@@ -135,8 +156,16 @@ impl StatementActionReady {
                 return Err("Local result belongs to another statement");
             }
         }
+        if let Ok(StatementActionValue::Rows(execution)) = &ready.result {
+            if !execution.has_rows_output() {
+                return Err("ordinary Read has no original row output");
+            }
+        }
         let ready = source.take().expect("checked original receiver");
         *target = Some(match ready.result {
+            Ok(StatementActionValue::Rows(execution)) => QuerySessionOutput::StreamingQuery(
+                StreamingStatementResult::from_verified_execution(execution, ready.owner),
+            ),
             Ok(StatementActionValue::Local(result)) => QuerySessionOutput::GovernedQuery(
                 GovernedImmediateStatementResult::from_verified_owned_local(result, ready.owner),
             ),
@@ -175,7 +204,7 @@ impl StatementActionReceipt {
         {
             let mut state = self.source.state.lock().unwrap_or_else(|p| p.into_inner());
             if !state.closed
-                || state.failure.is_some()
+                || state.business_failed
                 || state.settled
                 || state.owner.is_none()
                 || state.result.is_none()
@@ -186,6 +215,7 @@ impl StatementActionReceipt {
             let mut owner = state.owner.take().expect("checked original owner");
             owner.restore_control_link(&self.service);
             let result = state.result.take().expect("checked original result");
+            state.delivered = true;
             *destination = Some(StatementActionReady { result, owner });
         }
         assert!(
@@ -196,6 +226,7 @@ impl StatementActionReceipt {
             "same original statement source"
         );
         self.transferred = true;
+        self.source.retire_if_possible();
         Ok(StatementActionAttempt {
             result: Ok(()),
             root,
@@ -223,8 +254,13 @@ impl std::future::Future for StatementActionWaiter {
             if state.polling {
                 return Poll::Pending;
             }
-            if let Some(failure) = &state.failure {
-                return Poll::Ready(Err(StatementActionWaitError::Failed(Arc::clone(failure))));
+            if state.business_failed {
+                return Poll::Ready(Err(StatementActionWaitError::Failed(Arc::clone(
+                    state
+                        .failure
+                        .as_ref()
+                        .expect("business failure retains its cause"),
+                ))));
             }
             if state.settled {
                 return Poll::Ready(Err(StatementActionWaitError::Stopped {
@@ -255,9 +291,15 @@ impl Drop for StatementActionWaiter {
 struct StatementActionState {
     owner: Option<GovernedQueryStatementOwner>,
     action: Option<Box<dyn GovernedStatementAction>>,
+    residual: Option<Box<dyn GovernedStatementResidual>>,
+    residual_work: Option<WorkOwner>,
+    retirement_complete: bool,
+    delivered: bool,
     cancellation: Option<GovernedStatementCancellation>,
     result: Option<Result<StatementActionValue, QueryServiceError>>,
     failure: Option<Arc<StatementActionFailure>>,
+    // Retirement health retains the source without vetoing completed business.
+    business_failed: bool,
     secondary: Option<Arc<StatementActionFailure>>,
     publication: Option<LakePublicationDisposition>,
     settled: bool,
@@ -291,9 +333,14 @@ impl StatementActionSource {
             state: Mutex::new(StatementActionState {
                 owner: None,
                 action: None,
+                residual: None,
+                residual_work: None,
+                retirement_complete: true,
+                delivered: false,
                 cancellation: None,
                 result: None,
                 failure: None,
+                business_failed: false,
                 secondary: None,
                 publication: None,
                 settled: false,
@@ -344,25 +391,51 @@ impl StatementActionSource {
     }
     #[cfg(test)]
     pub(crate) fn dispose_poisoned_for_test(self: &Arc<Self>, service: &QueryControlService) {
-        let (action, mut owner, primary, secondary) = {
+        let (action, owner, primary, secondary, residual, residual_work, settled) = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             (
                 state.action.take(),
-                state.owner.take().expect("same source owner"),
+                state.owner.take(),
                 state.failure.take(),
                 state.secondary.take(),
+                state.residual.take(),
+                state.residual_work.take(),
+                state.settled,
             )
         };
         drop(action);
-        owner.restore_control_link(service);
-        assert!(service.port.detach_statement_action(owner.token(), self));
-        owner.protocol_fail();
+        drop(residual);
+        if let Some(work) = residual_work {
+            work.complete_after_terminal_cancel_settled();
+        }
+        if let Some(mut owner) = owner {
+            owner.restore_control_link(service);
+            if !settled {
+                assert!(service.port.detach_statement_action(owner.token(), self));
+                owner.protocol_fail();
+            } else {
+                drop(owner);
+            }
+        }
         drop((primary, secondary));
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.closed = true;
+            state.settled = true;
+            state.retirement_complete = true;
+        }
+        self.retire_if_possible();
     }
     fn record_failure(&self, primary: Box<dyn Any + Send>) {
         self.record_cause(StatementActionFailureCause::Panic(Mutex::new(primary)));
     }
     fn record_cause(&self, primary: StatementActionFailureCause) {
+        self.record_cause_in(primary, true);
+    }
+    fn record_retirement_cause(&self, primary: StatementActionFailureCause) {
+        self.record_cause_in(primary, false);
+    }
+    fn record_cause_in(&self, primary: StatementActionFailureCause, blocks_business: bool) {
         let packet = Arc::new(StatementActionFailure {
             primary,
             publication: AtomicU8::new(0),
@@ -375,6 +448,7 @@ impl StatementActionSource {
             packet
                 .publication
                 .store(publication_code(state.publication), Ordering::Release);
+            state.business_failed |= blocks_business;
             if state.failure.is_none() {
                 state.failure = Some(packet);
                 None
@@ -453,22 +527,36 @@ impl StatementActionSource {
     }
     fn poll(self: &Arc<Self>) {
         if self.failure().is_some() {
+            // Completed business may still settle its protocol after an
+            // independent retirement failure. Neither action nor residual is repolled.
+            self.finish_abandoned();
             return;
         }
-        if self.abandoned.load(Ordering::Acquire) {
+        if self.abandoned.load(Ordering::Acquire)
+            && !self
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .delivered
+        {
             self.request_cancel(CancellationReason::OwnerDropped);
         }
         let Some(mut loan) = StatementPollLoan::take(Arc::clone(self)) else {
+            self.poll_retirement();
             self.finish_abandoned();
+            self.retire_if_possible();
             return;
         };
         let waker = std::task::Waker::from(Arc::clone(&self.wake));
         let mut cx = Context::from_waker(&waker);
         let result = catch_unwind(AssertUnwindSafe(|| {
+            let owner = loan.owner.as_mut().unwrap();
+            let window = owner.result_window_alias();
+            let mut context = owner.action_context(window.as_ref());
             loan.action
                 .as_mut()
                 .unwrap()
-                .poll_action(loan.owner.as_mut().unwrap(), &mut cx)
+                .poll_action(&mut context, &mut cx)
         }));
         match result {
             Ok(Poll::Pending) => {
@@ -511,6 +599,46 @@ impl StatementActionSource {
                     self.waiter.wake();
                     return;
                 }
+                let handoff = catch_unwind(AssertUnwindSafe(|| {
+                    loan.action
+                        .as_mut()
+                        .expect("same original action")
+                        .handoff_residual_in(&mut loan.residual)
+                }));
+                match handoff {
+                    Ok(Ok(())) => {}
+                    Ok(Err(failure)) => {
+                        self.record_cause(StatementActionFailureCause::LocalHealth(failure));
+                        drop(loan);
+                        self.waiter.wake();
+                        return;
+                    }
+                    Err(primary) => {
+                        self.record_failure(primary);
+                        drop(loan);
+                        self.waiter.wake();
+                        return;
+                    }
+                }
+                if loan.residual.is_some() {
+                    let work = loan
+                        .owner
+                        .as_mut()
+                        .expect("same protocol owner")
+                        .execution_owner_slot();
+                    let Some(original) = work.take() else {
+                        self.record_cause(StatementActionFailureCause::LocalHealth(
+                            crate::api::StatementNativeHealthFailure::actual_exit_unproven(
+                                "statement residual has no original execution owner",
+                                Arc::new(WorkError::Conflict),
+                            ),
+                        ));
+                        drop(loan);
+                        self.waiter.wake();
+                        return;
+                    };
+                    loan.residual_work = Some(original);
+                }
                 let action = loan.action.take();
                 // Restore owner to its stable source before arbitrary Drop.
                 drop(loan);
@@ -519,8 +647,104 @@ impl StatementActionSource {
                     Ok(()) => self.state.lock().unwrap_or_else(|p| p.into_inner()).closed = true,
                     Err(primary) => self.record_failure(primary),
                 }
+                let has_residual = {
+                    let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    state.residual.is_some()
+                };
+                if has_residual {
+                    // Accepted custody is one real progress event. Register
+                    // retirement even when no UI observer takes the result.
+                    self.notify_root();
+                }
                 self.waiter.wake();
                 self.finish_abandoned();
+                self.retire_if_possible();
+            }
+        }
+    }
+    fn poll_retirement(self: &Arc<Self>) {
+        let Some(mut loan) = StatementRetirementLoan::take(Arc::clone(self)) else {
+            return;
+        };
+        let waker = std::task::Waker::from(Arc::clone(&self.wake));
+        let mut cx = Context::from_waker(&waker);
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            loan.residual
+                .as_mut()
+                .expect("same original residual")
+                .poll_retirement(&mut cx)
+        }));
+        match outcome {
+            Ok(Poll::Pending) => {
+                // The original source alone supplies the next real progress event.
+                drop(loan);
+            }
+            Ok(Poll::Ready(Err(failure))) => {
+                self.record_retirement_cause(StatementActionFailureCause::LocalHealth(failure));
+                drop(loan);
+                self.waiter.wake();
+            }
+            Err(primary) => {
+                self.record_retirement_cause(StatementActionFailureCause::Panic(Mutex::new(
+                    primary,
+                )));
+                drop(loan);
+                self.waiter.wake();
+            }
+            Ok(Poll::Ready(Ok(()))) => {
+                // Restore original Work before foreign Drop. Failed destruction
+                // retains its actual root, and the poisoned residual is not repolled.
+                let residual = loan.residual.take();
+                drop(loan);
+                if let Err(primary) = catch_unwind(AssertUnwindSafe(|| drop(residual))) {
+                    self.record_retirement_cause(StatementActionFailureCause::Panic(Mutex::new(
+                        primary,
+                    )));
+                    self.waiter.wake();
+                    return;
+                }
+                let work = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .residual_work
+                    .take();
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    work.expect("accepted residual retains one original root")
+                        .complete_after_terminal_cancel_settled();
+                }));
+                match outcome {
+                    Ok(()) => {
+                        self.state
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .retirement_complete = true
+                    }
+                    Err(primary) => self.record_retirement_cause(
+                        StatementActionFailureCause::Panic(Mutex::new(primary)),
+                    ),
+                }
+                self.waiter.wake();
+            }
+        }
+    }
+    pub(crate) fn can_retire(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.closed
+            && !state.polling
+            && state.failure.is_none()
+            && state.retirement_complete
+            && state.residual.is_none()
+            && state.residual_work.is_none()
+            && (state.settled || (state.owner.is_none() && state.result.is_none()))
+    }
+    fn retire_if_possible(self: &Arc<Self>) {
+        if !self.can_retire() {
+            return;
+        }
+        if let Some(root) = self.wake.root.upgrade() {
+            if let Some(control) = root.control() {
+                let _ = control.port.retire_statement_action_source(self);
             }
         }
     }
@@ -530,7 +754,12 @@ impl StatementActionSource {
         }
         let result = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            if !state.closed || state.failure.is_some() || state.polling || state.owner.is_none() {
+            if !state.closed
+                || state.settled
+                || state.business_failed
+                || state.polling
+                || state.owner.is_none()
+            {
                 return;
             }
             state.result.take()
@@ -567,7 +796,7 @@ impl StatementActionSource {
         drop(loan);
         {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            if state.failure.is_some() {
+            if state.business_failed {
                 return;
             }
             state.settled = true;
@@ -603,7 +832,7 @@ impl StatementCleanupLoan {
     fn take(source: Arc<StatementActionSource>) -> Option<Self> {
         let owner = {
             let mut state = source.state.lock().unwrap_or_else(|p| p.into_inner());
-            if state.polling || state.failure.is_some() || state.owner.is_none() {
+            if state.polling || state.business_failed || state.owner.is_none() {
                 return None;
             }
             state.polling = true;
@@ -624,21 +853,30 @@ struct StatementPollLoan {
     source: Arc<StatementActionSource>,
     action: Option<Box<dyn GovernedStatementAction>>,
     owner: Option<GovernedQueryStatementOwner>,
+    residual: Option<Box<dyn GovernedStatementResidual>>,
+    residual_work: Option<WorkOwner>,
 }
 impl StatementPollLoan {
     fn take(source: Arc<StatementActionSource>) -> Option<Self> {
-        let (action, owner) = {
+        let (action, owner, residual, residual_work) = {
             let mut state = source.state.lock().unwrap_or_else(|p| p.into_inner());
             if state.polling || state.closed || state.failure.is_some() || state.action.is_none() {
                 return None;
             }
             state.polling = true;
-            (state.action.take(), state.owner.take())
+            (
+                state.action.take(),
+                state.owner.take(),
+                state.residual.take(),
+                state.residual_work.take(),
+            )
         };
         Some(Self {
             source,
             action,
             owner,
+            residual,
+            residual_work,
         })
     }
 }
@@ -651,6 +889,38 @@ impl Drop for StatementPollLoan {
         );
         state.owner = self.owner.take();
         state.action = self.action.take();
+        state.residual = self.residual.take();
+        state.residual_work = self.residual_work.take();
+        if state.residual.is_some() || state.residual_work.is_some() {
+            state.retirement_complete = false;
+        }
+        state.polling = false;
+    }
+}
+
+struct StatementRetirementLoan {
+    source: Arc<StatementActionSource>,
+    residual: Option<Box<dyn GovernedStatementResidual>>,
+}
+impl StatementRetirementLoan {
+    fn take(source: Arc<StatementActionSource>) -> Option<Self> {
+        let residual = {
+            let mut state = source.state.lock().unwrap_or_else(|p| p.into_inner());
+            if !state.closed || state.polling || state.failure.is_some() || state.residual.is_none()
+            {
+                return None;
+            }
+            state.polling = true;
+            state.residual.take()
+        };
+        Some(Self { source, residual })
+    }
+}
+impl Drop for StatementRetirementLoan {
+    fn drop(&mut self) {
+        let mut state = self.source.state.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(state.residual.is_none(), "one original retirement loan");
+        state.residual = self.residual.take();
         state.polling = false;
     }
 }
@@ -667,7 +937,7 @@ pub struct StatementProgressSlot {
 }
 #[derive(Default)]
 pub(crate) struct StatementProgressCursor {
-    after: Option<u32>,
+    after: Option<usize>,
     active: bool,
 }
 impl StatementProgressSlot {
@@ -682,6 +952,7 @@ impl StatementProgressSlot {
     pub(crate) fn install(
         self: &Arc<Self>,
         control: QueryControlService,
+        source_slots: NonZeroUsize,
     ) -> Result<(), QueryControlError> {
         // Install is a serial pre-Ready composition step, not a hot replacement.
         if !self.accepting.load(Ordering::Acquire) {
@@ -691,7 +962,7 @@ impl StatementProgressSlot {
         if slot.is_some() {
             return Err(QueryControlError::StatementBusy);
         }
-        control.port.attach_statement_progress(self)?;
+        control.port.attach_statement_progress(self, source_slots)?;
         *slot = Some(control);
         drop(slot);
         self.notify();
@@ -824,6 +1095,7 @@ impl QueryControlService {
     }
     pub fn statement_action_geometry() -> StatementProgressGeometry {
         StatementProgressGeometry {
+            registry_record: std::alloc::Layout::new::<Option<Arc<StatementActionSource>>>(),
             source: novarocks_type_contract::owned_resources::layout::arc_layout(
                 std::alloc::Layout::new::<StatementActionSource>(),
             )
@@ -847,6 +1119,7 @@ impl QueryControlService {
 }
 #[derive(Clone, Copy, Debug)]
 pub struct StatementProgressGeometry {
+    pub registry_record: std::alloc::Layout,
     pub source: std::alloc::Layout,
     pub wake: std::alloc::Layout,
     pub driver: std::alloc::Layout,

@@ -245,6 +245,27 @@ fn begin_mor_change_stream_write_session(
     write_planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Arc<ConnectorWriteSession>, String> {
+    crate::query_execution::write_session::begin_connector_write_session(
+        crate::connector::write_target::derive_write_stack_lease(
+            state.typed_connector_control(),
+            write_planning_lease,
+        )?,
+        write_lease,
+        crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
+            target,
+            target_ref,
+            novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+            mor_change_stream_input_request(target_columns)?,
+            novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation,
+            connector_context.clone(),
+        )?,
+    )
+}
+
+fn mor_change_stream_input_request(
+    target_columns: &[novarocks_types::schema::ColumnDef],
+) -> Result<novarocks_spi::connector::ConnectorWriteInputRequest, String> {
     use novarocks_execution::exec::row_position::{
         ICEBERG_FILE_PATH_COL, ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL,
         ICEBERG_ROW_POS_COL,
@@ -277,34 +298,19 @@ fn begin_mor_change_stream_write_session(
         ICEBERG_LAST_UPDATED_SEQ_COL,
         FunctionValueType::new(DataType::Int64, true),
     )?);
-    crate::query_execution::write_session::begin_connector_write_session(
-        crate::connector::write_target::derive_write_stack_lease(
-            state.typed_connector_control(),
-            write_planning_lease,
-        )?,
-        write_lease,
-        crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
-            target,
-            target_ref,
-            novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
-            ConnectorWriteInputRequest::RowLineage {
-                data_fields,
-                row_identity_fields: vec![
-                    field(
-                        ICEBERG_FILE_PATH_COL,
-                        FunctionValueType::new(DataType::Utf8, false),
-                    )?,
-                    field(
-                        ICEBERG_ROW_POS_COL,
-                        FunctionValueType::new(DataType::Int64, false),
-                    )?,
-                ],
-            },
-            novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
-            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation,
-            connector_context.clone(),
-        )?,
-    )
+    Ok(ConnectorWriteInputRequest::RowLineage {
+        data_fields,
+        row_identity_fields: vec![
+            field(
+                ICEBERG_FILE_PATH_COL,
+                FunctionValueType::new(DataType::Utf8, false),
+            )?,
+            field(
+                ICEBERG_ROW_POS_COL,
+                FunctionValueType::new(DataType::Int64, false),
+            )?,
+        ],
+    })
 }
 
 /// Release a session whose plan never compiled.
@@ -367,34 +373,19 @@ fn change_stream_routed_targets(
     Ok(routed)
 }
 
-fn compile_dml_change_stream_write(
-    state: &DmlExecutionKernel,
+fn bind_change_stream_routes(
     target: &crate::catalog_application::resolver::TargetBackend,
-    query: novarocks_parser::ast::Query,
-    kind: DmlChangeStreamKind,
-    pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
-    execution: &QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    write_session: &Arc<ConnectorWriteSession>,
-    write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    write_session: &ConnectorWriteSession,
+    write_planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    table_bindings: &QueryTableBindingStore,
 ) -> Result<
-    crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
-    crate::dml::error::DmlExecutionError,
+    (
+        Vec<DmlChangeStreamRoute>,
+        Vec<novarocks_sql::planning::dml::DmlChangeStreamStatisticsTarget>,
+    ),
+    String,
 > {
     use novarocks_spi::connector::ConnectorWriteInputShape;
-
-    let catalog_service_snapshot =
-        crate::catalog_application::query_catalog::catalog_service_snapshot(state);
-    let analyzer_provider =
-        crate::catalog_application::query_materializer::build_catalog_service_provider(
-            Some(&target.catalog),
-            &catalog_service_snapshot,
-            state.connector_control().as_ref(),
-            connector_context.clone(),
-            novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
-            state.catalog_application().map(Arc::as_ref),
-        );
-    let table_bindings = analyzer_provider.query_table_bindings();
     // The recipes are sealed before the plan is compiled because the plan's
     // writer nodes carry them: a plan and the session that sealed it must not be
     // separable.
@@ -406,7 +397,7 @@ fn compile_dml_change_stream_write(
     let mut statistics_targets = Vec::with_capacity(routed_targets.len());
     for (write_target, route) in routed_targets {
         let target_binding = admit_session_connector_write_target(
-            table_bindings.as_ref(),
+            table_bindings,
             FrozenConnectorScanIdentity::new(
                 target.catalog.clone(),
                 target.namespace.clone(),
@@ -423,7 +414,7 @@ fn compile_dml_change_stream_write(
             ConnectorWriteInputShape::EqualityDelete { .. } => DmlWriteSinkMode::EqualityDeletes,
         };
         let sink = dml_write_plan_input_for_admitted_target(
-            table_bindings.as_ref(),
+            table_bindings,
             target_binding,
             mode,
             novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
@@ -450,6 +441,41 @@ fn compile_dml_change_stream_write(
             },
         );
     }
+    Ok((routes, statistics_targets))
+}
+
+fn compile_dml_change_stream_write(
+    state: &DmlExecutionKernel,
+    target: &crate::catalog_application::resolver::TargetBackend,
+    query: novarocks_parser::ast::Query,
+    kind: DmlChangeStreamKind,
+    pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
+    execution: &QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    write_session: &Arc<ConnectorWriteSession>,
+    write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+) -> Result<
+    crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
+    crate::dml::error::DmlExecutionError,
+> {
+    let catalog_service_snapshot =
+        crate::catalog_application::query_catalog::catalog_service_snapshot(state);
+    let analyzer_provider =
+        crate::catalog_application::query_materializer::build_catalog_service_provider(
+            Some(&target.catalog),
+            &catalog_service_snapshot,
+            state.connector_control().as_ref(),
+            connector_context.clone(),
+            novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
+            state.catalog_application().map(Arc::as_ref),
+        );
+    let table_bindings = analyzer_provider.query_table_bindings();
+    let (routes, statistics_targets) = bind_change_stream_routes(
+        target,
+        write_session,
+        &write_planning_lease,
+        table_bindings.as_ref(),
+    )?;
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
     let compile_control =
         crate::query_execution::planning::sql_compile_control_from_execution(execution);
@@ -515,6 +541,37 @@ fn compile_dml_change_stream_write(
     let access = access_sink
         .try_into_access()
         .map_err(|(error, _returned)| error.to_string())?;
+    finish_change_stream_write(
+        state,
+        completion,
+        facts,
+        access,
+        execution,
+        write_session,
+        Some(crate::query_execution::contract::synthetic_statement_query_options(execution)),
+        &completion_control,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Finalization pairs the same signed session with its actual read facts and execution context."
+)]
+fn finish_change_stream_write(
+    state: &DmlExecutionKernel,
+    completion: novarocks_sql::planning::dml::DmlChangeStreamCompletion,
+    facts: Vec<novarocks_sql::compiler::ProviderReadFact>,
+    access: novarocks_query_application::preparation::FinalPlanRuntimeAccess<
+        crate::query_execution::provider_read_facts::FrozenProviderRead,
+    >,
+    execution: &QueryExecutionContext,
+    write_session: &Arc<ConnectorWriteSession>,
+    query_options: Option<novarocks_proto_codec::lifecycle::QueryOptions>,
+    completion_control: &novarocks_sql::compiler::SqlCompileControl,
+) -> Result<
+    crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
+    crate::dml::error::DmlExecutionError,
+> {
     let targets = novarocks_sql::planning::dml::DmlFinalizedWriteTargetSet::try_new(
         write_session
             .targets()
@@ -546,13 +603,13 @@ fn compile_dml_change_stream_write(
             novarocks_sql::planning::dml::DmlFinalPlanContext::new(version, dop_domain, reads),
             targets,
         ),
-        &completion_control,
+        completion_control,
     )?;
     let (plan, writer_routes) = finalized.into_parts();
     let candidate =
         novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
             plan,
-            &completion_control,
+            completion_control,
         )
         .and_then(|candidate| {
             candidate.freeze_root_output(
@@ -575,16 +632,14 @@ fn compile_dml_change_stream_write(
                 session: write_session.as_ref(),
             },
         ),
-        &completion_control,
+        completion_control,
     )?;
     Ok(
         crate::query_execution::compiler::PlannedIcebergChangeStreamWrite {
             assembly: crate::query_execution::compiler::PreparedDmlWriteAssembly::new(
                 encoded,
                 version,
-                Some(
-                    crate::query_execution::contract::synthetic_statement_query_options(execution),
-                ),
+                query_options,
                 execution.clone(),
                 state.query_execution().clone(),
                 Arc::clone(write_session),
@@ -1082,15 +1137,12 @@ fn cow_target_columns(
         .collect()
 }
 
-pub(crate) fn prepare_update_mutation(
+pub(super) fn resolve_update_target(
     state: &DmlExecutionKernel,
     stmt: &PreparedUpdateStatement,
     current_catalog: Option<&str>,
     current_database: &str,
-    execution: &QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    publication_id: novarocks_spi::connector::LakePublicationId,
-) -> Result<PreparedUpdateMutation, String> {
+) -> Result<(crate::catalog_application::resolver::TargetBackend, String), String> {
     // Detect branch/tag suffix in the target table name.
     let (stripped_parts, ref_suffix) = split_ref_suffix(&stmt.table.parts);
     let effective_name;
@@ -1126,6 +1178,20 @@ pub(crate) fn prepare_update_mutation(
         ));
     }
 
+    Ok((target, target_ref))
+}
+
+pub(crate) fn prepare_update_mutation(
+    state: &DmlExecutionKernel,
+    stmt: &PreparedUpdateStatement,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    execution: &QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    publication_id: novarocks_spi::connector::LakePublicationId,
+) -> Result<PreparedUpdateMutation, String> {
+    let (target, target_ref) =
+        resolve_update_target(state, stmt, current_catalog, current_database)?;
     // Reject a managed materialized view from neutral metadata under an exact
     // generation. This cannot move into row-mutation admission: incremental MV
     // refresh drives its own writes through that same admission, so at that
@@ -1147,12 +1213,38 @@ pub(crate) fn prepare_update_mutation(
         novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
         connector_context.clone(),
     )?;
+    finish_update_mutation_preparation(
+        stmt,
+        current_catalog,
+        target,
+        target_ref,
+        target_binding,
+        execution,
+        connector_context,
+        publication_id.into(),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Pure mutation admission keeps the exact target, generation, original context and identity distinct."
+)]
+fn finish_update_mutation_preparation(
+    stmt: &PreparedUpdateStatement,
+    current_catalog: Option<&str>,
+    target: crate::catalog_application::resolver::TargetBackend,
+    target_ref: String,
+    target_binding: crate::connector::write_target::ConnectorWriteTargetBinding,
+    execution: &QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+) -> Result<PreparedUpdateMutation, String> {
     let planning_lease = target_binding.lease().clone();
     // Target columns and the partition-column set are provider-signed facts, so
     // assignment validation never decodes an Iceberg schema. The branch/format
     // gate now lives in row-mutation admission below.
     // The physical strategy is whatever the provider signs for this table state.
-    let strategy_operation_id = publication_id.into();
+    let strategy_operation_id = operation_id;
     let (strategy_lease, strategy_preparation) = target_binding.prepare_row_mutation(
         &target_ref,
         strategy_operation_id,
@@ -1239,15 +1331,12 @@ pub(crate) fn prepare_update_mutation(
 /// Resolve and validate MERGE without materializing source rows, registering a
 /// cohort, or creating a staging artifact. It retains one exact planning lease
 /// for every later read or writer admission.
-pub(crate) fn prepare_merge_mutation(
+pub(super) fn resolve_merge_target(
     state: &DmlExecutionKernel,
     stmt: &PreparedMergeStatement,
     current_catalog: Option<&str>,
     current_database: &str,
-    execution: &QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    publication_id: novarocks_spi::connector::LakePublicationId,
-) -> Result<PreparedMergeMutation, String> {
+) -> Result<(crate::catalog_application::resolver::TargetBackend, String), String> {
     let (stripped_parts, ref_suffix) = split_ref_suffix(&stmt.table.parts);
     let effective_name;
     let table_name: &ObjectName = match ref_suffix {
@@ -1280,6 +1369,20 @@ pub(crate) fn prepare_merge_mutation(
             target.provider_id.as_str()
         ));
     }
+    Ok((target, target_ref))
+}
+
+pub(crate) fn prepare_merge_mutation(
+    state: &DmlExecutionKernel,
+    stmt: &PreparedMergeStatement,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    execution: &QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    publication_id: novarocks_spi::connector::LakePublicationId,
+) -> Result<PreparedMergeMutation, String> {
+    let (target, target_ref) =
+        resolve_merge_target(state, stmt, current_catalog, current_database)?;
     // See the UPDATE path for why this rejection cannot live in row-mutation
     // admission.
     crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
@@ -1297,6 +1400,32 @@ pub(crate) fn prepare_merge_mutation(
         novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
         connector_context.clone(),
     )?;
+    finish_merge_mutation_preparation(
+        stmt,
+        current_catalog,
+        target,
+        target_ref,
+        target_binding,
+        execution,
+        connector_context,
+        publication_id.into(),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Pure mutation admission keeps the exact target, generation, original context and identity distinct."
+)]
+fn finish_merge_mutation_preparation(
+    stmt: &PreparedMergeStatement,
+    current_catalog: Option<&str>,
+    target: crate::catalog_application::resolver::TargetBackend,
+    target_ref: String,
+    target_binding: crate::connector::write_target::ConnectorWriteTargetBinding,
+    execution: &QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+) -> Result<PreparedMergeMutation, String> {
     let planning_lease = target_binding.lease().clone();
     // The clause composition is a statement fact; what it implies physically is
     // not. A MERGE that can delete matched rows needs merge-on-read even on a
@@ -1318,7 +1447,7 @@ pub(crate) fn prepare_merge_mutation(
         &target_ref,
         effect_set,
         connector_context.clone(),
-        publication_id.into(),
+        operation_id,
     )?;
     // Same two-route restriction as UPDATE; see `prepare_update_mutation`.
     let table_write_mode = match preparations.preparation.strategy() {
@@ -1716,20 +1845,20 @@ fn mutation_source_relation_to_sql(
     }
 }
 
-fn build_update_mor_change_stream_write_plan(
+fn build_update_mor_producer(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &PreparedUpdateStatement,
     current_catalog: Option<&str>,
     target_columns: &[novarocks_types::schema::ColumnDef],
     target_ref: &str,
-    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    write_session: &Arc<ConnectorWriteSession>,
-    write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<
-    crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
-    crate::dml::error::DmlExecutionError,
+    (
+        novarocks_parser::ast::Query,
+        DmlChangeStreamKind,
+        Option<DmlPreExpandKeyedAssert>,
+    ),
+    String,
 > {
     let target_alias = stmt.alias.as_deref().unwrap_or("__nr_t");
     let source_sql = mutation_source_to_sql(state, &stmt.source, current_catalog, target)?;
@@ -1747,7 +1876,44 @@ fn build_update_mor_change_stream_write_plan(
         &assignments_sql_refs,
         where_sql,
     );
-    let mut query = parse_generated_query(&match_sql, "MOR UPDATE change-stream producer")?;
+    let query = parse_generated_query(&match_sql, "MOR UPDATE change-stream producer")?;
+    Ok((
+        query,
+        DmlChangeStreamKind::Update {
+            target_columns: target_columns.to_vec(),
+        },
+        Some(DmlPreExpandKeyedAssert {
+            applicability_output_ordinal: None,
+            key_column_name: "__nr_row_id".to_string(),
+            key_label: novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+            message_prefix: "MOR UPDATE matched target row".to_string(),
+        }),
+    ))
+}
+
+fn build_update_mor_change_stream_write_plan(
+    state: &DmlExecutionKernel,
+    target: &crate::catalog_application::resolver::TargetBackend,
+    stmt: &PreparedUpdateStatement,
+    current_catalog: Option<&str>,
+    target_columns: &[novarocks_types::schema::ColumnDef],
+    target_ref: &str,
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    write_session: &Arc<ConnectorWriteSession>,
+    write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+) -> Result<
+    crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
+    crate::dml::error::DmlExecutionError,
+> {
+    let (mut query, kind, assertion) = build_update_mor_producer(
+        state,
+        target,
+        stmt,
+        current_catalog,
+        target_columns,
+        target_ref,
+    )?;
     if crate::query_execution::planning::time_travel::has_time_travel_refs(&query) {
         crate::query_execution::planning::time_travel::rewrite_time_travel_refs(
             state,
@@ -1762,15 +1928,8 @@ fn build_update_mor_change_stream_write_plan(
         state,
         target,
         query,
-        DmlChangeStreamKind::Update {
-            target_columns: target_columns.to_vec(),
-        },
-        Some(DmlPreExpandKeyedAssert {
-            applicability_output_ordinal: None,
-            key_column_name: "__nr_row_id".to_string(),
-            key_label: novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
-            message_prefix: "MOR UPDATE matched target row".to_string(),
-        }),
+        kind,
+        assertion,
         execution,
         connector_context,
         write_session,
@@ -2070,6 +2229,40 @@ fn begin_cow_write_session(
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Arc<ConnectorWriteSession>, CowFailure> {
+    let input = prepare_cow_begin_input(
+        state,
+        target,
+        preparation,
+        selection,
+        write_planning_lease,
+        execution,
+        connector_context,
+    )?;
+    crate::query_execution::write_session::begin_cow_connector_write_session(
+        input.lease,
+        write_lease,
+        input.request,
+        input.original,
+        input.existing_caller_upper,
+    )
+}
+
+struct CowBeginInput {
+    lease: novarocks_catalog_application::ConnectorWriteStackLease,
+    request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
+    original: novarocks_spi::connector::ConnectorOriginalResultScope,
+    existing_caller_upper: u64,
+}
+
+fn prepare_cow_begin_input(
+    state: &DmlExecutionKernel,
+    target: &crate::catalog_application::resolver::TargetBackend,
+    preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
+    selection: novarocks_spi::connector::ConnectorRowMutationSelection,
+    write_planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    execution: &QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<CowBeginInput, CowFailure> {
     use novarocks_execution::exec::row_position::{
         ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL,
     };
@@ -2136,15 +2329,14 @@ fn begin_cow_write_session(
             },
             context: connector_context.clone(),
         };
-        crate::query_execution::write_session::begin_cow_connector_write_session(
-            state.typed_connector_control()
+        Ok(CowBeginInput {
+            lease: state.typed_connector_control()
                 .acquire_exact_write_stack(write_planning_lease.control_runtime_id())
                 .map_err(CowFailure::lease)?,
-            write_lease,
             request,
-            original_scope,
-            caller_with_scope_upper,
-        )
+            original: original_scope,
+            existing_caller_upper: caller_with_scope_upper,
+        })
         },
     ).map_err(CowFailure::before_begin)?
 }
@@ -3080,15 +3272,19 @@ fn run_cow_target_writes(
     })
 }
 
-fn run_one_cow_target(
-    state: &DmlExecutionKernel,
+fn prepare_cow_target_binding(
     target: &crate::catalog_application::resolver::TargetBackend,
-    plan: CowTargetWritePlan,
+    plan: &CowTargetWritePlan,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     write_session: &Arc<ConnectorWriteSession>,
-    execution: &QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
+) -> Result<
+    (
+        novarocks_sql::planning::dml::DmlWritePlanInput,
+        Arc<QueryTableBindingStore>,
+        Vec<crate::catalog_application::query_materializer::QueryLocalTableOverlay>,
+    ),
+    crate::dml::error::DmlExecutionError,
+> {
     plan.original
         .check_before_growth(plan.simultaneous_upper)
         .map_err(|error| {
@@ -3142,38 +3338,39 @@ fn run_one_cow_target(
         novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
     )?
     .with_external_count_owner();
-    let assembly = match plan.frozen_read {
-        Some(frozen) => {
-            crate::query_execution::pinned_connector_read::admit_pinned_file_set_scan_binding(
-                table_bindings.as_ref(),
+    let overlays = if let Some(frozen) = &plan.frozen_read {
+        crate::query_execution::pinned_connector_read::admit_pinned_file_set_scan_binding(
+            table_bindings.as_ref(),
+            &frozen.identity,
+            &frozen.schema,
+            frozen.read.clone(),
+        )?;
+        vec![
+            crate::query_execution::pinned_connector_read::pinned_file_set_query_local_overlay(
                 &frozen.identity,
                 &frozen.schema,
                 frozen.read.clone(),
-            )?;
-            let overlay =
-                crate::query_execution::pinned_connector_read::pinned_file_set_query_local_overlay(
-                    &frozen.identity,
-                    &frozen.schema,
-                    frozen.read.clone(),
-                );
-            crate::query_execution::compiler::prepare_query_as_iceberg_write_at_write_target(
-                state,
-                Some(&target.catalog),
-                &target.namespace,
-                &plan.query,
-                plan.materialized_site,
-                plan.materialized_rows.clone(),
-                sink,
-                table_bindings,
-                novarocks_sql::compiler::RootDistributionRequirement::Any,
-                Some(execution),
-                connector_context,
-                Arc::clone(write_session),
-                plan.ordinal,
-                std::slice::from_ref(&overlay),
-            )?
-        }
-        None => crate::query_execution::compiler::prepare_query_as_iceberg_write_at_write_target(
+            ),
+        ]
+    } else {
+        Vec::new()
+    };
+    Ok((sink, table_bindings, overlays))
+}
+
+fn run_one_cow_target(
+    state: &DmlExecutionKernel,
+    target: &crate::catalog_application::resolver::TargetBackend,
+    plan: CowTargetWritePlan,
+    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    write_session: &Arc<ConnectorWriteSession>,
+    execution: &QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
+    let (sink, table_bindings, overlays) =
+        prepare_cow_target_binding(target, &plan, planning_lease, write_session)?;
+    let assembly =
+        crate::query_execution::compiler::prepare_query_as_iceberg_write_at_write_target(
             state,
             Some(&target.catalog),
             &target.namespace,
@@ -3187,9 +3384,8 @@ fn run_one_cow_target(
             connector_context,
             Arc::clone(write_session),
             plan.ordinal,
-            &[],
-        )?,
-    };
+            &overlays,
+        )?;
     plan.original.check_active().map_err(|error| {
         CowFailure::construction(
             super::cow_closed_ast::BuildError::Original(error),
@@ -3452,6 +3648,95 @@ fn execute_update_match_query(
 /// cannot observe a later ref head. Other statement sources still resolve
 /// normally.
 // Design: ADR-0191 (docs/adr/ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md)
+fn finish_cow_match_plan(
+    state: &DmlExecutionKernel,
+    completion: novarocks_sql::planning::dml::DmlReadCompletion,
+    facts: Vec<novarocks_sql::compiler::ProviderReadFact>,
+    access: novarocks_query_application::preparation::FinalPlanRuntimeAccess<
+        crate::query_execution::provider_read_facts::FrozenProviderRead,
+    >,
+    declaration: &[novarocks_type_contract::FunctionValueType],
+    completion_control: &novarocks_sql::compiler::SqlCompileControl,
+) -> Result<
+    (
+        novarocks_query_application::preparation::FrozenExecutionDescription,
+        crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
+    ),
+    crate::dml::error::DmlExecutionError,
+> {
+    let reads =
+        novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new(facts.into_iter().map(
+            |fact| novarocks_sql::planning::dml::DmlFinalizedProviderRead {
+                fact,
+                read_budget: novarocks_physical_plan::ScanReadBudget {
+                    max_batch_rows: novarocks_physical_plan::MAX_SCAN_BATCH_ROWS,
+                    max_batch_bytes: novarocks_physical_plan::MAX_SCAN_BATCH_BYTES,
+                },
+            },
+        ))?;
+    let version = crate::query_execution::physical_encoding::mint_plan_version();
+    let plan = completion.finish(
+        version,
+        crate::query_execution::contract::completed_plan_dop_domain(None)?,
+        reads,
+        completion_control,
+    )?;
+    let candidate =
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
+            plan,
+            completion_control,
+        )
+        .and_then(|candidate| {
+            candidate.freeze_root_output(
+                novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                    novarocks_result_contract::InternalResultDomain::CowSelectionArrowV1,
+                ),
+            )
+        })
+        .map_err(|error| error.to_string())?;
+    let output =
+        novarocks_query_application::preparation::OutputContract::from_completed_candidate(
+            novarocks_query_application::api::QueryExecutionKind::Read,
+            &candidate,
+        )?;
+    check_cow_root_output_types(output.fields(), &declaration, completion_control)
+        .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
+    let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
+        candidate, access,
+    )
+    .map_err(|(error, _returned)| error.to_string())?;
+    let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
+        paired,
+        state.static_plan_carrier(),
+        state.constant_policy(),
+        None,
+        completion_control,
+    )?;
+    let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
+    let description =
+        novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
+            novarocks_query_application::api::QueryExecutionKind::Read,
+            candidate,
+            template
+                .attempt_scheduling_facts()?
+                .fragments
+                .iter()
+                .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
+                .collect(),
+            output,
+            novarocks_coordination_contract::ExecutionEffect::None,
+            novarocks_coordination_contract::RecoveryMode::NoRecovery,
+            Vec::new(),
+            novarocks_query_application::preparation::FrozenCostEstimate::unknown(
+                novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+            ),
+            novarocks_query_application::preparation::ExecutionResourceRequirements::unknown(
+                novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+            ),
+        )?;
+    Ok((description, template))
+}
+
 fn execute_exact_cow_match_query(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
@@ -3554,76 +3839,14 @@ fn execute_exact_cow_match_query(
     let access = access_sink
         .try_into_access()
         .map_err(|(error, _returned)| error.to_string())?;
-    let reads =
-        novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new(facts.into_iter().map(
-            |fact| novarocks_sql::planning::dml::DmlFinalizedProviderRead {
-                fact,
-                read_budget: novarocks_physical_plan::ScanReadBudget {
-                    max_batch_rows: novarocks_physical_plan::MAX_SCAN_BATCH_ROWS,
-                    max_batch_bytes: novarocks_physical_plan::MAX_SCAN_BATCH_BYTES,
-                },
-            },
-        ))?;
-    let version = crate::query_execution::physical_encoding::mint_plan_version();
-    let plan = completion.finish(
-        version,
-        crate::query_execution::contract::completed_plan_dop_domain(None)?,
-        reads,
+    let (description, template) = finish_cow_match_plan(
+        state,
+        completion,
+        facts,
+        access,
+        &declaration,
         &completion_control,
     )?;
-    let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
-            plan,
-            &completion_control,
-        )
-        .and_then(|candidate| {
-            candidate.freeze_root_output(
-                novarocks_result_contract::FrozenRootOutput::InternalFacts(
-                    novarocks_result_contract::InternalResultDomain::CowSelectionArrowV1,
-                ),
-            )
-        })
-        .map_err(|error| error.to_string())?;
-    let output =
-        novarocks_query_application::preparation::OutputContract::from_completed_candidate(
-            novarocks_query_application::api::QueryExecutionKind::Read,
-            &candidate,
-        )?;
-    check_cow_root_output_types(output.fields(), &declaration, &completion_control)
-        .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
-    let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
-        candidate, access,
-    )
-    .map_err(|(error, _returned)| error.to_string())?;
-    let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
-        paired,
-        state.static_plan_carrier(),
-        state.constant_policy(),
-        None,
-        &completion_control,
-    )?;
-    let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
-    let description =
-        novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
-            novarocks_query_application::api::QueryExecutionKind::Read,
-            candidate,
-            template
-                .attempt_scheduling_facts()?
-                .fragments
-                .iter()
-                .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
-                .collect(),
-            output,
-            novarocks_coordination_contract::ExecutionEffect::None,
-            novarocks_coordination_contract::RecoveryMode::NoRecovery,
-            Vec::new(),
-            novarocks_query_application::preparation::FrozenCostEstimate::unknown(
-                novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
-            ),
-            novarocks_query_application::preparation::ExecutionResourceRequirements::unknown(
-                novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
-            ),
-        )?;
     let request = crate::query_execution::contract::build_request_from_finalized_execution(
         crate::query_execution::post_compile::FinalizedDistributedExecution::for_completed_plan(
             description,
@@ -4697,11 +4920,7 @@ fn build_exact_cow_merge_selection_query(
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The change-stream plan builder keeps mutation facts and connector capabilities explicit through validation; a bundle would duplicate the frozen plan input."
-)]
-fn build_merge_mor_change_stream_write_plan(
+fn build_merge_mor_producer(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &PreparedMergeStatement,
@@ -4709,13 +4928,13 @@ fn build_merge_mor_change_stream_write_plan(
     target_columns: &[novarocks_types::schema::ColumnDef],
     insert_columns: Option<&[MergeInsertColumn]>,
     target_ref: &str,
-    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    write_session: &Arc<ConnectorWriteSession>,
-    write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<
-    crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
-    crate::dml::error::DmlExecutionError,
+    (
+        novarocks_parser::ast::Query,
+        DmlChangeStreamKind,
+        Option<DmlPreExpandKeyedAssert>,
+    ),
+    String,
 > {
     let target_alias = stmt
         .target_alias
@@ -4822,20 +5041,8 @@ fn build_merge_mor_change_stream_write_plan(
         matched_action,
         has_not_matched_insert,
     );
-    let mut query = parse_generated_query(&match_sql, "MOR MERGE change-stream producer")?;
-    if crate::query_execution::planning::time_travel::has_time_travel_refs(&query) {
-        crate::query_execution::planning::time_travel::rewrite_time_travel_refs(
-            state,
-            Some(&target.catalog),
-            &target.namespace,
-            &mut query,
-            connector_context,
-        )?;
-    }
-
-    compile_dml_change_stream_write(
-        state,
-        target,
+    let query = parse_generated_query(&match_sql, "MOR MERGE change-stream producer")?;
+    Ok((
         query,
         DmlChangeStreamKind::Merge {
             target_columns: target_columns.to_vec(),
@@ -4852,6 +5059,54 @@ fn build_merge_mor_change_stream_write_plan(
             key_label: novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
             message_prefix: "MOR MERGE matched target row".to_string(),
         }),
+    ))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The change-stream plan builder keeps mutation facts and connector capabilities explicit through validation; a bundle would duplicate the frozen plan input."
+)]
+fn build_merge_mor_change_stream_write_plan(
+    state: &DmlExecutionKernel,
+    target: &crate::catalog_application::resolver::TargetBackend,
+    stmt: &PreparedMergeStatement,
+    current_catalog: Option<&str>,
+    target_columns: &[novarocks_types::schema::ColumnDef],
+    insert_columns: Option<&[MergeInsertColumn]>,
+    target_ref: &str,
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    write_session: &Arc<ConnectorWriteSession>,
+    write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+) -> Result<
+    crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
+    crate::dml::error::DmlExecutionError,
+> {
+    let (mut query, kind, assertion) = build_merge_mor_producer(
+        state,
+        target,
+        stmt,
+        current_catalog,
+        target_columns,
+        insert_columns,
+        target_ref,
+    )?;
+    if crate::query_execution::planning::time_travel::has_time_travel_refs(&query) {
+        crate::query_execution::planning::time_travel::rewrite_time_travel_refs(
+            state,
+            Some(&target.catalog),
+            &target.namespace,
+            &mut query,
+            connector_context,
+        )?;
+    }
+
+    compile_dml_change_stream_write(
+        state,
+        target,
+        query,
+        kind,
+        assertion,
         execution,
         connector_context,
         write_session,
@@ -6493,6 +6748,164 @@ mod tests {
             captured_failure_request: Option<Arc<Mutex<Option<ws::ConnectorWriteBeginRequest>>>>,
         }
         impl ws::ConnectorWriteControl for CowConsumerPort {
+            fn io_profile(
+                &self,
+            ) -> Result<
+                novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile,
+                novarocks_spi::connector::ConnectorError,
+            > {
+                unreachable!("legacy COW fixture performs no asynchronous Provider I/O")
+            }
+            fn cleanup_responsibility(
+                &self,
+                _commit: &novarocks_spi::connector::write_stack::ConnectorWriteCommitHandle,
+            ) -> Result<
+                novarocks_spi::connector::ConnectorMetadataCleanupResponsibility,
+                novarocks_spi::connector::ConnectorError,
+            > {
+                unreachable!("legacy COW fixture publishes no cleanup responsibility")
+            }
+
+            fn begin_write_async<'a>(
+                &'a self,
+                request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                novarocks_spi::connector::write_stack::ConnectorWriteSessionPlan,
+                                novarocks_spi::connector::ConnectorError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move { self.begin_write(request) })
+            }
+
+            fn finish_write_async<'a>(
+                &'a self,
+                _request: novarocks_spi::connector::write_stack::ConnectorWriteFinishRequestRef<'a>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                novarocks_spi::connector::ExternalMutationOutcome<
+                                    novarocks_spi::connector::ConnectorWriteReceipt,
+                                >,
+                                novarocks_spi::connector::ConnectorError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move { unreachable!("COW consumer fixture does not publish") })
+            }
+
+            fn finish_write_with_needed_ready_async<'a>(
+                &'a self,
+                _request: novarocks_spi::connector::write_stack::ConnectorWriteFinishRequestRef<'a>,
+
+                _receiving:&'a novarocks_spi::connector::write_stack::ConnectorWriteNeededReadyReceiving,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion,
+                                novarocks_spi::connector::ConnectorError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            >{
+                Box::pin(async move { unreachable!("COW consumer fixture does not publish") })
+            }
+
+            fn abort_write_async<'a>(
+                &'a self,
+                request: novarocks_spi::connector::write_stack::ConnectorWriteSessionAbortRequest<
+                    'a,
+                >,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                novarocks_spi::connector::ConnectorWriteAbortOutcome,
+                                novarocks_spi::connector::ConnectorError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move { self.abort_write(request) })
+            }
+
+            fn reconcile_write_async<'a>(
+                &'a self,
+                request: novarocks_spi::connector::write_stack::ConnectorWriteSessionReconcileRequest<'a>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                novarocks_spi::connector::ExternalMutationOutcome<
+                                    novarocks_spi::connector::ConnectorWriteReceipt,
+                                >,
+                                novarocks_spi::connector::ConnectorError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move { self.reconcile_write(request) })
+            }
+
+            fn reconcile_write_with_needed_ready_async<'a>(
+                &'a self,
+                request: novarocks_spi::connector::write_stack::ConnectorWriteSessionReconcileRequest<'a>,
+
+                receiving:&'a novarocks_spi::connector::write_stack::ConnectorWriteNeededReadyReceiving,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion,
+                                novarocks_spi::connector::ConnectorError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            >{
+                Box::pin(async move {
+                    let outcome = async { self.reconcile_write(request) }.await.map(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::from_outcome);
+                    if let Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, .. }) = &outcome {
+                        receiving.publish(std::sync::Arc::clone(needed))?;
+                    }
+                    outcome
+                })
+            }
+
+            fn begin_cow_write_checked_async(
+                &self,
+                request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
+                original: novarocks_spi::connector::ConnectorOriginalResultScope,
+                existing_caller_upper: u64,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                novarocks_spi::connector::ConnectorCowBeginPlan,
+                                novarocks_spi::connector::ConnectorCowBeginFailure,
+                            >,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                // This original test control's checked author is pure and performs no I/O.
+                Box::pin(async move {
+                    self.begin_cow_write_checked(request, original, existing_caller_upper)
+                })
+            }
+
             fn begin_cow_write_checked(
                 &self,
                 request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
@@ -7430,6 +7843,197 @@ mod tests {
     }
 
     impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeRowMutationControl {
+        fn io_profile(
+            &self,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            unreachable!("legacy COW fixture performs no asynchronous Provider I/O")
+        }
+        fn cleanup_responsibility(
+            &self,
+            _commit: &novarocks_spi::connector::write_stack::ConnectorWriteCommitHandle,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorMetadataCleanupResponsibility,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            unreachable!("legacy COW fixture publishes no cleanup responsibility")
+        }
+
+        fn begin_write_async<'a>(
+            &'a self,
+            request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            novarocks_spi::connector::write_stack::ConnectorWriteSessionPlan,
+                            novarocks_spi::connector::ConnectorError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { self.begin_write(request) })
+        }
+
+        fn finish_write_async<'a>(
+            &'a self,
+            _request: novarocks_spi::connector::write_stack::ConnectorWriteFinishRequestRef<'a>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            novarocks_spi::connector::ExternalMutationOutcome<
+                                novarocks_spi::connector::ConnectorWriteReceipt,
+                            >,
+                            novarocks_spi::connector::ConnectorError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.calls.lock().expect("recorded calls").finish += 1;
+                self.finish_outcome
+                    .lock()
+                    .expect("scripted outcome")
+                    .take()
+                    .ok_or_else(|| {
+                        novarocks_spi::connector::ConnectorError::new(
+                            novarocks_spi::connector::ConnectorErrorKind::Internal,
+                            "no scripted commit outcome",
+                        )
+                    })
+            })
+        }
+
+        fn finish_write_with_needed_ready_async<'a>(
+            &'a self,
+            _request: novarocks_spi::connector::write_stack::ConnectorWriteFinishRequestRef<'a>,
+
+            receiving:&'a novarocks_spi::connector::write_stack::ConnectorWriteNeededReadyReceiving,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion,
+                            novarocks_spi::connector::ConnectorError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        >{
+            Box::pin(async move {
+                let outcome = async {
+                    self.calls.lock().expect("recorded calls").finish += 1;
+                    self.finish_outcome
+                        .lock()
+                        .expect("scripted outcome")
+                        .take()
+                        .ok_or_else(|| {
+                            novarocks_spi::connector::ConnectorError::new(
+                                novarocks_spi::connector::ConnectorErrorKind::Internal,
+                                "no scripted commit outcome",
+                            )
+                        })
+                }
+                .await.map(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::from_outcome);
+                if let Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, .. }) = &outcome {
+                    receiving.publish(std::sync::Arc::clone(needed))?;
+                }
+                outcome
+            })
+        }
+
+        fn abort_write_async<'a>(
+            &'a self,
+            request: novarocks_spi::connector::write_stack::ConnectorWriteSessionAbortRequest<'a>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            novarocks_spi::connector::ConnectorWriteAbortOutcome,
+                            novarocks_spi::connector::ConnectorError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { self.abort_write(request) })
+        }
+
+        fn reconcile_write_async<'a>(
+            &'a self,
+            request: novarocks_spi::connector::write_stack::ConnectorWriteSessionReconcileRequest<
+                'a,
+            >,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            novarocks_spi::connector::ExternalMutationOutcome<
+                                novarocks_spi::connector::ConnectorWriteReceipt,
+                            >,
+                            novarocks_spi::connector::ConnectorError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { self.reconcile_write(request) })
+        }
+
+        fn reconcile_write_with_needed_ready_async<'a>(
+            &'a self,
+            request: novarocks_spi::connector::write_stack::ConnectorWriteSessionReconcileRequest<
+                'a,
+            >,
+
+            receiving:&'a novarocks_spi::connector::write_stack::ConnectorWriteNeededReadyReceiving,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion,
+                            novarocks_spi::connector::ConnectorError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        >{
+            Box::pin(async move {
+                let outcome = async { self.reconcile_write(request) }.await.map(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::from_outcome);
+                if let Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, .. }) = &outcome {
+                    receiving.publish(std::sync::Arc::clone(needed))?;
+                }
+                outcome
+            })
+        }
+
+        fn begin_cow_write_checked_async(
+            &self,
+            request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
+            original: novarocks_spi::connector::ConnectorOriginalResultScope,
+            existing_caller_upper: u64,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            novarocks_spi::connector::ConnectorCowBeginPlan,
+                            novarocks_spi::connector::ConnectorCowBeginFailure,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            // This original test control's checked author is pure and performs no I/O.
+            Box::pin(async move {
+                self.begin_cow_write_checked(request, original, existing_caller_upper)
+            })
+        }
+
         fn begin_cow_write_checked(
             &self,
             request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
@@ -8003,3 +8607,10 @@ mod root_output_declaration_tests {
         }
     }
 }
+
+#[path = "mutation_async.rs"]
+mod async_preparation;
+pub(crate) use async_preparation::{
+    PreparedCowMatchAssembly, PreparedCowMutationWrite, PreparedCowSelection,
+    PreparedMorMutationWrite, PreparedMutationFacts, prepare_mutation_facts_async,
+};

@@ -273,6 +273,15 @@ mod internal_supervisor_tests {
     }
 
     impl DormantNativeAttemptOwner for InternalCountDormant {
+        fn poll_bind_qualification(
+            &mut self,
+            _schedule: &crate::coordination::AttemptSchedule,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+            // This fixture owns no external dependency or qualification transport.
+            std::task::Poll::Ready(Ok(()))
+        }
+
         fn eligible_backends(&self) -> &[BackendProcessId] {
             std::slice::from_ref(&self.backend)
         }
@@ -1416,6 +1425,14 @@ mod internal_supervisor_tests {
     }
 
     impl DormantNativeAttemptOwner for HeldInternalActivationDormant {
+        fn poll_bind_qualification(
+            &mut self,
+            schedule: &crate::coordination::AttemptSchedule,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+            self.inner.poll_bind_qualification(schedule, cx)
+        }
+
         fn eligible_backends(&self) -> &[BackendProcessId] {
             self.inner.eligible_backends()
         }
@@ -1631,6 +1648,14 @@ mod internal_supervisor_tests {
     }
 
     impl DormantNativeAttemptOwner for FactoryPanickingDormant {
+        fn poll_bind_qualification(
+            &mut self,
+            schedule: &crate::coordination::AttemptSchedule,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+            self.inner.poll_bind_qualification(schedule, cx)
+        }
+
         fn eligible_backends(&self) -> &[BackendProcessId] {
             self.inner.eligible_backends()
         }

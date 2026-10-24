@@ -220,6 +220,60 @@ impl MetadataMaintenanceCall {
         })
     }
 
+    pub(crate) fn has_applied_publication(&self) -> bool {
+        self.session
+            .as_ref()
+            .and_then(|session| session.provider_outcome.as_ref())
+            .is_some_and(|outcome| {
+                matches!(
+                    outcome,
+                    Ok(ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::Applied,
+                        ..
+                    })
+                )
+            })
+    }
+
+    pub(crate) fn cleanup_responsibility(
+        &self,
+    ) -> novarocks_spi::connector::ConnectorMetadataCleanupResponsibility {
+        use novarocks_spi::connector::ConnectorMetadataCleanupResponsibility as R;
+        if let Some(session) = &self.session {
+            if let Some(execution) = &session.execution {
+                return execution.cleanup_responsibility();
+            }
+            // Only a proven pre-dispatch failure without an execution can
+            // have no produced objects. Absence alone is not that proof.
+            return match &session.resolved {
+                Some(
+                    ResolvedMetadataMaintenance::KnownUncommitted {
+                        cleanup: ExternalMutationFinalization::Complete,
+                        ..
+                    }
+                    | ResolvedMetadataMaintenance::ContractFailure {
+                        dispatch: MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
+                        ..
+                    },
+                ) => R::Disposed,
+                _ => R::Retained,
+            };
+        }
+        match &self.failure {
+            Some(
+                ResolvedMetadataMaintenance::KnownUncommitted {
+                    cleanup: ExternalMutationFinalization::Complete,
+                    ..
+                }
+                | ResolvedMetadataMaintenance::ContractFailure {
+                    dispatch: MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
+                    ..
+                },
+            ) if self.preparation.is_none() && !self.preparation_poll_unproven => R::Disposed,
+            _ => R::Retained,
+        }
+    }
+
     pub fn original_context(&self) -> &ConnectorRequestContext {
         &self.context
     }
@@ -1116,6 +1170,27 @@ mod tests {
         result: Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>,
     }
     impl novarocks_spi::connector::ConnectorMetadataMaintenanceExecutionSource for GatedExecution {
+        fn cleanup_responsibility(
+            &self,
+        ) -> novarocks_spi::connector::ConnectorMetadataCleanupResponsibility {
+            use novarocks_spi::connector::ConnectorMetadataCleanupResponsibility as R;
+            if !self.ready.load(Ordering::SeqCst) {
+                return R::Retained;
+            }
+            match &self.result {
+                Ok(
+                    ExternalMutationOutcome::KnownCommitted {
+                        cleanup: ExternalMutationFinalization::Complete,
+                        ..
+                    }
+                    | ExternalMutationOutcome::KnownUncommitted {
+                        cleanup: ExternalMutationFinalization::Complete,
+                        ..
+                    },
+                ) => R::Disposed,
+                _ => R::Retained,
+            }
+        }
         fn poll_result(
             &self,
             _: &mut Context<'_>,
@@ -1611,6 +1686,39 @@ mod tests {
             matches!(completed.cleanup, ExternalMutationFinalization::Failed(ref error) if error.message() == "retired objects remain")
         );
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn original_cleanup_observation_keeps_failed_and_unknown_responsibility_without_reexecution()
+     {
+        use novarocks_spi::connector::ConnectorMetadataCleanupResponsibility as R;
+        for (mode, expected, dispatches) in [
+            (Mode::Committed, R::Disposed, 1),
+            (Mode::CommittedCleanupFailed, R::Retained, 1),
+            (Mode::UnknownStaysUnknown, R::Retained, 1),
+            (Mode::PlanningFailure, R::Disposed, 0),
+        ] {
+            let provider = FakeProvider::new(mode);
+            let resolver = Resolver::new(provider.clone());
+            let finalizer = Finalizer {
+                events: provider.events.clone(),
+            };
+            let mut call = MetadataMaintenanceCall::try_new(
+                &resolver,
+                &provider.descriptor.instance_id,
+                ConnectorMutationOperationId::new(),
+                table(&provider.descriptor.instance_id),
+                MetadataMaintenanceIntent::expire_table_versions(None, Some(1)),
+                context(),
+            )
+            .unwrap_or_else(|_| panic!("original Call construction"));
+            assert_eq!(call.cleanup_responsibility(), R::Retained);
+            call.resolve(&finalizer).await;
+            for _ in 0..3 {
+                assert_eq!(call.cleanup_responsibility(), expected);
+            }
+            assert_eq!(provider.execute_calls.load(Ordering::SeqCst), dispatches);
+        }
     }
 
     #[tokio::test]

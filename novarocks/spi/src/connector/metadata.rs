@@ -1657,6 +1657,30 @@ pub trait ConnectorMetadata: Send + Sync {
         ))
     }
 
+    fn list_namespaces_async(
+        &self,
+        _request: ConnectorListNamespacesRequest,
+    ) -> futures::future::BoxFuture<'_, Result<Vec<ConnectorNamespaceIdentity>, ConnectorError>>
+    {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata has no async namespace listing",
+            ))
+        })
+    }
+    fn list_tables_async(
+        &self,
+        _request: ConnectorListTablesRequest,
+    ) -> futures::future::BoxFuture<'_, Result<Vec<ConnectorTableIdentity>, ConnectorError>> {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata has no async table listing",
+            ))
+        })
+    }
+
     fn namespace_exists(&self, request: ConnectorNamespaceRequest) -> Result<bool, ConnectorError>;
 
     /// Probe the provider's original namespace observation without joining it.

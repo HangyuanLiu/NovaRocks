@@ -73,6 +73,23 @@ impl QueryStatisticsContext {
         })
     }
 
+    pub(crate) async fn from_statistics_resolver_with_bindings_async(
+        resolver: &impl QueryStatisticsResolver,
+        bindings: Arc<QueryTableBindingStore>,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            snapshot: DmlStatisticsSnapshot::from_evidence(
+                project_statistics_evidence_async(
+                    resolver.unified_statistics(),
+                    &bindings,
+                    connector_context,
+                )
+                .await?,
+            ),
+        })
+    }
+
     pub(crate) fn snapshot(&self) -> &DmlStatisticsSnapshot {
         &self.snapshot
     }
@@ -134,6 +151,43 @@ fn project_statistics_evidence(
             &binding,
             connector_context,
         )?);
+    }
+    Ok(evidence)
+}
+
+/// Observe the same captured binding set and metric request as the original
+/// DML snapshot, using only the pinned asynchronous statistics capability.
+async fn project_statistics_evidence_async(
+    resolver: &UnifiedStatisticsResolver,
+    bindings: &QueryTableBindingStore,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<Vec<DmlStatisticsEvidence>, String> {
+    let mut evidence = Vec::new();
+    for (binding_id, binding) in bindings.captured_bindings() {
+        let facts = materialization_statistics_facts(&binding.resolved);
+        let metrics = match metric_request(facts.columns()) {
+            Ok(metrics) => metrics,
+            Err(error) => {
+                evidence.push(fatal_statistics_evidence(
+                    binding_id,
+                    facts.label(),
+                    DmlStatisticsFailure::CorruptEvidence(format!("build metric request: {error}")),
+                ));
+                continue;
+            }
+        };
+        evidence.push(
+            project_binding_statistics_for_metrics_async(
+                resolver,
+                binding_id,
+                facts.label(),
+                facts.columns(),
+                &binding,
+                metrics.metrics(),
+                connector_context,
+            )
+            .await?,
+        );
     }
     Ok(evidence)
 }
@@ -601,6 +655,7 @@ mod unified_tests {
         incarnation: ProviderBindingEpoch,
         reads: AtomicUsize,
         requested_metrics: Mutex<Vec<Vec<StatisticsMetric>>>,
+        async_reads: AtomicUsize,
     }
 
     impl ContextObservingProvider {
@@ -714,6 +769,30 @@ mod unified_tests {
                 "statistics fixture expected cancellation or deadline",
             ))
         }
+
+        fn read_statistics_async(
+            &self,
+            request: StatisticsReadRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<StatisticsEvidence, ConnectorError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                self.async_reads.fetch_add(1, Ordering::SeqCst);
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                self.requested_metrics
+                    .lock()
+                    .expect("statistics fixture metrics lock")
+                    .push(request.metrics.metrics().to_vec());
+                Err(ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "asynchronous statistics fixture has no evidence",
+                ))
+            })
+        }
     }
 
     impl ConnectorStatistics for ContextObservingProvider {}
@@ -761,6 +840,7 @@ mod unified_tests {
             incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
             reads: AtomicUsize::new(0),
             requested_metrics: Mutex::new(Vec::new()),
+            async_reads: AtomicUsize::new(0),
         })
     }
 
@@ -832,6 +912,49 @@ mod unified_tests {
             captured_ids
                 .iter()
                 .all(|binding| evidence_ids.contains(binding))
+        );
+    }
+
+    #[tokio::test]
+    async fn async_snapshot_keeps_captured_bindings_and_the_original_metric_request() {
+        let provider = observing_provider();
+        let bindings = QueryTableBindingStore::try_new().unwrap();
+        bindings.insert_strict_base_binding_for_test(
+            "ice.main",
+            "db",
+            "orders",
+            connector_binding_with_statistics(provider.clone()),
+        );
+        bindings.insert_strict_base_binding_for_test(
+            "ice.main",
+            "db",
+            "unavailable",
+            local_binding("ice.main", "db", "unavailable", 74),
+        );
+        let captured = bindings.captured_bindings();
+        let expected = metric_request(&[column("k")]).unwrap();
+        let context = request_context(Instant::now() + Duration::from_secs(60), false);
+        let evidence = project_statistics_evidence_async(
+            &UnifiedStatisticsResolver::default(),
+            &bindings,
+            &context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(evidence.len(), captured.len());
+        for (binding_id, _) in captured {
+            assert!(evidence.iter().any(|fact| matches!(fact,
+                DmlStatisticsEvidence::Missing { binding, .. } if *binding == binding_id)));
+        }
+        assert_eq!(provider.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider.async_reads.load(Ordering::SeqCst),
+            1,
+            "the async snapshot must never use the synchronous statistics reader"
+        );
+        assert_eq!(
+            provider.requested_metrics.lock().unwrap().as_slice(),
+            [expected.metrics().to_vec()]
         );
     }
 

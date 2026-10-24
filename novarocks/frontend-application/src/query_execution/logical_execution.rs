@@ -46,6 +46,18 @@ use crate::query_execution::completion::PreparedLogicalRead;
 pub(crate) trait LogicalExecutionLauncher: Send + Sync + 'static {
     fn reserve_identity(&self) -> Result<ReservedExecutionIdentity, QueryExecutionError>;
 
+    fn start_read_in(
+        &self,
+        read: &mut Option<PreparedLogicalRead>,
+        owner: &mut Option<WorkOwner>,
+        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        io: &Arc<crate::query::read_action::io_source::ReadMetadataIoSource>,
+        original: &mut OriginalComputationStart,
+        #[cfg(novarocks_dev_controls)] observation: Option<
+            crate::preparation_diagnostics::StatementObservationHandle,
+        >,
+    ) -> Result<novarocks_query_application::api::LogicalExecutionStartAttempt, QueryExecutionError>;
+
     fn start_computation_in(
         &self,
         computation: &mut Option<PreparedLogicalComputation>,
@@ -83,6 +95,7 @@ pub(crate) trait LogicalExecutionLauncher: Send + Sync + 'static {
 /// original QA inputs/results, not another execution identity or task owner.
 #[derive(Default)]
 pub(crate) struct OriginalComputationStart {
+    pub(crate) reservation: Option<ReservedExecutionIdentity>,
     pub(crate) request: Option<novarocks_query_application::api::QueryExecutionRequest>,
     pub(crate) input: Option<novarocks_query_application::api::OriginalLogicalStartInput>,
     pub(crate) ready: Option<QueryExecutionFuture>,
@@ -97,6 +110,26 @@ pub(crate) struct InitialComputationReservation {
 }
 
 impl InitialComputationReservation {
+    /// Same original first-attempt fixed allocations; reading is not admission.
+    pub(crate) fn fixed_backing_bytes() -> Result<usize, novarocks_workload_control::WorkError> {
+        use novarocks_type_contract::owned_resources::layout::arc_layout;
+        use novarocks_workload_control::WorkError;
+        let credentials = arc_layout(std::alloc::Layout::new::<InitialComputationCredentials>())
+            .map_err(|_| WorkError::ArithmeticOverflow)?;
+        super::lifecycle_plan::initial_credential_layouts()
+            .map_err(|_| WorkError::ArithmeticOverflow)?
+            .into_iter()
+            .chain(std::iter::once(
+                novarocks_spi::connector::ConnectorRequestScope::fixed_backing_layout()
+                    .map_err(|_| WorkError::ArithmeticOverflow)?,
+            ))
+            .try_fold(credentials.size(), |bytes, layout| {
+                bytes
+                    .checked_add(layout.size())
+                    .ok_or(WorkError::ArithmeticOverflow)
+            })
+    }
+
     pub(crate) fn new(reserved: ReservedExecutionIdentity) -> Result<Self, DistributedQueryError> {
         let reservation = QueryAttemptReservation::from_reserved(&reserved)?;
         let terminal = reservation.terminal_storage_resolver();

@@ -1998,7 +1998,12 @@ mod tests {
         let execute = || {
             ConnectorMetadataMaintenanceExecuteRequest::try_new(plan.clone(), context()).unwrap()
         };
-        let first = executor.block_on(lease.execute(execute())).unwrap();
+        let mut execution = lease.begin_execute(execute()).unwrap();
+        let first = executor.block_on(execution.wait()).unwrap();
+        assert_eq!(
+            execution.cleanup_responsibility(),
+            novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Retained
+        );
         let ExternalMutationOutcome::KnownCommitted {
             effect: ExternalMutationEffect::Applied,
             finalization,

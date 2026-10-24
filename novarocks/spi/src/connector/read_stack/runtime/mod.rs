@@ -1128,6 +1128,29 @@ fn check_attempt_request_active(request: &ConnectorAttemptContext) -> Result<(),
 /// factory is retained by the exact installed control; a role can request a
 /// view but cannot inspect or construct provider payloads.
 pub trait ConnectorReadRequestControlFactory: Send + Sync {
+    fn planning_io_geometry(
+        &self,
+    ) -> Result<crate::connector::ConnectorMetadataMaintenanceIoGeometry, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "read factory has no closed I/O geometry",
+        ))
+    }
+
+    /// Pure selected-route facts from this exact installed read generation.
+    /// Called after acquiring the original paid proposal position and before
+    /// request-control construction or any physical preparation. A callback
+    /// only appends facts to that same proposal; it grants no effect authority.
+    fn visit_planning_dependencies(
+        &self,
+        _visit: &mut dyn FnMut(&crate::connector::SharedDependency) -> Result<(), ConnectorError>,
+    ) -> Result<(), ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "read generation has no selected planning dependency author",
+        ))
+    }
+
     fn for_planning(
         &self,
         request: &ConnectorPlanningContext,

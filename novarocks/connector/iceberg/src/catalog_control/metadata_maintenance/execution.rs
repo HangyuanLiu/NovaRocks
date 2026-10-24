@@ -155,6 +155,34 @@ impl MaintenanceExecution {
 }
 
 impl ConnectorMetadataMaintenanceExecutionSource for MaintenanceExecution {
+    fn cleanup_responsibility(
+        &self,
+    ) -> novarocks_spi::connector::ConnectorMetadataCleanupResponsibility {
+        use novarocks_spi::connector::ConnectorMetadataCleanupResponsibility as R;
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.phase != Phase::Closed || state.failure.is_some() {
+            return R::Retained;
+        }
+        // Borrow the exact already-retained outcome. The same row still owns
+        // its original operation/journal and full cleanup report, not a copy
+        // hidden in a diagnostic string or the unbounded replay cache.
+        match &state.result {
+            Some(Ok(
+                ExternalMutationOutcome::KnownCommitted {
+                    cleanup: ExternalMutationFinalization::Complete,
+                    ..
+                }
+                | ExternalMutationOutcome::KnownUncommitted {
+                    cleanup: ExternalMutationFinalization::Complete,
+                    ..
+                },
+            )) => R::Disposed,
+            _ => R::Retained,
+        }
+    }
     fn poll_result(
         &self,
         cx: &mut Context<'_>,

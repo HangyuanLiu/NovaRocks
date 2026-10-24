@@ -236,6 +236,13 @@ fn make_quote(
             .checked_add(layout.size())
             .ok_or(WorkError::ArithmeticOverflow)?;
     }
+    metadata = metadata
+        .checked_add(
+            novarocks_workload_control::joint_admission::NativeDispatchSource::metadata_backing_bytes(
+                items,
+            )?,
+        )
+        .ok_or(WorkError::ArithmeticOverflow)?;
     let reply_meta = Layout::array::<std::sync::OnceLock<OperationAcknowledgement>>(items)
         .map_err(|_| WorkError::ArithmeticOverflow)?
         .size();

@@ -149,7 +149,9 @@ impl NativeAsyncActionAuthority {
         let execution_fence = capture_node(&execution)?;
         let state = inner.state.lock().unwrap();
         validate_execution(&state, self.owner, self.execution)?;
-        self.capacity.validate(&state, self.owner)?;
+        // Observing the original installed support does not authorize a new
+        // action or retain a result position. The actual source below checks
+        // whether this is foreground production or original settlement.
         node_facts(&state, &root_fence, false)?;
         node_facts(&state, &execution_fence, false)?;
         let node = state.nodes.get(&self.owner).ok_or(WorkError::Released)?;
@@ -406,7 +408,7 @@ fn node_facts<'a>(
         || claim.active_amounts != slot.base
         || claim.facts.key != claim.active_facts.key
         || claim.active_facts.class != node.class
-        || claim.active_facts.dependencies.is_empty()
+        || !root_domains::has_effective_domains(state, &claim.active_facts, true)
         || !claim.active_facts.key.causal.is_empty()
     {
         return Err(WorkError::Conflict);
@@ -428,13 +430,22 @@ fn source_facts<'a>(
         return Err(WorkError::Conflict);
     }
     validate_execution(state, owner, fence.execution.work)?;
-    fence.capacity.validate(state, owner)?;
+    if fence.lane == JointLane::Foreground {
+        fence.capacity.validate(state, owner)?;
+    }
+    // Settlement continues the original delegated responsibility after the
+    // result holder leaves. It still needs both live original control nodes,
+    // their exact slot/generation/revisions and a fresh paid Joint proof; it
+    // neither retains nor reacquires the released result position.
     Ok((
         node_facts(state, &fence.root, fence.lane == JointLane::Foreground)?,
         node_facts(state, &fence.execution, fence.lane == JointLane::Foreground)?,
     ))
 }
 fn exact_union(facts: &ProfileFacts, root: &ProfileFacts, execution: &ProfileFacts) -> bool {
+    if root_domains::combined_origin(root, execution).ok() != Some(facts.key.origin) {
+        return false;
+    }
     let actual = &facts.key.dependencies;
     actual.iter().all(|key| {
         root.key.dependencies.binary_search(key).is_ok()
@@ -604,6 +615,7 @@ impl NativeAsyncActionSource {
         for (lane, amounts) in changes.into_iter().flatten() {
             proposal.begin_new(lane, amounts)?;
             let current = proposal.current.as_mut().expect("original Native change");
+            current.origin = root_domains::combined_origin(&facts, &execution)?;
             for record in facts
                 .dependencies
                 .iter()
@@ -794,6 +806,31 @@ impl NativeActionFence {
         match (self.quote, index) {
             (NativeSourceQuote::Action(_), 0) => self.execution.work,
             _ => self.root.work,
+        }
+    }
+}
+
+impl NativeActionFence {
+    pub(in crate::joint_admission::ledger) fn dispatch_origin(
+        &self,
+        ticket: u64,
+        index: usize,
+        remaining: u64,
+    ) -> typed_custody::NativeDispatchOrigin {
+        let kind = match (self.quote, index) {
+            (NativeSourceQuote::Action(_), 0) => typed_custody::NativeDispatchKind::Action,
+            (NativeSourceQuote::Action(_), 1) => typed_custody::NativeDispatchKind::Reply,
+            (NativeSourceQuote::Queued(_), 0) => typed_custody::NativeDispatchKind::Input,
+            _ => unreachable!("validated original Native batch"),
+        };
+        typed_custody::NativeDispatchOrigin {
+            root: self.root.work,
+            execution: self.execution.work,
+            ticket,
+            kind,
+            remaining,
+            frozen: false,
+            lane: self.lane,
         }
     }
 }

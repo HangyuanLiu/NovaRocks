@@ -327,6 +327,10 @@ impl std::fmt::Debug for ManifestBoundNativeAttemptInputs {
 }
 
 impl ManifestBoundNativeAttemptInputs {
+    pub(crate) const fn manifest(&self) -> &TaskManifestBinding {
+        &self.manifest
+    }
+
     pub(crate) fn eligible_backends(&self) -> &[BackendProcessId] {
         self.manifest.eligible_backends()
     }
@@ -1200,6 +1204,24 @@ fn freeze_query_catalog_lease(
         .collect::<Result<Vec<_>, _>>()?;
     let catalog_set = merge_catalog_properties(existing, typed_reads)?;
     Ok(QueryCatalogLease::new(catalog_set, Vec::new()))
+}
+
+/// Add the original sealed writer's BE materialization input without resolving
+/// a current catalog or acquiring another generation. Typed reads merge through
+/// this same conflict-checking author during task preparation.
+pub(crate) fn merge_write_session_catalog(
+    existing: &CatalogSet,
+    session: &crate::query_execution::write_session::ConnectorWriteSession,
+) -> Result<CatalogSet, DistributedQueryError> {
+    let writer = session
+        .catalog_properties()
+        .backend_execution_projection()
+        .map_err(|error| {
+            contract_error(format!(
+                "project write catalog for backend execution: {error}"
+            ))
+        })?;
+    merge_catalog_properties(existing, [writer])
 }
 
 fn merge_catalog_properties(
@@ -2076,6 +2098,55 @@ mod tests {
             error
                 .message()
                 .contains("another request-bound Native attempt")
+        );
+    }
+
+    #[test]
+    fn original_writer_catalog_survives_without_reads_and_merges_exact_read_once() {
+        use novarocks_spi::connector::{
+            ConnectorMutationFailure, ConnectorMutationFailureKind, ExternalMutationFinalization,
+            ExternalMutationOutcome,
+        };
+        let fixture = crate::query_execution::write_session::tests::fixture_with_outcome(
+            1,
+            8,
+            ExternalMutationOutcome::KnownUncommitted {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "catalog projection fixture does not publish",
+                ),
+                cleanup: ExternalMutationFinalization::Complete,
+            },
+        );
+        let original = fixture.session.catalog_properties();
+        let expected = original.backend_execution_projection().unwrap();
+        let no_reads = CatalogSet::new([]).unwrap();
+        let writer = super::merge_write_session_catalog(&no_reads, &fixture.session).unwrap();
+        let catalogs = writer.catalogs().unwrap();
+        assert_eq!(catalogs, vec![expected.clone()]);
+        assert_eq!(catalogs[0].handle(), original.handle());
+        let round_trip = CatalogSet::parse(writer.as_proto().clone()).unwrap();
+        assert_eq!(round_trip.catalogs().unwrap(), catalogs);
+        let read_first = CatalogSet::new([expected.clone()]).unwrap();
+        let exact_writer =
+            super::merge_write_session_catalog(&read_first, &fixture.session).unwrap();
+        assert_eq!(exact_writer.catalogs().unwrap(), vec![expected.clone()]);
+        // The same merge used by freeze_query_catalog_lease adds typed reads.
+        let both = merge_catalog_properties(&writer, [expected.clone()]).unwrap();
+        assert_eq!(both.catalogs().unwrap(), vec![expected.clone()]);
+        let conflicting = CatalogProperties::new(
+            expected.handle().clone(),
+            expected.provider_id().clone(),
+            expected.config_format_version(),
+            vec![CatalogProperty::new("warehouse", "s3://conflicting-generation-input").unwrap()],
+            expected.credential_bindings().to_vec(),
+        )
+        .unwrap();
+        assert!(
+            merge_catalog_properties(&writer, [conflicting])
+                .unwrap_err()
+                .message()
+                .contains("conflicting materialization inputs")
         );
     }
 

@@ -204,9 +204,134 @@ pub struct QueryResultCapacityBinding {
 
 #[derive(Default)]
 struct ResultCapacityActivity {
-    count: std::sync::Mutex<usize>,
+    state: std::sync::Mutex<ResultCapacityActivityState>,
     exited: std::sync::Condvar,
     async_exited: tokio::sync::Notify,
+}
+#[derive(Default)]
+struct ResultCapacityActivityState {
+    count: usize,
+    client: Option<ClientComputationCustody>,
+}
+struct ClientComputationCustody {
+    // The sole positive Client computation; Window/Native tails carry no pin.
+    grant: Option<novarocks_workload_control::joint_admission::InternalComputationGrant>,
+    sealed: bool,
+    producer_exited: bool,
+    retiring: bool,
+    retired: bool,
+}
+/// Private original-source observation. Only the real Client pump/Native
+/// body exit authors may close it; a Work identity or success enum cannot.
+#[derive(Clone)]
+pub(crate) struct ClientComputationCutHandle {
+    activity: std::sync::Weak<ResultCapacityActivity>,
+    scope: WorkScope,
+}
+/// One inline custody reference to the existing activity allocation in the
+/// original Native body. It prevents incidental capacity-alias Drop from
+/// retiring the computation before the real local producer frame exits.
+pub(crate) struct ClientComputationProducer {
+    activity: std::sync::Arc<ResultCapacityActivity>,
+    scope: WorkScope,
+}
+impl ClientComputationProducer {
+    pub(crate) fn native_body_exited(&self) -> Result<(), WorkError> {
+        let handle = ClientComputationCutHandle {
+            activity: std::sync::Arc::downgrade(&self.activity),
+            scope: self.scope.clone(),
+        };
+        handle.native_body_exited()
+    }
+}
+impl ClientComputationCutHandle {
+    pub(crate) fn is_for_scope(&self, scope: &WorkScope) -> bool {
+        self.scope.id() == scope.id()
+    }
+    pub(crate) fn same_source(&self, other: &Self) -> bool {
+        std::sync::Weak::ptr_eq(&self.activity, &other.activity)
+    }
+    pub(crate) fn seal_producer(&self) -> Result<(), WorkError> {
+        let activity = self.activity.upgrade().ok_or(WorkError::Released)?;
+        let mut state = activity.state.lock().expect("result activity lock");
+        let client = state.client.as_mut().ok_or(WorkError::Conflict)?;
+        client.sealed = true;
+        Ok(())
+    }
+    fn producer_exited(&self) -> Result<std::sync::Arc<ResultCapacityActivity>, WorkError> {
+        let activity = self.activity.upgrade().ok_or(WorkError::Released)?;
+        {
+            let mut state = activity.state.lock().expect("result activity lock");
+            let client = state.client.as_mut().ok_or(WorkError::Conflict)?;
+            client.sealed = true;
+            client.producer_exited = true;
+        }
+        retire_client_if_ready(&activity);
+        Ok(activity)
+    }
+    /// Only after the original driver/pump frame returned normally. The
+    /// private pump token is checked before any positive grant can exit.
+    pub(crate) async fn retire_after_pump_exit(
+        &self,
+        cut: super::coordination::ClientRowsComputedCut,
+    ) -> Result<(), WorkError> {
+        if !cut.is_for(self) {
+            return Err(WorkError::Conflict);
+        }
+        let activity = self.producer_exited()?;
+        loop {
+            let exited = activity.async_exited.notified();
+            tokio::pin!(exited);
+            exited.as_mut().enable();
+            if activity
+                .state
+                .lock()
+                .expect("result activity lock")
+                .client
+                .as_ref()
+                .is_some_and(|client| client.retired)
+            {
+                return Ok(());
+            }
+            exited.await;
+        }
+    }
+    /// OriginalLogicalExit invokes this only after its real local role frame
+    /// and Native-body destructors have normally exited. Failure/timeout alone
+    /// never calls it; held activities still keep the same grant charged.
+    pub(crate) fn native_body_exited(&self) -> Result<(), WorkError> {
+        self.producer_exited().map(|_| ())
+    }
+}
+fn retire_client_if_ready(activity: &std::sync::Arc<ResultCapacityActivity>) {
+    let grant = {
+        let mut state = activity.state.lock().expect("result activity lock");
+        if state.count != 0 {
+            return;
+        }
+        let Some(client) = state.client.as_mut() else {
+            return;
+        };
+        if !client.producer_exited || !client.sealed || client.retiring || client.retired {
+            return;
+        }
+        client.retiring = true;
+        client
+            .grant
+            .take()
+            .expect("one original Client computation")
+    };
+    // The original positive resource exits outside the activity mutex. A Drop
+    // unwind leaves Retiring, never a fabricated completed retirement.
+    drop(grant);
+    {
+        let mut state = activity.state.lock().expect("result activity lock");
+        let client = state.client.as_mut().unwrap();
+        client.retiring = false;
+        client.retired = true;
+    }
+    activity.exited.notify_all();
+    activity.async_exited.notify_waiters();
 }
 
 /// Actual execution ownership, independent of a cancelled waiter. Drop this
@@ -221,11 +346,15 @@ impl Drop for ResultCapacityActivityLease {
         drop(self.window.take());
         drop(self.computation.take());
         let exited = {
-            let mut count = self.activity.count.lock().expect("result activity lock");
-            *count = count.checked_sub(1).expect("one result activity exit");
-            *count == 0
+            let mut state = self.activity.state.lock().expect("result activity lock");
+            state.count = state
+                .count
+                .checked_sub(1)
+                .expect("one result activity exit");
+            state.count == 0
         };
         if exited {
+            retire_client_if_ready(&self.activity);
             self.activity.exited.notify_all();
             self.activity.async_exited.notify_waiters();
         }
@@ -233,6 +362,15 @@ impl Drop for ResultCapacityActivityLease {
 }
 
 impl QueryResultCapacityBinding {
+    /// Pure geometry of the actual per-binding activity allocation. This
+    /// constructs no binding, waiter, result alias or resource authority.
+    pub fn fixed_backing_layout() -> Result<std::alloc::Layout, WorkError> {
+        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
+            ResultCapacityActivity,
+        >())
+        .map_err(|_| WorkError::ArithmeticOverflow)
+    }
+
     pub fn native_action_authority(
         &self,
     ) -> Result<novarocks_workload_control::joint_admission::NativeAsyncActionAuthority, WorkError>
@@ -250,7 +388,10 @@ impl QueryResultCapacityBinding {
         self.window.native_action_source(lane, quote)
     }
     pub fn try_new(scope: &WorkScope, window: ResultWindowAlias) -> Result<Self, WorkError> {
-        if !window.is_for_scope(scope) || window.class() == ResultWindowClass::Closing {
+        if !window.is_for_scope(scope)
+            || window.class() == ResultWindowClass::Closing
+            || window.has_client_computation_stamp()
+        {
             return Err(WorkError::Conflict);
         }
         scope.check()?;
@@ -273,6 +414,82 @@ impl QueryResultCapacityBinding {
             scope: execution.clone(),
             window,
             activity: std::sync::Arc::new(ResultCapacityActivity::default()),
+        })
+    }
+    /// Only the two original positive grants can attach manifest-binding
+    /// authority. Retained aliases cannot mint it from an identity.
+    pub fn from_internal_computation(
+        root: &WorkScope,
+        stage: &novarocks_workload_control::WorkOwner,
+        payload: &novarocks_workload_control::joint_admission::RetainedPayloadGrant,
+        compute: &novarocks_workload_control::joint_admission::InternalComputationGrant,
+    ) -> Result<Self, WorkError> {
+        let window = ResultWindowAlias::from_internal_computation(root, stage, payload, compute)?;
+        Ok(Self {
+            scope: stage.scope(),
+            window,
+            activity: std::sync::Arc::new(ResultCapacityActivity::default()),
+        })
+    }
+
+    /// Keep this original payload and activity allocation after its actual
+    /// computation exits. This projection carries no manifest-binding power.
+    pub fn into_statement_retention(mut self) -> Result<Self, WorkError> {
+        self.window = self.window.into_root_retention()?;
+        self.scope = self.window.root_scope().clone();
+        Ok(self)
+    }
+
+    /// Move the original positive Client computation into the existing shared
+    /// activity allocation. Every fallible check precedes the first owner move.
+    pub fn from_owned_client_computation_in(
+        root: &WorkScope,
+        stage: &novarocks_workload_control::WorkOwner,
+        original: &ResultWindowAlias,
+        payload: &novarocks_workload_control::joint_admission::RetainedPayloadGrant,
+        source: &mut Option<novarocks_workload_control::joint_admission::InternalComputationGrant>,
+        target: &mut Option<Self>,
+    ) -> Result<(), WorkError> {
+        if target.is_some() {
+            return Err(WorkError::Conflict);
+        }
+        let compute = source.as_ref().ok_or(WorkError::Released)?;
+        let window =
+            ResultWindowAlias::from_client_computation(root, stage, original, payload, compute)?;
+        let mut activity = std::sync::Arc::new(ResultCapacityActivity::default());
+        let state = std::sync::Arc::get_mut(&mut activity)
+            .unwrap()
+            .state
+            .get_mut()
+            .expect("new result activity lock");
+        state.client = Some(ClientComputationCustody {
+            grant: source.take(),
+            sealed: false,
+            producer_exited: false,
+            retiring: false,
+            retired: false,
+        });
+        *target = Some(Self {
+            scope: stage.scope(),
+            window,
+            activity,
+        });
+        Ok(())
+    }
+    pub(crate) fn client_computation_producer(&self) -> Option<ClientComputationProducer> {
+        let state = self.activity.state.lock().expect("result activity lock");
+        state.client.as_ref()?;
+        Some(ClientComputationProducer {
+            activity: std::sync::Arc::clone(&self.activity),
+            scope: self.scope.clone(),
+        })
+    }
+    pub(crate) fn client_computation_cut_handle(&self) -> Option<ClientComputationCutHandle> {
+        let state = self.activity.state.lock().expect("result activity lock");
+        state.client.as_ref()?;
+        Some(ClientComputationCutHandle {
+            activity: std::sync::Arc::downgrade(&self.activity),
+            scope: self.scope.clone(),
         })
     }
     pub fn scope(&self) -> &WorkScope {
@@ -308,11 +525,18 @@ impl QueryResultCapacityBinding {
             return Err(WorkError::Conflict);
         }
         self.scope.check()?;
-        let mut count = self.activity.count.lock().expect("result activity lock");
-        *count = count.checked_add(1).expect("bounded result activities");
+        let window = self.window.try_clone()?;
+        let mut state = self.activity.state.lock().expect("result activity lock");
+        if state.client.as_ref().is_some_and(|client| client.sealed) {
+            return Err(WorkError::Conflict);
+        }
+        state.count = state
+            .count
+            .checked_add(1)
+            .ok_or(WorkError::ArithmeticOverflow)?;
         Ok(ResultCapacityActivityLease {
             activity: std::sync::Arc::clone(&self.activity),
-            window: Some(self.window.clone()),
+            window: Some(window),
             computation: None,
         })
     }
@@ -328,8 +552,11 @@ impl QueryResultCapacityBinding {
         }
         self.scope.check()?;
         let window = self.window.try_clone()?;
-        let mut count = self.activity.count.lock().expect("result activity lock");
-        *count = count.checked_add(1).ok_or(WorkError::ArithmeticOverflow)?;
+        let mut state = self.activity.state.lock().expect("result activity lock");
+        state.count = state
+            .count
+            .checked_add(1)
+            .ok_or(WorkError::ArithmeticOverflow)?;
         Ok(ResultCapacityActivityLease {
             activity: std::sync::Arc::clone(&self.activity),
             window: Some(window),
@@ -341,12 +568,12 @@ impl QueryResultCapacityBinding {
     /// actual input/unclaimed-output destruction, never for cancellation.
     /// Foreground coordinator cancellation must not call this blocking fence.
     pub fn wait_result_activities_exited(&self) {
-        let mut count = self.activity.count.lock().expect("result activity lock");
-        while *count != 0 {
-            count = self
+        let mut state = self.activity.state.lock().expect("result activity lock");
+        while state.count != 0 {
+            state = self
                 .activity
                 .exited
-                .wait(count)
+                .wait(state)
                 .expect("result activity lock");
         }
     }
@@ -360,7 +587,14 @@ impl QueryResultCapacityBinding {
             // Register before inspecting count. A zero transition between the
             // inspection and await is retained by this registered waiter.
             exited.as_mut().enable();
-            if *self.activity.count.lock().expect("result activity lock") == 0 {
+            if self
+                .activity
+                .state
+                .lock()
+                .expect("result activity lock")
+                .count
+                == 0
+            {
                 return;
             }
             exited.await;
@@ -476,6 +710,52 @@ impl QueryExecutionContext {
         binding.scope().check()?;
         self.result_capacity = Some(binding);
         Ok(self)
+    }
+
+    /// Derive an execution view of this same admitted statement. The caller
+    /// must already hold the original positive payload and actual computation
+    /// grants; a payload-only alias cannot authorize a new execution stage.
+    pub fn for_internal_computation(
+        &self,
+        binding: QueryResultCapacityBinding,
+    ) -> Result<Self, WorkError> {
+        let original = self.result_capacity.as_ref().ok_or(WorkError::Conflict)?;
+        if !binding.is_root_backed_internal()
+            || !original.window.is_for_root_scope(binding.root_scope())
+            || binding.window.internal_manifest_binding()?.is_none()
+            || (original.is_root_backed_internal()
+                && !original.window.shares_capacity_with(&binding.window))
+        {
+            return Err(WorkError::Conflict);
+        }
+        original.root_scope().check()?;
+        binding.scope().check()?;
+        let mut execution = self.clone();
+        execution.result_capacity = Some(binding);
+        Ok(execution)
+    }
+
+    /// Continue business work under the same admitted statement and retained
+    /// payload. An old computation may have exited; no new computation is
+    /// authorized by this Root-only retention projection.
+    pub fn for_statement_retention(
+        &self,
+        binding: QueryResultCapacityBinding,
+    ) -> Result<Self, WorkError> {
+        let original = self.result_capacity.as_ref().ok_or(WorkError::Conflict)?;
+        if !binding.is_root_backed_internal()
+            || !binding.window.is_for_scope(binding.root_scope())
+            || !original.window.is_for_root_scope(binding.root_scope())
+            || binding.window.internal_manifest_binding()?.is_some()
+            || (original.is_root_backed_internal()
+                && !original.window.shares_capacity_with(&binding.window))
+        {
+            return Err(WorkError::Conflict);
+        }
+        binding.scope().check()?;
+        let mut execution = self.clone();
+        execution.result_capacity = Some(binding);
+        Ok(execution)
     }
 
     pub fn result_capacity(&self) -> Option<&QueryResultCapacityBinding> {

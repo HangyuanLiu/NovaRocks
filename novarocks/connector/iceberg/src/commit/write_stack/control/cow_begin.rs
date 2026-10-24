@@ -270,13 +270,29 @@ fn recipe_heap(recipe: &IcebergDataBranchRecipe) -> Result<u64, Cause> {
 }
 
 impl IcebergWriteSessionControl {
+    // Transitional old-family bridge; the asynchronous checked owner below
+    // remains the only COW admission algorithm.
     pub(super) fn begin_cow_original(
         &self,
         request: ConnectorWriteBeginRequest,
         original: ConnectorOriginalResultScope,
         existing_caller_upper: u64,
     ) -> Result<ConnectorCowBeginPlan, ConnectorCowBeginFailure> {
-        let outcome = (|| -> Result<(ConnectorWriteSessionPlan, u64), Cause> {
+        let retained = original.clone();
+        self.runtime
+            .resources()
+            .catalog_runtime()
+            .block_on(self.begin_cow_original_async(request, original, existing_caller_upper))
+            .map_err(|cause| ConnectorCowBeginFailure::new(unavailable(cause).into(), retained))?
+    }
+
+    pub(super) async fn begin_cow_original_async(
+        &self,
+        request: ConnectorWriteBeginRequest,
+        original: ConnectorOriginalResultScope,
+        existing_caller_upper: u64,
+    ) -> Result<ConnectorCowBeginPlan, ConnectorCowBeginFailure> {
+        let outcome: Result<(ConnectorWriteSessionPlan, u64), Cause> = async {
             validate_context(&request.context)?;
             let ConnectorWriteSessionFlavor::CopyOnWrite {
                 selection,
@@ -312,7 +328,8 @@ impl IcebergWriteSessionControl {
             scope.active()?;
             let physical = self
                 .runtime
-                .load_table_for_request(namespace, table_name, &request.context)
+                .load_table_for_request_async(namespace, table_name, &request.context)
+                .await
                 .map_err(|e| unavailable(e.to_string()))?;
             let cow_read_access =
                 crate::loaded_table::IcebergAttemptTableAccess::freeze_with_original_scope(
@@ -413,20 +430,10 @@ impl IcebergWriteSessionControl {
             let read_upper = scope.upper();
             // Move the loaded Table into the existing runtime bridge: no
             // explicit Table/metadata clone or refreshed activity/deadline.
-            let files = self
-                .runtime
-                .resources()
-                .catalog_runtime()
-                .block_on(async move {
-                    crate::manifest::extract_cow_data_files_with_stats_at_with_original_scope(
-                        &table,
-                        snapshot_id,
-                        &original_read,
-                        read_upper,
-                    )
-                    .await
-                })
-                .map_err(unavailable)??;
+            let files = crate::manifest::extract_cow_data_files_with_stats_at_with_original_scope(
+                &table, snapshot_id, &original_read, read_upper,
+            ).await?;
+            drop(table);
             scope.cover_total(files.simultaneous_upper)?;
             // Same original ReadSnapshot facts and loaded-table authority, moved
             // into typed base holders without another observation or SDK clone.
@@ -558,7 +565,7 @@ impl IcebergWriteSessionControl {
             )?;
             scope.active()?;
             Ok((plan, scope.upper()))
-        })();
+        }.await;
         match outcome {
             Ok((plan, upper)) => Ok(ConnectorCowBeginPlan::new(plan, original, upper)),
             Err(cause) => Err(ConnectorCowBeginFailure::new(cause, original)),

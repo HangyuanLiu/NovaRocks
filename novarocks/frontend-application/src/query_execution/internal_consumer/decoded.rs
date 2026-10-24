@@ -180,6 +180,9 @@ impl Holder {
 
 pub(crate) struct CowComputationOutput {
     holder: Arc<Holder>,
+    // Alias of the actual consumer creator's admitted payload/window. The
+    // manifest capability is weak identity and creates no computation grant.
+    binding: QueryResultCapacityBinding,
 }
 pub(crate) struct StatisticsComputationOutput {
     holder: Arc<Holder>,
@@ -187,6 +190,7 @@ pub(crate) struct StatisticsComputationOutput {
 
 pub(crate) struct ReadyCowComputation {
     pub(crate) ready: ComputationReadyToken,
+    pub(crate) binding: QueryResultCapacityBinding,
     pub(crate) selection: ConnectorRowMutationSelection,
     pub(crate) credentials: Option<Arc<AttemptCredentialStorage>>,
 }
@@ -208,6 +212,18 @@ impl CowComputationOutput {
         });
         Ok(ReadyCowComputation {
             ready: token,
+            binding: self.binding.clone().into_statement_retention().map_err(|error| {
+                use novarocks_execution_contract::failure::FailureProjection;
+                QueryExecutionError::from_execution(
+                    novarocks_query_application::execution_error::ExecutionFailureInput::new(
+                        error.failure_fact(),
+                        novarocks_execution_contract::SafeDetail::truncating(
+                            "COW result could not retain its original statement payload",
+                        ),
+                        novarocks_query_application::execution_error::ExecutionFailureSite::Coordinator,
+                    ),
+                )
+            })?,
             selection,
             credentials: staged._credentials,
         })
@@ -320,6 +336,7 @@ pub(crate) fn cow_computation_consumer(
     ),
     QueryExecutionError,
 > {
+    let binding = runtime.binding.clone();
     let original = CowMatchRootConsumer::try_new_declared_with_capacity(
         original.context,
         original.signed_schema,
@@ -342,7 +359,7 @@ pub(crate) fn cow_computation_consumer(
         InternalDomainState::Cow(Box::new(original)),
         runtime,
     )?;
-    Ok((consumer, offers, CowComputationOutput { holder }))
+    Ok((consumer, offers, CowComputationOutput { holder, binding }))
 }
 
 pub(crate) fn statistics_computation_consumer(
@@ -378,10 +395,12 @@ pub(crate) fn prepare_cow_computation(
     template: crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
     options: Arc<crate::query_execution::contract::ResolvedQueryOptions>,
     original: CowMatchComputationSeed,
+    initial: crate::query_execution::logical_execution::InitialComputationReservation,
     runtime: DecodedConsumerRuntime,
 ) -> Result<
     (
         crate::query_execution::logical_execution::PreparedLogicalComputation,
+        novarocks_query_application::api::ReservedExecutionIdentity,
         CowComputationOutput,
     ),
     QueryExecutionError,
@@ -404,7 +423,12 @@ pub(crate) fn prepare_cow_computation(
         crate::query_execution::logical_execution::ComputationDiagnostics::None,
     )
     .map_err(|_| domain_error("COW preparation differs from its Native template"))?;
-    Ok((prepared, output))
+    let (prepared, reserved) = prepared
+        .with_initial_reservation(initial)
+        .map_err(|error| {
+            QueryExecutionError::from_execution(error.into_execution_failure_input())
+        })?;
+    Ok((prepared, reserved, output))
 }
 
 pub(crate) fn prepare_statistics_computation(

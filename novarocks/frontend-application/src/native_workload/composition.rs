@@ -26,11 +26,11 @@ use crate::query_execution::maintenance::command::MaintenanceCommandExecutor;
 use novarocks_native_adapter::FrontendTaskTransportBudget;
 use novarocks_query_application::coordination::LogicalExecutionSupervisor;
 use novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry;
-use novarocks_workload_control::ControlStorageConfig;
 use novarocks_workload_control::joint_admission::{
     JointCapacityConfig, JointLane, JointResource as R, JointResourceLimits as Limits,
     JointResources as V, RequiredJointProgress, RootStageSource,
 };
+use novarocks_workload_control::ControlStorageConfig;
 
 /// Original Server/MySQL facts. These are bounds, not a new listener quota or
 /// a substitute for the original ingress author enforcing its same limits.
@@ -73,6 +73,12 @@ pub struct FrontendCompositionFacts {
 const PROPOSALS_PER_SLOT: usize = 6;
 
 impl FrontendWorkloadCapacityProfile {
+    pub(crate) fn statement_io_geometry(&self) -> Option<ConnectorMetadataMaintenanceIoGeometry> {
+        // Lifecycle-only profiles have no statement factories. Their callers
+        // still receive NotReady from the Read owner, never an inferred quote.
+        self.recipe.map(|recipe| recipe.metadata)
+    }
+
     /// Build the actual recipe from the same original configuration and pure
     /// factory facts. Neither this constructor nor its geometry grants I/O.
     pub fn try_for_native(
@@ -82,9 +88,11 @@ impl FrontendWorkloadCapacityProfile {
         transport: FrontendTaskTransportBudget,
         ingress: FrontendStatementIngress,
         metadata: ConnectorMetadataMaintenanceIoGeometry,
+        staged_create_source_bytes: u64,
     ) -> Result<Self, WorkError> {
         inputs.validate_pool_declarations(workload, inputs.query_blocking_capacity())?;
         let cpu = result.internal_cpu_action_quote()?;
+        let root_payload = result.internal_initial_payload_bytes();
         let least_owned =
             NativeTaskOperationSink::minimum_owned_support_for_composition(transport.into_codec())?;
         let native = NativeTaskOperationSink::minimum_progress_for_composition(
@@ -96,14 +104,23 @@ impl FrontendWorkloadCapacityProfile {
             [native.custody(), native.foreground(), native.settlement()],
             cpu,
             metadata_lanes,
-            0,
+            root_payload,
         )?;
         let physical = PhysicalCaps::from_original(&inputs, result, transport, &metadata)?;
         let ceiling = supported_fanout(&lanes, cpu, physical, inputs.policy())?;
         let mut last_error = WorkError::InvalidConfig("frontend complete supported profile");
         for fanout in (1..=ceiling).rev() {
             match Self::compose_for_fanout(
-                &inputs, workload, transport, ingress, cpu, physical, fanout, &metadata,
+                &inputs,
+                workload,
+                transport,
+                ingress,
+                cpu,
+                root_payload,
+                physical,
+                fanout,
+                &metadata,
+                staged_create_source_bytes,
             ) {
                 Ok(profile) => return Ok(profile),
                 Err(error) => last_error = error,
@@ -122,9 +139,11 @@ impl FrontendWorkloadCapacityProfile {
         transport: FrontendTaskTransportBudget,
         ingress: FrontendStatementIngress,
         cpu: InternalCpuActionQuote,
+        root_payload: u64,
         physical: PhysicalCaps,
         fanout: usize,
         metadata: &ConnectorMetadataMaintenanceIoGeometry,
+        staged_create_source_bytes: u64,
     ) -> Result<Self, WorkError> {
         let k = as_u64(fanout)?;
         let (metadata_lanes, metadata_source_bytes) = metadata_progress(metadata, fanout)?;
@@ -133,6 +152,7 @@ impl FrontendWorkloadCapacityProfile {
             inputs.policy().dependency_custody().retained_payload_bytes,
             fanout,
             metadata_lanes[0].get(R::PayloadBytes),
+            root_payload,
         )?;
         let native = NativeTaskOperationSink::minimum_progress_for_composition(
             transport.into_codec(),
@@ -142,7 +162,7 @@ impl FrontendWorkloadCapacityProfile {
             [native.custody(), native.foreground(), native.settlement()],
             cpu,
             metadata_lanes,
-            owned.get(),
+            root_payload,
         )?;
         // This is the actual Custody projection which the original RootStage
         // author reads back as its complete next retained-increment ceiling.
@@ -168,7 +188,14 @@ impl FrontendWorkloadCapacityProfile {
         let children = count.checked_sub(1).ok_or(WorkError::ArithmeticOverflow)?;
         let mut capacity = skeleton(&inputs, proposals, &lanes, fanout)?;
         let role = [LogicalExecutionSupervisor::logical_role_poll_geometry()?];
-        let process_sources = process_source_backing(ingress, transport, inputs)?;
+        let process_sources = process_source_backing(
+            ingress,
+            transport,
+            inputs,
+            fanout,
+            metadata,
+            staged_create_source_bytes,
+        )?;
         let storage = ControlStorageConfig::new(
             inputs.policy().slots_per_class(),
             children,
@@ -197,7 +224,29 @@ impl FrontendWorkloadCapacityProfile {
             Ok::<_, WorkError>(n.saturating_mul(as_u64(count)?))
         })?;
         let base = storage.base_charge(&capacity)?;
-        lanes[0] = add(lanes[0], base)?;
+        // Root and stage remain live across attempts. Every allowed attempt
+        // can still own its scan and covered-status children until actual exit;
+        // retiring an attempt's obligations does not retire these Sources.
+        // The same concrete Native author counts one scan and the complete
+        // supported context set. Larger actual cohorts undergo one atomic
+        // proof before any child or remote effect, without waiting on a prefix.
+        let native_sources =
+            crate::query_execution::native_execution_adapter::native_source_count(1, fanout)?;
+        let attempts = workload
+            .restarts_per_work
+            .checked_add(1)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        let control_records = plus(
+            RootStageSource::minimum_control_records(),
+            native_sources
+                .get()
+                .checked_mul(attempts)
+                .ok_or(WorkError::ArithmeticOverflow)?,
+        )?;
+        // Include the whole original base (Scope, Claim and metadata), not just
+        // its visible Scope coordinate. The process Free inventory below is
+        // still paid exactly once by N, independently of per-domain headroom.
+        lanes[0] = add(lanes[0], scale(base, control_records)?)?;
         let total = sum(lanes)?;
         let required = RequiredJointProgress {
             global: total,
@@ -233,6 +282,11 @@ impl FrontendWorkloadCapacityProfile {
         preserve_internal_capacity(&mut capacity, physical, cpu)?;
         enforce_physical(&mut capacity, physical)?;
         apply_custody_policy(&capacity, inputs.policy())?;
+        // Fixed class Sources and physical tightening are now included. The
+        // initial ceiling is only a search bound; each complete candidate must
+        // satisfy the original WC geometry before it can be selected. This
+        // pure check does not qualify the unregistered CPU source for install.
+        capacity.check_composition_geometry(&required, cpu.physical_queue_bytes())?;
         let facts = facts(
             ingress,
             protected_payload,
@@ -258,7 +312,9 @@ impl FrontendWorkloadCapacityProfile {
         profile.recipe = Some(NativeCompositionRecipe {
             result_cpu: physical,
             cpu,
+            root_payload,
             metadata: *metadata,
+            staged_create_source_bytes,
         });
         Ok(profile)
     }
@@ -276,7 +332,9 @@ impl FrontendWorkloadCapacityProfile {
 pub(super) struct NativeCompositionRecipe {
     result_cpu: PhysicalCaps,
     cpu: InternalCpuActionQuote,
+    root_payload: u64,
     metadata: ConnectorMetadataMaintenanceIoGeometry,
+    staged_create_source_bytes: u64,
 }
 impl FrontendWorkloadCapacityProfile {
     pub(super) fn rebind_process_sources(self) -> Result<Self, WorkError> {
@@ -292,22 +350,25 @@ impl FrontendWorkloadCapacityProfile {
             transport,
             ingress,
             recipe.cpu,
+            recipe.root_payload,
             recipe.result_cpu,
             fanout,
             &recipe.metadata,
+            recipe.staged_create_source_bytes,
         )
     }
 }
 
-/// All four supported owned increments can coexist: Native foreground,
-/// Native settlement, queued input, and Root retained materialization. Fixed
-/// wire/reply costs come from the SAME Native factory, never from a guessed
-/// multiplier. Metadata initial backing is a separate actual factory fact.
+/// The actual closed Internal factory's Root increment is reserved first.
+/// Three remaining Native increments can coexist: foreground clone, settlement
+/// clone, and queued input. Fixed wire/reply costs come from the SAME Native
+/// factory. Metadata initial backing remains a separate actual factory fact.
 fn supported_owned_increment(
     transport: FrontendTaskTransportBudget,
     per_dependency_payload: u64,
     fanout: usize,
     metadata_initial: u64,
+    root_payload: u64,
 ) -> Result<std::num::NonZeroU64, WorkError> {
     let least =
         NativeTaskOperationSink::minimum_owned_support_for_composition(transport.into_codec())?;
@@ -325,11 +386,12 @@ fn supported_owned_increment(
     let available = quantum
         .checked_sub(fixed)
         .and_then(|n| n.checked_sub(metadata_initial))
+        .and_then(|n| n.checked_sub(root_payload))
         .ok_or(WorkError::Capacity(
             "frontend complete owned source increments",
         ))?;
-    // One unit for each of the four named simultaneous sources above.
-    let owned = std::num::NonZeroU64::new(available / 4)
+    // Root has its own actual factory invoice, rather than one Native unit.
+    let owned = std::num::NonZeroU64::new(available / 3)
         .filter(|n| *n >= least)
         .ok_or(WorkError::Capacity(
             "frontend complete owned source increments",
@@ -344,7 +406,7 @@ fn metadata_progress(
         MaintenanceCommandExecutor::metadata_io_requirements_for_geometry(geometry, fanout)?;
     let retained = V::ZERO
         .with(R::ClaimRecords, 1)
-        .with(R::MetadataBytes, actual.source_metadata_bytes)
+        .with(R::MetadataBytes, geometry.metadata_bytes().get())
         .with(R::PayloadBytes, actual.initial_payload_bytes);
     Ok((
         [retained, actual.foreground, actual.settlement],
@@ -724,6 +786,9 @@ fn process_source_backing(
     ingress: FrontendStatementIngress,
     transport: FrontendTaskTransportBudget,
     inputs: &FrontendNativeCapacityInputs,
+    complete_dependency_limit: usize,
+    metadata: &ConnectorMetadataMaintenanceIoGeometry,
+    staged_create_source_bytes: u64,
 ) -> Result<novarocks_workload_control::PollRoleSourceBacking, WorkError> {
     use std::alloc::Layout;
     let q = novarocks_query_application::session_control::QueryControlService::statement_action_geometry();
@@ -744,6 +809,53 @@ fn process_source_backing(
     } else {
         e.diagnostics
     };
+    // The same original root cannot hold two statement-family actions.
+    // Each family quote already covers its own action/residual/F overlap.
+    let explain_bytes = [e.action, e.receiver, future]
+        .into_iter()
+        .chain(e.provider_custody)
+        .try_fold(0usize, |bytes, layout| plus(bytes, layout.size()))?;
+    let insert_bytes = usize::try_from(crate::query::insert_action::fixed_source_bytes(
+        metadata,
+        complete_dependency_limit,
+    )?)
+    .map_err(|_| WorkError::ArithmeticOverflow)?;
+    let delete_bytes = usize::try_from(crate::query::delete_action::fixed_source_bytes(
+        metadata,
+        complete_dependency_limit,
+    )?)
+    .map_err(|_| WorkError::ArithmeticOverflow)?;
+    let read_bytes = usize::try_from(crate::query::read_action::fixed_source_bytes(
+        metadata,
+        complete_dependency_limit,
+    )?)
+    .map_err(|_| WorkError::ArithmeticOverflow)?;
+    let mutation_bytes = usize::try_from(crate::query::mutation_action::fixed_source_bytes(
+        metadata,
+        complete_dependency_limit,
+    )?)
+    .map_err(|_| WorkError::ArithmeticOverflow)?;
+    let ctas_bytes = usize::try_from(crate::query::ctas_action::fixed_source_bytes(
+        metadata,
+        complete_dependency_limit,
+        staged_create_source_bytes,
+    )?)
+    .map_err(|_| WorkError::ArithmeticOverflow)?;
+    let maintenance_bytes = usize::try_from(crate::query::metadata_statement_fixed_source_bytes(
+        metadata,
+        complete_dependency_limit,
+    )?)
+    .map_err(|_| WorkError::ArithmeticOverflow)?;
+    let statement_family = Layout::array::<u8>(
+        explain_bytes
+            .max(insert_bytes)
+            .max(delete_bytes)
+            .max(ctas_bytes)
+            .max(read_bytes)
+            .max(mutation_bytes)
+            .max(maintenance_bytes),
+    )
+    .map_err(|_| WorkError::ArithmeticOverflow)?;
     let apply = NativeTaskOperationSink::source_geometry_for_composition(transport.into_codec())?;
     let apply_bytes = apply.resident_bytes()?;
     if let Some(actual) = inputs.native {
@@ -770,26 +882,23 @@ fn process_source_backing(
         .ok_or(WorkError::ArithmeticOverflow)?;
     let native_layout =
         Layout::array::<u8>(native_shared).map_err(|_| WorkError::ArithmeticOverflow)?;
+    let mut source_layouts = vec![
+        q.registry_record,
+        q.source,
+        q.wake,
+        q.observer,
+        q.receipt,
+        q.failure,
+        q.failure,
+        statement_family,
+    ];
+    // Consume every actual inline, retained Arc and Q-wait layout exposed by
+    // the original binding and cohort authors; no duplicated process bank.
+    source_layouts.extend_from_slice(
+        &crate::query_execution::native_execution_adapter::native_control_binding_layouts(),
+    );
     novarocks_workload_control::PollRoleSourceBacking::from_layouts(
-        &[
-            q.source,
-            q.wake,
-            q.observer,
-            q.receipt,
-            q.failure,
-            q.failure,
-            e.action,
-            e.receiver,
-            future,
-            e.provider_custody[0],
-            e.provider_custody[1],
-            e.provider_custody[2],
-            e.provider_custody[3],
-            e.provider_custody[4],
-            e.provider_custody[5],
-            e.provider_custody[6],
-            e.provider_custody[7],
-        ],
+        &source_layouts,
         &[
             q.driver,
             sessions.owner,
@@ -830,6 +939,7 @@ fn facts(
         session_records: ingress.sessions()?,
         session_record_inline_bytes: qa.record.size(),
         statement_source_bytes: [
+            statement.registry_record.size(),
             statement.source.size(),
             statement.wake.size(),
             statement.observer.size(),
@@ -882,6 +992,96 @@ mod tests {
             additional_queue_positions: 0,
         }
     }
+    #[tokio::test]
+    async fn complete_small_inventory_selects_a_profile_its_original_sources_can_install() {
+        use crate::query_execution::internal_result_cpu::InternalResultCpuOwner;
+        use novarocks_query_application::cpu::QueryBlockingExecutorOwner;
+        use novarocks_workload_control::WorkloadControl;
+
+        // The same finite inventory as the empty-topology real-entry host:
+        // Root + stage + three allowed attempts, each with one scan/context.
+        let mut workload = original_owner_test_workload();
+        let controls = RootStageSource::minimum_control_records()
+            + crate::query_execution::native_execution_adapter::native_source_count(1, 1)
+                .unwrap()
+                .get()
+                * (workload.restarts_per_work + 1);
+        let policy = policy();
+        assert_eq!(policy.slots_per_class(), [2 * controls; 5]);
+        workload.scope_records_limit = policy.scope_limit();
+        let blocking_config = QueryBlockingExecutorConfig::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(32).unwrap(),
+        );
+        let inputs = FrontendNativeCapacityInputs::try_new(policy, blocking_config).unwrap();
+        let result = FrontendResultCapacityProfile::for_test();
+        let transport = FrontendTaskTransportBudget::DEFAULT;
+        let metadata =
+            crate::query::read_action::empty_provider_preparation_geometry_for_test().unwrap();
+        let one = NonZeroUsize::new(1).unwrap();
+        let ingress = FrontendStatementIngress {
+            ordinary_connections: one,
+            control_connections: one,
+            ordinary_command_bytes: one,
+            control_command_bytes: one,
+        };
+        let cpu_quote = result.internal_cpu_action_quote().unwrap();
+        let root_payload = result.internal_initial_payload_bytes();
+        let physical = PhysicalCaps::from_original(&inputs, result, transport, &metadata).unwrap();
+        // K=2 has a complete physical recipe, but its fixed class inventory
+        // cannot protect the real Sources. It must be rejected during selection,
+        // before a host allocates or registers any process source.
+        let unsupported = FrontendWorkloadCapacityProfile::compose_for_fanout(
+            &inputs,
+            &workload,
+            transport,
+            ingress,
+            cpu_quote,
+            root_payload,
+            physical,
+            2,
+            &metadata,
+            0,
+        );
+        let profile = FrontendWorkloadCapacityProfile::try_for_native(
+            inputs, &workload, result, transport, ingress, metadata, 0,
+        )
+        .unwrap();
+        assert_eq!(profile.composition_facts().unwrap().maximum_dependencies, 1);
+        assert_eq!(profile.policy().slots_per_class(), [16; 5]);
+
+        let mut control = WorkloadControl::try_new_counted(workload.clone()).unwrap();
+        let mut blocking = QueryBlockingExecutorOwner::try_new(blocking_config).unwrap();
+        let mut cpu = InternalResultCpuOwner::try_new(result, &mut control.owner).unwrap();
+        let installed = profile
+            .capture_sources(&workload, result, &blocking.executor(), &cpu.runtime())
+            .and_then(|sources| profile.install(&mut control.owner, &sources));
+        let installation_ok = installed.is_ok();
+        drop(installed);
+        control.owner.close_admission();
+        let control_exit = control.owner.shutdown();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let cpu_exit = cpu.shutdown_until(deadline).await;
+        let blocking_exit = blocking.shutdown_until(deadline).await;
+        // Observe every original local exit before test assertions can unwind.
+        assert!(matches!(
+            unsupported,
+            Err(WorkError::InvalidConfig(
+                "joint protected progress geometry"
+            ))
+        ));
+        assert!(installation_ok);
+        assert!(control_exit.is_ok());
+        assert!(
+            cpu_exit.is_ok(),
+            "original CPU owner did not exit: {cpu_exit:?}"
+        );
+        assert!(
+            blocking_exit.is_ok(),
+            "original blocking owner did not exit: {blocking_exit:?}"
+        );
+    }
+
     #[test]
     fn actual_closed_cpu_three_positions_do_not_derive_k_from_one_blocking_worker() {
         let cpu = actual_cpu();
@@ -942,10 +1142,13 @@ mod tests {
     fn native_and_root_owned_support_share_the_same_payload_policy() {
         let transport = FrontendTaskTransportBudget::DEFAULT;
         let per_dependency = 4u64 << 30;
-        let k = 7;
+        let k = 3;
         let metadata_initial = 160 * 1024;
+        let root_payload =
+            FrontendResultCapacityProfile::for_test().internal_initial_payload_bytes();
         let owned =
-            supported_owned_increment(transport, per_dependency, k, metadata_initial).unwrap();
+            supported_owned_increment(transport, per_dependency, k, metadata_initial, root_payload)
+                .unwrap();
         let native = NativeTaskOperationSink::minimum_progress_for_composition(
             transport.into_codec(),
             owned,
@@ -953,7 +1156,7 @@ mod tests {
         .unwrap();
         let supported = add(
             sum([native.custody(), native.foreground(), native.settlement()]).unwrap(),
-            V::ZERO.with(R::PayloadBytes, owned.get() + metadata_initial),
+            V::ZERO.with(R::PayloadBytes, root_payload + metadata_initial),
         )
         .unwrap();
         assert!(
@@ -982,7 +1185,102 @@ mod tests {
             native.settlement().get(R::PayloadBytes) - encoder,
             owned.get()
         );
-        assert!(supported_owned_increment(transport, 1, k, metadata_initial).is_err());
+        assert!(
+            supported_owned_increment(transport, 1, k, metadata_initial, root_payload).is_err()
+        );
+    }
+
+    #[test]
+    fn actual_internal_factory_invoice_is_required_before_selecting_full_d_support() {
+        let result = FrontendResultCapacityProfile::for_test();
+        let root_payload = result.internal_initial_payload_bytes();
+        // This is the same unconditional construction guard used by the domain
+        // owner, not a sample result or the configured 1024 MiB window maximum.
+        assert_eq!(root_payload, 1008 * 1024 * 1024);
+        assert!(root_payload < result.declared().all_objects_bytes[2]);
+        let transport = FrontendTaskTransportBudget::DEFAULT;
+        let least =
+            NativeTaskOperationSink::minimum_owned_support_for_composition(transport.into_codec())
+                .unwrap();
+        let native = NativeTaskOperationSink::minimum_progress_for_composition(
+            transport.into_codec(),
+            least,
+        )
+        .unwrap();
+        let initial = 160 * 1024;
+        let metadata = ConnectorMetadataMaintenanceIoGeometry::new(
+            NonZeroUsize::new(8).unwrap(),
+            std::num::NonZeroU64::new(128).unwrap(),
+            std::num::NonZeroU64::new(initial).unwrap(),
+        );
+        let (metadata_lanes, _) = metadata_progress(&metadata, 1).unwrap();
+        let cpu = result.internal_cpu_action_quote().unwrap();
+        let lanes = action_lanes(
+            [native.custody(), native.foreground(), native.settlement()],
+            cpu,
+            metadata_lanes,
+            root_payload,
+        )
+        .unwrap();
+        assert_eq!(
+            lanes[1].get(R::PayloadBytes),
+            native.foreground().get(R::PayloadBytes)
+        );
+        assert_eq!(
+            lanes[0].get(R::PayloadBytes),
+            native.custody().get(R::PayloadBytes) + initial + root_payload
+        );
+        let mut actual_physical = physical(cpu);
+        actual_physical.native_queue_bytes = 512 * 1024 * 1024;
+        let k = supported_fanout(&lanes, cpu, actual_physical, &policy()).unwrap();
+        assert_eq!(k, 3);
+        assert!(supported_owned_increment(transport, 4 << 30, 3, initial, root_payload).is_ok());
+        assert!(matches!(
+            supported_owned_increment(transport, 4 << 30, 4, initial, root_payload),
+            Err(WorkError::Capacity(
+                "frontend complete owned source increments"
+            ))
+        ));
+    }
+
+    #[test]
+    fn original_per_root_backing_prepays_the_actual_statement_family_before_grants() {
+        let transport = FrontendTaskTransportBudget::DEFAULT;
+        let inputs = FrontendNativeCapacityInputs::try_new(
+            policy(),
+            QueryBlockingExecutorConfig::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(2).unwrap(),
+            ),
+        )
+        .unwrap();
+        let geometry = ConnectorMetadataMaintenanceIoGeometry::new(
+            NonZeroUsize::new(8).unwrap(),
+            std::num::NonZeroU64::new(128).unwrap(),
+            std::num::NonZeroU64::new(8 * 1024 * 1024 + 2 * 64 * 1024).unwrap(),
+        );
+        let one = NonZeroUsize::new(1).unwrap();
+        let ingress = FrontendStatementIngress {
+            ordinary_connections: one,
+            control_connections: one,
+            ordinary_command_bytes: one,
+            control_command_bytes: one,
+        };
+        let source = process_source_backing(ingress, transport, &inputs, 3, &geometry, 0).unwrap();
+        let role = LogicalExecutionSupervisor::logical_role_poll_geometry().unwrap();
+        let paid = role.with_source_backing(source).unwrap();
+        // Shared process allocations cancel. Adding ONE original root must
+        // have already paid the full actual INSERT and metadata family peak.
+        let per_root = (paid.bytes(2).unwrap() - paid.bytes(1).unwrap())
+            - (role.bytes(2).unwrap() - role.bytes(1).unwrap());
+        assert!(
+            per_root as u64
+                >= crate::query::insert_action::fixed_source_bytes(&geometry, 3).unwrap()
+        );
+        assert!(
+            per_root as u64
+                >= crate::query::metadata_statement_fixed_source_bytes(&geometry, 3).unwrap()
+        );
     }
 
     #[test]
@@ -999,7 +1297,15 @@ mod tests {
             lanes[0].get(R::PayloadBytes),
             geometry.initial_owned_bytes().get()
         );
-        assert_eq!(lanes[0].get(R::MetadataBytes), source);
+        assert_eq!(
+            lanes[0].get(R::MetadataBytes),
+            geometry.metadata_bytes().get()
+        );
+        assert!(source > lanes[0].get(R::MetadataBytes));
+        assert_eq!(
+            source - lanes[0].get(R::MetadataBytes),
+            MaintenanceCommandExecutor::frontend_fixed_source_bytes(&geometry, 7).unwrap()
+        );
         for lane in [1, 2] {
             assert_eq!(lanes[lane].get(R::AsyncIo), 1);
             assert_eq!(lanes[lane].get(R::ClaimRecords), 1);

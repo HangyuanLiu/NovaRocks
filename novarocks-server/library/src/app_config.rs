@@ -1290,7 +1290,9 @@ impl Default for FrontendDependencyCustodyConfig {
             unreceived_productions: 256,
             publications: 256,
             residuals: 256,
-            retained_payload_bytes: 4 * 1024 * 1024 * 1024,
+            // The concrete composer invoices the closed Internal factory and
+            // every original Native lane before selecting its full-D bound.
+            retained_payload_bytes: 12 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -2024,7 +2026,10 @@ fn default_task_backend_max_queued_operations() -> usize {
 }
 
 fn default_task_backend_max_queued_bytes() -> usize {
-    FrontendTaskTransportBudget::DEFAULT.max_backend_queued_bytes()
+    // Server deployment policy: leave physical queue headroom for protected
+    // foreground and settlement runs across the complete supported domain set.
+    // The frozen codec defaults remain independently configurable inputs.
+    1024 * 1024 * 1024
 }
 
 fn default_task_max_tasks_per_context() -> usize {
@@ -3708,7 +3713,7 @@ access_key_secret = ""
     }
 
     #[test]
-    fn task_execution_config_defaults_to_the_frozen_contract_values() {
+    fn task_execution_config_uses_frozen_wire_and_server_queue_policy() {
         let runtime = RuntimeConfig::default();
         let frozen = FrontendTaskTransportBudget::DEFAULT;
 
@@ -3752,10 +3757,7 @@ access_key_secret = ""
             runtime.task_backend_max_queued_operations,
             frozen.max_backend_queued_operations()
         );
-        assert_eq!(
-            runtime.task_backend_max_queued_bytes,
-            frozen.max_backend_queued_bytes()
-        );
+        assert_eq!(runtime.task_backend_max_queued_bytes, 1024 * 1024 * 1024);
         assert_eq!(
             runtime.task_max_tasks_per_context,
             frozen.max_tasks_per_context()
@@ -4952,6 +4954,25 @@ mod frontend_constant_policy_tests {
 mod frontend_joint_policy_config_tests {
     use super::*;
     #[test]
+    fn explicit_smaller_native_and_dependency_bounds_are_not_upgraded_to_defaults() {
+        let configured: RuntimeConfig = toml::from_str(
+            "task_backend_max_queued_bytes = 536870912\n\
+             [frontend_workload.dependency_custody]\n\
+             retained_payload_bytes = 4294967296\n",
+        )
+        .unwrap();
+        assert_eq!(configured.task_backend_max_queued_bytes, 512 * 1024 * 1024);
+        assert_eq!(
+            configured
+                .frontend_workload
+                .dependency_custody
+                .retained_payload_bytes,
+            4 << 30
+        );
+        assert_eq!(configured.task_operation_max_batch_items, 32);
+    }
+
+    #[test]
     fn named_shares_and_independent_custody_policy_parse_without_a_solver_matrix() {
         let configured: FrontendWorkloadRuntimeConfig = toml::from_str(
             "[scope_slots]\nquery = 20\nmaterialized_view = 6\nstatistics = 7\n\
@@ -4973,7 +4994,7 @@ mod frontend_joint_policy_config_tests {
             defaults.scope_slots.declared(),
             [4096, 1024, 1024, 1024, 1024]
         );
-        assert_eq!(defaults.dependency_custody.retained_payload_bytes, 4 << 30);
+        assert_eq!(defaults.dependency_custody.retained_payload_bytes, 12 << 30);
         for document in [
             "scope_records_limit = 8192",
             "max_claims = 99",

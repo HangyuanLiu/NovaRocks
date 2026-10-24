@@ -238,12 +238,17 @@ fn control_only_ordinary_pending_and_cow_begin_do_not_mint_a_collection() {
                 session
             }
         };
-        let recorded = recorded.lock().unwrap();
-        let captured = recorded.begin_context.as_ref().unwrap();
-        assert_eq!(captured.deadline(), context.deadline());
-        assert!(captured.vended_credential_lease_sink().is_none());
-        assert!(captured.vended_credential_lease_collection().is_none());
+        {
+            let recorded = recorded.lock().unwrap();
+            let captured = recorded.begin_context.as_ref().unwrap();
+            assert_eq!(captured.deadline(), context.deadline());
+            assert!(captured.vended_credential_lease_sink().is_none());
+            assert!(captured.vended_credential_lease_collection().is_none());
+        }
+        // The original lease's release callback records its actual exit under
+        // this same mutex, so retire the session outside the observation lock.
         drop(session);
+        assert_eq!(recorded.lock().unwrap().source_drops, 1);
     }
 }
 

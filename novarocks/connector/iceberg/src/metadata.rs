@@ -527,6 +527,33 @@ impl ConnectorMetadata for IcebergMetadata {
             .collect()
     }
 
+    fn list_namespaces_async(
+        &self,
+        request: ConnectorListNamespacesRequest,
+    ) -> futures::future::BoxFuture<'_, Result<Vec<ConnectorNamespaceIdentity>, ConnectorError>>
+    {
+        Box::pin(async move {
+            self.validate_context(&request.context)?;
+            self.ensure_owner(&request.instance_id)?;
+            let namespaces = self
+                .runtime
+                .list_namespaces_for_request_async(&request.context, request.bound)
+                .await;
+            self.validate_context(&request.context)?;
+            namespaces
+                .map_err(classified_control_error)?
+                .into_iter()
+                .map(|namespace| {
+                    self.validate_context(&request.context)?;
+                    Ok(ConnectorNamespaceIdentity {
+                        instance_id: self.descriptor.instance_id.clone(),
+                        namespace: Arc::from(namespace),
+                    })
+                })
+                .collect()
+        })
+    }
+
     fn namespace_exists(&self, request: ConnectorNamespaceRequest) -> Result<bool, ConnectorError> {
         self.validate_context(&request.context)?;
         self.ensure_owner(&request.namespace.instance_id)?;
@@ -634,6 +661,37 @@ impl ConnectorMetadata for IcebergMetadata {
                 })
             })
             .collect()
+    }
+
+    fn list_tables_async(
+        &self,
+        request: ConnectorListTablesRequest,
+    ) -> futures::future::BoxFuture<'_, Result<Vec<ConnectorTableIdentity>, ConnectorError>> {
+        Box::pin(async move {
+            self.validate_context(&request.context)?;
+            self.ensure_owner(&request.namespace.instance_id)?;
+            let tables = self
+                .runtime
+                .list_tables_for_request_async(
+                    &request.namespace.namespace,
+                    &request.context,
+                    request.bound,
+                )
+                .await;
+            self.validate_context(&request.context)?;
+            tables
+                .map_err(classified_control_error)?
+                .into_iter()
+                .map(|table| {
+                    self.validate_context(&request.context)?;
+                    Ok(ConnectorTableIdentity {
+                        instance_id: self.descriptor.instance_id.clone(),
+                        namespace: request.namespace.namespace.clone(),
+                        table: Arc::from(table),
+                    })
+                })
+                .collect()
+        })
     }
 
     fn read_reference_facts(

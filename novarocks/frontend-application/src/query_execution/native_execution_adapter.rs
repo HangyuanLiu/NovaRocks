@@ -24,6 +24,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+mod control_binding;
+pub(crate) mod source_cohort;
+use control_binding::NativeControlBinding;
+use source_cohort::NativeSourceCohortAdmission;
+pub(crate) use source_cohort::source_count as native_source_count;
+
 use crate::task_protocol_config::CoordinationBudgets;
 #[cfg(test)]
 use novarocks_coordination_contract::AttemptFailureClass;
@@ -426,6 +432,7 @@ async fn wait_for_failed_context_isolation(
             _ = process_epoch.changed() => {},
             _ = cancellation.changed() => {},
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(absolute_expiry)) => {
+                tracing::warn!(?context, "replacement failed-context isolation expired");
                 return Err(ReplacementQualificationFailure::Expired);
             }
         }
@@ -730,25 +737,14 @@ async fn acquire_replacement_admissions(
                         return Err(ReplacementQualificationFailure::Rejected);
                     }
                 }
-                let acknowledgement = loop {
-                    if let Some(ack) = acks
-                        .drain_events()
-                        .into_iter()
-                        .filter_map(|event| match event {
-                            TaskOperationIntakeEvent::Acknowledgement(ack) => Some(*ack),
-                            TaskOperationIntakeEvent::EstablishSendStarted { .. } => None,
-                        })
-                        .find(|ack| ack.operation_id() == request.envelope().operation_id())
-                    {
-                        break ack;
-                    }
-                    tokio::select! {
-                        _ = notify.notified() => {},
-                        _ = cancellation.changed() => {
-                            return Err(ReplacementQualificationFailure::Rejected);
-                        }
-                    }
-                };
+                let acknowledgement = wait_for_replacement_acknowledgement(
+                    &acks,
+                    &notify,
+                    notified.as_mut(),
+                    &mut cancellation,
+                    request.envelope().operation_id(),
+                )
+                .await?;
                 match (acknowledgement.worker_outcome(), acknowledgement.payload()) {
                     (
                         Some(OperationOutcome::Accepted | OperationOutcome::Idempotent),
@@ -789,7 +785,49 @@ async fn acquire_replacement_admissions(
         acquire,
     )
     .await
-    .map_err(|_| ReplacementQualificationFailure::Expired)?
+    .map_err(|_| {
+        tracing::warn!(identity = ?qualification.identity(), "replacement admission acquisition expired");
+        ReplacementQualificationFailure::Expired
+    })?
+}
+
+/// Reuse the qualification's original registered waiter. A second waiter
+/// would allow notify_one to wake the older dormant registration while this
+/// consumer sleeps with its real acknowledgement already in the intake.
+async fn wait_for_replacement_acknowledgement<'a>(
+    acks: &TaskAckIntake,
+    notify: &'a tokio::sync::Notify,
+    mut notified: std::pin::Pin<&mut tokio::sync::futures::Notified<'a>>,
+    cancellation: &mut watch::Receiver<bool>,
+    operation: TaskOperationId,
+) -> Result<crate::task_execution::intent::OperationAcknowledgement, ReplacementQualificationFailure>
+{
+    loop {
+        // Retire the same previous registration, then register before reading
+        // the level-triggered intake. Both early and racing ACKs are retained.
+        notified.as_mut().set(notify.notified());
+        notified.as_mut().enable();
+        if *cancellation.borrow() {
+            return Err(ReplacementQualificationFailure::Rejected);
+        }
+        if let Some(ack) = acks
+            .drain_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                TaskOperationIntakeEvent::Acknowledgement(ack) => Some(*ack),
+                TaskOperationIntakeEvent::EstablishSendStarted { .. } => None,
+            })
+            .find(|ack| ack.operation_id() == operation)
+        {
+            return Ok(ack);
+        }
+        tokio::select! {
+            _ = &mut notified => {},
+            _ = cancellation.changed() => {
+                return Err(ReplacementQualificationFailure::Rejected);
+            }
+        }
+    }
 }
 
 struct PendingReplacementAdmissions {
@@ -975,6 +1013,110 @@ struct InternalNativeRegistration {
 }
 
 impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
+    fn start_read_in(
+        &self,
+        read: &mut Option<PreparedLogicalRead>,
+        owner: &mut Option<WorkOwner>,
+        capacity: &QueryResultCapacityBinding,
+        io: &Arc<crate::query::read_action::io_source::ReadMetadataIoSource>,
+        original: &mut crate::query_execution::logical_execution::OriginalComputationStart,
+        #[cfg(novarocks_dev_controls)] observation: Option<
+            crate::preparation_diagnostics::StatementObservationHandle,
+        >,
+    ) -> Result<novarocks_query_application::api::LogicalExecutionStartAttempt, QueryExecutionError>
+    {
+        let refused = |detail: &'static str| {
+            QueryExecutionError::from_execution(ExecutionFailureInput::new(
+                QueryFailureReason::PreparationProtocol.failure_fact(),
+                SafeDetail::truncating(detail),
+                ExecutionFailureSite::Coordinator,
+            ))
+        };
+        if original.ready.is_some() || original.exit.is_some() || original.reservation.is_some() {
+            return Err(refused("ordinary Read start target is occupied"));
+        }
+        let work = owner
+            .as_ref()
+            .ok_or_else(|| refused("ordinary Read stage owner is absent"))?;
+        if !capacity.window_alias().is_for_scope(&work.scope()) {
+            return Err(refused("ordinary Read window has a foreign stage"));
+        }
+        if original.input.is_none() && original.request.is_none() {
+            let prepared = read
+                .as_ref()
+                .ok_or_else(|| refused("prepared Read is absent"))?;
+            prepared.validate_client_start().map_err(refused)?;
+            let carrier = prepared.client_row_carrier().map_err(|e| {
+                attempt_runtime_failure(QueryFailureReason::PreparationProtocol, e)
+                    .error()
+                    .clone()
+            })?;
+            drop(ProductionRootDelivery::bind(
+                carrier,
+                Some(capacity.window_alias()),
+            )?);
+            let (description, template, options) = read.take().unwrap().into_parts();
+            let aborts = LogicalAbortRouter::new();
+            let replacements = LogicalReplacementQualificationPort::new(
+                self.runtime.clone(),
+                aborts.worker_closed_contexts(),
+                aborts.closure_epoch(),
+            );
+            let factory = ProductionDormantAttemptFactory {
+                read_io: Some(Arc::downgrade(io)),
+                runtime: self.runtime.clone(),
+                options,
+                aborts: Arc::clone(&aborts),
+                diagnostics: ComputationDiagnostics::None,
+                initial_credentials: None,
+                replacements: replacements.clone(),
+                handoffs: None,
+                pending_projection: None,
+                pending_handoff: None,
+            };
+            let attempts = FrontendNativeAttemptPreparationPort::new(
+                template,
+                Arc::clone(&self.runtime.topology),
+                factory,
+                #[cfg(novarocks_dev_controls)]
+                observation,
+                #[cfg(novarocks_dev_controls)]
+                self.runtime.test_controls.clone(),
+                #[cfg(novarocks_dev_controls)]
+                self.runtime.observations.clone(),
+            );
+            original.request = Some(
+                QueryExecutionRequest::bind_native(
+                    description,
+                    aborts as Arc<dyn AbortQueryContextEffectPort>,
+                    Some(Arc::new(replacements) as Arc<dyn ReplacementQualificationEffectPort>),
+                    attempts,
+                )
+                .with_result_capacity(capacity.clone())?,
+            );
+        }
+        if original.input.is_none() {
+            let request = original
+                .request
+                .take()
+                .ok_or_else(|| refused("ordinary Read request is absent"))?;
+            match self.client.prepare_observed_start(request, None) {
+                Ok(input) => original.input = Some(input),
+                Err((error, request, reserved)) => {
+                    original.request = Some(request);
+                    original.reservation = reserved;
+                    return Err(error);
+                }
+            }
+        }
+        self.client.start_observed_in(
+            &mut original.input,
+            owner,
+            &mut original.ready,
+            &mut original.exit,
+        )
+    }
+
     fn start_computation_in(
         &self,
         computation: &mut Option<PreparedLogicalComputation>,
@@ -1008,20 +1150,34 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
             let prepared = computation
                 .as_ref()
                 .ok_or_else(|| refused("prepared computation is absent"))?;
-            if prepared.diagnostics != ComputationDiagnostics::Profile
-                || prepared.description.effect()
-                    != novarocks_coordination_contract::ExecutionEffect::None
-                || prepared.description.finish_boundary()
-                    != novarocks_query_application::preparation::ExecutionFinishBoundary::ComputationReady
+            if prepared.description.finish_boundary()
+                != novarocks_query_application::preparation::ExecutionFinishBoundary::ComputationReady
             {
-                return Err(refused(
-                    "observed statement start requires the closed effect-free Profile computation",
-                ));
+                return Err(refused("observed computation has a foreign finish boundary"));
             }
-            if prepared.initial_credentials.is_some() {
-                return Err(refused(
-                    "observed Profile start cannot consume an effectful initial reservation",
-                ));
+            // Check the original identity before moving any caller-owned input.
+            // Effectful computation cannot borrow a newly minted execution or a
+            // recovery policy that could replay its external production.
+            match prepared.description.effect() {
+                novarocks_coordination_contract::ExecutionEffect::External => {
+                    if prepared.description.recovery() != RecoveryMode::NoRecovery
+                        || prepared.diagnostics != ComputationDiagnostics::None
+                        || prepared.initial_credentials.as_ref().map(|c| c.execution())
+                            != original.reservation.as_ref().map(|r| r.execution())
+                        || prepared.initial_credentials.is_none()
+                    {
+                        return Err(refused(
+                            "effectful computation requires its matching original reserved NoRecovery execution",
+                        ));
+                    }
+                }
+                novarocks_coordination_contract::ExecutionEffect::None => {
+                    if prepared.initial_credentials.is_some() || original.reservation.is_some() {
+                        return Err(refused(
+                            "effect-free computation cannot consume an effectful initial reservation",
+                        ));
+                    }
+                }
             }
             if !prepared
                 .description
@@ -1045,7 +1201,7 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
                 consumer,
                 handoffs,
                 diagnostics,
-                initial_credentials: _,
+                initial_credentials,
             } = computation.take().unwrap();
             let aborts = LogicalAbortRouter::new();
             let replacements = LogicalReplacementQualificationPort::new(
@@ -1054,11 +1210,12 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
                 aborts.closure_epoch(),
             );
             let factory = ProductionDormantAttemptFactory {
+                read_io: None,
                 runtime: self.runtime.clone(),
                 options,
                 aborts: Arc::clone(&aborts),
                 diagnostics,
-                initial_credentials: None,
+                initial_credentials: initial_credentials.map(|c| Arc::downgrade(&c)),
                 replacements: replacements.clone(),
                 handoffs: Some(handoffs.reserve_view()),
                 pending_projection: None,
@@ -1098,11 +1255,14 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
                 .request
                 .take()
                 .ok_or_else(|| refused("original computation request is absent"))?;
-            match self.client.prepare_observed_start(request, None) {
+            match self
+                .client
+                .prepare_observed_start(request, original.reservation.take())
+            {
                 Ok(input) => original.input = Some(input),
                 Err((error, request, reserved)) => {
-                    debug_assert!(reserved.is_none());
                     original.request = Some(request);
+                    original.reservation = reserved;
                     return Err(error);
                 }
             }
@@ -1317,6 +1477,7 @@ impl FrontendNativeLogicalExecutionLauncher {
             aborts.closure_epoch(),
         );
         let factory = ProductionDormantAttemptFactory {
+            read_io: None,
             runtime: self.runtime.clone(),
             options,
             aborts: Arc::clone(&aborts),
@@ -1372,6 +1533,9 @@ impl FrontendNativeLogicalExecutionLauncher {
 }
 
 struct ProductionManifestAttemptProjection {
+    read_io: Option<Weak<crate::query::read_action::io_source::ReadMetadataIoSource>>,
+    control_binding: NativeControlBinding,
+    source_cohort: NativeSourceCohortAdmission,
     native_actions: novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
     work_scope: novarocks_workload_control::WorkScope,
     runtime: FrontendNativeLogicalExecutionRuntime,
@@ -1495,6 +1659,12 @@ pub(crate) trait FrontendDormantAttemptBehavior<M = ManifestBoundNativeAttemptIn
 {
     type ActiveBehavior: FrontendActiveAttemptBehavior<M>;
 
+    fn poll_bind_qualification(
+        &mut self,
+        inputs: &mut M,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), NativeAttemptActivationFailure>>;
+
     fn activate<'a>(
         &'a mut self,
         inputs: &'a mut M,
@@ -1545,6 +1715,12 @@ pub(crate) trait FrontendDormantAttemptFactory: std::fmt::Debug + Send + 'static
 pub(crate) trait FrontendManifestAttemptProjection:
     std::fmt::Debug + Send + 'static
 {
+    fn poll_bind_qualification(
+        &mut self,
+        manifest: &TaskManifestBinding,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), NativeAttemptActivationFailure>>;
+
     fn project<'a>(
         &'a mut self,
         prepared: PreparedDistributedQuery,
@@ -1604,6 +1780,7 @@ impl ProjectedManifestAttempt {
 }
 
 struct ProductionDormantAttemptFactory {
+    read_io: Option<Weak<crate::query::read_action::io_source::ReadMetadataIoSource>>,
     runtime: FrontendNativeLogicalExecutionRuntime,
     options: Arc<ResolvedQueryOptions>,
     aborts: Arc<LogicalAbortRouter>,
@@ -1652,6 +1829,9 @@ impl FrontendDormantAttemptFactory for ProductionDormantAttemptFactory {
             .native_action_authority()
             .map_err(|error| attempt_failure(QueryFailureReason::PreparationProtocol, error))?;
         self.pending_projection = Some(ProductionManifestAttemptProjection {
+            read_io: self.read_io.clone(),
+            control_binding: NativeControlBinding::default(),
+            source_cohort: NativeSourceCohortAdmission::default(),
             native_actions,
             runtime: self.runtime.clone(),
             work_scope: capacity.scope().clone(),
@@ -1709,6 +1889,14 @@ impl std::fmt::Debug for RegisteredManifestAttemptProjection {
     }
 }
 impl FrontendManifestAttemptProjection for RegisteredManifestAttemptProjection {
+    fn poll_bind_qualification(
+        &mut self,
+        manifest: &TaskManifestBinding,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), NativeAttemptActivationFailure>> {
+        self.base.poll_bind_qualification(manifest, cx)
+    }
+
     fn project<'a>(
         &'a mut self,
         prepared: PreparedDistributedQuery,
@@ -1780,6 +1968,37 @@ impl FrontendManifestAttemptProjection for RegisteredManifestAttemptProjection {
 }
 
 impl FrontendManifestAttemptProjection for ProductionManifestAttemptProjection {
+    fn poll_bind_qualification(
+        &mut self,
+        manifest: &TaskManifestBinding,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), NativeAttemptActivationFailure>> {
+        let ProductionRootDelivery::Relayed { window, .. } = &self.delivery;
+        // This is the SAME original projection field used by activation.
+        // Internal binding derives from original positive payload/computation
+        // grants and grows their full union without moving or refunding them.
+        self.control_binding
+            .poll(
+                window,
+                &self.work_scope,
+                manifest.selected_network_origins(self.runtime.data_runtime.native_transport()),
+                cx,
+            )
+            .map(|result| {
+                result.map_err(|error| {
+                    NativeAttemptActivationFailure::new(
+                        NativeAttemptPreparationFailure::from_input(ExecutionFailureInput::new(
+                            error.failure_fact(),
+                            SafeDetail::truncating_display(format_args!(
+                                "Native control binding refused: {error}"
+                            )),
+                            ExecutionFailureSite::Coordinator,
+                        )),
+                    )
+                })
+            })
+    }
+
     fn project<'a>(
         &'a mut self,
         prepared: PreparedDistributedQuery,
@@ -1804,6 +2023,9 @@ impl FrontendManifestAttemptProjection for ProductionManifestAttemptProjection {
 
     fn converge<'a>(&'a mut self) -> NativeAttemptConvergenceFuture<'a> {
         Box::pin(async move {
+            // Withdraw the same unpublished binding/reply before ending its
+            // original preparation source; no Task RPC can precede this phase.
+            self.control_binding.close();
             if let Some(projected) = self.pending_projected.as_mut() {
                 projected.round.converge_unstarted().await?;
                 drop(self.pending_projected.take());
@@ -1820,6 +2042,7 @@ impl FrontendManifestAttemptProjection for ProductionManifestAttemptProjection {
             self.pending_initializer = None;
             self.pending_credential_source = None;
             self.credential_anchor = None;
+            self.source_cohort.close_after_sources();
             Ok(())
         })
     }
@@ -1845,6 +2068,28 @@ impl ProductionManifestAttemptProjection {
                 "the original Native initializer still owns its source disposition",
             ));
         }
+        // Recovery has already driven this SAME original field before its
+        // qualification RPC. Initial activation drives it for the first time.
+        std::future::poll_fn(|cx| self.poll_bind_qualification(manifest, cx)).await?;
+        // Full parent D was bound by the original exact manifest above. One
+        // positive cohort must precede writers, initializer, watch and every round RPC.
+        // Qualification has its own paid Native action source after the same full-D gate.
+        let source_count =
+            native_source_count(prepared.typed_scans().count(), manifest.contexts().len())
+                .map_err(|error| projection_message(error.to_string()))?;
+        std::future::poll_fn(|cx| self.source_cohort.poll(&self.work_scope, source_count, cx))
+            .await
+            .map_err(|error| {
+                NativeAttemptActivationFailure::new(NativeAttemptPreparationFailure::from_input(
+                    ExecutionFailureInput::new(
+                        error.failure_fact(),
+                        SafeDetail::truncating_display(format_args!(
+                            "Native Source cohort refused: {error}"
+                        )),
+                        ExecutionFailureSite::Coordinator,
+                    ),
+                ))
+            })?;
         let execution = manifest.execution();
         let schedule = prepared
             .native_schedule_from_manifest(manifest)
@@ -1872,7 +2117,7 @@ impl ProductionManifestAttemptProjection {
             ))
             })
             .transpose()?;
-        if manifest.writer_cohorts().next().is_some() {
+        let write_session = if manifest.writer_cohorts().next().is_some() {
             let session = self
                 .credential_anchor
                 .as_ref()
@@ -1887,7 +2132,10 @@ impl ProductionManifestAttemptProjection {
                 .register_manifest_productions(manifest, &self.work_scope)
                 .await
                 .map_err(|error| projection_message(error.to_string()))?;
-        }
+            Some(session)
+        } else {
+            None
+        };
         self.pending_credential_source = Some(match &self.credential_anchor {
             Some(credentials) => credentials
                 .take_source(execution)
@@ -1903,17 +2151,33 @@ impl ProductionManifestAttemptProjection {
             ),
         )
         .map_err(projection_message)?;
+        let connector_context = match &self.read_io {
+            Some(original) => {
+                let source = original.upgrade().ok_or_else(|| {
+                    projection_message(
+                        "ordinary Read I/O source exited before Native initialization",
+                    )
+                })?;
+                connector_context.with_io_admission(source)
+            }
+            None => connector_context,
+        };
         let connector_context = self
             .pending_credential_source
             .as_ref()
             .unwrap()
             .connector_request_context(connector_context)
             .map_err(projection_message)?;
+        // Reborrow after the mutable binding/cohort awaits; initializer keeps
+        // the same original window alias and its payload/computation owners.
         let ProductionRootDelivery::Relayed { window, .. } = &self.delivery;
         AttemptInitializing::new_governed_in(
             execution,
             self.work_scope.clone(),
             window.clone(),
+            self.source_cohort
+                .borrowed()
+                .map_err(|error| projection_message(error.to_string()))?,
             prepared,
             schedule,
             self.runtime.task_update_retry_policy,
@@ -1982,6 +2246,19 @@ impl ProductionManifestAttemptProjection {
         )
         .map_err(projection_failure)?
         .with_credential_leases(credential_leases);
+        // The frozen writer handle must resolve against the same generation
+        // as its original session, including writes with no provider reads.
+        let options = match write_session.as_ref() {
+            Some(session) => {
+                let catalogs = crate::query_execution::artifact::merge_write_session_catalog(
+                    options.catalog_set(),
+                    session,
+                )
+                .map_err(projection_failure)?;
+                options.with_catalog_set(catalogs)
+            }
+            None => options,
+        };
         let mut task_prepared = ready
             .prepare_task_execution(options)
             .map_err(projection_failure)?;
@@ -2058,6 +2335,10 @@ impl ProductionManifestAttemptProjection {
                 },
                 data_runtime: self.runtime.data_runtime.clone(),
                 subscription_scope: self.work_scope.clone(),
+                source_cohort: self
+                    .source_cohort
+                    .borrowed()
+                    .map_err(|error| projection_message(error.to_string()))?,
                 native_actions: self.native_actions.clone(),
                 convergence_source: Arc::clone(&self.runtime.process_observation),
             },
@@ -2205,6 +2486,17 @@ where
     P: FrontendManifestAttemptProjection,
 {
     type ActiveBehavior = FrontendTaskProtocolActiveBehavior;
+
+    fn poll_bind_qualification(
+        &mut self,
+        inputs: &mut ManifestBoundNativeAttemptInputs,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), NativeAttemptActivationFailure>> {
+        // Binding needs only the exact retained manifest; it must not invoke
+        // access.instantiate, a writer, initializer, watch or network request.
+        self.projection
+            .poll_bind_qualification(inputs.manifest(), cx)
+    }
 
     fn activate<'a>(
         &'a mut self,
@@ -2404,6 +2696,11 @@ trait RetainedAttemptInputs: std::fmt::Debug + Send + 'static {
         manifest: &Self::Manifest,
     ) -> &[novarocks_types::identity::BackendProcessId];
 
+    fn validate_bound_schedule(
+        manifest: &Self::Manifest,
+        schedule: &AttemptSchedule,
+    ) -> Result<(), NativeAttemptActivationFailure>;
+
     fn bind_manifest(
         self,
         schedule: &AttemptSchedule,
@@ -2412,6 +2709,16 @@ trait RetainedAttemptInputs: std::fmt::Debug + Send + 'static {
 
 impl RetainedAttemptInputs for SnapshotBoundDormantAttemptInputs {
     type Manifest = ManifestBoundNativeAttemptInputs;
+
+    fn validate_bound_schedule(
+        manifest: &Self::Manifest,
+        schedule: &AttemptSchedule,
+    ) -> Result<(), NativeAttemptActivationFailure> {
+        manifest
+            .manifest()
+            .validate_schedule(schedule)
+            .map_err(projection_failure)
+    }
 
     fn eligible_backends(&self) -> &[novarocks_types::identity::BackendProcessId] {
         self.eligible_backends()
@@ -2528,8 +2835,8 @@ where
         &mut self,
         schedule: &AttemptSchedule,
     ) -> Result<(), NativeAttemptActivationFailure> {
-        if self.manifest_inputs.is_some() {
-            return Ok(());
+        if let Some(manifest) = self.manifest_inputs.as_ref() {
+            return I::validate_bound_schedule(manifest, schedule);
         }
         let inputs = self
             .dormant_inputs
@@ -2696,6 +3003,22 @@ where
     }
     fn eligible_backends(&self) -> &[novarocks_types::identity::BackendProcessId] {
         self.retained_eligible_backends()
+    }
+
+    fn poll_bind_qualification(
+        &mut self,
+        schedule: &AttemptSchedule,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), NativeAttemptActivationFailure>> {
+        if let Err(error) = self.bind_manifest(schedule) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        self.behavior.poll_bind_qualification(
+            self.manifest_inputs
+                .as_mut()
+                .expect("same original bound successor manifest"),
+            cx,
+        )
     }
 
     fn activate<'a>(
@@ -3032,6 +3355,76 @@ fn attempt_runtime_failure(
         SafeDetail::truncating(safe),
         ExecutionFailureSite::Coordinator,
     ))
+}
+
+#[cfg(test)]
+mod replacement_ack_tests {
+    use super::*;
+    use std::future::Future;
+    use std::sync::atomic::AtomicUsize;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct AckWake(AtomicUsize);
+    impl Wake for AckWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn replacement_ack_reuses_its_registered_waiter_for_early_and_late_real_intake_facts() {
+        for early in [false, true] {
+            let notify = Arc::new(tokio::sync::Notify::new());
+            let wake = Arc::new(NotifyWake::new(Arc::clone(&notify))) as Arc<dyn StatusIntakeWake>;
+            let acks = TaskAckIntake::new(wake);
+            let operation = TaskOperationId::new_v7();
+            // This is the same still-live registration made before the real
+            // queue/submit stage. It must not steal the sole ACK notification.
+            let original_waiter = notify.notified();
+            tokio::pin!(original_waiter);
+            original_waiter.as_mut().enable();
+            let publish = || {
+                acks.handle().publish(crate::task_execution::intent::OperationAcknowledgement::new(
+                    operation,
+                    novarocks_execution_contract::OperationKind::AcquireQueryContextAdmissionTicket,
+                    OperationOutcome::ResourceExhausted,
+                    AckPayload::None,
+                ));
+            };
+            if early {
+                publish();
+            }
+            let (_cancellation, mut cancellation) = watch::channel(false);
+            let wait = wait_for_replacement_acknowledgement(
+                &acks,
+                &notify,
+                original_waiter.as_mut(),
+                &mut cancellation,
+                operation,
+            );
+            tokio::pin!(wait);
+            let wake = Arc::new(AckWake(AtomicUsize::new(0)));
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut cx = Context::from_waker(&waker);
+            if !early {
+                assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Pending));
+                publish();
+                assert!(
+                    wake.0.load(Ordering::SeqCst) > 0,
+                    "the real ACK must wake the actively awaited original registration"
+                );
+            }
+            let Poll::Ready(Ok(ack)) = wait.as_mut().poll(&mut cx) else {
+                panic!("a published ACK must not remain stranded behind a dormant waiter");
+            };
+            assert_eq!(ack.operation_id(), operation);
+            assert_eq!(
+                ack.worker_outcome(),
+                Some(OperationOutcome::ResourceExhausted)
+            );
+            assert_eq!(acks.queued(), 0);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3493,6 +3886,14 @@ mod tests {
     impl RetainedAttemptInputs for CapturedInputs {
         type Manifest = TestManifest;
 
+        fn validate_bound_schedule(
+            _manifest: &Self::Manifest,
+            _schedule: &AttemptSchedule,
+        ) -> Result<(), NativeAttemptActivationFailure> {
+            // This eligibility-only fixture does not model manifest placement.
+            Ok(())
+        }
+
         fn eligible_backends(&self) -> &[BackendProcessId] {
             &self.eligible_backends
         }
@@ -3554,6 +3955,14 @@ mod tests {
     impl<M: std::fmt::Debug + Send + 'static> FrontendDormantAttemptBehavior<M>
         for AdversarialBehavior
     {
+        fn poll_bind_qualification(
+            &mut self,
+            _inputs: &mut M,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), NativeAttemptActivationFailure>> {
+            panic!("the adversarial eligibility fixture never qualifies")
+        }
+
         type ActiveBehavior = NeverActiveBehavior;
 
         fn activate<'a>(
@@ -3703,6 +4112,14 @@ mod tests {
     }
 
     impl FrontendDormantAttemptBehavior<TestManifest> for LifecycleBehavior {
+        fn poll_bind_qualification(
+            &mut self,
+            _inputs: &mut TestManifest,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), NativeAttemptActivationFailure>> {
+            // This lifecycle fixture owns no external dependency.
+            std::task::Poll::Ready(Ok(()))
+        }
         type ActiveBehavior = TestActiveBehavior;
 
         fn activate<'a>(
@@ -4018,6 +4435,14 @@ mod tests {
         }
     }
     impl FrontendDormantAttemptBehavior<TestManifest> for ExtractionPanicDormant {
+        fn poll_bind_qualification(
+            &mut self,
+            _inputs: &mut TestManifest,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), NativeAttemptActivationFailure>> {
+            // This lifecycle fixture owns no external dependency.
+            std::task::Poll::Ready(Ok(()))
+        }
         type ActiveBehavior = ExtractionPanicActive;
         fn activate<'a>(
             &'a mut self,
@@ -4151,4 +4576,23 @@ pub(crate) fn native_active_owner_layout() -> std::alloc::Layout {
             FrontendTaskProtocolActiveBehavior,
         >,
     >()
+}
+
+/// New original binding state plus its one named paid-Q wait pointee.
+/// Existing Native owner storage is not recursively re-quoted here.
+pub(crate) fn native_control_binding_layouts() -> [std::alloc::Layout; 7] {
+    let [state, wait_future] = control_binding::metadata_layouts();
+    let [source_state, source_wait, source_arc] = source_cohort::metadata_layouts();
+    // The original preparation port's Factory Option and the actual dormant
+    // owner both embed this state. Moving the value does not shrink the first
+    // allocation. Only the dormant author polls/allocates the one wait F.
+    [
+        state,
+        state,
+        wait_future,
+        source_state,
+        source_state,
+        source_wait,
+        source_arc,
+    ]
 }

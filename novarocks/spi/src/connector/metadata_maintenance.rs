@@ -643,9 +643,21 @@ pub type ConnectorMetadataMaintenanceOutcome =
 pub type ConnectorMetadataMaintenanceFuture<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, ConnectorError>> + Send + 'a>>;
 
+/// Object responsibility in the original execution, independent of business
+/// success. Disposed requires that exact cleanup actually finished; timeout,
+/// a completed business future, or a lost caller never establishes it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorMetadataCleanupResponsibility {
+    Retained,
+    Disposed,
+}
+
 /// Read/poll view of the provider's ORIGINAL active execution row. Creating a
 /// view grants no admission, and dropping a waiter never destroys that row.
 pub trait ConnectorMetadataMaintenanceExecutionSource: Send + Sync {
+    /// Pure observation of the same source; never clone the owned object graph,
+    /// poll a completed business F, retry a publication, or authorize deletion.
+    fn cleanup_responsibility(&self) -> ConnectorMetadataCleanupResponsibility;
     fn poll_result(
         &self,
         cx: &mut std::task::Context<'_>,
@@ -665,6 +677,9 @@ pub struct ConnectorMetadataMaintenanceExecution {
     )>,
 }
 impl ConnectorMetadataMaintenanceExecution {
+    pub fn cleanup_responsibility(&self) -> ConnectorMetadataCleanupResponsibility {
+        self.source.cleanup_responsibility()
+    }
     pub fn from_source(source: Arc<dyn ConnectorMetadataMaintenanceExecutionSource>) -> Self {
         Self {
             source,
@@ -1175,6 +1190,21 @@ mod tests {
     }
     struct ReadyExecution(Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>);
     impl ConnectorMetadataMaintenanceExecutionSource for ReadyExecution {
+        fn cleanup_responsibility(&self) -> ConnectorMetadataCleanupResponsibility {
+            match &self.0 {
+                Ok(
+                    ExternalMutationOutcome::KnownCommitted {
+                        cleanup: super::super::ExternalMutationFinalization::Complete,
+                        ..
+                    }
+                    | ExternalMutationOutcome::KnownUncommitted {
+                        cleanup: super::super::ExternalMutationFinalization::Complete,
+                        ..
+                    },
+                ) => ConnectorMetadataCleanupResponsibility::Disposed,
+                _ => ConnectorMetadataCleanupResponsibility::Retained,
+            }
+        }
         fn poll_result(
             &self,
             _: &mut Context<'_>,

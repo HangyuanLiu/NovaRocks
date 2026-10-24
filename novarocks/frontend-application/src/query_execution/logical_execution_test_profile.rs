@@ -74,8 +74,26 @@ fn process_inner(
     let roles = [LogicalExecutionSupervisor::logical_role_poll_geometry().unwrap()];
     let count = 4;
     let proposals_per_slot = 2;
-    let storage =
+    let mut storage =
         ControlStorageConfig::new([count, 0, 0, 0, 0], count - 1, proposals_per_slot, &roles);
+    if statements.is_some() {
+        let source = novarocks_query_application::session_control::QueryControlService::statement_action_geometry();
+        storage = storage.with_process_source_backing(
+            novarocks_workload_control::PollRoleSourceBacking::from_layouts(
+                &[
+                    source.registry_record,
+                    source.source,
+                    source.wake,
+                    source.observer,
+                    source.receipt,
+                    source.failure,
+                    source.failure,
+                ],
+                &[source.driver],
+            )
+            .unwrap(),
+        );
+    }
     let mut joint = JointCapacityConfig {
         global: JointResourceLimits::default(),
         classes: [JointResourceLimits::default(); 5],
@@ -151,7 +169,9 @@ fn process_inner(
     )
     .unwrap();
     if let Some(service) = statements {
-        supervisor.install_statement_control(service).unwrap();
+        supervisor
+            .install_statement_control(service, NonZeroUsize::new(count).unwrap())
+            .unwrap();
     }
     control.mark_ready().unwrap();
     (

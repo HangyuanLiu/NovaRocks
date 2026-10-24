@@ -71,6 +71,8 @@ pub(crate) struct ManifestAttemptTransport {
     pub(crate) wire: AttemptWireFacts,
     pub(crate) data_runtime: FrontendDataRuntime,
     pub(crate) subscription_scope: novarocks_workload_control::WorkScope,
+    pub(crate) source_cohort:
+        crate::query_execution::native_execution_adapter::source_cohort::NativeSourceCohort,
     pub(crate) native_actions:
         novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
     /// Exact process evidence bounds active pre-ready observation and residual
@@ -188,12 +190,13 @@ pub(crate) fn assemble_manifest_round(
         )?,
     );
     let covered_subscriber = Arc::new(
-        CoveredTaskStatusSubscriber::new(
+        CoveredTaskStatusSubscriber::new_with_source_cohort(
             &backends,
             Arc::clone(&observation),
             transport.status_subscription_error_budget,
             transport.data_runtime,
             transport.subscription_scope,
+            transport.source_cohort,
         )
         .map_err(TaskExecutionError::NativeTransport)?,
     );

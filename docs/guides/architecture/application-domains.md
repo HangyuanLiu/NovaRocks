@@ -29,6 +29,11 @@ under the License.
 为准；Task 的 wire/lifecycle、创建载体、按 identity 重放与一次激活以 ADR-0161 为准。
 ADR-0198 的统一执行契约已接受，代码切换与原生验收尚待完成；下文对应目标边界不构成实现完成证明。
 
+当前入口可从 `novarocks/frontend-application/src/query/statement_action.rs` 的稳定语句 custody，
+`read_action.rs`、`write_action.rs`、`mutation_action.rs` 和 `ctas_action.rs` 的实际 Action，以及
+`statement_computation.rs`、`statement_publication.rs` 的共享接缝核对。旧 `coordinator/**`
+和 `dml/runner.rs` 仍在；全部调用面迁移与删旧尚未完成，不能把上述源码存在解释为已贯通或已验收。
+
 ## 先判定 owner，再选 crate
 
 同一份数据被多个地方读取，不表示它有多个 owner。修改前先回答：谁能改变它、
@@ -124,6 +129,10 @@ ComputationReady。随后领域业务可立即推进；Native 诊断和收敛继
 普通读取仍保留客户端成功 EOF 的边界。Profile 在就绪前按冻结语义恢复，就绪后不恢复；
 诊断缺失必须显式标注，不能阻挡已完成计算或被当作零。
 
+普通 Read 保留同 Root 的 Client 结果窗口，把原执行 handle 交给流式结果 receipt；共享
+Root/Stage 准入不把它转换为 Internal 容量。Internal 计算就绪后，实际本地 CPU 退出与
+Native 的远端收尾分别观察；下一段可以归还计算位置后推进，原 Native tail 仍由同 owner 保管。
+
 外层语句/job 同时保存业务是否完成、实际 publication 的累计效果、剩余必要/维护义务和本地
 响应交付事实。seal/NoOp 不产生虚构提交；最后一步未提交不能覆盖前一步已提交或 Unknown。
 成功路径和错误路径都把这些事实传到 MySQL；业务完成后晚到取消不得改成普通中断。
@@ -133,6 +142,14 @@ ComputationReady。随后领域业务可立即推进；Native 诊断和收敛继
 已可能派发用独立有限结算预算观察同一 publication，不能凭取消当作可撤回或重派整条 SQL。
 正确性屏障和必要领域 finalize 完成才满足对应业务成功；安全 GC 和非必要诊断可以延后，
 但原对象、访问能力、删除权、容量和退出观察必须已由稳定 owner 接管。
+
+必要业务事实在 `ConnectorWriteNeededReady` 中保留原 effect、receipt 与 finalization，
+由同 canonical Arc 交给接收方和最终 completion；它不是一份深复制的提交记录。
+finalization 为 Failed 仍保留真实效果，但不能宣布相应业务成功，CTAS 也不能据失败 seal
+继续最终 CREATE。GC 尚未运行时为 Pending，只有真实清理观察才为 Observed。
+原 Provider Future 仍留在同一个 publication Call 中，由原 Root 的残留继续推进；
+会话取消或无人接成功结果也必须保留同一事实并续接原清理。NeededReady、F 实际退出与
+精确库存 Disposed 分别取证，任何一个都不能代替另外两个。
 
 ## 产物保管、容量与故障域
 
@@ -154,7 +171,9 @@ Unknown/未接收产物记录和字节，坏域不能占完健康域与既有结
 
 多段业务先交接上段保留 payload 并归还计算位置，再启动下一段。整句累计字节不逐段清零，
 还须容纳下一段最低运行/接收空间；不足且需要自己未来释放时明确失败，不等待自己。
-网络控制 I/O 异步，真正阻塞调用使用隔离的有界执行器；超时或取消等待不证明动作实际退出。
+metadata 结算沿同 Root 已取得的保管能力继续推进；scope 身份、alias 或 context getter
+不自行授予新容量，也不证明前一个阶段已退出。网络控制 I/O 异步，真正阻塞调用使用隔离的
+有界执行器；超时或取消等待不证明动作实际退出。
 永久卡住者仍占额，多个坏域或共享宿主耗尽时保留明确不可用边界。
 
 客户端取消经 query-control owner 进入，会话 generation fencing 等本语句的本地受监督编排

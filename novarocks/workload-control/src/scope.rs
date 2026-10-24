@@ -192,6 +192,7 @@ impl WorkloadConfig {
 }
 
 pub(crate) struct Node {
+    pub(crate) root_domains: Option<crate::joint_admission::ledger::root_domains::RootDomains>,
     pub parent: Option<WorkId>,
     pub root: WorkId,
     pub class: WorkClass,
@@ -229,6 +230,7 @@ pub(crate) struct Node {
 impl Node {
     fn new(parent: Option<WorkId>, root: WorkId, class: WorkClass, cancellation: SlotId) -> Self {
         Self {
+            root_domains: None,
             parent,
             root,
             class,
@@ -481,7 +483,12 @@ impl State {
             {
                 return;
             }
-            let node = self.nodes.remove(&id).unwrap();
+            let mut node = self.nodes.remove(&id).unwrap();
+            if let Some(domains) = node.root_domains.take() {
+                let slot = &mut self.cancellations.slots[node.cancellation.0];
+                assert!(slot.retired_root_domains.is_none());
+                slot.retired_root_domains = Some(domains);
+            }
             self.cancellations.retire(node.cancellation);
             if let Some(parent) = node.parent {
                 self.nodes.get_mut(&parent).unwrap().children -= 1;
@@ -1344,6 +1351,13 @@ pub struct WorkOwner {
 }
 
 impl WorkOwner {
+    /// Verify the exact host and work before transferring its unique owner.
+    pub fn is_for_scope(&self, scope: &WorkScope) -> bool {
+        self.scope
+            .as_ref()
+            .is_some_and(|held| held.id == scope.id && Arc::ptr_eq(&held.inner, &scope.inner))
+    }
+
     pub fn scope(&self) -> WorkScope {
         self.scope.as_ref().unwrap().clone()
     }
@@ -1656,6 +1670,31 @@ mod tests {
         .owner;
         control.mark_ready().unwrap();
         control
+    }
+
+    #[test]
+    fn owner_scope_identity_rejects_the_same_numeric_id_from_another_host() {
+        let first = controller();
+        let second = controller();
+        let a = first
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let b = second
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let a_scope = a.owner.scope();
+        let b_scope = b.owner.scope();
+        assert_eq!(a_scope.id(), b_scope.id());
+        assert!(a.owner.is_for_scope(&a_scope));
+        assert!(!a.owner.is_for_scope(&b_scope));
+        assert!(!b.owner.is_for_scope(&a_scope));
+        a.owner.complete_after_terminal_cancel_settled();
+        b.owner.complete_after_terminal_cancel_settled();
+        drop((a.business, b.business, a_scope, b_scope));
+        first.close_admission();
+        second.close_admission();
+        assert!(first.shutdown().is_ok());
+        assert!(second.shutdown().is_ok());
     }
 
     #[tokio::test]

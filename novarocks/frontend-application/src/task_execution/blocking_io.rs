@@ -452,6 +452,8 @@ impl<T: Send + 'static> ConnectorBlockingIoJob<T> {
 
 #[derive(Clone)]
 struct OriginalExecutors {
+    read_geometry:
+        std::sync::OnceLock<novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry>,
     cpu: novarocks_query_application::cpu::QueryCpuExecutor,
     blocking: novarocks_query_application::cpu::QueryBlockingExecutor,
     provider_creator:
@@ -515,6 +517,7 @@ impl ConnectorBlockingIoSupervisor {
     ) -> Result<(), WorkError> {
         self.executors
             .set(OriginalExecutors {
+                read_geometry: std::sync::OnceLock::new(),
                 cpu,
                 blocking,
                 provider_creator: std::sync::OnceLock::new(),
@@ -534,6 +537,26 @@ impl ConnectorBlockingIoSupervisor {
             .provider_creator
             .set(cpu)
             .map_err(|_| WorkError::Conflict)
+    }
+    pub(crate) fn install_read_io_geometry(
+        &self,
+        geometry: novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
+    ) -> Result<(), WorkError> {
+        self.executors
+            .get()
+            .ok_or(WorkError::NotReady)?
+            .read_geometry
+            .set(geometry)
+            .map_err(|_| WorkError::Conflict)
+    }
+    pub(crate) fn read_io_geometry(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry, WorkError> {
+        self.executors
+            .get()
+            .and_then(|e| e.read_geometry.get())
+            .copied()
+            .ok_or(WorkError::NotReady)
     }
     pub(crate) fn provider_creator_cpu(
         &self,

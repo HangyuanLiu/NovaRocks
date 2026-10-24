@@ -43,6 +43,7 @@ pub(super) struct FixedChildren {
     shared: SharedChildIndex,
     parent_slot: usize,
     len: usize,
+    reserved: usize,
     limit: usize,
 }
 
@@ -52,8 +53,35 @@ impl Children {
             shared,
             parent_slot,
             len: 0,
+            reserved: 0,
             limit,
         })
+    }
+
+    pub(super) fn reserve_fixed(&mut self, count: usize) -> Result<(), WorkError> {
+        let Self::Fixed(children) = self else {
+            return Err(WorkError::Conflict);
+        };
+        let total = children
+            .len
+            .checked_add(children.reserved)
+            .and_then(|n| n.checked_add(count))
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        if total > children.limit {
+            return Err(WorkError::Capacity("prepaid parent child backing"));
+        }
+        children.reserved += count;
+        Ok(())
+    }
+
+    pub(super) fn release_fixed(&mut self, count: usize) {
+        let Self::Fixed(children) = self else {
+            panic!("fixed child reservation");
+        };
+        children.reserved = children
+            .reserved
+            .checked_sub(count)
+            .expect("release each original child reservation once");
     }
 
     pub(super) fn assert_empty_for_reuse(&self) {
@@ -126,7 +154,7 @@ impl FixedChildren {
         {
             return Err(WorkError::Conflict);
         }
-        if self.len == self.limit {
+        if self.len + self.reserved == self.limit {
             return Err(WorkError::Capacity("prepaid parent child backing"));
         }
         if self
@@ -144,7 +172,7 @@ impl FixedChildren {
     // ParentLink is installed before this weak row; the same parent lock spans
     // preflight and insertion. There is no second capacity authority or queue.
     pub(super) fn insert_preflighted(&mut self, sequence: WorkId, child: Weak<Cancellation>) {
-        assert!(self.len < self.limit);
+        assert!(self.len + self.reserved < self.limit);
         let old = self
             .shared
             .lock()
@@ -180,6 +208,7 @@ impl FixedChildren {
 
     fn assert_empty_for_reuse(&self) {
         assert_eq!(self.len, 0);
+        assert_eq!(self.reserved, 0);
         assert!(
             self.shared
                 .lock()

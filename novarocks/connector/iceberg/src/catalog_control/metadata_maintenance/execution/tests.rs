@@ -78,6 +78,10 @@ async fn cancelled_borrow_keeps_original_active_future_until_actual_exit() {
         drops: drops.clone(),
     }));
     let mut execution = ConnectorMetadataMaintenanceExecution::from_source(row.clone());
+    assert_eq!(
+        execution.cleanup_responsibility(),
+        novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Retained
+    );
     let mut wait = Box::pin(execution.wait());
     assert!(futures::poll!(&mut wait).is_pending());
     drop(wait);
@@ -95,6 +99,10 @@ async fn cancelled_borrow_keeps_original_active_future_until_actual_exit() {
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert!(active.lock().unwrap().is_empty());
     assert_eq!(row.state.lock().unwrap().phase, Phase::Closed);
+    assert_eq!(
+        execution.cleanup_responsibility(),
+        novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Disposed
+    );
     assert_eq!(
         terminal
             .lock()

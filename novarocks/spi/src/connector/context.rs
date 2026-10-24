@@ -139,6 +139,17 @@ pub struct ConnectorRequestScope {
 }
 
 impl ConnectorRequestScope {
+    /// Requested fixed header of the same attempt-local sidecar. Extension
+    /// entries/payloads remain their actual creators' admitted backing.
+    pub fn fixed_backing_layout() -> Result<
+        std::alloc::Layout,
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+    > {
+        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
+            Mutex<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
+        >())
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

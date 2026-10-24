@@ -30,8 +30,8 @@ use novarocks_spi::connector::{
     ConnectorCleanupCandidatePageRequest, ConnectorCleanupExecuteRequest,
     ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance, ConnectorCleanupOwnedRefIdentity,
     ConnectorCleanupOwnedRefSelection, ConnectorCleanupPlan, ConnectorCleanupPlanSummary,
-    ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest, ConnectorError,
-    ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorProcessLocalPayload,
+    ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest, ConnectorCleanupScanSafety,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorProcessLocalPayload,
     ConnectorProviderBindingKey, ConnectorRequestContext, PreparedBatch,
 };
 use serde::{Deserialize, Serialize};
@@ -271,6 +271,10 @@ impl IcebergCleanupMaintenanceAdapter {
 }
 
 impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
+    fn scan_gc_safety(&self) -> ConnectorCleanupScanSafety {
+        iceberg_scan_gc_safety()
+    }
+
     fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
     }
@@ -333,6 +337,7 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
                 // destructively falling through to the object pass.
                 (CleanupPhase::OwnedRefRetire, owned_ref_records)
             } else if owned_ref_records.is_empty() {
+                self.scan_gc_safety().require_scanned_object_gc()?;
                 let table_for_scan = table.clone();
                 let binding = self
                     .runtime
@@ -655,6 +660,14 @@ fn execute_frozen_batch(
     batch: &[ManifestRecord],
     context: &ConnectorRequestContext,
 ) -> Result<Vec<ReceiptRecord>, ConnectorError> {
+    // A restored/process-local object manifest cannot bypass current safety.
+    // Exact Catalog-ref records do not grant or invoke object deletion.
+    if batch
+        .iter()
+        .any(|record| matches!(&record.candidate, ManifestCandidate::Object { .. }))
+    {
+        iceberg_scan_gc_safety().require_scanned_object_gc()?;
+    }
     let binding = runtime
         .resources()
         .planning_binding()
@@ -972,6 +985,11 @@ async fn delete_exact(
             "catalog metadata discovery root is protected from object cleanup",
         ));
     }
+    iceberg_scan_gc_safety()
+        .require_scanned_object_gc()
+        .map_err(|error| {
+            crate::opendal::Error::new(crate::opendal::ErrorKind::Unsupported, error.message())
+        })?;
     match identity {
         ObjectIdentity::Version { version, .. } => {
             operator.delete_with(&path).version(&version).await
@@ -1199,6 +1217,12 @@ fn write_canonical(value: &Value, bytes: &mut Vec<u8>) -> Result<(), ConnectorEr
     Ok(())
 }
 
+// Actual current catalog capability. No supported variant or test bypass
+// invents a persistent/fencing protocol which the Provider does not own.
+pub(super) fn iceberg_scan_gc_safety() -> ConnectorCleanupScanSafety {
+    ConnectorCleanupScanSafety::Unproven
+}
+
 fn validate_context(
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), ConnectorError> {
@@ -1371,7 +1395,7 @@ mod tests {
     }
 
     #[test]
-    fn planned_cleanup_deletes_only_mature_nested_orphans() {
+    fn unproven_scan_refuses_mature_nested_objects_after_ordinary_commit() {
         let (executor, _warehouse, runtime) = local_runtime();
         let table = executor.block_on(async {
             let schema = Schema::builder()
@@ -1516,90 +1540,26 @@ mod tests {
                 )
                 .expect("planning request"),
             )
-            .expect("plan exact cleanup");
-        assert_eq!(plan.summary().candidate_count(), 3);
-        assert!(old_orphan.exists(), "planning must not delete an object");
-        assert!(
-            old_metadata_orphan.exists(),
-            "planning must not delete a metadata orphan"
-        );
-        assert!(
-            retained_live_data.exists(),
-            "planning must retain live data"
-        );
-        let page = adapter
-            .read_candidate_page(
-                ConnectorCleanupCandidatePageRequest::try_new(plan.clone(), 0, 10, context())
-                    .unwrap(),
-            )
-            .expect("page reads frozen candidates");
-        assert_eq!(page.candidates().len(), 3);
+            .expect_err("age/current reachability cannot authorize scanned deletion");
+        assert_eq!(plan.kind(), ConnectorErrorKind::Unsupported);
+        assert!(plan.message().contains("writer fencing"));
+        for path in [
+            &old_orphan,
+            &changed_orphan,
+            &old_metadata_orphan,
+            &young_orphan,
+            &retained_live_data,
+        ] {
+            assert!(path.exists(), "scan refusal must preserve every object");
+        }
         assert!(!root.join("_novarocks").exists());
-        let weak = Arc::downgrade(
-            plan.manifest()
-                .value::<FrozenCleanupManifest>("cleanup-test")
-                .unwrap(),
-        );
-        File::options()
-            .write(true)
-            .open(&changed_orphan)
-            .expect("open changed orphan")
-            .set_times(FileTimes::new().set_modified(old_time + Duration::from_millis(100)))
-            .expect("change orphan identity within the same second");
-        let prepared = adapter
-            .prepare_batch(
-                ConnectorCleanupPrepareRequest::try_new(plan.clone(), 0, context())
-                    .expect("prepare request"),
-            )
-            .expect("prepare frozen batch");
-        let receipt = adapter
-            .execute_batch(
-                ConnectorCleanupExecuteRequest::try_new(plan.clone(), prepared.clone(), context())
-                    .expect("execute request"),
-            )
-            .expect("execute frozen batch");
-        assert_eq!(receipt.summary().deleted(), 2);
-        assert_eq!(receipt.summary().failed(), 1);
-        let replay = adapter
-            .execute_batch(
-                ConnectorCleanupExecuteRequest::try_new(plan.clone(), prepared, context()).unwrap(),
-            )
-            .expect("repeat checks exact objects again");
-        assert_eq!(replay.summary().already_absent(), 2);
-        assert_eq!(replay.summary().failed(), 1);
-        assert!(!root.join("_novarocks").exists());
-        let cloned = plan.clone();
-        drop(plan);
-        assert!(weak.upgrade().is_some());
-        drop(cloned);
-        assert!(
-            weak.upgrade().is_none(),
-            "adapter must not retain the manifest"
-        );
-        assert!(!old_orphan.exists(), "mature orphan must be deleted");
-        assert!(
-            !old_metadata_orphan.exists(),
-            "unlinked mature metadata object must be deleted"
-        );
-        assert!(young_orphan.exists(), "young orphan must be retained");
-        assert!(
-            retained_live_data.exists(),
-            "mature data referenced by the current snapshot must be retained"
-        );
-        assert!(
-            changed_orphan.exists(),
-            "changed orphan identity must be retained"
-        );
-        assert!(
-            table.metadata_location().is_some_and(|path| {
-                novarocks_fs::FsLocation::parse(path)
-                    .is_ok_and(|location| std::path::Path::new(location.path()).exists())
-            }),
-            "the live table metadata must be retained"
-        );
+        assert!(table.metadata_location().is_some_and(|path| {
+            novarocks_fs::FsLocation::parse(path)
+                .is_ok_and(|location| std::path::Path::new(location.path()).exists())
+        }));
     }
 
-    fn real_cleanup_plan(
+    fn cleanup_plan_identity_fixture(
         executor: &tokio::runtime::Runtime,
         runtime: Arc<IcebergMetadataContext>,
         with_candidate: bool,
@@ -1681,18 +1641,71 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
         let adapter = IcebergCleanupMaintenanceAdapter::new(key.clone(), runtime).unwrap();
-        let plan = adapter
-            .plan_cleanup(
-                ConnectorCleanupPlanningRequest::try_new(
-                    ConnectorCleanupOperationId::from_bytes([5; 16]),
-                    key,
-                    ConnectorCleanupOperation::remove_unreferenced_objects(loaded.table, cutoff)
-                        .unwrap(),
-                    context(),
-                )
-                .unwrap(),
+        let operation =
+            ConnectorCleanupOperation::remove_unreferenced_objects(loaded.table, cutoff).unwrap();
+        let request = if with_candidate {
+            ConnectorCleanupPlanningRequest::try_new(
+                ConnectorCleanupOperationId::from_bytes([5; 16]),
+                key.clone(),
+                operation,
+                context(),
             )
-            .unwrap();
+            .unwrap()
+        } else {
+            ConnectorCleanupPlanningRequest::try_new_selected_owned_refs(
+                ConnectorCleanupOperationId::from_bytes([5; 16]),
+                key.clone(),
+                operation,
+                ConnectorCleanupOwnedRefSelection::try_new(Vec::new()).unwrap(),
+                context(),
+            )
+            .unwrap()
+        };
+        let plan = if !with_candidate {
+            adapter.plan_cleanup(request).unwrap()
+        } else {
+            // Data-only legacy artifact fixture, not a supported scan or a
+            // safety proof. Real table/owner/UUID checks remain under test.
+            let records = vec![object_record(
+                0,
+                root.join("data/orphan.parquet").to_string_lossy(),
+                ObjectIdentity::SizeMtime {
+                    size: 6,
+                    mtime_ms: 0,
+                },
+            )];
+            let logical = LogicalManifest {
+                version: ARTIFACT_VERSION,
+                namespace: "orphan_test".into(),
+                table: "t".into(),
+                table_uuid: table.metadata().uuid().to_string(),
+                older_than_ms: cutoff,
+                phase: CleanupPhase::ObjectSweep,
+                records,
+            };
+            let digest = domain_digest(MANIFEST_DOMAIN, &canonical(&logical).unwrap());
+            ConnectorCleanupPlan::try_new(
+                &request,
+                [17; 32],
+                digest,
+                ConnectorCleanupPlanSummary::try_new(1, 6, 1).unwrap(),
+                canonical(&PlanPayload {
+                    version: ARTIFACT_VERSION,
+                    namespace: "orphan_test".into(),
+                    table: "t".into(),
+                    table_uuid: table.metadata().uuid().to_string(),
+                })
+                .unwrap(),
+                ConnectorProcessLocalPayload::new(
+                    key,
+                    Arc::new(FrozenCleanupManifest {
+                        records: logical.records.into(),
+                        manifest_digest: digest,
+                    }),
+                ),
+            )
+            .unwrap()
+        };
         (adapter, plan, table, root)
     }
 
@@ -1715,9 +1728,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_cleanup_uses_real_file_io_without_writing_artifacts() {
+    fn empty_selected_owned_ref_cleanup_preserves_independent_capability() {
         let (executor, _warehouse, runtime) = local_runtime();
-        let (adapter, plan, _table, root) = real_cleanup_plan(&executor, runtime, false);
+        let (adapter, plan, _table, root) =
+            cleanup_plan_identity_fixture(&executor, runtime, false);
         assert_eq!(plan.summary().candidate_count(), 0);
         let page = adapter
             .read_candidate_page(
@@ -1747,7 +1761,7 @@ mod tests {
     fn already_frozen_catalog_roots_are_refused_at_the_final_delete_gate() {
         let (executor, _warehouse, runtime) = local_runtime();
         let (adapter, plan, _table, root) =
-            real_cleanup_plan(&executor, Arc::clone(&runtime), false);
+            cleanup_plan_identity_fixture(&executor, Arc::clone(&runtime), false);
         let payload = adapter.plan_payload(&plan).unwrap();
         for name in [
             "v1.metadata.json",
@@ -1773,8 +1787,9 @@ mod tests {
                 &batch,
                 &context(),
             )
-            .unwrap();
-            assert!(matches!(result[0].outcome, ObjectOutcome::Failed));
+            .err()
+            .expect("unproven scanned cleanup is refused");
+            assert_eq!(result.kind(), ConnectorErrorKind::Unsupported);
             assert_eq!(fs::read(&path).unwrap(), b"retained root");
         }
         // The low-level exact-delete entry is equally protected, without LIST.
@@ -1808,10 +1823,41 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn unproven_frozen_object_delete_has_no_actual_delete_call() {
+        let base =
+            crate::opendal::Operator::new(crate::opendal::services::Memory::default()).unwrap();
+        base.write("warehouse/data/old.parquet", b"retained".to_vec())
+            .await
+            .unwrap();
+        let calls = super::super::cleanup_candidates::gc_io_test::GcIoCalls::default();
+        let operator = base.clone().layer(calls.clone());
+        let error = delete_exact(
+            operator,
+            "warehouse/data/old.parquet".into(),
+            "s3://bucket/warehouse/data/old.parquet".into(),
+            ObjectIdentity::SizeMtime {
+                size: 8,
+                mtime_ms: 0,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), crate::opendal::ErrorKind::Unsupported);
+        assert_eq!(calls.counts(), (0, 0));
+        assert_eq!(
+            base.read("warehouse/data/old.parquet")
+                .await
+                .unwrap()
+                .to_bytes(),
+            Bytes::from_static(b"retained")
+        );
+    }
+
     #[test]
     fn missing_wrong_owner_type_and_digest_payloads_fail_before_delete() {
         let (executor, _warehouse, runtime) = local_runtime();
-        let (adapter, plan, _table, root) = real_cleanup_plan(&executor, runtime, true);
+        let (adapter, plan, _table, root) = cleanup_plan_identity_fixture(&executor, runtime, true);
         let prepared = adapter
             .prepare_batch(
                 ConnectorCleanupPrepareRequest::try_new(plan.clone(), 0, context()).unwrap(),
@@ -1897,7 +1943,8 @@ mod tests {
     #[test]
     fn replaced_table_uuid_refuses_page_prepare_and_execute_before_delete() {
         let (executor, _warehouse, runtime) = local_runtime();
-        let (adapter, plan, table, root) = real_cleanup_plan(&executor, runtime.clone(), true);
+        let (adapter, plan, table, root) =
+            cleanup_plan_identity_fixture(&executor, runtime.clone(), true);
         let shared_context = context();
         let old = runtime
             .load_table_for_request("orphan_test", "t", &shared_context)

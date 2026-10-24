@@ -185,9 +185,18 @@ pub(crate) struct FrontendQueryCompiler {
 }
 
 mod async_explain;
+mod async_read;
 pub(crate) use async_explain::{PreparedAsyncExplain, PreparedAsyncProfile};
 
 impl FrontendQueryCompiler {
+    pub(crate) fn read_io_geometry(
+        &self,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
+        novarocks_workload_control::WorkError,
+    > {
+        self.connector_blocking_io.read_io_geometry()
+    }
     pub(crate) fn connector_runtime(&self) -> &tokio::runtime::Handle {
         self.connector_blocking_io.runtime()
     }
@@ -361,7 +370,7 @@ impl FrontendQueryCompiler {
         );
         let facts = crate::query_execution::completion_facts::frontend_fact_source(
             self.completion_fact_owners(),
-            crate::query_execution::completion_facts::StatementFactScope::new(
+            crate::query_execution::completion_facts::StatementFactScope::binding_only(
                 Arc::clone(&bindings),
                 connector_context.clone(),
                 current_catalog,

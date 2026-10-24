@@ -550,6 +550,10 @@ impl ObservationIntake {
         })
     }
 
+    pub(crate) fn progress_wake(&self) -> Arc<dyn StatusIntakeWake> {
+        Arc::clone(&self.inner.wake)
+    }
+
     /// Age of the oldest registered frame the serial owner has not applied.
     /// Pre-read reservations and a pending result seal are not stream facts.
     pub(crate) fn oldest_unapplied_age(&self) -> Option<Duration> {

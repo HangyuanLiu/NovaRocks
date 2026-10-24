@@ -34,6 +34,9 @@
 //! attempt alone: it is deposited the moment it is taken and never appears in a
 //! fact, a plan, or anything encoded.
 
+mod control_binding;
+use control_binding::ProviderCreatorControlBinding;
+
 use novarocks_query_application::api::RuntimeSplitPlacement;
 
 use super::internal_result_cpu::{InternalResultCpu, ProviderCreatorCpuSource, ProviderReadCpuJob};
@@ -156,7 +159,13 @@ pub(crate) struct FrozenReadEncoding {
 }
 
 /// Freezes each scan of one statement with its provider.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ProviderCreatorMode {
+    BindingOnly,
+    GovernedReadIo,
+}
 pub(crate) struct FrontendProviderReadFacts {
+    creator_mode: ProviderCreatorMode,
     control: Arc<ConnectorControlHost>,
     bindings: Arc<QueryTableBindingStore>,
     session: ConnectorSession,
@@ -172,6 +181,9 @@ pub(crate) struct FrontendProviderReadFacts {
 
 #[derive(Default)]
 struct ProviderCreatorSource {
+    creator_request: Option<novarocks_spi::connector::ConnectorIoRequest>,
+    creator_permit: Option<novarocks_spi::connector::ConnectorIoPermit>,
+    control_binding: ProviderCreatorControlBinding,
     admission: Option<ConnectorBlockingIoAdmission>,
     responsibility: Option<ConnectorBlockingIoResponsibility>,
     prepared: Option<PreparedProviderRead>,
@@ -192,7 +204,7 @@ impl StatusIntakeWake for ProviderCreatorWake {
 }
 
 impl FrontendProviderReadFacts {
-    pub(crate) fn new(
+    pub(crate) fn binding_only(
         control: Arc<ConnectorControlHost>,
         bindings: Arc<QueryTableBindingStore>,
         session: ConnectorSession,
@@ -201,6 +213,7 @@ impl FrontendProviderReadFacts {
         capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
     ) -> Self {
         Self {
+            creator_mode: ProviderCreatorMode::BindingOnly,
             control,
             bindings,
             session,
@@ -213,6 +226,10 @@ impl FrontendProviderReadFacts {
             #[cfg(test)]
             fixture_cpu: None,
         }
+    }
+    pub(super) fn with_creator_mode(mut self, mode: ProviderCreatorMode) -> Self {
+        self.creator_mode = mode;
+        self
     }
     /// Explicit unqualified Counted fixture. Production never takes this path.
     #[cfg(test)]
@@ -238,18 +255,26 @@ impl FrontendProviderReadFacts {
         source.prepared.take();
         source.admission.take();
         source.responsibility.take();
+        drop(source.creator_request.take());
+        drop(source.creator_permit.take());
+        source.control_binding.after_source_exit();
         Ok(())
     }
     /// Pure known first-party header facts. Self already includes the private
     /// body; its inline fields are not counted again as separate allocations.
     pub(crate) fn known_source_layouts() -> Result<
-        [std::alloc::Layout; 2],
+        [std::alloc::Layout; 4],
         novarocks_type_contract::owned_resources::layout::LayoutResourceError,
     > {
         use novarocks_type_contract::owned_resources::layout::arc_layout;
         Ok([
             arc_layout(std::alloc::Layout::new::<Self>())?,
             arc_layout(std::alloc::Layout::new::<ProviderCreatorWake>())?,
+            novarocks_workload_control::joint_admission::JointProposalSlotWait::metadata_layouts()
+                .1,
+            // The child constructor keeps its own original fixed wait field;
+            // charge that named F backing as well as the binding wait above.
+            ConnectorBlockingIoAdmission::wait_backing_layout(),
         ])
     }
     #[cfg(test)]
@@ -346,6 +371,75 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
                     .map_err(|e| e.to_string())?,
                 );
             } else {
+                // Catalog resolution already retained this exact admitted
+                // generation. Read only its pure route facts; do not construct
+                // a request-bound control or perform Provider I/O yet.
+                let admitted = self.bindings.binding(need.binding())?;
+                let lease = admitted.admission.exact_planning_lease()?;
+                let read = self
+                    .control
+                    .typed_read_for_planning_lease(&lease)
+                    .map_err(|error| error.to_string())?;
+                let factory = read.request_factory().ok_or_else(|| {
+                    "provider creator has no exact request control factory".to_owned()
+                })?;
+                if self.creator_mode == ProviderCreatorMode::GovernedReadIo {
+                    let io = self
+                        .context
+                        .io_admission()
+                        .and_then(|p| p.upgrade())
+                        .ok_or_else(|| {
+                            "read Provider source has no original I/O owner".to_owned()
+                        })?;
+                    let mut dependencies = Vec::new();
+                    factory
+                        .visit_planning_dependencies(&mut |fact| {
+                            if !dependencies.contains(fact) {
+                                dependencies.push(fact.clone());
+                            }
+                            Ok(())
+                        })
+                        .map_err(|e| e.to_string())?;
+                    let profile =
+                    novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile::from_geometry(
+                        factory.planning_io_geometry().map_err(|e| e.to_string())?,
+                        dependencies,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    io.configure_read_source(&profile)
+                        .map_err(|e| e.to_string())?;
+                    std::future::poll_fn(|cx| io.poll_read_source_ready(cx))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    // Exact factory service facts are joined into the SAME Root
+                    // payload/action D before the child can retain this creator.
+                    for dependency in profile.initial_dependencies() {
+                        source.creator_request =
+                            Some(io.request(dependency.clone()).map_err(|e| e.to_string())?);
+                        std::future::poll_fn(|cx| {
+                            let ProviderCreatorSource {
+                                creator_request,
+                                creator_permit,
+                                ..
+                            } = &mut *source;
+                            creator_request
+                                .as_ref()
+                                .expect("same creator request")
+                                .poll_admitted_in(creator_permit, cx)
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        drop(source.creator_request.take());
+                        drop(source.creator_permit.take());
+                    }
+                }
+                std::future::poll_fn(|cx| {
+                    source
+                        .control_binding
+                        .poll(self.capacity.scope(), factory.as_ref(), cx)
+                })
+                .await
+                .map_err(|error| error.to_string())?;
                 if source.admission.is_none() {
                     source.admission = Some(
                         ConnectorBlockingIoResponsibility::request(
@@ -430,6 +524,11 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
             // Only a genuinely joined, healthy original job is removed here.
             source.job.take();
             source.responsibility.take();
+            drop(source.creator_request.take());
+            drop(source.creator_permit.take());
+            // Only after the original worker/input/cause and child actually
+            // exit may the SAME Source prepare its next need's binding.
+            source.control_binding.after_source_exit();
             facts.push(
                 source
                     .result

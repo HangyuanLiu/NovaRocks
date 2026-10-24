@@ -107,7 +107,7 @@ impl FrontendQueryCompiler {
             let bindings = Arc::new(
                 QueryTableBindingStore::try_new().map_err(FrontendQueryCompilerError::Engine)?,
             );
-            let scope = crate::query_execution::completion_facts::StatementFactScope::new(
+            let scope = crate::query_execution::completion_facts::StatementFactScope::binding_only(
                 bindings,
                 connector_context.clone(),
                 current_catalog,
@@ -177,7 +177,7 @@ impl FrontendQueryCompiler {
         crate::query_execution::completion_facts::install_frontend_fact_source(
             provider_source,
             self.completion_fact_owners(),
-            crate::query_execution::completion_facts::StatementFactScope::new(
+            crate::query_execution::completion_facts::StatementFactScope::binding_only(
                 Arc::clone(&bindings),
                 connector_context.clone(),
                 current_catalog,
@@ -261,7 +261,7 @@ impl FrontendQueryCompiler {
         crate::query_execution::completion_facts::install_frontend_fact_source(
             provider_source,
             self.completion_fact_owners(),
-            crate::query_execution::completion_facts::StatementFactScope::new(
+            crate::query_execution::completion_facts::StatementFactScope::binding_only(
                 Arc::clone(&bindings),
                 connector_planning_context.request().clone(),
                 current_catalog,

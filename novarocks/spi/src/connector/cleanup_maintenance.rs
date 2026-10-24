@@ -1264,9 +1264,34 @@ impl ConnectorCleanupFinalizeRequest {
     }
 }
 
+/// Provider evidence for scanned-object reclamation, distinct from exact
+/// operation-owned cleanup and exact Catalog reference retirement.
+/// No current provider proves writer fencing, Unknown/unreceived protection
+/// and restart recovery together. Age/current reachability is not that proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ConnectorCleanupScanSafety {
+    Unproven,
+}
+impl ConnectorCleanupScanSafety {
+    pub fn require_scanned_object_gc(self) -> Result<(), ConnectorError> {
+        match self {
+            Self::Unproven => Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "scanned orphan cleanup is unsupported: Provider writer fencing, Unknown/unreceived output protection and restart safety are unproven",
+            )),
+        }
+    }
+}
+
 /// A cleanup provider never receives an opportunity to re-list candidates after
 /// planning. `execute_batch` is invoked once per prepared batch.
 pub trait ConnectorCleanupMaintenance: Send + Sync {
+    /// Must be checked before object discovery and before executing a frozen
+    /// object manifest. It does not gate independently safe owned operations.
+    fn scan_gc_safety(&self) -> ConnectorCleanupScanSafety {
+        ConnectorCleanupScanSafety::Unproven
+    }
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn binding_key(&self) -> &ConnectorProviderBindingKey;
     fn plan_cleanup(
@@ -1353,6 +1378,9 @@ impl ConnectorCleanupMaintenanceLease {
     }
     pub const fn control_runtime_id(&self) -> ConnectorControlRuntimeId {
         self.control_runtime_id
+    }
+    pub fn scan_gc_safety(&self) -> ConnectorCleanupScanSafety {
+        self.cleanup.scan_gc_safety()
     }
     pub fn metadata(&self) -> &Arc<dyn ConnectorMetadata> {
         &self.metadata
@@ -1870,5 +1898,19 @@ mod tests {
         .unwrap();
         assert_eq!(receipt.summary().unknown(), 4);
         assert!(receipt.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod scan_safety_tests {
+    use super::*;
+    #[test]
+    fn unproven_scan_safety_is_typed_unsupported_not_age_or_reachability() {
+        let error = ConnectorCleanupScanSafety::Unproven
+            .require_scanned_object_gc()
+            .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert!(error.message().contains("Unknown/unreceived"));
+        assert!(error.message().contains("restart"));
     }
 }

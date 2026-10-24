@@ -21,13 +21,34 @@
 //! The frontend drives the same Root's paid proposal outside provider polls.
 
 use super::{ConnectorError, ConnectorRequestContext};
-pub use novarocks_resource_contract::{HdfsServiceOrigin, NetworkServiceOrigin, SharedDependency};
+pub use novarocks_resource_contract::{
+    HdfsServiceOrigin, NetworkServiceOrigin, SelectedThriftServiceOrigin, SharedDependency,
+    ThriftServiceOrigin,
+};
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 
 /// The original action supplies one finite inventory, sized by the provider's
 /// actual maximum concurrent I/O. This port does not create an execution pool.
 pub trait ConnectorIoAdmissionPort: Send + Sync {
+    /// Bind the exact running generation's pure factory profile before its
+    /// read creator is dispatched. This publishes no physical permit.
+    fn configure_read_source(
+        &self,
+        _profile: &super::ConnectorMetadataMaintenanceIoProfile,
+    ) -> Result<(), ConnectorError> {
+        Err(ConnectorError::new(
+            super::ConnectorErrorKind::Unsupported,
+            "read source profile is not installed",
+        ))
+    }
+    fn poll_read_source_ready(&self, _cx: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+        Poll::Ready(Err(ConnectorError::new(
+            super::ConnectorErrorKind::Unsupported,
+            "read source profile is not installed",
+        )))
+    }
+
     fn request_owned(
         &self,
         additional: std::num::NonZeroU64,
@@ -89,6 +110,32 @@ impl ConnectorIoRequest {
     /// poll_admitted still requires the original owner's actual grant.
     pub fn from_original(original: Arc<dyn ConnectorIoRequestSource>) -> Self {
         Self { original }
+    }
+    /// Silent original receiving seam. The source retains its request while
+    /// pending and installs the positive permit before any request/F Drop.
+    pub fn poll_admitted_in(
+        &self,
+        target: &mut Option<ConnectorIoPermit>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ConnectorError>> {
+        if target.is_some() {
+            return Poll::Ready(Err(ConnectorError::new(
+                super::ConnectorErrorKind::InvalidRequest,
+                "I/O permit receiver is occupied",
+            )));
+        }
+        match self.original.poll_admitted(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) => {
+                *target = Some(ConnectorIoPermit {
+                    original: Some(Arc::downgrade(&self.original)),
+                    keepalive: Some(Arc::clone(&self.original)),
+                    exit_waker: self.original.exit_waker(),
+                });
+                Poll::Ready(Ok(()))
+            }
+        }
     }
     pub async fn admitted(self) -> Result<ConnectorIoPermit, ConnectorError> {
         std::future::poll_fn(|cx| self.original.poll_admitted(cx)).await?;

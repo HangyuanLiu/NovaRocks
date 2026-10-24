@@ -31,6 +31,8 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+pub(super) const FIXTURE_CHANGES_PER_REQUEST: usize = 2;
+
 pub(super) struct GovernedWireRole {
     control: WorkloadControl,
     driver: Mutex<JointProgressDriver>,
@@ -62,7 +64,7 @@ impl GovernedWireRole {
             max_registered_dependencies: 1,
             max_claims: 512,
             max_requests: 32,
-            max_changes_per_request: 2,
+            max_changes_per_request: FIXTURE_CHANGES_PER_REQUEST,
             max_snapshot_bytes: 64 * 1024 * 1024,
             max_scratch_bytes: 64 * 1024 * 1024,
             max_residual_arcs: 100000,
@@ -270,6 +272,28 @@ impl GovernedWireRole {
     pub(super) fn drive(&self) {
         drive_original(&mut self.driver.lock().unwrap())
     }
+    pub(super) fn finish(
+        self,
+    ) -> Result<
+        novarocks_workload_control::WorkloadShutdown,
+        novarocks_workload_control::WorkloadShutdownFailure,
+    > {
+        // The caller has joined the original Native owners and loopback.
+        // Their real sources kept this same Root/driver alive until here.
+        let Self {
+            control,
+            driver,
+            _root: root,
+            window,
+        } = self;
+        let mut driver = driver.into_inner().unwrap();
+        drop(window);
+        root.owner.complete_after_terminal_cancel_settled();
+        root.business.release();
+        control.close_admission();
+        drive_original(&mut driver);
+        control.shutdown()
+    }
     pub(super) fn reserve(
         &self,
         sink: &NativeTaskOperationSink,
@@ -297,6 +321,129 @@ fn drive_original(driver: &mut JointProgressDriver) {
         }
     }
     panic!("finite original wire fixture proof driver failed to reach idle")
+}
+
+/// Result delivery releases its position independently of the original
+/// control work. Only that original work may finish its paid settlement.
+#[tokio::test(flavor = "multi_thread")]
+async fn original_settlement_crosses_wire_after_last_result_window_alias_exits() {
+    use crate::task_execution::intent::TaskOperationSink;
+    use novarocks_workload_control::WorkError;
+
+    let backend = BackendProcessId::new_v7();
+    let mut peer = Loopback::start().await;
+    let governed = GovernedWireRole::new(&peer);
+    let authority = governed.authority();
+    let GovernedWireRole {
+        control,
+        driver,
+        _root: root,
+        window,
+    } = governed;
+    let mut driver = driver.into_inner().unwrap();
+    let mut runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+    let acks = TaskAckIntake::new(Arc::new(CountingWake::default()));
+    let sink = NativeTaskOperationSink::new(
+        &[peer.descriptor(backend)],
+        TransportBudget::DEFAULT,
+        test_attempt_facts(),
+        acks.handle(),
+        runtime.clone(),
+        authority.clone(),
+    )
+    .unwrap();
+    drop(window);
+    assert_eq!(control.snapshot().result_windows.held_positions, [0; 4]);
+    let mut foreground = TaskOperationQueuePreparation::new();
+    assert!(matches!(
+        sink.try_reserve_queue(
+            update_intent(1, backend, 1).queue_request(),
+            &mut foreground
+        ),
+        TaskOperationQueueAdmission::Rejected(WorkError::Released)
+    ));
+    drop(foreground);
+
+    // The peer's explicit rejection is an independent wire oracle: a local
+    // successful admission or synthetic ACK cannot satisfy this assertion.
+    peer.peer.expect_apply(ApplyAnswer::Outcomes(vec![
+        OperationOutcome::ResourceExhausted,
+    ]));
+    let intent = cancel_intent(1, backend);
+    let mut preparation = TaskOperationQueuePreparation::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let permit = tokio::time::timeout_at(deadline, async {
+        loop {
+            match sink.try_reserve_queue(intent.queue_request(), &mut preparation) {
+                TaskOperationQueueAdmission::Admitted(permit) => break permit,
+                TaskOperationQueueAdmission::Rejected(error) => {
+                    panic!("original settlement input refused: {error}")
+                }
+                _ => {}
+            }
+            drive_original(&mut driver);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut batch = DispatchBatch::with_queued_at(
+        backend,
+        DispatchLane::Lifecycle,
+        vec![intent.clone()],
+        vec![permit],
+        intent.queued_bytes(),
+        novarocks_coordination_contract::MonotonicInstant::ORIGIN,
+    );
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            batch = match sink.try_submit(batch) {
+                TaskOperationSubmit::Accepted => break,
+                TaskOperationSubmit::Backpressured(original) => original,
+                other => panic!("original settlement send refused: {other:?}"),
+            };
+            drive_original(&mut driver);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let received = settled(&acks, 1).await;
+    assert_eq!(received[0].operation_id(), intent.operation_id());
+    assert_eq!(
+        received[0].worker_outcome(),
+        Some(OperationOutcome::ResourceExhausted)
+    );
+    assert_eq!(peer.peer.control_requests(), 1);
+    assert_eq!(control.snapshot().result_windows.held_positions, [0; 4]);
+    drop((received, preparation, intent, sink, acks));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    runtime
+        .drain_original_subscriptions_until(deadline)
+        .await
+        .unwrap();
+    runtime.drain_original_apply_until(deadline).await.unwrap();
+    runtime.drain_native_outgoing_until(deadline).await.unwrap();
+    assert!(peer.settle().await);
+    drop((runtime, peer));
+    drive_original(&mut driver);
+    root.owner.complete_after_terminal_cancel_settled();
+    root.business.release();
+    drive_original(&mut driver);
+    assert_eq!(
+        authority
+            .begin_queued_input_when_available(
+                JointLane::Settlement,
+                queued_header_quote(0).unwrap(),
+            )
+            .err()
+            .map(|failure| failure.error),
+        Some(WorkError::Released),
+        "settlement never revives an exited original Work"
+    );
+    control.close_admission();
+    drive_original(&mut driver);
+    assert!(control.shutdown().is_ok());
 }
 
 /// Exercise the original paid preparation which RemoteTask withdraws before

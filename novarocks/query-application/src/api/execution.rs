@@ -521,6 +521,9 @@ impl ExecutionHandle {
     /// Transfers the single result consumer to the protocol/application owner.
     /// Cancellation remains available on this handle while that output is in
     /// use, and taking it twice cannot create another consumer.
+    pub(crate) fn has_rows_output(&self) -> bool {
+        matches!(self.output, Some(crate::api::ExecutionOutput::Rows(_)))
+    }
     pub fn take_output(&mut self) -> Option<crate::api::ExecutionOutput> {
         self.output.take()
     }

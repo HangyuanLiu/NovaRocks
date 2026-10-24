@@ -41,6 +41,20 @@ impl WorkOwner {
         })
     }
 }
+impl RetainedPayloadGrant {
+    /// Continue only this original positive Root's physical I/O Source after
+    /// its WorkOwner moved into a supervised execution/protocol receiver.
+    /// Retention aliases and WorkScope alone cannot create this author.
+    pub fn async_continuation_source(
+        &self,
+        root: &WorkScope,
+        lane: JointLane,
+    ) -> Result<AsyncActionSource, WorkError> {
+        Ok(AsyncActionSource {
+            original: control_action::capture_payload_continuation(self, root, lane)?,
+        })
+    }
+}
 impl AsyncActionSource {
     pub fn try_begin(
         &self,

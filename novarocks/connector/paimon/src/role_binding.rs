@@ -107,6 +107,19 @@ type FrozenReadCache = HashMap<(CatalogHandle, SchemaTableName), FrozenReadSlot>
 /// The provider has no environment, global credential or storage fallback.
 // Design: ADR-0138 (docs/adr/ADR-0138-vendored-paimon-read-host-patch.md)
 pub trait PaimonRoleFileIoFactory: Send + Sync {
+    /// The same role-local FS author that binds FileIO selects this pure route.
+    /// A provider must not reconstruct credential/endpoint defaults itself.
+    fn planning_dependency(
+        &self,
+        _properties: &CatalogProperties,
+        _warehouse: &str,
+    ) -> Result<novarocks_spi::connector::SharedDependency, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "Paimon FileIO author has no selected planning dependency",
+        ))
+    }
+
     fn bind_file_io(
         &self,
         properties: &CatalogProperties,
@@ -691,7 +704,47 @@ impl PaimonRequestControlFactory {
     }
 }
 
+/// The same original SDK table-scan bounded fanout, plus only actual Provider
+/// source/request headers. Manifest-list's two-way join precedes that fanout.
+pub fn read_io_geometry()
+-> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry, ConnectorError> {
+    let io = std::num::NonZeroUsize::new(paimon::table::MANIFEST_READ_CONCURRENCY.max(2)).unwrap();
+    let bytes = std::mem::size_of::<PaimonRequestControlFactory>()
+        .checked_add(std::mem::size_of::<PaimonReadRuntime>())
+        .and_then(|n| n.checked_add(std::mem::size_of::<ConnectorReadRequestControl>()))
+        .and_then(|n| {
+            n.checked_add(std::mem::size_of::<
+                novarocks_spi::connector::read_stack::ConnectorReadRelationPreparation,
+            >())
+        })
+        .ok_or_else(|| internal("Paimon read Source geometry overflow"))?;
+    let bytes = std::num::NonZeroU64::new(
+        u64::try_from(bytes).map_err(|_| internal("Paimon read Source geometry overflow"))?,
+    )
+    .unwrap();
+    Ok(novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry::new(io, bytes, bytes))
+}
+
 impl ConnectorReadRequestControlFactory for PaimonRequestControlFactory {
+    fn planning_io_geometry(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry, ConnectorError>
+    {
+        read_io_geometry()
+    }
+
+    fn visit_planning_dependencies(
+        &self,
+        visit: &mut dyn FnMut(
+            &novarocks_spi::connector::SharedDependency,
+        ) -> Result<(), ConnectorError>,
+    ) -> Result<(), ConnectorError> {
+        let dependency = self
+            .access
+            .planning_dependency(&self.properties, &self.warehouse)?;
+        visit(&dependency)
+    }
+
     fn for_planning(
         &self,
         request: &novarocks_spi::connector::ConnectorPlanningContext,
@@ -845,6 +898,31 @@ impl ConnectorMetadata for PaimonGenericControl {
         }))
     }
 
+    fn list_namespaces_async(
+        &self,
+        request: ConnectorListNamespacesRequest,
+    ) -> futures::future::BoxFuture<'_, Result<Vec<ConnectorNamespaceIdentity>, ConnectorError>>
+    {
+        Box::pin(async move {
+            self.ensure_instance(&request.instance_id)?;
+            let resources = PaimonRequestControl::from_request(&request.context);
+            let catalog = self.catalog(&request.context)?;
+            let bound = request.bound;
+            let entries = resources
+                .until(async move { catalog.list_databases(bound).await })
+                .await??;
+            Ok(entries.map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|namespace| ConnectorNamespaceIdentity {
+                        instance_id: self.descriptor.instance_id.clone(),
+                        namespace: Arc::from(namespace),
+                    })
+                    .collect()
+            }))
+        })
+    }
+
     fn namespace_exists(&self, request: ConnectorNamespaceRequest) -> Result<bool, ConnectorError> {
         self.ensure_instance(&request.namespace.instance_id)?;
         let resources = PaimonRequestControl::from_request(&request.context);
@@ -925,6 +1003,32 @@ impl ConnectorMetadata for PaimonGenericControl {
                 })
                 .collect()
         }))
+    }
+
+    fn list_tables_async(
+        &self,
+        request: ConnectorListTablesRequest,
+    ) -> futures::future::BoxFuture<'_, Result<Vec<ConnectorTableIdentity>, ConnectorError>> {
+        Box::pin(async move {
+            self.ensure_instance(&request.namespace.instance_id)?;
+            let resources = PaimonRequestControl::from_request(&request.context);
+            let catalog = self.catalog(&request.context)?;
+            let namespace = request.namespace.namespace.clone();
+            let bound = request.bound;
+            let entries = resources
+                .until(async move { catalog.list_tables(&namespace, bound).await })
+                .await??;
+            Ok(entries.map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|table| ConnectorTableIdentity {
+                        instance_id: self.descriptor.instance_id.clone(),
+                        namespace: request.namespace.namespace.clone(),
+                        table: Arc::from(table),
+                    })
+                    .collect()
+            }))
+        })
     }
 
     fn prepare_table(

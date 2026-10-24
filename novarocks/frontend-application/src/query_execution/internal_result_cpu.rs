@@ -57,7 +57,7 @@ pub use metadata_geometry::InternalCpuMetadataGeometry;
 
 // The whole maximum coexistence envelope is authorized before any domain
 // decoder/collector construction. Nested stages reuse it, never acquire again.
-pub(super) const INTERNAL_PEAK_BYTES: u64 = (2 * 336 + 256 + 32 + 32 + 8 + 8) * 1024 * 1024;
+pub(crate) const INTERNAL_PEAK_BYTES: u64 = (2 * 336 + 256 + 32 + 32 + 8 + 8) * 1024 * 1024;
 
 /// Coverage check for closed first-party factories which embed the supplied
 /// alias into their actual payload backing before handing it off.
@@ -151,6 +151,13 @@ impl FrontendResultCapacityProfile {
             capacity,
             internal_positions,
         })
+    }
+
+    /// Initial Root payload required by the same closed decoder/collector
+    /// construction guard. This is the factory's actual coexistence envelope,
+    /// not the configured Internal window maximum or a second CPU payload fee.
+    pub const fn internal_initial_payload_bytes(self) -> u64 {
+        INTERNAL_PEAK_BYTES
     }
 
     /// Known metadata from the actual closed production job factory.

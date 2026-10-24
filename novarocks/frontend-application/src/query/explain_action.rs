@@ -24,7 +24,8 @@ use crate::query_execution::logical_execution::OriginalComputationStart;
 use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_query_application::api::{ExecutionHandle, LocalResultProducer, OwnedLocalResult};
 use novarocks_query_application::session_control::{
-    GovernedQueryStatementOwner, GovernedStatementAction, StatementActionValue,
+    GovernedActionContext, GovernedQueryStatementOwner, GovernedStatementAction,
+    StatementActionValue,
 };
 use std::task::{Context, Poll};
 
@@ -170,7 +171,7 @@ impl GovernedStatementAction for ExplainStatementAction {
     }
     fn poll_action(
         &mut self,
-        owner: &mut GovernedQueryStatementOwner,
+        owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<StatementActionValue, QueryServiceError>> {
         let result = match self.poll_explain(owner, cx) {
@@ -199,7 +200,7 @@ impl GovernedStatementAction for ExplainStatementAction {
 impl ExplainStatementAction {
     fn poll_explain(
         &mut self,
-        owner: &mut GovernedQueryStatementOwner,
+        owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<StatementActionValue, QueryServiceError>> {
         if !self.preparation_started {
@@ -406,7 +407,7 @@ pub(crate) struct ExplainStatementGeometry {
     pub(crate) preparation: std::alloc::Layout,
     pub(crate) diagnostics: std::alloc::Layout,
     pub(crate) receiver: std::alloc::Layout,
-    pub(crate) provider_custody: [std::alloc::Layout; 8],
+    pub(crate) provider_custody: [std::alloc::Layout; 10],
 }
 pub(crate) fn statement_action_geometry() -> ExplainStatementGeometry {
     fn future_layout<I, F: Future>(_: impl Fn(I) -> F) -> std::alloc::Layout {
@@ -441,6 +442,22 @@ mod tests {
     impl LogicalExecutionLauncher for NoNativeLaunch {
         fn reserve_identity(&self) -> Result<ReservedExecutionIdentity, QueryExecutionError> {
             panic!("Local EXPLAIN cannot reserve Native work")
+        }
+        fn start_read_in(
+            &self,
+            _: &mut Option<crate::query_execution::completion::PreparedLogicalRead>,
+            _: &mut Option<novarocks_workload_control::WorkOwner>,
+            _: &QueryResultCapacityBinding,
+            _: &Arc<crate::query::read_action::io_source::ReadMetadataIoSource>,
+            _: &mut OriginalComputationStart,
+            #[cfg(novarocks_dev_controls)] _: Option<
+                crate::preparation_diagnostics::StatementObservationHandle,
+            >,
+        ) -> Result<
+            novarocks_query_application::api::LogicalExecutionStartAttempt,
+            QueryExecutionError,
+        > {
+            panic!("EXPLAIN fixture cannot start ordinary Read")
         }
         fn start_computation_in(
             &self,
@@ -557,7 +574,10 @@ mod tests {
                 capacity: binding,
             })
         }));
-        let produce = futures::future::poll_fn(|cx| action.poll_action(&mut owner, cx));
+        let produce = futures::future::poll_fn(|cx| {
+            let window = owner.result_window_alias();
+            action.poll_action(&mut owner.action_context(window.as_ref()), cx)
+        });
         let signal = async move {
             tokio::task::yield_now().await;
             send.send(()).unwrap();
@@ -588,7 +608,11 @@ mod tests {
             .as_ref()
             .unwrap()
             .cancel(novarocks_workload_control::CancellationReason::Requested);
-        let result = futures::future::poll_fn(|cx| action.poll_action(&mut owner, cx)).await;
+        let result = futures::future::poll_fn(|cx| {
+            let window = owner.result_window_alias();
+            action.poll_action(&mut owner.action_context(window.as_ref()), cx)
+        })
+        .await;
         let Err(error) = result else {
             panic!("cancelled preparation cannot deliver a result");
         };

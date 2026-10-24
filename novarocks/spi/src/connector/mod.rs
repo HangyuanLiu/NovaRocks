@@ -85,7 +85,7 @@ pub use cleanup_maintenance::{
     ConnectorCleanupMaintenanceLease, ConnectorCleanupMaintenanceResolver,
     ConnectorCleanupOperation, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefIdentity,
     ConnectorCleanupOwnedRefSelection, ConnectorCleanupPlan, ConnectorCleanupPlanSummary,
-    ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest,
+    ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest, ConnectorCleanupScanSafety,
     MAX_CONNECTOR_CLEANUP_BATCH_OBJECTS, MAX_CONNECTOR_CLEANUP_BATCHES,
     MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_BYTES, MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS,
     MAX_CONNECTOR_CLEANUP_OWNED_REF_SELECTION_ITEMS, MAX_CONNECTOR_CLEANUP_PROVIDER_PAYLOAD_BYTES,
@@ -183,7 +183,7 @@ pub use io_admission::{
     ConnectorIoAdmissionPort, ConnectorIoCleanupFuture, ConnectorIoPermit,
     ConnectorIoProgressSource, ConnectorIoRequest, ConnectorIoRequestSource,
     ConnectorIoStreamCustody, ConnectorIoWeakPhase, HdfsServiceOrigin, NetworkServiceOrigin,
-    SharedDependency,
+    SelectedThriftServiceOrigin, SharedDependency, ThriftServiceOrigin,
 };
 pub use listing::{ConnectorListingBound, ConnectorListingBudget, ConnectorListingCollector};
 pub use metadata::{
@@ -211,16 +211,16 @@ pub use metadata::{
 };
 pub use metadata_maintenance::{
     CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION, ConnectorMaxCompactableDataFiles,
-    ConnectorMaxCompactableDataFilesRequest, ConnectorMetadataMaintenance,
-    ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenanceExecution,
-    ConnectorMetadataMaintenanceExecutionSource, ConnectorMetadataMaintenanceFuture,
-    ConnectorMetadataMaintenanceIoGeometry, ConnectorMetadataMaintenanceIoProfile,
-    ConnectorMetadataMaintenanceLease, ConnectorMetadataMaintenanceOperation,
-    ConnectorMetadataMaintenanceOutcome, ConnectorMetadataMaintenancePlan,
-    ConnectorMetadataMaintenancePlanSummary, ConnectorMetadataMaintenancePlanningRequest,
-    ConnectorMetadataMaintenanceReceipt, ConnectorMetadataMaintenanceReceiptSummary,
-    ConnectorMetadataMaintenanceResolver, EXPIRE_TABLE_VERSIONS_KIND,
-    MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES,
+    ConnectorMaxCompactableDataFilesRequest, ConnectorMetadataCleanupResponsibility,
+    ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceExecuteRequest,
+    ConnectorMetadataMaintenanceExecution, ConnectorMetadataMaintenanceExecutionSource,
+    ConnectorMetadataMaintenanceFuture, ConnectorMetadataMaintenanceIoGeometry,
+    ConnectorMetadataMaintenanceIoProfile, ConnectorMetadataMaintenanceLease,
+    ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenanceOutcome,
+    ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenancePlanSummary,
+    ConnectorMetadataMaintenancePlanningRequest, ConnectorMetadataMaintenanceReceipt,
+    ConnectorMetadataMaintenanceReceiptSummary, ConnectorMetadataMaintenanceResolver,
+    EXPIRE_TABLE_VERSIONS_KIND, MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES,
     MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES, REWRITE_METADATA_LAYOUT_KIND,
 };
 pub use mutation::{

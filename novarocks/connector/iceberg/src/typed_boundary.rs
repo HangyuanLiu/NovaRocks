@@ -853,7 +853,62 @@ impl IcebergTypedRequestControlFactory {
     }
 }
 
+/// Fixed first-party headers of the actual serial FE read program. Metadata
+/// files are awaited one at a time by build_read_snapshot_in_domain; one
+/// additional slot covers its actual nested credential/authorization phase.
+/// SDK graphs and retained variable payload are admitted where they form.
+pub fn read_io_geometry()
+-> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry, ConnectorError> {
+    let io = std::num::NonZeroUsize::new(2).unwrap();
+    let headers = std::mem::size_of::<IcebergTypedBoundary>()
+        .checked_add(std::mem::size_of::<IcebergTypedRequestControlFactory>())
+        .and_then(|n| n.checked_add(std::mem::size_of::<ConnectorReadRequestControl>()))
+        .and_then(|n| {
+            n.checked_add(std::mem::size_of::<
+                novarocks_spi::connector::read_stack::ConnectorReadRelationPreparation,
+            >())
+        })
+        .ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "read Source header geometry overflow",
+            )
+        })?;
+    let metadata = std::num::NonZeroU64::new(u64::try_from(headers).map_err(|_| {
+        ConnectorError::new(
+            ConnectorErrorKind::Internal,
+            "read Source header geometry overflow",
+        )
+    })?)
+    .unwrap();
+    Ok(
+        novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry::new(
+            io, metadata, metadata,
+        ),
+    )
+}
+
 impl ConnectorReadRequestControlFactory for IcebergTypedRequestControlFactory {
+    fn planning_io_geometry(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry, ConnectorError>
+    {
+        read_io_geometry()
+    }
+
+    fn visit_planning_dependencies(
+        &self,
+        visit: &mut dyn FnMut(
+            &novarocks_spi::connector::SharedDependency,
+        ) -> Result<(), ConnectorError>,
+    ) -> Result<(), ConnectorError> {
+        // Reuse the exact generation's original REST/FS/Thrift route author.
+        for dependency in self.template.runtime.read_planning_initial_dependencies()? {
+            visit(&dependency)?;
+        }
+        Ok(())
+    }
+
     fn for_planning(
         &self,
         request: &novarocks_spi::connector::ConnectorPlanningContext,

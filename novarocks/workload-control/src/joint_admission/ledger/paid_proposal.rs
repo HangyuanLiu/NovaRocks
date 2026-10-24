@@ -45,6 +45,8 @@ pub use cpu_action::{
     InternalCpuActionAdmission, InternalCpuActionSource, InternalCpuFactoryBinding,
     InternalResultClosedFactoryDescriptor,
 };
+mod source_cohort;
+pub use source_cohort::SourceCohort;
 mod production_growth;
 pub(super) use production_growth::{production_change_count, validate_control_productions};
 mod root_payload;
@@ -54,7 +56,9 @@ pub use root_payload::{
 pub(super) use root_payload::{RootPayloadFence, validate_root_payload};
 mod root_stage;
 pub(super) use root_stage::validate_root_stage;
-pub use root_stage::{RootStageAdmission, RootStageProposal, RootStageReady, RootStageSource};
+pub use root_stage::{
+    InternalManifestBinding, RootStageAdmission, RootStageProposal, RootStageReady, RootStageSource,
+};
 
 /// Closed actual authors: a Provider-owned fact or its borrowed selected route.
 /// Neither variant can run an external constructor under the WC mutex.
@@ -69,7 +73,12 @@ impl DependencyInput<'_> {
             (Self::Selected(selected), SharedDependency::Network(fact)) => {
                 fact.matches_selected(*selected)
             }
-            (Self::Selected(_), SharedDependency::LocalHost | SharedDependency::Hdfs(_)) => false,
+            (
+                Self::Selected(_),
+                SharedDependency::LocalHost
+                | SharedDependency::Hdfs(_)
+                | SharedDependency::Thrift(_),
+            ) => false,
         }
     }
     fn into_owned(self) -> SharedDependency {
@@ -80,7 +89,8 @@ impl DependencyInput<'_> {
     }
 }
 
-struct PendingChange {
+pub(super) struct PendingChange {
+    pub(super) origin: GroupOrigin,
     source: Option<JointClaimView>,
     original: Option<(Arc<ProfileFacts>, JointResources)>,
     selected: Vec<DependencyRef>,
@@ -123,18 +133,19 @@ fn track_dependency_union(
 /// ```
 #[must_use = "A proposal must be submitted or dropped"]
 pub struct JointProposal {
+    pub(super) root_domain: Option<RootDomainChange>,
     root_stage: Option<RootStageFence>,
     root_payload: Option<RootPayloadFence>,
     cpu_action: Option<CpuActionFence>,
     control_action: Option<ControlActionFence>,
     native_action: Option<NativeActionFence>,
-    records: Vec<ChangeRecord>,
+    pub(super) records: Vec<ChangeRecord>,
     // The complete source union, shared by every change in this one paid
     // request. Ordinals grant no access and retain no canonical fact alias.
     dependency_union: Vec<u64>,
-    current: Option<PendingChange>,
+    pub(super) current: Option<PendingChange>,
     custody: Option<ProposalConstruction>,
-    scope: WorkScope,
+    pub(super) scope: WorkScope,
     config: Arc<ValidatedJointCapacityConfig>,
     class: WorkClass,
     started: usize,
@@ -192,6 +203,34 @@ impl JointAdmissionHandle {
         }
     }
 
+    pub(super) fn try_begin_root_writer_signal(
+        &self,
+        scope: WorkScope,
+        lane: JointLane,
+        observed: Option<u64>,
+    ) -> Result<JointTryBegin<JointProposal, JointProposalSlotSignal>, WorkError> {
+        match self.try_reserve_root_writer(&scope, lane, observed)? {
+            ProposalReservation::Reserved(Some(custody)) => self
+                .paid_proposal_with_custody(scope, custody)
+                .map(JointTryBegin::Started),
+            ProposalReservation::Reserved(None) => Err(WorkError::NotReady),
+            ProposalReservation::Full(target) => Ok(JointTryBegin::Full(
+                JointProposalSlotSignal::new(Arc::downgrade(&self.inner), target),
+            )),
+        }
+    }
+    pub(super) fn try_begin_root_writer(
+        &self,
+        scope: WorkScope,
+        lane: JointLane,
+        observed: Option<u64>,
+    ) -> Result<JointTryBegin<JointProposal>, WorkError> {
+        match self.try_begin_root_writer_signal(scope, lane, observed)? {
+            JointTryBegin::Started(proposal) => Ok(JointTryBegin::Started(proposal)),
+            JointTryBegin::Full(signal) => Ok(JointTryBegin::Full(signal.into_wait())),
+        }
+    }
+
     fn paid_proposal_with_custody(
         &self,
         scope: WorkScope,
@@ -207,6 +246,7 @@ impl JointAdmissionHandle {
             (Arc::clone(&ledger.config), node.class)
         };
         let mut proposal = JointProposal {
+            root_domain: None,
             root_stage: None,
             root_payload: None,
             cpu_action: None,
@@ -253,6 +293,7 @@ impl JointAdmissionHandle {
         }
         match (source.source, first_bind) {
             (ClaimSource::Physical, false) => {}
+            (ClaimSource::Computation { .. }, false) if delta == JointResources::ZERO => {}
             (ClaimSource::Payload { .. }, false)
                 if delta
                     == JointResources::ZERO.with(
@@ -264,7 +305,7 @@ impl JointAdmissionHandle {
                     && old.active_amounts == state.cancellations.slots[slot.0].base => {}
             (ClaimSource::NodeControl { slot, .. }, false)
                 if delta == JointResources::ZERO
-                    && !old.active_facts.dependencies.is_empty()
+                    && root_domains::has_effective_domains(&state, &old.active_facts, true)
                     && old.active_amounts == state.cancellations.slots[slot.0].base => {}
             _ => return Err(WorkError::Conflict),
         }
@@ -353,7 +394,11 @@ impl JointProposal {
         if amounts.get(JointResource::InternalCpuJobs) != 0 && self.cpu_action.is_none() {
             return Err(WorkError::Conflict);
         }
+        let origin = original
+            .as_ref()
+            .map_or(GroupOrigin::Frozen, |(facts, _)| facts.key.origin);
         self.current = Some(PendingChange {
+            origin,
             source,
             original,
             selected,
@@ -524,6 +569,7 @@ impl JointProposal {
         }
         let facts = Arc::new(ProfileFacts {
             key: Arc::new(ProfileKey {
+                origin: change.origin,
                 class: class_index(self.class),
                 lane: change.lane as usize,
                 dependencies: change.selected.iter().map(|d| d.ordinal).collect(),
@@ -538,9 +584,9 @@ impl JointProposal {
             }),
             class: self.class,
             lane: change.lane,
-            // Pinned Arc::from(Vec) copies into the exact Arc slice before
-            // releasing this capacity-K Vec. No Box/shrink author intervenes.
-            dependencies: change.selected.into(),
+            // Move the original paid capacity-K backing into the graph. This
+            // creates no overlapping second element array during capture.
+            dependencies: Arc::new(change.selected),
         });
         assert!(self.records.len() < self.records.capacity());
         self.records.push(ChangeRecord {
@@ -599,6 +645,7 @@ impl JointProposal {
             // Its queue author installs the original admission before any wake.
             handle.queue_request_mode(
                 PreparedRequest {
+                    root_domain: self.root_domain.take(),
                     root_stage: self.root_stage,
                     root_payload: self.root_payload,
                     cpu_action: self.cpu_action,

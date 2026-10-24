@@ -38,8 +38,8 @@ use async_trait::async_trait;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorOperationControl, ConnectorProcessLocalPayload, ConnectorProviderBindingKey,
-    ConnectorRequestContext, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome,
+    ConnectorRequestContext, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -176,6 +176,14 @@ struct JournalState<R> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct JournalEntryRef(Uuid);
 
+pub(crate) enum RetainedPublicationProjection<R> {
+    Committed {
+        effect: ExternalMutationEffect,
+        receipt: R,
+        finalization: ExternalMutationFinalization,
+    },
+    Settled(ExternalMutationOutcome<R>),
+}
 pub(crate) struct PublicationJournal<R> {
     operation: OperationToken,
     frontier: u64,
@@ -212,6 +220,12 @@ enum Phase<R> {
     Unknown(Checked<R>, ConnectorMutationFailure),
 }
 impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
+    pub(crate) const fn fixed_backing_bytes() -> usize {
+        // Exactly one original Arc-backed empty journal state. Variable
+        // entries and reports retain their original formation-point receipts.
+        std::mem::size_of::<Mutex<JournalState<R>>>() + std::mem::size_of::<[usize; 2]>()
+    }
+
     #[cfg(test)]
     pub(crate) fn new(operation: OperationToken) -> Self {
         Self::new_with_activity(operation, None)
@@ -656,6 +670,103 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
         );
         entry.finalization = merge_finalization(entry.finalization.clone(), finalization);
     }
+    /// Pure observation of the actual final whole-operation cleanup report.
+    /// That author covers all prior retry objects except the published set.
+    /// An absent report, Unknown, or an unconcluded entry proves no disposal.
+    pub(crate) fn cleanup_is_complete(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(current) = state
+            .current
+            .get(&self.frontier)
+            .and_then(|id| state.entries.get(id))
+        else {
+            return false;
+        };
+        matches!(
+            &current.cleanup_report,
+            Some(IcebergCleanupReport::Complete { .. })
+        ) && matches!(&current.cleanup, ExternalMutationFinalization::Complete)
+            && state.entries.values().all(|entry| {
+                match &entry.phase {
+                    EntryPhase::Concluded(
+                        DispatchEvidence::Applied { .. }
+                        | DispatchEvidence::NotDispatched { .. }
+                        | DispatchEvidence::Rejected { .. },
+                    ) => true,
+                    // Exact positive observation may prove the effect while
+                    // preserving the original Unknown dispatch evidence.
+                    EntryPhase::Concluded(DispatchEvidence::Unknown { .. }) => {
+                        entry.positive_proof.is_some()
+                    }
+                    _ => false,
+                }
+            })
+    }
+
+    /// Latest actual inventory disposal is independent of cumulative failure
+    /// diagnostics. No snapshot state or historical finalization grants it.
+    pub(crate) fn cleanup_inventory_is_disposed(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(current) = state
+            .current
+            .get(&self.frontier)
+            .and_then(|id| state.entries.get(id))
+        else {
+            return false;
+        };
+        matches!(
+            &current.cleanup_report,
+            Some(IcebergCleanupReport::Complete { .. })
+        ) && state.entries.values().all(|entry| match &entry.phase {
+            EntryPhase::Concluded(
+                DispatchEvidence::Applied { .. }
+                | DispatchEvidence::NotDispatched { .. }
+                | DispatchEvidence::Rejected { .. },
+            ) => true,
+            EntryPhase::Concluded(DispatchEvidence::Unknown { .. }) => {
+                entry.positive_proof.is_some()
+            }
+            _ => false,
+        })
+    }
+    /// Only this journal's exact positive proof and retained-object set can
+    /// revoke deletion rights for the committed objects before cleanup.
+    pub(crate) async fn settle_committed_cleanup_in(
+        &self,
+        operation: &IcebergCommitOperation,
+        current: &ConnectorRequestContext,
+    ) -> std::result::Result<(), ConnectorError> {
+        if operation.token() != self.operation {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Committed cleanup has a foreign original operation",
+            ));
+        }
+        let Phase::Committed(_, checked, _) = self.phase() else {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Committed cleanup requires the original positive publication proof",
+            ));
+        };
+        let entry = self.current_entry().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Committed cleanup has no original journal entry",
+            )
+        })?;
+        let report = operation
+            .cleanup_after_commit_in(&checked.retained, current)
+            .await;
+        self.record_entry_cleanup_report(entry, report);
+        Ok(())
+    }
+
     /// Diagnostic cleanup is an independent dimension of the SAME entry.
     pub(crate) fn record_entry_cleanup(
         &self,
@@ -1001,6 +1112,27 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
         ObservedPublisher {
             inner,
             journal: self.clone(),
+        }
+    }
+    /// Before safe GC there is no report to project. The actual positive
+    /// journal owns needed business facts; cleanup remains a real continuation.
+    pub(crate) fn project_retained_committed_frontier(
+        &self,
+        report: Report,
+    ) -> RetainedPublicationProjection<R> {
+        if matches!(&report.publication, PublicationOutcome::Committed(_))
+            && matches!(&report.cleanup, IcebergCleanupReport::NotAttempted)
+        {
+            let Phase::Committed(proof, checked, finalization) = self.phase() else {
+                panic!("committed frontier requires actual positive proof")
+            };
+            RetainedPublicationProjection::Committed {
+                effect: proof.effect,
+                receipt: checked.receipts.for_effect(proof.effect),
+                finalization,
+            }
+        } else {
+            RetainedPublicationProjection::Settled(self.project(report))
         }
     }
     pub(crate) fn project(&self, report: Report) -> ExternalMutationOutcome<R> {
@@ -2473,6 +2605,48 @@ mod tests {
         assert!(descriptor.first_dispatch_ms.is_none());
     }
     #[tokio::test]
+    async fn retained_positive_frontier_does_not_invent_a_cleanup_report() {
+        let (journal, preparation) = catalog_journal();
+        journal
+            .claim_dispatch()
+            .unwrap()
+            .begin_dispatch(&preparation, &MemoryDispatchBarrier)
+            .await
+            .unwrap();
+        journal.conclude(&CatalogOutcome::committed(
+            CommitProof::applied(None),
+            ExternalMutationEffect::Applied,
+        ));
+        let entry = journal.current_entry().unwrap();
+        let frontier = journal.project_retained_committed_frontier(Report {
+            publication: PublicationOutcome::Committed(CommitProof::applied(None)),
+            cleanup: IcebergCleanupReport::NotAttempted,
+        });
+        assert!(matches!(
+            frontier,
+            RetainedPublicationProjection::Committed {
+                finalization: ExternalMutationFinalization::Complete,
+                ..
+            }
+        ));
+        assert!(!journal.cleanup_inventory_is_disposed());
+        assert!(
+            journal
+                .state
+                .lock()
+                .unwrap()
+                .entries
+                .get(&entry.0)
+                .unwrap()
+                .cleanup_report
+                .is_none()
+        );
+        // Only this actual cleanup author can install an inventory report.
+        journal.record_entry_cleanup_report(entry, IcebergCleanupReport::Complete { deleted: 0 });
+        assert!(journal.cleanup_inventory_is_disposed());
+    }
+
+    #[tokio::test]
     async fn catalog_proof_is_recorded_before_finalization_and_cannot_be_overwritten() {
         let (journal, preparation) = catalog_journal();
         journal
@@ -2515,6 +2689,39 @@ mod tests {
         ));
     }
     #[tokio::test]
+    async fn latest_disposal_does_not_erase_historical_cleanup_failure() {
+        let (journal, preparation) = catalog_journal();
+        let entry = journal
+            .claim_dispatch()
+            .unwrap()
+            .begin_dispatch(&preparation, &MemoryDispatchBarrier)
+            .await
+            .unwrap();
+        assert!(!journal.cleanup_inventory_is_disposed());
+        journal.conclude(&CatalogOutcome::committed(
+            CommitProof::applied(None),
+            ExternalMutationEffect::Applied,
+        ));
+        journal.record_entry_cleanup(
+            entry,
+            ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::Unavailable,
+                "earlier real cleanup failed",
+            )),
+        );
+        assert!(!journal.cleanup_inventory_is_disposed());
+        journal.record_entry_cleanup_report(entry, IcebergCleanupReport::Complete { deleted: 1 });
+        assert!(journal.cleanup_inventory_is_disposed());
+        assert!(!journal.cleanup_is_complete());
+        assert!(matches!(
+            journal.catalog_entry_outcome(entry),
+            ExternalMutationOutcome::KnownCommitted {
+                cleanup: ExternalMutationFinalization::Failed(_),
+                ..
+            }
+        ));
+    }
+    #[tokio::test]
     async fn absent_cleanup_attempt_preserves_exact_completion_and_independent_failure() {
         let (journal, preparation) = catalog_journal();
         let entry = journal
@@ -2529,6 +2736,7 @@ mod tests {
         ));
         let exact = IcebergCleanupReport::Complete { deleted: 2 };
         journal.record_entry_cleanup_report(entry, exact.clone());
+        assert!(journal.cleanup_is_complete());
         let absent = || Report {
             publication: PublicationOutcome::Committed(CommitProof::applied(None)),
             cleanup: IcebergCleanupReport::NotAttempted,
@@ -2555,6 +2763,7 @@ mod tests {
             "independent reclamation failure",
         );
         journal.record_entry_cleanup(entry, ExternalMutationFinalization::Failed(failure.clone()));
+        assert!(!journal.cleanup_is_complete());
         let ExternalMutationOutcome::KnownCommitted { cleanup, .. } = journal.project(absent())
         else {
             unreachable!()

@@ -23,7 +23,7 @@ use crate::query_execution::maintenance::{
 };
 use novarocks_query_application::{
     api::LocalResultProducer,
-    session_control::{GovernedQueryStatementOwner, GovernedStatementAction, StatementActionValue},
+    session_control::{GovernedActionContext, GovernedStatementAction, StatementActionValue},
 };
 use std::task::{Context, Poll};
 
@@ -68,6 +68,20 @@ pub(super) fn prepare(
     }))
 }
 
+/// Full fixed frontend package for one original metadata statement root.
+pub(crate) fn fixed_source_bytes(
+    geometry: &novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
+    k: usize,
+) -> Result<u64, novarocks_workload_control::WorkError> {
+    use novarocks_workload_control::WorkError;
+    // Call is already inline in the action. Replace its sub-layout, rather
+    // than summing the same inline bytes twice.
+    MaintenanceCommandExecutor::frontend_fixed_source_bytes(geometry, k)?
+        .checked_sub(std::mem::size_of::<MaintenanceCommandCall>() as u64)
+        .and_then(|n| n.checked_add(std::mem::size_of::<MetadataMaintenanceAction>() as u64))
+        .ok_or(WorkError::ArithmeticOverflow)
+}
+
 struct MetadataMaintenanceAction {
     call: MaintenanceCommandCall,
     origin: novarocks_workload_control::ResultWindowAlias,
@@ -79,7 +93,7 @@ struct MetadataMaintenanceAction {
 impl MetadataMaintenanceAction {
     fn poll_result(
         &mut self,
-        owner: &mut GovernedQueryStatementOwner,
+        owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<StatementActionValue, QueryServiceError>> {
         if !self.origin.is_for_scope(owner.scope()) {
@@ -112,12 +126,26 @@ impl MetadataMaintenanceAction {
         // The source owns the Call and its publication facts independently of
         // its completed Product F and of the UI observer's continued presence.
         let disposition = self.call.publication_disposition();
+        let applied = match self.call.has_applied_publication() {
+            Ok(applied) => applied,
+            Err(message) => {
+                return Poll::Ready(Err(match disposition {
+                    Some(disposition) => internal_error(message)
+                        .attach_maintenance_publication_disposition(disposition),
+                    None => internal_error(message),
+                }));
+            }
+        };
         let result = self
             .result
             .take()
             .expect("stable original maintenance result");
-        let result = match select_maintenance_completion(result, disposition, cancellation.reason())
-        {
+        let result = match select_maintenance_completion(
+            result,
+            disposition,
+            applied,
+            cancellation.reason(),
+        ) {
             Ok(result) => result,
             Err(error) => return Poll::Ready(Err(error)),
         };
@@ -146,6 +174,15 @@ impl MetadataMaintenanceAction {
 }
 
 impl GovernedStatementAction for MetadataMaintenanceAction {
+    fn handoff_residual_in(
+        &mut self,
+        target: &mut Option<
+            Box<dyn novarocks_query_application::session_control::GovernedStatementResidual>,
+        >,
+    ) -> Result<(), novarocks_query_application::api::StatementNativeHealthFailure> {
+        self.call.handoff_residual_in(target)
+    }
+
     fn local_health_failure(
         &self,
     ) -> Option<novarocks_query_application::api::StatementNativeHealthFailure> {
@@ -160,7 +197,7 @@ impl GovernedStatementAction for MetadataMaintenanceAction {
 
     fn poll_action(
         &mut self,
-        owner: &mut GovernedQueryStatementOwner,
+        owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<StatementActionValue, QueryServiceError>> {
         match self.poll_result(owner, cx) {
@@ -182,6 +219,7 @@ impl GovernedStatementAction for MetadataMaintenanceAction {
 fn select_maintenance_completion(
     result: Result<MaintenanceStatementResult, novarocks_table_maintenance::runtime::TerminalError>,
     disposition: Option<novarocks_spi::connector::LakePublicationDisposition>,
+    applied: bool,
     cancellation: Option<QueryCancellationReason>,
 ) -> Result<MaintenanceStatementResult, QueryServiceError> {
     use novarocks_spi::connector::LakePublicationDisposition;
@@ -197,7 +235,7 @@ fn select_maintenance_completion(
             })
         }
         Ok(result) => match cancellation {
-            Some(reason) if !committed => {
+            Some(reason) if !(committed && applied) => {
                 let mut error = cancellation_error(reason);
                 if let Some(disposition) = disposition {
                     error = error.attach_maintenance_publication_disposition(disposition);
@@ -230,6 +268,7 @@ mod tests {
                 select_maintenance_completion(
                     Ok(MaintenanceStatementResult::Ok),
                     Some(LakePublicationDisposition::KnownCommitted),
+                    true,
                     Some(reason.clone()),
                 ),
                 Ok(MaintenanceStatementResult::Ok)
@@ -239,6 +278,7 @@ mod tests {
                     "required cache invalidation failed",
                 )),
                 Some(LakePublicationDisposition::KnownCommitted),
+                true,
                 Some(reason),
             )
             .unwrap_err();
@@ -255,10 +295,26 @@ mod tests {
     }
 
     #[test]
+    fn no_op_completion_is_not_an_irreversible_publication() {
+        assert!(
+            select_maintenance_completion(
+                Ok(MaintenanceStatementResult::Ok),
+                Some(LakePublicationDisposition::KnownCommitted),
+                false,
+                Some(QueryCancellationReason::ExplicitKill {
+                    requester_connection_id: 7
+                }),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn cancellation_still_vetoes_unpublished_maintenance() {
         let error = select_maintenance_completion(
             Ok(MaintenanceStatementResult::Ok),
             None,
+            false,
             Some(QueryCancellationReason::DeadlineExceeded { timeout_ms: 1 }),
         )
         .unwrap_err();

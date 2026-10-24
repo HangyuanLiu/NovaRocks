@@ -29,8 +29,16 @@ use std::{
     task::{Context, Poll, Waker},
 };
 fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+    fixture_with_client(false)
+}
+fn fixture_with_client(
+    client: bool,
+) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     let count = 8;
-    let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 1, 2, &[]);
+    // The Client fixture retains two sibling stages and one descendant.
+    // This pays their child headers; the computation limit remains P=1.
+    let children_per_parent = if client { 2 } else { 1 };
+    let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], children_per_parent, 2, &[]);
     let mut config = JointCapacityConfig {
         global: JointResourceLimits::default(),
         classes: [JointResourceLimits::default(); 5],
@@ -124,6 +132,11 @@ fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
         .configure_joint_capacity(config.validate(&required).unwrap())
         .unwrap();
     control.configure_control_storage(storage).unwrap();
+    if client {
+        let mut config = novarocks_workload_control::ResultCapacityConfig::V1;
+        config.all_objects_bytes[0] = 8;
+        control.configure_result_capacity(config).unwrap();
+    }
     control.mark_ready().unwrap();
     (control, handle, driver)
 }
@@ -317,6 +330,17 @@ fn successive_real_closed_batches_reuse_the_root_payload_after_each_actual_activ
     let original =
         QueryResultCapacityBinding::from_internal_payload(&root_scope, &root_scope, grant).unwrap();
     let old = original.try_window_alias().unwrap();
+    let mut execution = QueryExecutionContext::new(
+        novarocks_types::ClusterRole::Fe,
+        crate::api::BackendTopologySnapshot::try_new(1, Vec::new()).unwrap(),
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+        crate::cancellation::QueryCancellationSource::new().view(),
+        novarocks_sql::compiler::SessionOptimizerSettings::default(),
+        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+    )
+    .with_result_capacity(original.try_clone().unwrap())
+    .unwrap();
+    let original_deadline = execution.deadline();
     for expected_bytes in [12, 16] {
         let stage = joint_child(&root_scope, &mut driver);
         let scope = stage.scope();
@@ -343,7 +367,40 @@ fn successive_real_closed_batches_reuse_the_root_payload_after_each_actual_activ
         drop(ready);
         drop(admission);
         drive(&mut driver);
-        let binding = original.for_child(&scope).unwrap();
+        assert!(matches!(
+            execution.for_internal_computation(original.for_child(&scope).unwrap()),
+            Err(WorkError::Conflict)
+        ));
+        let binding = QueryResultCapacityBinding::from_internal_computation(
+            &root_scope,
+            &stage,
+            grant,
+            computation.as_ref().unwrap(),
+        )
+        .unwrap();
+        execution = execution
+            .for_internal_computation(binding.try_clone().unwrap())
+            .unwrap();
+        assert_eq!(execution.deadline(), original_deadline);
+        assert!(
+            execution
+                .result_capacity()
+                .unwrap()
+                .window
+                .is_for_scope(&scope)
+        );
+        let retained = binding
+            .try_clone()
+            .unwrap()
+            .into_statement_retention()
+            .unwrap();
+        assert!(
+            retained
+                .window
+                .internal_manifest_binding()
+                .unwrap()
+                .is_none()
+        );
         let view = binding.try_window_alias().unwrap();
         assert!(old.shares_capacity_with(&view));
         old.check_backing_total(expected_bytes).unwrap();
@@ -361,12 +418,27 @@ fn successive_real_closed_batches_reuse_the_root_payload_after_each_actual_activ
         drop(activity);
         drive(&mut driver);
         assert!(observer.is_reclaimed().unwrap());
+        assert!(matches!(binding.scope().check(), Err(WorkError::Released)));
+        execution = execution.for_statement_retention(retained).unwrap();
+        let continued = execution.result_capacity().unwrap();
+        continued.scope().check().unwrap();
+        assert!(continued.window.is_for_scope(&root_scope));
+        assert!(old.shares_capacity_with(&continued.window));
+        continued
+            .window
+            .check_backing_total(expected_bytes)
+            .unwrap();
+        assert!(matches!(
+            execution.for_internal_computation(continued.try_clone().unwrap()),
+            Err(WorkError::Conflict)
+        ));
         // Both the old Root bytes and this stage's payload-only projection
         // remain alive while the original slot becomes reusable.
         assert!(old.shares_capacity_with(&view));
         drop(view);
         drop(binding);
     }
+    drop(execution);
     drop(old);
     drop(original);
     drop(payload);
@@ -390,3 +462,5 @@ fn joint_child(scope: &WorkScope, driver: &mut JointProgressDriver) -> WorkOwner
     drive(driver);
     target.unwrap()
 }
+
+mod client_computation_tests;

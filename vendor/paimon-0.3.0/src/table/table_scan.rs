@@ -20,6 +20,11 @@
 //! Reference: [pypaimon.read.table_scan.TableScan](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/read/table_scan.py)
 //! and [FullStartingScanner](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/read/scanner/full_starting_scanner.py).
 
+/// The original scan planner's bounded manifest read fanout. Exposed as a
+/// pure closed-factory fact; consumers do not create another executor/limit.
+pub const MANIFEST_READ_CONCURRENCY: usize = 64;
+
+use super::Table;
 use super::bucket_filter::compute_target_buckets;
 use super::format_table_scan::FormatTableScan;
 use super::global_index_scanner::RowRangeIndex;
@@ -27,29 +32,28 @@ use super::global_index_types::normalize_sorted_global_index_type;
 use super::kv_file_reader::retain_primary_key_conjuncts;
 use super::partition_filter::PartitionFilter;
 use super::stats_filter::{
-    data_evolution_group_matches_predicates, data_file_matches_predicates,
-    data_file_matches_predicates_for_table, group_by_overlapping_row_id, FileStatsRows,
-    ResolvedStatsSchema,
+    FileStatsRows, ResolvedStatsSchema, data_evolution_group_matches_predicates,
+    data_file_matches_predicates, data_file_matches_predicates_for_table,
+    group_by_overlapping_row_id,
 };
-use super::Table;
 use crate::io::FileIO;
 use crate::spec::{
-    avro::SharedSchemaCache, bucket_dir_name, BinaryRow, BucketFunctionType, CoreOptions,
-    DataField, DataFileMeta, FileKind, GlobalIndexSearchMode, IndexManifest, IndexManifestEntry,
-    ManifestEntry, PartitionComputer, Predicate, Snapshot, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
-    SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
-    VALUE_KIND_FIELD_NAME,
+    BinaryRow, BucketFunctionType, CoreOptions, DataField, DataFileMeta, FileKind,
+    GlobalIndexSearchMode, IndexManifest, IndexManifestEntry, ManifestEntry, PartitionComputer,
+    Predicate, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID,
+    SEQUENCE_NUMBER_FIELD_NAME, Snapshot, VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
+    avro::SharedSchemaCache, bucket_dir_name,
 };
+use crate::table::ScanTrace;
 use crate::table::bin_pack::split_for_batch;
 use crate::table::merge_tree_split_generator::{
-    merge_tree_split_for_batch, KeyComparator, SplitGroup,
+    KeyComparator, SplitGroup, merge_tree_split_for_batch,
 };
 use crate::table::schema_manager::SchemaManager;
 use crate::table::source::{
-    any_range_overlaps_file, intersect_ranges_with_file, merge_row_ranges, DataSplit,
-    DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
+    DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
+    any_range_overlaps_file, intersect_ranges_with_file, merge_row_ranges,
 };
-use crate::table::ScanTrace;
 use futures::{StreamExt, TryStreamExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -265,7 +269,7 @@ async fn read_all_manifest_entries(
                     Ok::<_, crate::Error>((filtered, counters))
                 }
             })
-            .buffered(64)
+            .buffered(MANIFEST_READ_CONCURRENCY)
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -2065,21 +2069,22 @@ impl<'a> PaimonTableScan<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
+        LimitPushdownAccumulator, PaimonTableScan, RowRangeIndex, TableScan,
         data_evolution_row_range_groups, data_file_overlaps_row_range_index,
         manifest_file_overlaps_row_range_index, prune_data_evolution_group_by_read_fields,
         retain_index_manifest_entry, retain_manifest_entry_row_range_groups,
         retain_manifest_row_range_components, should_skip_level_zero_for_scan,
-        split_row_ranges_for_files, LimitPushdownAccumulator, PaimonTableScan, RowRangeIndex,
-        TableScan,
+        split_row_ranges_for_files,
     };
+    use crate::Error;
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::{
-        stats::BinaryTableStats, ArrayType, BinaryRow, BinaryRowBuilder, BucketFunctionType,
-        CommitKind, DataField, DataFileMeta, DataType, Datum, DeletionVectorMeta, FileKind,
-        IndexFileMeta, IndexManifestEntry, IntType, ManifestEntry, ManifestFileMeta, Predicate,
-        PredicateBuilder, PredicateOperator, Schema as PaimonSchema, Snapshot, TableSchema,
-        VarCharType,
+        ArrayType, BinaryRow, BinaryRowBuilder, BucketFunctionType, CommitKind, DataField,
+        DataFileMeta, DataType, Datum, DeletionVectorMeta, FileKind, IndexFileMeta,
+        IndexManifestEntry, IntType, ManifestEntry, ManifestFileMeta, Predicate, PredicateBuilder,
+        PredicateOperator, Schema as PaimonSchema, Snapshot, TableSchema, VarCharType,
+        stats::BinaryTableStats,
     };
     use crate::table::bucket_filter::{compute_target_buckets, extract_predicate_for_keys};
     use crate::table::partition_filter::PartitionFilter;
@@ -2089,7 +2094,6 @@ mod tests {
         group_by_overlapping_row_id,
     };
     use crate::table::{CommitMessage, Table, TableCommit};
-    use crate::Error;
     use bytes::Bytes;
     use chrono::{DateTime, Utc};
     use std::collections::{HashMap, HashSet};

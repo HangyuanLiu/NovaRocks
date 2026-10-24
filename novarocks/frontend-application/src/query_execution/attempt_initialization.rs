@@ -477,9 +477,15 @@ pub(super) fn check_source_close(
     }
 }
 
+enum SourceChildAdmission {
+    LegacyIndividual,
+    Cohort(crate::query_execution::native_execution_adapter::source_cohort::NativeSourceCohort),
+}
+
 struct ProductionInitializationState {
     work_scope: WorkScope,
     result_window: ResultWindowAlias,
+    source_children: SourceChildAdmission,
     execution_id: QueryExecutionId,
     artifacts: Option<PreparedDistributedQuery>,
     schedule: Option<ValidatedFragmentSchedule>,
@@ -700,10 +706,21 @@ impl SerialAttemptInitialization for ProductionInitializationState {
         Ok(Some(AttemptSourceRecipe {
             identity,
             recipe: ProductionSourceRecipe {
-                admission: ConnectorBlockingIoResponsibility::request(
-                    &self.work_scope,
-                    &self.result_window,
-                )
+                admission: match &self.source_children {
+                    SourceChildAdmission::Cohort(cohort) => {
+                        ConnectorBlockingIoResponsibility::request_from_cohort(
+                            &self.work_scope,
+                            &self.result_window,
+                            cohort.clone(),
+                        )
+                    }
+                    SourceChildAdmission::LegacyIndividual => {
+                        ConnectorBlockingIoResponsibility::request(
+                            &self.work_scope,
+                            &self.result_window,
+                        )
+                    }
+                }
                 .map_err(|error| failed(error.to_string()))?,
                 source,
                 session: self.session.as_ref().unwrap().clone(),
@@ -841,6 +858,7 @@ impl AttemptInitializing {
             runtime,
             &mut credential_lease_source,
             lifecycle,
+            SourceChildAdmission::LegacyIndividual,
         )
     }
 
@@ -861,6 +879,7 @@ impl AttemptInitializing {
         runtime: FrontendDataRuntime,
         credential_lease_source: &mut Option<RoundCredentialLeaseSource>,
         lifecycle: AttemptInitializationLifecycle,
+        source_children: SourceChildAdmission,
     ) -> Result<Self, DistributedQueryError> {
         if schedule.execution_id() != execution_id {
             return Err(DistributedQueryError::new(
@@ -877,6 +896,7 @@ impl AttemptInitializing {
                 ProductionInitializationState {
                     work_scope,
                     result_window,
+                    source_children,
                     execution_id,
                     artifacts: Some(artifacts),
                     schedule: Some(schedule),
@@ -912,6 +932,7 @@ impl AttemptInitializing {
         execution_id: QueryExecutionId,
         work_scope: WorkScope,
         result_window: ResultWindowAlias,
+        source_cohort: crate::query_execution::native_execution_adapter::source_cohort::NativeSourceCohort,
         artifacts: PreparedDistributedQuery,
         schedule: ValidatedFragmentSchedule,
         retry_policy: TaskUpdateRetryPolicy,
@@ -942,6 +963,7 @@ impl AttemptInitializing {
             runtime,
             credential_lease_source,
             lifecycle,
+            SourceChildAdmission::Cohort(source_cohort),
         )?);
         Ok(())
     }

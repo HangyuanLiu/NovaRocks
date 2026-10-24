@@ -73,6 +73,52 @@ impl ServerPaimonRoleFileIoFactory {
 }
 
 impl PaimonRoleFileIoFactory for ServerPaimonRoleFileIoFactory {
+    fn planning_dependency(
+        &self,
+        properties: &CatalogProperties,
+        warehouse: &str,
+    ) -> Result<novarocks_spi::connector::SharedDependency, ConnectorError> {
+        if properties.provider_id().as_str() != novarocks_connector_paimon::PROVIDER_ID
+            || properties
+                .execution_properties()
+                .iter()
+                .find(|property| property.key() == "warehouse")
+                .map(|property| property.value())
+                != Some(warehouse)
+        {
+            return Err(invalid(
+                "Paimon planning route differs from the exact catalog definition",
+            ));
+        }
+        let parsed = self
+            .resources
+            .access_resolver()
+            .parse_location(warehouse)
+            .map_err(map_file_error)?;
+        if parsed.scheme() != FsScheme::ObjectStore {
+            return Err(unsupported(
+                "PAI-1 Paimon filesystem catalogs require an object-store warehouse",
+            ));
+        }
+        let execution_properties = properties
+            .execution_properties()
+            .iter()
+            .map(|property| (property.key().to_string(), property.value().to_string()))
+            .collect::<Vec<_>>();
+        let endpoint =
+            object_store_endpoint_config_from_aws_s3_catalog_property_pairs(&execution_properties)
+                .map_err(invalid)?
+                .ok_or_else(|| {
+                    invalid("Paimon object-store route is missing its original endpoint config")
+                })?;
+        // This is the SAME parser/endpoint selection as bind_file_io. No
+        // credentials, operator, DNS, request or runtime owner is created.
+        self.resources
+            .access_resolver()
+            .selected_dependency(warehouse, Some(&endpoint))
+            .map_err(map_file_error)
+    }
+
     fn bind_file_io(
         &self,
         properties: &CatalogProperties,

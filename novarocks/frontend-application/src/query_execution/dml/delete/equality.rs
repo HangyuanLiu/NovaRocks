@@ -53,14 +53,7 @@ pub(crate) fn prepare_equality_delete_statement(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     publication_id: novarocks_spi::connector::LakePublicationId,
 ) -> Result<PreparedDelete, String> {
-    let table = sql_object_name(&stmt.target);
-    let target = resolve_existing_table_target(state, &table, current_catalog, current_database)?;
-    if target.provider_id.as_str() != "iceberg" {
-        return Err(format!(
-            "ADD EQUALITY DELETE only supports iceberg backends, got `{}`",
-            target.provider_id.as_str()
-        ));
-    }
+    let (target, _) = resolve_target(state, stmt, current_catalog, current_database)?;
     let planning_lease = crate::connector::acquire_metadata_planning_lease(
         state.connector_control().as_ref(),
         &target.catalog,
@@ -140,6 +133,112 @@ pub(crate) fn prepare_equality_delete_statement(
         write_session,
         publication_id,
     )
+}
+
+pub(super) fn resolve_target(
+    state: &DmlExecutionKernel,
+    stmt: &AddEqualityDelete,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<(crate::catalog_application::resolver::TargetBackend, String), String> {
+    let table = sql_object_name(&stmt.target);
+    let target = resolve_existing_table_target(state, &table, current_catalog, current_database)?;
+    if target.provider_id.as_str() != "iceberg" {
+        return Err(format!(
+            "ADD EQUALITY DELETE only supports iceberg backends, got `{}`",
+            target.provider_id.as_str()
+        ));
+    }
+    Ok((target, "main".to_string()))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The action passes its admitted statement, target, generation, execution and receiving authority unchanged."
+)]
+pub(super) async fn prepare_equality_delete_statement_async(
+    state: &DmlExecutionKernel,
+    stmt: &AddEqualityDelete,
+    target: &crate::catalog_application::resolver::TargetBackend,
+    target_ref: &str,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    execution: QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    begin_receiving: Arc<crate::query_execution::write_session::WriteBeginReceiving>,
+) -> Result<super::PreparedDeleteWrite, String> {
+    // Preserve the original MV guard before metadata loading and admission.
+    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context_async(
+        state.mv_storage_observation().as_ref(),
+        &planning_lease,
+        state.mv_readiness().as_ref(),
+        target,
+        crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Delete,
+        connector_context.clone(),
+    ).await?;
+    let target_binding =
+        super::load_delete_target_async(target, planning_lease, connector_context).await?;
+    let column_names = stmt
+        .columns
+        .iter()
+        .map(|column| column.value.clone())
+        .collect::<Vec<_>>();
+    let rows = stmt
+        .rows
+        .iter()
+        .map(|row| row.iter().map(lower_literal).collect())
+        .collect::<Result<Vec<Vec<_>>, _>>()?;
+    let write_lease = target_binding
+        .lease()
+        .derive_write_lease()
+        .map_err(|error| format!("derive equality-delete write lease: {error}"))?;
+    let input = resolve_equality_delete_input(target_binding.metadata(), &column_names, &rows)?;
+    // Keep RefHead observation on this exact generation before actual begin.
+    let current_snapshot_id =
+        crate::connector::metadata_read_reference_facts_with_planning_lease_async(
+            target_binding.lease().clone(),
+            connector_context.clone(),
+            &target.namespace,
+            &target.table,
+        )
+        .await?
+        .current_snapshot_id();
+    let write_session = super::begin_delete_write_session_async(
+        state,
+        target_binding.lease(),
+        &write_lease,
+        crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
+            target,
+            target_ref,
+            ConnectorWriteIntent::RowDelta,
+            ConnectorWriteInputRequest::EqualityDelete {
+                equality_fields: input.fields.clone(),
+            },
+            ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::Ordinary,
+            connector_context.clone(),
+        )?,
+        begin_receiving.as_ref(),
+    )
+    .await?;
+    // Provider admission deliberately precedes literal carrier checks. A
+    // rejection here leaves the accepted session in the original receiving.
+    let delete_fields = input.validate(&rows)?;
+    let delete_query = build_equality_delete_sink_query(&delete_fields, &rows)?;
+    let (sql_write_input, table_bindings) =
+        bind_equality_delete_write(target, target_binding.lease(), &write_session)?;
+    Ok(super::PreparedDeleteWrite {
+        state: state.clone(),
+        target: target.clone(),
+        target_ref: target_ref.to_string(),
+        base_snapshot_id: current_snapshot_id,
+        delete_query,
+        sql_write_input,
+        table_bindings,
+        execution,
+        connector_context: connector_context.clone(),
+        write_session,
+        distribution: novarocks_sql::compiler::RootDistributionRequirement::Any,
+    })
 }
 
 fn sql_object_name(name: &ObjectName) -> SqlObjectName {
@@ -291,25 +390,8 @@ fn prepare_equality_delete_distributed_write(
     write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     publication_id: novarocks_spi::connector::LakePublicationId,
 ) -> Result<PreparedDelete, String> {
-    let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    // The plan's target is the one the session sealed, so the plan and the
-    // writer's recipe carry the same signed input.
-    let target_binding = admit_session_connector_write_target(
-        table_bindings.as_ref(),
-        FrozenConnectorScanIdentity::new(
-            target.catalog.clone(),
-            target.namespace.clone(),
-            target.table.clone(),
-        ),
-        crate::query_execution::dml::iceberg_writer::sole_session_write_target(&write_session)?,
-        planning_lease.clone(),
-    )?;
-    let sql_write_input = dml_write_plan_input_for_admitted_target(
-        table_bindings.as_ref(),
-        target_binding,
-        DmlWriteSinkMode::EqualityDeletes,
-        novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
-    )?;
+    let (sql_write_input, table_bindings) =
+        bind_equality_delete_write(target, &planning_lease, &write_session)?;
 
     let connector_operation_id: novarocks_spi::connector::ConnectorWriteOperationId =
         publication_id.into();
@@ -336,6 +418,40 @@ fn prepare_equality_delete_distributed_write(
         },
         Arc::new(executor),
     ))
+}
+
+fn bind_equality_delete_write(
+    target: &crate::catalog_application::resolver::TargetBackend,
+    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    write_session: &crate::query_execution::write_session::ConnectorWriteSession,
+) -> Result<
+    (
+        novarocks_sql::planning::dml::DmlWritePlanInput,
+        Arc<QueryTableBindingStore>,
+    ),
+    String,
+> {
+    let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
+    // The plan's target is the one the session sealed, so the plan and the
+    // writer's recipe carry the same signed input.
+    let target_binding = admit_session_connector_write_target(
+        table_bindings.as_ref(),
+        FrozenConnectorScanIdentity::new(
+            target.catalog.clone(),
+            target.namespace.clone(),
+            target.table.clone(),
+        ),
+        crate::query_execution::dml::iceberg_writer::sole_session_write_target(write_session)?,
+        planning_lease.clone(),
+    )?;
+    let sql_write_input = dml_write_plan_input_for_admitted_target(
+        table_bindings.as_ref(),
+        target_binding,
+        DmlWriteSinkMode::EqualityDeletes,
+        novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
+    )?;
+
+    Ok((sql_write_input, table_bindings))
 }
 
 fn build_equality_delete_sink_query(
@@ -578,22 +694,42 @@ fn equality_delete_key_columns(
     Ok(columns)
 }
 
+/// The same exact signed input is retained across Provider admission. UUID
+/// and Variant rejection belongs to the Provider before carrier validation.
+struct EqualityDeleteInput {
+    columns: Vec<Field>,
+    fields: Vec<ConnectorWriteFieldRequest>,
+}
+
+impl EqualityDeleteInput {
+    fn validate(self, rows: &[Vec<Literal>]) -> Result<Vec<ConnectorWriteFieldRequest>, String> {
+        validate_equality_delete_columns(&self.columns, rows)?;
+        Ok(self.fields)
+    }
+}
+
+fn resolve_equality_delete_input(
+    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
+    names: &[String],
+    rows: &[Vec<Literal>],
+) -> Result<EqualityDeleteInput, String> {
+    let columns = resolve_equality_delete_key_columns(metadata, names, rows)?;
+    if rows.is_empty() {
+        return Err("ADD EQUALITY DELETE requires at least one row".to_string());
+    }
+    let fields = equality_delete_input_fields(metadata, &columns)?;
+    Ok(EqualityDeleteInput { columns, fields })
+}
+
 fn prepare_equality_delete_input<T>(
     metadata: &novarocks_spi::connector::ConnectorTableMetadata,
     names: &[String],
     rows: &[Vec<Literal>],
     begin_session: impl FnOnce(&[ConnectorWriteFieldRequest]) -> Result<T, String>,
 ) -> Result<(Vec<ConnectorWriteFieldRequest>, T), String> {
-    let columns = resolve_equality_delete_key_columns(metadata, names, rows)?;
-    if rows.is_empty() {
-        return Err("ADD EQUALITY DELETE requires at least one row".to_string());
-    }
-    let fields = equality_delete_input_fields(metadata, &columns)?;
-    // The existing session admission checks the provider's logical key types.
-    // Legacy prepare_write has dormant v1/spec-history policy that this SQL
-    // path must not reactivate merely to distinguish uuid from fixed binary.
-    let session = begin_session(&fields)?;
-    validate_equality_delete_columns(&columns, rows)?;
+    let input = resolve_equality_delete_input(metadata, names, rows)?;
+    let session = begin_session(&input.fields)?;
+    let fields = input.validate(rows)?;
     Ok((fields, session))
 }
 
@@ -1238,6 +1374,51 @@ mod tests {
         assert!(sql.contains("category"));
         assert!(sql.contains("NULL"));
     }
+    /// Both production routes use these two stages. Resolving the complete
+    /// provider input must not steal the later literal-admission decision.
+    #[test]
+    fn resolved_equality_input_defers_required_null_until_after_session_admission() {
+        let metadata = plain_table();
+        let rows = vec![vec![Literal::Null]];
+        let input = super::resolve_equality_delete_input(&metadata, &["id".to_owned()], &rows)
+            .expect("complete provider input precedes literal checks");
+        assert_eq!(input.fields.len(), 1);
+        assert_eq!(input.fields[0].field().name(), "id");
+        assert_eq!(
+            input.fields[0].execution_type(),
+            metadata.execution_schema().bindings().first(),
+        );
+        let error = input
+            .validate(&rows)
+            .expect_err("required NULL after admission");
+        assert_eq!(error, "NULL is not valid for required equality column `id`");
+    }
+
+    #[test]
+    fn resolved_equality_input_keeps_the_same_complete_fields_through_validation() {
+        let metadata = plain_table();
+        let rows = vec![vec![Literal::Int(7), Literal::Null]];
+        let input = super::resolve_equality_delete_input(
+            &metadata,
+            &["id".to_owned(), "category".to_owned()],
+            &rows,
+        )
+        .expect("complete input");
+        let before = input.fields.clone();
+        let after = input.validate(&rows).expect("valid admitted input");
+        assert_eq!(after.len(), 2);
+        for (before, after) in before.iter().zip(&after) {
+            assert_eq!(before.field(), after.field());
+            assert_eq!(before.execution_type(), after.execution_type());
+        }
+        let query =
+            super::build_equality_delete_sink_query(&after, &rows).expect("same shape author");
+        let sql = novarocks_parser::printer::print_query(&query);
+        assert!(sql.contains("VALUES"));
+        assert!(sql.contains("NULL"));
+        assert!(sql.contains("category"));
+    }
+
     #[test]
     fn equality_session_admission_precedes_carrier_validation_and_keeps_original_failures() {
         use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};

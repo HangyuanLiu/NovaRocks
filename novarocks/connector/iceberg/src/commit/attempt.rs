@@ -196,6 +196,11 @@ impl RetryPolicy {
 /// Neither cancellation nor elapsed retry time interrupts an already-issued dispatch.
 /// Once publication is possible, its typed outcome alone decides cleanup and retry.
 // Design: ADR-0171 (docs/adr/ADR-0171-commit-operation-model.md)
+#[derive(Clone, Copy)]
+enum CommittedCleanupPhase {
+    Inline,
+    Retained,
+}
 pub(crate) async fn run(
     operation: &IcebergCommitOperation,
     intent: &OperationIntent,
@@ -203,6 +208,48 @@ pub(crate) async fn run(
     preparers: &[&dyn Preparer],
     publisher: &dyn Publisher,
     policy: RetryPolicy,
+) -> Report {
+    run_in_phase(
+        operation,
+        intent,
+        prefix,
+        preparers,
+        publisher,
+        policy,
+        CommittedCleanupPhase::Inline,
+    )
+    .await
+}
+/// Same algorithm and one dispatch, returning only after the true publication
+/// frontier. Its checked journal retains the exact published object set; the
+/// caller's same original operation must later drive cleanup to actual exit.
+pub(crate) async fn run_to_committed_frontier(
+    operation: &IcebergCommitOperation,
+    intent: &OperationIntent,
+    prefix: &PreparedChange,
+    preparers: &[&dyn Preparer],
+    publisher: &dyn Publisher,
+    policy: RetryPolicy,
+) -> Report {
+    run_in_phase(
+        operation,
+        intent,
+        prefix,
+        preparers,
+        publisher,
+        policy,
+        CommittedCleanupPhase::Retained,
+    )
+    .await
+}
+pub(crate) async fn run_in_phase(
+    operation: &IcebergCommitOperation,
+    intent: &OperationIntent,
+    prefix: &PreparedChange,
+    preparers: &[&dyn Preparer],
+    publisher: &dyn Publisher,
+    policy: RetryPolicy,
+    cleanup_phase: CommittedCleanupPhase,
 ) -> Report {
     if operation.token() != intent.token() {
         return rejected(
@@ -273,7 +320,12 @@ pub(crate) async fn run(
             CatalogOutcome::KnownCommitted { receipt, .. } => {
                 return Report {
                     publication: PublicationOutcome::Committed(receipt),
-                    cleanup: operation.cleanup_after_commit(&retained).await,
+                    cleanup: match cleanup_phase {
+                        CommittedCleanupPhase::Inline => {
+                            operation.cleanup_after_commit(&retained).await
+                        }
+                        CommittedCleanupPhase::Retained => IcebergCleanupReport::NotAttempted,
+                    },
                 };
             }
             CatalogOutcome::CommitUnknown { failure, evidence } => {
@@ -1376,6 +1428,51 @@ mod tests {
             IcebergCleanupReport::Complete { deleted: 0 }
         );
         assert_eq!(fixture.operation.artifacts().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn committed_frontier_retains_the_actual_operation_until_cleanup_is_driven() {
+        let fixture = Fixture::new();
+        let metadata = fixture.metadata(FormatVersion::V3);
+        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoRead]);
+        let discarded = ObjectIdentity::new(format!(
+            "file://{}/superseded-owned.puffin",
+            fixture.directory.path().display(),
+        ))
+        .unwrap();
+        std::fs::write(discarded.path().strip_prefix("file://").unwrap(), b"owned").unwrap();
+        fixture
+            .operation
+            .adopt_session_data(discarded.clone())
+            .unwrap();
+        let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Commit);
+        let report = run_to_committed_frontier(
+            &fixture.operation,
+            &intent,
+            &PreparedChange::default(),
+            &[&FastAppendPreparer],
+            &publisher,
+            policy(),
+        )
+        .await;
+        assert!(matches!(
+            report.publication,
+            PublicationOutcome::Committed(_)
+        ));
+        assert_eq!(report.cleanup, IcebergCleanupReport::NotAttempted);
+        assert!(std::path::Path::new(discarded.path().strip_prefix("file://").unwrap()).exists());
+        let retained = fixture
+            .operation
+            .artifacts()
+            .unwrap()
+            .into_iter()
+            .map(|artifact| artifact.object)
+            .filter(|object| object != &discarded)
+            .collect::<Vec<_>>();
+        let cleanup = fixture.operation.cleanup_after_commit(&retained).await;
+        assert_eq!(cleanup, IcebergCleanupReport::Complete { deleted: 1 });
+        assert!(!std::path::Path::new(discarded.path().strip_prefix("file://").unwrap()).exists());
+        assert_eq!(publisher.requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

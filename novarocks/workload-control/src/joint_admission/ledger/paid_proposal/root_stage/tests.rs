@@ -27,6 +27,13 @@ fn fixture_with_productions(
     changes: usize,
     production: bool,
 ) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+    fixture_with_native_resources(changes, production, false)
+}
+fn fixture_with_native_resources(
+    changes: usize,
+    production: bool,
+    native: bool,
+) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     let count = 8;
     let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 2, 2, &[]);
     let mut config = JointCapacityConfig {
@@ -59,14 +66,18 @@ fn fixture_with_productions(
             .with(JointResource::MetadataBytes, m * 16)
             .with(JointResource::PayloadBytes, 64)
             .with(JointResource::UnreceivedProductions, 1)
-            .with(JointResource::Publications, u64::from(production)),
+            .with(JointResource::Publications, u64::from(production))
+            .with(JointResource::ReplyRecords, if native { 2 } else { 0 })
+            .with(JointResource::QueueRecords, if native { 2 } else { 0 }),
         per_dependency: JointResources::ZERO
             .with(JointResource::ScopeRecords, 7)
             .with(JointResource::ClaimRecords, 12)
             .with(JointResource::MetadataBytes, m * 8)
             .with(JointResource::PayloadBytes, 64)
             .with(JointResource::UnreceivedProductions, 1)
-            .with(JointResource::Publications, u64::from(production)),
+            .with(JointResource::Publications, u64::from(production))
+            .with(JointResource::ReplyRecords, if native { 2 } else { 0 })
+            .with(JointResource::QueueRecords, if native { 2 } else { 0 }),
         protected_progress: base,
     };
     let foreground = JointResourceLimits {
@@ -74,12 +85,30 @@ fn fixture_with_productions(
             .with(JointResource::ClaimRecords, 4)
             .with(JointResource::MetadataBytes, m * 16)
             .with(JointResource::PayloadBytes, 32)
-            .with(JointResource::Computations, 1),
+            .with(JointResource::Computations, 1)
+            .with(JointResource::AsyncIo, if native { 3 } else { 0 })
+            .with(
+                JointResource::PhysicalQueueRecords,
+                if native { 2 } else { 0 },
+            )
+            .with(
+                JointResource::PhysicalQueueBytes,
+                if native { 8 } else { 0 },
+            ),
         per_dependency: JointResources::ZERO
             .with(JointResource::ClaimRecords, 4)
             .with(JointResource::MetadataBytes, m * 8)
             .with(JointResource::PayloadBytes, 32)
-            .with(JointResource::Computations, 1),
+            .with(JointResource::Computations, 1)
+            .with(JointResource::AsyncIo, if native { 3 } else { 0 })
+            .with(
+                JointResource::PhysicalQueueRecords,
+                if native { 2 } else { 0 },
+            )
+            .with(
+                JointResource::PhysicalQueueBytes,
+                if native { 8 } else { 0 },
+            ),
         protected_progress: JointResources::ZERO,
     };
     let global = JointResourceLimits {
@@ -120,10 +149,13 @@ fn fixture_with_productions(
         .configure_joint_capacity(config.validate(&required).unwrap())
         .unwrap();
     control.configure_control_storage(storage).unwrap();
+    let mut result = crate::ResultCapacityConfig::V1;
+    result.all_objects_bytes[0] = 8;
+    control.configure_result_capacity(result).unwrap();
     control.mark_ready().unwrap();
     (control, handle, driver)
 }
-fn drive(driver: &mut JointProgressDriver) {
+pub(in crate::joint_admission::ledger::paid_proposal) fn drive(driver: &mut JointProgressDriver) {
     crate::joint_admission::tests::drive(driver);
 }
 fn receive(admission: &mut JointAdmission) -> JointGrantedBatch {
@@ -132,7 +164,7 @@ fn receive(admission: &mut JointAdmission) -> JointGrantedBatch {
         _ => panic!("expected original paid reply"),
     }
 }
-fn fact(name: &str) -> SharedDependency {
+pub(in crate::joint_admission::ledger::paid_proposal) fn fact(name: &str) -> SharedDependency {
     SharedDependency::Network(
         novarocks_resource_contract::NetworkServiceOrigin::from_selected_url(
             &url::Url::parse(&format!("https://{name}.example")).unwrap(),
@@ -213,7 +245,7 @@ fn setup(
 ) {
     setup_with_production(unbound_stage, 4, false)
 }
-fn setup_with_production(
+pub(in crate::joint_admission::ledger::paid_proposal) fn setup_with_production(
     unbound_stage: bool,
     changes: usize,
     production: bool,
@@ -251,7 +283,10 @@ fn setup_with_production(
     let stage = early.unwrap_or_else(|| child(&work.owner.scope(), &mut driver));
     (control, handle, driver, work, stage, payload)
 }
-fn child(root: &WorkScope, driver: &mut JointProgressDriver) -> WorkOwner {
+pub(in crate::joint_admission::ledger::paid_proposal) fn child(
+    root: &WorkScope,
+    driver: &mut JointProgressDriver,
+) -> WorkOwner {
     let mut pending = root.request_joint_child().unwrap();
     drive(driver);
     let mut ready = receive(&mut pending);
@@ -267,7 +302,7 @@ fn child(root: &WorkScope, driver: &mut JointProgressDriver) -> WorkOwner {
     drive(driver);
     target.unwrap()
 }
-fn batch(
+pub(in crate::joint_admission::ledger::paid_proposal) fn batch(
     payload: &RetainedPayloadGrant,
     work: &crate::RootWork,
     stage: &WorkOwner,
@@ -284,7 +319,9 @@ fn batch(
     proposal.end_stage().unwrap();
     proposal.submit().unwrap()
 }
-fn ready(admission: &mut RootStageAdmission) -> RootStageReady {
+pub(in crate::joint_admission::ledger::paid_proposal) fn ready(
+    admission: &mut RootStageAdmission,
+) -> RootStageReady {
     match Pin::new(admission).poll(&mut Context::from_waker(Waker::noop())) {
         Poll::Ready(Ok(value)) => value,
         _ => panic!("closed original batch verdict"),
@@ -744,3 +781,658 @@ fn complete_payload_increment_refuses_before_paid_body_and_preserves_same_source
     drive(&mut driver);
     assert_eq!(capacity(&control, JointResource::PayloadBytes), 0);
 }
+
+fn installed_binding_computation(
+    payload: &RetainedPayloadGrant,
+    work: &crate::RootWork,
+    stage: &WorkOwner,
+    driver: &mut JointProgressDriver,
+) -> InternalComputationGrant {
+    let mut admission = batch(payload, work, stage, 4);
+    drive(driver);
+    let mut ready = ready(&mut admission);
+    let mut computation = None;
+    ready
+        .install_in(&work.owner.scope(), payload, stage, &mut computation)
+        .unwrap()
+        .notify();
+    drop((ready, admission));
+    drive(driver);
+    computation.unwrap()
+}
+fn internal_binding_batch(
+    binding: &InternalManifestBinding,
+    selected: &SharedDependency,
+) -> RootStageAdmission {
+    let mut proposal = match binding.try_begin().unwrap() {
+        JointTryBegin::Started(proposal) => proposal,
+        JointTryBegin::Full(_) => panic!("original Q must be reaped before this component step"),
+    };
+    proposal.push_payload_dependency(selected).unwrap();
+    proposal.end_payload().unwrap();
+    proposal.end_stage().unwrap();
+    proposal.submit().unwrap()
+}
+fn typed_rows(control: &WorkloadControl) -> Vec<(u64, JointResources, u64, usize, Vec<u64>)> {
+    let state = control.inner.state.lock().unwrap();
+    state
+        .joint
+        .as_ref()
+        .unwrap()
+        .claims
+        .iter()
+        .filter_map(|(&id, row)| {
+            let (epoch, pins) = match row.custody {
+                ClaimCustody::Payload { epoch, pins }
+                | ClaimCustody::Computation { epoch, pins } => (epoch, pins),
+                _ => return None,
+            };
+            Some((
+                id,
+                row.active_amounts,
+                epoch,
+                pins,
+                row.active_facts
+                    .dependencies
+                    .iter()
+                    .map(|d| d.ordinal)
+                    .collect(),
+            ))
+        })
+        .collect()
+}
+
+#[test]
+fn internal_manifest_binding_reuses_all_four_originals_and_productions_without_new_claims() {
+    for received in [false, true] {
+        let (control, _, mut driver, work, stage, payload) = setup_with_production(false, 5, true);
+        let payload = payload.unwrap();
+        let scope = work.owner.scope();
+        let origin: Arc<dyn Send + Sync> = Arc::new(());
+        let quote = UnreceivedProductionQuote::new(
+            std::num::NonZeroU64::new(1).unwrap(),
+            std::num::NonZeroUsize::new(8).unwrap(),
+        )
+        .unwrap();
+        let mut admission = scope
+            .begin_unreceived_productions(Arc::downgrade(&origin), quote)
+            .unwrap();
+        drive(&mut driver);
+        let Poll::Ready(Ok(mut production_ready)) =
+            Pin::new(&mut admission).poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("original production admission")
+        };
+        let mut facts = Some(vec![45; 8].into_boxed_slice());
+        let mut production = None;
+        production_ready
+            .register_in(&mut facts, &mut production)
+            .unwrap()
+            .notify();
+        drop((production_ready, admission));
+        drive(&mut driver);
+        let compute = installed_binding_computation(&payload, &work, &stage, &mut driver);
+        if received {
+            production.as_ref().unwrap().receive_in().unwrap().notify();
+        }
+        let alias =
+            crate::ResultWindowAlias::from_internal_computation(&scope, &stage, &payload, &compute)
+                .unwrap();
+        let retained = alias.try_clone().unwrap();
+        let binding = alias.internal_manifest_binding().unwrap().unwrap().clone();
+        let compute_alias = compute.retain_alias().unwrap();
+        let before = typed_rows(&control);
+        let mut refused = match binding.try_begin().unwrap() {
+            JointTryBegin::Started(proposal) => proposal,
+            JointTryBegin::Full(_) => panic!("the actual Q has been reaped"),
+        };
+        refused.push_payload_dependency(&fact("d")).unwrap();
+        assert!(
+            matches!(
+                refused.push_payload_dependency(&fact("e")),
+                Err(WorkError::Capacity(_))
+            ),
+            "full old/new union rejects the fifth actual origin before formation"
+        );
+        drop(refused);
+        drive(&mut driver);
+        assert_eq!(typed_rows(&control), before);
+        let before_ids: Vec<_> = control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .joint
+            .as_ref()
+            .unwrap()
+            .claims
+            .keys()
+            .copied()
+            .collect();
+        assert_ne!(
+            before[0].4, before[1].4,
+            "original payload was narrower than its stage computation"
+        );
+        let blockers = [
+            scope.begin_control_binding().unwrap(),
+            scope.begin_control_binding().unwrap(),
+        ];
+        let pending_before = control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .joint
+            .as_ref()
+            .unwrap()
+            .requests
+            .len();
+        assert!(matches!(
+            binding.try_begin().unwrap(),
+            JointTryBegin::Full(_)
+        ));
+        assert!(
+            matches!(
+                payload
+                    .root_stage_source(&scope, &stage)
+                    .unwrap()
+                    .try_begin(0, JointLane::Foreground)
+                    .unwrap(),
+                JointTryBegin::Full(_)
+            ),
+            "the unchanged New mode also defers only its original unacquired Q"
+        );
+        assert_eq!(
+            control
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .joint
+                .as_ref()
+                .unwrap()
+                .requests
+                .len(),
+            pending_before,
+            "Full has no new ticket"
+        );
+        assert_eq!(
+            typed_rows(&control),
+            before,
+            "pure capability/Q Full adds no typed pins"
+        );
+        drop(blockers);
+        drive(&mut driver);
+        let mut admission = internal_binding_batch(&binding, &fact("d"));
+        drive(&mut driver);
+        let mut ready = ready(&mut admission);
+        assert!(
+            ready.batch.new_claims.is_empty(),
+            "the existing mode cannot mint a second computation"
+        );
+        let before_install = typed_rows(&control);
+        assert_eq!(
+            before_install, before,
+            "provisional D must not publish active D"
+        );
+        let notification = ready.install_binding_in(&binding).unwrap();
+        let after = typed_rows(&control);
+        assert_eq!(
+            before
+                .iter()
+                .map(|r| (&r.0, &r.1, &r.2, &r.3))
+                .collect::<Vec<_>>(),
+            after
+                .iter()
+                .map(|r| (&r.0, &r.1, &r.2, &r.3))
+                .collect::<Vec<_>>(),
+            "amounts/typed keys/epochs/pins are preserved"
+        );
+        assert_eq!(after[0].4, after[1].4);
+        assert_eq!(
+            after[0].4.len(),
+            4,
+            "old a/b/c and actual manifest d form the complete union"
+        );
+        {
+            let state = control.inner.state.lock().unwrap();
+            let ledger = state.joint.as_ref().unwrap();
+            assert_eq!(
+                ledger.claims.keys().copied().collect::<Vec<_>>(),
+                before_ids
+            );
+            for row in ledger.claims.values().filter(|row| match row.owner {
+                ClaimOwner::PhysicalWork(id) => id == scope.id || id == stage.scope().id,
+                ClaimOwner::ControlSlot(slot) => [scope.id, stage.scope().id]
+                    .iter()
+                    .any(|id| state.nodes[id].cancellation == slot),
+                _ => false,
+            }) {
+                assert_eq!(
+                    row.active_facts
+                        .dependencies
+                        .iter()
+                        .map(|d| d.ordinal)
+                        .collect::<Vec<_>>(),
+                    after[0].4
+                );
+                assert_eq!(row.amounts, row.active_amounts);
+                assert!(row.pending.is_none());
+            }
+        }
+        notification.notify();
+        assert!(
+            ready.install_binding_in(&binding).is_err(),
+            "same receipt installs once"
+        );
+        assert!(retained.internal_manifest_binding().unwrap().is_some());
+        assert!(
+            crate::ResultWindowAlias::from_internal_payload(&scope, &stage.scope(), &payload)
+                .unwrap()
+                .internal_manifest_binding()
+                .unwrap()
+                .is_none(),
+            "retention alone never grants binding authority"
+        );
+        if !received {
+            production.as_ref().unwrap().receive_in().unwrap().notify();
+        }
+        production
+            .as_ref()
+            .unwrap()
+            .owner()
+            .settle_received_in()
+            .unwrap()
+            .notify();
+        drop((
+            ready,
+            admission,
+            production,
+            origin,
+            retained,
+            alias,
+            compute_alias,
+            compute,
+            payload,
+        ));
+        stage.complete();
+        work.business.release();
+        work.owner.complete();
+        drive(&mut driver);
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
+    }
+}
+
+#[test]
+fn internal_manifest_binding_cannot_retarget_or_reanimate_cancelled_or_unpinned_sources() {
+    for delivered in [false, true] {
+        let (control, _, mut driver, work, stage, payload) = setup(false);
+        let payload = payload.unwrap();
+        let compute = installed_binding_computation(&payload, &work, &stage, &mut driver);
+        let alias = crate::ResultWindowAlias::from_internal_computation(
+            &work.owner.scope(),
+            &stage,
+            &payload,
+            &compute,
+        )
+        .unwrap();
+        let binding = alias.internal_manifest_binding().unwrap().unwrap().clone();
+        let other = child(&work.owner.scope(), &mut driver);
+        assert!(
+            crate::ResultWindowAlias::from_internal_computation(
+                &work.owner.scope(),
+                &other,
+                &payload,
+                &compute
+            )
+            .is_err()
+        );
+        let before = typed_rows(&control);
+        let mut admission = internal_binding_batch(&binding, &fact("d"));
+        let mut reply = if delivered {
+            drive(&mut driver);
+            Some(ready(&mut admission))
+        } else {
+            None
+        };
+        stage.cancel(crate::CancellationReason::ServerShutdown);
+        if let Some(reply) = reply.as_mut() {
+            assert!(reply.install_binding_in(&binding).is_err());
+        } else {
+            drive(&mut driver);
+            assert!(matches!(
+                Pin::new(&mut admission).poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Err(_))
+            ));
+        }
+        drop((reply, admission));
+        drive(&mut driver);
+        assert_eq!(
+            typed_rows(&control),
+            before,
+            "refusal/rollback does not change active D or pins"
+        );
+        assert!(binding.try_begin().is_err());
+        drop((alias, compute, payload));
+        other.complete();
+        stage.complete_after_terminal_cancel_settled();
+        work.business.release();
+        work.owner.complete();
+        drive(&mut driver);
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
+    }
+    for computation in [false, true] {
+        let (control, _, mut driver, work, stage, payload) = setup(false);
+        let payload = payload.unwrap();
+        let compute = installed_binding_computation(&payload, &work, &stage, &mut driver);
+        let alias = crate::ResultWindowAlias::from_internal_computation(
+            &work.owner.scope(),
+            &stage,
+            &payload,
+            &compute,
+        )
+        .unwrap();
+        let binding = alias.internal_manifest_binding().unwrap().unwrap().clone();
+        let mut admission = internal_binding_batch(&binding, &fact("d"));
+        let mut payload = Some(payload);
+        let mut compute = Some(compute);
+        drop(alias);
+        if computation {
+            drop(compute.take());
+        } else {
+            drop(payload.take());
+        }
+        drive(&mut driver);
+        assert!(
+            matches!(
+                Pin::new(&mut admission).poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Err(_))
+            ),
+            "a weak capture cannot keep a last typed pin alive"
+        );
+        assert!(binding.try_begin().is_err());
+        drop((admission, payload, compute));
+        stage.complete();
+        work.business.release();
+        work.owner.complete();
+        drive(&mut driver);
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
+    }
+}
+
+#[test]
+fn qualification_union_keeps_old_stage_only_s_and_cancel_preserves_typed_sources() {
+    let (control, _, mut driver, work, stage, payload) = setup(false);
+    let payload = payload.unwrap();
+    let computation = installed_binding_computation(&payload, &work, &stage, &mut driver);
+    let window = crate::ResultWindowAlias::from_internal_computation(
+        &work.owner.scope(),
+        &stage,
+        &payload,
+        &computation,
+    )
+    .unwrap();
+    let binding = window.internal_manifest_binding().unwrap().unwrap().clone();
+    let before = typed_rows(&control);
+    assert_ne!(
+        before[0].4, before[1].4,
+        "stage-only S is absent from the original payload"
+    );
+    // Old a/b/c come from the original payload/stage preparation. Here c is
+    // S, an old compute-only responsibility. Only successor B=d is selected.
+    let mut admission = internal_binding_batch(&binding, &fact("d"));
+    drive(&mut driver);
+    let mut reply = ready(&mut admission);
+    assert_eq!(
+        typed_rows(&control),
+        before,
+        "received proof is not installed active D"
+    );
+    reply.install_binding_in(&binding).unwrap().notify();
+    let after = typed_rows(&control);
+    assert_eq!(
+        before
+            .iter()
+            .map(|r| (&r.0, &r.1, &r.2, &r.3))
+            .collect::<Vec<_>>(),
+        after
+            .iter()
+            .map(|r| (&r.0, &r.1, &r.2, &r.3))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(after[0].4, after[1].4);
+    assert_eq!(after[0].4.len(), 4);
+    for (_, _, _, _, old) in &before {
+        assert!(old.iter().all(|d| after[0].4.contains(d)));
+    }
+    {
+        let state = control.inner.state.lock().unwrap();
+        let ledger = state.joint.as_ref().unwrap();
+        for row in ledger.claims.values().filter(|row| match row.owner {
+            ClaimOwner::PhysicalWork(id) => id == work.owner.scope().id || id == stage.scope().id,
+            ClaimOwner::ControlSlot(slot) => [work.owner.scope().id, stage.scope().id]
+                .iter()
+                .any(|id| state.nodes[id].cancellation == slot),
+            _ => false,
+        }) {
+            assert_eq!(
+                row.active_facts
+                    .dependencies
+                    .iter()
+                    .map(|d| d.ordinal)
+                    .collect::<Vec<_>>(),
+                after[0].4
+            );
+            for expected in ["a", "b", "c", "d"] {
+                assert!(
+                    row.active_facts
+                        .dependencies
+                        .iter()
+                        .any(|record| record.fact == fact(expected))
+                );
+            }
+            assert!(
+                !row.active_facts
+                    .dependencies
+                    .iter()
+                    .any(|record| record.fact == fact("unselected-c"))
+            );
+            assert_eq!(row.amounts, row.active_amounts);
+            assert!(row.pending.is_none());
+        }
+    }
+    drop((reply, admission));
+    drive(&mut driver);
+    // Cancel a new uninstalled exact batch while old typed holders stay live.
+    let mut pending = internal_binding_batch(&binding, &fact("d"));
+    assert!(
+        Pin::new(&mut pending)
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    stage.cancel(crate::CancellationReason::Requested);
+    drive(&mut driver);
+    assert!(matches!(
+        Pin::new(&mut pending).poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Err(_))
+    ));
+    drop(pending);
+    drive(&mut driver);
+    assert_eq!(
+        typed_rows(&control),
+        after,
+        "cancel cannot refund or revert any original held payload/compute"
+    );
+    drop((window, computation, payload));
+    stage.complete_after_terminal_cancel_settled();
+    work.business.release();
+    work.owner.complete();
+    drive(&mut driver);
+    control.close_admission();
+    assert!(control.shutdown().is_ok());
+}
+
+#[test]
+fn client_stage_window_manifest_retains_bytes_without_pinning_or_reminting_compute() {
+    let (control, _, mut driver, work, stage, payload) = setup(false);
+    let payload = payload.unwrap();
+    let window = control
+        .inner
+        .update(|state| {
+            crate::result_window::reserve_window(
+                state,
+                &work.owner.scope(),
+                crate::ResultWindowClass::Client,
+            )
+        })
+        .unwrap();
+    let original = window.retain_alias();
+    assert_eq!(original.client_all_objects_bytes().unwrap(), 8);
+    assert!(original.internal_manifest_binding().unwrap().is_none());
+    let mut admission = batch(&payload, &work, &stage, 4);
+    drive(&mut driver);
+    let mut proof = ready(&mut admission);
+    let mut compute = None;
+    proof
+        .install_in(&work.owner.scope(), &payload, &stage, &mut compute)
+        .unwrap()
+        .notify();
+    drop(proof);
+    let client = crate::ResultWindowAlias::from_client_computation(
+        &work.owner.scope(),
+        &stage,
+        &original,
+        &payload,
+        compute.as_ref().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(client.class(), crate::ResultWindowClass::Client);
+    assert!(client.shares_capacity_with(&original));
+    assert!(client.is_for_scope(&stage.scope()));
+    assert!(client.internal_manifest_binding().unwrap().is_some());
+    let consumer = client.try_clone().unwrap();
+    let binding = client.internal_manifest_binding().unwrap().unwrap().clone();
+    let authority = client.native_action_authority().unwrap();
+    let quote = crate::joint_admission::NativeAsyncActionQuote::for_original_native_transport(
+        std::num::NonZeroU64::MIN,
+        std::num::NonZeroU64::MIN,
+        std::num::NonZeroU64::MIN,
+        std::num::NonZeroU64::MIN,
+        std::num::NonZeroU64::MIN,
+        std::num::NonZeroU64::MIN,
+    );
+    drop(client);
+    assert_eq!(capacity(&control, JointResource::Computations), 1);
+    drop(compute);
+    assert_eq!(
+        capacity(&control, JointResource::Computations),
+        0,
+        "the sole actual compute owner exits independently of Native/window tails"
+    );
+    assert!(
+        binding.try_begin().is_err(),
+        "an old manifest cannot remint P"
+    );
+    assert!(
+        authority
+            .action_source(JointLane::Foreground, quote)
+            .is_err()
+    );
+    assert!(
+        consumer
+            .native_action_source(JointLane::Foreground, quote)
+            .is_err()
+    );
+    assert!(
+        authority
+            .action_source(JointLane::Settlement, quote)
+            .is_ok()
+    );
+    assert_eq!(consumer.client_all_objects_bytes().unwrap(), 8);
+    drop(consumer);
+    assert!(
+        original.internal_manifest_binding().unwrap().is_none(),
+        "plain Client alias cannot gain stage authority"
+    );
+    drop((original, window, payload));
+    stage.complete();
+    work.business.release();
+    work.owner.complete();
+    drive(&mut driver);
+}
+#[test]
+fn client_stage_rejects_foreign_original_window_without_releasing_either_owner() {
+    let (control, _, mut driver, work, stage, payload) = setup(false);
+    let payload = payload.unwrap();
+    let foreign = root(&control);
+    let window = control
+        .inner
+        .update(|state| {
+            crate::result_window::reserve_window(
+                state,
+                &foreign.owner.scope(),
+                crate::ResultWindowClass::Client,
+            )
+        })
+        .unwrap();
+    let mut admission = batch(&payload, &work, &stage, 4);
+    drive(&mut driver);
+    let mut proof = ready(&mut admission);
+    let mut compute = None;
+    proof
+        .install_in(&work.owner.scope(), &payload, &stage, &mut compute)
+        .unwrap()
+        .notify();
+    drop(proof);
+    assert!(matches!(
+        crate::ResultWindowAlias::from_client_computation(
+            &work.owner.scope(),
+            &stage,
+            &window.retain_alias(),
+            &payload,
+            compute.as_ref().unwrap()
+        ),
+        Err(WorkError::Conflict)
+    ));
+    assert_eq!(capacity(&control, JointResource::Computations), 1);
+    drop((window, compute, payload));
+    stage.complete();
+    work.business.release();
+    work.owner.complete();
+    foreign.business.release();
+    foreign.owner.complete();
+    drive(&mut driver);
+}
+#[test]
+fn metadata_continuation_requires_same_original_positive_root_payload() {
+    let (control, _, mut driver, work, stage, payload) = setup(false);
+    let payload = payload.unwrap();
+    let source = payload
+        .async_continuation_source(&work.owner.scope(), JointLane::Foreground)
+        .unwrap();
+    drop(source);
+    assert!(
+        payload
+            .async_continuation_source(&stage.scope(), JointLane::Foreground)
+            .is_err()
+    );
+    let foreign = root(&control);
+    assert!(
+        payload
+            .async_continuation_source(&foreign.owner.scope(), JointLane::Foreground)
+            .is_err()
+    );
+    drop(payload);
+    stage.complete();
+    work.business.release();
+    work.owner.complete();
+    foreign.business.release();
+    foreign.owner.complete();
+    drive(&mut driver);
+}
+
+#[path = "canonical_tests.rs"]
+mod canonical_tests;

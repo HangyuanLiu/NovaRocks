@@ -247,12 +247,97 @@ impl HdfsServiceOrigin {
     }
 }
 
+/// The same actual Thrift service is shared by framed and buffered codecs.
+/// A codec changes wire framing, not the endpoint's failure domain. No HTTP
+/// reinterpretation, DNS resolution, default port or catalog alias enters it.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ThriftServiceOrigin(Arc<str>);
+
+/// Borrow the original transport's selected host/address and explicit port.
+/// Selection and original URI ownership remain with that transport owner.
+#[derive(Clone, Copy, Debug)]
+pub struct SelectedThriftServiceOrigin<'a> {
+    host: &'a str,
+    port: u16,
+}
+impl<'a> SelectedThriftServiceOrigin<'a> {
+    pub fn from_selected_address(address: &'a str) -> Result<Self, DependencyFactError> {
+        let (host, port) = address
+            .rsplit_once(':')
+            .ok_or(DependencyFactError::InvalidServiceOrigin)?;
+        let port = port
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or(DependencyFactError::InvalidServiceOrigin)?;
+        if host.is_empty()
+            || !host.is_ascii()
+            || host.bytes().any(|byte| {
+                byte.is_ascii_whitespace() || matches!(byte, b'/' | b'@' | b'?' | b'#' | b'%')
+            })
+        {
+            return Err(DependencyFactError::InvalidServiceOrigin);
+        }
+        if host.starts_with('[') {
+            host.strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .and_then(|value| value.parse::<std::net::Ipv6Addr>().ok())
+                .ok_or(DependencyFactError::InvalidServiceOrigin)?;
+        } else if host.contains(':')
+            || host
+                .bytes()
+                .any(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'.' | b'-' | b'_'))
+        {
+            return Err(DependencyFactError::InvalidServiceOrigin);
+        }
+        let bytes = 9usize
+            .checked_add(host.len())
+            .and_then(|n| n.checked_add(1 + port.ilog10() as usize + 1))
+            .ok_or(DependencyFactError::EndpointTooLong)?;
+        if bytes > ThriftServiceOrigin::MAX_BYTES {
+            return Err(DependencyFactError::EndpointTooLong);
+        }
+        Ok(Self { host, port })
+    }
+    pub fn into_owned(self) -> ThriftServiceOrigin {
+        use std::fmt::Write;
+        // One bounded String and its final Arc coexist, exactly as the
+        // original service-fact fee model. Lowercase without a third buffer.
+        let mut value =
+            String::with_capacity(ThriftServiceOrigin::MAX_BYTES.min(9 + self.host.len() + 6));
+        value.push_str("thrift://");
+        if self.host.starts_with('[') {
+            let address = self.host[1..self.host.len() - 1]
+                .parse::<std::net::Ipv6Addr>()
+                .expect("validated selected IPv6");
+            write!(&mut value, "[{address}]").expect("bounded String write");
+        } else {
+            for byte in self.host.bytes() {
+                value.push(byte.to_ascii_lowercase() as char);
+            }
+        }
+        write!(&mut value, ":{}", self.port).expect("bounded String write");
+        ThriftServiceOrigin(Arc::from(value))
+    }
+}
+impl ThriftServiceOrigin {
+    pub const MAX_BYTES: usize = 1024;
+    pub fn from_selected_address(address: &str) -> Result<Self, DependencyFactError> {
+        SelectedThriftServiceOrigin::from_selected_address(address)
+            .map(SelectedThriftServiceOrigin::into_owned)
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A shared host-local dependency is intentionally independent of directory or
 /// catalog name. Network dependencies name the actual selected service origin.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum SharedDependency {
     Network(NetworkServiceOrigin),
     Hdfs(HdfsServiceOrigin),
+    Thrift(ThriftServiceOrigin),
     LocalHost,
 }
 
@@ -550,5 +635,47 @@ mod tests {
         .unwrap()
         .into_owned();
         assert_ne!(selected, alias, "DNS alias equivalence is not guessed");
+    }
+}
+
+#[cfg(test)]
+mod thrift_service_origin_tests {
+    use super::*;
+    #[test]
+    fn selected_thrift_preserves_actual_port_and_shared_service_domain() {
+        let framed = ThriftServiceOrigin::from_selected_address("HMS.Example:9083").unwrap();
+        let buffered = SelectedThriftServiceOrigin::from_selected_address("hms.example:9083")
+            .unwrap()
+            .into_owned();
+        assert_eq!(framed, buffered);
+        assert_eq!(framed.as_str(), "thrift://hms.example:9083");
+        assert_ne!(
+            framed,
+            ThriftServiceOrigin::from_selected_address("hms.example:9084").unwrap()
+        );
+        assert_eq!(
+            ThriftServiceOrigin::from_selected_address("[2001:db8::1]:19083")
+                .unwrap()
+                .as_str(),
+            "thrift://[2001:db8::1]:19083"
+        );
+    }
+    #[test]
+    fn thrift_requires_selected_address_without_defaults_or_http_reinterpretation() {
+        for address in [
+            "hms.example",
+            "hms.example:",
+            "hms.example:0",
+            "hms.example:65536",
+            "thrift://hms.example:9083",
+            "http://hms.example:9083",
+            "hms.example:9083/path",
+            "u@hms.example:9083",
+        ] {
+            assert!(
+                SelectedThriftServiceOrigin::from_selected_address(address).is_err(),
+                "{address}"
+            );
+        }
     }
 }

@@ -33,16 +33,23 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+pub(crate) mod root_domains;
+use root_domains::{GroupOrigin, RootDomainChange};
+pub use root_domains::{
+    RootDomainBinding, RootDomainInitialAdmission, RootDomainInitialProposal,
+    RootDomainInitialSource,
+};
 mod typed_custody;
 pub(crate) use paid_proposal::{capture_native_action, delegate_native_actions};
 use typed_custody::ClaimCustody;
-pub(crate) use typed_custody::validate_native_payload_fence;
 pub use typed_custody::{
     InternalComputationAlias, InternalComputationGrant, NativeAsyncActionGrant,
-    NativeQueuedInputGrant, NativeReplyGrant, RetainedPayloadAlias, RetainedPayloadGrant,
-    UnreceivedProductionAdmission, UnreceivedProductionGrant, UnreceivedProductionOwner,
-    UnreceivedProductionQuote, UnreceivedProductionReady,
+    NativeDispatchFrozen, NativeDispatchSource, NativeQueuedInputGrant, NativeReplyGrant,
+    RetainedPayloadAlias, RetainedPayloadGrant, UnreceivedProductionAdmission,
+    UnreceivedProductionGrant, UnreceivedProductionOwner, UnreceivedProductionQuote,
+    UnreceivedProductionReady,
 };
+pub(crate) use typed_custody::{validate_native_computation_fence, validate_native_payload_fence};
 mod control_binding;
 pub use control_binding::ControlBindingProposal;
 use control_binding::{validate_active_control_node, validate_control_binding_shape};
@@ -68,8 +75,9 @@ pub use paid_proposal::{
     InternalResultClosedFactoryDescriptor,
 };
 pub use paid_proposal::{
-    JointProposal, RootPayloadAdmission, RootPayloadProposal, RootPayloadReady, RootPayloadSource,
-    RootStageAdmission, RootStageProposal, RootStageReady, RootStageSource,
+    InternalManifestBinding, JointProposal, RootPayloadAdmission, RootPayloadProposal,
+    RootPayloadReady, RootPayloadSource, RootStageAdmission, RootStageProposal, RootStageReady,
+    RootStageSource, SourceCohort,
 };
 pub(crate) mod proposal_storage;
 pub(crate) use control_storage::{control_storage_base, control_storage_dependency_records};
@@ -118,6 +126,7 @@ pub struct JointAdmissionHandle {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) struct ProfileKey {
+    pub(super) origin: GroupOrigin,
     class: usize,
     lane: usize,
     dependencies: Vec<u64>,
@@ -127,7 +136,7 @@ pub(super) struct ProfileFacts {
     pub(super) key: Arc<ProfileKey>,
     pub(super) class: WorkClass,
     pub(super) lane: JointLane,
-    pub(super) dependencies: Arc<[DependencyRef]>,
+    pub(super) dependencies: Arc<Vec<DependencyRef>>,
 }
 #[derive(Clone)]
 pub(super) struct ProfileRecord {
@@ -149,6 +158,11 @@ pub(crate) enum ClaimOwner {
 }
 
 pub(super) struct ClaimRecord {
+    /// Only closed Root initial/Stage Ready contains these uninstalled raws.
+    /// No caller can extract them before the same atomic domain install.
+    domain_birth: Option<u64>,
+    native_dispatch: Option<typed_custody::NativeDispatchOrigin>,
+    dispatch_staging: Option<u64>,
     custody: ClaimCustody,
     production: Option<typed_custody::unreceived::ProductionRecord>,
     pub(super) owner: ClaimOwner,
@@ -170,6 +184,9 @@ enum ClaimSource {
         epoch: u64,
     },
     Payload {
+        epoch: u64,
+    },
+    Computation {
         epoch: u64,
     },
     NodeControl {
@@ -257,11 +274,16 @@ impl RequestBudget {
 
 #[derive(Clone, Copy)]
 struct RootStageFence {
+    canonical: bool,
     stage: WorkId,
     payload: u64,
     epoch: u64,
+    // None is the original New-compute mode; Some authenticates exactly one
+    // existing typed stage claim without granting another computation.
+    computation: Option<[u64; 2]>,
 }
 pub(super) struct RequestRecord {
+    pub(super) root_domain: Option<RootDomainChange>,
     // Restricted by closed original sources, never caller-supplied identities.
     root_stage: Option<RootStageFence>,
     root_payload: Option<RootPayloadFence>,
@@ -271,6 +293,7 @@ pub(super) struct RequestRecord {
     pub(super) budget: RequestBudget,
     pub(super) owner: WorkId,
     pub(super) changes: ChangeBody,
+    source_cohort: bool,
     proposal: Option<ProposalKey>,
     pub(super) phase: RequestPhase,
     pub(super) blocked_at: Option<u64>,
@@ -482,8 +505,8 @@ impl JointAdmissionHandle {
         })
     }
 
-    /// Propose a same-class child using an observed free position. Waiting
-    /// does not reserve that position or block another root from taking it.
+    /// Propose a same-class child using exact resident backing reserved by
+    /// this original paid constructor. Capacity is granted only by its proof.
     pub fn request_child(
         &self,
         owner: &WorkOwner,
@@ -500,11 +523,20 @@ impl JointAdmissionHandle {
         request: Option<WorkRequest>,
     ) -> Result<PreparedRequest, WorkError> {
         let custody = self.reserve_proposal(scope)?;
+        self.prepare_child_with_custody(scope, request, custody)
+    }
+
+    fn prepare_child_with_custody(
+        &self,
+        scope: &WorkScope,
+        request: Option<WorkRequest>,
+        mut custody: Option<ProposalConstruction>,
+    ) -> Result<PreparedRequest, WorkError> {
         if !Arc::ptr_eq(&self.inner, &scope.inner) {
             return Err(WorkError::ForeignAuthority);
         }
         let (source, from, base, to, work_limit) = {
-            let state = self.inner.state.lock().unwrap();
+            let mut state = self.inner.state.lock().unwrap();
             let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
             if state.closed || ledger.driver_closed {
                 return Err(WorkError::Closed);
@@ -525,7 +557,7 @@ impl JointAdmissionHandle {
             let parent_claim = parent_slot.claim.ok_or(WorkError::NotReady)?;
             let parent = &ledger.claims[&parent_claim];
             if parent.pending.is_some()
-                || parent.active_facts.dependencies.is_empty()
+                || !root_domains::has_effective_domains(&state, &parent.active_facts, true)
                 || parent.amounts != parent.active_amounts
                 || parent.facts.key != parent.active_facts.key
             {
@@ -536,39 +568,67 @@ impl JointAdmissionHandle {
             let cell = &state.cancellations.slots[slot.0];
             let claim = cell.claim.ok_or(WorkError::NotReady)?;
             let old = &ledger.claims[&claim];
+            if cell.phase != SlotPhase::Free
+                || cell.class != node.class
+                || cell.parent.is_some()
+                || old.owner != ClaimOwner::ControlSlot(slot)
+                || old.pending.is_some()
+                || old.amounts != cell.base
+                || old.active_amounts != cell.base
+                || !old.facts.dependencies.is_empty()
+                || !old.active_facts.dependencies.is_empty()
+                || !old.active_facts.key.causal.is_empty()
+            {
+                return Err(WorkError::Conflict);
+            }
             cell.generation
                 .checked_add(2)
                 .ok_or(WorkError::ArithmeticOverflow)?;
             old.structure_revision
                 .checked_add(2)
                 .ok_or(WorkError::ArithmeticOverflow)?;
+            let parent_fence = ParentControlFence {
+                work: scope.id,
+                slot: node.cancellation,
+                generation: parent_slot.generation,
+                claim: parent_claim,
+                structure_revision: parent.structure_revision,
+                release_revision: parent.release_revision,
+            };
             let source = JointClaimView {
                 inner: Arc::downgrade(&self.inner),
                 id: claim,
                 source: ClaimSource::PoolFree {
                     slot,
                     generation: cell.generation,
-                    parent: ParentControlFence {
-                        work: scope.id,
-                        slot: node.cancellation,
-                        generation: parent_slot.generation,
-                        claim: parent_claim,
-                        structure_revision: parent.structure_revision,
-                        release_revision: parent.release_revision,
-                    },
+                    parent: parent_fence,
                     deadline: request.deadline,
                 },
                 structure_revision: old.structure_revision,
                 release_revision: old.release_revision,
             };
-            authenticate_scope(&state, old, &source, scope.id)?;
-            (
+            authenticate(old, &source)?;
+            authenticate_parent(&state, parent_fence, scope.id)?;
+            // Capture every fallible fence and immutable fact before taking
+            // the resident position off the free chain. The paid constructor
+            // is the sole rollback owner until the original ticket is queued.
+            let result = (
                 source,
                 Arc::clone(&old.active_facts),
                 cell.base,
                 Arc::clone(&parent.active_facts),
                 ledger.config.config.max_total_proof_work,
-            )
+            );
+            let custody = custody.as_mut().ok_or(WorkError::NotReady)?;
+            if custody.reserved_child.is_some() {
+                return Err(WorkError::Conflict);
+            }
+            let class = class_index(node.class);
+            let next = state.cancellations.slots[slot.0].next_free.take();
+            state.cancellations.free_heads[class] = next;
+            state.cancellations.slots[slot.0].phase = SlotPhase::ChildReserved { parent: scope.id };
+            custody.reserved_child = Some(slot);
+            result
         };
         // No cell Arc escapes: only the existing immutable profile facts do.
         let change = ChangeRecord {
@@ -582,6 +642,7 @@ impl JointAdmissionHandle {
             },
         };
         Ok(PreparedRequest {
+            root_domain: None,
             root_stage: None,
             root_payload: None,
             cpu_action: None,
@@ -722,6 +783,7 @@ impl JointAdmissionHandle {
             }
             let facts = Arc::new(ProfileFacts {
                 key: Arc::new(ProfileKey {
+                    origin: GroupOrigin::Frozen,
                     class: class_index(class),
                     lane: lane as usize,
                     dependencies: selected.iter().map(|d| d.ordinal).collect(),
@@ -729,7 +791,7 @@ impl JointAdmissionHandle {
                 }),
                 class,
                 lane,
-                dependencies: selected.into(),
+                dependencies: Arc::new(selected),
             });
             records.push(ChangeRecord {
                 old: source.as_ref().map(|source| source.id),
@@ -740,6 +802,7 @@ impl JointAdmissionHandle {
             });
         }
         Ok(PreparedRequest {
+            root_domain: None,
             root_stage: None,
             root_payload: None,
             cpu_action: None,
@@ -790,6 +853,14 @@ impl JointAdmissionHandle {
             id: None,
         };
         self.inner.update(|state| {
+            if let Some(change) = &prepared.root_domain {
+                root_domains::validate_construction(
+                    state,
+                    change.root,
+                    prepared.custody.as_ref().and_then(|c| c.key),
+                )?;
+                root_domains::validate_change(state, change, None)?;
+            }
             validate_control_productions(state, records)?;
             if control_only {
                 validate_control_binding_shape(state, scope, records)?;
@@ -831,6 +902,18 @@ impl JointAdmissionHandle {
                 return Err(WorkError::Capacity("joint request and reply records"));
             }
             for change in records.iter() {
+                if let GroupOrigin::Inherited(root) = change.claim.facts.key.origin {
+                    if node.root != root.work
+                        || state
+                            .nodes
+                            .get(&root.work)
+                            .and_then(|n| n.root_domains.as_ref())
+                            .is_none()
+                        || root_domains::origin(state, root.work)? != change.claim.facts.key.origin
+                    {
+                        return Err(WorkError::Conflict);
+                    }
+                }
                 if change.claim.facts.class != node.class {
                     return Err(WorkError::Conflict);
                 }
@@ -863,6 +946,9 @@ impl JointAdmissionHandle {
                 .ok_or(WorkError::ArithmeticOverflow)?;
             let id = state.next_id()?;
             let proposal = queue_proposal(state, &prepared.custody, id)?;
+            if let Some(change) = &prepared.root_domain {
+                root_domains::queue(state, change, id);
+            }
             state.nodes.get_mut(&scope.id).unwrap().resource_waiters = waiters;
             if let Some(fence) = prepared.root_stage {
                 state.nodes.get_mut(&fence.stage).unwrap().resource_waiters += 1;
@@ -870,11 +956,7 @@ impl JointAdmissionHandle {
             let ledger = state.joint.as_mut().unwrap();
             for record in records.iter() {
                 if let Some(old) = record.old {
-                    if !record
-                        .source
-                        .as_ref()
-                        .is_some_and(|source| matches!(source.source, ClaimSource::PoolFree { .. }))
-                    {
+                    if !(prepared.root_domain.is_some() && root_domains::observation(record)) {
                         ledger.claims.get_mut(&old).unwrap().pending = Some(id);
                     }
                 }
@@ -882,6 +964,7 @@ impl JointAdmissionHandle {
             ledger.requests.insert(
                 id,
                 RequestRecord {
+                    root_domain: prepared.root_domain.take(),
                     root_stage: prepared.root_stage,
                     root_payload: prepared.root_payload,
                     cpu_action: prepared.cpu_action,
@@ -895,6 +978,10 @@ impl JointAdmissionHandle {
                     },
                     owner: scope.id,
                     changes: records.clone(),
+                    source_cohort: prepared
+                        .custody
+                        .as_ref()
+                        .is_some_and(|custody| !custody.reserved_cohort.is_empty()),
                     proposal,
                     phase: RequestPhase::Waiting,
                     blocked_at: None,
@@ -904,6 +991,26 @@ impl JointAdmissionHandle {
             );
             admission.id = Some(id);
             if let Some(custody) = &mut prepared.custody {
+                if let Some(slot) = custody.reserved_child.take() {
+                    assert_eq!(
+                        state.cancellations.slots[slot.0].phase,
+                        SlotPhase::ChildReserved { parent: scope.id }
+                    );
+                    state.cancellations.slots[slot.0].phase = SlotPhase::ChildQueued {
+                        parent: scope.id,
+                        ticket: id,
+                    };
+                }
+                for slot in custody.reserved_cohort.drain(..) {
+                    assert_eq!(
+                        state.cancellations.slots[slot.0].phase,
+                        SlotPhase::ChildReserved { parent: scope.id }
+                    );
+                    state.cancellations.slots[slot.0].phase = SlotPhase::ChildQueued {
+                        parent: scope.id,
+                        ticket: id,
+                    };
+                }
                 custody.key = None;
             }
             Ok(())
@@ -913,6 +1020,7 @@ impl JointAdmissionHandle {
 }
 
 pub(super) struct PreparedRequest {
+    root_domain: Option<RootDomainChange>,
     root_stage: Option<RootStageFence>,
     root_payload: Option<RootPayloadFence>,
     cpu_action: Option<CpuActionFence>,
@@ -964,6 +1072,11 @@ fn source_work(root: WorkId, fence: Option<RootStageFence>, source: &JointClaimV
             Some(fence),
             ClaimSource::NodeControl { work, .. } | ClaimSource::Production { work, .. },
         ) if work == fence.stage => fence.stage,
+        (Some(fence), ClaimSource::Computation { epoch })
+            if fence.computation == Some([source.id, epoch]) =>
+        {
+            fence.stage
+        }
         _ => root,
     }
 }
@@ -981,6 +1094,14 @@ fn authenticate(record: &ClaimRecord, source: &JointClaimView) -> Result<(), Wor
             },
         ) => epoch == original && pins != 0,
         (ClaimSource::Payload { .. }, _) => false,
+        (
+            ClaimSource::Computation { epoch },
+            ClaimCustody::Computation {
+                epoch: original,
+                pins,
+            },
+        ) => epoch == original && pins != 0,
+        (ClaimSource::Computation { .. }, _) => false,
         (_, ClaimCustody::Raw) => true,
         _ => false,
     };
@@ -1019,7 +1140,7 @@ fn authenticate_parent(
         || claim.structure_revision != fence.structure_revision
         || claim.release_revision != fence.release_revision
         || claim.pending.is_some()
-        || claim.active_facts.dependencies.is_empty()
+        || !root_domains::has_effective_domains(state, &claim.active_facts, true)
         || claim.active_amounts != claim.amounts
         || claim.active_facts.key != claim.facts.key
     {
@@ -1036,7 +1157,7 @@ fn authenticate_scope(
 ) -> Result<(), WorkError> {
     authenticate(record, source)?;
     match source.source {
-        ClaimSource::Physical | ClaimSource::Payload { .. }
+        ClaimSource::Physical | ClaimSource::Payload { .. } | ClaimSource::Computation { .. }
             if record.owner == ClaimOwner::PhysicalWork(work) =>
         {
             Ok(())
@@ -1083,17 +1204,18 @@ fn authenticate_scope(
                 .get(slot.0)
                 .ok_or(WorkError::Released)?;
             if !state.cancellations.fixed
-                || cell.phase != SlotPhase::Free
+                || !matches!(cell.phase,
+                    SlotPhase::ChildReserved { parent: owner }
+                        | SlotPhase::ChildQueued { parent: owner, .. } if owner == work)
                 || cell.generation != generation
                 || cell.claim != Some(source.id)
                 || cell.parent.is_some()
                 || record.owner != ClaimOwner::ControlSlot(slot)
-                || record.pending.is_some()
                 || record.amounts != cell.base
                 || record.active_amounts != cell.base
                 || !record.facts.dependencies.is_empty()
                 || !record.active_facts.dependencies.is_empty()
-                || state.cancellations.free_heads[class_index(cell.class)] != Some(slot)
+                || cell.next_free.is_some()
                 || ledger.claims[&parent.claim].active_facts.class != cell.class
             {
                 return Err(WorkError::Conflict);
@@ -1109,6 +1231,15 @@ pub(super) fn validate_waiting(
     id: u64,
     changes: &[ChangeRecord],
 ) -> Result<(), WorkError> {
+    if let Some(change) = state
+        .joint
+        .as_ref()
+        .and_then(|l| l.requests.get(&id))
+        .and_then(|r| r.root_domain.as_ref())
+    {
+        root_domains::validate_change(state, change, Some(id))?;
+    }
+
     let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
     let request = ledger.requests.get(&id).ok_or(WorkError::Released)?;
     let work = request.owner;
@@ -1137,7 +1268,7 @@ pub(super) fn validate_waiting(
                 source,
                 source_work(work, request.root_stage, source),
             )?;
-            let expected = if matches!(source.source, ClaimSource::PoolFree { .. }) {
+            let expected = if request.root_domain.is_some() && root_domains::observation(change) {
                 None
             } else {
                 Some(id)
@@ -1172,6 +1303,24 @@ impl WorkScope {
             .prepare_child(self, None)
             .and_then(|prepared| handle.queue_request(prepared))
             .map_err(|error| JointAdmissionFailure { error })
+    }
+    /// Same child constructor and one finite proof. Full is only the original
+    /// unacquired proposal slot; every other refusal retains its typed fact.
+    pub fn try_request_joint_child(
+        &self,
+    ) -> Result<JointTryBegin<JointAdmission, JointProposalSlotSignal>, WorkError> {
+        let handle = JointAdmissionHandle {
+            inner: Arc::clone(&self.inner),
+        };
+        match handle.try_reserve_proposal(self)? {
+            ProposalReservation::Full(target) => Ok(JointTryBegin::Full(
+                JointProposalSlotSignal::new(Arc::downgrade(&self.inner), target),
+            )),
+            ProposalReservation::Reserved(custody) => {
+                let prepared = handle.prepare_child_with_custody(self, None, custody)?;
+                handle.queue_request(prepared).map(JointTryBegin::Started)
+            }
+        }
     }
 }
 
@@ -1402,8 +1551,30 @@ fn remove_request(state: &mut State, id: u64) {
         }
         for change in request.changes.iter() {
             if let Some(source) = &change.source {
-                if let ClaimSource::PoolFree { slot, .. } = source.source {
+                if let ClaimSource::PoolFree { slot, parent, .. } = source.source {
+                    if request.source_cohort
+                        && matches!(state.cancellations.slots[slot.0].phase,
+                        SlotPhase::ChildQueued { ticket, .. } | SlotPhase::ChildGranted { ticket, .. } if ticket == id)
+                    {
+                        state
+                            .cancellations
+                            .cell(parent.slot)
+                            .release_fixed_children(1);
+                    }
                     if matches!(state.cancellations.slots[slot.0].phase,
+                        SlotPhase::ChildQueued { ticket, .. } if ticket == id)
+                    {
+                        let record = state
+                            .joint
+                            .as_mut()
+                            .unwrap()
+                            .claims
+                            .get_mut(&source.id)
+                            .unwrap();
+                        assert_eq!(record.pending, Some(id));
+                        record.pending = None;
+                        state.cancellations.withdraw_child_reservation(slot);
+                    } else if matches!(state.cancellations.slots[slot.0].phase,
                         SlotPhase::ChildGranted { ticket, .. } if ticket == id)
                     {
                         let record = state
@@ -1457,19 +1628,70 @@ pub(super) fn fail_request(state: &mut State, id: u64, error: WorkError) -> Opti
     }
     let phase = std::mem::replace(&mut request.phase, RequestPhase::Failed(error));
     let changes = request.changes.clone();
+    let source_cohort = request.source_cohort;
+    let root_domain = request.root_domain.clone();
     let waker = request.waker.take();
     let charged = matches!(
         phase,
         RequestPhase::Granted { .. } | RequestPhase::Delivered
     );
+    if root_domain.is_some() && charged {
+        // Unlike ordinary Delivered New, these raw grants are sealed inside
+        // RootDomainInitialAdmission/RootStageReady and cannot authorize a
+        // physical effect. Withdraw them at the same cut BEFORE changing D.
+        let mut after = std::ops::Bound::Unbounded;
+        loop {
+            let next = state
+                .joint
+                .as_ref()
+                .unwrap()
+                .claims
+                .range((after, std::ops::Bound::Unbounded))
+                .find_map(|(&claim, row)| (row.domain_birth == Some(id)).then_some(claim));
+            let Some(claim) = next else {
+                break;
+            };
+            after = std::ops::Bound::Excluded(claim);
+            assert!(
+                state.joint.as_ref().unwrap().claims[&claim]
+                    .custody
+                    .is_raw()
+            );
+            remove_claim(state, claim);
+        }
+    }
+    let ledger = state.joint.as_mut().unwrap();
     for change in changes.iter() {
         if change
             .source
             .as_ref()
             .is_some_and(|source| matches!(source.source, ClaimSource::PoolFree { .. }))
         {
-            // ChildGranted is an actual committed responsibility. Keep its
-            // active domain fee and pending ticket until this reply exits.
+            if let Some(JointClaimView {
+                source: ClaimSource::PoolFree { slot, parent, .. },
+                id: claim,
+                ..
+            }) = change.source.as_ref()
+            {
+                if matches!(state.cancellations.slots[slot.0].phase,
+                    SlotPhase::ChildQueued { ticket, .. } if ticket == id)
+                {
+                    if source_cohort {
+                        state
+                            .cancellations
+                            .cell(parent.slot)
+                            .release_fixed_children(1);
+                    }
+                    // A refused proof installed no domain grant or observer.
+                    // Return only its original uncommitted resident position.
+                    let record = ledger.claims.get_mut(claim).unwrap();
+                    assert_eq!(record.pending, Some(id));
+                    record.pending = None;
+                    state.cancellations.withdraw_child_reservation(*slot);
+                }
+            }
+            // A ChildGranted reply has actual committed domain liability;
+            // retain that fee and pending ticket until its original reply exits.
             continue;
         }
         let Some(old) = change.old else {
@@ -1500,6 +1722,11 @@ pub(super) fn fail_request(state: &mut State, id: u64, error: WorkError) -> Opti
             }
             ledger.released();
         }
+    }
+    if let Some(change) = &root_domain {
+        // The active graph and the same original request retain both sides.
+        // No detached snapshot amount is ever restored.
+        let _retired = root_domains::rollback(state, change, id);
     }
     if let RequestPhase::Granted { new_ids } = phase {
         for id in new_ids {
@@ -1537,8 +1764,12 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
     validate_waiting(state, id, &request.changes)?;
     let changes = request.changes.clone();
     let owner = request.owner;
+    let root_domain = request.root_domain.clone();
     let physical_owner = request.root_stage.map_or(owner, |fence| fence.stage);
     let native_action = request.native_action.clone();
+    let dispatch_work = request
+        .budget
+        .limit(ledger.config.config.max_total_proof_work);
     let new_count = changes.iter().filter(|c| c.old.is_none()).count();
     if ledger
         .claims
@@ -1570,6 +1801,7 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
     ledger
         .profile_layout_revision
         .checked_add(changes.len() as u64)
+        .and_then(|n| n.checked_add(u64::from(root_domain.is_some())))
         .ok_or(WorkError::ArithmeticOverflow)?;
     for change in changes.iter() {
         if let Some(source) = &change.source {
@@ -1627,10 +1859,13 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
             .as_ref()
             .map_or(physical_owner, |fence| fence.physical_owner(index));
         if let Some(old) = change.old {
+            if root_domain.is_some() && root_domains::observation(change) {
+                continue;
+            }
             let ledger = state.joint.as_mut().unwrap();
             let record = ledger.claims.get_mut(&old).unwrap();
             let rekey = record.facts.key != change.claim.facts.key;
-            record.facts = Arc::clone(&change.claim.facts);
+            record.facts = Arc::clone(&profiles[&change.claim.facts.key].facts);
             record.amounts = change.claim.amounts;
             record.structure_revision += 1; // Reserved by request preflight.
             if let Some(source) = &change.source {
@@ -1639,9 +1874,13 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
                     record.active_amounts = record.amounts;
                     record.pending = Some(id);
                     let cell = &mut state.cancellations.slots[slot.0];
-                    let class = class_index(cell.class);
-                    assert_eq!(state.cancellations.free_heads[class], Some(slot));
-                    state.cancellations.free_heads[class] = cell.next_free.take();
+                    assert_eq!(
+                        cell.phase,
+                        SlotPhase::ChildQueued {
+                            parent: parent.work,
+                            ticket: id,
+                        }
+                    );
                     cell.generation += 1;
                     cell.phase = SlotPhase::ChildGranted {
                         parent: parent.work,
@@ -1657,12 +1896,17 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
             state.joint.as_mut().unwrap().claims.insert(
                 new_id,
                 ClaimRecord {
+                    domain_birth: root_domain.as_ref().map(|_| id),
+                    native_dispatch: native_action
+                        .as_ref()
+                        .map(|fence| fence.dispatch_origin(id, index, dispatch_work)),
+                    dispatch_staging: None,
                     custody: ClaimCustody::Raw,
                     production: None,
                     owner: ClaimOwner::PhysicalWork(physical_owner),
-                    facts: Arc::clone(&change.claim.facts),
+                    facts: Arc::clone(&profiles[&change.claim.facts.key].facts),
                     amounts: change.claim.amounts,
-                    active_facts: Arc::clone(&change.claim.facts),
+                    active_facts: Arc::clone(&profiles[&change.claim.facts.key].facts),
                     active_amounts: change.claim.amounts,
                     pending: None,
                     structure_revision: 0,
@@ -1694,7 +1938,19 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
                 .mark_published(dependency);
         }
     }
+    if let Some(change) = &root_domain {
+        for dependency in change.candidate.iter() {
+            ledger
+                .dependencies
+                .as_mut()
+                .unwrap()
+                .mark_published(dependency);
+        }
+    }
     ledger.requests.get_mut(&id).unwrap().phase = RequestPhase::Granted { new_ids };
+    if let Some(change) = &root_domain {
+        root_domains::charge(state, change);
+    }
     Ok(())
 }
 
@@ -1835,7 +2091,8 @@ impl Future for JointAdmission {
                 else {
                     unreachable!()
                 };
-                let has_adjustment = changes.iter().any(|change| change.old.is_some());
+                let has_adjustment = request.root_domain.is_some()
+                    || changes.iter().any(|change| change.old.is_some());
                 // IDs are checked, monotonic and never reused in this exact
                 // authority. Only this unique reply constructs physical guards.
                 delivery.new_ids = new_ids;
@@ -2033,7 +2290,7 @@ impl JointAdmission {
                 if let Some(fence) = request.native_action.as_ref() {
                     validate_native_action(state, request.owner, fence, &request.changes)?;
                 }
-                if request.root_payload.is_some() {
+                if request.root_payload.is_some() || request.root_domain.is_some() {
                     return Err(WorkError::Conflict);
                 }
                 if let Some(fence) = request.control_action {
@@ -2383,7 +2640,10 @@ impl JointAdjustmentReceipt {
             if state.closed || ledger.driver_closed {
                 return Err(WorkError::Closed);
             }
-            if request.changes.len() != 1 || request.owner != parent_scope.id {
+            if request.source_cohort
+                || request.changes.len() != 1
+                || request.owner != parent_scope.id
+            {
                 return Err(WorkError::Conflict);
             }
             let change = &request.changes[0];
@@ -2543,7 +2803,9 @@ impl JointAdjustmentReceipt {
                         return Err(WorkError::Conflict);
                     }
                 }
-                ClaimSource::PoolFree { .. } | ClaimSource::Payload { .. } => {
+                ClaimSource::PoolFree { .. }
+                | ClaimSource::Payload { .. }
+                | ClaimSource::Computation { .. } => {
                     return Err(WorkError::Conflict);
                 }
             }

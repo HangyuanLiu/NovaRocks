@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 mod action_state;
 pub mod command;
-mod io_admission;
+pub(crate) mod io_admission;
 pub use action_state::MaintenanceActionState;
 pub(crate) mod iceberg;
 #[cfg(test)]

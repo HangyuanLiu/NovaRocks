@@ -136,6 +136,18 @@ fn write_transaction_spec(prepared: &PreparedMutation, _subkind: &str) -> WriteT
 }
 
 impl DmlService {
+    /// Apply the original typed statement admission before any asynchronous
+    /// source or Provider action is created. Lowering reads only admitted spans.
+    pub(crate) fn prepare_mutation_shape(
+        &self,
+        statement: &DmlStatement,
+        source: &str,
+    ) -> Result<crate::query_execution::dml::mutation::OwnedMutationStatement, DmlError> {
+        admit_mutation(statement, source)?;
+        crate::query_execution::dml::mutation::lower_statement(statement, source)
+            .map_err(DmlError::executor)
+    }
+
     /// Prepares an UPDATE or MERGE already classified by SQLP-5's typed AST.
     /// The statement family comes from the variant, never from `source` text.
     pub(crate) fn prepare_typed_mutation(

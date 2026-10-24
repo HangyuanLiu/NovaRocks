@@ -172,7 +172,7 @@ impl novarocks_query_application::session_control::GovernedStatementAction
 {
     fn poll_action(
         &mut self,
-        _: &mut novarocks_query_application::session_control::GovernedQueryStatementOwner,
+        _: &mut novarocks_query_application::session_control::GovernedActionContext<'_>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<
         Result<
@@ -297,7 +297,7 @@ fn observe_real_statistics_port(class: ResultWindowClass) {
         novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )
     .unwrap();
-    let scope = StatementFactScope::new(
+    let scope = StatementFactScope::binding_only(
         bindings.clone(),
         context,
         Some("ice.main"),

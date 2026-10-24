@@ -327,7 +327,7 @@ fn action_source_facts(
             || row.active_amounts != slot.base
             || row.facts.key != row.active_facts.key
             || row.active_facts.class != node.class
-            || row.active_facts.dependencies.is_empty()
+            || !root_domains::has_effective_domains(state, &row.active_facts, true)
             || !row.active_facts.key.causal.is_empty()
         {
             return Err(WorkError::Conflict);
@@ -345,7 +345,7 @@ fn action_source_facts(
         || row.amounts != row.active_amounts
         || row.facts.key != row.active_facts.key
         || row.active_facts.class != node.class
-        || row.active_facts.dependencies.is_empty()
+        || !root_domains::has_effective_domains(state, &row.active_facts, true)
         || row.active_amounts.get(JointResource::Computations) != 1
         || !matches!(
             row.active_facts.lane,
@@ -548,6 +548,7 @@ impl InternalCpuActionSource {
         if facts.dependencies.len() > current.selected.capacity() {
             return Err(WorkError::Capacity("CPU action full dependency backing"));
         }
+        current.origin = facts.key.origin;
         current.selected.extend(facts.dependencies.iter().cloned());
         proposal.end_change()?;
         let admission = proposal.submit().map_err(|failure| failure.error)?;

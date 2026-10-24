@@ -346,6 +346,8 @@ impl ResultWindowGrant {
             backing: AliasBacking::Window {
                 holder: Arc::clone(&self.holder),
                 execution_scope: None,
+                manifest: None,
+                client_computation: None,
             },
         }
     }
@@ -359,11 +361,17 @@ enum AliasBacking {
     Window {
         holder: Arc<WindowHolder>,
         execution_scope: Option<Arc<WindowExecutionScope>>,
+        client_computation: Option<(WorkId, [u64; 2])>,
+        manifest: Option<(
+            crate::joint_admission::InternalManifestBinding,
+            crate::joint_admission::RetainedPayloadAlias,
+        )>,
     },
     InternalRoot {
         payload: crate::joint_admission::RetainedPayloadAlias,
         root: WorkScope,
         execution: WorkScope,
+        binding: Option<crate::joint_admission::InternalManifestBinding>,
     },
 }
 
@@ -394,6 +402,11 @@ fn internal_pin_error(error: novarocks_resource_contract::RetentionPinError) -> 
 #[derive(Clone)]
 pub(crate) enum NativeCapacityFence {
     Window(std::sync::Weak<WindowHolder>),
+    ClientWindow {
+        holder: std::sync::Weak<WindowHolder>,
+        stage: WorkId,
+        key: [u64; 2],
+    },
     InternalPayload([u64; 2]),
 }
 impl NativeCapacityFence {
@@ -407,6 +420,14 @@ impl NativeCapacityFence {
                 }
                 Ok(())
             }
+            Self::ClientWindow { holder, stage, key } => {
+                if holder.strong_count() == 0 {
+                    return Err(WorkError::Released);
+                }
+                crate::joint_admission::ledger::validate_native_computation_fence(
+                    state, root, *stage, *key,
+                )
+            }
             Self::InternalPayload(key) => {
                 crate::joint_admission::ledger::validate_native_payload_fence(state, root, *key)
             }
@@ -418,11 +439,26 @@ impl ResultWindowAlias {
         &self,
     ) -> Result<crate::joint_admission::NativeAsyncActionAuthority, WorkError> {
         let fence = match &self.backing {
-            AliasBacking::Window { holder, .. } => {
+            AliasBacking::Window {
+                holder,
+                client_computation,
+                ..
+            } => {
                 if holder.class == ResultWindowClass::Closing {
                     return Err(WorkError::Conflict);
                 }
-                NativeCapacityFence::Window(Arc::downgrade(holder))
+                if let Some((stage, key)) = client_computation {
+                    if self.execution_scope().id != *stage {
+                        return Err(WorkError::Conflict);
+                    }
+                    NativeCapacityFence::ClientWindow {
+                        holder: Arc::downgrade(holder),
+                        stage: *stage,
+                        key: *key,
+                    }
+                } else {
+                    NativeCapacityFence::Window(Arc::downgrade(holder))
+                }
             }
             AliasBacking::InternalRoot { payload, .. } => {
                 NativeCapacityFence::InternalPayload(payload.native_source_key()?)
@@ -442,11 +478,26 @@ impl ResultWindowAlias {
         quote: crate::joint_admission::NativeAsyncActionQuote,
     ) -> Result<crate::joint_admission::NativeAsyncActionSource, WorkError> {
         let fence = match &self.backing {
-            AliasBacking::Window { holder, .. } => {
+            AliasBacking::Window {
+                holder,
+                client_computation,
+                ..
+            } => {
                 if holder.class == ResultWindowClass::Closing {
                     return Err(WorkError::Conflict);
                 }
-                NativeCapacityFence::Window(Arc::downgrade(holder))
+                if let Some((stage, key)) = client_computation {
+                    if self.execution_scope().id != *stage {
+                        return Err(WorkError::Conflict);
+                    }
+                    NativeCapacityFence::ClientWindow {
+                        holder: Arc::downgrade(holder),
+                        stage: *stage,
+                        key: *key,
+                    }
+                } else {
+                    NativeCapacityFence::Window(Arc::downgrade(holder))
+                }
             }
             AliasBacking::InternalRoot { payload, .. } => {
                 NativeCapacityFence::InternalPayload(payload.native_source_key()?)
@@ -496,8 +547,124 @@ impl ResultWindowAlias {
                 payload,
                 root: root.clone(),
                 execution: execution.clone(),
+                binding: None,
             },
         })
+    }
+    /// Author the closed manifest binding only while borrowing the original
+    /// positive Root payload and actual direct-child computation grants.
+    pub fn from_internal_computation(
+        root: &WorkScope,
+        stage: &crate::WorkOwner,
+        payload: &crate::joint_admission::RetainedPayloadGrant,
+        computation: &crate::joint_admission::InternalComputationGrant,
+    ) -> Result<Self, WorkError> {
+        let binding = crate::joint_admission::InternalManifestBinding::from_grants(
+            root,
+            stage,
+            payload,
+            computation,
+        )?;
+        let mut alias = Self::from_internal_payload(root, &stage.scope(), payload)?;
+        let AliasBacking::InternalRoot {
+            binding: target, ..
+        } = &mut alias.backing
+        else {
+            unreachable!()
+        };
+        *target = Some(binding);
+        Ok(alias)
+    }
+    /// Preserve the actual Client window while attaching only the original
+    /// positive Root/stage manifest authority. No Internal result window or
+    /// new quota is acquired, and retention alone cannot call this constructor.
+    pub fn from_client_computation(
+        root: &WorkScope,
+        stage: &crate::WorkOwner,
+        original: &Self,
+        payload: &crate::joint_admission::RetainedPayloadGrant,
+        computation: &crate::joint_admission::InternalComputationGrant,
+    ) -> Result<Self, WorkError> {
+        if original.class() != ResultWindowClass::Client || !original.is_for_scope(root) {
+            return Err(WorkError::Conflict);
+        }
+        if payload.capacity_bytes().map_err(internal_pin_error)?
+            < original.client_all_objects_bytes()?
+        {
+            return Err(WorkError::Capacity(
+                "Client stage original payload envelope",
+            ));
+        }
+        let binding = crate::joint_admission::InternalManifestBinding::from_grants(
+            root,
+            stage,
+            payload,
+            computation,
+        )?;
+        let retained = payload.retain_alias().map_err(internal_pin_error)?;
+        let mut alias = original.for_child(&stage.scope())?;
+        let AliasBacking::Window {
+            manifest,
+            client_computation,
+            ..
+        } = &mut alias.backing
+        else {
+            return Err(WorkError::Conflict);
+        };
+        // The QA activity owns the unique positive grant. Window aliases keep
+        // only its original incarnation fence and payload/window retention.
+        *client_computation = Some(binding.computation_identity());
+        *manifest = Some((binding, retained));
+        Ok(alias)
+    }
+    /// Read the SAME original Client envelope, never a guessed peak constant.
+    pub fn client_all_objects_bytes(&self) -> Result<u64, WorkError> {
+        match &self.backing {
+            AliasBacking::Window { holder, .. } if holder.class == ResultWindowClass::Client => {
+                Ok(holder.all_objects_bytes)
+            }
+            _ => Err(WorkError::Conflict),
+        }
+    }
+    /// Borrow the exact positive-grant-derived capability carried by this
+    /// original alias. Plain payload/retention constructors cannot mint one.
+    pub fn internal_manifest_binding(
+        &self,
+    ) -> Result<Option<&crate::joint_admission::InternalManifestBinding>, WorkError> {
+        match &self.backing {
+            AliasBacking::Window {
+                manifest: Some((binding, payload)),
+                ..
+            } => {
+                binding.validate_alias(
+                    self.root_scope(),
+                    self.execution_scope(),
+                    payload.native_source_key()?,
+                )?;
+                Ok(Some(binding))
+            }
+            AliasBacking::InternalRoot {
+                binding: Some(binding),
+                root,
+                execution,
+                payload,
+            } => {
+                binding.validate_alias(root, execution, payload.native_source_key()?)?;
+                Ok(Some(binding))
+            }
+            _ => Ok(None),
+        }
+    }
+    /// A governed Client alias cannot become a legacy execution allowance by
+    /// dropping its manifest projection or deriving another attribution scope.
+    pub fn has_client_computation_stamp(&self) -> bool {
+        matches!(
+            &self.backing,
+            AliasBacking::Window {
+                client_computation: Some(_),
+                ..
+            }
+        )
     }
     pub fn is_root_backed_internal(&self) -> bool {
         matches!(self.backing, AliasBacking::InternalRoot { .. })
@@ -512,6 +679,32 @@ impl ResultWindowAlias {
     pub fn is_for_scope(&self, scope: &WorkScope) -> bool {
         self.execution_scope().id == scope.id
             && Arc::ptr_eq(&self.execution_scope().inner, &scope.inner)
+    }
+    /// Move the same positive Root payload pin into statement retention.
+    /// The completed computation's identity is no longer an execution scope;
+    /// dropping its manifest capability cannot mint another computation grant.
+    pub fn into_root_retention(mut self) -> Result<Self, WorkError> {
+        let AliasBacking::InternalRoot {
+            payload,
+            root,
+            execution,
+            binding,
+        } = &mut self.backing
+        else {
+            return Err(WorkError::Conflict);
+        };
+        root.check()?;
+        payload.check_backing_total(0)?;
+        *execution = root.clone();
+        *binding = None;
+        Ok(self)
+    }
+
+    /// Exact original Root identity, including its owning authority. This
+    /// comparison grants no payload or computation capacity.
+    pub fn is_for_root_scope(&self, root: &WorkScope) -> bool {
+        let original = self.root_scope();
+        original.id == root.id && Arc::ptr_eq(&original.inner, &root.inner)
     }
     pub fn shares_capacity_with(&self, other: &Self) -> bool {
         match (&self.backing, &other.backing) {
@@ -533,6 +726,7 @@ impl ResultWindowAlias {
             AliasBacking::Window {
                 holder,
                 execution_scope,
+                ..
             } => execution_scope
                 .as_ref()
                 .map_or(&holder.scope, |value| &value.scope),
@@ -544,18 +738,32 @@ impl ResultWindowAlias {
             AliasBacking::Window {
                 holder,
                 execution_scope,
+                manifest,
+                client_computation,
             } => AliasBacking::Window {
                 holder: Arc::clone(holder),
                 execution_scope: execution_scope.clone(),
+                client_computation: *client_computation,
+                manifest: manifest
+                    .as_ref()
+                    .map(|(binding, payload)| {
+                        Ok((
+                            binding.clone(),
+                            payload.try_clone().map_err(internal_pin_error)?,
+                        ))
+                    })
+                    .transpose()?,
             },
             AliasBacking::InternalRoot {
                 payload,
                 root,
                 execution,
+                binding,
             } => AliasBacking::InternalRoot {
                 payload: payload.try_clone().map_err(internal_pin_error)?,
                 root: root.clone(),
                 execution: execution.clone(),
+                binding: binding.clone(),
             },
         };
         Ok(Self { backing })
@@ -597,10 +805,18 @@ impl ResultWindowAlias {
                     payload,
                     root: root.clone(),
                     execution: child.clone(),
+                    // A different execution cannot inherit the old stage's
+                    // positive-computation authority through retention alone.
+                    binding: None,
                 },
             });
         }
-        let AliasBacking::Window { holder, .. } = &self.backing else {
+        let AliasBacking::Window {
+            holder,
+            client_computation,
+            ..
+        } = &self.backing
+        else {
             unreachable!()
         };
         child.inner.update(|state| {
@@ -624,6 +840,8 @@ impl ResultWindowAlias {
                     execution_scope: Some(Arc::new(WindowExecutionScope {
                         scope: child.clone(),
                     })),
+                    manifest: None,
+                    client_computation: *client_computation,
                 },
             })
         })
@@ -895,6 +1113,8 @@ mod tests {
         let alias = window.retain_alias();
         assert!(alias.is_for_scope(&a.owner.scope()));
         assert!(!alias.is_for_scope(&b.owner.scope()));
+        assert!(alias.is_for_root_scope(&a.owner.scope()));
+        assert!(!alias.is_for_root_scope(&b.owner.scope()));
     }
 
     #[test]

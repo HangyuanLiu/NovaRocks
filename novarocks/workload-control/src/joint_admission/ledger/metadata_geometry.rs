@@ -80,12 +80,15 @@ pub(super) fn backing_bytes(
         arc_bytes::<ProfileFacts>()?,
         arc_bytes::<ProfileKey>()?,
         array_bytes::<u64>(k)?,
-        arc_slice_bytes::<DependencyRef>(k)?,
+        sum_bytes([
+            arc_bytes::<Vec<DependencyRef>>()?,
+            array_bytes::<DependencyRef>(k)?,
+        ])?,
     ])?;
     let empty_facts = sum_bytes([
         arc_bytes::<ProfileFacts>()?,
         arc_bytes::<ProfileKey>()?,
-        arc_slice_bytes::<DependencyRef>(0)?,
+        arc_bytes::<Vec<DependencyRef>>()?,
     ])?
     .checked_mul(empty_classes)
     .ok_or(WorkError::ArithmeticOverflow)?;
@@ -106,6 +109,9 @@ pub(super) fn backing_bytes(
     let reply = sum_bytes([array_bytes::<u64>(c)?, array_bytes::<JointClaim>(c)?])?;
     let body = sum_bytes([
         array_bytes::<ChangeRecord>(c)?,
+        // One original paid constructor may reserve a closed Source cohort.
+        // Its rollback positions coexist with its exact change body.
+        array_bytes::<SlotId>(c)?,
         construction.max(reply),
         // The builder's allocation-free membership check has one prepaid
         // capacity-K ordinal union, separate from its current selected set.
@@ -188,17 +194,27 @@ mod tests {
         first.owner.complete();
         drive(&mut driver);
         {
-            let state = control.inner.state.lock().unwrap();
-            assert!(!state.nodes.contains_key(&first_id));
-            let ledger = state.joint.as_ref().unwrap();
-            let survivor = &ledger.claims[&b.id.unwrap()].facts;
-            let historical = original
-                .upgrade()
-                .expect("aggregate owns the original graph");
-            assert!(!Arc::ptr_eq(&historical, survivor));
-            let (key, aggregate) = ledger.profiles.get_key_value(&survivor.key).unwrap();
-            assert!(Arc::ptr_eq(&aggregate.facts, &historical));
-            assert!(Arc::ptr_eq(key, &aggregate.facts.key));
+            let (creator_recycled, survivor, historical, aggregate_facts, aggregate_key) = {
+                let state = control.inner.state.lock().unwrap();
+                let ledger = state.joint.as_ref().unwrap();
+                let survivor = &ledger.claims[&b.id.unwrap()].facts;
+                let (key, aggregate) = ledger.profiles.get_key_value(&survivor.key).unwrap();
+                (
+                    !state.nodes.contains_key(&first_id),
+                    Arc::clone(survivor),
+                    original.upgrade(),
+                    Arc::clone(&aggregate.facts),
+                    Arc::clone(key),
+                )
+            };
+            // Equivalent Frozen groups share the canonical graph. Recycling
+            // its first role must neither destroy nor duplicate that graph.
+            // Assert outside State so a failed oracle cannot poison teardown.
+            assert!(creator_recycled);
+            let historical = historical.expect("aggregate owns the original graph");
+            assert!(Arc::ptr_eq(&historical, &survivor));
+            assert!(Arc::ptr_eq(&aggregate_facts, &historical));
+            assert!(Arc::ptr_eq(&aggregate_key, &aggregate_facts.key));
         }
         drop(b);
         second.business.release();

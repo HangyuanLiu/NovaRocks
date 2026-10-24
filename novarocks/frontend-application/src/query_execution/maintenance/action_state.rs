@@ -70,6 +70,52 @@ impl MaintenanceActionState {
         loan.body.as_ref()?.call.as_ref()?.publication_disposition()
     }
 
+    pub(super) fn has_applied_publication(&self) -> Result<bool, String> {
+        let loan = self.loan()?;
+        Ok(loan
+            .body
+            .as_ref()
+            .unwrap()
+            .call
+            .as_ref()
+            .is_some_and(|call| call.has_applied_publication()))
+    }
+
+    pub(super) fn needs_cleanup_custody(&self) -> Result<bool, String> {
+        let loan = self.loan()?;
+        Ok(loan
+            .body
+            .as_ref()
+            .unwrap()
+            .call
+            .as_ref()
+            .is_some_and(|call| {
+                call.cleanup_responsibility()
+                    == novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Retained
+            }))
+    }
+    /// Closed moves only. The caller installs the receiving Box in the same
+    /// stable Source before disposing execution/result-window aliases.
+    pub(super) fn take_cleanup_call_in(
+        &self,
+        target: &mut Option<MetadataMaintenanceCall>,
+    ) -> Result<(), String> {
+        if target.is_some() {
+            return Err("metadata residual receiver is occupied".into());
+        }
+        let mut loan = self.loan()?;
+        *target = loan.body.as_mut().unwrap().call.take();
+        Ok(())
+    }
+    pub(super) fn drop_execution_aliases(&self) -> Result<(), String> {
+        let mut loan = self.loan()?;
+        let engine = loan.body.as_mut().unwrap().engine.take();
+        // Restore the canonical row before any result-window last-alias Drop.
+        drop(loan);
+        drop(engine);
+        Ok(())
+    }
+
     fn loan(&self) -> Result<ActionLoan<'_>, String> {
         let body = self
             .original

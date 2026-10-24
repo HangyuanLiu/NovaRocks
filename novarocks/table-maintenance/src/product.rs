@@ -120,6 +120,11 @@ pub enum CleanupTerminal {
 
 /// Opaque provider session for one cleanup operation.
 pub trait CleanupSession: Send {
+    /// Current reachability and safe_gc_age never authorize a scanned-object
+    /// deletion. The real Provider must supply its checked safety capability.
+    fn require_scanned_object_gc(&self) -> Result<(), String> {
+        Err("scanned orphan cleanup is unsupported without Provider writer-fencing, Unknown/unreceived and restart safety evidence".to_string())
+    }
     fn candidates(&self) -> &[CleanupCandidate];
     fn select_owned_refs(&mut self, candidate_indexes: &[usize]) -> Result<(), String>;
     fn execute(&mut self) -> Result<CleanupTerminal, String>;
@@ -379,7 +384,7 @@ impl TableMaintenanceProduct {
             }
             MaintenanceActionRequest::RemoveOrphanFiles { .. } => {
                 Err(TerminalError::pre_dispatch_failed(
-                    "automatic orphan cleanup has no effect identity terminal port",
+                    "automatic scanned orphan cleanup is unsupported: Provider safety evidence and an effect identity terminal port are unavailable",
                 ))
             }
             request => {
@@ -484,6 +489,7 @@ impl TableMaintenanceProduct {
         let _permit = self
             .acquire_activity(&target, MaintenanceActivityFamily::Cleanup)
             .map_err(|error| error.to_string())?;
+        // This is only the owned-ref maturity policy, never a scan capability.
         let (now_ms, safe_gc_age_ms) = self.gc_timing(older_than_ms)?;
         let mut session = effects.begin_cleanup(&target, older_than_ms)?;
         let candidates = session.candidates();
@@ -495,6 +501,9 @@ impl TableMaintenanceProduct {
             .any(|candidate| matches!(candidate, CleanupCandidate::Object));
         if has_owned && has_objects {
             return Err("cleanup discovery mixed owned-ref and object candidates".to_string());
+        }
+        if has_objects {
+            session.require_scanned_object_gc()?;
         }
         if has_owned {
             let observations = self.observations.as_ref().ok_or_else(|| {
@@ -1602,17 +1611,23 @@ mod tests {
         content: Mutex<Option<Arc<()>>>,
         executed: Arc<Mutex<bool>>,
         terminal: Result<CleanupTerminal, String>,
+        object_candidates: bool,
     }
 
     struct ReleaseCleanupSession {
         _content: Arc<()>,
         executed: Arc<Mutex<bool>>,
         terminal: Result<CleanupTerminal, String>,
+        object_candidates: bool,
     }
 
     impl CleanupSession for ReleaseCleanupSession {
         fn candidates(&self) -> &[CleanupCandidate] {
-            &[CleanupCandidate::Object]
+            if self.object_candidates {
+                &[CleanupCandidate::Object]
+            } else {
+                &[]
+            }
         }
 
         fn select_owned_refs(&mut self, _candidate_indexes: &[usize]) -> Result<(), String> {
@@ -1658,6 +1673,7 @@ mod tests {
                 _content: self.content.lock().unwrap().take().expect("begin once"),
                 executed: self.executed.clone(),
                 terminal: self.terminal.clone(),
+                object_candidates: self.object_candidates,
             }))
         }
     }
@@ -1667,7 +1683,7 @@ mod tests {
         let cases = [
             (
                 Ok(CleanupTerminal::KnownCommitted {
-                    locations: vec!["orphan.parquet".to_string()],
+                    locations: Vec::new(),
                 }),
                 None,
             ),
@@ -1702,6 +1718,7 @@ mod tests {
                 content: Mutex::new(Some(content)),
                 executed: Arc::new(Mutex::new(false)),
                 terminal,
+                object_candidates: false,
             };
             assert!(weak.upgrade().is_some(), "fixture owns content");
             let result = product
@@ -1724,7 +1741,7 @@ mod tests {
                 None => assert!(matches!(
                     result.as_ref().expect("cleanup committed"),
                     MaintenanceActionOutcome::RemoveOrphanFiles { orphan_file_locations }
-                        if orphan_file_locations == &["orphan.parquet".to_string()]
+                        if orphan_file_locations.is_empty()
                 )),
             }
             assert!(*port.executed.lock().unwrap(), "cleanup reached dispatch");
@@ -1734,6 +1751,67 @@ mod tests {
                 "terminal result and live port must release content"
             );
         }
+    }
+    #[tokio::test]
+    async fn unproven_object_cleanup_never_executes_even_with_safe_age() {
+        let product = TableMaintenanceProduct::new(None).with_safe_gc_age(Duration::ZERO);
+        let content = Arc::new(());
+        let weak = Arc::downgrade(&content);
+        let port = ReleaseCleanupPort {
+            content: Mutex::new(Some(content)),
+            executed: Arc::new(Mutex::new(false)),
+            terminal: Ok(CleanupTerminal::KnownCommitted {
+                locations: Vec::new(),
+            }),
+            object_candidates: true,
+        };
+        let error = product
+            .execute_action(
+                &port,
+                MaintenanceActionRequest::RemoveOrphanFiles {
+                    target: target(),
+                    older_than_ms: 1,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("scanned orphan cleanup is unsupported")
+        );
+        assert!(!*port.executed.lock().unwrap());
+        assert!(port.content.lock().unwrap().is_none());
+        assert!(
+            weak.upgrade().is_none(),
+            "refusal releases only the empty local test session"
+        );
+        let automatic = ReleaseCleanupPort {
+            content: Mutex::new(Some(Arc::new(()))),
+            executed: Arc::new(Mutex::new(false)),
+            terminal: Ok(CleanupTerminal::KnownCommitted {
+                locations: Vec::new(),
+            }),
+            object_candidates: true,
+        };
+        assert!(
+            product
+                .execute_automatic_action(
+                    &automatic,
+                    MaintenanceActionRequest::RemoveOrphanFiles {
+                        target: target(),
+                        older_than_ms: 1,
+                    },
+                    MaintenanceEffectId::from_bytes([6; 16])
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            automatic.content.lock().unwrap().is_some(),
+            "automatic entry must not begin discovery"
+        );
+        assert!(!*automatic.executed.lock().unwrap());
     }
 }
 

@@ -662,7 +662,7 @@ fn original_provider_completion_fixture(panic_after_release: bool) {
         crate::query_execution::internal_result_cpu::InternalResultCpuOwner::try_new_for_test()
             .unwrap();
     let port = Arc::new(
-        FrontendProviderReadFacts::new(
+        FrontendProviderReadFacts::binding_only(
             host.clone(),
             bindings.clone(),
             ConnectorSession::try_new("actual-port", "u", "UTC", "en_US", SystemTime::UNIX_EPOCH)

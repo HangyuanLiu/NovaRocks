@@ -59,7 +59,9 @@ use crate::connector::UnifiedStatisticsResolver;
 use crate::mv::domain::readiness::MvCandidateReader;
 use crate::mv::domain::rewrite_prep::freeze_materialized_view_fact_with_ports_async;
 use crate::query_execution::planning::statistics::resolve_statistics_need_async;
-use crate::query_execution::provider_read_facts::{FrontendProviderReadFacts, FrozenProviderRead};
+use crate::query_execution::provider_read_facts::{
+    FrontendProviderReadFacts, FrozenProviderRead, ProviderCreatorMode,
+};
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 
 /// The owners in this process that can answer a compilation question, and the
@@ -106,14 +108,17 @@ impl CompletionFactOwners {
 /// against whatever the catalog holds at the moment the question is asked.
 #[derive(Clone)]
 pub(crate) struct StatementFactScope {
+    creator_mode: ProviderCreatorMode,
     bindings: Arc<QueryTableBindingStore>,
     connector_context: ConnectorRequestContext,
     current_catalog: Option<Arc<str>>,
     capacity: QueryResultCapacityBinding,
+    query_local_overlays:
+        Vec<crate::catalog_application::query_materializer::QueryLocalTableOverlay>,
 }
 
 impl StatementFactScope {
-    pub(crate) fn new(
+    pub(crate) fn binding_only(
         bindings: Arc<QueryTableBindingStore>,
         connector_context: ConnectorRequestContext,
         current_catalog: Option<&str>,
@@ -124,11 +129,46 @@ impl StatementFactScope {
             return Err(novarocks_workload_control::WorkError::Conflict);
         }
         Ok(Self {
+            creator_mode: ProviderCreatorMode::BindingOnly,
             bindings,
             connector_context,
             current_catalog: current_catalog.map(Arc::from),
             capacity,
+            query_local_overlays: Vec::new(),
         })
+    }
+    /// Actual ordinary Read requires its original I/O source; this is not an
+    /// optional fallback selected from an absent port during Provider polling.
+    pub(crate) fn governed_read_io(
+        bindings: Arc<QueryTableBindingStore>,
+        connector_context: ConnectorRequestContext,
+        current_catalog: Option<&str>,
+        work_scope: &novarocks_workload_control::WorkScope,
+        capacity: QueryResultCapacityBinding,
+    ) -> Result<Self, novarocks_workload_control::WorkError> {
+        if connector_context
+            .io_admission()
+            .and_then(|p| p.upgrade())
+            .is_none()
+        {
+            return Err(novarocks_workload_control::WorkError::NotReady);
+        }
+        let mut scope = Self::binding_only(
+            bindings,
+            connector_context,
+            current_catalog,
+            work_scope,
+            capacity,
+        )?;
+        scope.creator_mode = ProviderCreatorMode::GovernedReadIo;
+        Ok(scope)
+    }
+    pub(crate) fn with_query_local_overlays(
+        mut self,
+        overlays: Vec<crate::catalog_application::query_materializer::QueryLocalTableOverlay>,
+    ) -> Self {
+        self.query_local_overlays = overlays;
+        self
     }
 }
 
@@ -162,11 +202,12 @@ impl CatalogFactPort for FrontendCatalogFacts {
             self.owners.connector_control.as_ref(),
             self.scope.connector_context.clone(),
         );
-        let materializer = CatalogServiceMaterializer::new(
+        let materializer = CatalogServiceMaterializer::new_with_query_local_overlays(
             self.scope.current_catalog.as_deref(),
             self.owners.catalog_service.as_ref(),
             Arc::clone(&self.scope.bindings),
             loader,
+            self.scope.query_local_overlays.clone(),
         )
         .with_catalog_application(self.owners.catalog_application.as_deref());
         let mut facts = Vec::with_capacity(needs.len());
@@ -323,14 +364,17 @@ pub(crate) fn frontend_fact_source(
     scope: StatementFactScope,
     session: ConnectorSession,
 ) -> QueryCompletionFactSource<FrozenProviderRead> {
-    let provider_reads = Arc::new(FrontendProviderReadFacts::new(
-        Arc::clone(&owners.connector_control),
-        Arc::clone(&scope.bindings),
-        session,
-        scope.connector_context.clone(),
-        owners.blocking.clone(),
-        scope.capacity.clone(),
-    ));
+    let provider_reads = Arc::new(
+        FrontendProviderReadFacts::binding_only(
+            Arc::clone(&owners.connector_control),
+            Arc::clone(&scope.bindings),
+            session,
+            scope.connector_context.clone(),
+            owners.blocking.clone(),
+            scope.capacity.clone(),
+        )
+        .with_creator_mode(scope.creator_mode),
+    );
     statement_fact_source(owners, scope, provider_reads)
 }
 
@@ -343,14 +387,17 @@ pub(crate) fn install_frontend_fact_source(
     scope: StatementFactScope,
     session: ConnectorSession,
 ) -> Result<(), String> {
-    let provider = Arc::new(FrontendProviderReadFacts::new(
-        Arc::clone(&owners.connector_control),
-        Arc::clone(&scope.bindings),
-        session,
-        scope.connector_context.clone(),
-        owners.blocking.clone(),
-        scope.capacity.clone(),
-    ));
+    let provider = Arc::new(
+        FrontendProviderReadFacts::binding_only(
+            Arc::clone(&owners.connector_control),
+            Arc::clone(&scope.bindings),
+            session,
+            scope.connector_context.clone(),
+            owners.blocking.clone(),
+            scope.capacity.clone(),
+        )
+        .with_creator_mode(scope.creator_mode),
+    );
     let facts = Arc::new(statement_fact_source(owners, scope, provider.clone()));
     custody.install(facts, provider).map_err(|original| {
         // No work can have been issued by this rejected new port. Destruction

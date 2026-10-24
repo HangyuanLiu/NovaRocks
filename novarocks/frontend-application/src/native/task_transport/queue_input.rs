@@ -67,6 +67,9 @@ impl TaskOperationQueuePermit for NativeInputQueuePermit {
             self.maximum_owned_increment,
         )
     }
+    fn native_dispatch_input(&self) -> Option<&NativeQueuedInputGrant> {
+        self.input.as_ref()
+    }
     fn native_input_retention(&self) -> Result<Option<ExistingOwnerRetentionLease>, WorkError> {
         self.input
             .as_ref()

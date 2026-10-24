@@ -19,19 +19,23 @@ under the License.
 
 # 维护 / 治理
 
-> Iceberg 的运维操作包括压缩小文件、清理历史 snapshot、回收孤儿文件、重写 manifest 与重写 deletion vector。NovaRocks 支持 whole-table OPTIMIZE、EXPIRE SNAPSHOTS、REWRITE MANIFESTS 与 V3 Puffin deletion-vector repack；扫描型回收按 Provider 安全证明准入，REMOVE ORPHAN FILES 的现有 REST/Hadoop 组合缺证受限。增量压缩、sort-order rewrite 和通用定时调度仍待补。
+> Iceberg 的运维操作包括压缩小文件、清理历史 snapshot、回收孤儿文件、重写 manifest 与重写 deletion vector。NovaRocks 支持 whole-table OPTIMIZE、EXPIRE SNAPSHOTS、REWRITE MANIFESTS 与 V3 Puffin deletion-vector repack；扫描型回收的已接受契约要求 Provider 安全证明，现有 REST/Hadoop 组合缺证，应受限；完整接线与原生验收尚待完成，不能据本文认定某个二进制已实施限制。增量压缩、sort-order rewrite 和通用定时调度仍待补。
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
 | `ALTER TABLE ... OPTIMIZE`（whole-table 文件压缩） | ✅ | 异步 job |
 | `OPTIMIZE` 增量（仅小文件 / 仅 partition） | ❌ | |
-| `EXPIRE SNAPSHOTS` | ✅ | 同步 action |
+| `EXPIRE SNAPSHOTS` | ✅ | 语句内 action |
 | `REMOVE ORPHAN FILES` | 受限 | REST/Hadoop 安全证明为 UNPROVEN；缺证应明确拒绝 |
-| `REWRITE MANIFESTS` | ✅ | 同步 action |
-| `rewrite_position_delete_files`（V3 Puffin DV repack） | ✅ | 同步 Spark-style `CALL` |
+| `REWRITE MANIFESTS` | ✅ | 语句内 action |
+| `rewrite_position_delete_files`（V3 Puffin DV repack） | ✅ | 语句内 Spark-style `CALL` |
 | V2 Parquet position delete → V3 DV 升级 | ❌ | |
 | `REWRITE DATA FILES BY SORT ORDER` | ❌ | |
 | 自动 maintenance 调度器 | ❌ | |
+
+“语句内”只描述 SQL 的返回方式：调用等待相应业务结果，而不是先返回后台 job。
+它不要求 Rust 控制 I/O 同步阻塞，也不把可延后的安全 GC 作为必要业务成功屏障；
+具体异步切换与结算边界仍须按实际二进制验证。
 
 ---
 
@@ -69,8 +73,7 @@ SHOW ALTER TABLE OPTIMIZE
 
 `ALTER TABLE ... OPTIMIZE` 在当前进程的 job runtime 接受后返回，rewrite 由 Frontend
 Application 的 maintenance worker 异步执行。调用方必须轮询 `SHOW ALTER TABLE OPTIMIZE`，并以 `FINISHED` 或 `FAILED`
-作为终态。Spark-style `CALL ...rewrite_data_files(...)` 则保持同步，并直接返回 action
-结果。
+作为终态。Spark-style `CALL ...rewrite_data_files(...)` 则在同一语句内返回 action 结果。
 
 行为：
 
@@ -172,6 +175,11 @@ hdfs 列举仍未支持，`t.branch_<x>` 后缀仍在 parse-time 拒绝。
 可交给监督者延后执行，携带原对象、访问能力、删除授权、容量及实际退出观察。
 仅延后 GC 失败不翻转已完成业务；必要步骤失败则必须同时报告已有提交效果和业务未完成。
 
+必要业务就绪不证明原清理 Future 已退出，也不证明对象库存已处置。原 receipt、失败原因、
+operation/journal 与访问能力仍由同一稳定 Call/残留保管；GC 的 Pending 与实际 Observed
+结果分开，不能为了返回成功而丢弃未退出的清理工作。相反，精确库存已经真正处置时，
+历史清理诊断也不能单独把该责任永久留住。CTAS seal 必要 finalize 失败时不得继续最终 CREATE。
+
 无表锚 CTAS 的旧根扫描是可选维护。禁用缺证扫描不阻止新 CTAS 走已安全准入的 staged
 publication，也不能把该扫描的 unsupported 错误投成新 CTAS 的 AppliedButUnusable。
 目前不承诺跨 FE/BE 崩溃可重建全部产物清单、自动回收或无孤儿；恢复这类能力需要独立协议与证明。
@@ -216,7 +224,7 @@ CALL iceberg_catalog.system.rewrite_position_delete_files(
 );
 ```
 
-该同步 action 重写 Iceberg V3 表中现有 Puffin deletion-vector 文件，保持可见 row set、
+该语句内 action 重写 Iceberg V3 表中现有 Puffin deletion-vector 文件，保持可见 row set、
 `_row_id` 与 live data files 不变，并返回 rewritten/added file 与 byte counts。当前不支持
 `where`、`target-file-size-bytes` 或 V2 Parquet position delete → V3 DV 的格式升级。
 

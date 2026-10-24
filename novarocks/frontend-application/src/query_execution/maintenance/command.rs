@@ -105,18 +105,13 @@ impl MaintenanceCommandExecutor {
                 "metadata source has no admitted root capacity",
             )
         })?;
-        let requirements = Self::metadata_io_requirements(
-            &profile,
-            capacity
-                .root_scope()
-                .joint_dependency_limit()
-                .map_err(|e| format!("metadata source geometry unavailable: {e:?}"))?,
-        )
-        .map_err(|e| format!("metadata source geometry unavailable: {e:?}"))?;
+        // Frontend fixed Source/header/F inventory is already paid by the
+        // original per-root process backing. Do not charge it again here.
+        let provider_bytes = profile.geometry().metadata_bytes().get();
         let io = super::io_admission::MetadataIoAdmission::new(
             capacity.root_scope().clone(),
             profile,
-            requirements.source_metadata_bytes,
+            provider_bytes,
         )
         .map_err(|e| format!("metadata source construction refused: {e:?}"))?;
         let context = connector_context.clone().with_io_admission(
@@ -250,7 +245,82 @@ pub struct MaintenanceCommandCall {
     original: MaintenanceActionState,
     io: Option<Arc<super::io_admission::MetadataIoAdmission>>,
 }
+/// Only exact remaining object custody crosses the business completion cut.
+/// The Product F, origin/result window and execution context stay out of it.
+struct MetadataCleanupResidual {
+    call: Option<crate::connector::metadata_maintenance::MetadataMaintenanceCall>,
+    io: Option<Arc<super::io_admission::MetadataIoAdmission>>,
+}
+impl novarocks_query_application::session_control::GovernedStatementResidual
+    for MetadataCleanupResidual
+{
+    fn poll_retirement(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), novarocks_query_application::api::StatementNativeHealthFailure>>
+    {
+        use novarocks_spi::connector::ConnectorMetadataCleanupResponsibility as R;
+        if self
+            .call
+            .as_ref()
+            .is_some_and(|call| call.cleanup_responsibility() == R::Retained)
+        {
+            // A recorded cleanup failure is not actual disposal. Keep the same
+            // report/lease/charge, without retrying publication or a completed F.
+            return std::task::Poll::Pending;
+        }
+        // A panic here leaves this original residual Box and its other field
+        // in the QA restoration loan. In particular io outlives Call Drop.
+        drop(self.call.take());
+        drop(self.io.take());
+        std::task::Poll::Ready(Ok(()))
+    }
+}
 impl MaintenanceCommandCall {
+    pub(crate) fn has_applied_publication(&self) -> Result<bool, String> {
+        self.original.has_applied_publication()
+    }
+
+    pub(crate) fn handoff_residual_in(
+        &mut self,
+        target: &mut Option<
+            Box<dyn novarocks_query_application::session_control::GovernedStatementResidual>,
+        >,
+    ) -> Result<(), novarocks_query_application::api::StatementNativeHealthFailure> {
+        let failure = |message: String| {
+            novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
+                "metadata residual transfer is unproven",
+                Arc::new(novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    message,
+                )),
+            )
+        };
+        if target.is_some() {
+            return Err(failure("metadata residual receiver is occupied".into()));
+        }
+        if self.future.is_some() || self.poll_unproven || self.result.is_some() {
+            return Err(failure(
+                "metadata business source has not actually completed".into(),
+            ));
+        }
+        if !self.original.needs_cleanup_custody().map_err(failure)? {
+            return Ok(());
+        }
+        let mut residual = Box::new(MetadataCleanupResidual {
+            call: None,
+            io: None,
+        });
+        self.original
+            .take_cleanup_call_in(&mut residual.call)
+            .map_err(failure)?;
+        residual.io = self.io.take();
+        // Stable recipient precedes foreign execution/result-window cleanup.
+        *target = Some(residual);
+        self.original.drop_execution_aliases().map_err(failure)?;
+        Ok(())
+    }
+
     pub fn publication_disposition(
         &self,
     ) -> Option<novarocks_spi::connector::LakePublicationDisposition> {
@@ -656,6 +726,29 @@ impl MaintenanceCommandExecutor {
         Self::metadata_io_requirements_for_geometry(profile.geometry(), complete_dependency_limit)
     }
 
+    /// Additional first-party allocations of the same metadata Source.
+    /// Provider fixed backing and variable payload are separately admitted.
+    pub(crate) fn frontend_fixed_source_bytes(
+        geometry: &novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
+        complete_dependency_limit: usize,
+    ) -> Result<u64, novarocks_workload_control::WorkError> {
+        use novarocks_workload_control::WorkError;
+        let bytes = metadata_product_bytes(make_metadata_product)
+            .checked_add(std::mem::size_of::<MaintenanceCommandCall>())
+            .and_then(|n| n.checked_add(std::mem::size_of::<MetadataCleanupResidual>()))
+            .and_then(|n| n.checked_add(MaintenanceActionState::owned_row_bytes().ok()?))
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        u64::try_from(bytes)
+            .map_err(|_| WorkError::ArithmeticOverflow)?
+            .checked_add(
+                super::io_admission::MetadataIoAdmission::fixed_backing_bytes(
+                    geometry.max_concurrent_io().get(),
+                    complete_dependency_limit,
+                )?,
+            )
+            .ok_or(WorkError::ArithmeticOverflow)
+    }
+
     /// Pure fixed quote; selected dependencies are supplied only by the actual
     /// running Provider profile before admission, never invented by composition.
     pub fn metadata_io_requirements_for_geometry(
@@ -666,24 +759,10 @@ impl MaintenanceCommandExecutor {
             WorkError,
             joint_admission::{JointResource, JointResources},
         };
-        let bytes = metadata_product_bytes(make_metadata_product)
-            .checked_add(std::mem::size_of::<MaintenanceCommandCall>())
-            .and_then(|n| n.checked_add(std::mem::size_of::<MetadataProductInput>()))
-            .and_then(|n| n.checked_add(MaintenanceActionState::owned_row_bytes().ok()?))
-            .ok_or(WorkError::ArithmeticOverflow)?;
-        let source_metadata_bytes = u64::try_from(bytes)
-            .map_err(|_| WorkError::ArithmeticOverflow)?
-            .checked_add(geometry.metadata_bytes().get())
-            .and_then(|n| {
-                n.checked_add(
-                    super::io_admission::MetadataIoAdmission::fixed_backing_bytes(
-                        geometry.max_concurrent_io().get(),
-                        complete_dependency_limit,
-                    )
-                    .ok()?,
-                )
-            })
-            .ok_or(WorkError::ArithmeticOverflow)?;
+        let source_metadata_bytes =
+            Self::frontend_fixed_source_bytes(geometry, complete_dependency_limit)?
+                .checked_add(geometry.metadata_bytes().get())
+                .ok_or(WorkError::ArithmeticOverflow)?;
         // There is no independent local physical queue. One genuine next I/O
         // uses one same-Root AsyncIo action plus its real claim/row metadata.
         let step = JointResources::ZERO

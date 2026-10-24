@@ -46,6 +46,63 @@ pub enum MutationStatementKind {
     Merge,
 }
 
+/// Exact-span lowered input from the admitted parser statement. This retains
+/// the original SQL expression slices, without reparsing the statement source.
+#[derive(Clone, Debug)]
+pub(crate) enum OwnedMutationStatement {
+    Update(crate::query_execution::dml::mutation_flow::PreparedUpdateStatement),
+    Merge(crate::query_execution::dml::mutation_flow::PreparedMergeStatement),
+}
+
+pub(crate) fn lower_statement(
+    statement: &DmlStatement,
+    source: &str,
+) -> Result<OwnedMutationStatement, String> {
+    match statement {
+        DmlStatement::Update(statement) => {
+            lower_update_statement(statement, source).map(OwnedMutationStatement::Update)
+        }
+        DmlStatement::Merge(statement) => {
+            lower_merge_statement(statement, source).map(OwnedMutationStatement::Merge)
+        }
+        _ => Err("mutation engine received a non-UPDATE/MERGE typed statement".to_string()),
+    }
+}
+
+pub(crate) fn resolve_target(
+    state: &crate::query_execution::kernels::DmlExecutionKernel,
+    statement: &OwnedMutationStatement,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<(crate::catalog_application::resolver::TargetBackend, String), String> {
+    match statement {
+        OwnedMutationStatement::Update(statement) => super::mutation_flow::resolve_update_target(
+            state,
+            statement,
+            current_catalog,
+            current_database,
+        ),
+        OwnedMutationStatement::Merge(statement) => super::mutation_flow::resolve_merge_target(
+            state,
+            statement,
+            current_catalog,
+            current_database,
+        ),
+    }
+}
+
+/// Complete admitted UPDATE/MERGE input held by the original statement Source.
+pub struct MutationStatementInput {
+    pub(crate) statement: OwnedMutationStatement,
+    pub(crate) sql: String,
+    pub(crate) context: novarocks_query_application::admitted_query_context::RequestContext,
+    pub(crate) query_options: QueryOptions,
+    pub(crate) launcher:
+        Arc<dyn crate::query_execution::logical_execution::LogicalExecutionLauncher>,
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
+}
+
 /// One admitted frontend mutation request. The typed statement establishes the
 /// command family; `source` may only be read through spans carried by it.
 pub struct PrepareMutationRequest<'a> {
@@ -102,6 +159,14 @@ pub enum MutationStageOutcome {
 /// One-to-one capability consumed only by the frontend DML application owner.
 // Design: ADR-0033 (docs/adr/ADR-0033-frontend-update-merge-application-owner.md)
 pub trait MutationEngine: Send + Sync {
+    fn prepare_statement_action(
+        &self,
+        input: MutationStatementInput,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        String,
+    >;
+
     fn prepare_mutation(
         &self,
         request: PrepareMutationRequest<'_>,
@@ -437,6 +502,16 @@ fn abort_handle(abort: &dyn MutationAbort) -> Result<&CoreMutationAbort, String>
 }
 
 impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
+    fn prepare_statement_action(
+        &self,
+        input: MutationStatementInput,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        String,
+    > {
+        crate::query::mutation_action::prepare(self.clone(), input)
+    }
+
     fn prepare_mutation(
         &self,
         request: PrepareMutationRequest<'_>,

@@ -92,6 +92,7 @@ novarocks-sql = { workspace = true }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 tower = { workspace = true, features = ["util"] }
+url.workspace = true
 
 [package.metadata.novarocks.test]
 runtime-inputs = []

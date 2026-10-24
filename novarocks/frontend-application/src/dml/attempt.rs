@@ -84,6 +84,8 @@ pub(crate) const fn publication_next_action_name(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DmlPublicationAdjudicationOutcome {
     KnownCommitted,
+    /// The original journal has an authoritative non-publication verdict.
+    KnownUncommitted,
     CommitUnknown,
 }
 
@@ -314,6 +316,10 @@ impl DmlPublicationAttempt {
                 validate_committed_finalization(finalization)?;
                 self.assign_terminal(LakePublicationDisposition::KnownCommitted, finalization)
             }
+            DmlPublicationAdjudicationOutcome::KnownUncommitted => self.assign_terminal(
+                LakePublicationDisposition::KnownUncommitted,
+                DmlPublicationFinalization::NotApplicable,
+            ),
             DmlPublicationAdjudicationOutcome::CommitUnknown => self.assign_terminal(
                 LakePublicationDisposition::CommitUnknown,
                 DmlPublicationFinalization::NotApplicable,
@@ -518,6 +524,28 @@ mod tests {
         assert_eq!(
             attempt.finalization(),
             Some(DmlPublicationFinalization::Failed)
+        );
+    }
+
+    #[test]
+    fn authoritative_uncommitted_adjudication_preserves_the_original_verdict() {
+        let mut original = attempt();
+        original.mark_dispatch_possible().unwrap();
+        let token = original.begin_adjudication().unwrap();
+        let terminal = original
+            .finish_adjudication(
+                token,
+                DmlPublicationAdjudicationOutcome::KnownUncommitted,
+                DmlPublicationFinalization::NotApplicable,
+            )
+            .unwrap();
+        assert_eq!(
+            terminal.disposition(),
+            LakePublicationDisposition::KnownUncommitted
+        );
+        assert!(
+            original.begin_adjudication().is_err(),
+            "one original adjudication only"
         );
     }
 

@@ -46,9 +46,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use novarocks_spi::connector::write_stack::session::{
-    ConnectorWriteBeginRequest, ConnectorWriteFinishRequest, ConnectorWriteSessionAbortRequest,
-    ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan, ConnectorWriteSessionReconcileRequest,
-    ConnectorWriteTargetPlan,
+    ConnectorWriteBeginRequest, ConnectorWriteFinishRequest, ConnectorWriteFinishRequestRef,
+    ConnectorWriteSessionAbortRequest, ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan,
+    ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan,
 };
 use novarocks_spi::connector::write_stack::{
     ConnectorManagedPublicationShape, ConnectorPreparedWriteSet, WriteStatisticsContract,
@@ -428,7 +428,7 @@ pub(crate) fn validate_merged_old_references(
 
 fn validate_statistics_artifacts(
     handle: &IcebergCommitHandle,
-    artifacts: Vec<novarocks_spi::connector::write_stack::WriteStatisticsArtifact>,
+    artifacts: &[novarocks_spi::connector::write_stack::WriteStatisticsArtifact],
 ) -> Result<Vec<novarocks_spi::connector::StatisticsArtifactDraft>, ConnectorError> {
     let expected = handle.statistics_expectations();
     let expected_pairs = expected
@@ -449,7 +449,7 @@ fn validate_statistics_artifacts(
     let mut observed = BTreeSet::new();
     let mut by_identity: BTreeMap<StatisticsArtifactIdentity, Vec<Bytes>> = BTreeMap::new();
     for artifact in artifacts {
-        let (target, draft) = artifact.into_parts();
+        let (target, draft) = (artifact.target(), artifact.draft());
         let key = (target, draft.identity().clone());
         if !expected_pairs.contains(&key) || !observed.insert(key) {
             return Err(invalid(
@@ -1001,7 +1001,7 @@ impl IcebergWriteSessionControl {
     ///
     /// The session's own state machine is the mutual exclusion: `begin_commit`
     /// latches, so a second `finish_write` cannot dispatch a second snapshot.
-    pub(crate) fn commit_prepared_set(
+    pub(crate) async fn commit_prepared_set_async(
         &self,
         handle: &IcebergCommitHandle,
         prepared: &ConnectorPreparedWriteSet,
@@ -1009,7 +1009,13 @@ impl IcebergWriteSessionControl {
         frozen_old_references: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<EntryIdentity>>>,
         document_publication: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
         context: &ConnectorRequestContext,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        needed_ready: Option<
+            &novarocks_spi::connector::write_stack::ConnectorWriteNeededReadyReceiving,
+        >,
+    ) -> Result<
+        novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion,
+        ConnectorError,
+    > {
         #[cfg(novarocks_dev_controls)]
         let phase_started = std::time::Instant::now();
         #[cfg(novarocks_dev_controls)]
@@ -1039,7 +1045,7 @@ impl IcebergWriteSessionControl {
                 "publication_empty_exit",
                 phase_started,
             );
-            return settle_empty_write_without_commit(handle);
+            return settle_empty_write_without_commit(handle).map(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::from_outcome);
         }
 
         #[cfg(novarocks_dev_controls)]
@@ -1070,26 +1076,34 @@ impl IcebergWriteSessionControl {
             "publication_dispatch_enter",
             phase_started,
         );
-        let mut outcome = self.dispatch_operation(
-            handle,
-            &validated,
-            statistics,
-            document_publication,
-            context,
-        );
+        let dispatched = self
+            .dispatch_operation_async(
+                handle,
+                &validated,
+                statistics,
+                document_publication,
+                context,
+            )
+            .await;
+        let (mut outcome, deferred_cleanup) = match dispatched {
+            Ok(dispatched) => (Ok(dispatched.outcome), dispatched.cleanup),
+            Err(error) => (Err(error), None),
+        };
         if document_publication.is_some()
-            && let Ok(ExternalMutationOutcome::KnownUncommitted {
-                failure: rejection, ..
+            && let Ok(publication::WritePublicationVerdict::KnownUncommitted {
+                failure: rejection,
+                ..
             }) = &mut outcome
             && rejection.kind() == ConnectorMutationFailureKind::InvalidRequest
         {
-            let error = crate::document_storage::keyed::write::refusal_with_retained_bytes(
+            let error = crate::document_storage::keyed::write::refusal_with_retained_bytes_async(
                 &self.runtime,
                 handle.table().namespace(),
                 handle.table().table_name(),
                 context,
                 invalid(rejection.message()),
-            );
+            )
+            .await;
             *rejection = failure(
                 ConnectorMutationFailureKind::InvalidRequest,
                 error.to_string(),
@@ -1105,27 +1119,32 @@ impl IcebergWriteSessionControl {
             phase_started,
         );
         let terminal = match &outcome {
-            Ok(ExternalMutationOutcome::KnownCommitted {
+            Ok(publication::WritePublicationVerdict::KnownCommitted {
                 receipt,
                 finalization,
                 cleanup,
                 ..
             }) => {
                 handle.retain_finalization(finalization.clone());
-                handle.retain_cleanup(cleanup.clone());
+                if let novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(
+                    actual,
+                ) = cleanup
+                {
+                    handle.retain_cleanup(actual.clone());
+                }
                 IcebergWriteSessionState::KnownCommitted {
                     snapshot_id: receipt
                         .committed_version()
                         .and_then(|version| version.snapshot_id()),
                 }
             }
-            Ok(ExternalMutationOutcome::KnownUncommitted { failure, cleanup }) => {
+            Ok(publication::WritePublicationVerdict::KnownUncommitted { failure, cleanup }) => {
                 handle.retain_finalization(cleanup.clone());
                 IcebergWriteSessionState::KnownUncommitted {
                     message: failure.message().to_string(),
                 }
             }
-            Ok(ExternalMutationOutcome::CommitUnknown { failure, .. }) => {
+            Ok(publication::WritePublicationVerdict::CommitUnknown { failure, .. }) => {
                 IcebergWriteSessionState::CommitUnknown {
                     message: failure.message().to_string(),
                     staging_dir: handle.staging_dir(),
@@ -1137,11 +1156,16 @@ impl IcebergWriteSessionControl {
         };
         if let Err(error) = handle.settle(terminal) {
             // Local state recording cannot erase an already proven publication verdict.
-            if let Ok(ExternalMutationOutcome::KnownCommitted { finalization, .. }) = &mut outcome {
+            if let Ok(publication::WritePublicationVerdict::KnownCommitted {
+                finalization, ..
+            }) = &mut outcome
+            {
                 *finalization = add_finalization_failure(finalization.clone(), error.message());
                 handle.retain_finalization(finalization.clone());
-            } else if let Ok(ExternalMutationOutcome::KnownUncommitted { cleanup, .. }) =
-                &mut outcome
+            } else if let Ok(publication::WritePublicationVerdict::KnownUncommitted {
+                cleanup,
+                ..
+            }) = &mut outcome
             {
                 *cleanup = add_finalization_failure(cleanup.clone(), error.message());
                 handle.retain_finalization(cleanup.clone());
@@ -1156,7 +1180,59 @@ impl IcebergWriteSessionControl {
             "publication_settle_exit",
             phase_started,
         );
+        let mut outcome = outcome.map(publication::WritePublicationVerdict::into_completion);
+        if let Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, .. }) = &outcome {
+            if let Some(receiving) = needed_ready {
+                receiving.publish(Arc::clone(needed))?;
+                if deferred_cleanup.is_some() { receiving.cleanup_permitted().await; }
+            }
+        }
+        if let Some((operation, journal)) = deferred_cleanup {
+            self.complete_committed_cleanup(handle, &operation, &journal, context, &mut outcome)
+                .await;
+        }
         outcome
+    }
+
+    async fn complete_committed_cleanup(
+        &self,
+        handle: &IcebergCommitHandle,
+        operation: &crate::commit::operation::IcebergCommitOperation,
+        journal: &crate::commit::attempt::observation::PublicationJournal<ConnectorWriteReceipt>,
+        context: &ConnectorRequestContext,
+        outcome: &mut Result<
+            novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion,
+            ConnectorError,
+        >,
+    ) {
+        if let Err(error) = journal
+            .settle_committed_cleanup_in(operation, context)
+            .await
+        {
+            if let Some(entry) = journal.current_entry() {
+                journal.record_entry_cleanup(
+                    entry,
+                    ExternalMutationFinalization::Failed(ConnectorMutationFailure::from_connector(
+                        error,
+                    )),
+                );
+            } else if let Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { cleanup, .. }) = outcome {
+                // The original cleanup author actually failed before it could
+                // record a journal report. Preserve that failure, not Complete.
+                *cleanup = novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(ExternalMutationFinalization::Failed(ConnectorMutationFailure::from_connector(error)));
+            }
+        }
+        if let Some(entry) = journal.current_entry() {
+            if let ExternalMutationOutcome::KnownCommitted {
+                cleanup: actual, ..
+            } = journal.catalog_entry_outcome(entry)
+            {
+                if let Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { cleanup, .. }) = outcome {
+                    *cleanup = novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(actual.clone());
+                }
+                handle.retain_cleanup(actual);
+            }
+        }
     }
 
     /// Seal a staged write into the receipt its publication will consume.
@@ -1256,7 +1332,23 @@ impl IcebergWriteSessionControl {
     /// observation fresh; it is not implied by dropping the lease sink, which
     /// only stops the reload admitting a vended-credential response after the
     /// attempt froze.
+    #[cfg(test)]
     pub(crate) fn publication_row_count(
+        &self,
+        handle: &IcebergCommitHandle,
+        snapshot_id: i64,
+        context: &ConnectorRequestContext,
+    ) -> Result<Option<u64>, ConnectorError> {
+        // Transitional P05 bridge for the explicitly unconverted families.
+        // INSERT calls the async author directly and never enters this bridge.
+        self.runtime
+            .resources()
+            .catalog_runtime()
+            .block_on(self.publication_row_count_async(handle, snapshot_id, context))
+            .map_err(|error| unavailable(error.to_string()))?
+    }
+
+    pub(crate) async fn publication_row_count_async(
         &self,
         handle: &IcebergCommitHandle,
         snapshot_id: i64,
@@ -1271,7 +1363,7 @@ impl IcebergWriteSessionControl {
             .invalidate_table_cache(facts.namespace(), facts.table_name());
         let table = self
             .runtime
-            .load_table_for_request_with_snapshots(
+            .observe_table_classified_for_request_with_snapshots_async(
                 facts.namespace(),
                 facts.table_name(),
                 &context
@@ -1280,6 +1372,8 @@ impl IcebergWriteSessionControl {
                     .after_external_effect(),
                 crate::catalog::SnapshotLoading::Refs,
             )
+            .await
+            .map_err(|(_, message)| message)
             .map_err(|error| internal(error.to_string()))?
             .into_table();
         publication_row_count_from_metadata(handle, table.metadata(), snapshot_id)
@@ -1320,13 +1414,70 @@ impl IcebergWriteSessionControl {
     /// Without a complete set there is no trustworthy cleanup manifest, so this
     /// path deliberately does not guess which staged objects exist. It reports
     /// what it knows and never claims a commit it did not observe.
-    pub fn release_session(
+    // This transition observes an existing responsibility. It starts no I/O
+    // and remains available after its business request is stopped.
+    fn release_session(
         &self,
         handle: &IcebergCommitHandle,
-        context: &ConnectorRequestContext,
+        production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction,
     ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
-        validate_context(context)?;
-        release_session_state(&self.descriptor, self.key.incarnation, handle)
+        let mut outcome = release_session_state(&self.descriptor, self.key.incarnation, handle)?;
+        if let ConnectorWriteAbortOutcome::KnownUncommitted { cleanup } = &mut outcome {
+            // No object is deleted. Both the original frontend and this
+            // Provider must prove their own no-object responsibility closed.
+            let disposed = production
+                == novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::NotStarted
+                && handle.record_unstarted_cleanup_disposed()?;
+            if !disposed
+                && matches!(cleanup, ExternalMutationFinalization::Complete)
+                && handle.cleanup_responsibility()
+                    == novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Retained
+            {
+                *cleanup = ExternalMutationFinalization::Failed(failure(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "write release retains an unproven object inventory",
+                ));
+            }
+            handle.retain_cleanup(cleanup.clone());
+            handle.retain_finalization(cleanup.clone());
+        }
+        Ok(outcome)
+    }
+
+    async fn reject_before_commit(
+        &self,
+        handle: &IcebergCommitHandle,
+        error: ConnectorError,
+        production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction,
+        prepared: &ConnectorPreparedWriteSet,
+        context: &ConnectorRequestContext,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        // Active is the actual Provider's negative dispatch proof. Errors from
+        // Committing/Unknown/terminal states retain their original semantics.
+        if !matches!(handle.state(), Ok(IcebergWriteSessionState::Active)) {
+            return Err(error);
+        }
+        let outcome = self.release_session(
+            handle,
+            novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::Unproven,
+        );
+        match outcome {
+            Ok(ConnectorWriteAbortOutcome::KnownUncommitted { mut cleanup }) => {
+                if production == novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::CompleteReceived {
+                    cleanup = match self.cleanup_received_set_async(handle, prepared, context).await {
+                        Ok(cleanup) => cleanup,
+                        Err(cause) => ExternalMutationFinalization::Failed(ConnectorMutationFailure::from_connector(cause)),
+                    };
+                }
+                handle.retain_cleanup(cleanup.clone());
+                handle.retain_finalization(cleanup.clone());
+                Ok(ExternalMutationOutcome::KnownUncommitted {
+                    failure: ConnectorMutationFailure::from_connector(error),
+                    cleanup,
+                })
+            }
+            _ => Err(error),
+        }
     }
 }
 
@@ -1390,6 +1541,7 @@ fn validate_document_records(
 pub(crate) fn settle_empty_write_without_commit(
     handle: &IcebergCommitHandle,
 ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+    handle.record_empty_cleanup_disposed();
     let Some(unchanged_snapshot_id) = handle.table().base_snapshot_id() else {
         let message = format!(
             "Iceberg {} write produced no artifact and its target holds no snapshot to report",
@@ -1504,6 +1656,21 @@ impl IcebergWriteSessionControl {
         evidence: &ExternalMutationEvidence,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        // Transitional P05 bridge for the explicitly unconverted families.
+        // INSERT calls the async author directly and never enters this bridge.
+        self.runtime
+            .resources()
+            .catalog_runtime()
+            .block_on(self.adjudicate_session_async(handle, evidence, context))
+            .map_err(|error| unavailable(error.to_string()))?
+    }
+
+    pub async fn adjudicate_session_async(
+        &self,
+        handle: &IcebergCommitHandle,
+        evidence: &ExternalMutationEvidence,
+        context: &ConnectorRequestContext,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         use crate::commit::attempt::observation::PublicationJournal;
         use crate::commit::publication_descriptor::PositiveAttributionObservation;
         validate_context(context)?;
@@ -1578,13 +1745,17 @@ impl IcebergWriteSessionControl {
             .as_ref()
             .and_then(|_| journal.finalization_activity(entry));
         let facts = handle.table();
-        let physical = match self.runtime.load_table_for_request(
-            facts.namespace(),
-            facts.table_name(),
-            &read_context
-                .without_vended_credential_lease_sink()
-                .after_external_effect(),
-        ) {
+        let physical = match self
+            .runtime
+            .load_table_for_request_async(
+                facts.namespace(),
+                facts.table_name(),
+                &read_context
+                    .without_vended_credential_lease_sink()
+                    .after_external_effect(),
+            )
+            .await
+        {
             Ok(physical) => physical,
             Err(error) => {
                 if let Some(snapshot) = known_snapshot {
@@ -1679,9 +1850,14 @@ impl IcebergWriteSessionControl {
         {
             return Ok(journal.catalog_entry_outcome(entry));
         }
-        handle.settle(IcebergWriteSessionState::KnownCommitted {
+        if let Err(error) = handle.settle(IcebergWriteSessionState::KnownCommitted {
             snapshot_id: Some(snapshot_id),
-        })?;
+        }) {
+            let finalization =
+                add_finalization_failure(handle.terminal_finalization(), error.message());
+            journal.record_entry_finalization(entry, finalization.clone());
+            handle.retain_finalization(finalization);
+        }
         let projection = journal
             .finalization_context(entry, self.runtime.novarocks_catalog().evidence_policy())
             .and_then(|grant| grant.for_io(context));
@@ -2061,7 +2237,7 @@ impl IcebergWriteSessionControl {
     /// files. It deliberately does not read a single delete artifact — that is
     /// the whole point of the NCP-6 inversion — and it performs no external
     /// mutation, so a failure here leaves nothing started.
-    fn admit(
+    async fn admit_async(
         &self,
         request: &ConnectorWriteBeginRequest,
     ) -> Result<
@@ -2154,21 +2330,32 @@ impl IcebergWriteSessionControl {
                     &request.flavor,
                     ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. }
                 ) {
-                    self.runtime.observe_table_for_request_with_snapshots(
-                        namespace,
-                        table_name,
-                        &request.context,
-                        crate::catalog::SnapshotLoading::Refs,
-                    )
+                    self.runtime
+                        .observe_table_classified_for_request_with_snapshots_async(
+                            namespace,
+                            table_name,
+                            &request.context,
+                            crate::catalog::SnapshotLoading::Refs,
+                        )
+                        .await
+                        .map_err(|(_, message)| message)
                 } else if matches!(
                     &request.flavor,
                     ConnectorWriteSessionFlavor::DistributedRewrite { .. }
                 ) {
                     self.runtime
-                        .observe_table_for_request(namespace, table_name, &request.context)
+                        .observe_table_classified_for_request_with_snapshots_async(
+                            namespace,
+                            table_name,
+                            &request.context,
+                            crate::catalog::SnapshotLoading::All,
+                        )
+                        .await
+                        .map_err(|(_, message)| message)
                 } else {
                     self.runtime
-                        .load_table_for_request(namespace, table_name, &request.context)
+                        .load_table_for_request_async(namespace, table_name, &request.context)
+                        .await
                 }
                 .map_err(|error| unavailable(error.to_string()))?;
                 let cow_read_access = if matches!(
@@ -2494,7 +2681,13 @@ impl IcebergWriteSessionControl {
                 let table = table.as_ref().ok_or_else(|| {
                     invalid("Iceberg row-level write requires a loaded target table")
                 })?;
-                self.freeze_old_delete_references(table, &metadata, snapshot_id, &request.context)?
+                self.freeze_old_delete_references_async(
+                    table,
+                    &metadata,
+                    snapshot_id,
+                    &request.context,
+                )
+                .await?
             } else {
                 Vec::new()
             },
@@ -2537,8 +2730,9 @@ impl IcebergWriteSessionControl {
                 let table = table.as_ref().ok_or_else(|| {
                     invalid("Iceberg distributed rewrite requires a loaded target table")
                 })?;
-                let groups =
-                    self.rewrite_branches_from_frozen(table, &metadata, content, *shape)?;
+                let groups = self
+                    .rewrite_branches_from_frozen_async(table, &metadata, content, *shape)
+                    .await?;
                 plan_distributed_rewrite_branches(&material, *shape, &groups)?
             }
             ConnectorWriteSessionFlavor::CopyOnWrite {
@@ -2572,12 +2766,12 @@ impl IcebergWriteSessionControl {
                             table_name,
                             metadata: &metadata,
                             snapshot_id,
-                            base_files: self.frozen_base_data_files(
+                            base_files: self.frozen_base_data_files_async(
                                 table, snapshot_id,
                                 cow_read_access.as_ref().ok_or_else(|| invalid(
                                     "Iceberg copy-on-write source lost its original access recipe"
                                 ))?,
-                            )?,
+                            ).await?,
                             input: &material.input,
                             base_version_digest,
                             max_handle_payload_bytes: request.context.max_handle_payload_bytes(),
@@ -2650,7 +2844,7 @@ impl IcebergWriteSessionControl {
     /// This is the same read a distributed rewrite performs to cut its groups:
     /// a walk of the frozen snapshot's manifests, and nothing else. It opens no
     /// delete artifact and mutates nothing.
-    fn frozen_base_data_files(
+    async fn frozen_base_data_files_async(
         &self,
         table: &crate::iceberg::table::Table,
         snapshot_id: i64,
@@ -2662,32 +2856,27 @@ impl IcebergWriteSessionControl {
         let owned = table.clone();
         let metadata = table.metadata_ref();
         let access = access.clone();
-        self.runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move {
-                crate::manifest::extract_data_files_with_stats_at_projected(
-                    &owned,
-                    snapshot_id,
-                    None,
-                    |stats, manifest, deletes| {
-                        crate::commit::write_stack::copy_on_write::IcebergCowFrozenBaseFile::new(
-                            crate::manifest::FrozenReadFileWithStats::retain(
-                                stats, manifest, deletes,
-                            ),
-                            metadata.clone(),
-                            access.clone(),
-                        )
-                    },
-                )
-                .await
-            })
-            .map_err(|error| unavailable(error.to_string()))?
-            .map_err(unavailable)
+        (async move {
+            crate::manifest::extract_data_files_with_stats_at_projected(
+                &owned,
+                snapshot_id,
+                None,
+                |stats, manifest, deletes| {
+                    crate::commit::write_stack::copy_on_write::IcebergCowFrozenBaseFile::new(
+                        crate::manifest::FrozenReadFileWithStats::retain(stats, manifest, deletes),
+                        metadata.clone(),
+                        access.clone(),
+                    )
+                },
+            )
+            .await
+        })
+        .await
+        .map_err(unavailable)
     }
 
     /// Build writers from the attempt's one frozen selection, preserving cohort order.
-    fn rewrite_branches_from_frozen(
+    async fn rewrite_branches_from_frozen_async(
         &self,
         table: &crate::iceberg::table::Table,
         metadata: &TableMetadata,
@@ -2709,15 +2898,11 @@ impl IcebergWriteSessionControl {
                     .base_snapshot_id
                     .ok_or_else(|| internal("Iceberg rewrite has no starting snapshot"))?;
                 let owned = table.clone();
-                let files = self
-                    .runtime
-                    .resources()
-                    .catalog_runtime()
-                    .block_on(async move {
-                        crate::manifest::extract_data_files_with_stats_at(&owned, snapshot_id).await
-                    })
-                    .map_err(|error| unavailable(error.to_string()))?
-                    .map_err(unavailable)?;
+                let files = (async move {
+                    crate::manifest::extract_data_files_with_stats_at(&owned, snapshot_id).await
+                })
+                .await
+                .map_err(unavailable)?;
                 let by_path = files
                     .into_iter()
                     .map(|file| (file.path.clone(), file))
@@ -2738,7 +2923,7 @@ impl IcebergWriteSessionControl {
     ///
     /// This is the frontend half of D10. It records what exists; it never opens
     /// one of those artifacts.
-    fn freeze_old_delete_references(
+    async fn freeze_old_delete_references_async(
         &self,
         table: &crate::iceberg::table::Table,
         metadata: &TableMetadata,
@@ -2748,57 +2933,54 @@ impl IcebergWriteSessionControl {
         validate_context(context)?;
         let owned = table.clone();
         let control = context.clone();
-        let (files, facts) =
-            self.runtime
-                .resources()
-                .catalog_runtime()
-                .block_on(async move {
-                    let check = || validate_context(&control).map_err(|error| error.to_string());
-                    check()?;
-                    let files = crate::manifest::extract_data_files_with_stats_at_with_control(
-                        &owned,
-                        snapshot_id,
-                        Some(&control),
+        let (files, facts) = (async move {
+            let check = || validate_context(&control).map_err(|error| error.to_string());
+            check()?;
+            let files = crate::manifest::extract_data_files_with_stats_at_with_control(
+                &owned,
+                snapshot_id,
+                Some(&control),
+            )
+            .await?;
+            let snapshot = owned
+                .metadata()
+                .snapshot_by_id(snapshot_id)
+                .ok_or_else(|| {
+                    format!(
+                        "Iceberg frozen snapshot {snapshot_id} disappeared from pinned metadata"
                     )
-                    .await?;
-                    let snapshot = owned.metadata().snapshot_by_id(snapshot_id).ok_or_else(||
-                format!("Iceberg frozen snapshot {snapshot_id} disappeared from pinned metadata"))?;
-                    let manifests = crate::manifest::load_manifest_list(
-                        snapshot,
-                        owned.file_io(),
-                        owned.metadata(),
-                    )
+                })?;
+            let manifests =
+                crate::manifest::load_manifest_list(snapshot, owned.file_io(), owned.metadata())
                     .await
                     .map_err(|error| error.to_string())?;
+            check()?;
+            let mut facts = BTreeMap::new();
+            for descriptor in manifests.entries() {
+                check()?;
+                let manifest = crate::manifest::load_manifest(descriptor, owned.file_io())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                check()?;
+                for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
                     check()?;
-                    let mut facts = BTreeMap::new();
-                    for descriptor in manifests.entries() {
-                        check()?;
-                        let manifest = crate::manifest::load_manifest(descriptor, owned.file_io())
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        check()?;
-                        for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
-                            check()?;
-                            let identity = EntryIdentity::try_from(entry.data_file())
-                                .map_err(|error| error.to_string())?;
-                            // An absent entry snapshot inherits the manifest's actual added snapshot.
-                            let fact = (
-                                entry.data_file().record_count(),
-                                entry.snapshot_id().unwrap_or(descriptor.added_snapshot_id),
-                            );
-                            if facts.insert(identity, fact).is_some() {
-                                return Err(
-                                    "Iceberg pinned snapshot repeats a logical entry".to_string()
-                                );
-                            }
-                        }
+                    let identity = EntryIdentity::try_from(entry.data_file())
+                        .map_err(|error| error.to_string())?;
+                    // An absent entry snapshot inherits the manifest's actual added snapshot.
+                    let fact = (
+                        entry.data_file().record_count(),
+                        entry.snapshot_id().unwrap_or(descriptor.added_snapshot_id),
+                    );
+                    if facts.insert(identity, fact).is_some() {
+                        return Err("Iceberg pinned snapshot repeats a logical entry".to_string());
                     }
-                    check()?;
-                    Ok::<_, String>((files, facts))
-                })
-                .map_err(|error| unavailable(error.to_string()))?
-                .map_err(corrupt)?;
+                }
+            }
+            check()?;
+            Ok::<_, String>((files, facts))
+        })
+        .await
+        .map_err(corrupt)?;
         validate_context(context)?;
         let mut targets = Vec::with_capacity(files.len());
         for file in files {
@@ -3279,6 +3461,62 @@ fn data_branch_recipe(
     )
 }
 
+/// Same first-party write-control factory geometry as the running session.
+/// This constructs no catalog, credential, session, I/O, or dummy future.
+pub fn write_control_io_geometry()
+-> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry, ConnectorError> {
+    let actual_io = crate::commit::operation::OperationLimits::default().io_requests as usize;
+    let io = std::num::NonZeroUsize::new(actual_io)
+        .ok_or_else(|| internal("write operation I/O inventory is empty"))?;
+    let future =
+        write_control_cow_future_bytes(IcebergWriteSessionControl::begin_cow_original_async)
+            .max(write_control_future_bytes(
+                IcebergWriteSessionControl::begin_write_original,
+            ))
+            .max(write_control_future_bytes(
+                IcebergWriteSessionControl::finish_write_original,
+            ))
+            .max(write_control_future_bytes(
+                IcebergWriteSessionControl::adjudicate_session_request_original,
+            ))
+            .max(write_control_future_bytes(
+                IcebergWriteSessionControl::abort_write_original,
+            ))
+            .max(write_control_future_bytes3(
+                IcebergWriteSessionControl::finish_write_needed_original,
+            ))
+            .max(write_control_future_bytes3(
+                IcebergWriteSessionControl::adjudicate_session_needed_original,
+            ));
+    let fixed = crate::commit::operation::IcebergCommitOperation::fixed_backing_bytes()
+        .map_err(|e| internal(e.to_string()))?
+        .checked_add(IcebergCommitHandle::fixed_backing_bytes())
+        .and_then(|n| {
+            n.checked_add(crate::commit::attempt::observation::PublicationJournal::<
+                ConnectorWriteReceipt,
+            >::fixed_backing_bytes())
+        })
+        .and_then(|n| n.checked_add(future))
+        .and_then(|n| {
+            n.checked_add(
+                crate::fs_io::governed_writer_backing_bytes()
+                    .ok()?
+                    .checked_mul(actual_io)?,
+            )
+        })
+        .ok_or_else(|| internal("write source geometry overflow"))?;
+    let fixed = std::num::NonZeroU64::new(
+        u64::try_from(fixed).map_err(|_| internal("write source geometry overflow"))?,
+    )
+    .ok_or_else(|| internal("write source geometry is empty"))?;
+    let initial = recovery_codec::initial_owned_backing_bytes()?;
+    let initial = std::num::NonZeroU64::new(
+        u64::try_from(initial).map_err(|_| internal("write initial payload geometry overflow"))?,
+    )
+    .ok_or_else(|| internal("write initial payload geometry is empty"))?;
+    Ok(novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry::new(io, fixed, initial))
+}
+
 impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
     for IcebergWriteSessionControl
 {
@@ -3286,30 +3524,146 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         &self.key
     }
 
+    fn io_profile(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile, ConnectorError>
+    {
+        let geometry = write_control_io_geometry()?;
+        novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile::try_new(
+            geometry.max_concurrent_io(),
+            geometry.metadata_bytes(),
+            geometry.initial_owned_bytes(),
+            self.runtime.metadata_action_initial_dependencies()?,
+        )
+    }
+
+    fn cleanup_responsibility(
+        &self,
+        commit: &novarocks_spi::connector::write_stack::ConnectorWriteCommitHandle,
+    ) -> Result<novarocks_spi::connector::ConnectorMetadataCleanupResponsibility, ConnectorError>
+    {
+        Ok(self.adapter.commit_handle(commit)?.cleanup_responsibility())
+    }
+
+    fn begin_write_async(
+        &self,
+        request: ConnectorWriteBeginRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorWriteSessionPlan, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self.begin_write_original(request))
+    }
+
+    fn begin_cow_write_checked_async(
+        &self,
+        request: ConnectorWriteBeginRequest,
+        original: novarocks_spi::connector::ConnectorOriginalResultScope,
+        existing_caller_upper: u64,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        novarocks_spi::connector::ConnectorCowBeginPlan,
+                        novarocks_spi::connector::ConnectorCowBeginFailure,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self.begin_cow_original_async(request, original, existing_caller_upper))
+    }
+
+    fn finish_write_async<'a>(
+        &'a self,
+        request: ConnectorWriteFinishRequestRef<'a>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(self.finish_write_original(request))
+    }
+
+    fn finish_write_with_needed_ready_async<'a>(
+        &'a self,
+        request: ConnectorWriteFinishRequestRef<'a>,
+        receiving: &'a novarocks_spi::connector::write_stack::ConnectorWriteNeededReadyReceiving,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion,
+                        ConnectorError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(self.finish_write_needed_original(request, Some(receiving)))
+    }
+    fn reconcile_write_with_needed_ready_async<'a>(
+        &'a self,
+        request: ConnectorWriteSessionReconcileRequest<'a>,
+        receiving: &'a novarocks_spi::connector::write_stack::ConnectorWriteNeededReadyReceiving,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion,
+                        ConnectorError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(self.adjudicate_session_needed_original(request, receiving))
+    }
+
+    fn abort_write_async<'a>(
+        &'a self,
+        request: ConnectorWriteSessionAbortRequest<'a>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorWriteAbortOutcome, ConnectorError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(self.abort_write_original(request))
+    }
+
+    fn reconcile_write_async<'a>(
+        &'a self,
+        request: ConnectorWriteSessionReconcileRequest<'a>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(self.adjudicate_session_request_original(request))
+    }
+
     fn begin_write(
         &self,
         request: ConnectorWriteBeginRequest,
     ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
-        validate_context(&request.context)?;
-        let (handle, targets, statistics_metadata) = self.admit(&request)?;
-        // The frozen old-delete map is derived from the same writer handles the
-        // plan carries, so `finish_write` can re-derive it without a second
-        // source of truth.
-        let copy_on_write = match &request.flavor {
-            ConnectorWriteSessionFlavor::CopyOnWrite {
-                selection,
-                match_contract,
-            } => Some((selection.clone(), match_contract.clone())),
-            _ => None,
-        };
-        let plan = session_plan_from_targets(
-            &self.adapter,
-            handle,
-            targets,
-            Some(&statistics_metadata),
-            copy_on_write,
-        )?;
-        Ok(plan)
+        // Transitional whole-family bridge. The actual author is shared with
+        // async INSERT; this boundary is removed with the remaining families.
+        self.runtime
+            .resources()
+            .catalog_runtime()
+            .block_on(self.begin_write_original(request))
+            .map_err(unavailable)?
     }
 
     fn begin_cow_write_checked(
@@ -3346,60 +3700,39 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         &self,
         request: ConnectorWriteFinishRequest<'_>,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        let handle = self.adapter.commit_handle(request.commit)?;
-        let document_publication = match (
-            handle.document_publication(),
-            &request.publication,
-        ) {
-            (Some(frozen), novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::KeyedDocuments(intent)) => {
-                intent.validate_for(frozen.declaration())?;
-                let records = intent.documents.records.iter().map(|record| {
-                    Ok((crate::document_storage::keyed::keys::record_key(&record.owner,&record.name), crate::document_storage::keyed::record::encode_record(record)?))
-                }).collect::<Result<BTreeMap<_,_>,ConnectorError>>()?;
-                handle.bind_document_records(records)?;
-                Some(intent)
-            }
-            (None, novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::KeyedDocuments(_)) => return Err(invalid("ordinary write cannot attach keyed publication records")),
-            (
-                None,
-                novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None,
-            ) => None,
-            (Some(_), novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None) => {
-                return Err(invalid(
-                    "Iceberg document publication session requires its prepared documents",
-                ));
-            }
-        };
-        let statistics = validate_statistics_artifacts(handle, request.statistics)?;
-        let frozen = self.frozen_references_of(handle);
-        // A staged create is the one flavor that finishes without committing:
-        // its single external effect belongs to the publication that owns the
-        // staged target, and performing one here would create a snapshot on a
-        // table the catalog does not yet have.
-        if handle.flavor() == IcebergWriteFlavor::StagedCreate {
-            return self.seal_staged_prepared_set(
-                handle,
-                &request.prepared,
-                &frozen,
-                &request.context,
-            );
-        }
-        self.commit_prepared_set(
-            handle,
-            &request.prepared,
-            statistics,
-            &frozen,
-            document_publication,
-            &request.context,
-        )
+        self.runtime
+            .resources()
+            .catalog_runtime()
+            .block_on(async {
+                self.finish_write_original(ConnectorWriteFinishRequestRef {
+                    commit: request.commit,
+                    prepared: &request.prepared,
+                    statistics: &request.statistics,
+                    publication: &request.publication,
+                    context: &request.context,
+                    production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::Unproven,
+                })
+                .await
+            })
+            .map_err(|error| unavailable(error.to_string()))?
     }
 
     fn abort_write(
         &self,
         request: ConnectorWriteSessionAbortRequest<'_>,
     ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
+        if request.production == novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::CompleteReceived {
+            return self.runtime.resources().catalog_runtime()
+                .block_on(self.abort_write_original(request))
+                .map_err(unavailable)?;
+        }
         let handle = self.adapter.commit_handle(request.commit)?;
-        self.release_session(handle, &request.context)
+        if request.received.is_some() {
+            return Err(invalid(
+                "unproven write abort cannot carry a deletion inventory",
+            ));
+        }
+        self.release_session(handle, request.production)
     }
 
     fn reconcile_write(
@@ -4910,5 +5243,237 @@ mod variant_statistics_tests {
         let error = decode_bounds(&BTreeMap::from([(1, vec![0])]), &metadata).unwrap_err();
         assert!(error.message().contains("Variant statistics"));
         assert!(error.message().contains("Variant writes are unsupported"));
+    }
+}
+
+// The measured F is the exact factory above; no request or dummy Future is
+// constructed, polled or dropped to quote backing. Variable graphs remain on
+// their original formation-point receipts rather than guessed fixed minima.
+fn write_control_cow_future_bytes<A, B, C, D, F>(_: fn(A, B, C, D) -> F) -> usize {
+    std::mem::size_of::<F>()
+}
+
+fn write_control_future_bytes3<A, B, C, F>(_: fn(A, B, C) -> F) -> usize {
+    std::mem::size_of::<F>()
+}
+fn write_control_future_bytes<A, B, F>(_: fn(A, B) -> F) -> usize {
+    std::mem::size_of::<F>()
+}
+
+impl IcebergWriteSessionControl {
+    async fn begin_write_original(
+        &self,
+        request: ConnectorWriteBeginRequest,
+    ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
+        validate_context(&request.context)?;
+        let (handle, targets, statistics_metadata) = self.admit_async(&request).await?;
+        let copy_on_write = match &request.flavor {
+            ConnectorWriteSessionFlavor::CopyOnWrite {
+                selection,
+                match_contract,
+            } => Some((selection.clone(), match_contract.clone())),
+            _ => None,
+        };
+        session_plan_from_targets(
+            &self.adapter,
+            handle,
+            targets,
+            Some(&statistics_metadata),
+            copy_on_write,
+        )
+    }
+
+    async fn abort_write_original(
+        &self,
+        request: ConnectorWriteSessionAbortRequest<'_>,
+    ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
+        let handle = self.adapter.commit_handle(request.commit)?;
+        use novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction as P;
+        if (request.production == P::CompleteReceived) != request.received.is_some() {
+            return Err(invalid(
+                "write abort inventory lacks its original complete receiving proof",
+            ));
+        }
+        let mut outcome = self.release_session(handle, request.production)?;
+        if let (
+            P::CompleteReceived,
+            Some(received),
+            ConnectorWriteAbortOutcome::KnownUncommitted { cleanup },
+        ) = (request.production, request.received, &mut outcome)
+        {
+            *cleanup = match self
+                .cleanup_received_set_async(handle, received, &request.context)
+                .await
+            {
+                Ok(cleanup) => cleanup,
+                Err(cause) => ExternalMutationFinalization::Failed(
+                    ConnectorMutationFailure::from_connector(cause),
+                ),
+            };
+            handle.retain_cleanup(cleanup.clone());
+            handle.retain_finalization(cleanup.clone());
+        }
+        Ok(outcome)
+    }
+
+    async fn adjudicate_session_request_original(
+        &self,
+        request: ConnectorWriteSessionReconcileRequest<'_>,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        let handle = self.adapter.commit_handle(request.commit)?;
+        self.adjudicate_session_async(handle, &request.evidence, &request.context)
+            .await
+    }
+
+    async fn adjudicate_session_needed_original(
+        &self,
+        request: ConnectorWriteSessionReconcileRequest<'_>,
+        receiving: &novarocks_spi::connector::write_stack::ConnectorWriteNeededReadyReceiving,
+    ) -> Result<
+        novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion,
+        ConnectorError,
+    > {
+        let handle = self.adapter.commit_handle(request.commit)?;
+        let mut outcome = self
+            .adjudicate_session_async(handle, &request.evidence, &request.context)
+            .await;
+        let cleanup = if let Ok(ExternalMutationOutcome::KnownCommitted {
+            receipt,
+            finalization,
+            cleanup,
+            ..
+        }) = &mut outcome
+        {
+            handle.retain_finalization(finalization.clone());
+            handle.retain_cleanup(cleanup.clone());
+            if let Err(error) = handle.settle(IcebergWriteSessionState::KnownCommitted {
+                snapshot_id: receipt
+                    .committed_version()
+                    .and_then(|version| version.snapshot_id()),
+            }) {
+                *finalization = add_finalization_failure(finalization.clone(), error.message());
+                handle.retain_finalization(finalization.clone());
+            }
+            match handle.retained_publication() {
+                Ok(original) => original,
+                Err(error) => {
+                    // The positive exact observation is already real. Failure
+                    // to borrow its retained cleanup owner cannot undo it.
+                    *cleanup = add_finalization_failure(cleanup.clone(), error.message());
+                    handle.retain_cleanup(cleanup.clone());
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let mut outcome = outcome.map(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::from_outcome);
+        if let Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, cleanup: state }) = &mut outcome {
+            if cleanup.is_some() { *state = novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Pending; }
+            receiving.publish(Arc::clone(needed))?;
+            if cleanup.is_some() { receiving.cleanup_permitted().await; }
+        }
+        if let Some((operation, journal)) = cleanup {
+            self.complete_committed_cleanup(
+                handle,
+                &operation,
+                &journal,
+                &request.context,
+                &mut outcome,
+            )
+            .await;
+        }
+        outcome
+    }
+
+    async fn finish_write_original(
+        &self,
+        request: ConnectorWriteFinishRequestRef<'_>,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        self.finish_write_needed_original(request, None)
+            .await?
+            .into_legacy_outcome()
+            .map_err(|_retained| {
+                internal("write legacy projection requires actual cleanup observation")
+            })
+    }
+    async fn finish_write_needed_original(
+        &self,
+        request: ConnectorWriteFinishRequestRef<'_>,
+        needed_ready: Option<
+            &novarocks_spi::connector::write_stack::ConnectorWriteNeededReadyReceiving,
+        >,
+    ) -> Result<
+        novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion,
+        ConnectorError,
+    > {
+        let handle = self.adapter.commit_handle(request.commit)?;
+        let outcome = async {
+        let document_publication = match (
+            handle.document_publication(),
+            request.publication,
+        ) {
+            (Some(frozen), novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::KeyedDocuments(intent)) => {
+                intent.validate_for(frozen.declaration())?;
+                let records = intent.documents.records.iter().map(|record| {
+                    Ok((crate::document_storage::keyed::keys::record_key(&record.owner,&record.name), crate::document_storage::keyed::record::encode_record(record)?))
+                }).collect::<Result<BTreeMap<_,_>,ConnectorError>>()?;
+                handle.bind_document_records(records)?;
+                Some(intent)
+            }
+            (None, novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::KeyedDocuments(_)) => return Err(invalid("ordinary write cannot attach keyed publication records")),
+            (
+                None,
+                novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None,
+            ) => None,
+            (Some(_), novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None) => {
+                return Err(invalid(
+                    "Iceberg document publication session requires its prepared documents",
+                ));
+            }
+        };
+        let statistics = validate_statistics_artifacts(handle, request.statistics)?;
+        let frozen = self.frozen_references_of(handle);
+        // A staged create is the one flavor that finishes without committing:
+        // its single external effect belongs to the publication that owns the
+        // staged target, and performing one here would create a snapshot on a
+        // table the catalog does not yet have.
+        if handle.flavor() == IcebergWriteFlavor::StagedCreate {
+            return self.seal_staged_prepared_set(
+                handle,
+                request.prepared,
+                &frozen,
+                request.context,
+            ).map(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::from_outcome);
+        }
+        self.commit_prepared_set_async(
+            handle,
+            request.prepared,
+            statistics,
+            &frozen,
+            document_publication,
+            request.context,
+            needed_ready,
+        )
+        .await
+        }.await;
+        match outcome {
+            Err(error) => {
+                self.reject_before_commit(
+                    handle,
+                    error,
+                    request.production,
+                    request.prepared,
+                    request.context,
+                )
+                .await.map(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::from_outcome)
+            }
+            outcome => {
+                if let (Some(receiving), Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted { needed, .. })) = (needed_ready, &outcome) {
+                    if receiving.observed().is_none() { receiving.publish(Arc::clone(needed))?; }
+                }
+                outcome
+            }
+        }
     }
 }

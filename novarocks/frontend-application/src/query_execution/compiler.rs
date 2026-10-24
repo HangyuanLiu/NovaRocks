@@ -1189,6 +1189,267 @@ pub(crate) fn prepare_query_as_iceberg_write_with_write_session_and_constants(
     )
 }
 
+/// Compile the original INSERT source after asynchronously observing its
+/// catalog, statistics and provider facts. The statement action must retain
+/// `provider_source` until its close proves the original creator actually exited.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The async write boundary retains the original statement, binding store and sealed session explicitly."
+)]
+pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_constants_async(
+    state: &domain::DmlExecutionKernel,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &Query,
+    constants: Option<novarocks_sql::compiler::SqlExpressionConstants>,
+    sink: novarocks_sql::planning::dml::DmlWritePlanInput,
+    table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
+    query_opts: Option<QueryOptions>,
+    root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
+) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
+    prepare_query_as_iceberg_write_with_connector_binding_async(
+        state,
+        current_catalog,
+        current_database,
+        query,
+        constants.map(DmlMaterializedWriteSource::Expressions),
+        sink,
+        table_bindings,
+        query_opts,
+        root_distribution,
+        execution,
+        connector_context,
+        write_session,
+        None,
+        &[],
+        provider_source,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The target ordinal and original materialized source are independently frozen write facts."
+)]
+pub(crate) async fn prepare_query_as_iceberg_write_at_write_target_async(
+    state: &domain::DmlExecutionKernel,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &Query,
+    materialized_site: novarocks_sql::compiler::SqlMaterializedValuesSite,
+    materialized_rows: std::sync::Arc<[Box<[novarocks_functions::ConstantValue]>]>,
+    sink: novarocks_sql::planning::dml::DmlWritePlanInput,
+    table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
+    query_opts: Option<QueryOptions>,
+    root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    overlays: &[crate::catalog_application::query_materializer::QueryLocalTableOverlay],
+    provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
+) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
+    prepare_query_as_iceberg_write_with_connector_binding_async(
+        state,
+        current_catalog,
+        current_database,
+        query,
+        Some(DmlMaterializedWriteSource::Complete(
+            materialized_site,
+            materialized_rows,
+        )),
+        sink,
+        table_bindings,
+        query_opts,
+        root_distribution,
+        execution,
+        connector_context,
+        write_session,
+        Some(ordinal),
+        overlays,
+        provider_source,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The shared async author retains exact session, ordinal, materialized values and query-local overlays."
+)]
+async fn prepare_query_as_iceberg_write_with_connector_binding_async(
+    state: &domain::DmlExecutionKernel,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &Query,
+    materialized: Option<DmlMaterializedWriteSource>,
+    sink: novarocks_sql::planning::dml::DmlWritePlanInput,
+    table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
+    query_opts: Option<QueryOptions>,
+    root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    write_target_ordinal: Option<novarocks_spi::connector::write_stack::WriteTargetOrdinal>,
+    overlays: &[crate::catalog_application::query_materializer::QueryLocalTableOverlay],
+    provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
+) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
+    let query_opts = Some(query_opts.unwrap_or_else(|| {
+        crate::query_execution::contract::synthetic_statement_query_options(execution)
+    }));
+    let capacity = execution
+        .result_capacity()
+        .cloned()
+        .ok_or_else(|| "async DML compilation requires the admitted result capacity".to_owned())?;
+    let scope = crate::query_execution::completion_facts::StatementFactScope::binding_only(
+        Arc::clone(&table_bindings),
+        connector_context.clone(),
+        current_catalog,
+        capacity.scope(),
+        capacity.clone(),
+    )
+    .map_err(|error| error.to_string())?
+    .with_query_local_overlays(overlays.to_vec());
+    crate::query_execution::completion_facts::install_frontend_fact_source(
+        provider_source,
+        state.completion_fact_owners()?,
+        scope,
+        typed_connector_session()?,
+    )?;
+    let mut prepared = query.clone();
+    if has_time_travel_refs(&prepared) {
+        crate::query_execution::planning::time_travel::rewrite_time_travel_refs_async(
+            state,
+            current_catalog,
+            current_database,
+            &mut prepared,
+            connector_context,
+        )
+        .await?;
+    }
+    let compile_control =
+        crate::query_execution::planning::sql_compile_control_from_execution(execution);
+    let statement = match materialized {
+        Some(DmlMaterializedWriteSource::Complete(site, rows)) => {
+            novarocks_sql::compiler::SqlStatementInput::materialized_values_query(
+                Box::new(prepared),
+                site,
+                rows,
+                &compile_control,
+            )
+            .map_err(crate::dml::error::DmlExecutionError::from_compile)?
+        }
+        Some(DmlMaterializedWriteSource::Expressions(constants)) => {
+            novarocks_sql::compiler::SqlStatementInput::query_with_expression_constants(
+                Box::new(prepared),
+                constants,
+                &compile_control,
+            )
+            .map_err(crate::dml::error::DmlExecutionError::from_compile)?
+        }
+        None => novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(prepared)),
+    };
+    let preparation = novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new(
+        statement,
+        novarocks_sql::compiler::SqlSessionContext {
+            sql_semantics: execution.sql_semantics().clone(),
+            current_catalog: current_catalog.map(str::to_string),
+            current_database: current_database.to_string(),
+            optimizer_settings: execution.optimizer_settings().clone(),
+        },
+        compile_control.clone(),
+        root_distribution,
+    )
+    .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
+    let catalog_facts = provider_source
+        .resolve_catalog_relations(preparation.needs())
+        .await?;
+    let analyzed = preparation
+        .analyze(
+            &catalog_facts,
+            DmlQueryExecutionKernel::function_catalog(state),
+            crate::query_execution::constant_eval::constant_evaluator(),
+            DmlQueryExecutionKernel::constant_policy(state),
+        )
+        .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
+    let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings_async(
+        state, Arc::clone(&table_bindings), connector_context,
+    ).await?;
+    let optimize_request = novarocks_sql::compiler::SqlOptimizeRequest::new(
+        analyzed,
+        &statistics,
+        compile_control.clone(),
+    );
+    let sealed = write_session
+        .seal_write_targets()
+        .map_err(|error| error.to_string())?;
+    let ordinal = match write_target_ordinal {
+        Some(ordinal)
+            if write_session
+                .targets()
+                .iter()
+                .any(|target| target.ordinal() == ordinal) =>
+        {
+            ordinal
+        }
+        Some(ordinal) => {
+            return Err(format!("write session did not seal target {}", ordinal.get()).into());
+        }
+        None => sealed.sole_target_ordinal()?,
+    };
+    let requirements = write_session
+        .statistics_requirements(ordinal)
+        .map_err(|error| error.to_string())?;
+    let target = write_session
+        .targets()
+        .iter()
+        .find(|target| target.ordinal() == ordinal)
+        .ok_or_else(|| format!("write session did not seal target {}", ordinal.get()))?;
+    let write_handle = write_session
+        .encode_writer_handle_payload(target.handle())
+        .map_err(|error| error.to_string())?;
+    let decimal_overflow_policy = optimize_request.decimal_overflow_policy();
+    let (completion, needs) = novarocks_sql::planning::dml::begin_final_connector_write_plan(
+        optimize_request,
+        sink,
+        ordinal,
+        requirements,
+        execution.optimizer_settings(),
+        decimal_overflow_policy,
+    )
+    .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
+    let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
+    let facts = provider_source
+        .resolve_provider_reads(&needs, &access_sink)
+        .await?;
+    // The original Provider retains every pending creator. Do not extract the
+    // final access set until its local creator exit is proven by the same source.
+    provider_source
+        .close()
+        .await
+        .map_err(|error| format!("{}: {}", error.detail(), error.cause()))?;
+    let access = access_sink
+        .try_into_access()
+        .map_err(|(error, _returned)| error.to_string())?;
+    finish_prepared_iceberg_write_assembly(
+        state,
+        completion,
+        facts,
+        access,
+        novarocks_sql::planning::dml::DmlFinalizedWriteTarget {
+            ordinal,
+            handle: write_handle,
+        },
+        query_opts,
+        execution,
+        write_session,
+        &compile_control,
+    )
+}
+
 /// Compile one query of a *multi-target* write session, at the sealed ordinal
 /// that query writes to.
 ///
@@ -1301,6 +1562,35 @@ impl PreparedDmlWriteAssembly {
             query_execution,
             write_session,
         })
+    }
+
+    /// Consume the same completed write through the closed internal consumer.
+    /// The original reservation and stable session cross once into the common
+    /// logical execution path; this does not start a Native attempt.
+    pub(crate) fn prepare_computation(
+        self,
+        initial: crate::query_execution::logical_execution::InitialComputationReservation,
+        runtime: crate::query_execution::internal_consumer::decoded::DecodedConsumerRuntime,
+    ) -> Result<
+        (
+            crate::query_execution::logical_execution::PreparedLogicalComputation,
+            novarocks_query_application::api::ReservedExecutionIdentity,
+            crate::query_execution::internal_consumer::write::WriteComputationOutput,
+        ),
+        novarocks_query_application::api::QueryExecutionError,
+    > {
+        crate::query_execution::internal_consumer::write::prepare_write_computation(
+            self.description,
+            self.template,
+            Arc::new(
+                crate::query_execution::contract::ResolvedQueryOptions::from_upstream(
+                    self.query_options,
+                ),
+            ),
+            self.write_session,
+            initial,
+            runtime,
+        )
     }
 
     /// Consume this one-shot assembly into its exact distributed write
@@ -1512,9 +1802,6 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     let write_handle = write_session
         .encode_writer_handle_payload(write_target.handle())
         .map_err(|error| crate::dml::error::DmlExecutionError::from(error.to_string()))?;
-    let write_target_facts = crate::query_execution::physical_encoding::WriteTargetFacts {
-        session: write_session.as_ref(),
-    };
 
     // Optimize the write, then freeze the reads it states. The plan addresses
     // each scan by the occurrence its read was accounted for under, so the
@@ -1546,6 +1833,42 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     let access = access_sink
         .try_into_access()
         .map_err(|(error, _returned)| error.to_string())?;
+    finish_prepared_iceberg_write_assembly(
+        state,
+        completion,
+        facts,
+        access,
+        novarocks_sql::planning::dml::DmlFinalizedWriteTarget {
+            ordinal,
+            handle: write_handle,
+        },
+        query_opts,
+        execution,
+        write_session,
+        &completion_control,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The pure finalization pairs the original SQL plan, runtime access and sealed write target."
+)]
+fn finish_prepared_iceberg_write_assembly(
+    state: &impl DmlQueryExecutionKernel,
+    completion: novarocks_sql::planning::dml::DmlWriteCompletion,
+    facts: Vec<novarocks_sql::compiler::ProviderReadFact>,
+    access: novarocks_query_application::preparation::FinalPlanRuntimeAccess<
+        crate::query_execution::provider_read_facts::FrozenProviderRead,
+    >,
+    target: novarocks_sql::planning::dml::DmlFinalizedWriteTarget,
+    query_opts: Option<QueryOptions>,
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+    write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    completion_control: &novarocks_sql::compiler::SqlCompileControl,
+) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
+    let write_target_facts = crate::query_execution::physical_encoding::WriteTargetFacts {
+        session: write_session.as_ref(),
+    };
     let read_budget = dml_scan_read_budget();
     let plan = completion.finish(
         crate::query_execution::physical_encoding::mint_plan_version(),
@@ -1553,19 +1876,14 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new(facts.into_iter().map(
             |fact| novarocks_sql::planning::dml::DmlFinalizedProviderRead { fact, read_budget },
         ))?,
-        novarocks_sql::planning::dml::DmlFinalizedWriteTargetSet::try_new([
-            novarocks_sql::planning::dml::DmlFinalizedWriteTarget {
-                ordinal,
-                handle: write_handle,
-            },
-        ])?,
-        &completion_control,
+        novarocks_sql::planning::dml::DmlFinalizedWriteTargetSet::try_new([target])?,
+        completion_control,
     )?;
     let version = plan.plan().version();
     let candidate =
         novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
             plan,
-            &completion_control,
+            completion_control,
         )
         .and_then(|candidate| {
             candidate.freeze_root_output(
@@ -1584,7 +1902,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         DmlQueryExecutionKernel::static_plan_carrier(state),
         DmlQueryExecutionKernel::constant_policy(state),
         Some(&write_target_facts),
-        &completion_control,
+        completion_control,
     )?;
     Ok(PreparedDmlWriteAssembly::new(
         encoded,

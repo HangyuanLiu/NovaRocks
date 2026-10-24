@@ -459,8 +459,9 @@ impl LogicalExecutionSupervisor {
     pub fn install_statement_control(
         &mut self,
         service: crate::session_control::QueryControlService,
+        source_slots: std::num::NonZeroUsize,
     ) -> Result<(), crate::session_control::QueryControlError> {
-        self.statements.install(service)
+        self.statements.install(service, source_slots)
     }
     /// Pure layout facts from this owner's actual logical-role factory.
     /// No Work, input, task or bank is created. Composition must separately
@@ -1473,6 +1474,10 @@ async fn run_logical_role(
     body.seed = Some(seed);
     body.consumer = consumer;
     body.capacity = capacity;
+    body.client_computation = body
+        .capacity
+        .as_ref()
+        .and_then(|capacity| capacity.client_computation_producer());
     let description = Arc::clone(body.description.as_ref().unwrap());
     let internal_consumer = body.consumer.clone();
     let internal = internal_consumer.is_some();
@@ -2422,25 +2427,35 @@ async fn drive_rows_attempt_until_pump_decision(
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
     internal: &mut Option<InternalExecutionConsumer>,
-) -> (Result<super::LogicalConclusion, ResultPumpFailure>,) {
+    client: Option<crate::admitted_query_context::ClientComputationCutHandle>,
+) -> (
+    Result<super::LogicalConclusion, ResultPumpFailure>,
+    Option<super::result_pump::ClientRowsComputedCut>,
+) {
     let root_ack = match active.reserve_root_ack_tail(running.identity(), root) {
         Ok(reservation) => reservation,
         Err(error) => {
-            return (Err(super::result_pump::pump_failure(
-                running,
-                super::result_pump::contract_failure(error),
-            )),);
+            return (
+                Err(super::result_pump::pump_failure(
+                    running,
+                    super::result_pump::contract_failure(error),
+                )),
+                None,
+            );
         }
     };
     let mut ready = if let Some(internal) = internal.as_ref() {
         let activation = match running.bind_internal_consumer(root).await {
             Ok(activation) => activation,
             Err(error) => {
-                return (Err(super::result_pump::pump_actor_failure(
-                    running,
-                    "bind internal consumer",
-                    error,
-                )),);
+                return (
+                    Err(super::result_pump::pump_actor_failure(
+                        running,
+                        "bind internal consumer",
+                        error,
+                    )),
+                    None,
+                );
             }
         };
         let ready = activation.ready.clone();
@@ -2448,11 +2463,14 @@ async fn drive_rows_attempt_until_pump_decision(
             Ok(exit) => exit,
             Err(error) => {
                 drop(activation);
-                return (Err(super::result_pump::pump_actor_failure(
-                    running,
-                    "register internal consumer supervision",
-                    error,
-                )),);
+                return (
+                    Err(super::result_pump::pump_actor_failure(
+                        running,
+                        "register internal consumer supervision",
+                        error,
+                    )),
+                    None,
+                );
             }
         };
         let mut input = Some(super::native_active_custody::OriginalConsumerStart {
@@ -2463,10 +2481,13 @@ async fn drive_rows_attempt_until_pump_decision(
         if let Err(error) = active.start_consumer_in(&mut input) {
             // Refusal has not moved any original input, and no factory was called.
             drop(input);
-            return (Err(super::result_pump::pump_failure(
-                running,
-                super::result_pump::contract_failure(error),
-            )),);
+            return (
+                Err(super::result_pump::pump_failure(
+                    running,
+                    super::result_pump::contract_failure(error),
+                )),
+                None,
+            );
         }
         Some(ready)
     } else {
@@ -2490,8 +2511,12 @@ async fn drive_rows_attempt_until_pump_decision(
                 ready,
             )
             .await
+            .map(|conclusion| super::result_pump::RootPumpDecision {
+                conclusion,
+                client_cut: None,
+            })
         } else {
-            super::run_root_relay(
+            super::result_pump::run_client_root_relay(
                 running,
                 root,
                 scope,
@@ -2499,6 +2524,7 @@ async fn drive_rows_attempt_until_pump_decision(
                 runtime.statuses,
                 terminal_source,
                 root_ack,
+                client,
             )
             .await
         }
@@ -2534,7 +2560,10 @@ async fn drive_rows_attempt_until_pump_decision(
         }
     };
     observe_internal_ready(internal, ready.as_ref());
-    (pump_result,)
+    match pump_result {
+        Ok(decision) => (Ok(decision.conclusion), decision.client_cut),
+        Err(error) => (Err(error), None),
+    }
 }
 
 struct InternalExecutionConsumer {
@@ -2656,6 +2685,7 @@ async fn supervise_rows_inner(
     clock: &dyn MonotonicClock,
     mut attempt: RowsAttempt,
 ) -> Result<(), QueryExecutionError> {
+    let client_computation = session.client_computation_cut_handle();
     let mut residuals = JoinSet::new();
     // One recovery window covers every replacement preparation. A failed
     // successor cannot renew the topology wait by starting another attempt.
@@ -2673,7 +2703,7 @@ async fn supervise_rows_inner(
             ));
         }
         let drive = NativeAttemptDrive::new(&attempt.running);
-        let (pump_result,) = drive_rows_attempt_until_pump_decision(
+        let (pump_result, client_cut) = drive_rows_attempt_until_pump_decision(
             &mut attempt.active,
             &drive,
             scope.cancellation().map_err(work_error)?,
@@ -2684,6 +2714,7 @@ async fn supervise_rows_inner(
             shutdown,
             requester,
             internal,
+            client_computation.clone(),
         )
         .await;
         attempt.active.begin_terminal_cut(Instant::now());
@@ -2704,6 +2735,11 @@ async fn supervise_rows_inner(
             Ok(
                 super::LogicalConclusion::Succeeded | super::LogicalConclusion::ComputationReady,
             ) => {
+                // The original pump/driver future has returned and dropped its
+                // local producer slots. Only now can its private cut retire P.
+                if let Some(cut) = client_cut {
+                    cut.retire_after_pump_exit().await.map_err(work_error)?;
+                }
                 session.retire_preparation();
                 return converge_rows_attempts(
                     &mut attempt.active,
@@ -2898,6 +2934,50 @@ async fn supervise_rows_inner(
                         return first_supervision_error(supervision, convergence);
                     }
                 };
+                // The exact successor dormant owner binds its complete original
+                // dependency union BEFORE the actor dispatches qualification.
+                // Every pending constructor/reply stays in that owner; this
+                // borrowed wait owns neither the old grant nor a fresh source.
+                if let Err(error) = await_with_shutdown(
+                    bind_dormant_qualification(
+                        dormant,
+                        &replacement_schedule,
+                        &cancellation,
+                        preparation_deadline,
+                    ),
+                    shutdown,
+                    requester,
+                )
+                .await
+                {
+                    session.retire_preparation();
+                    let actor_outcome = if internal.is_some() {
+                        decision.fail_logical_with_error(actor, error.clone()).await
+                    } else {
+                        decision.fail_logical(actor).await
+                    };
+                    let supervision = preparation_supervision_result(error, actor_outcome);
+                    // No successor qualification was dispatched and no successor
+                    // context was registered. Close only its actual local owner.
+                    let replacement_convergence =
+                        converge_dormant(dormant, cancellation.clone(), shutdown, requester).await;
+                    let old_convergence = converge_rows_attempts(
+                        &mut attempt.active,
+                        attempt.schedule.contexts(),
+                        &mut residuals,
+                        cancellation,
+                        registry,
+                        registration,
+                        shutdown,
+                        requester,
+                        config.remote_cleanup_timeout(),
+                    )
+                    .await;
+                    return first_supervision_error(
+                        supervision,
+                        first_supervision_error(replacement_convergence, old_convergence),
+                    );
+                }
                 let qualification = match decision
                     .begin_replacement(actor, replacement, replacement_schedule.contexts().to_vec())
                     .await
@@ -3424,6 +3504,54 @@ async fn record_remote_tracking_ended(
         }
     }
     first_error.map_or(Ok(()), Err)
+}
+
+/// The borrowed polling frame retains only references. The original dormant
+/// projection owns the paid binding state and the original custody owns panic.
+async fn bind_dormant_qualification(
+    custody: &mut crate::api::NativeDormantCustody,
+    schedule: &super::AttemptSchedule,
+    cancellation: &novarocks_workload_control::CancellationView,
+    deadline: tokio::time::Instant,
+) -> Result<(), QueryExecutionError> {
+    let Some((owner, original)) = custody.activation_parts() else {
+        return Err(result_protocol_error(
+            "original qualification binding owner is unavailable",
+        ));
+    };
+    let binding = std::future::poll_fn(|cx| {
+        match catch_unwind(AssertUnwindSafe(|| {
+            owner.poll_bind_qualification(schedule, cx)
+        })) {
+            Ok(Poll::Ready(Ok(()))) => Poll::Ready(Ok(())),
+            Ok(Poll::Ready(Err(failure))) => {
+                Poll::Ready(Err(failure.into_failure().error().clone()))
+            }
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(payload) => {
+                *original = Some(payload);
+                Poll::Ready(Err(native_future_panicked(
+                    "Native qualification binding panicked",
+                )))
+            }
+        }
+    });
+    tokio::pin!(binding);
+    tokio::select! {
+        biased;
+        reason = cancellation.cancelled() => Err(cancellation_error(
+            cancellation.reason().unwrap_or(reason),
+            "Native replacement dependency binding was cancelled",
+        )),
+        _ = tokio::time::sleep_until(deadline) => {
+            Err(QueryExecutionError::from_execution(ExecutionFailureInput::new(
+                QueryFailureReason::RecoveryPreparationBudgetExceeded.failure_fact(),
+                SafeDetail::truncating("Native replacement dependency binding exceeded its recovery budget"),
+                ExecutionFailureSite::Coordinator,
+            )))
+        }
+        outcome = &mut binding => outcome,
+    }
 }
 
 /// Only this original dormant owner can receive these two causes. Capture
@@ -3989,6 +4117,8 @@ mod tests {
     include!("supervisor_internal_tests.rs");
     include!("supervisor_role_bank_fixture.rs");
     include!("supervisor_original_exit_tests.rs");
+    include!("supervisor_qualification_binding_tests.rs");
+    include!("supervisor_client_computation_tests.rs");
     #[test]
     fn terminal_actor_disposition_does_not_hide_invalid_phase_or_service_invariants() {
         use super::super::{LogicalConclusion, LogicalExecutionActorError};
@@ -4888,6 +5018,15 @@ mod tests {
     }
 
     impl DormantNativeAttemptOwner for FailingDormantOwner {
+        fn poll_bind_qualification(
+            &mut self,
+            _schedule: &crate::coordination::AttemptSchedule,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+            // This fixture owns no external dependency or qualification transport.
+            std::task::Poll::Ready(Ok(()))
+        }
+
         fn eligible_backends(&self) -> &[BackendProcessId] {
             std::slice::from_ref(&self.backend)
         }
@@ -5181,6 +5320,15 @@ mod tests {
     }
 
     impl DormantNativeAttemptOwner for RowsDormantOwner {
+        fn poll_bind_qualification(
+            &mut self,
+            _schedule: &crate::coordination::AttemptSchedule,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+            // This fixture owns no external dependency or qualification transport.
+            std::task::Poll::Ready(Ok(()))
+        }
+
         fn eligible_backends(&self) -> &[BackendProcessId] {
             std::slice::from_ref(&self.backend)
         }
@@ -5343,6 +5491,14 @@ mod tests {
         signals: Arc<PreparationExitSignals>,
     }
     impl DormantNativeAttemptOwner for PreparationExitDormant {
+        fn poll_bind_qualification(
+            &mut self,
+            schedule: &crate::coordination::AttemptSchedule,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+            self.inner.poll_bind_qualification(schedule, cx)
+        }
+
         fn eligible_backends(&self) -> &[BackendProcessId] {
             self.inner.eligible_backends()
         }
@@ -5726,6 +5882,14 @@ mod tests {
         phase: InitialTerminalPhase,
     }
     impl DormantNativeAttemptOwner for InitialTerminalDormant {
+        fn poll_bind_qualification(
+            &mut self,
+            schedule: &crate::coordination::AttemptSchedule,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+            self.inner.poll_bind_qualification(schedule, cx)
+        }
+
         fn eligible_backends(&self) -> &[BackendProcessId] {
             self.inner.eligible_backends()
         }
@@ -5916,6 +6080,15 @@ mod tests {
         }
     }
     impl DormantNativeAttemptOwner for DormantCaptureOwner {
+        fn poll_bind_qualification(
+            &mut self,
+            _schedule: &crate::coordination::AttemptSchedule,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+            // This fixture owns no external dependency or qualification transport.
+            std::task::Poll::Ready(Ok(()))
+        }
+
         fn eligible_backends(&self) -> &[BackendProcessId] {
             &[]
         }
@@ -6061,6 +6234,15 @@ mod tests {
     #[derive(Debug)]
     struct ReadyActivationDropOwner(Arc<AtomicU64>);
     impl DormantNativeAttemptOwner for ReadyActivationDropOwner {
+        fn poll_bind_qualification(
+            &mut self,
+            _schedule: &crate::coordination::AttemptSchedule,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+            // This fixture owns no external dependency or qualification transport.
+            std::task::Poll::Ready(Ok(()))
+        }
+
         fn eligible_backends(&self) -> &[BackendProcessId] {
             &[]
         }
@@ -6791,6 +6973,15 @@ mod tests {
     }
 
     impl DormantNativeAttemptOwner for RecoveringRowsDormantOwner {
+        fn poll_bind_qualification(
+            &mut self,
+            _schedule: &crate::coordination::AttemptSchedule,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+            // This fixture owns no external dependency or qualification transport.
+            std::task::Poll::Ready(Ok(()))
+        }
+
         fn eligible_backends(&self) -> &[BackendProcessId] {
             std::slice::from_ref(&self.backend)
         }
@@ -7802,6 +7993,15 @@ mod tests {
     }
 
     impl DormantNativeAttemptOwner for VisibleFailureDormantOwner {
+        fn poll_bind_qualification(
+            &mut self,
+            _schedule: &crate::coordination::AttemptSchedule,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+            // This fixture owns no external dependency or qualification transport.
+            std::task::Poll::Ready(Ok(()))
+        }
+
         fn eligible_backends(&self) -> &[BackendProcessId] {
             std::slice::from_ref(&self.backend)
         }
@@ -8010,6 +8210,15 @@ mod tests {
     }
 
     impl DormantNativeAttemptOwner for PanickingDormantOwner {
+        fn poll_bind_qualification(
+            &mut self,
+            _schedule: &crate::coordination::AttemptSchedule,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+            // This fixture owns no external dependency or qualification transport.
+            std::task::Poll::Ready(Ok(()))
+        }
+
         fn eligible_backends(&self) -> &[BackendProcessId] {
             std::slice::from_ref(&self.backend)
         }
@@ -8496,6 +8705,14 @@ mod tests {
     }
 
     impl DormantNativeAttemptOwner for ActivationCancellationDormant {
+        fn poll_bind_qualification(
+            &mut self,
+            schedule: &crate::coordination::AttemptSchedule,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+            self.inner.poll_bind_qualification(schedule, cx)
+        }
+
         fn eligible_backends(&self) -> &[BackendProcessId] {
             self.inner.eligible_backends()
         }
@@ -8676,6 +8893,15 @@ mod tests {
     }
 
     impl DormantNativeAttemptOwner for SuccessfulCompletionDormantOwner {
+        fn poll_bind_qualification(
+            &mut self,
+            _schedule: &crate::coordination::AttemptSchedule,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+            // This fixture owns no external dependency or qualification transport.
+            std::task::Poll::Ready(Ok(()))
+        }
+
         fn eligible_backends(&self) -> &[BackendProcessId] {
             std::slice::from_ref(&self.backend)
         }
@@ -8863,6 +9089,15 @@ mod tests {
     }
 
     impl DormantNativeAttemptOwner for PrematureCompletionDormant {
+        fn poll_bind_qualification(
+            &mut self,
+            _schedule: &crate::coordination::AttemptSchedule,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), crate::api::NativeAttemptActivationFailure>> {
+            // This fixture owns no external dependency or qualification transport.
+            std::task::Poll::Ready(Ok(()))
+        }
+
         fn eligible_backends(&self) -> &[BackendProcessId] {
             std::slice::from_ref(&self.backend)
         }

@@ -189,6 +189,10 @@ pub struct DmlEnginePorts {
     connector_runtime: tokio::runtime::Handle,
     lake_publication_runtime_policy:
         novarocks_query_application::publication::LakePublicationRuntimePolicy,
+    write_runtime: Option<(
+        crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+        crate::native::data_runtime::FrontendDataRuntime,
+    )>,
 }
 
 impl DmlEnginePorts {
@@ -224,12 +228,22 @@ impl DmlEnginePorts {
             mv_readiness,
             query_execution,
             connector_runtime,
+            write_runtime: None,
             lake_publication_runtime_policy,
         }
     }
 
+    pub(crate) fn with_write_runtime(
+        mut self,
+        blocking: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+        data: crate::native::data_runtime::FrontendDataRuntime,
+    ) -> Self {
+        self.write_runtime = Some((blocking, data));
+        self
+    }
+
     fn kernel(&self) -> domain::DmlExecutionKernel {
-        domain::DmlExecutionKernel::new(
+        let kernel = domain::DmlExecutionKernel::new(
             domain::DmlPlanningServices::new(
                 Arc::clone(&self.functions),
                 Arc::clone(&self.catalog_service),
@@ -245,7 +259,11 @@ impl DmlEnginePorts {
             self.query_execution.clone(),
         )
         .with_lake_publication_runtime_policy(self.lake_publication_runtime_policy)
-        .with_connector_runtime(self.connector_runtime.clone())
+        .with_connector_runtime(self.connector_runtime.clone());
+        match &self.write_runtime {
+            Some((blocking, data)) => kernel.with_write_runtime(blocking.clone(), data.clone()),
+            None => kernel,
+        }
     }
 }
 

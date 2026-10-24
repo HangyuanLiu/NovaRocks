@@ -1757,7 +1757,28 @@ pub struct IcebergCommitHandle {
     terminal_cleanup: std::sync::Mutex<novarocks_spi::connector::ExternalMutationFinalization>,
     recovery_evidence:
         Arc<std::sync::Mutex<Option<novarocks_spi::connector::ExternalMutationEvidence>>>,
+    // The original session retains the actual operation and journal before
+    // their first poll. Neither a waiter nor an evidence projection owns exit.
+    publication: std::sync::Mutex<Option<IcebergWritePublication>>,
+    empty_cleanup_disposed: std::sync::atomic::AtomicBool,
     state: std::sync::Mutex<IcebergWriteSessionState>,
+}
+
+struct IcebergWritePublication {
+    operation: crate::commit::operation::IcebergCommitOperation,
+    journal: crate::commit::attempt::observation::PublicationJournal<
+        novarocks_spi::connector::ConnectorWriteReceipt,
+    >,
+    // Rejection can precede the first dispatch entry. Preserve its actual
+    // report here; reports after dispatch stay in the SAME original journal.
+    early_cleanup: Option<crate::commit::model::IcebergCleanupReport>,
+}
+impl std::fmt::Debug for IcebergWritePublication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IcebergWritePublication")
+            .field("operation", &self.operation)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Everything a sealed session carries besides its identity, its table
@@ -1835,6 +1856,10 @@ pub enum IcebergWriteSessionState {
 }
 
 impl IcebergCommitHandle {
+    pub(crate) const fn fixed_backing_bytes() -> usize {
+        std::mem::size_of::<Self>()
+    }
+
     /// Seal a begin session.
     ///
     /// Target ordinals must be dense from zero and each branch must appear at
@@ -1995,6 +2020,8 @@ impl IcebergCommitHandle {
                 novarocks_spi::connector::ExternalMutationFinalization::Complete,
             ),
             recovery_evidence: Arc::new(std::sync::Mutex::new(None)),
+            publication: std::sync::Mutex::new(None),
+            empty_cleanup_disposed: std::sync::atomic::AtomicBool::new(false),
             state: std::sync::Mutex::new(IcebergWriteSessionState::Active),
         })
     }
@@ -2336,6 +2363,137 @@ impl IcebergCommitHandle {
             .lock()
             .map(|state| state.clone())
             .map_err(|_| corrupt("Iceberg write session state lock is poisoned"))
+    }
+
+    pub(crate) fn retain_publication(
+        &self,
+        operation: crate::commit::operation::IcebergCommitOperation,
+        journal: crate::commit::attempt::observation::PublicationJournal<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+    ) -> Result<(), ConnectorError> {
+        let mut original = self
+            .publication
+            .lock()
+            .map_err(|_| corrupt("Iceberg publication custody lock is poisoned"))?;
+        if original.is_some() {
+            return Err(invalid("Iceberg session already retains its publication"));
+        }
+        *original = Some(IcebergWritePublication {
+            operation,
+            journal,
+            early_cleanup: None,
+        });
+        Ok(())
+    }
+
+    /// Same retained publication owner, borrowed out of its lock before any
+    /// necessary finalizer, handoff notification or cleanup await.
+    pub(crate) fn retained_publication(
+        &self,
+    ) -> Result<
+        Option<(
+            crate::commit::operation::IcebergCommitOperation,
+            crate::commit::attempt::observation::PublicationJournal<
+                novarocks_spi::connector::ConnectorWriteReceipt,
+            >,
+        )>,
+        ConnectorError,
+    > {
+        let original = self
+            .publication
+            .lock()
+            .map_err(|_| corrupt("Iceberg publication custody lock is poisoned"))?;
+        Ok(original
+            .as_ref()
+            .map(|original| (original.operation.clone(), original.journal.clone())))
+    }
+    pub(crate) fn retain_early_cleanup(&self, report: crate::commit::model::IcebergCleanupReport) {
+        let mut original = self
+            .publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original = original
+            .as_mut()
+            .expect("cleanup follows original publication custody");
+        assert!(
+            original.early_cleanup.is_none(),
+            "early cleanup is recorded once"
+        );
+        original.early_cleanup = Some(report);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn early_cleanup_report_for_test(
+        &self,
+    ) -> Option<crate::commit::model::IcebergCleanupReport> {
+        self.publication
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|original| original.early_cleanup.clone())
+    }
+
+    pub(crate) fn record_empty_cleanup_disposed(&self) {
+        self.empty_cleanup_disposed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn record_unstarted_cleanup_disposed(&self) -> Result<bool, ConnectorError> {
+        if !matches!(
+            self.state()?,
+            IcebergWriteSessionState::KnownUncommitted { .. }
+        ) {
+            return Ok(false);
+        }
+        let original = self.publication.lock().map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "write publication custody is poisoned",
+            )
+        })?;
+        if original.is_some() {
+            return Ok(false);
+        }
+        self.record_empty_cleanup_disposed();
+        Ok(true)
+    }
+
+    pub(crate) fn cleanup_responsibility(
+        &self,
+    ) -> novarocks_spi::connector::ConnectorMetadataCleanupResponsibility {
+        use novarocks_spi::connector::ConnectorMetadataCleanupResponsibility as R;
+        // Unwind, an in-flight operation and Unknown cannot authorize release.
+        if !matches!(
+            self.state(),
+            Ok(IcebergWriteSessionState::KnownCommitted { .. }
+                | IcebergWriteSessionState::KnownUncommitted { .. })
+        ) {
+            return R::Retained;
+        }
+        let original = self
+            .publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match original.as_ref() {
+            Some(original) if original.journal.cleanup_inventory_is_disposed() => R::Disposed,
+            Some(original)
+                if original.journal.current_entry().is_none()
+                    && matches!(
+                        &original.early_cleanup,
+                        Some(crate::commit::model::IcebergCleanupReport::Complete { .. })
+                    ) =>
+            {
+                R::Disposed
+            }
+            None if self
+                .empty_cleanup_disposed
+                .load(std::sync::atomic::Ordering::Acquire) =>
+            {
+                R::Disposed
+            }
+            _ => R::Retained,
+        }
     }
 
     /// Claim the single commit attempt this session allows.

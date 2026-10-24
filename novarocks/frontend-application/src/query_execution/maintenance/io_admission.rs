@@ -26,9 +26,9 @@ use novarocks_spi::connector::{
     ConnectorMetadataMaintenanceIoProfile, ConnectorPayloadRetentionGuard,
 };
 use novarocks_workload_control::joint_admission::{
-    AsyncActionAdmission, AsyncActionGrant, AsyncActionSource, JointAdjustmentReceipt,
-    JointAdmission, JointLane, JointProposalSlotWait, JointTryBegin, RetainedPayloadGrant,
-    RootPayloadAdmission, RootPayloadInitialAdmission, RootPayloadInitialSource, RootPayloadReady,
+    AsyncActionAdmission, AsyncActionGrant, AsyncActionSource, JointLane, JointProposalSlotWait,
+    JointTryBegin, RetainedPayloadGrant, RootDomainBinding, RootDomainInitialAdmission,
+    RootDomainInitialSource, RootPayloadAdmission, RootPayloadReady,
 };
 use novarocks_workload_control::{WorkError, WorkOwner, WorkScope};
 use std::{
@@ -68,7 +68,7 @@ impl std::task::Wake for MetadataWake {
     }
 }
 
-pub(super) struct MetadataIoAdmission {
+pub(crate) struct MetadataIoAdmission {
     wake: Arc<MetadataWake>,
     original: Mutex<Option<Body>>,
     cleanup: Mutex<CleanupReceipt>,
@@ -122,13 +122,12 @@ struct Body {
     profile: ConnectorMetadataMaintenanceIoProfile,
     source_metadata_bytes: u64,
     k: usize,
-    bootstrap: Option<JointAdmission>,
-    bootstrap_receipt: Option<JointAdjustmentReceipt>,
+    domains: RootDomainBinding,
     bound: Vec<SharedDependency>,
     full: Option<Arc<[SharedDependency]>>,
-    initial_source: Option<RootPayloadInitialSource>,
+    initial_source: Option<RootDomainInitialSource>,
     payload_slot_wait: Option<JointProposalSlotWait>,
-    initial: Option<RootPayloadInitialAdmission>,
+    initial: Option<RootDomainInitialAdmission>,
     payload: Option<RetainedPayloadGrant>,
     growth: Option<RootPayloadAdmission>,
     growth_ready: Option<RootPayloadReady>,
@@ -426,7 +425,15 @@ impl ConnectorIoRequestSource for RequestCell {
             Some(body) if body.failure.is_some() => {
                 Poll::Ready(Err(error(body.failure.as_ref().unwrap())))
             }
-            Some(body) if body.grant.is_some() || body.owned_admitted => Poll::Ready(Ok(())),
+            Some(body)
+                if body.extension.is_none()
+                    && body.requested.as_ref().is_none_or(|route| {
+                        body.full.as_ref().is_some_and(|full| full.contains(route))
+                    })
+                    && (body.grant.is_some() || body.owned_admitted) =>
+            {
+                Poll::Ready(Ok(()))
+            }
             _ => Poll::Pending,
         }
     }
@@ -472,15 +479,18 @@ impl ConnectorIoRequestSource for RequestCell {
     }
 }
 impl MetadataIoAdmission {
-    pub(super) const fn request_metadata_bytes() -> u64 {
+    pub(crate) const fn request_metadata_bytes() -> u64 {
         std::mem::size_of::<CellBody>() as u64
     }
-    pub(super) fn new(
+    pub(crate) fn new(
         root: WorkScope,
         profile: ConnectorMetadataMaintenanceIoProfile,
         source_metadata_bytes: u64,
     ) -> Result<Arc<Self>, WorkError> {
         let k = root.joint_dependency_limit()?;
+        // Mark the original root before preparation creates any long-lived
+        // claims. This observer alone grants neither D nor physical capacity.
+        let domains = root.prepare_root_domains()?;
         let wake = Arc::new(MetadataWake::new());
         let mut cells = Vec::new();
         cells
@@ -508,8 +518,7 @@ impl MetadataIoAdmission {
                 profile,
                 source_metadata_bytes,
                 k,
-                bootstrap: None,
-                bootstrap_receipt: None,
+                domains,
                 bound,
                 full: None,
                 initial_source: None,
@@ -534,7 +543,7 @@ impl MetadataIoAdmission {
     }
     /// Actual Source containers plus all finite loan/fence/fact replacement scratch.
     /// This is owned first-party backing, not a recursive SDK/allocator/RSS quote.
-    pub(super) fn fixed_backing_bytes(n: usize, k: usize) -> Result<u64, WorkError> {
+    pub(crate) fn fixed_backing_bytes(n: usize, k: usize) -> Result<u64, WorkError> {
         let arc = std::mem::size_of::<[usize; 2]>();
         let mutex_external = if cfg!(target_os = "macos") {
             128usize
@@ -590,21 +599,21 @@ impl MetadataIoAdmission {
         CleanupReceipt::accept_in(&self.cleanup, completion);
         true
     }
-    pub(super) fn cleanup_failure(&self) -> Option<ConnectorError> {
+    pub(crate) fn cleanup_failure(&self) -> Option<ConnectorError> {
         self.cleanup
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .first
             .clone()
     }
-    pub(super) fn failure(&self) -> Option<WorkError> {
+    pub(crate) fn failure(&self) -> Option<WorkError> {
         self.original
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
             .and_then(|b| b.failure.clone())
     }
-    pub(super) fn health_failure(
+    pub(crate) fn health_failure(
         self: &Arc<Self>,
     ) -> Option<novarocks_query_application::api::StatementNativeHealthFailure> {
         if self
@@ -647,9 +656,22 @@ impl MetadataIoAdmission {
         }
         None
     }
-    pub(super) fn poll_progress(
+    pub(crate) fn poll_progress(
         &self,
         owner: &WorkOwner,
+        cx: &mut Context<'_>,
+    ) -> Result<bool, WorkError> {
+        self.poll_with_original_owner(Some(owner), cx)
+    }
+    /// Only the same already-positive Root Source may continue after its owner
+    /// moved into a stable statement/protocol receiver. Initial construction
+    /// still requires that actual owner; aliases cannot enable this method.
+    pub(crate) fn poll_continuing(&self, cx: &mut Context<'_>) -> Result<bool, WorkError> {
+        self.poll_with_original_owner(None, cx)
+    }
+    fn poll_with_original_owner(
+        &self,
+        owner: Option<&WorkOwner>,
         cx: &mut Context<'_>,
     ) -> Result<bool, WorkError> {
         self.wake.register(cx.waker());
@@ -693,37 +715,16 @@ impl MetadataIoAdmission {
     }
     fn progress(
         body: &mut Body,
-        owner: &WorkOwner,
+        owner: Option<&WorkOwner>,
         cx: &mut Context<'_>,
     ) -> Result<bool, WorkError> {
         if !body.started {
+            let owner = owner.ok_or(WorkError::NotReady)?;
+            if !owner.is_for_scope(&body.root) {
+                return Err(WorkError::ForeignAuthority);
+            }
             if let Some(error) = &body.failure {
                 return Err(error.clone());
-            }
-            if body.bootstrap.is_none() && body.bootstrap_receipt.is_none() {
-                let mut p = body.root.begin_control_binding()?;
-                for fact in body.profile.initial_dependencies() {
-                    p.push_dependency(fact)?;
-                }
-                p.end_change()?;
-                body.bootstrap = Some(p.submit().map_err(|e| e.error)?);
-            }
-            if body.bootstrap_receipt.is_none() {
-                let batch = match Pin::new(body.bootstrap.as_mut().unwrap()).poll(cx) {
-                    Poll::Pending => return Ok(false),
-                    Poll::Ready(r) => r.map_err(|e| e.error)?,
-                };
-                if !batch.new_claims.is_empty() {
-                    return Err(WorkError::Conflict);
-                }
-                body.bootstrap_receipt = batch.adjustment;
-                let notice = body
-                    .bootstrap_receipt
-                    .as_mut()
-                    .ok_or(WorkError::Conflict)?
-                    .install_control_scope_in(&body.root)?;
-                body.changed = true;
-                notice.notify();
             }
             if body.initial.is_none() {
                 if let Some(wait) = body.payload_slot_wait.as_mut() {
@@ -734,7 +735,10 @@ impl MetadataIoAdmission {
                     }
                 }
                 if body.initial_source.is_none() {
-                    body.initial_source = Some(owner.root_payload_initial_source()?);
+                    body.initial_source = Some(
+                        body.domains
+                            .initial_payload_source(&body.root, JointLane::Custody)?,
+                    );
                 }
                 let bytes = body.source_metadata_bytes;
                 match body
@@ -747,7 +751,12 @@ impl MetadataIoAdmission {
                     )
                     .map_err(|failure| failure.error)?
                 {
-                    JointTryBegin::Started(admission) => body.initial = Some(admission),
+                    JointTryBegin::Started(mut proposal) => {
+                        for fact in body.profile.initial_dependencies() {
+                            proposal.push_dependency(fact)?;
+                        }
+                        body.initial = Some(proposal.submit().map_err(|failure| failure.error)?);
+                    }
                     JointTryBegin::Full(mut wait) => {
                         match Pin::new(&mut wait).poll(cx) {
                             Poll::Pending => body.payload_slot_wait = Some(wait),
@@ -838,12 +847,7 @@ impl MetadataIoAdmission {
             }
         }
         if let Some(ready) = body.growth_ready.as_mut() {
-            let active: Vec<_> = cells
-                .iter()
-                .filter_map(|c| c.body.as_ref().unwrap().grant.as_ref())
-                .collect();
-            let result = ready.install_in(&body.root, body.payload.as_ref().unwrap(), &active);
-            drop(active);
+            let result = ready.install_domains_in(&body.root, body.payload.as_ref().unwrap());
             let notice = match result {
                 Ok(notice) => notice,
                 Err(error) => {
@@ -870,9 +874,13 @@ impl MetadataIoAdmission {
             }
             for cell in &mut cells {
                 let cell = cell.body.as_mut().unwrap();
-                if cell.grant.is_some() {
+                if cell.grant.is_some() || cell.owned_admitted {
                     cell.full = body.full.clone();
-                    cell.extension = None;
+                    if cell.extension.as_ref().is_some_and(|route| {
+                        body.full.as_ref().is_some_and(|full| full.contains(route))
+                    }) {
+                        cell.extension = None;
+                    }
                 }
             }
             body.growth.take();
@@ -914,7 +922,14 @@ impl MetadataIoAdmission {
                 .map_err(|_| WorkError::Conflict)?;
             let bytes = required.saturating_sub(capacity);
             if required != 0 && bytes == 0 {
-                cells[i].body.as_mut().unwrap().owned_admitted = true;
+                let cell = cells[i].body.as_mut().unwrap();
+                cell.owned_admitted = true;
+                cell.full = body.full.clone();
+                if cell.extension.as_ref().is_some_and(|route| {
+                    body.full.as_ref().is_some_and(|full| full.contains(route))
+                }) {
+                    cell.extension = None;
+                }
                 body.changed = true;
             }
             if route.is_some() || bytes != 0 {
@@ -929,10 +944,6 @@ impl MetadataIoAdmission {
                         drop(source.source.take());
                     }
                 }
-                let active: Vec<_> = cells
-                    .iter()
-                    .filter_map(|c| c.body.as_ref().unwrap().grant.as_ref())
-                    .collect();
                 let lane = if body.settlement {
                     JointLane::Settlement
                 } else {
@@ -943,7 +954,7 @@ impl MetadataIoAdmission {
                         .payload
                         .as_ref()
                         .unwrap()
-                        .root_payload_source(&body.root, lane, &active)?;
+                        .root_domain_source(&body.root, lane)?;
                     match source.try_begin(bytes)? {
                         JointTryBegin::Started(mut proposal) => {
                             if let Some(route) = route.as_ref() {
@@ -1027,7 +1038,15 @@ impl MetadataIoAdmission {
                     }
                 }
                 if cell.source.is_none() {
-                    match owner.async_action_source(lane) {
+                    // Capture from the original positive Root payload. The
+                    // exact original Root/epoch/full D/lane are authenticated
+                    // both here and by the original joint proof at dispatch.
+                    match body
+                        .payload
+                        .as_ref()
+                        .ok_or(WorkError::NotReady)?
+                        .async_continuation_source(&body.root, lane)
+                    {
                         Ok(source) => cell.source = Some(source),
                         Err(error) => {
                             cell.failure = Some(error.clone());
@@ -1098,12 +1117,84 @@ impl MetadataIoAdmission {
         }
         Ok(body.first_ready)
     }
-    pub(super) fn poll_quiescent(
+    /// Borrow the original Root payload; this neither exposes a raw claim nor
+    /// creates a second budget. The caller owns the original direct stage.
+    pub(crate) fn root_stage_source(
+        &self,
+        stage: &WorkOwner,
+    ) -> Result<novarocks_workload_control::joint_admission::RootStageSource, WorkError> {
+        let mut original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let body = original.body.as_mut().ok_or(WorkError::Released)?;
+        body.payload
+            .as_ref()
+            .ok_or(WorkError::NotReady)?
+            .root_stage_source(&body.root, stage)
+    }
+
+    pub(crate) fn install_stage_in(
+        &self,
+        ready: &mut novarocks_workload_control::joint_admission::RootStageReady,
+        stage: &WorkOwner,
+        target: &mut Option<novarocks_workload_control::joint_admission::InternalComputationGrant>,
+    ) -> Result<novarocks_workload_control::WorkloadProgressNotification, WorkError> {
+        let mut original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let body = original.body.as_mut().ok_or(WorkError::Released)?;
+        ready.install_in(
+            &body.root,
+            body.payload.as_ref().ok_or(WorkError::NotReady)?,
+            stage,
+            target,
+        )
+    }
+
+    pub(crate) fn stage_capacity(
+        &self,
+        stage: &WorkOwner,
+        compute: &novarocks_workload_control::joint_admission::InternalComputationGrant,
+    ) -> Result<
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        WorkError,
+    > {
+        let mut original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let body = original.body.as_mut().ok_or(WorkError::Released)?;
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::from_internal_computation(
+            &body.root, stage, body.payload.as_ref().ok_or(WorkError::NotReady)?, compute)
+    }
+
+    pub(crate) fn install_client_stage_capacity_in(
+        &self,
+        window: &novarocks_workload_control::ResultWindowAlias,
+        stage: &WorkOwner,
+        compute: &mut Option<novarocks_workload_control::joint_admission::InternalComputationGrant>,
+        target: &mut Option<
+            novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        >,
+    ) -> Result<(), WorkError> {
+        let mut original = loan(&self.original).ok_or(WorkError::Conflict)?;
+        let body = original.body.as_mut().ok_or(WorkError::Released)?;
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::from_owned_client_computation_in(
+            &body.root, stage, window, body.payload.as_ref().ok_or(WorkError::NotReady)?, compute, target,
+        )
+    }
+    pub(crate) fn poll_quiescent(
         &self,
         owner: &WorkOwner,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), WorkError>> {
-        if let Err(error) = self.poll_progress(owner, cx) {
+        self.poll_quiescent_with_owner(Some(owner), cx)
+    }
+    pub(crate) fn poll_quiescent_continuing(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), WorkError>> {
+        self.poll_quiescent_with_owner(None, cx)
+    }
+    fn poll_quiescent_with_owner(
+        &self,
+        owner: Option<&WorkOwner>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), WorkError>> {
+        if let Err(error) = self.poll_with_original_owner(owner, cx) {
             return Poll::Ready(Err(error));
         }
         let Some(mut original) = loan(&self.original) else {
@@ -1208,6 +1299,41 @@ impl MetadataIoAdmission {
     }
 }
 impl ConnectorIoAdmissionPort for MetadataIoAdmission {
+    fn configure_read_source(
+        &self,
+        profile: &ConnectorMetadataMaintenanceIoProfile,
+    ) -> Result<(), ConnectorError> {
+        let original = self.original.lock().unwrap_or_else(|p| p.into_inner());
+        let body = original.as_ref().ok_or_else(busy)?;
+        let actual = profile.geometry();
+        let sealed = body.profile.geometry();
+        if actual.max_concurrent_io() > sealed.max_concurrent_io()
+            || actual.metadata_bytes() > sealed.metadata_bytes()
+            || actual.initial_owned_bytes() > sealed.initial_owned_bytes()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "read factory exceeds its sealed I/O geometry",
+            ));
+        }
+        Ok(())
+    }
+    fn poll_read_source_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+        self.wake.register(cx.waker());
+        let original = self.original.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(body) = original.as_ref() else {
+            return Poll::Pending;
+        };
+        if let Some(failure) = &body.failure {
+            return Poll::Ready(Err(error(failure)));
+        }
+        if body.first_ready {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+
     fn request(&self, dependency: SharedDependency) -> Result<ConnectorIoRequest, ConnectorError> {
         self.request_in(Some(dependency), None)
     }
@@ -1286,6 +1412,11 @@ mod original_governor_tests {
     // Finite single-class/single-LocalHost component policy only. This creates
     // the actual WC substrate, not a Native or external-fault protection token.
     fn original_governor() -> (WorkloadControl, JointProgressDriver, RootWork) {
+        original_governor_with_domains(1)
+    }
+    fn original_governor_with_domains(
+        k: usize,
+    ) -> (WorkloadControl, JointProgressDriver, RootWork) {
         let count = 8;
         let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], count - 1, 2, &[]);
         let mut config = JointCapacityConfig {
@@ -1293,8 +1424,8 @@ mod original_governor_tests {
             classes: [JointResourceLimits::default(); 5],
             lanes: [JointResourceLimits::default(); 3],
             class_lanes: [[JointResourceLimits::default(); 3]; 5],
-            max_dependencies_per_claim: 1,
-            max_registered_dependencies: 1,
+            max_dependencies_per_claim: k,
+            max_registered_dependencies: k,
             max_claims: 64,
             max_requests: 32,
             max_changes_per_request: 10,
@@ -1408,6 +1539,177 @@ mod original_governor_tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn reused_bootstrap_grant_cannot_dispatch_a_new_route_before_full_domain_install() {
+        let (control, mut driver, root) = original_governor_with_domains(2);
+        let source_bytes = MetadataIoAdmission::fixed_backing_bytes(2, 2).unwrap();
+        let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU64::new(source_bytes).unwrap(),
+            NonZeroU64::new(128).unwrap(),
+            vec![SharedDependency::LocalHost],
+        )
+        .unwrap();
+        let source = MetadataIoAdmission::new(root.owner.scope(), profile, source_bytes).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut ready = false;
+        for _ in 0..256 {
+            ready = source.poll_progress(&root.owner, &mut cx).unwrap();
+            if ready {
+                break;
+            }
+            drive_original(&mut driver);
+        }
+        assert!(ready);
+        let route = SharedDependency::Network(
+            novarocks_resource_contract::NetworkServiceOrigin::from_selected_url(
+                &url::Url::parse("https://new-vended-fe-fs.invalid").unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut request = Box::pin(source.request(route.clone()).unwrap().admitted());
+        assert!(
+            request.as_mut().poll(&mut cx).is_pending(),
+            "a real existing bootstrap grant does not authorize the newly requested service"
+        );
+        source.poll_progress(&root.owner, &mut cx).unwrap();
+        assert!(
+            request.as_mut().poll(&mut cx).is_pending(),
+            "queued proof is not dispatch permission"
+        );
+        let mut permit = None;
+        for _ in 0..256 {
+            drive_original(&mut driver);
+            source.poll_progress(&root.owner, &mut cx).unwrap();
+            match request.as_mut().poll(&mut cx) {
+                Poll::Pending => {}
+                Poll::Ready(Ok(actual)) => {
+                    permit = Some(actual);
+                    break;
+                }
+                Poll::Ready(Err(e)) => panic!("original new route refused: {e}"),
+            }
+        }
+        assert!(permit.is_some());
+        assert_original_healthy(&source);
+        {
+            let original = source.original.lock().unwrap();
+            assert!(original.as_ref().unwrap().bound.contains(&route));
+        }
+        drop((permit, request));
+        let mut exited = false;
+        for _ in 0..256 {
+            match source.poll_quiescent(&root.owner, &mut cx) {
+                Poll::Ready(r) => {
+                    r.unwrap();
+                    exited = true;
+                    break;
+                }
+                Poll::Pending => drive_original(&mut driver),
+            }
+        }
+        assert!(exited);
+        drop(source);
+        root.business.release();
+        root.owner.complete_after_terminal_cancel_settled();
+        control.close_admission();
+        drive_original(&mut driver);
+        assert!(control.shutdown().is_ok());
+    }
+
+    #[test]
+    fn covered_owned_peak_retains_positive_domains_and_proves_each_new_route() {
+        let (control, mut driver, root) = original_governor_with_domains(2);
+        let source_bytes = MetadataIoAdmission::fixed_backing_bytes(2, 2).unwrap();
+        let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU64::new(source_bytes).unwrap(),
+            NonZeroU64::new(128).unwrap(),
+            vec![SharedDependency::LocalHost],
+        )
+        .unwrap();
+        let source = MetadataIoAdmission::new(root.owner.scope(), profile, source_bytes).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut ready = false;
+        for _ in 0..256 {
+            ready = source.poll_progress(&root.owner, &mut cx).unwrap();
+            if ready {
+                break;
+            }
+            drive_original(&mut driver);
+        }
+        assert!(ready);
+        let mut request = Box::pin(
+            source
+                .request_owned(NonZeroU64::new(64).unwrap())
+                .unwrap()
+                .admitted(),
+        );
+        assert!(request.as_mut().poll(&mut cx).is_pending());
+        source.poll_progress(&root.owner, &mut cx).unwrap();
+        let permit = match request.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(permit)) => permit,
+            _ => panic!("the already positive original payload covers this peak"),
+        };
+        {
+            let known_route = SharedDependency::LocalHost;
+            let mut known = Box::pin(permit.include_dependency(&known_route));
+            assert!(
+                matches!(known.as_mut().poll(&mut cx), Poll::Ready(Ok(()))),
+                "the peak receipt retains its actual positive full domain set"
+            );
+        }
+        let route = SharedDependency::Network(
+            novarocks_resource_contract::NetworkServiceOrigin::from_selected_url(
+                &url::Url::parse("https://owned-peak-selected-service.invalid").unwrap(),
+            )
+            .unwrap(),
+        );
+        {
+            let mut extension = Box::pin(permit.include_dependency(&route));
+            assert!(extension.as_mut().poll(&mut cx).is_pending());
+            source.poll_progress(&root.owner, &mut cx).unwrap();
+            assert!(
+                extension.as_mut().poll(&mut cx).is_pending(),
+                "queued proof is not permission"
+            );
+            let mut positive = false;
+            for _ in 0..256 {
+                drive_original(&mut driver);
+                source.poll_progress(&root.owner, &mut cx).unwrap();
+                match extension.as_mut().poll(&mut cx) {
+                    Poll::Pending => {}
+                    Poll::Ready(Ok(())) => {
+                        positive = true;
+                        break;
+                    }
+                    Poll::Ready(Err(error)) => panic!("original peak route refused: {error}"),
+                }
+            }
+            assert!(positive);
+        }
+        assert_original_healthy(&source);
+        drop((permit, request));
+        let mut exited = false;
+        for _ in 0..256 {
+            match source.poll_quiescent(&root.owner, &mut cx) {
+                Poll::Ready(result) => {
+                    result.unwrap();
+                    exited = true;
+                    break;
+                }
+                Poll::Pending => drive_original(&mut driver),
+            }
+        }
+        assert!(exited);
+        drop(source);
+        root.business.release();
+        root.owner.complete_after_terminal_cancel_settled();
+        control.close_admission();
+        drive_original(&mut driver);
+        assert!(control.shutdown().is_ok());
     }
 
     #[test]

@@ -51,6 +51,7 @@ pub(super) async fn collect_orphan_candidates(
     binding: &IcebergReadBinding,
     max_candidates: usize,
 ) -> Result<Vec<ScannedFile>, ConnectorError> {
+    super::cleanup_maintenance::iceberg_scan_gc_safety().require_scanned_object_gc()?;
     let metadata = table.metadata();
     let file_io = table.file_io();
     let location = metadata.location().trim_end_matches('/');
@@ -121,6 +122,7 @@ async fn list_files(
     older_than_ms: i64,
     max_candidates: usize,
 ) -> Result<Vec<ScannedFile>, ConnectorError> {
+    super::cleanup_maintenance::iceberg_scan_gc_safety().require_scanned_object_gc()?;
     let parsed = FsLocation::parse(location).map_err(|error| {
         unavailable(format!(
             "parse orphan cleanup location `{location}`: {error}"
@@ -278,6 +280,11 @@ async fn list_candidate_entries(
     operator: &crate::opendal::Operator,
     prefix: &str,
 ) -> Result<crate::opendal::Lister, crate::opendal::Error> {
+    super::cleanup_maintenance::iceberg_scan_gc_safety()
+        .require_scanned_object_gc()
+        .map_err(|error| {
+            crate::opendal::Error::new(crate::opendal::ErrorKind::Unsupported, error.message())
+        })?;
     // Iceberg data, manifests, and document carriers live below nested paths.
     // A one-level listing sees only directory entries and would report an
     // empty orphan manifest for an object store table.
@@ -363,50 +370,36 @@ fn canonical_containment(location: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use futures::TryStreamExt;
-
     use crate::opendal::{Operator, services::Memory};
 
     use super::{ScannedFile, collect_candidate, list_candidate_entries};
     use crate::commit::FileSet;
 
     #[tokio::test]
-    async fn orphan_listing_visits_nested_table_objects() {
-        let operator = Operator::new(Memory::default()).expect("memory operator");
-        operator
-            .write("warehouse/table/data/partition=1/file.parquet", vec![1])
+    async fn unproven_listing_rejects_before_actual_list() {
+        let base = Operator::new(Memory::default()).unwrap();
+        base.write("warehouse/table/data/partition=1/file.parquet", vec![1])
             .await
-            .expect("write data");
-        operator
-            .write(
-                "warehouse/table/metadata/scratch/nested/object.bin",
-                vec![2],
-            )
+            .unwrap();
+        base.write("warehouse/table/metadata/scratch/object.bin", vec![2])
             .await
-            .expect("write metadata object");
-        operator
-            .write("warehouse/other/data/unrelated.parquet", vec![3])
-            .await
-            .expect("write unrelated");
-
-        let mut paths = Vec::new();
+            .unwrap();
+        let calls = super::gc_io_test::GcIoCalls::default();
+        let operator = base.clone().layer(calls.clone());
         for prefix in ["warehouse/table/data/", "warehouse/table/metadata/"] {
-            let mut entries = list_candidate_entries(&operator, prefix)
+            let error = list_candidate_entries(&operator, prefix)
                 .await
-                .expect("list nested objects");
-            while let Some(entry) = entries.try_next().await.expect("next object") {
-                if !entry.metadata().is_dir() {
-                    paths.push(entry.path().to_string());
-                }
-            }
+                .err()
+                .expect("unproven scan must be refused");
+            assert_eq!(error.kind(), crate::opendal::ErrorKind::Unsupported);
         }
-        paths.sort();
+        assert_eq!(calls.counts(), (0, 0));
         assert_eq!(
-            paths,
-            [
-                "warehouse/table/data/partition=1/file.parquet",
-                "warehouse/table/metadata/scratch/nested/object.bin",
-            ]
+            base.read("warehouse/table/data/partition=1/file.parquet")
+                .await
+                .unwrap()
+                .to_bytes(),
+            bytes::Bytes::from_static(&[1])
         );
     }
 
@@ -509,5 +502,125 @@ mod tests {
             novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted
         );
         assert_eq!(selected.len(), 1);
+    }
+}
+
+#[cfg(test)]
+pub(super) mod gc_io_test {
+    use crate::opendal::{self, OperationContext, raw::*};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    #[derive(Clone, Debug, Default)]
+    pub(in crate::catalog_control) struct GcIoCalls {
+        lists: Arc<AtomicUsize>,
+        deletes: Arc<AtomicUsize>,
+    }
+    impl GcIoCalls {
+        pub(in crate::catalog_control) fn counts(&self) -> (usize, usize) {
+            (
+                self.lists.load(Ordering::SeqCst),
+                self.deletes.load(Ordering::SeqCst),
+            )
+        }
+    }
+    impl Layer for GcIoCalls {
+        fn apply_service(&self, inner: Servicer) -> Servicer {
+            Arc::new(RecordedGcAccess {
+                inner,
+                calls: self.clone(),
+            })
+        }
+    }
+    #[derive(Debug)]
+    struct RecordedGcAccess {
+        inner: Servicer,
+        calls: GcIoCalls,
+    }
+    impl Service for RecordedGcAccess {
+        type Reader = oio::Reader;
+        type Writer = oio::Writer;
+        type Lister = oio::Lister;
+        type Deleter = oio::Deleter;
+        type Copier = oio::Copier;
+        fn info(&self) -> ServiceInfo {
+            self.inner.info()
+        }
+        fn capability(&self) -> opendal::Capability {
+            self.inner.capability()
+        }
+        async fn create_dir(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpCreateDir,
+        ) -> opendal::Result<RpCreateDir> {
+            self.inner.create_dir(ctx, path, args).await
+        }
+        async fn stat(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpStat,
+        ) -> opendal::Result<RpStat> {
+            self.inner.stat(ctx, path, args).await
+        }
+        fn read(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpRead,
+        ) -> opendal::Result<Self::Reader> {
+            self.inner.read(ctx, path, args)
+        }
+        fn write(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpWrite,
+        ) -> opendal::Result<Self::Writer> {
+            self.inner.write(ctx, path, args)
+        }
+        fn delete(&self, ctx: &OperationContext) -> opendal::Result<Self::Deleter> {
+            self.calls.deletes.fetch_add(1, Ordering::SeqCst);
+            self.inner.delete(ctx)
+        }
+        fn list(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpList,
+        ) -> opendal::Result<Self::Lister> {
+            self.calls.lists.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(ctx, path, args)
+        }
+        fn copy(
+            &self,
+            ctx: &OperationContext,
+            from: &str,
+            to: &str,
+            args: OpCopy,
+            opts: OpCopier,
+        ) -> opendal::Result<Self::Copier> {
+            self.inner.copy(ctx, from, to, args, opts)
+        }
+        async fn rename(
+            &self,
+            ctx: &OperationContext,
+            from: &str,
+            to: &str,
+            args: OpRename,
+        ) -> opendal::Result<RpRename> {
+            self.inner.rename(ctx, from, to, args).await
+        }
+        async fn presign(
+            &self,
+            ctx: &OperationContext,
+            path: &str,
+            args: OpPresign,
+        ) -> opendal::Result<RpPresign> {
+            self.inner.presign(ctx, path, args).await
+        }
     }
 }

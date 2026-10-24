@@ -1016,3 +1016,22 @@ impl LogicalExecutionTestHarness {
             .expect("the test registration remains owned until finish")
     }
 }
+
+/// Build a real QA schedule for a role adapter's exact frozen fixture facts.
+/// This test-support module is absent from production composition.
+pub fn qualification_schedule(
+    execution: novarocks_types::QueryExecutionId,
+    frontend: novarocks_types::identity::FrontendProcessId,
+    eligible: &[novarocks_types::identity::BackendProcessId],
+    facts: &crate::api::ExecutionSchedulingFacts,
+) -> crate::coordination::AttemptSchedule {
+    crate::coordination::build_attempt_schedule(
+        execution,
+        frontend,
+        eligible,
+        facts,
+        #[cfg(novarocks_dev_controls)]
+        Ok(None),
+    )
+    .expect("fixture uses the original QA schedule builder")
+}

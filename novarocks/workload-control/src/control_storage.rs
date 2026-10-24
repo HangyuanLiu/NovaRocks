@@ -40,6 +40,16 @@ pub(crate) enum SlotPhase {
     Vacant,
     Free,
     Node(WorkId),
+    /// Exact resident backing selected by one paid constructor. This grants
+    /// neither a Work nor the parent's domain-bound control capacity.
+    ChildReserved {
+        parent: WorkId,
+    },
+    /// The original queued proof owns its reserved resident backing.
+    ChildQueued {
+        parent: WorkId,
+        ticket: u64,
+    },
     /// A real committed reply, not a published Work or a free slot.
     ChildGranted {
         parent: WorkId,
@@ -49,6 +59,8 @@ pub(crate) enum SlotPhase {
 }
 
 pub(crate) struct ControlSlot {
+    pub(crate) retired_root_domains:
+        Option<crate::joint_admission::ledger::root_domains::RootDomains>,
     pub(crate) cell: Option<Arc<Cancellation>>,
     pub(crate) proposals: Vec<crate::joint_admission::ledger::proposal_storage::ProposalCell>,
     pub(crate) polls: Vec<crate::role_poll::PollBacking>,
@@ -306,6 +318,7 @@ impl CancellationStorage {
             return Ok(free);
         }
         self.slots.push(ControlSlot {
+            retired_root_domains: None,
             cell: Some(cell),
             proposals: Vec::new(),
             polls: Vec::new(),
@@ -441,6 +454,22 @@ impl CancellationStorage {
         self.slots[slot.0].generation = generation;
         self.slots[slot.0].phase = SlotPhase::Node(id);
         Ok(())
+    }
+
+    /// Return an uncommitted reservation. No cancellation cell was attached,
+    /// no domain fee was installed, and no observer alias escaped this phase.
+    pub(crate) fn withdraw_child_reservation(&mut self, id: SlotId) {
+        let slot = &mut self.slots[id.0];
+        assert!(matches!(
+            slot.phase,
+            SlotPhase::ChildReserved { .. } | SlotPhase::ChildQueued { .. }
+        ));
+        assert!(slot.parent.is_none());
+        assert!(slot.next_free.is_none());
+        slot.phase = SlotPhase::Free;
+        let class = free_class_index(slot.class);
+        slot.next_free = self.free_heads[class];
+        self.free_heads[class] = Some(id);
     }
 
     pub(crate) fn retire(&mut self, id: SlotId) {

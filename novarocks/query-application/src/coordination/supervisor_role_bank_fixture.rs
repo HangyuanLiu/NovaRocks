@@ -27,6 +27,7 @@ use novarocks_workload_control::{ControlStorageConfig, PollRoleGeometry};
 type TestRoleFactory<F> = fn(WorkOwner, LogicalRoleInput) -> F;
 struct TestGovernance<F: Future> {
     control: Option<WorkloadControl>,
+    statement_source_slots: NonZeroUsize,
     // A metadata-only Option move transfers this SAME bank into the root.
     bank: std::sync::Mutex<
         Option<RolePollBank<LogicalRoleInput, F, TestRoleFactory<F>, Arc<OriginalLogicalExit>>>,
@@ -137,6 +138,11 @@ impl<F: Future> Drop for TestGovernance<F> {
 
 fn governance_empty() -> TestGovernance<impl Future<Output = Result<(), QueryExecutionError>> + Send>
 {
+    governance_with_client_compute(false)
+}
+fn governance_with_client_compute(
+    client: bool,
+) -> TestGovernance<impl Future<Output = Result<(), QueryExecutionError>> + Send> {
     // This function pointer names the SAME actual opaque async factory. Quote
     // its real M too (a pointer here, not the production zero-sized item).
     let factory: TestRoleFactory<_> = make_logical_role;
@@ -149,7 +155,7 @@ fn governance_empty() -> TestGovernance<impl Future<Output = Result<(), QueryExe
     let slots = [8usize, 3, 3, 3, 3];
     let count = slots.iter().sum::<usize>();
     let proposals_per_slot = 2;
-    let max_changes = 1;
+    let max_changes = if client { 4 } else { 1 };
     let max_dependencies = 1;
     let storage = ControlStorageConfig::new(slots, count - 1, proposals_per_slot, &roles);
     let mut config = JointCapacityConfig {
@@ -198,6 +204,50 @@ fn governance_empty() -> TestGovernance<impl Future<Output = Result<(), QueryExe
         config.class_lanes[class][0] = limit(n);
     }
     config.lanes[0] = limit(count);
+    if client {
+        // Real Root payload plus one P=1 stage; no Native network protection
+        // is asserted by this deliberately in-process finite fixture.
+        for limits in [
+            &mut config.global,
+            &mut config.classes[0],
+            &mut config.lanes[0],
+            &mut config.class_lanes[0][0],
+        ] {
+            limits.global = limits
+                .global
+                .with(JointResource::PayloadBytes, 64 * 1024 * 1024);
+            limits.per_dependency = limits
+                .per_dependency
+                .with(JointResource::PayloadBytes, 64 * 1024 * 1024);
+        }
+        let foreground = JointResourceLimits {
+            global: JointResources::ZERO
+                .with(JointResource::ClaimRecords, 4)
+                .with(JointResource::Computations, 1),
+            per_dependency: JointResources::ZERO
+                .with(JointResource::ClaimRecords, 4)
+                .with(JointResource::Computations, 1),
+            protected_progress: JointResources::ZERO,
+        };
+        config.lanes[1] = foreground;
+        config.class_lanes[0][1] = foreground;
+        for limits in [&mut config.global, &mut config.classes[0]] {
+            limits.global = limits
+                .global
+                .with(
+                    JointResource::ClaimRecords,
+                    limits.global.get(JointResource::ClaimRecords) + 4,
+                )
+                .with(JointResource::Computations, 1);
+            limits.per_dependency = limits
+                .per_dependency
+                .with(
+                    JointResource::ClaimRecords,
+                    limits.per_dependency.get(JointResource::ClaimRecords) + 4,
+                )
+                .with(JointResource::Computations, 1);
+        }
+    }
     // Every class may need its original base progress at the same time.
     // Keep the actual fixture inventories; only sum their real reservations.
     let simultaneous_progress = [
@@ -272,6 +322,7 @@ fn governance_empty() -> TestGovernance<impl Future<Output = Result<(), QueryExe
     let progress = TestProgressOwner::start(driver, control.deadline_expiry_handle());
     TestGovernance {
         control: Some(control),
+        statement_source_slots: NonZeroUsize::new(count).unwrap(),
         bank: std::sync::Mutex::new(Some(bank)),
         admission,
         progress: Some(progress),

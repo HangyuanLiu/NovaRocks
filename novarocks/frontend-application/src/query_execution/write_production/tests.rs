@@ -205,7 +205,18 @@ fn checked_writer_prefix_without_end_keeps_actual_record_and_refuses_cleanup_com
     );
     assert_eq!(session.accumulated_row_count().unwrap(), 0);
     assert_eq!(fixture.recorded.lock().unwrap().finish, 0);
-    let outcome = session.abort(request_context()).unwrap();
+    let mut call = session.prepare_abort_call(request_context()).unwrap();
+    assert!(
+        call.poll_completed(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+    );
+    assert!(
+        call.local_health_failure().is_none(),
+        "missing End is retained responsibility, not a local poll failure"
+    );
+    let mut outcome = None;
+    call.take_abort_outcome_in(&mut outcome).unwrap();
+    let outcome = outcome.unwrap().unwrap();
     assert!(matches!(
         outcome,
         ConnectorWriteAbortOutcome::KnownUncommitted {
@@ -315,4 +326,149 @@ fn terminal_decision_during_paid_registration_keeps_both_original_sources() {
     work.owner.complete();
     drive(&mut driver);
     assert!(control.snapshot().root_responsibilities == 0);
+}
+
+#[test]
+fn complete_original_end_transfers_same_union_to_abort_call_and_retires_canonical_rows() {
+    let (control, mut driver) = original_runtime();
+    let work = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let scope = work.owner.scope();
+    bind(&scope, &mut driver);
+    let fixture = fixture_with_outcome(1, 1, known_committed());
+    let session = fixture.session;
+    let (execution, plan, owner, facts) = register_original(&session, &scope, &mut driver);
+    let mut decoder = decoder(&session, execution, plan);
+    decoder
+        .apply_relay_body(
+            &crate::query_execution::write_result::tests::component_write_body(
+                commit_fragment_bytes(),
+            ),
+        )
+        .unwrap();
+    decoder.check_relay_end(2).unwrap();
+    decoder.observe_root_eof().unwrap();
+    let original = decoder.finish().unwrap();
+    let decode = session
+        .computation_decode(&[WriteTargetOrdinal::try_new(0).unwrap()])
+        .unwrap();
+    let interpreted = decode.interpret(original).unwrap();
+    let accepted = session.receiving_port().accept(interpreted).unwrap();
+    assert!(accepted.belongs_to(&session));
+    assert_eq!(owner.pending_records().unwrap(), 0);
+    assert!(owner.retains_facts(&facts).unwrap());
+    let mut call = session.prepare_abort_call(request_context()).unwrap();
+    assert_eq!(session.accumulated_row_count().unwrap(), 3);
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(call.poll_completed(&mut cx).is_ready());
+    let mut result = None;
+    call.take_abort_outcome_in(&mut result).unwrap();
+    assert!(matches!(
+        result,
+        Some(Ok(ConnectorWriteAbortOutcome::KnownUncommitted { .. }))
+    ));
+    let recorded = fixture.recorded.lock().unwrap();
+    assert_eq!(
+        recorded.abort_production,
+        Some(
+            novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::CompleteReceived
+        )
+    );
+    assert_eq!(recorded.abort_received_rows, Some(3));
+    assert_eq!(recorded.abort_received_fragments, Some(1));
+    assert_eq!(recorded.finish, 0);
+    drop(recorded);
+    assert!(
+        !owner.retains_facts(&facts).unwrap(),
+        "the original Call consumed the actual non-Unknown disposition"
+    );
+    let retired = work.owner.retirement_observer().unwrap();
+    drop((call, session, accepted));
+    work.business.release();
+    work.owner.complete();
+    drive(&mut driver);
+    assert!(retired.is_reclaimed().unwrap());
+}
+
+#[test]
+fn cancel_between_precheck_and_claim_hands_same_complete_end_to_original_abort() {
+    let (control, mut driver) = original_runtime();
+    let work = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let scope = work.owner.scope();
+    bind(&scope, &mut driver);
+    let fixture = fixture_with_outcome(1, 1, known_committed());
+    let session = fixture.session;
+    let (execution, plan, owner, facts) = register_original(&session, &scope, &mut driver);
+    let mut decoder = decoder(&session, execution, plan);
+    decoder
+        .apply_relay_body(
+            &crate::query_execution::write_result::tests::component_write_body(
+                commit_fragment_bytes(),
+            ),
+        )
+        .unwrap();
+    decoder.check_relay_end(2).unwrap();
+    decoder.observe_root_eof().unwrap();
+    let decode = session
+        .computation_decode(&[WriteTargetOrdinal::try_new(0).unwrap()])
+        .unwrap();
+    let accepted = session
+        .receiving_port()
+        .accept(decode.interpret(decoder.finish().unwrap()).unwrap())
+        .unwrap();
+    assert!(accepted.belongs_to(&session));
+    let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+    let context = ConnectorRequestContext::try_new(
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
+        stop.view(),
+        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )
+    .unwrap();
+    assert!(
+        !context.is_cancelled(),
+        "the earlier business precheck passed"
+    );
+    stop.request_stop();
+    let mut call = None;
+    let mut refusal = None;
+    session
+        .prepare_finish_or_abort_call_in(context, &mut call, &mut refusal)
+        .unwrap();
+    assert_eq!(
+        refusal.as_ref().unwrap().kind(),
+        ConnectorErrorKind::Cancelled
+    );
+    let mut call = call.unwrap();
+    assert!(
+        call.poll_completed(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+    );
+    let mut outcome = None;
+    call.take_abort_outcome_in(&mut outcome).unwrap();
+    assert!(matches!(
+        outcome,
+        Some(Ok(ConnectorWriteAbortOutcome::KnownUncommitted { .. }))
+    ));
+    let recorded = fixture.recorded.lock().unwrap();
+    assert_eq!(
+        recorded.abort_production,
+        Some(
+            novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::CompleteReceived
+        )
+    );
+    assert_eq!(recorded.abort_received_rows, Some(3));
+    assert_eq!(recorded.abort_received_fragments, Some(1));
+    assert_eq!(recorded.finish, 0);
+    drop(recorded);
+    assert!(!owner.retains_facts(&facts).unwrap());
+    let retired = work.owner.retirement_observer().unwrap();
+    drop((call, session, accepted, refusal));
+    work.business.release();
+    work.owner.complete();
+    drive(&mut driver);
+    assert!(retired.is_reclaimed().unwrap());
 }

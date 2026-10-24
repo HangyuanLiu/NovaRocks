@@ -140,9 +140,31 @@ pub enum IcebergWriteReport {
     CommitRequired(Arc<dyn IcebergInsertCommit>),
 }
 
+/// Complete original INSERT input for its registered statement action.
+/// Fields are not an authority constructor for downstream callers.
+pub struct InsertStatementInput {
+    pub(crate) command: crate::dml::insert::command::InsertCommand,
+    pub(crate) reference: crate::dml::insert::InsertTargetRef,
+    pub(crate) sql: String,
+    pub(crate) context: novarocks_query_application::admitted_query_context::RequestContext,
+    pub(crate) query_options: QueryOptions,
+    pub(crate) launcher:
+        Arc<dyn crate::query_execution::logical_execution::LogicalExecutionLauncher>,
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
+}
+
 /// Iceberg write port used by frontend-owned native INSERT orchestration.
 // Design: ADR-0021 (docs/adr/ADR-0021-native-frontend-insert-is-iceberg-only.md)
 pub trait InsertEngine: Send + Sync {
+    fn prepare_statement_action(
+        &self,
+        input: InsertStatementInput,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        String,
+    >;
+
     fn resolve_target(&self, request: ResolveInsertTarget) -> Result<ResolvedInsertTarget, String>;
 
     fn prepare_iceberg_write(
@@ -266,6 +288,16 @@ impl IcebergInsertCommit for CoreIcebergInsertCommit {
 }
 
 impl InsertEngine for DmlExecutionKernel {
+    fn prepare_statement_action(
+        &self,
+        input: InsertStatementInput,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        String,
+    > {
+        crate::query::insert_action::prepare(self.clone(), input)
+    }
+
     fn resolve_target(&self, request: ResolveInsertTarget) -> Result<ResolvedInsertTarget, String> {
         let name = ObjectName {
             parts: request.target.parts,
@@ -467,7 +499,7 @@ impl InsertEngine for DmlExecutionKernel {
 ///   type reproduces the read-side type exactly.
 /// - `write_default()` is the value a write omitting the column receives; it
 ///   projects onto the neutral catalog vocabulary variant-for-variant.
-fn insert_columns_from_connector_metadata(
+pub(crate) fn insert_columns_from_connector_metadata(
     metadata: &novarocks_spi::connector::ConnectorTableMetadata,
 ) -> Vec<ColumnDef> {
     let column_facts = metadata.planning_facts.column_facts();

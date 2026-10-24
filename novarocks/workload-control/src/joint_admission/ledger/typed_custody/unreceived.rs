@@ -169,7 +169,7 @@ fn control_facts<'a>(
         || control.amounts != cell.base
         || control.active_amounts != cell.base
         || control.facts.key != control.active_facts.key
-        || control.active_facts.dependencies.is_empty()
+        || !root_domains::has_effective_domains(state, &control.active_facts, true)
         || !control.active_facts.key.causal.is_empty()
     {
         return Err(WorkError::Conflict);

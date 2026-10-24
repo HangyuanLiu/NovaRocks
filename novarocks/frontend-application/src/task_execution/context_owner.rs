@@ -665,10 +665,10 @@ impl QueryContextOwner {
                     .expect("a checked Worker verdict has its original branch"),
             });
         }
-        Err(TaskExecutionError::DispatchRejected {
-            kind: OperationKind::QuiesceQueryContext,
-            result: ack.dispatch_result(),
-        })
+        Err(crate::task_execution::error::dispatch_rejection(
+            ack,
+            OperationKind::QuiesceQueryContext,
+        ))
     }
 
     #[cfg(test)]
@@ -876,10 +876,10 @@ impl QueryContextOwner {
         if !ack.is_applied() {
             self.fail_admission();
             let Some(_outcome) = ack.worker_outcome() else {
-                return Err(TaskExecutionError::DispatchRejected {
-                    kind: OperationKind::AcquireQueryContextAdmissionTicket,
-                    result: ack.dispatch_result(),
-                });
+                return Err(crate::task_execution::error::dispatch_rejection(
+                    ack,
+                    OperationKind::AcquireQueryContextAdmissionTicket,
+                ));
             };
             return Err(TaskExecutionError::OperationFailed {
                 context: self.context,
@@ -1052,10 +1052,10 @@ impl QueryContextOwner {
         let Some(_outcome) = ack.worker_outcome() else {
             // The admission grant may still occupy Worker capacity. Keep the
             // context open so failure cleanup issues its exact Abort.
-            return Err(TaskExecutionError::DispatchRejected {
-                kind: OperationKind::UpdateQueryContext,
-                result: ack.dispatch_result(),
-            });
+            return Err(crate::task_execution::error::dispatch_rejection(
+                ack,
+                OperationKind::UpdateQueryContext,
+            ));
         };
         self.state = QueryContextState::TerminalRetained;
         self.released = true;
@@ -1135,10 +1135,10 @@ impl QueryContextOwner {
             return if ack.dispatch_result() == OperationDispatchResult::TransportUnknown {
                 Ok(ReleaseSettlement::RetryExactRequest)
             } else {
-                Err(TaskExecutionError::DispatchRejected {
-                    kind: OperationKind::ReleaseQueryContext,
-                    result: ack.dispatch_result(),
-                })
+                Err(crate::task_execution::error::dispatch_rejection(
+                    ack,
+                    OperationKind::ReleaseQueryContext,
+                ))
             };
         };
         match outcome {
@@ -1173,10 +1173,10 @@ impl QueryContextOwner {
         if ack.worker_outcome().is_none()
             && ack.dispatch_result() != OperationDispatchResult::TransportUnknown
         {
-            return Err(TaskExecutionError::DispatchRejected {
-                kind: OperationKind::AbortQueryContext,
-                result: ack.dispatch_result(),
-            });
+            return Err(crate::task_execution::error::dispatch_rejection(
+                ack,
+                OperationKind::AbortQueryContext,
+            ));
         }
         if ack.is_applied()
             || matches!(

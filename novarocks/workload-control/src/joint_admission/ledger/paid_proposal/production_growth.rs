@@ -51,6 +51,9 @@ impl JointProposal {
         let base = self.records.len();
         for index in 0..base {
             let change = &self.records[index];
+            if root_domains::observation(change) {
+                continue;
+            }
             let Some(control) = change.source.as_ref() else {
                 continue;
             };
@@ -156,6 +159,9 @@ pub(in crate::joint_admission::ledger) fn validate_control_productions(
             .as_ref()
             .is_some_and(|source| matches!(source.source, ClaimSource::NodeControl { .. }))
     }) {
+        if root_domains::observation(control) {
+            continue;
+        }
         let ClaimSource::NodeControl { work, .. } = control.source.as_ref().unwrap().source else {
             unreachable!()
         };

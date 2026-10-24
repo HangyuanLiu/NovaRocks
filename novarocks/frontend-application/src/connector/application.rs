@@ -518,6 +518,25 @@ pub fn metadata_list_namespaces_with_planning_lease(
         .map_err(|error| error.to_string())
 }
 
+pub(crate) async fn metadata_list_namespaces_with_planning_lease_async(
+    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+    bound: novarocks_spi::connector::ConnectorListingBound,
+) -> Result<Vec<ConnectorNamespaceIdentity>, String> {
+    let instance_id = binding.binding().descriptor().instance_id.clone();
+    let context = context_for_planning_lease(&binding, context)?;
+    binding
+        .binding()
+        .metadata()
+        .list_namespaces_async(ConnectorListNamespacesRequest {
+            instance_id,
+            bound,
+            context,
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Enumerate a namespace's tables through an admission-frozen connector control
 /// lease.
 ///
@@ -544,6 +563,35 @@ pub fn metadata_list_tables_with_planning_lease(
             bound,
             context,
         })
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|identity| identity.table.to_string())
+        .collect::<Vec<_>>();
+    tables.sort();
+    tables.dedup();
+    Ok(tables)
+}
+
+pub(crate) async fn metadata_list_tables_with_planning_lease_async(
+    binding: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+    namespace: &str,
+    bound: novarocks_spi::connector::ConnectorListingBound,
+) -> Result<Vec<String>, String> {
+    let instance_id = binding.binding().descriptor().instance_id.clone();
+    let context = context_for_planning_lease(binding, context)?;
+    let mut tables = binding
+        .binding()
+        .metadata()
+        .list_tables_async(novarocks_spi::connector::ConnectorListTablesRequest {
+            namespace: novarocks_spi::connector::ConnectorNamespaceIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+            },
+            bound,
+            context,
+        })
+        .await
         .map_err(|error| error.to_string())?
         .into_iter()
         .map(|identity| identity.table.to_string())

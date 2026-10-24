@@ -39,7 +39,7 @@ use novarocks_resource_contract::SelectedNetworkOrigin;
 /// ```
 #[must_use = "Finish and submit this original proposal, or drop it"]
 pub struct ControlBindingProposal {
-    proposal: JointProposal,
+    pub(super) proposal: JointProposal,
 }
 impl ControlBindingProposal {
     pub fn push_dependency(&mut self, fact: &SharedDependency) -> Result<(), WorkError> {
@@ -77,7 +77,29 @@ impl WorkScope {
         let handle = JointAdmissionHandle {
             inner: Arc::clone(&self.inner),
         };
-        let mut proposal = handle.begin_paid_proposal_for_scope(self.clone())?;
+        self.finish_control_binding(handle.begin_paid_proposal_for_scope(self.clone())?)
+    }
+
+    /// The same restricted constructor, with a typed unacquired-Q observation.
+    /// Full has no request/body/ticket and grants no control or physical right.
+    pub fn try_begin_control_binding(
+        &self,
+    ) -> Result<JointTryBegin<ControlBindingProposal, JointProposalSlotSignal>, WorkError> {
+        let handle = JointAdmissionHandle {
+            inner: Arc::clone(&self.inner),
+        };
+        match handle.try_begin_paid_proposal_for_scope_signal(self.clone())? {
+            JointTryBegin::Full(signal) => Ok(JointTryBegin::Full(signal)),
+            JointTryBegin::Started(proposal) => self
+                .finish_control_binding(proposal)
+                .map(JointTryBegin::Started),
+        }
+    }
+
+    fn finish_control_binding(
+        &self,
+        mut proposal: JointProposal,
+    ) -> Result<ControlBindingProposal, WorkError> {
         let (source, unbound) = control_claim_view_for_scope(self, true)?;
         if unbound {
             proposal.begin_first_bind(source)?;

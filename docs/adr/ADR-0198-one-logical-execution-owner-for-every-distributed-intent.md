@@ -28,8 +28,17 @@ provenance:
 code-anchors:
   - "novarocks/query-application/src/coordination/ (logical execution owner and supervisor; migration anchor)"
   - "novarocks/frontend-application/src/task_execution/ (native attempt facts and convergence; migration anchor)"
-  - "novarocks/frontend-application/src/dml/runner.rs (statement publication orchestration; migration anchor)"
+  - "novarocks/frontend-application/src/query/statement_action.rs (registered statement action and result custody; migration anchor)"
+  - "novarocks/frontend-application/src/query/read_action.rs (Client read statement action and streaming handoff; migration anchor)"
+  - "novarocks/frontend-application/src/query/statement_computation.rs (shared Root/Stage admission, internal readiness and actual Native tail; migration anchor)"
+  - "novarocks/frontend-application/src/query/statement_publication.rs (needed-ready business facts and the same retained publication Call; migration anchor)"
+  - "novarocks/frontend-application/src/query/write_action.rs (common write family action; migration anchor)"
+  - "novarocks/frontend-application/src/query/mutation_action.rs (multi-stage mutation action; migration anchor)"
+  - "novarocks/frontend-application/src/query/ctas_action.rs (staged CREATE and final catalog publication; migration anchor)"
+  - "novarocks/frontend-application/src/dml/runner.rs (legacy synchronous runner still present; retirement pending)"
   - "novarocks/frontend-application/src/query_execution/write_session.rs (provider session and retained access; migration anchor)"
+  - "novarocks/frontend-application/src/query_execution/write_session/publication_call.rs (original Provider Future, needed-ready receiving and actual exit; migration anchor)"
+  - "novarocks/spi/src/connector/write_stack/session.rs (canonical needed-ready and separate cleanup completion; migration anchor)"
   - "novarocks/query-application/src/api/result.rs (statement result projection; migration anchor)"
   - "novarocks/spi/src/connector/write_stack/writer.rs (writer seal and deletion authority; migration anchor)"
   - "novarocks/connector/iceberg/src/commit/operation.rs (operation-owned artifacts and actual I/O exit; migration anchor)"
@@ -44,6 +53,8 @@ code-anchors:
 ## 背景与执行事实
 
 本条记录已接受的目标契约；代码切换与原生验证尚待完成。上列锚点是已有迁移入口，集成时须核对最终模块和承重注释，不能用本条的 active 状态证明实现或测试通过。
+
+当前源码已有普通 Read 与 Internal 写入的 governed Action 接缝；旧 `coordinator/**`、同步 runner 与旧调用面仍须逐项退役。新入口存在、局部检查通过和所有生产调用面完成迁移是不同事实；本条保持 implementation pending，不能据这些入口宣称删旧或原生验收完成。
 
 | 责任 | 唯一 owner | 不拥有的权力 |
 |---|---|---|
@@ -86,6 +97,8 @@ code-anchors:
 内部消费者先完成 End 解码，再组合领域 proof 与准确 attempt 的协议事实。写入需完整 prepared set、冻结 writer 的成功相容终态、root 完成和没有已选失败；不能仅凭 EOF，也不要求所有无关参与者的清理都完成。接收方保管已预留时才能接受一次 `ComputationReady`，冻结计算事实、关闭恢复并交接 payload；领域可立即推进提交，不等 Native 资源收敛。
 
 统计另要求全部任务成功、统计域 finished 和收尾解码完成；COW 匹配要求根封口接受、选择集 End 和无挂起解码。领域证明绑定 execution、activation、冻结输入/输出与真实结果，只能交接一次。
+
+普通 Read 与 Internal 计算共用原 Root/Stage 的准入与真实退出边界，但 Read 保留 Client 结果窗口和原流式 handle；不能用 Internal 窗口替换客户端结果容量，也不能把内部计算就绪投成客户端成功 EOF。计算位置按实际本地 CPU/交接证明归还，原 Native 退出观察和残余责任继续由同 owner 保管；不能为了继续下一段而丢弃观察者。
 
 写入、COW 匹配、统计当前使用 NoRecovery；这是支持范围，不是这些语句族永久不能恢复。Profile 在计算就绪前可按冻结语义恢复可恢复的基础设施故障，替换时丢弃旧消费者和诊断；就绪后不再恢复。普通读保留可见性与成功 EOS 的既有顺序，不能提前向客户端发成功 EOF。
 
@@ -130,11 +143,19 @@ FE 的未接收责任记录不能虚构完整清单的内存占用，各中间�
 
 凭据保管随实际业务 holder 延续：begin 使用已准入收集器和 retained generation 的准确 catalog properties，保持原 stop/deadline；终结阶段不向已冻结 descriptor 集补项。publication/安全清理仍需的 vended storage 与访问 resolver 不能因原计算或提交终态而提前释放。
 
+CTAS 的 staged seal 与最终 catalog CREATE 是两个实际阶段。后续绑定借用同一份 seal receipt，只有必要 finalization 为 Complete 才能据此继续最终 publication；seal 的 KnownCommitted/NoOp 不制造 catalog 已发布事实。必要 finalization 失败时保留已观察事实并拒绝下一步，不能靠复制或重造 receipt 绕过该屏障。
+
 seal 后零输出、只到前缀或缺 End 都不能 Ready。若 publication 没有派发，可以同时成立 KnownUncommitted 与产物回收未决/清单不完整；不能改成 CommitUnknown，也不能因 session 内存释放而报 cleanup Complete。缺清单时不猜路径删除，保留有界责任并在该故障域额度耗尽时拒绝新工作。跨 FE/BE 崩溃可能失去进程内清单，本条不承诺确定回收或无孤儿。
 
 ### 6. 必要 finalize 与可延后维护
 
 先区分三类工作：正确性屏障（撤销旧删除权、保护提交引用）；领域必要步骤（如 staged CREATE 的可见发布或业务必须的附着）；可延后维护（已证明安全的 GC、非必要诊断）。前两类未完成时不能宣布相应业务成功；第三类失败不改变成功，但须交接原对象、权限、凭据/访问能力、有限容量和真实退出观察，保留失败记录。
+
+Provider 的必要业务事实与安全 GC 使用两个本地端口。`ConnectorWriteNeededReady` 保有实际 effect、原 receipt 与必要 finalization 的结论；finalization 仍可能是 Failed，所以这个事实不单独代表语句成功。它与最终 completion 共享同一 canonical Arc，不深复制 receipt 的可变 backing 或完整失败 cause，也不生成第二份 journal。尚未运行的 GC 明确为 Pending，不能投成 Complete 或占位 Failed。
+
+原 publication Future 在 typed 事实进入稳定接收格后让出，接收方先保留同一事实，再静默开放同一 Future 的清理许可，最后在锁外通知。安全 GC 继续由原 Call/残留、同 operation/journal/lease 和访问能力驱动；等待方失败或取消时，关闭路径也保留原事实并续接清理，不能因无人接成功结果而遗失义务。唯一的 exact 正面裁定也通过同一必要业务事实端口，不重新派发 publication。
+
+NeededReady、原 Future 的真实 poll/Drop 退出和精确库存 Disposed 是不同证明。poll/Drop 或通知 panic 后，已存事实仍可观察，但不能据此重入动作或归还未证实退出的责任。Observed 只记录原清理作者的实际结论，包括有证据的无清理义务与失败，不以等待结束代替；正常已提交且精确库存已处置时可释放该责任，历史清理诊断不反推仍有对象，业务 receipt 也不反推库存已处置。
 
 operation-owned cleanup 仅删除 ledger 内精确归属且已证明不再使用的对象。Unknown 对象不得删除；未接收完整产物与 publication Unknown 是不同未决事实，都不能由本地 release 推导全量回收。具名子责任转交可使该子责任退出，接收方仍承担未决义务。
 

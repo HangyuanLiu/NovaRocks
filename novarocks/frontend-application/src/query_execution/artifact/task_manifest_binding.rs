@@ -405,6 +405,88 @@ impl std::fmt::Debug for TaskManifestBinding {
 }
 
 impl TaskManifestBinding {
+    /// Reentry uses the exact original placement without allocating a second
+    /// graph or accepting execution/process identity as a substitute for it.
+    pub(crate) fn validate_schedule(
+        &self,
+        schedule: &AttemptSchedule,
+    ) -> Result<(), DistributedQueryError> {
+        let same =
+            self.execution == schedule.execution()
+                && self.root == schedule.root()
+                && self
+                    .contexts
+                    .iter()
+                    .map(|context| context.context())
+                    .eq(schedule.contexts().iter().copied())
+                && self.tasks.len()
+                    == schedule
+                        .fragments()
+                        .iter()
+                        .map(|fragment| fragment.tasks().len())
+                        .sum::<usize>()
+                && self
+                    .tasks
+                    .iter()
+                    .zip(schedule.fragments().iter().flat_map(|fragment| {
+                        fragment.tasks().iter().map(move |task| (fragment, task))
+                    }))
+                    .all(|(bound, (fragment, task))| {
+                        bound.fragment_id == fragment.fragment_id()
+                            && bound.identity.stage_id() == fragment.stage_id()
+                            && bound.identity == task.identity()
+                            && bound.context == task.context()
+                            && bound.instance_index == task.instance_index()
+                            && bound.scan_work.len() == task.scan_work().len()
+                            && bound
+                                .scan_work
+                                .iter()
+                                .zip(task.scan_work())
+                                .all(|(old, new)| {
+                                    let assignment = match new.assignment() {
+                                        ScheduledScanAssignment::RuntimeSplits => {
+                                            BoundManifestScanAssignment::RuntimeSplits
+                                        }
+                                        ScheduledScanAssignment::FrozenUnits { units } => {
+                                            BoundManifestScanAssignment::FrozenUnits(
+                                                BoundManifestFrozenUnits::from_scheduled(*units),
+                                            )
+                                        }
+                                    };
+                                    old.scan == new.scan() && old.assignment == assignment
+                                })
+                    })
+                && self.edges.len() == schedule.edges().len()
+                && self.edges.iter().zip(schedule.edges()).all(|(old, new)| {
+                    old.edge_id == new.edge_id()
+                        && old.source_fragment_id == new.source_fragment_id()
+                        && old.target_fragment_id == new.target_fragment_id()
+                        && old.target_exchange_node_id == new.target_exchange_node_id()
+                        && old.sender_count == new.sender_count()
+                        && old.destinations.as_ref() == new.destinations()
+                        && old.producers.len() == new.producers().len()
+                        && old.producers.iter().zip(new.producers()).all(|(old, new)| {
+                            old.task == new.task() && old.sender_ordinal == new.sender_ordinal()
+                        })
+                });
+        if same {
+            Ok(())
+        } else {
+            Err(contract_error(
+                "qualification reentry changed the original bound schedule",
+            ))
+        }
+    }
+
+    #[cfg(all(test, novarocks_dev_controls))]
+    pub(crate) fn qualification_fixture_for_test(
+        execution: QueryExecutionId,
+        processes: &[BackendProcessId; 3],
+        selected: usize,
+    ) -> (Self, AttemptSchedule) {
+        tests::qualification_fixture(execution, processes, selected)
+    }
+
     #[cfg(test)]
     pub(crate) fn original_writer_occurrences_for_test() -> Vec<BoundWriterCohort> {
         tests::original_writer_occurrences()
@@ -2689,5 +2771,61 @@ mod tests {
             assert_eq!(facts, expected);
         }
         // No Native open/activation, split source, client, DNS, socket or task.
+    }
+    #[cfg(novarocks_dev_controls)]
+    pub(super) fn qualification_fixture(
+        execution: QueryExecutionId,
+        processes: &[BackendProcessId; 3],
+        selected: usize,
+    ) -> (super::TaskManifestBinding, super::AttemptSchedule) {
+        let targets = processes
+            .iter()
+            .enumerate()
+            .map(|(index, &process)| {
+                full_bind_supported(live_target(index, process, 19010 + index as u16))
+            })
+            .collect();
+        let topology =
+            FrozenAttemptTopology::capture(BackendTopologySnapshot::try_new(91, targets).unwrap())
+                .unwrap();
+        let template = full_bind_native_template(execution, FullBindPurpose::ClientRows);
+        let facts = template.template.attempt_scheduling_facts().unwrap();
+        let schedule = novarocks_query_application::test_support::qualification_schedule(
+            execution,
+            FrontendProcessId::new_v7(),
+            &[processes[selected]],
+            &facts,
+        );
+        let manifest = super::TaskManifestBinding::bind(template, &schedule, topology).unwrap();
+        (manifest, schedule)
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    #[test]
+    fn qualification_reentry_accepts_same_schedule_and_rejects_same_execution_new_placement() {
+        let processes = [
+            BackendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        ];
+        let execution = execution();
+        let (manifest, original) = qualification_fixture(execution, &processes, 0);
+        manifest.validate_schedule(&original).unwrap();
+        manifest.validate_schedule(&original).unwrap();
+        let (_, changed) = qualification_fixture(execution, &processes, 1);
+        assert_eq!(original.execution(), changed.execution());
+        assert_ne!(
+            original.root().backend_process_id(),
+            changed.root().backend_process_id()
+        );
+        assert!(manifest.validate_schedule(&changed).is_err());
+        let (_, different_context) = qualification_fixture(execution, &processes, 0);
+        assert_eq!(original.root(), different_context.root());
+        assert_ne!(original.contexts(), different_context.contexts());
+        assert!(
+            manifest.validate_schedule(&different_context).is_err(),
+            "same root identity is not the same exact schedule"
+        );
+        manifest.validate_schedule(&original).unwrap();
     }
 }

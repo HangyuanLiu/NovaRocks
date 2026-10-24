@@ -69,7 +69,7 @@ impl Deref for ChangeBody {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ProposalKey {
     slot: SlotId,
     index: usize,
@@ -82,13 +82,29 @@ pub(crate) struct ProposalConstruction {
     inner: Weak<Inner>,
     owner: WorkId,
     pub(super) key: Option<ProposalKey>,
+    pub(super) reserved_child: Option<SlotId>,
+    pub(super) reserved_cohort: Vec<SlotId>,
 }
 impl Drop for ProposalConstruction {
     fn drop(&mut self) {
         let Some(key) = self.key.take() else { return };
         if let Some(inner) = self.inner.upgrade() {
             inner.update(|state| {
+                root_domains::release_construction(state, self.owner, key);
                 retire_proposal(state, key, None);
+                if let Some(slot) = self.reserved_child.take() {
+                    state.cancellations.withdraw_child_reservation(slot);
+                }
+                if !self.reserved_cohort.is_empty() {
+                    let parent = state.nodes[&self.owner].cancellation;
+                    state
+                        .cancellations
+                        .cell(parent)
+                        .release_fixed_children(self.reserved_cohort.len());
+                }
+                for slot in self.reserved_cohort.drain(..) {
+                    state.cancellations.withdraw_child_reservation(slot);
+                }
                 state.nodes.get_mut(&self.owner).unwrap().resource_waiters -= 1;
                 state.collect(self.owner);
             });
@@ -103,8 +119,15 @@ pub enum JointTryBegin<T, W = JointProposalSlotWait> {
     Full(W),
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProposalWaitReason {
+    Slot,
+    RootWriter(JointLane),
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct ProposalSlotWaitTarget {
+    reason: ProposalWaitReason,
     owner: WorkId,
     slot: SlotId,
     generation: u64,
@@ -136,6 +159,7 @@ impl JointProposalSlotSignal {
             && self.target.owner == other.target.owner
             && self.target.slot == other.target.slot
             && self.target.generation == other.target.generation
+            && self.target.reason == other.target.reason
     }
 }
 
@@ -203,10 +227,25 @@ async fn wait_proposal_slot(
             {
                 return Err(WorkError::Released);
             }
-            slot.proposals
-                .iter()
-                .any(|cell| cell.phase == ProposalPhase::Free)
-                || inner.capture_progress(&state) != target.marker
+            match target.reason {
+                ProposalWaitReason::Slot => {
+                    slot.proposals
+                        .iter()
+                        .any(|cell| cell.phase == ProposalPhase::Free)
+                        || inner.capture_progress(&state) != target.marker
+                }
+                ProposalWaitReason::RootWriter(lane) => {
+                    if lane != JointLane::Settlement {
+                        node.check(&state.cancellations)?;
+                        if state.closed {
+                            return Err(WorkError::Closed);
+                        }
+                    }
+                    let domains = node.root_domains.as_ref().ok_or(WorkError::Conflict)?;
+                    // A free Q does not make a busy original Root writable.
+                    domains.construction.is_none() && domains.pending.is_none()
+                }
+            }
         };
         if reobserve {
             return Ok(());
@@ -232,6 +271,23 @@ impl JointAdmissionHandle {
         &self,
         scope: &WorkScope,
     ) -> Result<ProposalReservation, WorkError> {
+        self.try_reserve_proposal_mode(scope, None)
+    }
+
+    pub(super) fn try_reserve_root_writer(
+        &self,
+        scope: &WorkScope,
+        lane: JointLane,
+        observed: Option<u64>,
+    ) -> Result<ProposalReservation, WorkError> {
+        self.try_reserve_proposal_mode(scope, Some((lane, observed)))
+    }
+
+    fn try_reserve_proposal_mode(
+        &self,
+        scope: &WorkScope,
+        writer: Option<(JointLane, Option<u64>)>,
+    ) -> Result<ProposalReservation, WorkError> {
         if !Arc::ptr_eq(&self.inner, &scope.inner) {
             return Err(WorkError::ForeignAuthority);
         }
@@ -247,6 +303,34 @@ impl JointAdmissionHandle {
                     return Ok(ProposalReservation::Reserved(None));
                 }
                 let slot = node.cancellation;
+                if let Some((lane, observed)) = writer {
+                    if node.parent.is_some() || node.owner != crate::OwnerState::Active {
+                        return Err(WorkError::Conflict);
+                    }
+                    if lane != JointLane::Settlement {
+                        node.check(&state.cancellations)?;
+                        if state.closed {
+                            return Err(WorkError::Closed);
+                        }
+                    }
+                    let domains = node.root_domains.as_ref().ok_or(WorkError::Conflict)?;
+                    if domains.construction.is_some()
+                        || domains.pending.is_some()
+                        || observed.is_some_and(|revision| revision != domains.writer_revision)
+                    {
+                        return Ok(ProposalReservation::Full(ProposalSlotWaitTarget {
+                            reason: ProposalWaitReason::RootWriter(lane),
+                            owner: scope.id,
+                            slot,
+                            generation: state.cancellations.slots[slot.0].generation,
+                            marker: self.inner.capture_progress(&state),
+                        }));
+                    }
+                    domains
+                        .writer_revision
+                        .checked_add(1)
+                        .ok_or(WorkError::ArithmeticOverflow)?;
+                }
                 if state.cancellations.slots[slot.0].proposals.is_empty() {
                     return Err(WorkError::Capacity("fixed proposal cell geometry"));
                 }
@@ -258,6 +342,7 @@ impl JointAdmissionHandle {
                     // A failed reservation is read-only. Advancing/notifying
                     // here would wake this constructor on its own Full result.
                     return Ok(ProposalReservation::Full(ProposalSlotWaitTarget {
+                        reason: ProposalWaitReason::Slot,
                         owner: scope.id,
                         slot,
                         generation: state.cancellations.slots[slot.0].generation,
@@ -276,10 +361,21 @@ impl JointAdmissionHandle {
                     .ok_or(WorkError::ArithmeticOverflow)?;
                 cell.generation = generation;
                 cell.phase = ProposalPhase::Building;
-                state.nodes.get_mut(&scope.id).unwrap().resource_waiters = waiters;
+                let key = ProposalKey {
+                    slot,
+                    index,
+                    generation,
+                };
+                let node = state.nodes.get_mut(&scope.id).unwrap();
+                node.resource_waiters = waiters;
+                if writer.is_some() {
+                    node.root_domains.as_mut().unwrap().construction = Some(key);
+                }
                 Ok(ProposalReservation::Reserved(Some(ProposalConstruction {
                     inner: Arc::downgrade(&self.inner),
                     owner: scope.id,
+                    reserved_child: None,
+                    reserved_cohort: Vec::new(),
                     key: Some(ProposalKey {
                         slot,
                         index,
@@ -456,3 +552,127 @@ impl DoubleEndedIterator for JointGrantedClaimsIter {
 }
 impl ExactSizeIterator for JointGrantedClaimsIter {}
 impl std::iter::FusedIterator for JointGrantedClaimsIter {}
+
+#[cfg(test)]
+mod child_reservation_tests {
+    use super::*;
+    use crate::{CancellationReason, WorkClass, WorkRequest};
+
+    fn drain(driver: &mut crate::joint_admission::JointProgressDriver) {
+        for _ in 0..10000 {
+            if matches!(
+                driver.step(),
+                crate::joint_admission::JointProgress::Idle(_)
+            ) {
+                return;
+            }
+        }
+        panic!("the original driver must reach a finite idle pass");
+    }
+
+    #[test]
+    fn exact_child_reservation_returns_on_constructor_drop_queue_drop_and_cancel() {
+        let (control, handle, mut driver) =
+            crate::scope::fixed_control_storage_tests::prototype_profile(3, 1, 1, 1);
+        {
+            let dependency = handle
+                .register_dependency(novarocks_resource_contract::SharedDependency::Network(
+                    novarocks_resource_contract::NetworkServiceOrigin::from_selected_url(
+                        &url::Url::parse("https://original.example").unwrap(),
+                    )
+                    .unwrap(),
+                ))
+                .unwrap();
+            let parent = control
+                .try_begin_root(WorkRequest::new(WorkClass::Query))
+                .unwrap();
+            let scope = parent.owner.scope();
+            let mut binding = handle
+                .request(
+                    &scope,
+                    vec![JointClaimChange::FirstBind {
+                        source: parent.owner.control_claim_view().unwrap(),
+                        dependencies: vec![dependency],
+                    }],
+                )
+                .unwrap();
+            drain(&mut driver);
+            let Poll::Ready(Ok(batch)) =
+                Pin::new(&mut binding).poll(&mut Context::from_waker(Waker::noop()))
+            else {
+                panic!("the real first-binding proof must complete");
+            };
+            batch
+                .adjustment
+                .unwrap()
+                .install_control(&parent.owner, &[])
+                .unwrap();
+            drain(&mut driver);
+            let head = control.inner.state.lock().unwrap().cancellations.free_heads[0].unwrap();
+            let before = control
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .joint
+                .as_ref()
+                .unwrap()
+                .control_snapshot_for_test();
+            let prepared = handle.prepare_child(&scope, None).unwrap();
+            {
+                let state = control.inner.state.lock().unwrap();
+                assert_eq!(
+                    state.cancellations.slots[head.0].phase,
+                    SlotPhase::ChildReserved { parent: scope.id }
+                );
+                assert_eq!(state.nodes.len(), 1);
+                assert_eq!(
+                    state.joint.as_ref().unwrap().control_snapshot_for_test(),
+                    before
+                );
+            }
+            drop(prepared);
+            assert_eq!(
+                control.inner.state.lock().unwrap().cancellations.free_heads[0],
+                Some(head)
+            );
+            drain(&mut driver);
+            let queued = handle
+                .request_child(&parent.owner, WorkRequest::new(WorkClass::Query))
+                .unwrap();
+            {
+                let state = control.inner.state.lock().unwrap();
+                assert!(matches!(state.cancellations.slots[head.0].phase,
+                    SlotPhase::ChildQueued { parent: owner, .. } if owner == scope.id));
+            }
+            drop(queued);
+            assert_eq!(
+                control.inner.state.lock().unwrap().cancellations.free_heads[0],
+                Some(head)
+            );
+            drain(&mut driver);
+            let mut cancelled = handle
+                .request_child(&parent.owner, WorkRequest::new(WorkClass::Query))
+                .unwrap();
+            parent.owner.cancel(CancellationReason::Requested);
+            drain(&mut driver);
+            // A refused proof has no real child payload or observer to retain.
+            assert_eq!(
+                control.inner.state.lock().unwrap().cancellations.free_heads[0],
+                Some(head)
+            );
+            assert!(matches!(
+                Pin::new(&mut cancelled).poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Err(JointAdmissionFailure {
+                    error: WorkError::Cancelled(_)
+                }))
+            ));
+            parent.business.release();
+            parent.owner.complete_after_terminal_cancel_settled();
+        }
+        drain(&mut driver);
+        control.close_admission();
+        drain(&mut driver);
+        assert!(control.shutdown().is_ok());
+    }
+}

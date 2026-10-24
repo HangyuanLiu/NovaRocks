@@ -21,6 +21,7 @@
 use super::{
     ledger::{
         ProfileFacts, ProfileKey, ProfileRecord, RequestPhase, fail_request, grant_request,
+        root_domains::{FactCapture, RootDomainChange},
         validate_waiting,
     },
     protection::{
@@ -84,7 +85,16 @@ enum Preparation {
     Profiles(usize),
     Ready,
 }
+struct SnapshotRecord {
+    facts: Arc<ProfileFacts>,
+    amounts: JointResources,
+    claims: usize,
+    affected: bool,
+}
 struct Turn {
+    root_domain: Option<RootDomainChange>,
+    snapshot_pending: Option<(ProfileRecord, bool, FactCapture)>,
+    snapshot_new: usize,
     preparation: Preparation,
     id: u64,
     owner: WorkId,
@@ -92,7 +102,7 @@ struct Turn {
     release_epoch: u64,
     layout_revision: u64,
     cursor: Option<Arc<ProfileKey>>,
-    records: Vec<ProfileRecord>,
+    records: Vec<SnapshotRecord>,
     snapshot_capacity: usize,
     pending_domain_limits: Vec<u128>,
     domains: BTreeMap<u64, usize>,
@@ -193,7 +203,7 @@ pub(super) fn metadata_backing_bytes(
     sum_bytes([
         // active: Option<Turn> already includes all Turn/ProofInput/graph headers.
         std::mem::size_of::<JointProgressDriver>(),
-        array_bytes::<ProfileRecord>(n)?,
+        array_bytes::<SnapshotRecord>(n)?,
         btree_peak_bytes::<u64, usize>(build_d)?,
         numeric,
         graph
@@ -221,7 +231,7 @@ impl JointCapacityConfig {
             .ok_or(WorkError::ArithmeticOverflow)?;
         let per_profile = COORDINATE_COUNT
             .checked_mul(16)
-            .and_then(|n| n.checked_add(std::mem::size_of::<ProfileRecord>().checked_mul(2)?))
+            .and_then(|n| n.checked_add(std::mem::size_of::<SnapshotRecord>().checked_mul(2)?))
             .and_then(|n| n.checked_add(k.checked_mul(32)?))
             .ok_or(WorkError::ArithmeticOverflow)?;
         self.max_snapshot_bytes = n
@@ -504,7 +514,7 @@ impl JointProgressDriver {
             // Parent strong references and obsolete values actually leave here,
             // outside State. Only then may the exact original claim be rekeyed.
             drop(reset);
-            {
+            let retired_root = {
                 let mut state = self.inner.state.lock().unwrap();
                 let slot = &state.cancellations.slots[id.0];
                 assert_eq!(slot.phase, SlotPhase::Retired);
@@ -519,8 +529,11 @@ impl JointProgressDriver {
                 if !state.cancellations.finish_reaped(id) {
                     state.joint.as_mut().unwrap().driver_closed = true;
                 }
+                let retired = state.cancellations.slots[id.0].retired_root_domains.take();
                 state.advance_progress_revision();
-            }
+                retired
+            };
+            drop(retired_root);
             self.reclaim_parent = parent;
             self.reclaim_idle = None;
             self.inner.notify_reclaim_progress();
@@ -607,8 +620,16 @@ impl JointProgressDriver {
                     {
                         return Some(Err(false));
                     }
+                    if !cancelled && super::ledger::root_domains::request_blocked(state, id) {
+                        return Some(Err(false));
+                    }
+                    let ledger = state.joint.as_mut().unwrap();
+                    let request = &ledger.requests[&id];
                     ledger.active = Some(id);
                     Some(Ok(Turn {
+                        root_domain: request.root_domain.clone(),
+                        snapshot_pending: None,
+                        snapshot_new: 0,
                         preparation: Preparation::Allocate,
                         id,
                         owner: request.owner,
@@ -617,7 +638,7 @@ impl JointProgressDriver {
                         layout_revision: ledger.profile_layout_revision,
                         cursor: None,
                         records: Vec::new(),
-                        snapshot_capacity: ledger.profiles.len(),
+                        snapshot_capacity: ledger.config.config.max_claims,
                         pending_domain_limits: Vec::new(),
                         domains: BTreeMap::new(),
                         input: None,
@@ -677,6 +698,9 @@ impl JointProgressDriver {
                         .ok_or(WorkError::Released)?
                         .check(&state.cancellations)?;
                 }
+                if super::ledger::root_domains::request_blocked(&state, turn.id) {
+                    return Ok(false);
+                }
                 validate_waiting(&state, turn.id, &turn.changes)?;
                 Ok(ledger.profile_layout_revision == turn.layout_revision)
             })()
@@ -702,9 +726,38 @@ impl JointProgressDriver {
             }
         }
         if matches!(turn.preparation, Preparation::Snapshot) {
-            // Copy one fixed-size claim header and at most declared K Arc refs.
-            // Positive claims are fenced; concurrent releases can only make this
-            // retained observation a conservative upper bound.
+            if let Some((_, _, capture)) = &mut turn.snapshot_pending {
+                match capture.step() {
+                    Err(error) => {
+                        self.finish(turn, Err(error), false);
+                        return JointProgress::More;
+                    }
+                    Ok(Poll::Pending) => {
+                        self.active = Some(turn);
+                        return JointProgress::More;
+                    }
+                    Ok(Poll::Ready(facts)) => {
+                        let (record, affected, capture) = turn.snapshot_pending.take().unwrap();
+                        // The old Root/group aliases leave before capturing the
+                        // next record. A snapshot retains flat exact D only.
+                        drop(capture);
+                        if let Err(error) = turn.push_record(
+                            SnapshotRecord {
+                                facts,
+                                amounts: record.amounts,
+                                claims: record.claims,
+                                affected,
+                            },
+                            &self.config.config,
+                        ) {
+                            self.finish(turn, Err(error), false);
+                            return JointProgress::More;
+                        }
+                        self.active = Some(turn);
+                        return JointProgress::More;
+                    }
+                }
+            }
             let next = {
                 let state = self.inner.state.lock().unwrap();
                 let ledger = state.joint.as_ref().unwrap();
@@ -715,13 +768,25 @@ impl JointProgressDriver {
                         Unbounded,
                     ))
                     .next()
-                    .map(|(key, record)| (Arc::clone(key), record.clone()))
+                    .map(|(key, record)| {
+                        FactCapture::capture(
+                            &state,
+                            Arc::clone(&record.facts),
+                            turn.root_domain.as_ref(),
+                        )
+                        .map(|capture| (Arc::clone(key), record.clone(), capture))
+                    })
+                    .transpose()
             };
-            if let Some((key, mut record)) = next {
+            let next = match next {
+                Ok(next) => next,
+                Err(error) => {
+                    self.finish(turn, Err(error), false);
+                    return JointProgress::More;
+                }
+            };
+            if let Some((key, mut record, capture)) = next {
                 turn.cursor = Some(Arc::clone(&key));
-                // Authenticate and subtract every old charge from its exact
-                // aggregate once. Other owners' concurrent releases remain a
-                // conservative overestimate, never a copied grant to restore.
                 for change in turn.changes.iter() {
                     if change
                         .original_facts
@@ -742,13 +807,44 @@ impl JointProgressDriver {
                     }
                 }
                 if record.claims != 0 {
-                    if let Err(error) = turn.push_record(record, &self.config.config) {
-                        self.finish(turn, Err(error), false);
-                        return JointProgress::More;
-                    }
+                    let affected = turn
+                        .root_domain
+                        .as_ref()
+                        .is_some_and(|change| key.origin.is_root(change.root));
+                    turn.snapshot_pending = Some((record, affected, capture));
                 }
                 self.active = Some(turn);
                 return JointProgress::More;
+            }
+            if let Some(change) = turn.changes.get(turn.snapshot_new) {
+                let capture = {
+                    let state = self.inner.state.lock().unwrap();
+                    FactCapture::capture(
+                        &state,
+                        Arc::clone(&change.claim.facts),
+                        turn.root_domain.as_ref(),
+                    )
+                };
+                match capture {
+                    Err(error) => {
+                        self.finish(turn, Err(error), false);
+                        return JointProgress::More;
+                    }
+                    Ok(capture) => {
+                        turn.snapshot_pending = Some((
+                            ProfileRecord {
+                                facts: Arc::clone(&change.claim.facts),
+                                amounts: change.claim.amounts,
+                                claims: 1,
+                            },
+                            true,
+                            capture,
+                        ));
+                        turn.snapshot_new += 1;
+                        self.active = Some(turn);
+                        return JointProgress::More;
+                    }
+                }
             }
             turn.preparation = Preparation::Domains(0, 0);
             self.active = Some(turn);
@@ -795,7 +891,7 @@ impl JointProgressDriver {
                 }
             }
         }
-        if turn.next_change < turn.changes.len() {
+        if turn.next_change < turn.records.len() {
             if turn.work >= turn.work_limit {
                 self.finish(
                     turn,
@@ -804,8 +900,15 @@ impl JointProgressDriver {
                 );
                 return JointProgress::More;
             }
-            let claim = &turn.changes[turn.next_change].claim;
-            let profile = turn.profile(&claim.facts, claim.amounts);
+            let record = &turn.records[turn.next_change];
+            turn.next_change += 1;
+            if !record.affected {
+                self.active = Some(turn);
+                return JointProgress::More;
+            }
+            // All post-state records are already present. Check every actual
+            // affected exact D/mask; do not add the same amount again.
+            let profile = turn.profile(&record.facts, record.amounts);
             let checked = match profile_checked_coordinates(&profile.amounts) {
                 Ok(checked) => checked,
                 Err(error) => {
@@ -814,11 +917,9 @@ impl JointProgressDriver {
                 }
             };
             let input = turn.input.as_mut().unwrap();
-            input.affected_dependencies = profile.dependencies.clone();
+            input.affected_dependencies = profile.dependencies;
             input.affected_causal = profile.causal;
             input.checked_coordinates = checked;
-            input.profiles.push(profile);
-            turn.next_change += 1;
             let mut bounds = self.config.solver_bounds();
             bounds.max_total_work = turn.work_limit - turn.work;
             turn.proof = Some(ProtectionProof::new(turn.input.take().unwrap(), bounds));
@@ -903,6 +1004,17 @@ impl JointProgressDriver {
             }
             let finite = request.budget.is_finite();
             let exhausted = request.budget.exhausted();
+            if super::ledger::root_domains::request_blocked(state, turn.id) {
+                if exhausted {
+                    return fail_request(
+                        state,
+                        turn.id,
+                        WorkError::Capacity("joint finite proof work"),
+                    );
+                }
+                return None;
+            }
+            let ledger = state.joint.as_mut().unwrap();
             // Amount-only frees make a positive proof conservative. Rekeying a
             // live charge can move it behind the snapshot cursor, so layout
             // changes invalidate every verdict and rotate this request fairly.
@@ -986,7 +1098,7 @@ impl Turn {
 
     fn push_record(
         &mut self,
-        record: ProfileRecord,
+        record: SnapshotRecord,
         config: &JointCapacityConfig,
     ) -> Result<(), WorkError> {
         if self.records.len() >= config.max_claims {
@@ -996,12 +1108,11 @@ impl Turn {
         let count = self
             .records
             .len()
-            .checked_add(self.changes.len())
-            .and_then(|n| n.checked_add(1))
+            .checked_add(1)
             .ok_or(WorkError::ArithmeticOverflow)?;
         let bytes = count
             .checked_mul(
-                std::mem::size_of::<ProfileRecord>()
+                std::mem::size_of::<SnapshotRecord>()
                     + COORDINATE_COUNT * 16
                     + config.max_dependencies_per_claim * std::mem::size_of::<usize>(),
             )
@@ -1018,7 +1129,7 @@ impl Turn {
     fn prepare_one(&mut self, config: &JointCapacityConfig) -> Result<(), WorkError> {
         match self.preparation {
             Preparation::Allocate => {
-                let per_record = std::mem::size_of::<ProfileRecord>();
+                let per_record = std::mem::size_of::<SnapshotRecord>();
                 if self.snapshot_capacity > config.max_claims
                     || self
                         .snapshot_capacity
@@ -1033,13 +1144,7 @@ impl Turn {
                 self.preparation = Preparation::Snapshot;
             }
             Preparation::Domains(index, dependency) => {
-                let record = if index < self.records.len() {
-                    Some(&self.records[index].facts)
-                } else {
-                    self.changes
-                        .get(index - self.records.len())
-                        .map(|change| &change.claim.facts)
-                };
+                let record = self.records.get(index).map(|record| &record.facts);
                 if let Some(record) = record {
                     if let Some(domain) = record.dependencies.get(dependency) {
                         self.domains.insert(domain.ordinal, 0);
@@ -1063,11 +1168,7 @@ impl Turn {
                     *self.domains.get_mut(&ordinal).unwrap() = index;
                     self.preparation = Preparation::NumberDomains(Some(ordinal), index + 1);
                 } else {
-                    let retained = self
-                        .records
-                        .len()
-                        .checked_add(self.changes.len())
-                        .ok_or(WorkError::ArithmeticOverflow)?;
+                    let retained = self.records.len();
                     if retained > config.max_claims {
                         return Err(WorkError::Capacity("joint post-state claims"));
                     }
@@ -1075,7 +1176,7 @@ impl Turn {
                     // domain arcs/maps, coordinate limits and temporary buffers.
                     let per_profile = COORDINATE_COUNT
                         .checked_mul(16)
-                        .and_then(|n| n.checked_add(std::mem::size_of::<ProfileRecord>() * 2))
+                        .and_then(|n| n.checked_add(std::mem::size_of::<SnapshotRecord>() * 2))
                         .and_then(|n| {
                             n.checked_add(config.max_dependencies_per_claim.checked_mul(32)?)
                         })

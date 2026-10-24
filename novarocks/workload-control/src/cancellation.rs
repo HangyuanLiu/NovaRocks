@@ -100,6 +100,14 @@ impl Cancellation {
         cell
     }
 
+    pub(crate) fn reserve_fixed_children(&self, count: usize) -> Result<(), crate::WorkError> {
+        self.state.lock().unwrap().children.reserve_fixed(count)
+    }
+
+    pub(crate) fn release_fixed_children(&self, count: usize) {
+        self.state.lock().unwrap().children.release_fixed(count);
+    }
+
     pub(crate) fn reuse_root(&mut self, deadline: Option<Instant>) {
         assert!(self.parent.is_none(), "Free cell has no previous parent");
         let state = self.state.get_mut().unwrap();

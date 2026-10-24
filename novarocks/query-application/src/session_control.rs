@@ -22,9 +22,9 @@ use std::sync::{Arc, Weak};
 mod statement_action;
 pub(crate) use statement_action::StatementProgressCursor;
 pub use statement_action::{
-    GovernedStatementAction, StatementActionAttempt, StatementActionFailure, StatementActionReady,
-    StatementActionReceipt, StatementActionValue, StatementActionWaitError, StatementActionWaiter,
-    StatementProgressGeometry,
+    GovernedStatementAction, GovernedStatementResidual, StatementActionAttempt,
+    StatementActionFailure, StatementActionReady, StatementActionReceipt, StatementActionValue,
+    StatementActionWaitError, StatementActionWaiter, StatementProgressGeometry,
 };
 #[doc(hidden)]
 pub use statement_action::{StatementActionSource, StatementProgressSlot};
@@ -215,6 +215,7 @@ pub enum QueryControlError {
     UnknownSession,
     StaleSession,
     StatementBusy,
+    StatementActionCapacity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -366,6 +367,7 @@ pub trait QueryControlPort: Send + Sync + 'static {
     fn attach_statement_progress(
         &self,
         _slot: &Arc<StatementProgressSlot>,
+        _source_slots: std::num::NonZeroUsize,
     ) -> Result<(), QueryControlError> {
         Err(QueryControlError::UnknownSession)
     }
@@ -382,9 +384,12 @@ pub trait QueryControlPort: Send + Sync + 'static {
     }
     fn next_statement_action(
         &self,
-        _after: Option<u32>,
-    ) -> Option<(u32, Option<Arc<StatementActionSource>>)> {
+        _after: Option<usize>,
+    ) -> Option<(usize, Option<Arc<StatementActionSource>>)> {
         None
+    }
+    fn retire_statement_action_source(&self, _source: &Arc<StatementActionSource>) -> bool {
+        false
     }
     fn detach_statement_action(
         &self,
@@ -825,6 +830,58 @@ impl GovernedControlLink {
     }
 }
 
+/// A synchronous borrow of one original action's existing root slots.
+/// This view owns no Work, result alias, registration, permit or authority;
+/// constructing it neither admits work nor manufactures a background root.
+/// The source author supplies its exact existing scope, owner slot and facts.
+pub struct GovernedActionContext<'a> {
+    scope: &'a WorkScope,
+    execution_owner: &'a mut Option<WorkOwner>,
+    cancellation: &'a CancellationView,
+    timeout_ms: Option<u64>,
+    result_window: Option<&'a ResultWindowAlias>,
+}
+
+impl<'a> GovernedActionContext<'a> {
+    pub fn new(
+        scope: &'a WorkScope,
+        execution_owner: &'a mut Option<WorkOwner>,
+        cancellation: &'a CancellationView,
+        timeout_ms: Option<u64>,
+        result_window: Option<&'a ResultWindowAlias>,
+    ) -> Self {
+        Self {
+            scope,
+            execution_owner,
+            cancellation,
+            timeout_ms,
+            result_window,
+        }
+    }
+
+    pub fn scope(&self) -> &WorkScope {
+        self.scope
+    }
+
+    pub fn cancellation(&self) -> &CancellationView {
+        self.cancellation
+    }
+
+    pub const fn timeout_ms(&self) -> Option<u64> {
+        self.timeout_ms
+    }
+
+    /// Retain only the same original window when the actual result needs it.
+    /// A missing alias remains missing; this view cannot acquire a new window.
+    pub fn result_window_alias(&self) -> Option<ResultWindowAlias> {
+        self.result_window.cloned()
+    }
+
+    pub fn execution_owner_slot(&mut self) -> &mut Option<WorkOwner> {
+        self.execution_owner
+    }
+}
+
 pub struct GovernedQueryStatementOwner {
     service: GovernedControlLink,
     registration: GovernedStatementRegistration,
@@ -842,6 +899,21 @@ pub struct GovernedQueryStatementOwner {
 }
 
 impl GovernedQueryStatementOwner {
+    /// Borrow protocol-owned facts for one synchronous action poll. The
+    /// caller's original window alias remains outside this non-owning view.
+    pub fn action_context<'a>(
+        &'a mut self,
+        result_window: Option<&'a ResultWindowAlias>,
+    ) -> GovernedActionContext<'a> {
+        GovernedActionContext::new(
+            &self.scope,
+            &mut self.execution_owner,
+            self.registration.cancellation(),
+            self.timeout_ms,
+            result_window,
+        )
+    }
+
     fn park_control_link(&mut self) {
         let port = self.service.port();
         self.service = GovernedControlLink::Stable(Arc::downgrade(&port));
@@ -883,6 +955,14 @@ impl GovernedQueryStatementOwner {
         // Fetch and transport aliases retain their own short-tail position.
         // The protocol has already moved its owned bytes into closing capacity.
         self.result_window.take();
+    }
+
+    pub(crate) fn execution_owner_matches_scope(&self) -> bool {
+        // Both fields are minted together by the same statement constructor.
+        // The WorkOwner is move-only; this read grants no capacity or locator.
+        self.execution_owner
+            .as_ref()
+            .is_some_and(|owner| owner.is_for_scope(&self.scope))
     }
 
     /// Borrow the original stable slot for a synchronous, in-place QA start.

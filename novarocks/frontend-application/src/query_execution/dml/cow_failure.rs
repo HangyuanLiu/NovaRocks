@@ -100,6 +100,17 @@ impl CowFailure {
         self,
         terminal: Option<&novarocks_spi::connector::LakePublicationTerminal>,
     ) -> String {
+        let presentation = self.borrowed_presentation(terminal);
+        drop(self); // Actual raw cause exit precedes publication of this String.
+        presentation
+    }
+
+    /// The supervised source retains the move-only cause while publishing the
+    /// same bounded client projection. This borrows no erased formatter.
+    pub(crate) fn borrowed_presentation(
+        &self,
+        terminal: Option<&novarocks_spi::connector::LakePublicationTerminal>,
+    ) -> String {
         let mut out = DiagnosticPrefix(String::with_capacity(WIRE_DIAGNOSTIC_BYTES + 3));
         out.push("Executor: ");
         match &self.cause {
@@ -192,7 +203,6 @@ impl CowFailure {
             );
         }
         let presentation = out.0;
-        drop(self); // Actual raw cause exit precedes publication of this String.
         presentation
     }
     #[cfg(test)]

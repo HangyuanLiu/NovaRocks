@@ -433,6 +433,35 @@ impl IcebergMetadataContext {
         Ok(dependencies)
     }
 
+    pub(crate) fn read_planning_initial_dependencies(
+        &self,
+    ) -> Result<Vec<novarocks_spi::connector::SharedDependency>, ConnectorError> {
+        let config = self.control_state.configuration();
+        if config.kind != crate::catalog_config::IcebergCatalogKind::Hive {
+            return self.metadata_action_initial_dependencies();
+        }
+        // Catalog configuration already selected the first real HMS address.
+        // The vendored Thrift builder consumes this identical host:port;
+        // framed/buffered codecs share this same external service domain.
+        let address = config.hms_uris.as_deref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "HMS read generation has no selected address",
+            )
+        })?;
+        let selected =
+            novarocks_spi::connector::SelectedThriftServiceOrigin::from_selected_address(address)
+                .map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "HMS selected service address exceeds the dependency contract",
+                )
+            })?;
+        Ok(vec![novarocks_spi::connector::SharedDependency::Thrift(
+            selected.into_owned(),
+        )])
+    }
+
     pub(crate) fn control_state(&self) -> &IcebergCatalogControlState {
         &self.control_state
     }
@@ -1697,6 +1726,27 @@ impl IcebergMetadataContext {
             })
     }
 
+    pub(crate) async fn list_namespaces_for_request_async(
+        &self,
+        request: &ConnectorRequestContext,
+        bound: novarocks_spi::connector::ConnectorListingBound,
+    ) -> Result<Vec<String>, (ConnectorErrorKind, String)> {
+        let owner = Arc::clone(self.novarocks_catalog());
+        let binding = self
+            .resources
+            .planning_binding()
+            .for_request(request.clone());
+        owner
+            .list_namespaces_for_read(binding, bound)
+            .await
+            .map_err(|error| {
+                (
+                    error.kind(),
+                    format!("list Iceberg namespaces: {}", error.message()),
+                )
+            })
+    }
+
     pub(crate) fn namespace_exists(&self, namespace: &str) -> Result<bool, String> {
         let namespace = NamespaceIdent::new(normalize_identifier(namespace)?);
         let namespace_label = namespace.to_string();
@@ -1768,6 +1818,35 @@ impl IcebergMetadataContext {
             .catalog_runtime()
             .block_on(async move { owner.list_tables_for_read(target, binding, bound).await })
             .map_err(|error| (ConnectorErrorKind::Unavailable, error))?
+            .map_err(|error| {
+                (
+                    error.kind(),
+                    format!(
+                        "list Iceberg tables in {namespace_label}: {}",
+                        error.message()
+                    ),
+                )
+            })
+    }
+
+    pub(crate) async fn list_tables_for_request_async(
+        &self,
+        namespace: &str,
+        request: &ConnectorRequestContext,
+        bound: novarocks_spi::connector::ConnectorListingBound,
+    ) -> Result<Vec<String>, (ConnectorErrorKind, String)> {
+        let namespace =
+            NamespaceIdent::new(normalize_identifier(namespace).map_err(invalid_request)?);
+        let namespace_label = namespace.to_string();
+        let owner = Arc::clone(self.novarocks_catalog());
+        let target = crate::catalog::CatalogNamespaceName::new(namespace.to_url_string());
+        let binding = self
+            .resources
+            .planning_binding()
+            .for_request(request.clone());
+        owner
+            .list_tables_for_read(target, binding, bound)
+            .await
             .map_err(|error| {
                 (
                     error.kind(),

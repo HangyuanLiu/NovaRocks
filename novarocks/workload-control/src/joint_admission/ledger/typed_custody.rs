@@ -370,7 +370,7 @@ fn validate_adoption(
         || control.amounts != cell.base
         || control.active_amounts != cell.base
         || control.facts.key != control.active_facts.key
-        || control.active_facts.dependencies.is_empty()
+        || !root_domains::has_effective_domains(state, &control.active_facts, false)
     {
         return Err(WorkError::Conflict);
     }
@@ -794,30 +794,124 @@ pub(super) fn payload_growth_view(
     if !Arc::ptr_eq(&grant.pin.inner, &root.inner) {
         return Err(WorkError::ForeignAuthority);
     }
-    let [id, epoch] = grant.pin.key.ok_or(WorkError::Released)?;
+    typed_binding_view(
+        state,
+        root,
+        grant.pin.key.ok_or(WorkError::Released)?,
+        false,
+    )
+}
+/// Canonical capture may observe an original incarnation held by the same
+/// Root writer. It cannot begin a change until that writer's position is free.
+pub(super) fn payload_capture_view(
+    grant: &RetainedPayloadGrant,
+    root: &WorkScope,
+    state: &State,
+) -> Result<JointClaimView, WorkError> {
+    if !Arc::ptr_eq(&grant.pin.inner, &root.inner) {
+        return Err(WorkError::ForeignAuthority);
+    }
+    typed_binding_capture_view(
+        state,
+        root,
+        grant.pin.key.ok_or(WorkError::Released)?,
+        false,
+    )
+}
+/// Internal closed zero-growth binding capture. Only positive original grants
+/// provide these keys; retention-only aliases never expose this constructor.
+pub(super) fn computation_growth_view(
+    grant: &InternalComputationGrant,
+    stage: &WorkScope,
+    state: &State,
+) -> Result<JointClaimView, WorkError> {
+    if !Arc::ptr_eq(&grant.pin.inner, &stage.inner) {
+        return Err(WorkError::ForeignAuthority);
+    }
+    typed_binding_view(
+        state,
+        stage,
+        grant.pin.key.ok_or(WorkError::Released)?,
+        true,
+    )
+}
+pub(super) fn computation_capture_view(
+    grant: &InternalComputationGrant,
+    stage: &WorkScope,
+    state: &State,
+) -> Result<JointClaimView, WorkError> {
+    if !Arc::ptr_eq(&grant.pin.inner, &stage.inner) {
+        return Err(WorkError::ForeignAuthority);
+    }
+    typed_binding_capture_view(
+        state,
+        stage,
+        grant.pin.key.ok_or(WorkError::Released)?,
+        true,
+    )
+}
+pub(super) fn typed_binding_view(
+    state: &State,
+    work: &WorkScope,
+    key: [u64; 2],
+    computation: bool,
+) -> Result<JointClaimView, WorkError> {
+    typed_binding_view_mode(state, work, key, computation, false)
+}
+pub(super) fn typed_binding_capture_view(
+    state: &State,
+    work: &WorkScope,
+    key: [u64; 2],
+    computation: bool,
+) -> Result<JointClaimView, WorkError> {
+    typed_binding_view_mode(state, work, key, computation, true)
+}
+fn typed_binding_view_mode(
+    state: &State,
+    work: &WorkScope,
+    key: [u64; 2],
+    computation: bool,
+    capture: bool,
+) -> Result<JointClaimView, WorkError> {
     let row = state
         .joint
         .as_ref()
         .ok_or(WorkError::NotReady)?
         .claims
-        .get(&id)
+        .get(&key[0])
         .ok_or(WorkError::Released)?;
-    if row.owner != ClaimOwner::PhysicalWork(root.id)
-        || !matches!(row.custody, ClaimCustody::Payload { epoch: original, pins } if original == epoch && pins != 0)
-        || row.pending.is_some()
-        || row.amounts != row.active_amounts
-        || row.facts.key != row.active_facts.key
+    let custody = match row.custody {
+        ClaimCustody::Computation { epoch, pins } if computation => epoch == key[1] && pins != 0,
+        ClaimCustody::Payload { epoch, pins } if !computation => epoch == key[1] && pins != 0,
+        _ => false,
+    };
+    if !custody
+        || row.owner != ClaimOwner::PhysicalWork(work.id)
+        || (!capture && row.pending.is_some())
+        || (row.pending.is_none()
+            && (row.amounts != row.active_amounts || row.facts.key != row.active_facts.key))
+        || !row.active_facts.key.causal.is_empty()
     {
         return Err(WorkError::Conflict);
     }
-    Ok(JointClaimView {
-        inner: Arc::downgrade(&root.inner),
-        id,
-        source: ClaimSource::Payload { epoch },
+    let view = JointClaimView {
+        inner: Arc::downgrade(&work.inner),
+        id: key[0],
+        source: if computation {
+            ClaimSource::Computation { epoch: key[1] }
+        } else {
+            ClaimSource::Payload { epoch: key[1] }
+        },
         structure_revision: row.structure_revision,
         release_revision: row.release_revision,
-    })
+    };
+    if capture {
+        root_domains::capture_view(state, view, work.id)
+    } else {
+        Ok(view)
+    }
 }
+
 pub(super) fn same_payload_grant(
     grant: &RetainedPayloadGrant,
     inner: &Arc<Inner>,
@@ -865,11 +959,102 @@ pub(crate) fn validate_native_payload_fence(
         .ok_or(WorkError::Released)?;
     if row.owner != ClaimOwner::PhysicalWork(root)
         || !matches!(row.custody, ClaimCustody::Payload { epoch, pins } if epoch == key[1] && pins != 0)
-        || row.pending.is_some()
-        || row.amounts != row.active_amounts
-        || row.facts.key != row.active_facts.key
+        || (row.pending.is_some()
+            && !root_domains::pending_payload_is_original(state, root, key[0], key[1]))
+        || (row.pending.is_none()
+            && (row.amounts != row.active_amounts || row.facts.key != row.active_facts.key))
     {
         return Err(WorkError::Conflict);
     }
     Ok(())
 }
+
+/// Foreground Native production under a governed Client window still needs
+/// the same positive stage computation. Settlement never uses this gate.
+pub(crate) fn validate_native_computation_fence(
+    state: &State,
+    root: WorkId,
+    stage: WorkId,
+    key: [u64; 2],
+) -> Result<(), WorkError> {
+    let original = state.nodes.get(&root).ok_or(WorkError::Released)?;
+    let execution = state.nodes.get(&stage).ok_or(WorkError::Released)?;
+    let row = state
+        .joint
+        .as_ref()
+        .and_then(|l| l.claims.get(&key[0]))
+        .ok_or(WorkError::Released)?;
+    if original.owner != crate::OwnerState::Active
+        || original.parent.is_some()
+        || original.root != root
+        || execution.owner != crate::OwnerState::Active
+        || execution.root != root
+        || execution.parent != Some(root)
+        || execution.class != original.class
+        || row.owner != ClaimOwner::PhysicalWork(stage)
+        || !matches!(row.custody, ClaimCustody::Computation { epoch, pins } if epoch == key[1] && pins != 0)
+        || row.pending.is_some()
+        || row.amounts != row.active_amounts
+        || row.facts.key != row.active_facts.key
+        || row.active_amounts.get(JointResource::Computations) != 1
+        || !row.active_facts.key.causal.is_empty()
+    {
+        return Err(WorkError::Conflict);
+    }
+    Ok(())
+}
+
+/// Initial payload and canonical Root activation cross the same State cut.
+/// The caller's stable target receives the real pin before a notification exists.
+pub(super) fn adopt_initial_root_in(
+    scope: &WorkScope,
+    source: &mut Option<JointClaim>,
+    receipt: Result<&mut JointAdjustmentReceipt, WorkError>,
+    target: &mut Option<RetainedPayloadGrant>,
+) -> Result<WorkloadProgressNotification, WorkError> {
+    let receipt = receipt?;
+    if target.is_some() {
+        return Err(WorkError::Conflict);
+    }
+    let original = source.as_ref().ok_or(WorkError::Released)?;
+    if !Arc::ptr_eq(&original.inner, &scope.inner) || !Arc::ptr_eq(&receipt.inner, &scope.inner) {
+        return Err(WorkError::ForeignAuthority);
+    }
+    let inner = Arc::clone(&scope.inner);
+    let ticket = receipt.id.ok_or(WorkError::Released)?;
+    let (retired_graph, retired_guard) = {
+        let mut state = inner.state.lock().unwrap();
+        let original = source.as_mut().unwrap();
+        root_domains::validate_install(&state, ticket, scope.id)?;
+        validate_adoption(&state, scope, original, Kind::Payload)?;
+        let id = original.id.unwrap();
+        let row = state.joint.as_mut().unwrap().claims.get_mut(&id).unwrap();
+        let epoch = row
+            .structure_revision
+            .checked_add(1)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        row.structure_revision = epoch;
+        row.custody = Kind::Payload.new_custody(epoch);
+        row.domain_birth = None;
+        original.id = None;
+        *target = Some(RetainedPayloadGrant {
+            pin: OriginalPin {
+                inner: Arc::clone(&inner),
+                key: Some([id, epoch]),
+                kind: Kind::Payload,
+            },
+        });
+        let retired = root_domains::install(&mut state, ticket);
+        receipt.id = None;
+        remove_request(&mut state, ticket);
+        state.advance_progress_revision();
+        (retired, source.take())
+    };
+    drop(retired_graph);
+    drop(retired_guard);
+    Ok(WorkloadProgressNotification::new(inner))
+}
+
+mod native_dispatch;
+pub use native_dispatch::{NativeDispatchFrozen, NativeDispatchSource};
+pub(super) use native_dispatch::{NativeDispatchKind, NativeDispatchOrigin};

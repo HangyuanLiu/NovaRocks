@@ -17,7 +17,7 @@
 
 //! Frontend-owned INSERT command conversion and source shaping.
 
-mod command;
+pub(crate) mod command;
 mod iceberg;
 mod shaping;
 
@@ -42,7 +42,7 @@ pub(crate) use shaping::{
 use self::iceberg::{IcebergInsertWriteExecutor, write_transaction_spec};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum InsertTargetRef {
+pub(crate) enum InsertTargetRef {
     Main,
     Branch(String),
     Tag(String),
@@ -57,6 +57,23 @@ pub(crate) struct PreparedInsertAttempt {
 }
 
 impl DmlService {
+    /// Pure command/target validation shared by both migration callers. No
+    /// provider request, execution identity or statement authority is created.
+    pub(crate) fn prepare_insert_shape(
+        &self,
+        statement: &novarocks_parser::ast::Insert,
+        source: &str,
+    ) -> Result<(command::InsertCommand, InsertTargetRef), DmlError> {
+        let mut command = convert_insert_command(statement)
+            .map_err(|error| insert_admit_error(source, statement.span, error))?;
+        let (target, reference) = split_target_ref(&command.target)
+            .map_err(|error| insert_admit_error(source, statement.target.span, error))?;
+        validate_target(&reference)
+            .map_err(|error| insert_admit_error(source, statement.target.span, error))?;
+        command.target = target;
+        Ok((command, reference))
+    }
+
     /// Prepare one SQLP-5 typed INSERT without beginning native execution.
     ///
     /// Statement-family routing is complete before this boundary. `source`
@@ -71,11 +88,8 @@ impl DmlService {
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
     ) -> Result<PreparedInsertAttempt, DmlError> {
-        let mut command = convert_insert_command(statement)
-            .map_err(|error| insert_admit_error(source, statement.span, error))?;
-        let (target, target_ref) = split_target_ref(&command.target)
-            .map_err(|error| insert_admit_error(source, statement.target.span, error))?;
-        command.target = target.clone();
+        let (command, target_ref) = self.prepare_insert_shape(statement, source)?;
+        let target = command.target.clone();
 
         let session = context.session();
         let resolved = engine
@@ -154,7 +168,7 @@ fn insert_admit_error(source: &str, span: novarocks_parser::Span, message: Strin
     DmlError::admit(DmlAdmissionError::InsertUnsupportedForm.to_user_error(source, span, message))
 }
 
-fn split_target_ref(
+pub(crate) fn split_target_ref(
     target: &InsertTargetName,
 ) -> Result<(InsertTargetName, InsertTargetRef), String> {
     let Some(last) = target.parts.last() else {
@@ -181,7 +195,7 @@ fn split_target_ref(
     Ok((InsertTargetName { parts }, target_ref))
 }
 
-fn validate_target(target_ref: &InsertTargetRef) -> Result<(), String> {
+pub(crate) fn validate_target(target_ref: &InsertTargetRef) -> Result<(), String> {
     if let InsertTargetRef::Tag(name) = target_ref {
         return Err(format!(
             "iceberg ref: tag '{name}' is read-only; use a branch as DML target"

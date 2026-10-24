@@ -7131,6 +7131,86 @@ async fn actor_abort_round_at_first_dispatch() -> (
     )
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actor_abort_local_dispatch_refusal_preserves_cause_without_context_closure() {
+    use novarocks_query_application::coordination::ContextClosureState;
+    use novarocks_workload_control::WorkError;
+    let (mut round, _sink, acknowledgements, mut logical, context, abort, _clock) =
+        actor_abort_round_at_first_dispatch().await;
+    acknowledgements.publish(
+        crate::native::apply_send_owner::canonical_dispatch_rejection_fixture(
+            abort.operation_id(),
+            OperationKind::AbortQueryContext,
+            WorkError::Capacity("Native dispatch proof work"),
+        ),
+    );
+    assert_eq!(
+        round.turn().unwrap_err(),
+        TaskExecutionError::Workload(WorkError::Capacity("Native dispatch proof work"))
+    );
+    assert!(matches!(
+        round
+            .execution()
+            .actor_abort_dispatch_state(abort.operation_id()),
+        Err(TaskExecutionError::UnknownOperation)
+    ));
+    assert!(!round.execution().owner(context).unwrap().is_released());
+    assert!(
+        round
+            .execution()
+            .context_convergence_receipt(context)
+            .is_none()
+    );
+    let snapshot = logical.stand_down_snapshot(context).await.unwrap().unwrap();
+    assert!(!matches!(
+        snapshot.closure(),
+        ContextClosureState::NoRemoteResponsibility
+            | ContextClosureState::TerminalRetained
+            | ContextClosureState::Gone
+            | ContextClosureState::WorkerStoppedAndContextFenced
+            | ContextClosureState::WorkerProcessReplaced
+    ));
+    // Only the fixture's independent process fence can settle the residual.
+    logical
+        .observe_worker_process_replaced(context)
+        .await
+        .unwrap();
+    logical
+        .finish_until(std::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actor_abort_dispatch_cause_does_not_override_wrong_operation_kind() {
+    use novarocks_workload_control::WorkError;
+    let (mut round, _sink, acknowledgements, mut logical, context, abort, _clock) =
+        actor_abort_round_at_first_dispatch().await;
+    acknowledgements.publish(
+        crate::native::apply_send_owner::canonical_dispatch_rejection_fixture(
+            abort.operation_id(),
+            OperationKind::CancelTask,
+            WorkError::Capacity("Native dispatch proof work"),
+        ),
+    );
+    assert!(matches!(round.turn(), Err(TaskExecutionError::Schedule(_))));
+    assert!(!round.execution().owner(context).unwrap().is_released());
+    assert!(
+        round
+            .execution()
+            .context_convergence_receipt(context)
+            .is_none()
+    );
+    logical
+        .observe_worker_process_replaced(context)
+        .await
+        .unwrap();
+    logical
+        .finish_until(std::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+}
+
 #[test]
 fn terminal_cleanup_dispatches_actor_abort_without_normal_work() {
     let mut harness = Harness::new(&[0], &[0], 64);

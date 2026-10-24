@@ -33,6 +33,7 @@ use novarocks_execution::task_execution::identity::TaskIdentity;
 use novarocks_execution::task_execution::status::TerminationDetail;
 
 use crate::task_execution::operation::OperationDispatchResult;
+use novarocks_execution::task_execution::OperationKind;
 use novarocks_execution::task_execution::identity::QueryContextRef;
 use novarocks_execution::task_execution::status::TaskStatusCursor;
 use novarocks_query_application::api::{QueryExecutionError, QueryExecutionErrorKind};
@@ -728,9 +729,10 @@ impl TaskRound {
                 continue;
             }
             if let Some(subscriber) = &self.covered_subscriber {
-                subscriber
-                    .reconcile(self.covered_request(context)?)
-                    .map_err(TaskExecutionError::Schedule)?;
+                if !subscriber.prepare(context)? {
+                    continue;
+                }
+                subscriber.reconcile(self.covered_request(context)?)?;
             } else {
                 self.legacy_subscriber()
                     .resubscribe(context, self.execution.status_cursors(context))
@@ -785,9 +787,7 @@ impl TaskRound {
                     {
                         continue;
                     }
-                    subscriber
-                        .update_applied_request(self.covered_request(context)?)
-                        .map_err(TaskExecutionError::Schedule)?;
+                    subscriber.update_applied_request(self.covered_request(context)?)?;
                 }
             }
             status
@@ -849,9 +849,10 @@ impl TaskRound {
             if self.needs_covered_observation(context)
                 && let Some(subscriber) = &self.covered_subscriber
             {
-                subscriber
-                    .reconcile(self.covered_request(context)?)
-                    .map_err(TaskExecutionError::Schedule)?;
+                if !subscriber.prepare(context)? {
+                    continue;
+                }
+                subscriber.reconcile(self.covered_request(context)?)?;
                 report.resubscriptions += 1;
             }
         }
@@ -870,9 +871,10 @@ impl TaskRound {
                     continue;
                 }
                 if let Some(subscriber) = &self.covered_subscriber {
-                    subscriber
-                        .reconcile(self.covered_request(context)?)
-                        .map_err(TaskExecutionError::Schedule)?;
+                    if !subscriber.prepare(context)? {
+                        continue;
+                    }
+                    subscriber.reconcile(self.covered_request(context)?)?;
                 } else {
                     self.legacy_subscriber()
                         .resubscribe(context, self.execution.status_cursors(context))
@@ -949,9 +951,10 @@ impl TaskRound {
                 continue;
             }
             if let Some(subscriber) = &self.covered_subscriber {
-                subscriber
-                    .ensure(self.covered_request(context)?)
-                    .map_err(TaskExecutionError::Schedule)?;
+                if !subscriber.prepare(context)? {
+                    continue;
+                }
+                subscriber.ensure(self.covered_request(context)?)?;
             } else {
                 self.legacy_subscriber()
                     .ensure(context, self.execution.status_cursors(context))
@@ -1151,6 +1154,63 @@ impl TaskRound {
         acknowledgement: &OperationAcknowledgement,
     ) -> Result<bool, TaskExecutionError> {
         let operation_id = acknowledgement.operation_id();
+
+        if acknowledgement.dispatch_result() == OperationDispatchResult::NonWorkerRejected
+            && acknowledgement.governance_failure().is_some()
+        {
+            let exact_active = self.abort_effects.get(&operation_id).is_some_and(|effect| {
+                matches!(
+                    effect.validate_acknowledgement(acknowledgement),
+                    Err(super::abort_effect::NativeAbortEffectAckError::MissingWorkerReceipt)
+                )
+            });
+            if exact_active {
+                // Missing Worker receipt is expected only for this exact
+                // operation/kind's local refusal. It is never context closure.
+                let state = match self.execution.actor_abort_dispatch_state(operation_id) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        self.fail_closed_abort_operation(operation_id)?;
+                        return Err(error);
+                    }
+                };
+                let settled = match state {
+                    ActorAbortDispatchState::Queued => {
+                        self.execution.cancel_queued_actor_abort(operation_id)
+                    }
+                    ActorAbortDispatchState::InFlight => {
+                        self.execution.acknowledge(acknowledgement)
+                    }
+                };
+                if let Err(error) = settled {
+                    self.fail_closed_abort_operation(operation_id)?;
+                    return Err(error);
+                }
+                self.fail_closed_abort_operation(operation_id)?;
+                return Err(super::error::dispatch_rejection(
+                    acknowledgement,
+                    OperationKind::AbortQueryContext,
+                ));
+            }
+            let exact_late = self
+                .late_abort_settlements
+                .get(&operation_id)
+                .is_some_and(|late| {
+                    late.first().is_some_and(|settlement| {
+                        settlement.identity().operation_id() == operation_id
+                            && acknowledgement.kind() == OperationKind::AbortQueryContext
+                    })
+                });
+            if !self.abort_effects.contains_key(&operation_id) && exact_late {
+                // That dispatcher generation was already settled Unknown.
+                // Fail its original late owner without inventing a fence.
+                self.fail_closed_abort_operation(operation_id)?;
+                return Err(super::error::dispatch_rejection(
+                    acknowledgement,
+                    OperationKind::AbortQueryContext,
+                ));
+            }
+        }
 
         let replay_dispatch_state = if self.abort_effects.contains_key(&operation_id)
             && self.late_abort_settlements.contains_key(&operation_id)

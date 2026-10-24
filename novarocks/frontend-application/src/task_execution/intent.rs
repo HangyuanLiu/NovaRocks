@@ -480,6 +480,11 @@ impl PartialEq for OperationAcknowledgement {
     }
 }
 impl OperationAcknowledgement {
+    /// Borrow the original batch's local dispatch refusal. A canonical cell
+    /// retains this same cause through its actual backing's final exit.
+    pub fn governance_failure(&self) -> Option<&novarocks_workload_control::WorkError> {
+        self.canonical.as_ref()?.governance_failure()
+    }
     #[cfg(test)]
     pub(crate) fn shares_original_canonical_with(&self, other: &Self) -> bool {
         self.canonical
@@ -918,6 +923,14 @@ pub trait TaskOperationQueuePermit: std::fmt::Debug + Send {
         &self,
         input: &OperationIntent,
     ) -> Result<OriginalOperationPacking, novarocks_workload_control::WorkError>;
+    /// Borrow the original Native queue capability for the same batch's
+    /// actual dispatch cut. Absence is not permission to omit governance.
+    /// Call outside WC State while the original queue holder stays stable.
+    fn native_dispatch_input(
+        &self,
+    ) -> Option<&novarocks_workload_control::joint_admission::NativeQueuedInputGrant> {
+        None
+    }
     fn native_input_retention(
         &self,
     ) -> Result<

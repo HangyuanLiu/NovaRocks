@@ -200,7 +200,7 @@ struct ActualFactAction {
 impl novarocks_query_application::session_control::GovernedStatementAction for ActualFactAction {
     fn poll_action(
         &mut self,
-        _: &mut novarocks_query_application::session_control::GovernedQueryStatementOwner,
+        _: &mut novarocks_query_application::session_control::GovernedActionContext<'_>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<
         Result<
@@ -398,7 +398,7 @@ fn observe_actual_completion_port(kind: ActualCompletionPort, class: ResultWindo
         novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )
     .unwrap();
-    let scope = StatementFactScope::new(
+    let scope = StatementFactScope::binding_only(
         bindings.clone(),
         context,
         Some("ice.main"),

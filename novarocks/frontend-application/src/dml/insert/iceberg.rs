@@ -140,6 +140,16 @@ mod runtime_identity_tests {
         source: PhysicalEncodeError,
     }
     impl InsertEngine for RefusingEngine {
+        fn prepare_statement_action(
+            &self,
+            _input: crate::query_execution::dml::insert::InsertStatementInput,
+        ) -> Result<
+            Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+            String,
+        > {
+            Err("legacy refusal fixture has no governed INSERT source".into())
+        }
+
         fn resolve_target(&self, _: ResolveInsertTarget) -> Result<ResolvedInsertTarget, String> {
             panic!("already prepared");
         }

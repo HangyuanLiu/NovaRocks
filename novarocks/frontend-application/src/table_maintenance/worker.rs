@@ -325,6 +325,11 @@ struct FrontendCleanupSession<'a> {
 }
 
 impl CleanupSession for FrontendCleanupSession<'_> {
+    fn require_scanned_object_gc(&self) -> Result<(), String> {
+        self.session
+            .require_scanned_object_gc()
+            .map_err(|error| error.to_string())
+    }
     fn candidates(&self) -> &[CleanupCandidate] {
         &self.candidates
     }

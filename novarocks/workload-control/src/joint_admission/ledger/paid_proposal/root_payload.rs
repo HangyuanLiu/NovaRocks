@@ -16,12 +16,13 @@
 // under the License.
 
 //! Monotone retained Root backing and its in-flight async rows, one paid batch.
-use super::super::typed_custody::{payload_growth_view, same_payload_grant};
+use super::super::typed_custody::{payload_capture_view, payload_growth_view, same_payload_grant};
 use super::*;
 use std::num::NonZeroU64;
 
 #[derive(Clone, Copy)]
 pub(in crate::joint_admission::ledger) struct RootPayloadFence {
+    canonical: bool,
     payload: u64,
     epoch: u64,
     physical: usize,
@@ -29,6 +30,7 @@ pub(in crate::joint_admission::ledger) struct RootPayloadFence {
 }
 #[must_use = "Capture is not capacity; construct outside receiver locks"]
 pub struct RootPayloadSource<'a> {
+    writer_revision: Option<u64>,
     inner: Weak<Inner>,
     root: WorkId,
     fence: RootPayloadFence,
@@ -67,25 +69,28 @@ fn control(state: &State, scope: &WorkScope, lane: JointLane) -> Result<JointCla
     if slot.phase != SlotPhase::Node(scope.id)
         || row.owner != ClaimOwner::ControlSlot(work.cancellation)
         || !row.custody.is_raw()
-        || row.pending.is_some()
-        || row.amounts != slot.base
         || row.active_amounts != slot.base
-        || row.facts.key != row.active_facts.key
-        || row.active_facts.dependencies.is_empty()
+        || (row.pending.is_none() && row.amounts != slot.base)
+        || (row.pending.is_none() && row.facts.key != row.active_facts.key)
+        || !root_domains::has_effective_domains(state, &row.active_facts, true)
     {
         return Err(WorkError::Conflict);
     }
-    Ok(JointClaimView {
-        inner: Arc::downgrade(&scope.inner),
-        id,
-        source: ClaimSource::NodeControl {
-            work: scope.id,
-            slot: work.cancellation,
-            generation: slot.generation,
+    root_domains::capture_view(
+        state,
+        JointClaimView {
+            inner: Arc::downgrade(&scope.inner),
+            id,
+            source: ClaimSource::NodeControl {
+                work: scope.id,
+                slot: work.cancellation,
+                generation: slot.generation,
+            },
+            structure_revision: row.structure_revision,
+            release_revision: row.release_revision,
         },
-        structure_revision: row.structure_revision,
-        release_revision: row.release_revision,
-    })
+        scope.id,
+    )
 }
 impl RootPayloadFence {
     pub(in crate::joint_admission::ledger) fn requires_business_active(self) -> bool {
@@ -93,6 +98,42 @@ impl RootPayloadFence {
     }
 }
 impl RetainedPayloadGrant {
+    pub fn root_domain_source(
+        &self,
+        root: &WorkScope,
+        lane: JointLane,
+    ) -> Result<RootPayloadSource<'static>, WorkError> {
+        let state = root.inner.state.lock().unwrap();
+        node(&state, root.id, lane)?;
+        let payload = payload_capture_view(self, root, &state)?;
+        let ClaimSource::Payload { epoch } = payload.source else {
+            return Err(WorkError::Conflict);
+        };
+        let control = control(&state, root, lane)?;
+        let domains = state.nodes[&root.id]
+            .root_domains
+            .as_ref()
+            .ok_or(WorkError::Conflict)?;
+        if domains.epoch == 0 {
+            return Err(WorkError::Conflict);
+        }
+        Ok(RootPayloadSource {
+            writer_revision: Some(domains.writer_revision),
+            inner: Arc::downgrade(&root.inner),
+            root: root.id,
+            fence: RootPayloadFence {
+                canonical: true,
+                payload: payload.id,
+                epoch,
+                physical: 0,
+                lane,
+            },
+            payload,
+            control,
+            physical: &[],
+        })
+    }
+
     /// Borrow all original in-flight async grants. Their complete old D and
     /// amounts are rekeyed in this same proof, never parked as a partial vector.
     pub fn root_payload_source<'a>(
@@ -139,9 +180,11 @@ impl RetainedPayloadGrant {
             }
         }
         Ok(RootPayloadSource {
+            writer_revision: None,
             inner: Arc::downgrade(&root.inner),
             root: root.id,
             fence: RootPayloadFence {
+                canonical: false,
                 payload: payload.id,
                 epoch,
                 physical: active.len(),
@@ -163,11 +206,37 @@ impl RootPayloadSource<'_> {
         {
             let state = inner.state.lock().unwrap();
             node(&state, self.root, self.fence.lane)?;
+            if self.fence.canonical {
+                root_domains::validate_captured(
+                    &state,
+                    self.root,
+                    &self.payload,
+                    self.root,
+                    self.writer_revision,
+                )?;
+                root_domains::validate_captured(
+                    &state,
+                    self.root,
+                    &self.control,
+                    self.root,
+                    self.writer_revision,
+                )?;
+            }
             if delta_bytes > super::root_stage::maximum_payload_increment(&state, self.root)? {
                 return Err(WorkError::Capacity("Root protected payload increment"));
             }
         }
-        let proposal = JointAdmissionHandle { inner }.begin_paid_proposal_for_scope(scope)?;
+        let handle = JointAdmissionHandle { inner };
+        let proposal = if self.fence.canonical {
+            match handle.try_begin_root_writer(scope, self.fence.lane, self.writer_revision)? {
+                JointTryBegin::Started(proposal) => proposal,
+                JointTryBegin::Full(_) => {
+                    return Err(WorkError::Capacity("original Root writer is busy"));
+                }
+            }
+        } else {
+            handle.begin_paid_proposal_for_scope(scope)?
+        };
         self.finish_begin(proposal, delta_bytes)
     }
 
@@ -185,11 +254,33 @@ impl RootPayloadSource<'_> {
         {
             let state = inner.state.lock().unwrap();
             node(&state, self.root, self.fence.lane)?;
+            if self.fence.canonical {
+                root_domains::validate_captured(
+                    &state,
+                    self.root,
+                    &self.payload,
+                    self.root,
+                    self.writer_revision,
+                )?;
+                root_domains::validate_captured(
+                    &state,
+                    self.root,
+                    &self.control,
+                    self.root,
+                    self.writer_revision,
+                )?;
+            }
             if delta_bytes > super::root_stage::maximum_payload_increment(&state, self.root)? {
                 return Err(WorkError::Capacity("Root protected payload increment"));
             }
         }
-        match (JointAdmissionHandle { inner }).try_begin_paid_proposal_for_scope(scope)? {
+        let handle = JointAdmissionHandle { inner };
+        let begin = if self.fence.canonical {
+            handle.try_begin_root_writer(scope, self.fence.lane, self.writer_revision)?
+        } else {
+            handle.try_begin_paid_proposal_for_scope(scope)?
+        };
+        match begin {
             JointTryBegin::Full(wait) => Ok(JointTryBegin::Full(wait)),
             JointTryBegin::Started(proposal) => self
                 .finish_begin(proposal, delta_bytes)
@@ -202,6 +293,14 @@ impl RootPayloadSource<'_> {
         mut proposal: JointProposal,
         delta_bytes: u64,
     ) -> Result<RootPayloadProposal, WorkError> {
+        if self.fence.canonical {
+            let state = proposal.scope.inner.state.lock().unwrap();
+            root_domains::validate_construction(
+                &state,
+                self.root,
+                proposal.custody.as_ref().and_then(|c| c.key),
+            )?;
+        }
         proposal.root_payload = Some(self.fence);
         let mut physical = Vec::new();
         physical
@@ -221,6 +320,23 @@ impl RootPayloadSource<'_> {
             self.payload,
             JointResources::ZERO.with(JointResource::PayloadBytes, delta_bytes),
         )?;
+        if self.fence.canonical {
+            let (epoch, active) = {
+                let state = proposal.scope.inner.state.lock().unwrap();
+                let domains = state.nodes[&self.root]
+                    .root_domains
+                    .as_ref()
+                    .ok_or(WorkError::Conflict)?;
+                (domains.epoch, Arc::clone(&domains.active))
+            };
+            super::root_stage::merge(&mut proposal, &active)?;
+            proposal.root_domain = Some(RootDomainChange {
+                root: self.root,
+                epoch,
+                candidate: active,
+                lane: self.fence.lane,
+            });
+        }
         Ok(RootPayloadProposal {
             control: self.control,
             physical,
@@ -253,6 +369,15 @@ impl RootPayloadProposal {
         self.proposal.arm()?;
         let result = (|| {
             self.proposal.end()?;
+            if let Some(change) = &mut self.proposal.root_domain {
+                let payload = &mut self.proposal.records[0];
+                change.candidate = Arc::clone(&payload.claim.facts.dependencies);
+                // Root D changes once; the original payload local S is not
+                // rewritten, and no control/other-source revision is mutated.
+                payload.claim.facts = Arc::clone(payload.original_facts.as_ref().unwrap());
+                self.phase = 1;
+                return Ok(());
+            }
             self.proposal.begin(
                 Some(self.control.clone()),
                 JointLane::Custody,
@@ -330,6 +455,49 @@ pub(in crate::joint_admission::ledger) fn validate_root_payload(
     changes: &[ChangeRecord],
 ) -> Result<(), WorkError> {
     node(state, root, fence.lane)?;
+    if fence.canonical {
+        if changes.len() != 1 {
+            return Err(WorkError::Conflict);
+        }
+        let change = &changes[0];
+        let source = change.source.as_ref().ok_or(WorkError::Conflict)?;
+        let row = state
+            .joint
+            .as_ref()
+            .unwrap()
+            .claims
+            .get(&fence.payload)
+            .ok_or(WorkError::Released)?;
+        if source.id != fence.payload
+            || !matches!(source.source, ClaimSource::Payload { epoch } if epoch == fence.epoch)
+            || !matches!(row.custody, ClaimCustody::Payload { epoch, pins } if epoch == fence.epoch && pins != 0)
+            || row.owner != ClaimOwner::PhysicalWork(root)
+            || change.old != Some(source.id)
+            || change.claim.facts.key
+                != change
+                    .original_facts
+                    .as_ref()
+                    .ok_or(WorkError::Conflict)?
+                    .key
+        {
+            return Err(WorkError::Conflict);
+        }
+        let delta = change
+            .claim
+            .amounts
+            .checked_sub(change.original_amounts.ok_or(WorkError::Conflict)?)?;
+        if delta
+            != JointResources::ZERO.with(
+                JointResource::PayloadBytes,
+                delta.get(JointResource::PayloadBytes),
+            )
+            || delta.get(JointResource::PayloadBytes)
+                > super::root_stage::maximum_payload_increment(state, root)?
+        {
+            return Err(WorkError::Capacity("Root protected payload increment"));
+        }
+        return Ok(());
+    }
     let count = fence
         .physical
         .checked_add(2)
@@ -445,6 +613,14 @@ pub struct RootPayloadReady {
     batch: JointGrantedBatch,
 }
 impl RootPayloadReady {
+    pub fn install_domains_in(
+        &mut self,
+        root: &WorkScope,
+        payload: &RetainedPayloadGrant,
+    ) -> Result<crate::WorkloadProgressNotification, WorkError> {
+        self.install_in(root, payload, &[])
+    }
+
     pub fn install_in(
         &mut self,
         root: &WorkScope,
@@ -460,7 +636,7 @@ impl RootPayloadReady {
         if !Arc::ptr_eq(&inner, &root.inner) {
             return Err(WorkError::ForeignAuthority);
         }
-        inner.update_facts_silent(|state| {
+        let retired = inner.update_facts_silent(|state| {
             let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
             let request = ledger.requests.get(&id).ok_or(WorkError::Released)?;
             if let RequestPhase::Failed(error) = &request.phase {
@@ -480,6 +656,9 @@ impl RootPayloadReady {
             }
             let changes = request.changes.clone();
             validate_root_payload(state, root.id, fence, &changes)?;
+            if fence.canonical {
+                root_domains::validate_install(state, id, root.id)?;
+            }
             for (grant, change) in active
                 .iter()
                 .zip(changes.iter().skip(2).take(fence.physical))
@@ -494,13 +673,14 @@ impl RootPayloadReady {
             for change in changes.iter() {
                 let source = change.source.as_ref().ok_or(WorkError::Conflict)?;
                 let row = ledger.claims.get(&source.id).ok_or(WorkError::Released)?;
+                let observation = fence.canonical && root_domains::observation(change);
                 let mut committed = source.clone();
                 committed.structure_revision = committed
                     .structure_revision
-                    .checked_add(1)
+                    .checked_add(u64::from(!observation))
                     .ok_or(WorkError::ArithmeticOverflow)?;
                 authenticate_scope(state, row, &committed, root.id)?;
-                if row.pending != Some(id)
+                if row.pending != (if observation { None } else { Some(id) })
                     || row.amounts != change.claim.amounts
                     || row.facts.key != change.claim.facts.key
                     || row.active_amounts != change.original_amounts.ok_or(WorkError::Conflict)?
@@ -518,6 +698,9 @@ impl RootPayloadReady {
                     .ok_or(WorkError::ArithmeticOverflow)?;
             }
             for change in changes.iter() {
+                if fence.canonical && root_domains::observation(change) {
+                    continue;
+                }
                 let row = state
                     .joint
                     .as_mut()
@@ -530,9 +713,15 @@ impl RootPayloadReady {
                 row.pending = None;
                 row.structure_revision += 1;
             }
+            let retired = if fence.canonical {
+                root_domains::install(state, id)
+            } else {
+                None
+            };
             remove_request(state, id);
-            Ok(())
+            Ok(retired)
         })?;
+        drop(retired);
         receipt.id = None;
         Ok(crate::WorkloadProgressNotification::new(inner))
     }

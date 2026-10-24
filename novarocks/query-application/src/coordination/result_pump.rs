@@ -989,6 +989,57 @@ type DeliveryFuture<'a> =
 type ReadFuture =
     Pin<Box<dyn Future<Output = Result<RetainedRootReply, RootResultFetchFailure>> + Send>>;
 
+/// Minted only after this original Client pump consumed Root End, drained its
+/// real delivery/read slots and obtained its final actor success. Moving this
+/// token out is not P retirement: the supervisor consumes it after the pump
+/// and its driver frame have returned normally.
+pub(crate) struct ClientRowsComputedCut {
+    source: crate::admitted_query_context::ClientComputationCutHandle,
+    _activation: novarocks_coordination_contract::AttemptActivationIdentity,
+    _root: TaskIdentity,
+    sealing: Result<(), WorkError>,
+}
+impl ClientRowsComputedCut {
+    pub(crate) fn is_for(
+        &self,
+        source: &crate::admitted_query_context::ClientComputationCutHandle,
+    ) -> bool {
+        self.source.same_source(source)
+    }
+    pub(super) async fn retire_after_pump_exit(self) -> Result<(), WorkError> {
+        self.sealing.clone()?;
+        let source = self.source.clone();
+        source.retire_after_pump_exit(self).await
+    }
+}
+pub(super) struct RootPumpDecision {
+    pub(super) conclusion: LogicalConclusion,
+    pub(super) client_cut: Option<ClientRowsComputedCut>,
+}
+pub(super) async fn run_client_root_relay(
+    permit: RunningAttemptPermit,
+    root: TaskIdentity,
+    scope: WorkScope,
+    binding: RootRelayBinding,
+    statuses: AcceptedRootStatusSource,
+    native_terminal: NativeAttemptTerminalSource,
+    root_ack: super::RootAckTailReservation,
+    client: Option<crate::admitted_query_context::ClientComputationCutHandle>,
+) -> Result<RootPumpDecision, ResultPumpFailure> {
+    run_root_relay_core(
+        permit,
+        root,
+        scope,
+        binding,
+        statuses,
+        native_terminal,
+        root_ack,
+        None,
+        client,
+    )
+    .await
+}
+
 /// Relays one exact attempt's Backend-encoded root stream in order. The next
 /// item is read while the previous one is written; the cumulative ACK on
 /// each read is the prefix whose delivery receipts completed. Success seal
@@ -1013,8 +1064,10 @@ pub(crate) async fn run_root_relay(
         native_terminal,
         root_ack,
         None,
+        None,
     )
     .await
+    .map(|decision| decision.conclusion)
 }
 
 /// Relays provisional internal output while retaining the original attempt
@@ -1038,8 +1091,10 @@ pub(crate) async fn run_internal_root_relay(
         native_terminal,
         root_ack,
         Some(ready),
+        None,
     )
     .await
+    .map(|decision| decision.conclusion)
 }
 
 async fn run_root_relay_core(
@@ -1051,14 +1106,18 @@ async fn run_root_relay_core(
     native_terminal: NativeAttemptTerminalSource,
     root_ack: super::RootAckTailReservation,
     ready: Option<watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>>,
-) -> Result<LogicalConclusion, ResultPumpFailure> {
+    client: Option<crate::admitted_query_context::ClientComputationCutHandle>,
+) -> Result<RootPumpDecision, ResultPumpFailure> {
     let RootRelayBinding {
         port,
         mut frontier,
         window,
         max_wait,
     } = binding;
-    if statuses.root != root
+    if client
+        .as_ref()
+        .is_some_and(|client| !client.is_for_scope(&scope))
+        || statuses.root != root
         || frontier.root() != root
         || permit.identity().execution() != root.query_execution_id()
         || !window.is_for_scope(&scope)
@@ -1304,7 +1363,11 @@ async fn run_root_relay_core(
     }
     if let Some(ready) = ready {
         return finish_internal_relay(&mut runtime, &observer_owner, permit, root, end, ready)
-            .await;
+            .await
+            .map(|conclusion| RootPumpDecision {
+                conclusion,
+                client_cut: None,
+            });
     }
     if !runtime.success_sealed {
         let seal_reply = match runtime.statuses.begin_success_seal_request() {
@@ -1337,8 +1400,29 @@ async fn run_root_relay_core(
     if let Err(interruption) = runtime.await_success_seal().await {
         return Err(bound_pump_interruption(&observer_owner, permit, interruption).await);
     }
+    let activation = permit.identity();
     match permit.finish_result_stream().await {
-        Ok(conclusion) => Ok(conclusion),
+        Ok(conclusion) => {
+            let client_cut = if conclusion == LogicalConclusion::Succeeded {
+                if let Some(source) = client {
+                    let sealing = source.seal_producer();
+                    Some(ClientRowsComputedCut {
+                        source,
+                        _activation: activation,
+                        _root: root,
+                        sealing,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            Ok(RootPumpDecision {
+                conclusion,
+                client_cut,
+            })
+        }
         Err(error) => Err(finish_handoff_failure(observer_owner, error).await),
     }
 }

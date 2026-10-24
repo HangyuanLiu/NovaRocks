@@ -445,6 +445,21 @@ pub struct StreamingStatementResult {
 }
 
 impl StreamingStatementResult {
+    pub(crate) fn from_verified_execution(
+        mut execution: ExecutionHandle,
+        statement: GovernedQueryStatementOwner,
+    ) -> Self {
+        let Some(ExecutionOutput::Rows(stream)) = execution.take_output() else {
+            unreachable!("same verified original output");
+        };
+        Self {
+            execution,
+            stream,
+            protocol: GovernedProtocolOwner::new(statement),
+            settled: false,
+        }
+    }
+
     pub fn try_from_execution(
         mut execution: ExecutionHandle,
         statement: GovernedQueryStatementOwner,

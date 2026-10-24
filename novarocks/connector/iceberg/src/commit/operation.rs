@@ -834,6 +834,14 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_is_independent_of_request_stop_and_retains_budget_remainder() {
+        assert_eq!(
+            novarocks_spi::connector::ConnectorCleanupScanSafety::Unproven
+                .require_scanned_object_gc()
+                .unwrap_err()
+                .kind(),
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+        );
+        // This exact original artifact ledger remains independently eligible.
         let dir = tempfile::tempdir().unwrap();
         let stop = ConnectorStopOwner::new();
         let operation = operation(

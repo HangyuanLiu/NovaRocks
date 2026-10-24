@@ -228,6 +228,7 @@ impl WorkloadControl {
                 }
                 let facts = Arc::new(ProfileFacts {
                     key: Arc::new(ProfileKey {
+                        origin: GroupOrigin::Frozen,
                         class,
                         lane: JointLane::Custody as usize,
                         dependencies: Vec::new(),
@@ -235,7 +236,7 @@ impl WorkloadControl {
                     }),
                     class: classes[class],
                     lane: JointLane::Custody,
-                    dependencies: Arc::from(Vec::<DependencyRef>::new()),
+                    dependencies: Arc::new(Vec::<DependencyRef>::new()),
                 });
                 empty_facts[class] = Some(Arc::clone(&facts));
                 free_heads[class] = Some(SlotId(slots.len()));
@@ -265,6 +266,7 @@ impl WorkloadControl {
                         ));
                     }
                     slots.push(ControlSlot {
+                        retired_root_domains: None,
                         cell: Some(cell),
                         proposals,
                         polls,
@@ -279,6 +281,9 @@ impl WorkloadControl {
                     claims.insert(
                         claim,
                         ClaimRecord {
+                            domain_birth: None,
+                            native_dispatch: None,
+                            dispatch_staging: None,
                             custody: ClaimCustody::Raw,
                             production: None,
                             owner: ClaimOwner::ControlSlot(id),
@@ -324,7 +329,9 @@ impl WorkloadControl {
 impl JointLedger {
     pub(crate) fn control_is_empty(&self, claim: u64) -> bool {
         self.claims.get(&claim).is_some_and(|record| {
-            record.facts.dependencies.is_empty()
+            record.facts.key.origin == GroupOrigin::Frozen
+                && record.active_facts.key.origin == GroupOrigin::Frozen
+                && record.facts.dependencies.is_empty()
                 && record.active_facts.dependencies.is_empty()
                 && record.pending.is_none()
         })
@@ -447,6 +454,7 @@ impl JointLedger {
         let ordinal = dependency.ordinal;
         let to = Arc::new(ProfileFacts {
             key: Arc::new(ProfileKey {
+                origin: GroupOrigin::Frozen,
                 class: class_index(from.class),
                 lane: from.lane as usize,
                 dependencies: vec![ordinal],
@@ -454,7 +462,7 @@ impl JointLedger {
             }),
             class: from.class,
             lane: from.lane,
-            dependencies: Arc::from(vec![dependency]),
+            dependencies: Arc::new(vec![dependency]),
         });
         subtract_profile(self, &from, amount);
         add_profile(self, Arc::clone(&to), amount);

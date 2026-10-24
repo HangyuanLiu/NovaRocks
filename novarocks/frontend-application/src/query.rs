@@ -115,12 +115,21 @@ use novarocks_workload_control::{
 use novarocks_workload_control::{WorkError, WorkOwner};
 
 pub(crate) mod compiler;
+pub(crate) mod ctas_action;
+pub(crate) mod delete_action;
 mod explain_action;
+pub(crate) mod insert_action;
 mod maintenance_action;
+pub(crate) mod mutation_action;
+pub(crate) mod read_action;
 mod statement_action;
+pub(crate) mod statement_computation;
+mod statement_publication;
+pub(crate) mod write_action;
 pub(crate) use explain_action::{
     ExplainStatementGeometry, statement_action_geometry as explain_statement_geometry,
 };
+pub(crate) use maintenance_action::fixed_source_bytes as metadata_statement_fixed_source_bytes;
 
 const DEFAULT_CATALOG: &str = "default_catalog";
 
@@ -1975,107 +1984,8 @@ impl FrontendQuerySession {
         }
 
         let state = self.state.lock().map_err(poisoned_state)?.clone();
-        let prepared = match self
-            .prepare_governed_query_operation(
-                &sql,
-                parsed_statement,
-                state,
-                deadline,
-                timeout_ms,
-                statement.token(),
-                statement.cancellation().clone(),
-                statement.scope(),
-                statement.result_window_alias(),
-                purpose,
-            )
+        self.execute_observed_read(sql, parsed_statement, state, deadline, statement, purpose)
             .await
-        {
-            Ok(prepared) => prepared,
-            Err(GovernedPreparationError::Cancelled(error)) => {
-                let _ = statement.finish_unstarted_read_after_cancellation();
-                return Err(error);
-            }
-            Err(GovernedPreparationError::Service(error)) => {
-                let _ = statement.finish();
-                return Err(error);
-            }
-        };
-        let read = match prepared {
-            PreparedQueryOperation::Immediate(operation) => {
-                return match operation.into_result() {
-                    StatementResult::Query(result) => {
-                        Ok(self.governed_local_result(result, statement))
-                    }
-                    StatementResult::GovernedQuery(_)
-                    | StatementResult::StreamingQuery(_)
-                    | StatementResult::GovernedCompletion(_)
-                    | StatementResult::GovernedError(_) => {
-                        let _ = statement.finish();
-                        Err(internal_error(
-                            "plain query preparation returned an already-owned protocol result",
-                        ))
-                    }
-                    StatementResult::Ok => {
-                        let _ = statement.finish();
-                        Err(internal_error(
-                            "plain query preparation returned completion-only immediate output",
-                        ))
-                    }
-                };
-            }
-            PreparedQueryOperation::LogicalRead(read) => read,
-            PreparedQueryOperation::Distributed(_) => {
-                let _ = statement.finish();
-                return Err(internal_error(
-                    "plain query preparation returned a legacy distributed operation",
-                ));
-            }
-        };
-        let owner = statement
-            .take_execution_owner()
-            .expect("governed query start transfers its root owner exactly once");
-        let start = {
-            self.service.logical_execution_launcher.start(
-                read,
-                owner,
-                statement.result_window_alias(),
-                #[cfg(novarocks_dev_controls)]
-                self.service
-                    .statement_observation
-                    .as_ref()
-                    .and_then(|owner| owner.bound_statement(statement.token())),
-            )
-        };
-        let execution = match start.await {
-            Ok(execution) => execution,
-            Err(error) => {
-                let completion = statement.finish();
-                return Err(governed_execution_error(error, completion));
-            }
-        };
-        #[cfg(novarocks_dev_controls)]
-        let handoff_statement = statement.token();
-        #[cfg(novarocks_dev_controls)]
-        let handoff_target = self
-            .service
-            .statement_observation
-            .as_ref()
-            .and_then(|owner| owner.bound_statement(handoff_statement))
-            .and_then(|handle| handle.statement_target());
-        let result = novarocks_query_application::protocol_delivery::StreamingStatementResult::try_from_execution(
-            execution,
-            statement,
-        ).map_err(governed_query_execution_error)?;
-        #[cfg(novarocks_dev_controls)]
-        if let Some(control) = &self.service.result_handoff {
-            // Only an independent, exact role grant may delay this original
-            // protocol handoff. Observation identity alone grants no control.
-            control
-                .before_protocol(handoff_statement, handoff_target, result.failure_view())
-                .await
-                .map_err(internal_error)?;
-        }
-        Ok(StatementResult::StreamingQuery(result))
     }
 
     async fn execute_typed_statement(
@@ -2368,6 +2278,155 @@ impl FrontendQuerySession {
                     .await;
             }
         }
+        if let ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::Insert(insert)) =
+            &parsed_statement
+        {
+            let (command, reference) = match dml.prepare_insert_shape(insert, &sql) {
+                Ok(value) => value,
+                Err(error) => {
+                    return Ok(self.governed_typed_error(
+                        routed_execution_service_error(dml_result::<()>(Err(error)).unwrap_err()),
+                        statement,
+                    ));
+                }
+            };
+            let action = match insert_engine.prepare_statement_action(
+                crate::query_execution::dml::insert::InsertStatementInput {
+                    command,
+                    reference,
+                    sql,
+                    context,
+                    query_options,
+                    launcher: Arc::clone(&self.service.logical_execution_launcher),
+                    #[cfg(novarocks_dev_controls)]
+                    observation,
+                },
+            ) {
+                Ok(action) => action,
+                Err(error) => {
+                    return Ok(self.governed_typed_error(internal_error(error), statement));
+                }
+            };
+            return self
+                .execute_observed_statement_action(statement, action)
+                .await;
+        }
+        let parsed_statement = match parsed_statement {
+            ParsedStatement::Dml(
+                value @ (novarocks_parser::ast::DmlStatement::Update(_)
+                | novarocks_parser::ast::DmlStatement::Merge(_)),
+            ) => {
+                let lowered = match dml.prepare_mutation_shape(&value, &sql) {
+                    Ok(lowered) => lowered,
+                    Err(error) => {
+                        return Ok(self.governed_typed_error(
+                            routed_execution_service_error(
+                                dml_result::<()>(Err(error)).unwrap_err(),
+                            ),
+                            statement,
+                        ));
+                    }
+                };
+                let action = match mutation_engine.prepare_statement_action(
+                    crate::query_execution::dml::mutation::MutationStatementInput {
+                        statement: lowered,
+                        sql,
+                        context,
+                        query_options,
+                        launcher: Arc::clone(&self.service.logical_execution_launcher),
+                        #[cfg(novarocks_dev_controls)]
+                        observation,
+                    },
+                ) {
+                    Ok(action) => action,
+                    Err(error) => {
+                        return Ok(self.governed_typed_error(internal_error(error), statement));
+                    }
+                };
+                return self
+                    .execute_observed_statement_action(statement, action)
+                    .await;
+            }
+            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::CreateTableAsSelect(
+                value,
+            )) => {
+                let action = match ctas_engine.prepare_statement_action(
+                    crate::query_execution::dml::ctas::CtasStatementInput {
+                        statement: value,
+                        sql,
+                        context,
+                        query_options,
+                        launcher: Arc::clone(&self.service.logical_execution_launcher),
+                        #[cfg(novarocks_dev_controls)]
+                        observation,
+                    },
+                ) {
+                    Ok(action) => action,
+                    Err(error) => {
+                        return Ok(self.governed_typed_error(
+                            routed_execution_service_error(
+                                dml_result::<()>(Err(error)).unwrap_err(),
+                            ),
+                            statement,
+                        ));
+                    }
+                };
+                return self
+                    .execute_observed_statement_action(statement, action)
+                    .await;
+            }
+            other => other,
+        };
+        let (parsed_statement, delete_statement) = match parsed_statement {
+            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::Delete(statement)) => (
+                None,
+                Some(
+                    crate::query_execution::dml::delete::OwnedDeleteStatement::Predicate(statement),
+                ),
+            ),
+            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::AddEqualityDelete(
+                statement,
+            )) => (
+                None,
+                Some(
+                    crate::query_execution::dml::delete::OwnedDeleteStatement::Equality(statement),
+                ),
+            ),
+            statement => (Some(statement), None),
+        };
+        if let Some(delete_statement) = delete_statement {
+            use crate::query_execution::dml::delete::{DeleteStatement, OwnedDeleteStatement};
+            let borrowed = match &delete_statement {
+                OwnedDeleteStatement::Predicate(value) => DeleteStatement::Predicate(value),
+                OwnedDeleteStatement::Equality(value) => DeleteStatement::Equality(value),
+            };
+            if let Err(error) = dml.admit_delete_shape(borrowed, &sql) {
+                return Ok(self.governed_typed_error(
+                    routed_execution_service_error(dml_result::<()>(Err(error)).unwrap_err()),
+                    statement,
+                ));
+            }
+            let action = match delete_engine.prepare_statement_action(
+                crate::query_execution::dml::delete::DeleteStatementInput {
+                    statement: delete_statement,
+                    sql,
+                    context,
+                    query_options,
+                    launcher: Arc::clone(&self.service.logical_execution_launcher),
+                    #[cfg(novarocks_dev_controls)]
+                    observation,
+                },
+            ) {
+                Ok(action) => action,
+                Err(error) => {
+                    return Ok(self.governed_typed_error(internal_error(error), statement));
+                }
+            };
+            return self
+                .execute_observed_statement_action(statement, action)
+                .await;
+        }
+        let parsed_statement = parsed_statement.expect("remaining typed statement is retained");
         let producer_window = command_context.result_window_alias();
         let execution_owner = statement
             .take_execution_owner()
@@ -2378,157 +2437,21 @@ impl FrontendQuerySession {
             ParsedStatement::ExplainQuery(_) => {
                 unreachable!("EXPLAIN was transferred to its original statement source")
             }
-            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::Delete(statement)) => {
-                let prepare_dml = Arc::clone(&dml);
-                let execute_dml = dml;
-                let prepare_engine = Arc::clone(&delete_engine);
-                let execute_engine = delete_engine;
-                let prepare_context = context.clone();
-                let prepare_options = query_options.clone();
-                Box::pin(execute_prepared_dml_statement(
-                    synchronous_command_executor,
-                    worker_cancellation,
-                    execution_owner,
-                    producer_window,
-                    move || {
-                        dml_result(prepare_dml.prepare_delete(
-                            prepare_engine.as_ref(),
-                            crate::query_execution::dml::delete::DeleteStatement::Predicate(
-                                &statement,
-                            ),
-                            &sql,
-                            &prepare_context,
-                            Some(&prepare_options),
-                        ))
-                    },
-                    move |prepared| {
-                        dml_statement_result(
-                            execute_dml.execute_prepared_delete(execute_engine.as_ref(), prepared),
-                        )
-                    },
-                ))
+            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::Delete(_)) => {
+                unreachable!("DELETE was transferred to its original statement action")
             }
-            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::Insert(statement)) => {
-                let prepare_dml = Arc::clone(&dml);
-                let execute_dml = dml;
-                let prepare_engine = Arc::clone(&insert_engine);
-                let execute_engine = insert_engine;
-                let prepare_context = context.clone();
-                let prepare_options = query_options.clone();
-                Box::pin(execute_prepared_dml_statement(
-                    synchronous_command_executor,
-                    worker_cancellation,
-                    execution_owner,
-                    producer_window,
-                    move || {
-                        dml_result(prepare_dml.prepare_insert(
-                            prepare_engine.as_ref(),
-                            &statement,
-                            &sql,
-                            &prepare_context,
-                            Some(&prepare_options),
-                        ))
-                    },
-                    move |prepared| {
-                        dml_statement_result(
-                            execute_dml.execute_prepared_insert(execute_engine.as_ref(), prepared),
-                        )
-                    },
-                ))
+            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::Insert(_)) => {
+                unreachable!("INSERT was transferred to its original statement action")
             }
-            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::AddEqualityDelete(
-                statement,
-            )) => {
-                let prepare_dml = Arc::clone(&dml);
-                let execute_dml = dml;
-                let prepare_engine = Arc::clone(&delete_engine);
-                let execute_engine = delete_engine;
-                let prepare_context = context.clone();
-                let prepare_options = query_options.clone();
-                Box::pin(execute_prepared_dml_statement(
-                    synchronous_command_executor,
-                    worker_cancellation,
-                    execution_owner,
-                    producer_window,
-                    move || {
-                        dml_result(prepare_dml.prepare_delete(
-                            prepare_engine.as_ref(),
-                            crate::query_execution::dml::delete::DeleteStatement::Equality(
-                                &statement,
-                            ),
-                            &sql,
-                            &prepare_context,
-                            Some(&prepare_options),
-                        ))
-                    },
-                    move |prepared| {
-                        dml_statement_result(
-                            execute_dml.execute_prepared_delete(execute_engine.as_ref(), prepared),
-                        )
-                    },
-                ))
+            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::AddEqualityDelete(_)) => {
+                unreachable!("equality DELETE was transferred to its original statement action")
             }
             ParsedStatement::Dml(
-                statement @ (novarocks_parser::ast::DmlStatement::Update(_)
-                | novarocks_parser::ast::DmlStatement::Merge(_)),
+                novarocks_parser::ast::DmlStatement::Update(_)
+                | novarocks_parser::ast::DmlStatement::Merge(_)
+                | novarocks_parser::ast::DmlStatement::CreateTableAsSelect(_),
             ) => {
-                let prepare_dml = Arc::clone(&dml);
-                let execute_dml = dml;
-                let prepare_engine = Arc::clone(&mutation_engine);
-                let execute_engine = mutation_engine;
-                let prepare_context = context.clone();
-                let prepare_options = query_options.clone();
-                Box::pin(execute_prepared_dml_statement(
-                    synchronous_command_executor,
-                    worker_cancellation,
-                    execution_owner,
-                    producer_window,
-                    move || {
-                        dml_result(prepare_dml.prepare_typed_mutation(
-                            prepare_engine.as_ref(),
-                            &statement,
-                            &sql,
-                            &prepare_context,
-                            Some(&prepare_options),
-                        ))
-                    },
-                    move |prepared| {
-                        dml_statement_result(
-                            execute_dml
-                                .execute_prepared_mutation(execute_engine.as_ref(), prepared),
-                        )
-                    },
-                ))
-            }
-            ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::CreateTableAsSelect(
-                statement,
-            )) => {
-                let prepare_dml = Arc::clone(&dml);
-                let execute_dml = dml;
-                let prepare_engine = Arc::clone(&ctas_engine);
-                let execute_engine = ctas_engine;
-                let prepare_context = context.clone();
-                let prepare_options = query_options.clone();
-                Box::pin(execute_prepared_dml_statement(
-                    synchronous_command_executor,
-                    worker_cancellation,
-                    execution_owner,
-                    producer_window,
-                    move || {
-                        dml_result(prepare_dml.prepare_ctas(
-                            prepare_engine.as_ref(),
-                            &statement,
-                            &sql,
-                            &prepare_context,
-                            Some(&prepare_options),
-                        ))
-                    },
-                    move |prepared| {
-                        dml_statement_result(
-                            execute_dml.execute_prepared_ctas(execute_engine.as_ref(), prepared),
-                        )
-                    },
-                ))
+                unreachable!("mutation or CTAS was transferred to its original statement action")
             }
             ParsedStatement::Table(table_statement) => Box::pin(async move {
                 let command = validate_table_statement_admission(&table_statement, &sql)
@@ -5014,6 +4937,16 @@ mod tests {
     }
 
     impl MutationEngine for RejectingMutationEngine {
+        fn prepare_statement_action(
+            &self,
+            _: crate::query_execution::dml::mutation::MutationStatementInput,
+        ) -> Result<
+            Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+            String,
+        > {
+            Err("legacy recording fixture has no governed mutation source".into())
+        }
+
         fn prepare_mutation(
             &self,
             _request: PrepareMutationRequest<'_>,
@@ -5034,6 +4967,16 @@ mod tests {
     }
 
     impl MutationEngine for RecordingMutationEngine {
+        fn prepare_statement_action(
+            &self,
+            _: crate::query_execution::dml::mutation::MutationStatementInput,
+        ) -> Result<
+            Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+            String,
+        > {
+            Err("legacy recording fixture has no governed mutation source".into())
+        }
+
         fn prepare_mutation(
             &self,
             request: PrepareMutationRequest<'_>,
@@ -5079,6 +5022,16 @@ mod tests {
     }
 
     impl DeleteEngine for RecordingDeleteEngine {
+        fn prepare_statement_action(
+            &self,
+            _: crate::query_execution::dml::delete::DeleteStatementInput,
+        ) -> Result<
+            Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+            String,
+        > {
+            Err("legacy recording fixture has no governed DELETE source".into())
+        }
+
         fn prepare_delete(
             &self,
             request: PrepareDeleteRequest<'_>,
@@ -5135,6 +5088,16 @@ mod tests {
     }
 
     impl InsertEngine for RecordingInsertEngine {
+        fn prepare_statement_action(
+            &self,
+            _input: crate::query_execution::dml::insert::InsertStatementInput,
+        ) -> Result<
+            Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+            String,
+        > {
+            Err("legacy recording fixture has no governed INSERT source".into())
+        }
+
         fn resolve_target(
             &self,
             request: ResolveInsertTarget,

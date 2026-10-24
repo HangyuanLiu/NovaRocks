@@ -603,7 +603,8 @@ pub fn compose_frontend_role_config(
         result_profile,
         task_execution_budgets.transport,
         ingress,
-        provider_manifest.metadata_maintenance_io_geometry()?,
+        provider_manifest.statement_io_geometry()?,
+        provider_manifest.staged_create_source_bytes()?,
     )
     .context("compose frontend original-source workload capacity profile")?;
     // The fifth input and the actual pool consume one frozen configuration.
@@ -1366,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn task_execution_budgets_default_to_the_frozen_contract_values() {
+    fn task_execution_budgets_use_frozen_wire_and_server_queue_policy() {
         let config = crate::app_config::NovaRocksConfig::default();
         let budgets = compose_task_execution_budgets(&config).expect("default budgets");
 
@@ -1399,7 +1400,7 @@ mod tests {
         );
         assert_eq!(
             budgets.transport.max_backend_queued_bytes(),
-            frozen.max_backend_queued_bytes()
+            config.runtime.task_backend_max_queued_bytes
         );
         assert_eq!(
             budgets.transport.max_tasks_per_context(),
@@ -1445,16 +1446,65 @@ mod tests {
             result,
             transport,
             compose_frontend_statement_ingress().unwrap(),
-            providers.metadata_maintenance_io_geometry().unwrap(),
+            providers.statement_io_geometry().unwrap(),
+            providers.staged_create_source_bytes().unwrap(),
         )
         .expect("original configured action bounds compose without a role or lease");
         let facts = profile.composition_facts().unwrap();
         assert!(facts.maximum_dependencies > 0);
         assert!(facts.maximum_native_owned_increment > 0);
-        assert!(facts.maximum_protected_payload_increment > 0);
+        assert!(
+            facts.maximum_protected_payload_increment >= result.internal_initial_payload_bytes()
+        );
+        // This is an explicit default capability policy in dependency domains,
+        // not a backend count or a promise about every graph's complete union.
+        assert!(facts.maximum_dependencies >= 8);
+        assert!(transport.max_batch_items() >= 32);
         assert!(facts.metadata_source_bytes > 0);
         assert_eq!(facts.proposals_per_slot, 6);
         assert_eq!(profile.policy().scope_limit(), workload.scope_records_limit);
+    }
+
+    #[test]
+    fn explicit_smaller_custody_and_native_queue_retain_a_smaller_full_domain_bound() {
+        let mut config = crate::app_config::NovaRocksConfig::default();
+        config
+            .runtime
+            .frontend_workload
+            .dependency_custody
+            .retained_payload_bytes = 4 << 30;
+        config.runtime.task_backend_max_queued_bytes = 512 * 1024 * 1024;
+        let (_, workload, _, result, inputs) =
+            compose_frontend_workload_runtime(&config.runtime).unwrap();
+        let transport = compose_task_execution_budgets(&config).unwrap().transport;
+        assert_eq!(transport.max_backend_queued_bytes(), 512 * 1024 * 1024);
+        assert_eq!(
+            inputs.policy().dependency_custody().retained_payload_bytes,
+            4 << 30
+        );
+        let providers = ServerProviderManifest::seal().unwrap();
+        let profile = FrontendWorkloadCapacityProfile::try_for_native(
+            inputs,
+            &workload,
+            result,
+            transport,
+            compose_frontend_statement_ingress().unwrap(),
+            providers.statement_io_geometry().unwrap(),
+            providers.staged_create_source_bytes().unwrap(),
+        )
+        .expect("the smaller explicit policy retains bounded source support");
+        let facts = profile.composition_facts().unwrap();
+        assert!(
+            facts.maximum_dependencies < 8,
+            "explicit limits cannot silently inherit the larger default capability"
+        );
+        assert!(
+            facts.maximum_protected_payload_increment >= result.internal_initial_payload_bytes()
+        );
+        assert_eq!(
+            profile.policy().dependency_custody().retained_payload_bytes,
+            4 << 30
+        );
     }
 
     #[test]
@@ -1702,7 +1752,7 @@ mod frontend_capacity_input_tests {
         assert_eq!(inputs.policy().scope_limit(), workload.scope_records_limit);
         assert_eq!(
             inputs.policy().dependency_custody().retained_payload_bytes,
-            4 << 30
+            12 << 30
         );
         runtime.frontend_workload.scope_slots.management = 0;
         assert!(compose_frontend_workload_runtime(&runtime).is_err());

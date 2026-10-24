@@ -31,16 +31,18 @@ pub use ledger::{
     AsyncActionAdmission, AsyncActionGrant, AsyncActionSource, BlockingActionAdmission,
     BlockingActionSource, ControlBindingProposal, InternalComputationAlias,
     InternalComputationGrant, InternalCpuActionAdmission, InternalCpuActionSource,
-    InternalCpuFactoryBinding, InternalResultClosedFactoryDescriptor, JointAdjustmentReceipt,
-    JointAdmission, JointAdmissionFailure, JointAdmissionHandle, JointClaim, JointClaimView,
-    JointGrantedBatch, JointGrantedClaims, JointLocalGrant, JointLocalOffer, JointProposal,
-    JointProposalSlotSignal, JointProposalSlotWait, JointTryBegin, NativeAsyncActionAdmission,
-    NativeAsyncActionAuthority, NativeAsyncActionGrant, NativeAsyncActionQuote,
-    NativeAsyncActionSource, NativeQueuedInputAdmission, NativeQueuedInputGrant,
-    NativeQueuedInputQuote, NativeQueuedInputReady, NativeReplyGrant, RetainedPayloadAlias,
-    RetainedPayloadGrant, RootPayloadAdmission, RootPayloadInitialAdmission,
+    InternalCpuFactoryBinding, InternalManifestBinding, InternalResultClosedFactoryDescriptor,
+    JointAdjustmentReceipt, JointAdmission, JointAdmissionFailure, JointAdmissionHandle,
+    JointClaim, JointClaimView, JointGrantedBatch, JointGrantedClaims, JointLocalGrant,
+    JointLocalOffer, JointProposal, JointProposalSlotSignal, JointProposalSlotWait, JointTryBegin,
+    NativeAsyncActionAdmission, NativeAsyncActionAuthority, NativeAsyncActionGrant,
+    NativeAsyncActionQuote, NativeAsyncActionSource, NativeDispatchFrozen, NativeDispatchSource,
+    NativeQueuedInputAdmission, NativeQueuedInputGrant, NativeQueuedInputQuote,
+    NativeQueuedInputReady, NativeReplyGrant, RetainedPayloadAlias, RetainedPayloadGrant,
+    RootDomainBinding, RootDomainInitialAdmission, RootDomainInitialProposal,
+    RootDomainInitialSource, RootPayloadAdmission, RootPayloadInitialAdmission,
     RootPayloadInitialSource, RootPayloadProposal, RootPayloadReady, RootPayloadSource,
-    RootStageAdmission, RootStageProposal, RootStageReady, RootStageSource,
+    RootStageAdmission, RootStageProposal, RootStageReady, RootStageSource, SourceCohort,
     UnreceivedProductionAdmission, UnreceivedProductionGrant, UnreceivedProductionOwner,
     UnreceivedProductionQuote, UnreceivedProductionReady,
 };
@@ -234,15 +236,43 @@ impl JointCapacityConfig {
         self.validate_inner(required, Some(factory), Some(authority))
     }
 
+    /// Check a proposed deployment's geometry using the original pure closed
+    /// CPU factory's queue quote. This hypothetical contribution is not source
+    /// authentication: no registered source, authority, readiness or installable
+    /// validated capacity is returned. Installation must still validate against
+    /// the same authority's actual registered CPU factory.
+    pub fn check_composition_geometry(
+        &self,
+        required: &RequiredJointProgress,
+        closed_cpu_queue_bytes: NonZeroU64,
+    ) -> Result<(), WorkError> {
+        self.check_geometry(required, Some(closed_cpu_queue_bytes))
+    }
+
     fn validate_inner(
         self,
         required: &RequiredJointProgress,
         internal_cpu_factory: Option<InternalResultClosedFactoryDescriptor>,
         source_authority: Option<std::sync::Weak<crate::scope::Inner>>,
     ) -> Result<ValidatedJointCapacityConfig, WorkError> {
-        let finite_queue_bytes = internal_cpu_factory
-            .as_ref()
-            .map(|source| source.queue_bytes());
+        self.check_geometry(
+            required,
+            internal_cpu_factory
+                .as_ref()
+                .map(|source| source.queue_bytes()),
+        )?;
+        Ok(ValidatedJointCapacityConfig {
+            config: self,
+            internal_cpu_factory,
+            source_authority,
+        })
+    }
+
+    fn check_geometry(
+        &self,
+        required: &RequiredJointProgress,
+        finite_queue_bytes: Option<NonZeroU64>,
+    ) -> Result<(), WorkError> {
         if self.max_dependencies_per_claim == 0
             || self.max_dependencies_per_claim > self.max_registered_dependencies
             || self.max_registered_dependencies > u32::MAX as usize
@@ -336,11 +366,7 @@ impl JointCapacityConfig {
                 return Err(WorkError::InvalidConfig("joint lane class reservation"));
             }
         }
-        Ok(ValidatedJointCapacityConfig {
-            config: self,
-            internal_cpu_factory,
-            source_authority,
-        })
+        Ok(())
     }
 
     fn validate_projection(

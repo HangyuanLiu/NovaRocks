@@ -404,7 +404,7 @@ impl PaimonFixture {
             }),
             Arc::new(NoMaterializedViews),
             Arc::new(
-                FrontendProviderReadFacts::new(
+                FrontendProviderReadFacts::binding_only(
                     Arc::clone(&self.host),
                     bindings,
                     crate::query_execution::compiler::typed_connector_session()

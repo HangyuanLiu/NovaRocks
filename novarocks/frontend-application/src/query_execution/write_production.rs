@@ -233,6 +233,34 @@ impl ConnectorWriteSession {
             }
         }
     }
+    pub(super) fn production_never_registered(&self) -> Result<bool, ConnectorError> {
+        let state = self
+            .productions
+            .lock()
+            .map_err(|_| production_error("write production state is poisoned"))?;
+        // The original owner remains after received rows settle, so clearing
+        // current does not turn a previously dispatched production into none.
+        Ok(state.current.is_none() && state.owner.is_none())
+    }
+    pub(super) fn production_fully_received(&self) -> Result<bool, ConnectorError> {
+        let owner = {
+            let state = self
+                .productions
+                .lock()
+                .map_err(|_| production_error("write production state is poisoned"))?;
+            if state.current.is_some() {
+                return Ok(false);
+            }
+            state.owner.clone()
+        };
+        match owner {
+            Some(owner) => owner
+                .pending_records()
+                .map(|count| count == 0)
+                .map_err(production_work_error),
+            None => Ok(false),
+        }
+    }
     pub(super) fn has_unreceived_productions(&self) -> Result<bool, ConnectorError> {
         let (current, owner) = {
             let state = self
@@ -351,4 +379,5 @@ fn encode_occurrences(
 }
 
 #[cfg(all(test, novarocks_dev_controls))]
+#[path = "write_production/tests.rs"]
 mod tests;

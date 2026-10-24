@@ -901,44 +901,185 @@ fn control_union_refusal_is_finite_and_never_discards_its_old_domain() {
 }
 
 #[test]
-fn waiting_pool_proposals_do_not_reserve_a_slot_or_block_a_new_root_binding() {
-    let (control, handle, mut driver) = prototype_full(4, 1);
-    let a = selected_dependency(&handle, "a");
-    let b = selected_dependency(&handle, "b");
-    let parent = root(&control);
-    let mut binding = first_bind(&handle, &parent.owner, &a);
-    drain(&mut driver);
-    binding_receipt(&mut binding)
-        .install_control(&parent.owner, &[])
-        .unwrap();
-    drain(&mut driver);
-    let mut first = handle
-        .request_child(&parent.owner, WorkRequest::new(WorkClass::Query))
-        .unwrap();
-    let mut second = handle
-        .request_child(&parent.owner, WorkRequest::new(WorkClass::Query))
-        .unwrap();
-    let newcomer = root(&control);
-    let mut binding = first_bind(&handle, &newcomer.owner, &b);
-    drain(&mut driver);
-    for request in [&mut first, &mut second] {
-        assert!(matches!(
-            std::pin::Pin::new(request).poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Err(crate::joint_admission::JointAdmissionFailure {
-                error: WorkError::Conflict
-            }))
-        ));
+fn concurrent_paid_child_proposals_reserve_distinct_backing_without_granting_work() {
+    let (control, handle, mut driver) = prototype_profile(5, 2, 2, 2);
+    let prepaid = snapshot(&control);
+    {
+        let a = selected_dependency(&handle, "a");
+        let b = selected_dependency(&handle, "b");
+        let parent = root(&control);
+        let parent_scope = parent.owner.scope();
+        let expected = [a.fact().clone(), b.fact().clone()];
+        let mut binding = handle
+            .request(
+                &parent_scope,
+                vec![crate::joint_admission::JointClaimChange::FirstBind {
+                    source: parent.owner.control_claim_view().unwrap(),
+                    dependencies: vec![a.clone(), b.clone()],
+                }],
+            )
+            .unwrap();
+        drain(&mut driver);
+        binding_receipt(&mut binding)
+            .install_control(&parent.owner, &[])
+            .unwrap();
+        drain(&mut driver);
+        let before = snapshot(&control);
+        let mut first = handle
+            .request_child(&parent.owner, WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let mut second = handle
+            .request_child(&parent.owner, WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let reserved = {
+            let state = control.inner.state.lock().unwrap();
+            let reserved = state
+                .cancellations
+                .slots
+                .iter()
+                .enumerate()
+                .filter_map(|(index, cell)| {
+                    matches!(cell.phase,
+                    SlotPhase::ChildQueued { parent: owner, .. } if owner == parent_scope.id)
+                    .then_some(SlotId(index))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(reserved.len(), 2);
+            assert_ne!(reserved[0], reserved[1]);
+            assert_eq!(state.nodes.len(), 1, "reservation cannot publish a Work");
+            assert_eq!(state.nodes[&parent_scope.id].children, 0);
+            for slot in &reserved {
+                let claim = state.cancellations.slots[slot.0].claim.unwrap();
+                assert!(
+                    state
+                        .joint
+                        .as_ref()
+                        .unwrap()
+                        .control_has_domains_for_test(claim, &[])
+                );
+            }
+            reserved
+        };
+        assert_eq!(
+            snapshot(&control),
+            before,
+            "a queued reservation cannot install domain fees"
+        );
+        // Another root still consumes the next genuinely spare position.
+        let newcomer = root(&control);
+        assert!(!reserved.contains(&slot(&control, newcomer.owner.scope().id())));
+        let mut newcomer_binding = first_bind(&handle, &newcomer.owner, &b);
+        drain(&mut driver);
+        let first_child = binding_receipt(&mut first)
+            .install_child(&parent.owner)
+            .unwrap();
+        let second_child = binding_receipt(&mut second)
+            .install_child(&parent.owner)
+            .unwrap();
+        binding_receipt(&mut newcomer_binding)
+            .install_control(&newcomer.owner, &[])
+            .unwrap();
+        let first_slot = slot(&control, first_child.scope().id());
+        let second_slot = slot(&control, second_child.scope().id());
+        assert_ne!(first_slot, second_slot);
+        for child_slot in [first_slot, second_slot] {
+            assert!(reserved.contains(&child_slot));
+            let state = control.inner.state.lock().unwrap();
+            let claim = state.cancellations.slots[child_slot.0].claim.unwrap();
+            assert!(
+                state
+                    .joint
+                    .as_ref()
+                    .unwrap()
+                    .control_has_domains_for_test(claim, &expected)
+            );
+        }
+        first_child.complete();
+        second_child.complete();
+        for work in [parent, newcomer] {
+            work.business.release();
+            work.owner.complete();
+        }
     }
-    binding_receipt(&mut binding)
-        .install_control(&newcomer.owner, &[])
-        .unwrap();
-    assert_eq!(snapshot(&control).3, 2);
-    for work in [parent, newcomer] {
-        work.business.release();
-        work.owner.complete();
+    drain(&mut driver);
+    assert_eq!(snapshot(&control), prepaid);
+    control.close_admission();
+    drain(&mut driver);
+    assert!(control.shutdown().is_ok());
+}
+
+#[test]
+fn concurrent_same_class_parents_keep_their_own_complete_child_domains() {
+    let (control, handle, mut driver) = prototype_profile(6, 1, 2, 2);
+    let prepaid = snapshot(&control);
+    {
+        let a = selected_dependency(&handle, "a");
+        let b = selected_dependency(&handle, "b");
+        let c = selected_dependency(&handle, "c");
+        let parents = [root(&control), root(&control)];
+        for (parent, dependencies) in [
+            (&parents[0], vec![a.clone(), b.clone()]),
+            (&parents[1], vec![b.clone(), c.clone()]),
+        ] {
+            let mut binding = handle
+                .request(
+                    &parent.owner.scope(),
+                    vec![crate::joint_admission::JointClaimChange::FirstBind {
+                        source: parent.owner.control_claim_view().unwrap(),
+                        dependencies,
+                    }],
+                )
+                .unwrap();
+            drain(&mut driver);
+            binding_receipt(&mut binding)
+                .install_control(&parent.owner, &[])
+                .unwrap();
+        }
+        drain(&mut driver);
+        let mut first = handle
+            .request_child(&parents[0].owner, WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let mut second = handle
+            .request_child(&parents[1].owner, WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        drain(&mut driver);
+        let first = binding_receipt(&mut first)
+            .install_child(&parents[0].owner)
+            .unwrap();
+        let second = binding_receipt(&mut second)
+            .install_child(&parents[1].owner)
+            .unwrap();
+        assert_ne!(
+            slot(&control, first.scope().id()),
+            slot(&control, second.scope().id())
+        );
+        for (child, expected) in [
+            (&first, [a.fact().clone(), b.fact().clone()]),
+            (&second, [b.fact().clone(), c.fact().clone()]),
+        ] {
+            let state = control.inner.state.lock().unwrap();
+            let child_slot = state.nodes[&child.scope().id()].cancellation;
+            let claim = state.cancellations.slots[child_slot.0].claim.unwrap();
+            assert!(
+                state
+                    .joint
+                    .as_ref()
+                    .unwrap()
+                    .control_has_domains_for_test(claim, &expected)
+            );
+        }
+        first.complete();
+        second.complete();
+        for parent in parents {
+            parent.business.release();
+            parent.owner.complete();
+        }
     }
     drain(&mut driver);
-    assert_eq!(snapshot(&control).3, 0);
+    assert_eq!(snapshot(&control), prepaid);
+    control.close_admission();
+    drain(&mut driver);
+    assert!(control.shutdown().is_ok());
 }
 
 #[test]
@@ -970,17 +1111,8 @@ fn pool_grant_publishes_one_child_with_the_full_parent_domain_and_same_claim() {
     let mut first = handle
         .request_child(&parent.owner, WorkRequest::new(WorkClass::Query))
         .unwrap();
-    let mut second = handle
-        .request_child(&parent.owner, WorkRequest::new(WorkClass::Query))
-        .unwrap();
     drain(&mut driver);
     let receipt = binding_receipt(&mut first);
-    assert!(matches!(
-        std::pin::Pin::new(&mut second).poll(&mut Context::from_waker(Waker::noop())),
-        Poll::Ready(Err(crate::joint_admission::JointAdmissionFailure {
-            error: WorkError::Conflict
-        }))
-    ));
     let granted = snapshot(&control);
     assert_eq!(
         (granted.0, granted.1, granted.2),
@@ -2360,4 +2492,87 @@ fn independent_process_source_layout_is_prepaid_once_by_the_original_base() {
         new.get(JointResource::ClaimRecords),
         old.get(JointResource::ClaimRecords)
     );
+}
+
+#[test]
+fn one_slot_progress_invoice_cannot_protect_a_healthy_root_and_its_child_on_shared_origin() {
+    // This diagnoses a supported-progress invoice that counts one control
+    // slot while its real consumer needs two simultaneously. The local
+    // proof must refuse the underfunded second slot, never relax full D.
+    let (control, handle, mut driver) = prototype_profile(4, 1, 2, 2);
+    {
+        let a = selected_dependency(&handle, "catalog-a");
+        let b = selected_dependency(&handle, "catalog-b");
+        let x = selected_dependency(&handle, "shared-healthy-native");
+        let roots = [root(&control), root(&control), root(&control)];
+        for (owner, catalog) in [
+            (&roots[0].owner, &a),
+            (&roots[1].owner, &a),
+            (&roots[2].owner, &b),
+        ] {
+            let mut bind = handle
+                .request(
+                    &owner.scope(),
+                    vec![crate::joint_admission::JointClaimChange::FirstBind {
+                        source: owner.control_claim_view().unwrap(),
+                        dependencies: vec![catalog.clone(), x.clone()],
+                    }],
+                )
+                .unwrap();
+            drain(&mut driver);
+            binding_receipt(&mut bind)
+                .install_control(owner, &[])
+                .unwrap();
+        }
+        drain(&mut driver);
+        let before = snapshot(&control);
+        let free = control.inner.state.lock().unwrap().cancellations.free_heads[0];
+        assert!(
+            free.is_some(),
+            "a real original fixed slot is physically free"
+        );
+        let scope = roots[2].owner.scope();
+        let mut child = match scope.try_request_joint_child().unwrap() {
+            crate::joint_admission::JointTryBegin::Started(child) => child,
+            crate::joint_admission::JointTryBegin::Full(_) => {
+                panic!("this source has real paid Q backing")
+            }
+        };
+        drain(&mut driver);
+        assert!(matches!(
+            std::pin::Pin::new(&mut child).poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(crate::joint_admission::JointAdmissionFailure {
+                error: WorkError::Capacity("joint protected intersections")
+            }))
+        ));
+        assert_eq!(
+            snapshot(&control),
+            before,
+            "the refused child cannot wash the old charges"
+        );
+        assert_eq!(
+            control.inner.state.lock().unwrap().cancellations.free_heads[0],
+            free
+        );
+        {
+            let state = control.inner.state.lock().unwrap();
+            let joint = state.joint.as_ref().unwrap();
+            for (index, catalog) in [&a, &a, &b].into_iter().enumerate() {
+                let slot = state.nodes[&roots[index].owner.scope().id()].cancellation;
+                let claim = state.cancellations.slots[slot.0].claim.unwrap();
+                assert!(joint.control_has_domains_for_test(
+                    claim,
+                    &[catalog.fact().clone(), x.fact().clone()]
+                ));
+            }
+            assert_eq!(state.nodes[&scope.id].children, 0);
+        }
+        for root in roots {
+            root.business.release();
+            root.owner.complete();
+        }
+    }
+    control.close_admission();
+    drain(&mut driver);
+    assert!(control.shutdown().is_ok());
 }

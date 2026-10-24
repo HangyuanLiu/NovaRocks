@@ -45,6 +45,7 @@ struct QueryControlState {
     statement_progress: std::sync::Weak<crate::session_control::StatementProgressSlot>,
     statement_actions_open: bool,
     statement_progress_installed: bool,
+    statement_sources: Box<[Option<Arc<crate::session_control::StatementActionSource>>]>,
     sessions: BTreeMap<u32, SessionEntry>,
 }
 
@@ -227,7 +228,15 @@ impl QueryControlPort for QueryApplicationControl {
     fn attach_statement_progress(
         &self,
         slot: &Arc<crate::session_control::StatementProgressSlot>,
+        source_slots: std::num::NonZeroUsize,
     ) -> Result<(), QueryControlError> {
+        // One serial pre-Ready allocation, paid by the same profile's N slots.
+        // Allocate before locking; publication never grows this original array.
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(source_slots.get())
+            .map_err(|_| QueryControlError::StatementActionCapacity)?;
+        rows.resize_with(source_slots.get(), || None);
+        let rows = rows.into_boxed_slice();
         let mut state = self.lock();
         if state.statement_progress_installed
             || state.sessions.values().any(|entry| {
@@ -239,6 +248,7 @@ impl QueryControlPort for QueryApplicationControl {
         {
             return Err(QueryControlError::StatementBusy);
         }
+        state.statement_sources = rows;
         state.statement_progress = Arc::downgrade(slot);
         state.statement_actions_open = true;
         state.statement_progress_installed = true;
@@ -262,10 +272,19 @@ impl QueryControlPort for QueryApplicationControl {
         if action.is_none() {
             return Err(QueryControlError::StatementBusy);
         }
+        let original = owner.as_ref().expect("checked original owner");
+        if !original.execution_owner_matches_scope() {
+            return Err(QueryControlError::StatementBusy);
+        }
         let mut state = self.lock();
         if !state.statement_actions_open {
             return Err(QueryControlError::StatementBusy);
         }
+        let row = state
+            .statement_sources
+            .iter()
+            .position(Option::is_none)
+            .ok_or(QueryControlError::StatementActionCapacity)?;
         let entry = state
             .sessions
             .get_mut(&token.session().connection_id())
@@ -286,29 +305,49 @@ impl QueryControlPort for QueryApplicationControl {
         };
         source.install(owner, action, cancellation);
         active.action = Some(Arc::clone(source));
+        state.statement_sources[row] = Some(Arc::clone(source));
         Ok(())
     }
     fn next_statement_action(
         &self,
-        after: Option<u32>,
+        after: Option<usize>,
     ) -> Option<(
-        u32,
+        usize,
         Option<Arc<crate::session_control::StatementActionSource>>,
     )> {
-        use std::ops::Bound::{Excluded, Unbounded};
         let state = self.lock();
-        let (id, entry) = state
-            .sessions
-            .range((after.map_or(Unbounded, Excluded), Unbounded))
-            .next()?;
-        Some((
-            *id,
-            entry
-                .active
-                .as_ref()
-                .and_then(|active| active.action.as_ref())
-                .map(Arc::clone),
-        ))
+        let next = match after {
+            Some(previous) => previous.checked_add(1)?,
+            None => 0,
+        };
+        // Empty original rows consume the same finite turn budget as occupied
+        // ones. Do not scan an arbitrary N-row suffix under the registry lock
+        // inside a single source step.
+        state
+            .statement_sources
+            .get(next)
+            .map(|source| (next, source.as_ref().map(Arc::clone)))
+    }
+    fn retire_statement_action_source(
+        &self,
+        source: &Arc<crate::session_control::StatementActionSource>,
+    ) -> bool {
+        let retired = {
+            let mut state = self.lock();
+            if !source.can_retire() {
+                return false;
+            }
+            let Some(row) = state.statement_sources.iter_mut().find(|row| {
+                row.as_ref()
+                    .is_some_and(|original| Arc::ptr_eq(original, source))
+            }) else {
+                return false;
+            };
+            row.take()
+        };
+        // The polling caller still owns the same Source; no foreign Drop under State.
+        drop(retired);
+        true
     }
     fn detach_statement_action(
         &self,
@@ -387,37 +426,21 @@ impl QueryControlPort for QueryApplicationControl {
     fn close_statement_actions(&self) {
         let mut state = self.lock();
         state.statement_actions_open = false;
-        for entry in state.sessions.values() {
-            if let Some(source) = entry
-                .active
-                .as_ref()
-                .and_then(|active| active.action.as_ref())
-            {
-                source.stop();
-            }
+        for source in state.statement_sources.iter().flatten() {
+            source.stop();
         }
     }
     fn statement_action_failure(
         &self,
     ) -> Option<Arc<crate::session_control::StatementActionFailure>> {
         self.lock()
-            .sessions
-            .values()
-            .filter_map(|entry| {
-                entry
-                    .active
-                    .as_ref()
-                    .and_then(|active| active.action.as_ref())
-            })
+            .statement_sources
+            .iter()
+            .flatten()
             .find_map(|source| source.failure())
     }
     fn has_statement_actions(&self) -> bool {
-        self.lock().sessions.values().any(|entry| {
-            entry
-                .active
-                .as_ref()
-                .is_some_and(|active| active.action.is_some())
-        })
+        self.lock().statement_sources.iter().any(Option::is_some)
     }
 
     fn register_session(
@@ -2037,7 +2060,7 @@ mod tests {
     impl crate::session_control::GovernedStatementAction for OriginalStatementGate {
         fn poll_action(
             &mut self,
-            _owner: &mut crate::session_control::GovernedQueryStatementOwner,
+            _owner: &mut crate::session_control::GovernedActionContext<'_>,
             cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<
             Result<
@@ -2061,22 +2084,33 @@ mod tests {
         let mut cursor = crate::session_control::StatementProgressCursor::default();
         let waker = futures::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
-        // The actual finite scanner is used; no mirror action state machine.
-        assert!(
-            slot.poll_turn(
-                &mut cursor,
-                std::num::NonZeroUsize::new(7).unwrap(),
-                &mut cx
-            )
-            .is_ready()
-        );
+        // Drive the real finite scanner with its persistent cursor across
+        // turns. The test waker is inert; only real source notifications mark
+        // another sweep. Empty rows still consume the production turn budget.
+        for _ in 0..10000 {
+            if slot
+                .poll_turn(
+                    &mut cursor,
+                    std::num::NonZeroUsize::new(7).unwrap(),
+                    &mut cx,
+                )
+                .is_pending()
+            {
+                return;
+            }
+        }
+        panic!("original statement scanner did not reach idle");
     }
     #[tokio::test]
     async fn original_statement_source_keeps_owner_until_actual_action_drop_and_protocol_take() {
         let (control, service, workload) = governed_control();
         let session = register(&control, 7, 1, "root");
         let slot = crate::session_control::StatementProgressSlot::empty();
-        slot.install(service.clone()).unwrap();
+        slot.install(
+            service.clone(),
+            std::num::NonZeroUsize::new(WorkloadConfig::default().scope_records_limit).unwrap(),
+        )
+        .unwrap();
         let mut owner = Some(
             service
                 .begin_governed_query_statement(
@@ -2139,7 +2173,11 @@ mod tests {
         let (control, service, workload) = governed_control();
         let session = register(&control, 7, 1, "root");
         let slot = crate::session_control::StatementProgressSlot::empty();
-        slot.install(service.clone()).unwrap();
+        slot.install(
+            service.clone(),
+            std::num::NonZeroUsize::new(WorkloadConfig::default().scope_records_limit).unwrap(),
+        )
+        .unwrap();
         let mut owner = Some(
             service
                 .begin_governed_query_statement(
@@ -2217,7 +2255,7 @@ mod tests {
 
             fn poll_action(
                 &mut self,
-                _: &mut crate::session_control::GovernedQueryStatementOwner,
+                _: &mut crate::session_control::GovernedActionContext<'_>,
                 _: &mut std::task::Context<'_>,
             ) -> std::task::Poll<
                 Result<
@@ -2232,7 +2270,11 @@ mod tests {
         let (control, service, workload) = governed_control();
         let session = register(&control, 7, 1, "root");
         let slot = crate::session_control::StatementProgressSlot::empty();
-        slot.install(service.clone()).unwrap();
+        slot.install(
+            service.clone(),
+            std::num::NonZeroUsize::new(WorkloadConfig::default().scope_records_limit).unwrap(),
+        )
+        .unwrap();
         let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observer: Observer = Arc::new(std::sync::Mutex::new(None));
@@ -2327,7 +2369,7 @@ mod tests {
             }
             fn poll_action(
                 &mut self,
-                _: &mut crate::session_control::GovernedQueryStatementOwner,
+                _: &mut crate::session_control::GovernedActionContext<'_>,
                 _: &mut std::task::Context<'_>,
             ) -> std::task::Poll<
                 Result<StatementActionValue, crate::session_error::QueryServiceError>,
@@ -2349,7 +2391,11 @@ mod tests {
             let (control, service, workload) = governed_control();
             let session = register(&control, 7, 1, "root");
             let slot = crate::session_control::StatementProgressSlot::empty();
-            slot.install(service.clone()).unwrap();
+            slot.install(
+                service.clone(),
+                std::num::NonZeroUsize::new(WorkloadConfig::default().scope_records_limit).unwrap(),
+            )
+            .unwrap();
             let polls = Arc::new(AtomicUsize::new(0));
             let drops = Arc::new(AtomicUsize::new(0));
             let cause_drops = Arc::new(AtomicUsize::new(0));
@@ -2424,7 +2470,7 @@ mod tests {
         impl crate::session_control::GovernedStatementAction for DomainError {
             fn poll_action(
                 &mut self,
-                _: &mut crate::session_control::GovernedQueryStatementOwner,
+                _: &mut crate::session_control::GovernedActionContext<'_>,
                 _: &mut std::task::Context<'_>,
             ) -> std::task::Poll<
                 Result<
@@ -2441,7 +2487,11 @@ mod tests {
         let (control, service, workload) = governed_control();
         let session = register(&control, 7, 1, "root");
         let slot = crate::session_control::StatementProgressSlot::empty();
-        slot.install(service.clone()).unwrap();
+        slot.install(
+            service.clone(),
+            std::num::NonZeroUsize::new(WorkloadConfig::default().scope_records_limit).unwrap(),
+        )
+        .unwrap();
         let mut owner = Some(
             service
                 .begin_governed_query_statement(
@@ -2507,7 +2557,7 @@ mod tests {
             }
             fn poll_action(
                 &mut self,
-                _: &mut crate::session_control::GovernedQueryStatementOwner,
+                _: &mut crate::session_control::GovernedActionContext<'_>,
                 _: &mut std::task::Context<'_>,
             ) -> std::task::Poll<
                 Result<
@@ -2534,7 +2584,11 @@ mod tests {
             let (control, service, workload) = governed_control();
             let session = register(&control, 7, 1, "root");
             let slot = crate::session_control::StatementProgressSlot::empty();
-            slot.install(service.clone()).unwrap();
+            slot.install(
+                service.clone(),
+                std::num::NonZeroUsize::new(WorkloadConfig::default().scope_records_limit).unwrap(),
+            )
+            .unwrap();
             let polls = Arc::new(AtomicUsize::new(0));
             let drops = Arc::new(AtomicUsize::new(0));
             let mut owner = Some(
@@ -2589,7 +2643,7 @@ mod tests {
             }
             fn poll_action(
                 &mut self,
-                _: &mut crate::session_control::GovernedQueryStatementOwner,
+                _: &mut crate::session_control::GovernedActionContext<'_>,
                 _: &mut std::task::Context<'_>,
             ) -> std::task::Poll<
                 Result<
@@ -2608,7 +2662,11 @@ mod tests {
             let (control, service, workload) = governed_control();
             let session = register(&control, 7, 1, "root");
             let slot = crate::session_control::StatementProgressSlot::empty();
-            slot.install(service.clone()).unwrap();
+            slot.install(
+                service.clone(),
+                std::num::NonZeroUsize::new(WorkloadConfig::default().scope_records_limit).unwrap(),
+            )
+            .unwrap();
             let mut owner = Some(
                 service
                     .begin_governed_query_statement(
@@ -2648,7 +2706,11 @@ mod tests {
         let (control, service, workload) = governed_control();
         let session = register(&control, 7, 1, "root");
         let slot = crate::session_control::StatementProgressSlot::empty();
-        slot.install(service.clone()).unwrap();
+        slot.install(
+            service.clone(),
+            std::num::NonZeroUsize::new(WorkloadConfig::default().scope_records_limit).unwrap(),
+        )
+        .unwrap();
         let mut owner = Some(
             service
                 .begin_governed_query_statement(
@@ -2715,7 +2777,7 @@ mod tests {
         impl crate::session_control::GovernedStatementAction for ArmActualCleanupWake {
             fn poll_action(
                 &mut self,
-                _: &mut crate::session_control::GovernedQueryStatementOwner,
+                _: &mut crate::session_control::GovernedActionContext<'_>,
                 _: &mut std::task::Context<'_>,
             ) -> std::task::Poll<
                 Result<
@@ -2749,7 +2811,11 @@ mod tests {
         let workload = Arc::new(workload);
         let session = register(&control, 7, 1, "root");
         let slot = crate::session_control::StatementProgressSlot::empty();
-        slot.install(service.clone()).unwrap();
+        slot.install(
+            service.clone(),
+            std::num::NonZeroUsize::new(WorkloadConfig::default().scope_records_limit).unwrap(),
+        )
+        .unwrap();
         let drops = Arc::new(AtomicUsize::new(0));
         let wake = Arc::new(PanicOnce {
             cause: Mutex::new(Some(CleanupCause(Arc::clone(&drops)))),
@@ -2830,7 +2896,7 @@ mod tests {
     impl crate::session_control::GovernedStatementAction for OriginalLocalExplainGate {
         fn poll_action(
             &mut self,
-            owner: &mut crate::session_control::GovernedQueryStatementOwner,
+            owner: &mut crate::session_control::GovernedActionContext<'_>,
             cx: &mut Context<'_>,
         ) -> Poll<
             Result<
@@ -2911,7 +2977,11 @@ mod tests {
         let service = QueryControlService::new(control.clone());
         let (workload, capacity) = local_workload();
         let slot = crate::session_control::StatementProgressSlot::empty();
-        slot.install(service.clone()).unwrap();
+        slot.install(
+            service.clone(),
+            std::num::NonZeroUsize::new(WorkloadConfig::default().scope_records_limit).unwrap(),
+        )
+        .unwrap();
         let mut owner = Some(original_local_statement(&control, &service, &workload, 7).await);
         let (release, gate) = futures::channel::oneshot::channel();
         let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2944,7 +3014,11 @@ mod tests {
         let service = QueryControlService::new(control.clone());
         let (workload, capacity) = local_workload();
         let slot = crate::session_control::StatementProgressSlot::empty();
-        slot.install(service.clone()).unwrap();
+        slot.install(
+            service.clone(),
+            std::num::NonZeroUsize::new(WorkloadConfig::default().scope_records_limit).unwrap(),
+        )
+        .unwrap();
         let mut owner = Some(original_local_statement(&control, &service, &workload, 7).await);
         let token = owner.as_ref().unwrap().token();
         let (release, gate) = futures::channel::oneshot::channel();
@@ -3044,5 +3118,502 @@ mod tests {
         ready.owner.finish();
         foreign.finish();
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+
+    #[tokio::test]
+    async fn original_residual_outlives_business_and_session_without_holding_result_window() {
+        use crate::session_control::{
+            GovernedStatementAction, GovernedStatementResidual, StatementActionValue,
+        };
+        use novarocks_workload_control::{
+            ResultCapacityConfig, ResultWindowAlias, ResultWindowClass, WorkClass,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Tail {
+            gate: futures::channel::oneshot::Receiver<()>,
+            dropped: Arc<AtomicUsize>,
+            control: std::sync::Weak<QueryApplicationControl>,
+        }
+        impl GovernedStatementResidual for Tail {
+            fn poll_retirement(
+                &mut self,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), crate::api::StatementNativeHealthFailure>> {
+                assert!(
+                    self.control
+                        .upgrade()
+                        .expect("original control owner")
+                        .state
+                        .try_lock()
+                        .is_ok(),
+                    "retirement poll outside registry lock"
+                );
+                use std::future::Future;
+                std::pin::Pin::new(&mut self.gate).poll(cx).map(|result| {
+                    result.expect("actual retirement sender");
+                    Ok(())
+                })
+            }
+        }
+        impl Drop for Tail {
+            fn drop(&mut self) {
+                assert!(
+                    self.control
+                        .upgrade()
+                        .expect("original control owner")
+                        .state
+                        .try_lock()
+                        .is_ok(),
+                    "retirement Drop outside registry lock"
+                );
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct Action {
+            window: Option<ResultWindowAlias>,
+            tail: Option<Box<dyn GovernedStatementResidual>>,
+            dropped: Arc<AtomicUsize>,
+        }
+        impl GovernedStatementAction for Action {
+            fn poll_action(
+                &mut self,
+                _: &mut crate::session_control::GovernedActionContext<'_>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<
+                Result<StatementActionValue, crate::session_error::QueryServiceError>,
+            > {
+                std::task::Poll::Ready(Ok(StatementActionValue::Ok))
+            }
+            fn handoff_residual_in(
+                &mut self,
+                target: &mut Option<Box<dyn GovernedStatementResidual>>,
+            ) -> Result<(), crate::api::StatementNativeHealthFailure> {
+                assert!(target.is_none());
+                *target = self.tail.take();
+                Ok(())
+            }
+        }
+        impl Drop for Action {
+            fn drop(&mut self) {
+                drop(self.window.take());
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let control = Arc::new(QueryApplicationControl::default());
+        let service = QueryControlService::new(control.clone());
+        let config = WorkloadConfig {
+            root_limit: 2,
+            business_limit: 2,
+            query_concurrency_limit: 1,
+            scope_records_limit: 2,
+            ..WorkloadConfig::default()
+        };
+        let source_slots = std::num::NonZeroUsize::new(config.scope_records_limit).unwrap();
+        let workload = WorkloadControl::try_new(
+            config,
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
+        )
+        .unwrap();
+        let capacity = workload
+            .configure_result_capacity(ResultCapacityConfig {
+                positions: [1; 4],
+                client_compute_positions: 1,
+                client_short_tail_positions: 0,
+                supported_cancel_burst: 0,
+                sustained_cancels_per_second: 0,
+                ..ResultCapacityConfig::V1
+            })
+            .unwrap();
+        workload.mark_ready().unwrap();
+        let slot = crate::session_control::StatementProgressSlot::empty();
+        slot.install(service.clone(), source_slots).unwrap();
+        let session = register(&control, 7, 1, "root");
+        let action_drops = Arc::new(AtomicUsize::new(0));
+        let tail_drops = Arc::new(AtomicUsize::new(0));
+        let mut releases = Vec::new();
+        for index in 0..2 {
+            let mut owner = Some(
+                service
+                    .begin_governed_statement_with_result(
+                        session,
+                        &workload.root_admission(),
+                        WorkClass::Management,
+                        None,
+                        None,
+                        None,
+                        ResultWindowClass::Local,
+                    )
+                    .expect("same session can start its next real statement"),
+            );
+            let (release, gate) = futures::channel::oneshot::channel();
+            releases.push(release);
+            let mut action: Option<Box<dyn GovernedStatementAction>> = Some(Box::new(Action {
+                window: owner.as_ref().unwrap().result_window_alias(),
+                tail: Some(Box::new(Tail {
+                    gate,
+                    dropped: tail_drops.clone(),
+                    control: Arc::downgrade(&control),
+                })),
+                dropped: action_drops.clone(),
+            }));
+            let mut waiter = None;
+            service
+                .publish_statement_action_in(&mut owner, &mut action, &mut waiter)
+                .unwrap()
+                .finish()
+                .unwrap();
+            drive_original_statement_actions(&slot);
+            assert_eq!(action_drops.load(Ordering::SeqCst), index + 1);
+            assert_eq!(tail_drops.load(Ordering::SeqCst), 0);
+            let receipt = waiter.take().unwrap().await.unwrap();
+            let mut ready = None;
+            receipt
+                .take_ready_in(&mut ready)
+                .unwrap_or_else(|_| panic!("same stable business receiver"))
+                .finish()
+                .unwrap();
+            let ready = ready.take().unwrap();
+            assert!(ready.result.is_ok());
+            ready.owner.finish();
+            assert_eq!(
+                capacity.snapshot().held_positions,
+                [0; 4],
+                "residual does not retain the result window"
+            );
+            assert_eq!(
+                workload.snapshot().root_responsibilities,
+                index + 1,
+                "same root remains actual residual owner"
+            );
+            drive_original_statement_actions(&slot);
+            assert!(slot.has_sources());
+        }
+        assert_eq!(
+            control.lock().statement_sources.iter().flatten().count(),
+            source_slots.get()
+        );
+        assert!(
+            matches!(
+                service.begin_governed_statement_with_result(
+                    session,
+                    &workload.root_admission(),
+                    WorkClass::Management,
+                    None,
+                    None,
+                    None,
+                    ResultWindowClass::Local,
+                ),
+                Err(GovernedQueryStatementBeginError::Admission(_))
+            ),
+            "actual original N is exhausted, not silently enlarged"
+        );
+        control.unregister_session(session);
+        assert!(
+            slot.has_sources(),
+            "actual registry rows survive Session removal"
+        );
+        slot.close();
+        drive_original_statement_actions(&slot);
+        assert_eq!(tail_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(workload.snapshot().root_responsibilities, 2);
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        drive_original_statement_actions(&slot);
+        assert_eq!(tail_drops.load(Ordering::SeqCst), 2);
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
+        assert!(
+            !slot.has_sources(),
+            "same original root sees actual retirement"
+        );
+        workload.close_admission();
+        assert!(
+            workload.shutdown().is_ok(),
+            "same WC must actually drain after both real tails"
+        );
+    }
+
+    #[test]
+    fn retirement_poll_panic_preserves_original_root_and_cause_without_repoll() {
+        use crate::session_control::{
+            GovernedStatementAction, GovernedStatementResidual, StatementActionValue,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Cause(Arc<AtomicUsize>);
+        impl Drop for Cause {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct Tail {
+            cause: Option<Cause>,
+            polls: Arc<AtomicUsize>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl GovernedStatementResidual for Tail {
+            fn poll_retirement(
+                &mut self,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), crate::api::StatementNativeHealthFailure>> {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                std::panic::panic_any(self.cause.take().expect("original opaque cause"));
+            }
+        }
+        impl Drop for Tail {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct Action(Option<Box<dyn GovernedStatementResidual>>);
+        impl GovernedStatementAction for Action {
+            fn poll_action(
+                &mut self,
+                _: &mut crate::session_control::GovernedActionContext<'_>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<
+                Result<StatementActionValue, crate::session_error::QueryServiceError>,
+            > {
+                std::task::Poll::Ready(Ok(StatementActionValue::Ok))
+            }
+            fn handoff_residual_in(
+                &mut self,
+                target: &mut Option<Box<dyn GovernedStatementResidual>>,
+            ) -> Result<(), crate::api::StatementNativeHealthFailure> {
+                assert!(target.is_none());
+                *target = self.0.take();
+                Ok(())
+            }
+        }
+        let (control, service, workload) = governed_control();
+        let session = register(&control, 7, 1, "root");
+        let slot = crate::session_control::StatementProgressSlot::empty();
+        slot.install(
+            service.clone(),
+            std::num::NonZeroUsize::new(WorkloadConfig::default().scope_records_limit).unwrap(),
+        )
+        .unwrap();
+        let mut owner = Some(
+            service
+                .begin_governed_query_statement(
+                    session,
+                    &workload.root_admission(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+        );
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let cause_drops = Arc::new(AtomicUsize::new(0));
+        let mut action: Option<Box<dyn GovernedStatementAction>> =
+            Some(Box::new(Action(Some(Box::new(Tail {
+                cause: Some(Cause(cause_drops.clone())),
+                polls: polls.clone(),
+                drops: drops.clone(),
+            })))));
+        let mut waiter = None;
+        service
+            .publish_statement_action_in(&mut owner, &mut action, &mut waiter)
+            .unwrap()
+            .finish()
+            .unwrap();
+        // No UI take can supply the first residual progress notification.
+        drop(waiter.take());
+        drive_original_statement_actions(&slot);
+        // Original business F closed and the abandoned protocol actually settled.
+        // Its accepted residual must wake/register under the same root itself.
+        drive_original_statement_actions(&slot);
+        let packet = slot
+            .failure()
+            .expect("original retirement panic remains health custody");
+        assert!(packet.panic_payload().unwrap().is::<Cause>());
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(cause_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(workload.snapshot().root_responsibilities, 1);
+        drop(waiter.take());
+        drive_original_statement_actions(&slot);
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        let source = control.next_statement_action(None).unwrap().1.unwrap();
+        source.dispose_poisoned_for_test(&service);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
+        assert!(!slot.has_sources());
+        assert_eq!(cause_drops.load(Ordering::SeqCst), 0);
+        drop(packet);
+        assert_eq!(cause_drops.load(Ordering::SeqCst), 1);
+        drop(source);
+        workload.close_admission();
+        assert!(
+            workload.shutdown().is_ok(),
+            "explicit actual test disposition must drain the same WC"
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_panic_preserves_late_business_ready_and_abandoned_protocol_exit() {
+        use crate::session_control::{
+            GovernedStatementAction, GovernedStatementResidual, StatementActionValue,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Cause {
+            drops: Arc<AtomicUsize>,
+            identity: [u8; 16],
+        }
+        impl Drop for Cause {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct Tail {
+            cause: Option<Cause>,
+            polls: Arc<AtomicUsize>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl GovernedStatementResidual for Tail {
+            fn poll_retirement(
+                &mut self,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), crate::api::StatementNativeHealthFailure>> {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                std::panic::panic_any(self.cause.take().expect("original retirement cause"));
+            }
+        }
+        impl Drop for Tail {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct Action(Option<Box<dyn GovernedStatementResidual>>);
+        impl GovernedStatementAction for Action {
+            fn poll_action(
+                &mut self,
+                _: &mut crate::session_control::GovernedActionContext<'_>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<
+                Result<StatementActionValue, crate::session_error::QueryServiceError>,
+            > {
+                std::task::Poll::Ready(Ok(StatementActionValue::Ok))
+            }
+            fn handoff_residual_in(
+                &mut self,
+                target: &mut Option<Box<dyn GovernedStatementResidual>>,
+            ) -> Result<(), crate::api::StatementNativeHealthFailure> {
+                assert!(target.is_none());
+                *target = self.0.take();
+                Ok(())
+            }
+        }
+        // Both real observation paths delay the UI until retirement has failed.
+        // The abandoned path must still settle the original protocol/window.
+        for deliver_business in [true, false] {
+            let control = Arc::new(QueryApplicationControl::default());
+            let service = QueryControlService::new(control.clone());
+            let (workload, capacity) = local_workload();
+            let slot = crate::session_control::StatementProgressSlot::empty();
+            slot.install(
+                service.clone(),
+                std::num::NonZeroUsize::new(WorkloadConfig::default().scope_records_limit).unwrap(),
+            )
+            .unwrap();
+            let mut owner = Some(original_local_statement(&control, &service, &workload, 7).await);
+            let session = owner.as_ref().unwrap().token().session();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let tail_drops = Arc::new(AtomicUsize::new(0));
+            let cause_drops = Arc::new(AtomicUsize::new(0));
+            let mut action: Option<Box<dyn GovernedStatementAction>> =
+                Some(Box::new(Action(Some(Box::new(Tail {
+                    cause: Some(Cause {
+                        drops: cause_drops.clone(),
+                        identity: [73; 16],
+                    }),
+                    polls: polls.clone(),
+                    drops: tail_drops.clone(),
+                })))));
+            let mut waiter = None;
+            service
+                .publish_statement_action_in(&mut owner, &mut action, &mut waiter)
+                .unwrap()
+                .finish()
+                .unwrap();
+            drive_original_statement_actions(&slot);
+            drive_original_statement_actions(&slot);
+            let packet = slot
+                .failure()
+                .expect("same source retains retirement health");
+            assert_eq!(
+                packet
+                    .panic_payload()
+                    .unwrap()
+                    .downcast_ref::<Cause>()
+                    .unwrap()
+                    .identity,
+                [73; 16],
+            );
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            assert_eq!(tail_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(cause_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+            let source = control.next_statement_action(None).unwrap().1.unwrap();
+            if deliver_business {
+                let receipt = waiter
+                    .take()
+                    .unwrap()
+                    .await
+                    .unwrap_or_else(|_| panic!("retirement cannot veto completed business"));
+                let mut ready = None;
+                receipt
+                    .take_ready_in(&mut ready)
+                    .unwrap_or_else(|_| panic!("same completed business installs once"))
+                    .finish()
+                    .unwrap();
+                let ready = ready.take().unwrap();
+                assert!(matches!(ready.result, Ok(StatementActionValue::Ok)));
+                ready.owner.finish();
+            } else {
+                drop(waiter.take());
+                drive_original_statement_actions(&slot);
+                assert!(
+                    source.is_settled(),
+                    "retirement health does not block protocol cleanup"
+                );
+            }
+            assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+            assert_eq!(workload.snapshot().root_responsibilities, 1);
+            assert!(
+                slot.has_sources(),
+                "retirement failure is not source retirement"
+            );
+            drop(waiter.take());
+            control.unregister_session(session);
+            drive_original_statement_actions(&slot);
+            assert_eq!(
+                polls.load(Ordering::SeqCst),
+                1,
+                "poisoned tail is never repolled"
+            );
+            assert_eq!(tail_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(cause_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(workload.snapshot().root_responsibilities, 1);
+            assert!(Arc::ptr_eq(&packet, &slot.failure().unwrap()));
+            source.dispose_poisoned_for_test(&service);
+            assert_eq!(tail_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(workload.snapshot().root_responsibilities, 0);
+            assert!(!slot.has_sources());
+            assert_eq!(cause_drops.load(Ordering::SeqCst), 0);
+            drop(packet);
+            assert_eq!(cause_drops.load(Ordering::SeqCst), 1);
+            drop(source);
+            workload.close_admission();
+            assert!(
+                workload.shutdown().is_ok(),
+                "explicit same-owner disposition drains WC"
+            );
+        }
     }
 }

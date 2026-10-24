@@ -699,21 +699,27 @@ fn build_frontend_query_session_factory_from_role_products(
         maintenance_read_command_executor,
         host.query_blocking_executor(),
     );
-    let dml_engines = core_capabilities::dml_engines(core_capabilities::DmlEnginePorts::new(
-        function_catalog,
-        Arc::clone(&catalog_service),
-        Some(catalog_application),
-        connector_control,
-        typed_connector_control,
-        unified_statistics,
-        mv_storage_observation,
-        Arc::clone(&mv_readiness),
-        query_execution.clone(),
-        Handle::current(),
-        host.lake_publication_runtime_policy(),
-        host.constant_policy(),
-        host.static_plan_carrier(),
-    ));
+    let dml_engines = core_capabilities::dml_engines(
+        core_capabilities::DmlEnginePorts::new(
+            function_catalog,
+            Arc::clone(&catalog_service),
+            Some(catalog_application),
+            connector_control,
+            typed_connector_control,
+            unified_statistics,
+            mv_storage_observation,
+            Arc::clone(&mv_readiness),
+            query_execution.clone(),
+            Handle::current(),
+            host.lake_publication_runtime_policy(),
+            host.constant_policy(),
+            host.static_plan_carrier(),
+        )
+        .with_write_runtime(
+            host.connector_blocking_io_supervisor(),
+            host.write_data_runtime(),
+        ),
+    );
     let query_service = crate::query::FrontendQueryService::new(
         session_catalog_resolver,
         query_compiler,
@@ -2243,6 +2249,31 @@ mod tests {
         use sha2::{Digest, Sha256};
         use std::os::unix::fs::PermissionsExt;
 
+        fn complete_empty_provider_execution_config() -> Result<FrontendExecutionConfig> {
+            // Same frozen ingress author used by the actual session/control
+            // service; no test-owned listener quota or session registry.
+            let mysql = novarocks_mysql_adapter::frozen_mysql_startup_parameters()
+                .map_err(anyhow::Error::msg)?;
+            let ingress = crate::native_workload::FrontendStatementIngress {
+                ordinary_connections: NonZeroUsize::new(mysql.ordinary_positions)
+                    .ok_or_else(|| anyhow!("ordinary MySQL positions must be nonzero"))?,
+                control_connections: NonZeroUsize::new(mysql.control_positions)
+                    .ok_or_else(|| anyhow!("control MySQL positions must be nonzero"))?,
+                ordinary_command_bytes: NonZeroUsize::new(mysql.ordinary.limits.command_bytes)
+                    .ok_or_else(|| anyhow!("ordinary MySQL command bound must be nonzero"))?,
+                control_command_bytes: NonZeroUsize::new(mysql.control.limits.command_bytes)
+                    .ok_or_else(|| anyhow!("control MySQL command bound must be nonzero"))?,
+            };
+            FrontendExecutionConfig::new_for_test(
+                NonZeroUsize::new(1).unwrap(),
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                builtin_function_catalog(),
+                crate::application::test_constant_policy(),
+            )
+            .try_with_empty_provider_read_profile_for_test(ingress)
+            .map_err(anyhow::Error::new)
+        }
+
         fn arm_real_entry(
             owner: &crate::preparation_diagnostics::StatementObservationOwner,
             token: &str,
@@ -2328,6 +2359,7 @@ mod tests {
         }
 
         async fn run_unbound_entry_case(rearm: bool) -> Result<()> {
+            let execution_config = complete_empty_provider_execution_config()?;
             let directory = tempfile::Builder::new()
                 .prefix("g2-real-entry-")
                 .tempdir_in("/tmp")?;
@@ -2371,13 +2403,7 @@ mod tests {
                 FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
                     Some(test_state_store_input("g2-real-entry")),
                     &registry,
-                    FrontendExecutionConfig::new_for_test(
-                        NonZeroUsize::new(1).unwrap(),
-                        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
-                        builtin_function_catalog(),
-                        crate::application::test_constant_policy(),
-                    )
-                    .with_test_session(
+                    execution_config.with_test_session(
                         crate::test_session::FrontendTestSessionConfig::new(prepared),
                     ),
                     frontend_backend_open_config(),
@@ -2532,6 +2558,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn real_entry_finite_input_survives_unbound_drain_and_bound_successors() -> Result<()>
         {
+            let execution_config = complete_empty_provider_execution_config()?;
             let directory = tempfile::Builder::new()
                 .prefix("g2-real-entry-")
                 .tempdir_in("/tmp")?;
@@ -2574,13 +2601,7 @@ mod tests {
                 FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
                     Some(test_state_store_input("g2-real-entry")),
                     &registry,
-                    FrontendExecutionConfig::new_for_test(
-                        NonZeroUsize::new(1).unwrap(),
-                        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
-                        builtin_function_catalog(),
-                        crate::application::test_constant_policy(),
-                    )
-                    .with_test_session(
+                    execution_config.with_test_session(
                         crate::test_session::FrontendTestSessionConfig::new(prepared),
                     ),
                     frontend_backend_open_config(),

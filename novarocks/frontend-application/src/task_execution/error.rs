@@ -601,6 +601,23 @@ impl novarocks_execution_contract::failure::FailureProjection for TaskProtocolFa
     }
 }
 
+/// Project only a settled local dispatch refusal; identity, Worker and
+/// cleanup failures keep their original owners and typed branches.
+pub(crate) fn dispatch_rejection(
+    acknowledgement: &crate::task_execution::intent::OperationAcknowledgement,
+    kind: OperationKind,
+) -> TaskExecutionError {
+    if acknowledgement.dispatch_result() == OperationDispatchResult::NonWorkerRejected
+        && let Some(cause) = acknowledgement.governance_failure()
+    {
+        return TaskExecutionError::Workload(cause.clone());
+    }
+    TaskExecutionError::DispatchRejected {
+        kind,
+        result: acknowledgement.dispatch_result(),
+    }
+}
+
 impl TaskExecutionError {
     /// Boundary projection, not a second Task conclusion or a recovery gate.
     pub(crate) fn preparation_input(
@@ -615,7 +632,11 @@ impl TaskExecutionError {
             Self::Workload(error) => {
                 return ExecutionFailureInput::new(
                     error.failure_fact(),
-                    SafeDetail::truncating("Native workload admission failed"),
+                    // WorkError contains only producer-defined scalar facts,
+                    // not Native payloads or arbitrary exception messages.
+                    SafeDetail::truncating_display(format_args!(
+                        "Native workload admission failed: {error}"
+                    )),
                     ExecutionFailureSite::Coordinator,
                 );
             }

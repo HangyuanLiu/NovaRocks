@@ -763,7 +763,7 @@ fn concurrent_insert(ordinal: usize) -> String {
     )
 }
 
-fn require_concurrent_effective_config(context: &ScenarioContext) -> Result<()> {
+fn require_concurrent_effective_config(context: &ScenarioContext) -> Result<usize> {
     let evidence: serde_json::Value =
         serde_json::from_slice(context.effective_launch_config_evidence().artifact_bytes())?;
     let roles = evidence["semantics"]["roles"]
@@ -794,6 +794,61 @@ fn require_concurrent_effective_config(context: &ScenarioContext) -> Result<()> 
             path.join(".")
         );
     }
+    let integer = |path: &[&str]| -> Result<usize> {
+        let mut value = config;
+        for key in path {
+            value = &value["value"][*key];
+        }
+        usize::try_from(
+            value["value"]
+                .as_i64()
+                .with_context(|| format!("effective {} is not an integer", path.join(".")))?,
+        )
+        .with_context(|| format!("effective {} is not nonnegative", path.join(".")))
+    };
+    // The immutable prelaunch test-session plan nominates N=3 exact SQLs.
+    // Consume the real FE window here; a mismatch must fail, not silently
+    // nominate new statements or assume a historical default window.
+    let workers = integer(&["runtime", "query_blocking_worker_threads"])?;
+    let writers = integer(&["runtime", "frontend_workload", "internal_result_positions"])?;
+    anyhow::ensure!(
+        writers == CONCURRENT_WRITERS && writers > workers,
+        "concurrent progress needs its exact admitted {CONCURRENT_WRITERS} statements to exceed the actual blocking worker count: window={writers}, workers={workers}"
+    );
+    Ok(writers)
+}
+
+/// Read external data only before admission or after EVERY original writer
+/// actually exits. A SQL read while all Internal positions are held would wait
+/// for those same positions and contaminate the progress proof.
+fn require_concurrent_source_data(control: &mut mysql::Conn) -> Result<()> {
+    let source = format!("{CONCURRENT_CATALOG}.{CONCURRENT_DATABASE}.{CONCURRENT_SOURCE}");
+    let rows = row_count(control, &source)?;
+    let total: Option<i64> = control
+        .query_first(format!("SELECT SUM(v) FROM {source}"))
+        .context("read concurrent writer source value sum")?;
+    anyhow::ensure!(
+        rows == SEED_ROWS && total == Some(SEED_SUM),
+        "concurrent source changed: rows={rows}, sum={total:?}; expected rows={SEED_ROWS}, sum={SEED_SUM}"
+    );
+    println!("concurrent-writer source rows={rows} sum={total:?}");
+    Ok(())
+}
+
+fn require_concurrent_targets_unpublished(
+    control: &mut mysql::Conn,
+    snapshots_before: &[i64],
+) -> Result<()> {
+    for (ordinal, &before) in snapshots_before.iter().enumerate() {
+        let target = concurrent_target(ordinal);
+        let rows = row_count(control, &target)?;
+        let snapshots = snapshot_count(control, &target)?;
+        anyhow::ensure!(
+            rows == 0 && snapshots == before,
+            "concurrent target {ordinal} published unexpected data: rows={rows}, snapshots={before}->{snapshots}; expected empty target and no new snapshot"
+        );
+        println!("concurrent-writer target={ordinal} rows={rows} snapshots={before}->{snapshots}");
+    }
     Ok(())
 }
 
@@ -807,6 +862,8 @@ impl Scenario for DistributedWriterConcurrentProgress {
         );
         declaration.impact.paths.extend([
             "novarocks/workload-control/**".into(),
+            "novarocks/result-contract/**".into(),
+            "novarocks/type-contract/**".into(),
             "novarocks-server/**".into(),
             "tests/system-test-runner/src/scenarios/writer_statement_actor.rs".into(),
             "tests/system-test-runner/src/scenarios/native_sql_controls.rs".into(),
@@ -861,7 +918,7 @@ impl Scenario for DistributedWriterConcurrentProgress {
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
-        require_concurrent_effective_config(context)?;
+        let concurrent_writers = require_concurrent_effective_config(context)?;
         let baseline = resource_baseline(context)?;
         let (user, port) = mysql_endpoint(context);
         let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
@@ -873,12 +930,17 @@ impl Scenario for DistributedWriterConcurrentProgress {
             CONCURRENT_SOURCE,
             "distributed-writer-concurrent-progress",
         )?;
-        for ordinal in 0..CONCURRENT_WRITERS {
+        for ordinal in 0..concurrent_writers {
             control.query_drop(format!(
                 "CREATE TABLE {} (v BIGINT)",
                 concurrent_target(ordinal)
             ))?;
         }
+        require_concurrent_source_data(&mut control)?;
+        let snapshots_before = (0..concurrent_writers)
+            .map(|ordinal| snapshot_count(&mut control, &concurrent_target(ordinal)))
+            .collect::<Result<Vec<_>>>()?;
+        require_concurrent_targets_unpublished(&mut control, &snapshots_before)?;
         control.finish()?;
         await_resource_convergence(context, &baseline, "concurrent writer fixture setup")?;
 
@@ -894,10 +956,10 @@ impl Scenario for DistributedWriterConcurrentProgress {
             "no concurrent writer progress budget remains"
         );
         let progress_deadline = Instant::now() + progress_budget;
-        let mut writers = Vec::with_capacity(CONCURRENT_WRITERS);
+        let mut writers = Vec::with_capacity(concurrent_writers);
         let progress = (|| -> Result<()> {
             context.action("submit three independent INSERTs with one FE blocking worker");
-            for ordinal in 0..CONCURRENT_WRITERS {
+            for ordinal in 0..concurrent_writers {
                 let selected = self.intent.take(ordinal)?;
                 let actor = WriterActor::start(
                     context,
@@ -960,7 +1022,22 @@ impl Scenario for DistributedWriterConcurrentProgress {
         result = writer_statement_actor::combine(result, faults);
         let convergence =
             await_resource_convergence(context, &baseline, "all original concurrent writers");
-        writer_statement_actor::combine(result, convergence)
+        result = writer_statement_actor::combine(result, convergence);
+
+        // These are independent committed-data oracles, after real actor exit.
+        // The BE resource oracle above covers contexts/fragments/catalog leases;
+        // neither it nor empty tables proves unknown sealed objects disposed.
+        let external_effects = mysql_actor::connect_until(&user, port, context.deadline())
+            .and_then(|control| {
+                control.run(|control| {
+                    require_concurrent_targets_unpublished(control, &snapshots_before)?;
+                    require_concurrent_source_data(control)
+                })
+            });
+        result = writer_statement_actor::combine(result, external_effects);
+        let readback_cleanup =
+            await_resource_convergence(context, &baseline, "concurrent writer external readbacks");
+        writer_statement_actor::combine(result, readback_cleanup)
     }
 }
 

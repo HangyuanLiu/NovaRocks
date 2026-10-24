@@ -34,6 +34,7 @@ pub use crate::functions::{
     builtin_sql_function_catalog, contribute_builtin_functions,
 };
 pub use crate::optimizer::options::SessionOptimizerSettings;
+mod dml_catalog;
 mod logical_explain;
 mod scalar_presence_catalog;
 pub use crate::planner::distributed::build::{
@@ -48,6 +49,7 @@ pub use crate::planner::distributed::build::{
 };
 #[cfg(test)]
 pub(crate) use completion_driver::compile_authored_aggregate_for_test;
+pub use dml_catalog::SqlDmlCatalogPreparation;
 pub use logical_explain::SqlLogicalExplainCatalog;
 pub use mv_rewrite::{
     MvRewriteDefinitionIndex, SqlImvAggregateContractFacts, SqlImvAggregateExecutionFacts,

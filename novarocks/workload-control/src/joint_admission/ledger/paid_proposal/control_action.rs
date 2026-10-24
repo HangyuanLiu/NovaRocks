@@ -29,6 +29,7 @@ pub(in crate::joint_admission::ledger) struct ControlActionFence {
     release_revision: u64,
     lane: JointLane,
     kind: ControlActionKind,
+    root_payload: Option<[u64; 2]>,
 }
 
 /// Permission to seek one E action, not a physical grant or finite CPU source.
@@ -53,6 +54,9 @@ fn source_facts(
     if ledger.driver_closed {
         return Err(WorkError::Closed);
     }
+    if let Some(key) = fence.root_payload {
+        super::super::typed_custody::validate_native_payload_fence(state, owner, key)?;
+    }
     let node = state.nodes.get(&owner).ok_or(WorkError::Released)?;
     if node.owner != crate::OwnerState::Active {
         return Err(WorkError::Released);
@@ -76,7 +80,7 @@ fn source_facts(
         || claim.active_amounts != slot.base
         || claim.facts.key != claim.active_facts.key
         || claim.active_facts.class != node.class
-        || claim.active_facts.dependencies.is_empty()
+        || !root_domains::has_effective_domains(state, &claim.active_facts, true)
         || !claim.active_facts.key.causal.is_empty()
         || (matches!(fence.kind, ControlActionKind::Payload)
             && (node.parent.is_some() || fence.lane != JointLane::Foreground))
@@ -112,29 +116,54 @@ impl WorkOwner {
         kind: ControlActionKind,
     ) -> Result<ControlActionSource, WorkError> {
         let scope = self.scope();
-        let (view, _) = control_claim_view_for_scope(&scope, false)?;
-        let ClaimSource::NodeControl {
-            slot, generation, ..
-        } = view.source
-        else {
-            return Err(WorkError::Conflict);
-        };
-        let fence = ControlActionFence {
-            claim: view.id,
-            slot,
-            generation,
-            structure_revision: view.structure_revision,
-            release_revision: view.release_revision,
-            lane,
-            kind,
-        };
-        source_facts(&scope.inner.state.lock().unwrap(), scope.id, fence)?;
-        Ok(ControlActionSource {
-            inner: Arc::downgrade(&scope.inner),
-            owner: scope.id,
-            fence,
-        })
+        capture(&scope, lane, kind, None)
     }
+}
+
+fn capture(
+    scope: &WorkScope,
+    lane: JointLane,
+    kind: ControlActionKind,
+    root_payload: Option<[u64; 2]>,
+) -> Result<ControlActionSource, WorkError> {
+    let (view, _) = control_claim_view_for_scope(scope, false)?;
+    let ClaimSource::NodeControl {
+        slot, generation, ..
+    } = view.source
+    else {
+        return Err(WorkError::Conflict);
+    };
+    let fence = ControlActionFence {
+        claim: view.id,
+        slot,
+        generation,
+        structure_revision: view.structure_revision,
+        release_revision: view.release_revision,
+        lane,
+        kind,
+        root_payload,
+    };
+    source_facts(&scope.inner.state.lock().unwrap(), scope.id, fence)?;
+    Ok(ControlActionSource {
+        inner: Arc::downgrade(&scope.inner),
+        owner: scope.id,
+        fence,
+    })
+}
+
+pub(super) fn capture_payload_continuation(
+    grant: &RetainedPayloadGrant,
+    root: &WorkScope,
+    lane: JointLane,
+) -> Result<ControlActionSource, WorkError> {
+    let state = root.inner.state.lock().unwrap();
+    let payload = super::super::typed_custody::payload_growth_view(grant, root, &state)?;
+    let ClaimSource::Payload { epoch } = payload.source else {
+        return Err(WorkError::Conflict);
+    };
+    let key = [payload.id, epoch];
+    drop(state);
+    capture(root, lane, ControlActionKind::Async, Some(key))
 }
 
 pub(in crate::joint_admission::ledger) fn validate_control_action(
@@ -184,6 +213,7 @@ pub(in crate::joint_admission::ledger) fn validate_control_action(
                     || amounts.get(JointResource::PhysicalQueueBytes) != 0
             }
         }
+        || change.claim.facts.key.origin != facts.key.origin
         || change.claim.facts.key.class != facts.key.class
         || change.claim.facts.lane
             != match fence.kind {
@@ -298,6 +328,7 @@ impl ControlActionSource {
                 "blocking action full dependency backing",
             ));
         }
+        current.origin = facts.key.origin;
         current.selected.extend(facts.dependencies.iter().cloned());
         proposal.end_change()?;
         Ok(ControlActionAdmission {

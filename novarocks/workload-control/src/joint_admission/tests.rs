@@ -190,6 +190,132 @@ fn saturated_bad_dependency_does_not_take_healthy_or_settlement_reservations() {
 }
 
 #[test]
+fn two_retained_catalog_custodies_leave_progress_on_a_shared_healthy_origin() {
+    // Same real ledger/proof fixture as the adjacent saturated-A/B case.
+    // Held claims model retained responsibility; this is not a Provider
+    // publication or a claim that an actual Native End has been observed.
+    let unit = |n| bytes(n).with(JointResource::UnreceivedProductions, n);
+    let cap = |global, dependency, progress| JointResourceLimits {
+        global: unit(global),
+        per_dependency: unit(dependency),
+        protected_progress: unit(progress),
+    };
+    let (mut config, mut required) = profile();
+    config.max_dependencies_per_claim = 3;
+    config.global = cap(4, 3, 1);
+    config.classes = [JointResourceLimits::default(); CLASS_COUNT];
+    config.classes[4] = cap(4, 3, 1);
+    config.lanes = [
+        cap(4, 3, 1),
+        JointResourceLimits::default(),
+        JointResourceLimits::default(),
+    ];
+    config.class_lanes = [[JointResourceLimits::default(); LANE_COUNT]; CLASS_COUNT];
+    config.class_lanes[4][0] = cap(4, 3, 1);
+    required.global = unit(1);
+    required.classes = [JointResources::ZERO; CLASS_COUNT];
+    required.classes[4] = unit(1);
+    required.lanes = [unit(1), JointResources::ZERO, JointResources::ZERO];
+    required.class_lanes = [[JointResources::ZERO; LANE_COUNT]; CLASS_COUNT];
+    required.class_lanes[4][0] = unit(1);
+    let control = WorkloadControl::try_new_counted(WorkloadConfig::default())
+        .unwrap()
+        .owner;
+    let (handle, mut driver) = control
+        .configure_joint_capacity(config.validate(&required).unwrap())
+        .unwrap();
+    control.mark_ready().unwrap();
+    {
+        let a = dependency(&handle, "catalog-a");
+        let b = dependency(&handle, "catalog-b");
+        let x = dependency(&handle, "shared-healthy-native");
+        let roots = [
+            control
+                .try_begin_root(WorkRequest::new(WorkClass::Management))
+                .unwrap(),
+            control
+                .try_begin_root(WorkRequest::new(WorkClass::Management))
+                .unwrap(),
+            control
+                .try_begin_root(WorkRequest::new(WorkClass::Management))
+                .unwrap(),
+        ];
+        let issue = |scope: &WorkScope, catalog: &JointDependency| {
+            handle
+                .request(
+                    scope,
+                    vec![JointClaimChange::New {
+                        dependencies: vec![catalog.clone(), x.clone()],
+                        lane: JointLane::Custody,
+                        amounts: unit(1),
+                    }],
+                )
+                .unwrap()
+        };
+        let mut first = issue(&roots[0].owner.scope(), &a);
+        let mut second = issue(&roots[1].owner.scope(), &a);
+        drive(&mut driver);
+        let first = granted(&mut first);
+        let second = granted(&mut second);
+        assert_eq!(held(&control), (2, 2));
+        // Trying to fill X's third unit through A is refused by the complete
+        // {A,X} intersection before it can steal B's protected unit.
+        let mut blocked_a = issue(&roots[0].owner.scope(), &a);
+        let mut healthy_b = issue(&roots[2].owner.scope(), &b);
+        drive(&mut driver);
+        assert!(poll(&mut blocked_a).is_pending());
+        let healthy_b = granted(&mut healthy_b);
+        assert_eq!(held(&control), (3, 3));
+        for guard in first.iter().chain(second.iter()).chain(healthy_b.iter()) {
+            assert_eq!(guard.amounts().unwrap(), unit(1));
+        }
+        {
+            let state = control.inner.state.lock().unwrap();
+            let records = &state.joint.as_ref().unwrap().claims;
+            assert!(records
+                .values()
+                .all(|record| record.facts.dependencies.len() == 2));
+            let retained_a = records
+                .values()
+                .filter(|record| {
+                    record
+                        .facts
+                        .dependencies
+                        .iter()
+                        .any(|dependency| dependency.fact == *a.fact())
+                })
+                .count();
+            let retained_x = records
+                .values()
+                .filter(|record| {
+                    record
+                        .facts
+                        .dependencies
+                        .iter()
+                        .any(|dependency| dependency.fact == *x.fact())
+                })
+                .count();
+            assert_eq!(
+                retained_a, 2,
+                "neither original catalog-A charge was washed away"
+            );
+            assert_eq!(
+                retained_x, 3,
+                "all claims keep the shared origin in their full D"
+            );
+        }
+        drop((blocked_a, healthy_b, second, first));
+        for root in roots {
+            root.business.release();
+            root.owner.complete();
+        }
+    }
+    control.close_admission();
+    drive(&mut driver);
+    assert!(control.shutdown().is_ok());
+}
+
+#[test]
 fn exact_dependency_batch_is_atomic_and_sequential_not_independent() {
     let (control, handle, mut driver) = control();
     let root = control
@@ -459,19 +585,15 @@ async fn idle_revision_has_no_self_wake_and_covers_both_notify_orderings() {
     let expiry = control.deadline_expiry_handle();
     let waiting = expiry.wait_state_change(revision);
     tokio::pin!(waiting);
-    assert!(
-        waiting
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending()
-    );
+    assert!(waiting
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
     let first = request(&handle, &scope, &[&a], JointLane::Foreground, 1);
-    assert!(
-        waiting
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_ready()
-    );
+    assert!(waiting
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_ready());
     drop(first);
     drive(&mut driver);
     let JointProgress::Idle(revision) = driver.step() else {
@@ -481,12 +603,10 @@ async fn idle_revision_has_no_self_wake_and_covers_both_notify_orderings() {
     let second = request(&handle, &scope, &[&a], JointLane::Foreground, 1);
     let waiting = expiry.wait_state_change(revision);
     tokio::pin!(waiting);
-    assert!(
-        waiting
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_ready()
-    );
+    assert!(waiting
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_ready());
     drop(second);
     drive(&mut driver);
 }
@@ -1436,18 +1556,16 @@ fn request_publication_preserves_original_cancel_and_drop_errors() {
         }
         drive(&mut driver);
         assert_eq!(held(&control), (0, 0));
-        assert!(
-            control
-                .inner
-                .state
-                .lock()
-                .unwrap()
-                .joint
-                .as_ref()
-                .unwrap()
-                .requests
-                .is_empty()
-        );
+        assert!(control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .joint
+            .as_ref()
+            .unwrap()
+            .requests
+            .is_empty());
     }
 }
 
@@ -1780,18 +1898,16 @@ fn continuous_new_requests_cannot_overtake_a_finite_reobservation_forever() {
             break;
         }
     }
-    assert!(
-        control
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .joint
-            .as_ref()
-            .unwrap()
-            .active
-            .is_some()
-    );
+    assert!(control
+        .inner
+        .state
+        .lock()
+        .unwrap()
+        .joint
+        .as_ref()
+        .unwrap()
+        .active
+        .is_some());
     drop(receipt);
     driver.step();
     let mut newcomer = request(&handle, &scope, &[&b], JointLane::Foreground, 1);
@@ -1863,18 +1979,16 @@ fn reobservation_rechecks_actual_stop_and_source_facts_before_budget_failure() {
                 break;
             }
         }
-        assert!(
-            control
-                .inner
-                .state
-                .lock()
-                .unwrap()
-                .joint
-                .as_ref()
-                .unwrap()
-                .active
-                .is_some()
-        );
+        assert!(control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .joint
+            .as_ref()
+            .unwrap()
+            .active
+            .is_some());
         // This is the real gap after the unlocked validity observation and
         // before reobserve acquires the final authority transaction.
         if cancel {
@@ -1922,19 +2036,17 @@ fn finite_pass_cannot_swallow_new_ticket_or_cancellation_before_its_last_skip() 
         let mut delivered_later = request(&handle, &scope, &[], JointLane::Settlement, 0);
         drive(&mut driver);
         assert!(poll(&mut blocked).is_pending());
-        assert!(
-            control
-                .inner
-                .state
-                .lock()
-                .unwrap()
-                .joint
-                .as_ref()
-                .unwrap()
-                .requests
-                .values()
-                .any(|r| matches!(r.phase, ledger::RequestPhase::Granted { .. }))
-        );
+        assert!(control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .joint
+            .as_ref()
+            .unwrap()
+            .requests
+            .values()
+            .any(|r| matches!(r.phase, ledger::RequestPhase::Granted { .. })));
         // Start a new read-only pass. Its first ticket is blocked at the
         // current release epoch; leave the granted final ticket to be skipped.
         assert_eq!(driver.step(), JointProgress::More);
@@ -1979,7 +2091,7 @@ impl std::task::Wake for QueueHandoffPanicWake {
 
 #[test]
 fn queue_handoff_panic_withdraws_the_original_ticket() {
-    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     for fixed in [false, true] {
         let (control, handle, mut driver) = if fixed {
             crate::scope::fixed_control_storage_tests::prototype_profile(3, 1, 1, 1)
@@ -2012,12 +2124,10 @@ fn queue_handoff_panic_withdraws_the_original_ticket() {
             std::sync::atomic::AtomicBool::new(true),
         )));
         let mut waiter = Box::pin(control.wait_progress(control.progress_revision()));
-        assert!(
-            waiter
-                .as_mut()
-                .poll(&mut Context::from_waker(&wake))
-                .is_pending()
-        );
+        assert!(waiter
+            .as_mut()
+            .poll(&mut Context::from_waker(&wake))
+            .is_pending());
         assert!(catch_unwind(AssertUnwindSafe(|| handle.queue_request(prepared))).is_err());
         drop(waiter);
         let (requests, waiters) = {
@@ -2043,7 +2153,7 @@ fn queue_handoff_panic_withdraws_the_original_ticket() {
 
 #[test]
 fn reply_handoff_panic_preserves_an_existing_physical_claim() {
-    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     let (control, handle, mut driver) = control();
     let work = control
         .try_begin_root(WorkRequest::new(WorkClass::Management))
@@ -2070,12 +2180,10 @@ fn reply_handoff_panic_preserves_an_existing_physical_claim() {
         std::sync::atomic::AtomicBool::new(true),
     )));
     let mut waiter = Box::pin(control.wait_progress(control.progress_revision()));
-    assert!(
-        waiter
-            .as_mut()
-            .poll(&mut Context::from_waker(&wake))
-            .is_pending()
-    );
+    assert!(waiter
+        .as_mut()
+        .poll(&mut Context::from_waker(&wake))
+        .is_pending());
     assert!(catch_unwind(AssertUnwindSafe(|| poll(&mut mixed))).is_err());
     drop((waiter, mixed));
     assert_eq!(
@@ -2346,11 +2454,9 @@ fn local_refusal_keeps_original_ticket_budget_and_waits_for_original_timer_pass(
     assert_eq!(local_request_state(&control), (ticket, first, true));
     drive(&mut driver);
     assert_eq!(local_request_state(&control), (ticket, first, true));
-    assert!(
-        request
-            .poll_local_offer(&mut Context::from_waker(Waker::noop()))
-            .is_pending()
-    );
+    assert!(request
+        .poll_local_offer(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
     driver.recheck_retired_backing();
     drive(&mut driver);
     let (same, second, blocked) = local_request_state(&control);
@@ -2372,18 +2478,16 @@ fn local_refusal_keeps_original_ticket_budget_and_waits_for_original_timer_pass(
         .notify();
     drop(offer);
     assert!(physical.is_none());
-    assert!(
-        control
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .joint
-            .as_ref()
-            .unwrap()
-            .requests
-            .is_empty()
-    );
+    assert!(control
+        .inner
+        .state
+        .lock()
+        .unwrap()
+        .joint
+        .as_ref()
+        .unwrap()
+        .requests
+        .is_empty());
     assert_eq!(destination.as_ref().unwrap().claims().len(), 1);
     drop(destination);
     assert_eq!(seen.lock().unwrap().as_slice(), &[(true, 1), (true, 1)]);
@@ -2394,7 +2498,7 @@ fn local_refusal_keeps_original_ticket_budget_and_waits_for_original_timer_pass(
 
 #[test]
 fn local_accept_stable_destination_survives_real_post_state_wake_panic() {
-    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     let (control, handle, mut driver) = control();
     let work = control
         .try_begin_root(WorkRequest::new(WorkClass::Management))
@@ -2410,12 +2514,10 @@ fn local_accept_stable_destination_survives_real_post_state_wake_panic() {
         std::sync::atomic::AtomicBool::new(true),
     )));
     let mut progress = Box::pin(control.wait_progress(control.progress_revision()));
-    assert!(
-        progress
-            .as_mut()
-            .poll(&mut Context::from_waker(&wake))
-            .is_pending()
-    );
+    assert!(progress
+        .as_mut()
+        .poll(&mut Context::from_waker(&wake))
+        .is_pending());
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut physical = Some(LocalPhysicalDrop {
         control: control.inner.clone(),
@@ -2454,13 +2556,11 @@ fn local_accept_stable_destination_survives_real_post_state_wake_panic() {
     // physical owner's stable slots. Its explicit cleanup is physical first.
     let mut physical_owner = None;
     let mut claim_owner = None;
-    assert!(
-        destination
-            .take()
-            .unwrap()
-            .transfer_in(&mut physical_owner, &mut claim_owner)
-            .is_ok()
-    );
+    assert!(destination
+        .take()
+        .unwrap()
+        .transfer_in(&mut physical_owner, &mut claim_owner)
+        .is_ok());
     assert_eq!(claim_owner.as_ref().unwrap().len(), 1);
     assert_eq!(held(&control), (1, 1));
     drop(physical_owner.take());
@@ -2512,18 +2612,16 @@ fn local_cancel_records_failure_but_cannot_free_an_in_flight_physical_offer() {
         }))
     ));
     drop(request);
-    assert!(
-        control
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .joint
-            .as_ref()
-            .unwrap()
-            .requests
-            .is_empty()
-    );
+    assert!(control
+        .inner
+        .state
+        .lock()
+        .unwrap()
+        .joint
+        .as_ref()
+        .unwrap()
+        .requests
+        .is_empty());
     work.business.release();
     work.owner.complete();
 }
@@ -2597,7 +2695,7 @@ fn local_refusal_does_not_replenish_exhausted_proof_or_soften_finite_infeasibili
 
 #[test]
 fn local_physical_drop_unwind_keeps_same_offer_and_cannot_retry_or_refund() {
-    use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
+    use std::panic::{catch_unwind, panic_any, AssertUnwindSafe};
     #[derive(Debug)]
     struct OriginalPhysicalExitPanic;
     struct PanickingPhysical {

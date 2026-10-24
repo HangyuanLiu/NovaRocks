@@ -1167,12 +1167,12 @@ impl RemoteTask {
                 Ok(CreateSettlement::RetryExactRequest)
             }
             FrontendAction::RetryAfterProgress => {
-                let outcome = ack
-                    .worker_outcome()
-                    .ok_or(TaskExecutionError::DispatchRejected {
-                        kind: OperationKind::CreateTask,
-                        result: ack.dispatch_result(),
-                    })?;
+                let outcome = ack.worker_outcome().ok_or(
+                    crate::task_execution::error::dispatch_rejection(
+                        ack,
+                        OperationKind::CreateTask,
+                    ),
+                )?;
                 if self.create_ownership_proven
                     && matches!(
                         outcome,
@@ -1208,10 +1208,10 @@ impl RemoteTask {
                     if !self.create_remote_unknown {
                         self.enter_terminal();
                     }
-                    return Err(TaskExecutionError::DispatchRejected {
-                        kind: OperationKind::CreateTask,
-                        result: ack.dispatch_result(),
-                    });
+                    return Err(crate::task_execution::error::dispatch_rejection(
+                        ack,
+                        OperationKind::CreateTask,
+                    ));
                 };
                 self.enter_terminal();
                 Ok(CreateSettlement::FailedClosed(outcome))
@@ -1294,10 +1294,10 @@ impl RemoteTask {
         let Some(outcome) = ack.worker_outcome() else {
             // An ingress refusal says nothing about the already accepted
             // task's terminal state. Failure cleanup must still stop it.
-            return Err(TaskExecutionError::DispatchRejected {
-                kind: OperationKind::UpdateTask,
-                result: ack.dispatch_result(),
-            });
+            return Err(crate::task_execution::error::dispatch_rejection(
+                ack,
+                OperationKind::UpdateTask,
+            ));
         };
         self.enter_terminal();
         Ok(UpdateSettlement::FailedClosed(outcome))
@@ -1318,10 +1318,10 @@ impl RemoteTask {
         if ack.worker_outcome().is_none()
             && ack.dispatch_result() != OperationDispatchResult::TransportUnknown
         {
-            return Err(TaskExecutionError::DispatchRejected {
-                kind: OperationKind::CancelTask,
-                result: ack.dispatch_result(),
-            });
+            return Err(crate::task_execution::error::dispatch_rejection(
+                ack,
+                OperationKind::CancelTask,
+            ));
         }
         Ok(())
     }

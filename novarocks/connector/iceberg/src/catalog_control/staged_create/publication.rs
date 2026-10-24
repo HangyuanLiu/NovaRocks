@@ -309,6 +309,45 @@ pub(super) fn publish(
     })
 }
 
+pub(super) async fn publish_async(
+    adapter: &IcebergStagedCreateAdapter,
+    prepared: &mut PreparedOperation,
+    operation_id: ConnectorStagedCreateOperationId,
+    context: &ConnectorRequestContext,
+) -> Result<ExternalMutationOutcome<ConnectorStagedCreateReceipt>, ConnectorError> {
+    if operation_id.to_bytes() != prepared.operation_id().to_bytes() {
+        return Err(invalid(
+            "Create publication must preserve the original staged operation token",
+        ));
+    }
+    let operation = ensure_operation(adapter, prepared, operation_id, context)?;
+    let intent =
+        create_intent(prepared, operation.token()).map_err(|error| corrupt(error.to_string()))?;
+    let prefix = create_prefix(prepared);
+    let policy = RetryPolicy::from_properties(prepared.staged.table.metadata().properties())
+        .map_err(|error| invalid(error.to_string()))?;
+    let journal = prepared
+        .stage_publication
+        .journal
+        .next_frontier()
+        .map_err(|error| internal(error.to_string()))?;
+    prepared.final_publication = Some(journal.clone());
+    let publisher = journal.observe_prepared(Arc::new(CreatePublisher {
+        adapter: adapter.clone(),
+        prepared: prepared.clone(),
+        operation_id,
+        journal: journal.clone(),
+    }));
+    let append = crate::commit::FastAppendPreparer;
+    let preparers: Vec<&dyn Preparer> = if intent.changes().added.is_empty() {
+        vec![]
+    } else {
+        vec![&append]
+    };
+    let report = attempt::run(&operation, &intent, &prefix, &preparers, &publisher, policy).await;
+    Ok(journal.project(report))
+}
+
 /// Append a fresh exact positive observation to the final request's entry.
 /// The stage frontier remains unchanged and cannot receive this proof.
 pub(super) fn record_observed_publication(
