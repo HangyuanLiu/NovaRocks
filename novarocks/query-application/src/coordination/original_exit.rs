@@ -61,6 +61,8 @@ struct State {
     native_pre_actor_started: bool,
     native_body_exited: bool,
     native_failure: Option<Box<dyn std::any::Any + Send>>,
+    run_panic: Option<Box<dyn std::any::Any + Send>>,
+    run_cleanup_panic: Option<Box<dyn std::any::Any + Send>>,
     native_dormant_failed: bool,
     native_closure_seen: bool,
     native_return_disposition: Option<LocalExecutionDisposition>,
@@ -98,6 +100,8 @@ impl OriginalLogicalExit {
                 native_pre_actor_started: false,
                 native_body_exited: true,
                 native_failure: None,
+                run_panic: None,
+                run_cleanup_panic: None,
                 native_dormant_failed: false,
                 native_closure_seen: false,
                 native_return_disposition: None,
@@ -281,10 +285,35 @@ impl OriginalLogicalExit {
     pub(super) fn mark_health_published_silent(&self) {
         self.lock().health_published = true;
     }
+    /// Intake only: no foreign Drop, formatting, notification or authority.
+    /// A run failure does not deny a later positive close of the same Active.
+    pub(super) fn retain_run_panic_silent(
+        &self,
+        incoming: &mut Option<Box<dyn std::any::Any + Send>>,
+        cleanup: bool,
+    ) {
+        let mut state = self.lock();
+        let destination = if cleanup {
+            &mut state.run_cleanup_panic
+        } else {
+            &mut state.run_panic
+        };
+        if destination.is_none() {
+            *destination = incoming.take();
+        }
+    }
+    pub(super) fn run_failed(&self) -> bool {
+        let state = self.lock();
+        state.run_panic.is_some() || state.run_cleanup_panic.is_some()
+    }
     pub(super) fn has_unhandled_failure(&self) -> bool {
         let s = self.lock();
         !s.health_disposed
-            && (s.role_failed || s.native_failure.is_some() || matches!(&s.actor, Some(Err(_))))
+            && (s.role_failed
+                || s.native_failure.is_some()
+                || s.run_panic.is_some()
+                || s.run_cleanup_panic.is_some()
+                || matches!(&s.actor, Some(Err(_))))
     }
     pub(super) fn receive_role_silent(&self, packet: &mut Option<RoleResult>) {
         let mut s = self.lock();
@@ -298,7 +327,11 @@ impl OriginalLogicalExit {
     }
     pub(super) fn has_failure(&self) -> bool {
         let s = self.lock();
-        s.role_failed || s.native_failure.is_some() || matches!(&s.actor, Some(Err(_)))
+        s.role_failed
+            || s.native_failure.is_some()
+            || s.run_panic.is_some()
+            || s.run_cleanup_panic.is_some()
+            || matches!(&s.actor, Some(Err(_)))
     }
     pub(super) fn pending_actor(&self) -> bool {
         let s = self.lock();
@@ -440,6 +473,14 @@ impl LogicalExecutionExitView<'_> {
     /// Diagnostic facts only; none substitutes for an actual local return.
     pub fn native_preparation_failure(&self) -> Option<&(dyn std::any::Any + Send)> {
         self.state.native_failure.as_deref()
+    }
+    /// Raw run causes stay in this Source independently of a positive Active
+    /// close. These borrows never transfer the original payload or its charge.
+    pub fn native_run_panic(&self) -> Option<&(dyn std::any::Any + Send)> {
+        self.state.run_panic.as_deref()
+    }
+    pub fn native_run_cleanup_panic(&self) -> Option<&(dyn std::any::Any + Send)> {
+        self.state.run_cleanup_panic.as_deref()
     }
     /// A diagnostic failure fact, never an actual-exit receipt. Raw causes
     /// remain in the original Native body beside the dormant owner.

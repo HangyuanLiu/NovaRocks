@@ -462,22 +462,35 @@ mod internal_supervisor_tests {
             .with_internal_consumer(Arc::new(ObservedCountConsumer(Arc::clone(&consumer))))
             .unwrap();
         let (mut supervisor, client) = test_supervisor(
-            &control, Handle::current(), Arc::new(BindingNativePort),
-            QueryProcessNamespace::new(0xae), FrontendProcessId::new_v7(), supervisor_config(),
+            &control,
+            Handle::current(),
+            Arc::new(BindingNativePort),
+            QueryProcessNamespace::new(0xae),
+            FrontendProcessId::new_v7(),
+            supervisor_config(),
         );
         let started = client.start(request, root.owner);
         wait_preparation_exit_fact(&entered).await.unwrap();
         requester.request(CancellationReason::Requested).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(2), started).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), started)
+            .await
+            .unwrap();
         assert!(matches!(result, Err(error) if error.kind() == QueryExecutionErrorKind::Cancelled));
-        wait_preparation_exit_fact(&consumer.local_closed).await.unwrap();
+        wait_preparation_exit_fact(&consumer.local_closed)
+            .await
+            .unwrap();
         assert!(!consumer.decoded.load(Ordering::SeqCst));
         assert!(consumer.accepted.lock().unwrap().is_none());
-        assert!(consumer.ready_observation.lock().unwrap().is_none(),
-            "a refused original prepare must never activate a consumer");
+        assert!(
+            consumer.ready_observation.lock().unwrap().is_none(),
+            "a refused original prepare must never activate a consumer"
+        );
         assert_eq!(supervisor.registry.active_native_custody_count(), 0);
         root.business.release();
-        supervisor.shutdown_until(Instant::now() + Duration::from_secs(5)).await.unwrap();
+        supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
         drop(client);
         acknowledge_all_control(&control);
         control.finish().await;
@@ -548,7 +561,9 @@ mod internal_supervisor_tests {
                 );
                 assert_eq!(token.end().output_rows, INTERNAL_ROWS);
                 assert!(consumer.decoded.load(Ordering::SeqCst));
-                wait_preparation_exit_fact(&consumer.local_closed).await.unwrap();
+                wait_preparation_exit_fact(&consumer.local_closed)
+                    .await
+                    .unwrap();
                 assert!(signals.run_entered.load(Ordering::SeqCst));
                 assert!(!signals.run_returned.load(Ordering::SeqCst));
                 assert!(!signals.cleanup_completed.load(Ordering::SeqCst));
@@ -1407,7 +1422,9 @@ mod internal_supervisor_tests {
                 }
                 // A delivered terminal verdict cannot abandon the original future or
                 // turn an observation timeout into actual Native owner exit.
-                wait_preparation_exit_fact(&consumer.local_closed).await.unwrap();
+                wait_preparation_exit_fact(&consumer.local_closed)
+                    .await
+                    .unwrap();
                 assert!(!activation.returned.load(Ordering::SeqCst));
                 assert!(!activation.dormant_dropped.load(Ordering::SeqCst));
                 assert!(!native.cleanup_entered.load(Ordering::SeqCst));
@@ -1623,7 +1640,7 @@ mod internal_supervisor_tests {
                 ))),
             );
             let mut original_exit = None;
-            let start = if phase == NativeFactoryPanicPhase::Activate {
+            let start = {
                 let mut input = match client.prepare_observed_start(request, None) {
                     Ok(input) => Some(input),
                     Err(original) => std::panic::panic_any(original),
@@ -1636,8 +1653,6 @@ mod internal_supervisor_tests {
                     .finish()
                     .unwrap();
                 ready.take().unwrap()
-            } else {
-                client.start(request, root.owner)
             };
             let result = tokio::time::timeout(Duration::from_secs(2), start)
                 .await
@@ -1675,11 +1690,15 @@ mod internal_supervisor_tests {
                 .shutdown_until(Instant::now() + Duration::from_secs(5))
                 .await;
             if phase == NativeFactoryPanicPhase::Activate {
-                assert!(matches!(&shutdown,
-                    Err(LogicalExecutionSupervisorShutdownError::Registry(
-                        LogicalExecutionRuntimeRegistryError::OriginalExitFailureUnresolved
-                    ))
-                ), "original activation shutdown: {shutdown:?}");
+                assert!(
+                    matches!(
+                        &shutdown,
+                        Err(LogicalExecutionSupervisorShutdownError::Registry(
+                            LogicalExecutionRuntimeRegistryError::OriginalExitFailureUnresolved
+                        ))
+                    ),
+                    "original activation shutdown: {shutdown:?}"
+                );
                 let mut exit = original_exit.take().expect("the same original Source");
                 wait_for_dormant_failure(&mut exit).await;
                 let view = exit.view().unwrap();
@@ -1687,8 +1706,10 @@ mod internal_supervisor_tests {
                 assert!(!view.native_preparation_exited());
                 drop(view);
                 let failure = exit.dormant_failure().unwrap();
-                assert_eq!(failure.activation_panic().unwrap().downcast_ref::<&str>(),
-                    Some(&"injected synchronous Native activation factory panic"));
+                assert_eq!(
+                    failure.activation_panic().unwrap().downcast_ref::<&str>(),
+                    Some(&"injected synchronous Native activation factory panic")
+                );
                 assert!(failure.convergence_panic().is_none());
                 assert!(failure.reported_failure().is_none());
                 drop(failure);
@@ -1706,25 +1727,39 @@ mod internal_supervisor_tests {
                 drop(exit);
                 supervisor.abandon_for_process_exit();
             } else {
-                shutdown.unwrap();
-                acknowledge_all_control(&control);
-                tokio::time::timeout(Duration::from_secs(2), scope.wait_released())
-                    .await
-                    .unwrap();
+                assert!(
+                    matches!(
+                        &shutdown,
+                        Err(LogicalExecutionSupervisorShutdownError::Registry(
+                            LogicalExecutionRuntimeRegistryError::OriginalExitFailureUnresolved
+                        ))
+                    ),
+                    "original run factory shutdown: {shutdown:?}"
+                );
+                let exit = original_exit
+                    .take()
+                    .expect("same original run factory Source");
+                let view = exit.view().unwrap();
+                assert_eq!(
+                    view.native_run_panic().unwrap().downcast_ref::<&str>(),
+                    Some(&"injected synchronous Native run factory panic")
+                );
+                assert!(view.native_run_cleanup_panic().is_none());
+                assert!(view.native_preparation_exited());
+                assert!(!view.role_failed());
+                drop(view);
                 assert!(activation.dormant_dropped.load(Ordering::SeqCst));
                 assert!(native.cleanup_completed.load(Ordering::SeqCst));
                 assert!(native.active_dropped.load(Ordering::SeqCst));
                 assert_eq!(supervisor.registry.active_native_custody_count(), 0);
+                assert!(futures::poll!(Box::pin(scope.wait_released())).is_pending());
+                drop(exit);
+                supervisor.abandon_for_process_exit();
             }
 
             control
         };
-        if phase == NativeFactoryPanicPhase::Activate {
-            control.finish_for_process_exit().await;
-        } else {
-            acknowledge_all_control(&control);
-            control.finish().await;
-        }
+        control.finish_for_process_exit().await;
     }
 
     #[tokio::test]

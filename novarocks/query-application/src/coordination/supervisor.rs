@@ -2026,8 +2026,9 @@ async fn run_logical_role(
             }
         };
         let drive = NativeAttemptDrive::new(&running);
+        let original_run = active.original_exit();
         let terminal = await_with_shutdown(
-            catch_future_panic(async { active.as_mut().run(&drive, cancellation.clone()).await }),
+            catch_native_run_panic(active.as_mut(), &drive, cancellation.clone(), &original_run),
             &mut shutdown,
             &requester,
         )
@@ -2406,7 +2407,8 @@ async fn drive_rows_attempt_until_pump_decision(
     };
     let (terminal_sender, terminal_source) = super::native_attempt_terminal_channel();
     let mut terminal_sender = Some(terminal_sender);
-    let native_run = catch_future_panic(async { active.as_mut().run(drive, cancellation).await });
+    let original_run = active.original_exit();
+    let native_run = catch_native_run_panic(active.as_mut(), drive, cancellation, &original_run);
     let pump_ready = ready.clone();
     let pump = async move {
         if let Some(ready) = pump_ready {
@@ -2749,7 +2751,12 @@ async fn supervise_rows_inner(
                         Some(CancellationReason::DeadlineExceeded)
                     ),
                 });
-                if recovery != RecoveryDecision::BeginReplacement {
+                let run_source_failed = attempt
+                    .active
+                    .original_exit()
+                    .upgrade()
+                    .is_some_and(|source| source.run_failed());
+                if recovery != RecoveryDecision::BeginReplacement || run_source_failed {
                     session.retire_preparation();
                     let actor_result = decision
                         .fail_logical(actor)
@@ -3620,6 +3627,60 @@ async fn converge_active_request(
             Ok(Err(health)) | Err(health) => ActiveAttemptConvergence::Unresolved(health),
         };
         return (outcome, deadline);
+    }
+}
+
+/// Poll the actual trait future so its raw panic reaches the existing Source
+/// before the actual future is destroyed or the safe business verdict is sent.
+async fn catch_native_run_panic(
+    owner: &mut dyn ActiveNativeAttemptOwner,
+    drive: &NativeAttemptDrive,
+    cancellation: novarocks_workload_control::CancellationView,
+    original: &Weak<OriginalLogicalExit>,
+) -> Result<NativeAttemptTerminal, ()> {
+    if original.upgrade().is_some_and(|source| source.run_failed()) {
+        drop(cancellation);
+        return Err(());
+    }
+    let mut future = match catch_unwind(AssertUnwindSafe(move || owner.run(drive, cancellation))) {
+        Ok(future) => future,
+        Err(payload) => {
+            retain_native_run_panic(original, payload, false);
+            return Err(());
+        }
+    };
+    let result = std::future::poll_fn(|cx| {
+        match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+            Ok(Poll::Ready(terminal)) => Poll::Ready(Ok(terminal)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(payload) => {
+                retain_native_run_panic(original, payload, false);
+                Poll::Ready(Err(()))
+            }
+        }
+    })
+    .await;
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(future))) {
+        retain_native_run_panic(original, payload, true);
+        // The real run already authored its terminal. A secondary destructor
+        // failure is Source health, not a replacement business verdict.
+    }
+    result
+}
+
+fn retain_native_run_panic(
+    original: &Weak<OriginalLogicalExit>,
+    payload: Box<dyn std::any::Any + Send>,
+    cleanup: bool,
+) {
+    let mut incoming = Some(payload);
+    if let Some(source) = original.upgrade() {
+        source.retain_run_panic_silent(&mut incoming, cleanup);
+    }
+    // The original loop never restarts after a run panic. An invariant breach
+    // must preserve a rejected raw packet outside the Source lock as well.
+    if let Some(rejected) = incoming {
+        std::panic::panic_any(std::mem::ManuallyDrop::new(rejected));
     }
 }
 
@@ -5580,6 +5641,7 @@ mod tests {
         ActivatePanic,
         CompletionSuccess,
         CompletionFailure,
+        CompletionFailureDropPanic,
         CompletionPanic,
     }
 
@@ -5707,6 +5769,13 @@ mod tests {
                         fixture_execution_input("initial terminal fixture run failure"),
                     ))
                 }),
+                InitialTerminalPhase::CompletionFailureDropPanic => {
+                    Box::pin(TerminalDropPanicFuture(Some(
+                        NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(
+                            fixture_execution_input("initial terminal fixture run failure"),
+                        )),
+                    )))
+                }
                 InitialTerminalPhase::CompletionPanic => {
                     Box::pin(async { panic!("initial terminal fixture run panic") })
                 }
@@ -5725,6 +5794,26 @@ mod tests {
                 signals.convergence_completed.store(true, Ordering::SeqCst);
                 result
             })
+        }
+    }
+
+    struct TerminalDropPanicFuture(Option<NativeAttemptTerminal>);
+    impl Future for TerminalDropPanicFuture {
+        type Output = NativeAttemptTerminal;
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<Self::Output> {
+            Poll::Ready(
+                self.0
+                    .take()
+                    .expect("the actual run Future returns only once"),
+            )
+        }
+    }
+    impl Drop for TerminalDropPanicFuture {
+        fn drop(&mut self) {
+            panic!("initial terminal fixture returned Future Drop panic");
         }
     }
 
@@ -6129,7 +6218,12 @@ mod tests {
                 supervisor_config().with_remote_cleanup_timeout(Duration::from_secs(10)),
             );
             let mut original_exit = None;
-            let future = if matches!(phase, InitialTerminalPhase::ActivatePanic) {
+            let future = if matches!(
+                phase,
+                InitialTerminalPhase::ActivatePanic
+                    | InitialTerminalPhase::CompletionPanic
+                    | InitialTerminalPhase::CompletionFailureDropPanic
+            ) {
                 let mut input =
                     match client.prepare_observed_start(completion_request(attempts), None) {
                         Ok(input) => Some(input),
@@ -6177,7 +6271,8 @@ mod tests {
                             InitialTerminalPhase::ActivatePanic => {
                                 "Native attempt activation panicked"
                             }
-                            InitialTerminalPhase::CompletionFailure => {
+                            InitialTerminalPhase::CompletionFailure
+                            | InitialTerminalPhase::CompletionFailureDropPanic => {
                                 "initial terminal fixture run failure"
                             }
                             InitialTerminalPhase::CompletionPanic => "Native attempt run panicked",
@@ -6205,7 +6300,12 @@ mod tests {
                 .shutdown_until(Instant::now() + Duration::from_secs(2))
                 .await;
             acknowledge_all_control(&control);
-            let settled = if matches!(phase, InitialTerminalPhase::ActivatePanic) {
+            let settled = if matches!(
+                phase,
+                InitialTerminalPhase::ActivatePanic
+                    | InitialTerminalPhase::CompletionPanic
+                    | InitialTerminalPhase::CompletionFailureDropPanic
+            ) {
                 None
             } else {
                 Some(tokio::time::timeout(Duration::from_secs(2), scope.wait_released()).await)
@@ -6225,12 +6325,10 @@ mod tests {
                     Err(LogicalExecutionSupervisorShutdownError::Registry(
                         LogicalExecutionRuntimeRegistryError::OriginalExitFailureUnresolved,
                     )),
-                    InitialTerminalPhase::ActivatePanic,
+                    InitialTerminalPhase::ActivatePanic
+                    | InitialTerminalPhase::CompletionPanic
+                    | InitialTerminalPhase::CompletionFailureDropPanic,
                 ) => true,
-                (
-                    Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)),
-                    InitialTerminalPhase::CompletionPanic,
-                ) => error.message() == "Native attempt run panicked",
                 _ => false,
             };
             assert!(
@@ -6259,6 +6357,35 @@ mod tests {
                 assert!(supervisor.run_outcome.is_some());
                 assert!(!supervisor.shutdown_complete);
                 drop(exit);
+            } else if matches!(
+                phase,
+                InitialTerminalPhase::CompletionPanic
+                    | InitialTerminalPhase::CompletionFailureDropPanic
+            ) {
+                let exit = original_exit.take().expect("same original run Source");
+                let view = exit.view().unwrap();
+                if matches!(phase, InitialTerminalPhase::CompletionPanic) {
+                    assert_eq!(
+                        view.native_run_panic().unwrap().downcast_ref::<&str>(),
+                        Some(&"initial terminal fixture run panic")
+                    );
+                    assert!(view.native_run_cleanup_panic().is_none());
+                } else {
+                    assert!(view.native_run_panic().is_none());
+                    assert_eq!(
+                        view.native_run_cleanup_panic()
+                            .unwrap()
+                            .downcast_ref::<&str>(),
+                        Some(&"initial terminal fixture returned Future Drop panic")
+                    );
+                }
+                assert!(view.native_preparation_exited());
+                assert!(!view.role_failed());
+                assert_eq!(view.pending_native_returns(), 0);
+                drop(view);
+                assert_eq!(supervisor.registry.active_native_custody_count(), 0);
+                assert!(futures::poll!(Box::pin(scope.wait_released())).is_pending());
+                drop(exit);
             } else {
                 assert!(
                     settled.unwrap().is_ok(),
@@ -6282,7 +6409,12 @@ mod tests {
                 held_positions, 1,
                 "original attempt guard lost its window: {phase:?}"
             );
-            if matches!(phase, InitialTerminalPhase::ActivatePanic) {
+            if matches!(
+                phase,
+                InitialTerminalPhase::ActivatePanic
+                    | InitialTerminalPhase::CompletionPanic
+                    | InitialTerminalPhase::CompletionFailureDropPanic
+            ) {
                 // This is the existing explicit process disposition, not a
                 // successful cleanup or an invented source-exit receipt.
                 supervisor.abandon_for_process_exit();
@@ -6292,7 +6424,12 @@ mod tests {
 
             control
         };
-        if matches!(phase, InitialTerminalPhase::ActivatePanic) {
+        if matches!(
+            phase,
+            InitialTerminalPhase::ActivatePanic
+                | InitialTerminalPhase::CompletionPanic
+                | InitialTerminalPhase::CompletionFailureDropPanic
+        ) {
             control.finish_for_process_exit().await;
         } else {
             acknowledge_all_control(&control);
@@ -6316,6 +6453,12 @@ mod tests {
     async fn completion_failure_retires_only_unused_preparation_before_convergence() {
         initial_terminal_preparation_fixture(InitialTerminalPhase::CompletionFailure).await;
     }
+    #[tokio::test(flavor = "current_thread")]
+    async fn returned_business_failure_survives_actual_run_future_drop_panic() {
+        initial_terminal_preparation_fixture(InitialTerminalPhase::CompletionFailureDropPanic)
+            .await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn completion_panic_retires_only_unused_preparation_before_convergence() {
         initial_terminal_preparation_fixture(InitialTerminalPhase::CompletionPanic).await;
@@ -7886,7 +8029,10 @@ mod tests {
             _cancellation: novarocks_workload_control::CancellationView,
         ) -> NativeAttemptRunFuture<'a> {
             match self.phase {
-                AttemptPanicPhase::Run => Box::pin(async { panic!("injected Native run panic") }),
+                AttemptPanicPhase::Run => Box::pin(OriginalRunPanicFuture {
+                    primary_drops: Arc::new(AtomicU64::new(0)),
+                    cleanup_drops: Arc::new(AtomicU64::new(0)),
+                }),
                 AttemptPanicPhase::Converge => Box::pin(async {
                     NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(
                         fixture_execution_input("injected Native attempt failure"),
@@ -7909,6 +8055,32 @@ mod tests {
                     NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
                 ))
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct OriginalRunPanicPayload(Arc<AtomicU64>);
+    impl Drop for OriginalRunPanicPayload {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct OriginalRunPanicFuture {
+        primary_drops: Arc<AtomicU64>,
+        cleanup_drops: Arc<AtomicU64>,
+    }
+    impl Future for OriginalRunPanicFuture {
+        type Output = NativeAttemptTerminal;
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::panic::panic_any(OriginalRunPanicPayload(Arc::clone(&self.primary_drops)));
+        }
+    }
+    impl Drop for OriginalRunPanicFuture {
+        fn drop(&mut self) {
+            std::panic::panic_any(OriginalRunPanicPayload(Arc::clone(&self.cleanup_drops)));
         }
     }
 
@@ -7937,7 +8109,7 @@ mod tests {
             let scope = root.owner.scope();
 
             let mut original_exit = None;
-            let future = if phase == AttemptPanicPhase::Activate {
+            let future = if phase != AttemptPanicPhase::Converge {
                 let mut input =
                     match client.prepare_observed_start(completion_request(attempts), None) {
                         Ok(input) => Some(input),
@@ -7995,6 +8167,47 @@ mod tests {
                 assert!(!supervisor.shutdown_complete);
                 drop(exit);
                 supervisor.abandon_for_process_exit();
+            } else if phase == AttemptPanicPhase::Run {
+                assert!(
+                    matches!(
+                        shutdown,
+                        Err(LogicalExecutionSupervisorShutdownError::Registry(
+                            LogicalExecutionRuntimeRegistryError::OriginalExitFailureUnresolved,
+                        ))
+                    ),
+                    "original run shutdown: {shutdown:?}"
+                );
+                let exit = original_exit.take().expect("same original run Source");
+                let view = exit.view().unwrap();
+                let primary = Arc::clone(
+                    &view
+                        .native_run_panic()
+                        .unwrap()
+                        .downcast_ref::<OriginalRunPanicPayload>()
+                        .unwrap()
+                        .0,
+                );
+                let cleanup = Arc::clone(
+                    &view
+                        .native_run_cleanup_panic()
+                        .unwrap()
+                        .downcast_ref::<OriginalRunPanicPayload>()
+                        .unwrap()
+                        .0,
+                );
+                assert_eq!(primary.load(Ordering::SeqCst), 0);
+                assert_eq!(cleanup.load(Ordering::SeqCst), 0);
+                assert!(view.native_preparation_exited());
+                assert_eq!(view.pending_native_returns(), 0);
+                assert!(!view.native_dormant_failed());
+                assert!(!view.role_failed());
+                drop(view);
+                assert_eq!(supervisor.registry.active_native_custody_count(), 0);
+                assert!(futures::poll!(Box::pin(scope.wait_released())).is_pending());
+                drop(exit);
+                supervisor.abandon_for_process_exit();
+                assert_eq!(primary.load(Ordering::SeqCst), 1);
+                assert_eq!(cleanup.load(Ordering::SeqCst), 1);
             } else {
                 assert!(matches!(
                     shutdown,
@@ -8008,7 +8221,7 @@ mod tests {
 
             control
         };
-        if phase == AttemptPanicPhase::Activate {
+        if phase != AttemptPanicPhase::Converge {
             control.finish_for_process_exit().await;
         } else {
             acknowledge_all_control(&control);

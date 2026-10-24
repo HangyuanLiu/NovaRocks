@@ -827,6 +827,9 @@ impl fmt::Debug for SupervisedActiveNativeOwner {
     }
 }
 impl SupervisedActiveNativeOwner {
+    pub(super) fn original_exit(&self) -> Weak<super::original_exit::OriginalLogicalExit> {
+        self.custody.slot.original_exit.clone()
+    }
     pub(crate) fn convergence_failure_custody(&self) -> NativeConvergenceFailureCustody {
         NativeConvergenceFailureCustody {
             slot: Arc::clone(&self.custody.slot),
