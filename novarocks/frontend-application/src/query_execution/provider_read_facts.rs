@@ -252,6 +252,29 @@ impl FrontendProviderReadFacts {
             arc_layout(std::alloc::Layout::new::<ProviderCreatorWake>())?,
         ])
     }
+    #[cfg(test)]
+    pub(crate) async fn fixture_worker_failure_is<T: std::any::Any>(&self) -> bool {
+        self.source
+            .lock()
+            .await
+            .job
+            .as_ref()
+            .is_some_and(ProviderReadCpuJob::fixture_worker_failure_is::<T>)
+    }
+    /// Return the SAME joined job to the fixture for explicit disposition.
+    /// Refusal preserves the original field; no foreign Drop runs in this lock.
+    #[cfg(test)]
+    pub(crate) async fn take_joined_for_fixture_disposition(
+        &self,
+        observed: &novarocks_query_application::api::StatementNativeHealthFailure,
+    ) -> Result<super::internal_result_cpu::ProviderCreatorFixtureDisposition, &'static str> {
+        let mut source = self.source.lock().await;
+        source
+            .job
+            .as_mut()
+            .ok_or("fixture has no original creator job")?
+            .take_joined_for_fixture_disposition(observed)
+    }
     pub(crate) async fn local_health_failure(
         &self,
     ) -> Option<Arc<dyn std::error::Error + Send + Sync>> {

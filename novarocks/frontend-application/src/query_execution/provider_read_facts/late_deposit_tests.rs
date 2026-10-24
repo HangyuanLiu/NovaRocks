@@ -389,7 +389,16 @@ impl ProviderReadSplitManager for LateProvider {
     }
 }
 
+#[derive(Debug)]
+struct OriginalProviderCreatorPanic(Arc<AtomicUsize>);
+impl Drop for OriginalProviderCreatorPanic {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 struct LateAccessSealer {
+    panic_after_release: Option<Arc<AtomicUsize>>,
     adapter: Arc<ReadRuntimeAdapter<LateProvider>>,
     seals: Arc<AtomicUsize>,
     entered: mpsc::Sender<()>,
@@ -406,6 +415,9 @@ impl ConnectorReadAttemptAccessSealer for LateAccessSealer {
         // the original plan sink closes, then exercise the late deposit.
         let _ = self.entered.send(());
         let _ = self.release.lock().unwrap().recv();
+        if let Some(drops) = &self.panic_after_release {
+            std::panic::panic_any(OriginalProviderCreatorPanic(Arc::clone(drops)));
+        }
         Ok(mint.seal(Arc::new(LateReacquirer(self.adapter.clone()))))
     }
 }
@@ -490,6 +502,15 @@ impl ConnectorReadWireEncoder for LateEncoder {
 
 #[test]
 fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit() {
+    original_provider_completion_fixture(false);
+}
+
+#[test]
+fn actual_provider_panic_reaches_completion_health_and_only_fixture_disposition_releases_it() {
+    original_provider_completion_fixture(true);
+}
+
+fn original_provider_completion_fixture(panic_after_release: bool) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .max_blocking_threads(2)
@@ -539,7 +560,9 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
     });
     let adapter = Arc::new(ReadRuntimeAdapter::new(provider.clone()));
     let seals = Arc::new(AtomicUsize::new(0));
+    let cause_drops = Arc::new(AtomicUsize::new(0));
     let sealer = Arc::new(LateAccessSealer {
+        panic_after_release: panic_after_release.then(|| Arc::clone(&cause_drops)),
         adapter: adapter.clone(),
         seals: seals.clone(),
         entered: seal_started,
@@ -723,41 +746,107 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
     let watchdog_joined = watchdog.join().is_ok();
     let actual_closed =
         runtime.block_on(async { tokio::time::timeout(Duration::from_secs(2), &mut closed).await });
-    let closed_ok = matches!(&actual_closed, Ok(Ok(Ok(()))));
+    let closed_ok = if panic_after_release {
+        matches!(&actual_closed, Ok(Ok(Err(_))))
+    } else {
+        matches!(&actual_closed, Ok(Ok(Ok(()))))
+    };
     // Do not detach a timed-out original close task. Its same JoinHandle is
     // retained in this concrete failure packet through test-harness disposition.
-    if !closed_ok {
-        struct CloseFailure {
-            _join: tokio::task::JoinHandle<
+    struct CloseFailure {
+        _join: tokio::task::JoinHandle<
+            Result<(), novarocks_query_application::api::StatementNativeHealthFailure>,
+        >,
+        _outcome: Result<
+            Result<
                 Result<(), novarocks_query_application::api::StatementNativeHealthFailure>,
+                tokio::task::JoinError,
             >,
-            _outcome: Result<
-                Result<
-                    Result<(), novarocks_query_application::api::StatementNativeHealthFailure>,
-                    tokio::task::JoinError,
-                >,
-                tokio::time::error::Elapsed,
-            >,
-            _source: Arc<crate::query_execution::completion_facts::FrontendCompletionCustody>,
-            _cpu: std::mem::ManuallyDrop<
-                crate::query_execution::internal_result_cpu::InternalResultCpuOwner,
-            >,
-            _runtime: std::mem::ManuallyDrop<tokio::runtime::Runtime>,
-        }
+            tokio::time::error::Elapsed,
+        >,
+        _source: std::mem::ManuallyDrop<
+            Arc<crate::query_execution::completion_facts::FrontendCompletionCustody>,
+        >,
+        _disposition_refusal: Option<&'static str>,
+        _cpu_shutdown: Option<String>,
+        _cpu: std::mem::ManuallyDrop<
+            crate::query_execution::internal_result_cpu::InternalResultCpuOwner,
+        >,
+        _runtime: std::mem::ManuallyDrop<tokio::runtime::Runtime>,
+    }
+    if !closed_ok {
         std::panic::panic_any(CloseFailure {
             _join: closed,
             _outcome: actual_closed,
-            _source: completion_source,
+            _source: std::mem::ManuallyDrop::new(completion_source),
+            _disposition_refusal: None,
+            _cpu_shutdown: None,
             _cpu: std::mem::ManuallyDrop::new(provider_cpu),
             _runtime: std::mem::ManuallyDrop::new(runtime),
         });
     }
-    runtime
-        .block_on(provider_cpu.shutdown_until(Instant::now() + Duration::from_secs(2)))
-        .unwrap();
+    let mut health_observed = completion_source.local_health_failure();
+    let held_health = panic_after_release.then(|| control.snapshot());
+    let mut same_health = !panic_after_release;
+    let mut original_payload = !panic_after_release;
+    let mut cached_failure = !panic_after_release;
+    let mut cause_held_after_disposition = !panic_after_release;
+    if let Some(observed) = health_observed.as_ref() {
+        same_health = match &actual_closed {
+            Ok(Ok(Err(returned))) => std::ptr::addr_eq(returned.cause(), observed.cause()),
+            _ => false,
+        };
+        original_payload =
+            runtime.block_on(port.fixture_worker_failure_is::<OriginalProviderCreatorPanic>());
+        let repeated = runtime.block_on(completion_source.close());
+        cached_failure = matches!(&repeated, Err(failure) if std::ptr::addr_eq(failure.cause(), observed.cause()));
+        drop(repeated);
+        // The health getter retained exactly this packet; move the already
+        // joined original job to the fixture, never manufacture normal exit.
+        let original_job =
+            match runtime.block_on(port.take_joined_for_fixture_disposition(observed)) {
+                Ok(original) => original,
+                Err(refusal) => std::panic::panic_any(CloseFailure {
+                    _join: closed,
+                    _outcome: actual_closed,
+                    _source: std::mem::ManuallyDrop::new(completion_source),
+                    _disposition_refusal: Some(refusal),
+                    _cpu_shutdown: None,
+                    _cpu: std::mem::ManuallyDrop::new(provider_cpu),
+                    _runtime: std::mem::ManuallyDrop::new(runtime),
+                }),
+            };
+        drop(original_job);
+        let after_disposition = runtime.block_on(completion_source.close());
+        cached_failure &= matches!(&after_disposition, Err(failure) if std::ptr::addr_eq(failure.cause(), observed.cause()));
+        drop(after_disposition);
+        // The canonical source never turns this into a healthy/unused branch.
+        cause_held_after_disposition = cause_drops.load(Ordering::Acquire) == 0;
+    }
     let source_healthy = completion_source.local_health_failure().is_none();
+    let held_after_disposition = panic_after_release.then(|| control.snapshot());
+    if let Err(detail) =
+        runtime.block_on(provider_cpu.shutdown_until(Instant::now() + Duration::from_secs(2)))
+    {
+        std::panic::panic_any(CloseFailure {
+            _join: closed,
+            _outcome: actual_closed,
+            _source: std::mem::ManuallyDrop::new(completion_source),
+            _disposition_refusal: None,
+            _cpu_shutdown: Some(detail),
+            _cpu: std::mem::ManuallyDrop::new(provider_cpu),
+            _runtime: std::mem::ManuallyDrop::new(runtime),
+        });
+    }
     drop(port);
     drop(completion_source);
+    // close()'s returned health and the observed stable health are actual
+    // aliases. Safe projection above did not consume either original payload.
+    drop(actual_closed);
+    let retained_by_observer = cause_drops.load(Ordering::Acquire) == 0;
+    let held_by_observer = panic_after_release.then(|| control.snapshot());
+    drop(health_observed.take());
+    let cause_released = cause_drops.load(Ordering::Acquire) == usize::from(panic_after_release);
     let deadline = Instant::now() + Duration::from_secs(2);
     let after = loop {
         let facts = control.snapshot();
@@ -786,9 +875,20 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
             && watchdog_joined
             && closed_ok
             && borrowed_close_pending
-            && source_healthy
+            && (source_healthy != panic_after_release)
+            && same_health
+            && original_payload
+            && cached_failure
+            && cause_held_after_disposition
+            && retained_by_observer
+            && cause_released
     );
-    for facts in [&held_call, &held_output] {
+    for facts in [&held_call, &held_output]
+        .into_iter()
+        .chain(held_health.iter())
+        .chain(held_after_disposition.iter())
+        .chain(held_by_observer.iter())
+    {
         assert_eq!(facts.root_responsibilities, 1);
         assert_eq!(facts.result_windows.held_positions, [0, 1, 0, 0]);
         assert!(

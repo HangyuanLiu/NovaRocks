@@ -759,7 +759,52 @@ pub(crate) struct ProviderReadCpuJob {
     marker: Option<OperationResult>,
     finished: bool,
 }
+#[cfg(test)]
+pub(crate) type ProviderCreatorFixtureDisposition = InternalResultCpuJob<OperationOutput>;
+
 impl ProviderReadCpuJob {
+    #[cfg(test)]
+    pub(crate) fn fixture_worker_failure_is<T: std::any::Any>(&self) -> bool {
+        self.job.as_ref().is_some_and(|job| {
+            job.retirement
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .worker
+                .as_ref()
+                .is_some_and(QueryBlockingFailure::original_payload_is::<T>)
+        })
+    }
+    /// Explicit fixture-only disposition, not a normal exit receipt. A real
+    /// close must already have joined the original forwarder and delivered
+    /// this same health packet to its stable receiving source.
+    #[cfg(test)]
+    pub(crate) fn take_joined_for_fixture_disposition(
+        &mut self,
+        observed: &novarocks_query_application::api::StatementNativeHealthFailure,
+    ) -> Result<ProviderCreatorFixtureDisposition, &'static str> {
+        let job = self.job.as_ref().ok_or("fixture job already moved")?;
+        if job.forwarder.is_some() || !matches!(&job.closed, Some(Ok(()))) {
+            return Err("fixture requires the actual successful forwarder join");
+        }
+        let same: &(dyn std::error::Error + Send + Sync) = job.retirement.as_ref();
+        if !job.retirement.has_failure() || !std::ptr::addr_eq(observed.cause(), same) {
+            return Err("fixture requires the same observed health source");
+        }
+        {
+            let packet = job
+                .retirement
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if packet.physical_unproven || packet.physical_failure.is_some() {
+                return Err("fixture cannot dispose an unproven physical exit");
+            }
+        }
+        // No finished flag, normal retirement, new receipt or worker. The same
+        // opaque packet remains owned by observed health after this move.
+        Ok(self.job.take().expect("same validated fixture job"))
+    }
     pub(crate) fn health_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
         self.job
             .as_ref()
