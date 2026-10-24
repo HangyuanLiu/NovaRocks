@@ -618,6 +618,22 @@ impl ManifestAssembledRound {
             .await
     }
 
+    /// Only the stable pre-run owner may use this local close author. It
+    /// closes normal dispatch before touching the same original round sources.
+    pub(crate) async fn converge_unstarted(&mut self) -> Result<(), StatementNativeHealthFailure> {
+        if !self.actor_gate.prepare_convergence() {
+            return Err(self.convergence.retain_unstarted_gate_failure());
+        }
+        self.convergence
+            .drive_unstarted(
+                &mut self.round,
+                &self.split_delivery,
+                &self.notify,
+                self.profile_diagnostics.as_mut(),
+            )
+            .await
+    }
+
     #[cfg(test)]
     fn context_convergence(
         &self,
@@ -758,6 +774,221 @@ mod tests {
         {
             panic!("attempt terminal arbitration must not inspect residual convergence");
         }
+    }
+
+    fn unstarted_close_round(round: TaskRound) -> ManifestAssembledRound {
+        let targets = round
+            .execution()
+            .graph()
+            .contexts()
+            .copied()
+            .map(|context| {
+                NativeAttemptConvergenceTarget::new(
+                    context,
+                    novarocks_execution::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 1)
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let split_delivery = SplitDeliveryBridge::for_graph(round.execution().graph());
+        let (_, actor_gate, _) = ActorGatedTaskOperationSink::pair(
+            Arc::new(BackpressuredGateTransport),
+            Arc::new(super::super::status_intake::CountingWake::default()),
+            novarocks_types::NativeCompatibilityId::new([0x41; 32]),
+        );
+        let convergence =
+            NativeAttemptConvergenceOwner::new(&round, Arc::new(UnusedConvergenceSource), targets)
+                .unwrap();
+        ManifestAssembledRound {
+            round,
+            split_delivery,
+            actor_gate,
+            protocol_facts: None,
+            convergence,
+            notify: Arc::new(tokio::sync::Notify::new()),
+            terminal: None,
+            pending_terminal: None,
+            pending_pre_ready_unknown: None,
+            split_failure: None,
+            profile_diagnostics: None,
+        }
+    }
+
+    fn unstarted_close_cancellation() -> (
+        novarocks_workload_control::WorkloadControl,
+        novarocks_workload_control::RootWork,
+        CancellationView,
+    ) {
+        use novarocks_workload_control::{
+            ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+        };
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1 << 20,
+                control_bytes: 1 << 10,
+                per_scope_bytes: (1 << 20) - (1 << 10),
+            },
+        )
+        .unwrap();
+        control.mark_ready().unwrap();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let cancellation = root.owner.scope().cancellation().unwrap();
+        (control, root, cancellation)
+    }
+
+    #[tokio::test]
+    async fn unstarted_declared_empty_pumps_require_exact_never_established_facts() {
+        let mut round = super::super::tests::manifest_unstarted_regression_fixture();
+        round.seal_pumps();
+        let mut assembled = unstarted_close_round(round);
+        let (_control, root, _cancellation) = unstarted_close_cancellation();
+        assembled.converge_unstarted().await.unwrap();
+        let facts = assembled
+            .convergence
+            .observed_contexts(&assembled.round)
+            .unwrap();
+        let expected = assembled
+            .round
+            .execution()
+            .graph()
+            .contexts()
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(!expected.is_empty());
+        assert_eq!(facts.len(), expected.len());
+        for (fact, context) in facts.iter().zip(expected) {
+            assert_eq!(fact.context(), context);
+            assert_eq!(
+                fact.kind(),
+                novarocks_query_application::api::NativeContextConvergenceKind::NeverEstablished
+            );
+        }
+        drop(assembled);
+        root.owner.complete();
+        root.business.release();
+    }
+
+    #[tokio::test]
+    async fn unstarted_undeclared_empty_pumps_are_not_actual_close_proof() {
+        let round = super::super::tests::manifest_unstarted_regression_fixture();
+        assert!(round.pumps_closed());
+        assert!(!round.pumps_declared());
+        let mut assembled = unstarted_close_round(round);
+        let (_control, root, _cancellation) = unstarted_close_cancellation();
+        let failure = assembled.converge_unstarted().await.unwrap_err();
+        assert_eq!(
+            failure.detail(),
+            "Native dormant cleanup requires its original source declaration"
+        );
+        assert!(!assembled.round.pumps_declared());
+        // Explicit fixture disposition, not a successful source-exit receipt.
+        drop(failure);
+        drop(assembled);
+        root.owner.complete();
+        root.business.release();
+    }
+
+    #[tokio::test]
+    async fn unstarted_round_waits_for_the_original_source_close_job_after_borrowed_cancel() {
+        use crate::query_execution::split_assignment::SplitAssignmentDriverError;
+        use crate::query_execution::split_assignment_round::failure_observation_plan;
+        use std::sync::atomic::Ordering;
+        let round = super::super::tests::manifest_unstarted_regression_fixture();
+        let context = *round.execution().graph().contexts().next().unwrap();
+        assert!(round.execution().context_never_established(context));
+        let mut assembled = unstarted_close_round(round);
+        let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let (release, released) = std::sync::mpsc::channel();
+        let (plan, enumerations, closes) = failure_observation_plan(
+            context.query_execution_id(),
+            data_runtime.connector_blocking_io().clone(),
+            Some(released),
+        );
+        let guard = assembled
+            .install_split_assignment(context.query_execution_id(), plan, data_runtime)
+            .unwrap();
+        assembled.round.seal_pumps();
+        let (_control, root, _cancellation) = unstarted_close_cancellation();
+        let mut close = Box::pin(assembled.converge_unstarted());
+        assert!(futures::poll!(&mut close).is_pending());
+        drop(close);
+        // No borrowed Future owns or aborts the real original close job.
+        assert!(!guard.is_finished());
+        let observe_then_release = async {
+            while closes.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !guard.is_finished(),
+                "the actual source is blocked inside its own close"
+            );
+            assert_eq!(enumerations.load(Ordering::SeqCst), 0);
+            release.send(()).unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(assembled.converge_unstarted(), observe_then_release)
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+        assert!(guard.is_finished());
+        assert!(assembled.round.pumps_closed());
+        assert!(
+            assembled
+                .round
+                .execution()
+                .context_never_established(context)
+        );
+        let facts = assembled
+            .convergence
+            .observed_contexts(&assembled.round)
+            .unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].context(), context);
+        assert_eq!(
+            facts[0].kind(),
+            novarocks_query_application::api::NativeContextConvergenceKind::NeverEstablished
+        );
+        assert_eq!(enumerations.load(Ordering::SeqCst), 0);
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            guard.finish_after_attempt(false),
+            Err(SplitAssignmentDriverError::SourceClose { .. })
+        ));
+        drop(assembled);
+        root.owner.complete();
+        root.business.release();
+    }
+
+    #[tokio::test]
+    async fn unstarted_round_refuses_a_real_original_admission_ticket() {
+        let (round, _) = super::super::tests::pre_ready_observation_round();
+        let context = *round.execution().graph().contexts().next().unwrap();
+        assert!(!round.execution().context_never_established(context));
+        let mut assembled = unstarted_close_round(round);
+        let (_control, root, _cancellation) = unstarted_close_cancellation();
+        let failure = assembled.converge_unstarted().await.unwrap_err();
+        assert_eq!(
+            failure.detail(),
+            "Native dormant cleanup requires every exact context to be never established"
+        );
+        let same_failure = assembled.converge_unstarted().await.unwrap_err();
+        assert!(std::ptr::eq(failure.cause(), same_failure.cause()));
+        drop(same_failure);
+        assert!(
+            !assembled
+                .round
+                .execution()
+                .context_never_established(context)
+        );
+        // No Worker/remote closure is minted and the original round stays here.
+        drop(failure);
+        drop(assembled);
+        root.owner.complete();
+        root.business.release();
     }
 
     async fn terminal_regression_drive(

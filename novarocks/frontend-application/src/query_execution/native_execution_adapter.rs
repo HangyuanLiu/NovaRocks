@@ -1316,6 +1316,13 @@ pub(crate) trait FrontendActiveAttemptBehavior<M = ManifestBoundNativeAttemptInp
         inputs: &'a mut M,
         request: NativeActiveConvergenceRequest,
     ) -> NativeActiveAttemptConvergenceFuture<'a>;
+
+    /// Closes a completed activation result which never entered run(). The
+    /// same active/manifest fields stay installed throughout this borrowed F.
+    fn converge_unstarted<'a>(
+        &'a mut self,
+        inputs: &'a mut M,
+    ) -> NativeAttemptConvergenceFuture<'a>;
 }
 
 pub(crate) trait FrontendDormantAttemptBehavior<M = ManifestBoundNativeAttemptInputs>:
@@ -1339,11 +1346,7 @@ pub(crate) trait FrontendDormantAttemptBehavior<M = ManifestBoundNativeAttemptIn
         >,
     >;
 
-    fn converge<'a>(
-        &'a mut self,
-        inputs: &'a mut M,
-        cancellation: CancellationView,
-    ) -> NativeAttemptConvergenceFuture<'a>;
+    fn converge<'a>(&'a mut self, inputs: &'a mut M) -> NativeAttemptConvergenceFuture<'a>;
 }
 
 /// Frontend-local constructor for Task protocol and transport behavior. The
@@ -1394,10 +1397,7 @@ pub(crate) trait FrontendManifestAttemptProjection:
         >,
     >;
 
-    fn converge<'a>(
-        &'a mut self,
-        cancellation: CancellationView,
-    ) -> NativeAttemptConvergenceFuture<'a>;
+    fn converge<'a>(&'a mut self) -> NativeAttemptConvergenceFuture<'a>;
 }
 
 /// One exact Task round and its move-only root result owners.
@@ -1591,20 +1591,22 @@ impl FrontendManifestAttemptProjection for RegisteredManifestAttemptProjection {
             Ok(self.pending_projected.take().unwrap())
         })
     }
-    fn converge<'a>(
-        &'a mut self,
-        cancellation: CancellationView,
-    ) -> NativeAttemptConvergenceFuture<'a> {
-        if self.pending_projected.is_some() {
-            // The completed round/rows are no longer covered by the base's
-            // empty convergence. Keep this same finite owner unproven until
-            // the original round's actual close/return author is connected.
-            return Box::pin(std::future::pending());
-        }
-        if let Some(handoff) = self.handoff.as_mut() {
-            handoff.retire_unclaimed();
-        }
-        self.base.converge(cancellation)
+    fn converge<'a>(&'a mut self) -> NativeAttemptConvergenceFuture<'a> {
+        Box::pin(async move {
+            if let Some(projected) = self.pending_projected.as_mut() {
+                if let Some(handoff) = projected.handoff.as_mut() {
+                    handoff.retire_unclaimed();
+                }
+                projected.round.converge_unstarted().await?;
+                // Only after actual original close may the synchronously
+                // drop-safe return leave its stable receiving field.
+                drop(self.pending_projected.take());
+            }
+            if let Some(handoff) = self.handoff.as_mut() {
+                handoff.retire_unclaimed();
+            }
+            self.base.converge().await
+        })
     }
 }
 
@@ -1631,15 +1633,11 @@ impl FrontendManifestAttemptProjection for ProductionManifestAttemptProjection {
         })
     }
 
-    fn converge<'a>(
-        &'a mut self,
-        _cancellation: CancellationView,
-    ) -> NativeAttemptConvergenceFuture<'a> {
+    fn converge<'a>(&'a mut self) -> NativeAttemptConvergenceFuture<'a> {
         Box::pin(async move {
-            if self.pending_projected.is_some() {
-                // The original round has been assembled: its existing actual
-                // round-close contract, not initializer cleanup, owns it.
-                std::future::pending::<()>().await;
+            if let Some(projected) = self.pending_projected.as_mut() {
+                projected.round.converge_unstarted().await?;
+                drop(self.pending_projected.take());
             }
             if let Some(ready) = self.pending_ready.as_mut() {
                 ready.close().await?;
@@ -2061,9 +2059,8 @@ where
     fn converge<'a>(
         &'a mut self,
         _inputs: &'a mut ManifestBoundNativeAttemptInputs,
-        cancellation: CancellationView,
     ) -> NativeAttemptConvergenceFuture<'a> {
-        self.projection.converge(cancellation)
+        self.projection.converge()
     }
 }
 
@@ -2132,6 +2129,18 @@ impl FrontendTaskProtocolActiveBehavior {
 }
 
 impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
+    fn converge_unstarted<'a>(
+        &'a mut self,
+        _inputs: &'a mut ManifestBoundNativeAttemptInputs,
+    ) -> NativeAttemptConvergenceFuture<'a> {
+        Box::pin(async move {
+            if let Some(handoff) = self.handoff.as_mut() {
+                handoff.retire_unclaimed();
+            }
+            self.attempt.converge_unstarted().await
+        })
+    }
+
     fn take_rows_runtime(&mut self) -> Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)> {
         self.rows.take()
     }
@@ -2422,16 +2431,24 @@ where
     where
         B: FrontendDormantAttemptBehavior<I::Manifest>,
     {
-        if self.pending_active_behavior.is_some() {
-            // A completed active source is not covered by dormant projection
-            // cleanup. Keep this SAME finite owner until its real close/return
-            // author is supplied; never report an empty convergence as exit.
-            return Box::pin(std::future::pending());
-        }
-        match self.manifest_inputs.as_mut() {
-            Some(inputs) => self.behavior.converge(inputs, cancellation),
-            None => Box::pin(async { Ok(()) }),
-        }
+        // Cleanup is irrevocable. Its private borrowed chain needs no owned
+        // cancellation view whose notification-bearing Drop could follow a
+        // retained health clone through several async return frames.
+        drop(cancellation);
+        Box::pin(async move {
+            if let Some(active) = self.pending_active_behavior.as_mut() {
+                let inputs = self
+                    .manifest_inputs
+                    .as_mut()
+                    .expect("a stable returned active retains its original manifest");
+                active.converge_unstarted(inputs).await?;
+                drop(self.pending_active_behavior.take());
+            }
+            match self.manifest_inputs.as_mut() {
+                Some(inputs) => self.behavior.converge(inputs).await,
+                None => Ok(()),
+            }
+        })
     }
 }
 
@@ -3319,6 +3336,13 @@ mod tests {
     struct NeverActiveBehavior;
 
     impl<M: std::fmt::Debug + Send + 'static> FrontendActiveAttemptBehavior<M> for NeverActiveBehavior {
+        fn converge_unstarted<'a>(
+            &'a mut self,
+            _: &'a mut M,
+        ) -> NativeAttemptConvergenceFuture<'a> {
+            Box::pin(async { panic!("the adversarial eligibility fixture never activates") })
+        }
+
         fn run<'a>(
             &'a mut self,
             _inputs: &'a mut M,
@@ -3362,11 +3386,7 @@ mod tests {
             Box::pin(async { panic!("adversarial eligibility test must not activate") })
         }
 
-        fn converge<'a>(
-            &'a mut self,
-            _inputs: &'a mut M,
-            _cancellation: CancellationView,
-        ) -> NativeAttemptConvergenceFuture<'a> {
+        fn converge<'a>(&'a mut self, _inputs: &'a mut M) -> NativeAttemptConvergenceFuture<'a> {
             Box::pin(async { Ok(()) })
         }
     }
@@ -3450,6 +3470,22 @@ mod tests {
     }
 
     impl FrontendActiveAttemptBehavior<TestManifest> for TestActiveBehavior {
+        fn converge_unstarted<'a>(
+            &'a mut self,
+            inputs: &'a mut TestManifest,
+        ) -> NativeAttemptConvergenceFuture<'a> {
+            assert_eq!(inputs.marker, 73);
+            assert_eq!(
+                inputs.identity.as_ref() as *const u8 as usize,
+                self.identity_address
+            );
+            let observed = Arc::clone(&self.convergence_observed);
+            Box::pin(async move {
+                observed.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
         fn run<'a>(
             &'a mut self,
             inputs: &'a mut TestManifest,
@@ -3519,7 +3555,6 @@ mod tests {
         fn converge<'a>(
             &'a mut self,
             inputs: &'a mut TestManifest,
-            _cancellation: CancellationView,
         ) -> NativeAttemptConvergenceFuture<'a> {
             assert_eq!(inputs.marker, 73);
             let observed = Arc::clone(&self.convergence_observed);
@@ -3734,6 +3769,8 @@ mod tests {
     }
     #[derive(Debug)]
     struct ExtractionPanicDormant {
+        close_gate: Arc<tokio::sync::Notify>,
+        active_closes: Arc<AtomicU64>,
         active_drops: Arc<AtomicU64>,
         cause_drops: Arc<AtomicU64>,
         extractions: Arc<AtomicU64>,
@@ -3741,6 +3778,8 @@ mod tests {
     }
     #[derive(Debug)]
     struct ExtractionPanicActive {
+        close_gate: Arc<tokio::sync::Notify>,
+        active_closes: Arc<AtomicU64>,
         active_drops: Arc<AtomicU64>,
         cause_drops: Arc<AtomicU64>,
         extractions: Arc<AtomicU64>,
@@ -3751,6 +3790,20 @@ mod tests {
         }
     }
     impl FrontendActiveAttemptBehavior<TestManifest> for ExtractionPanicActive {
+        fn converge_unstarted<'a>(
+            &'a mut self,
+            inputs: &'a mut TestManifest,
+        ) -> NativeAttemptConvergenceFuture<'a> {
+            assert_eq!(inputs.marker, 73);
+            let gate = Arc::clone(&self.close_gate);
+            let closes = Arc::clone(&self.active_closes);
+            Box::pin(async move {
+                gate.notified().await;
+                closes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
         fn take_rows_runtime(
             &mut self,
         ) -> Option<(
@@ -3796,6 +3849,8 @@ mod tests {
             Box::pin(async move {
                 assert_eq!(inputs.marker, 73);
                 Ok(ExtractionPanicActive {
+                    close_gate: Arc::clone(&self.close_gate),
+                    active_closes: Arc::clone(&self.active_closes),
                     active_drops: Arc::clone(&self.active_drops),
                     cause_drops: Arc::clone(&self.cause_drops),
                     extractions: Arc::clone(&self.extractions),
@@ -3805,7 +3860,6 @@ mod tests {
         fn converge<'a>(
             &'a mut self,
             _inputs: &'a mut TestManifest,
-            _cancellation: CancellationView,
         ) -> NativeAttemptConvergenceFuture<'a> {
             self.dormant_closes.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
@@ -3818,6 +3872,8 @@ mod tests {
         let cause_drops = Arc::new(AtomicU64::new(0));
         let extractions = Arc::new(AtomicU64::new(0));
         let dormant_closes = Arc::new(AtomicU64::new(0));
+        let close_gate = Arc::new(tokio::sync::Notify::new());
+        let active_closes = Arc::new(AtomicU64::new(0));
         let mut owner = SnapshotBoundDormantAttemptOwner::<_, CapturedInputs>::from_manifest(
             TestManifest {
                 eligible_backends: vec![],
@@ -3825,6 +3881,8 @@ mod tests {
                 identity: Box::new(91),
             },
             ExtractionPanicDormant {
+                close_gate: Arc::clone(&close_gate),
+                active_closes: Arc::clone(&active_closes),
                 active_drops: Arc::clone(&active_drops),
                 cause_drops: Arc::clone(&cause_drops),
                 extractions: Arc::clone(&extractions),
@@ -3851,9 +3909,17 @@ mod tests {
             manifest.identity.as_ref() as *const u8 as usize == original_identity
         });
         let active_retained = owner.pending_active_behavior.is_some();
-        let mut close = owner.converge_retained(cancellation);
+        let mut close = owner.converge_retained(cancellation.clone());
         let close_pending = futures::poll!(&mut close).is_pending();
         drop(close);
+        assert!(owner.pending_active_behavior.is_some());
+        assert_eq!(active_closes.load(Ordering::SeqCst), 0);
+        assert_eq!(active_drops.load(Ordering::SeqCst), 0);
+        close_gate.notify_one();
+        owner.converge_retained(cancellation).await.unwrap();
+        assert!(owner.pending_active_behavior.is_none());
+        assert!(owner.manifest_inputs.is_some());
+        assert_eq!(active_closes.load(Ordering::SeqCst), 1);
         let before = (
             active_drops.load(Ordering::SeqCst),
             cause_drops.load(Ordering::SeqCst),
@@ -3865,9 +3931,9 @@ mod tests {
         root.owner.complete();
         root.business.release();
         assert!(exact_cause && manifest_retained && active_retained && close_pending);
-        assert_eq!(before, (0, 0));
+        assert_eq!(before, (1, 0));
         assert_eq!(extractions.load(Ordering::SeqCst), 1);
-        assert_eq!(dormant_closes.load(Ordering::SeqCst), 0);
+        assert_eq!(dormant_closes.load(Ordering::SeqCst), 1);
         assert_eq!(active_drops.load(Ordering::SeqCst), 1);
         assert_eq!(cause_drops.load(Ordering::SeqCst), 1);
     }

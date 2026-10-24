@@ -9680,6 +9680,12 @@ fn pending_success_seal_recovers_at_a_new_cut_or_rejects_at_the_original_deadlin
     }
 }
 
+/// The original round factory before its first Task/lifecycle turn.
+pub(crate) fn manifest_unstarted_regression_fixture() -> TaskRoundForTest {
+    let (round, _) = round_of(Harness::new(&[0], &[0], 64));
+    round
+}
+
 pub(crate) fn manifest_terminal_regression_fixture() -> (
     TaskRoundForTest,
     crate::native::task_transport::TaskAckIntakeHandle,

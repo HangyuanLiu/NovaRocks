@@ -1600,6 +1600,11 @@ impl TaskRound {
         self.execution.attempt_drained()
     }
 
+    /// Pure observation of the original source-installation declaration.
+    pub(crate) fn pumps_declared(&self) -> bool {
+        self.pumps_sealed
+    }
+
     /// Local pump proof is independent of remote Task/context receipts.
     pub(crate) fn pumps_closed(&self) -> bool {
         self.pumps.iter().all(|pump| pump.owner.is_closed())
