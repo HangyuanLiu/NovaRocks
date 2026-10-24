@@ -128,7 +128,6 @@ pub(crate) fn queued_header_quote(payload: usize) -> Result<NativeQueuedInputQuo
     let bytes = Layout::new::<NativeInputQueuePermit>()
         .size()
         .checked_add(crate::task_execution::dispatch::queued_operation_layout().size())
-        .and_then(|bytes| bytes.checked_add(novarocks_workload_control::joint_admission::JointProposalSlotWait::metadata_layouts().1.size()))
         .ok_or(WorkError::ArithmeticOverflow)?;
     Ok(NativeQueuedInputQuote::for_original_native_input(
         metadata(bytes)?,
@@ -226,7 +225,9 @@ impl NativeTaskOperationSink {
         let waker = Waker::from(Arc::clone(&self.acks.inner));
         let mut cx = Context::from_waker(&waker);
         if let Some(admission) = preparation.admission.as_mut() {
-            match std::pin::Pin::new(&mut *admission).poll(&mut cx) {
+            match admission.poll_with_slot_observer(&mut cx, &mut |signal, cx| {
+                self.proposal_wait.poll(signal, cx, &self.acks.inner)
+            }) {
                 Poll::Pending => {
                     return if admission.is_waiting_for_proposal_slot() {
                         // Original Root-wide Q exhaustion stops this producer pass

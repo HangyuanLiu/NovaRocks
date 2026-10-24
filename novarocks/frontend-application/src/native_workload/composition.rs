@@ -753,8 +753,20 @@ fn process_source_backing(
             ));
         }
     }
+    let waits = NativeTaskOperationSink::proposal_wait_source_geometry(transport.into_codec())?;
+    if inputs
+        .native
+        .is_some_and(|actual| actual.transport.waiter_records != waits.records)
+    {
+        return Err(WorkError::InvalidConfig(
+            "frontend actual Native source waiter geometry",
+        ));
+    }
     let native_shared = apply_bytes
-        .checked_add(inputs.native.map_or(0, |s| s.subscription_resident_bytes))
+        .checked_add(waits.resident_bytes()?)
+        .and_then(|bytes| {
+            bytes.checked_add(inputs.native.map_or(0, |s| s.subscription_resident_bytes))
+        })
         .ok_or(WorkError::ArithmeticOverflow)?;
     let native_layout =
         Layout::array::<u8>(native_shared).map_err(|_| WorkError::ArithmeticOverflow)?;

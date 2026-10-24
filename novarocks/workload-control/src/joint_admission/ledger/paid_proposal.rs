@@ -177,6 +177,21 @@ impl JointAdmissionHandle {
         }
     }
 
+    pub(super) fn try_begin_paid_proposal_for_scope_signal(
+        &self,
+        scope: WorkScope,
+    ) -> Result<JointTryBegin<JointProposal, JointProposalSlotSignal>, WorkError> {
+        match self.try_reserve_proposal(&scope)? {
+            ProposalReservation::Reserved(Some(custody)) => self
+                .paid_proposal_with_custody(scope, custody)
+                .map(JointTryBegin::Started),
+            ProposalReservation::Reserved(None) => Err(WorkError::NotReady),
+            ProposalReservation::Full(target) => Ok(JointTryBegin::Full(
+                JointProposalSlotSignal::new(Arc::downgrade(&self.inner), target),
+            )),
+        }
+    }
+
     fn paid_proposal_with_custody(
         &self,
         scope: WorkScope,

@@ -234,7 +234,7 @@ pub struct NativeAsyncActionAdmission {
     admission: Option<JointAdmission>,
     scope: WorkScope,
     fence: NativeActionFence,
-    slot_wait: Option<JointProposalSlotWait>,
+    slot_wait: Option<JointProposalSlotSignal>,
 }
 impl NativeAsyncActionAdmission {
     pub fn is_waiting_for_proposal_slot(&self) -> bool {
@@ -244,12 +244,16 @@ impl NativeAsyncActionAdmission {
     fn poll_constructor(
         &mut self,
         cx: &mut Context<'_>,
+        observe: &mut impl FnMut(
+            &JointProposalSlotSignal,
+            &mut Context<'_>,
+        ) -> Poll<Result<(), WorkError>>,
     ) -> Poll<Result<(), JointAdmissionFailure>> {
         if self.admission.is_some() {
             return Poll::Ready(Ok(()));
         }
         if let Some(wait) = self.slot_wait.as_mut() {
-            match Pin::new(wait).poll(cx) {
+            match observe(wait, cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => {
                     return Poll::Ready(Err(JointAdmissionFailure { error }));
@@ -271,7 +275,7 @@ impl NativeAsyncActionAdmission {
             }
             JointTryBegin::Full(wait) => {
                 self.slot_wait = Some(wait);
-                match Pin::new(self.slot_wait.as_mut().unwrap()).poll(cx) {
+                match observe(self.slot_wait.as_ref().unwrap(), cx) {
                     Poll::Pending => Poll::Pending,
                     Poll::Ready(Err(error)) => Poll::Ready(Err(JointAdmissionFailure { error })),
                     Poll::Ready(Ok(())) => {
@@ -311,8 +315,12 @@ impl NativeAsyncActionAdmission {
     pub fn poll_local_offer(
         &mut self,
         cx: &mut Context<'_>,
+        observe: &mut impl FnMut(
+            &JointProposalSlotSignal,
+            &mut Context<'_>,
+        ) -> Poll<Result<(), WorkError>>,
     ) -> Poll<Result<JointLocalOffer<'_>, JointAdmissionFailure>> {
-        match self.poll_constructor(cx) {
+        match self.poll_constructor(cx, observe) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Ready(Ok(())) => {}
@@ -519,7 +527,10 @@ impl NativeAsyncActionSource {
     }
     pub fn try_begin(
         &self,
-    ) -> Result<JointTryBegin<NativeAsyncActionAdmission>, JointAdmissionFailure> {
+    ) -> Result<
+        JointTryBegin<NativeAsyncActionAdmission, JointProposalSlotSignal>,
+        JointAdmissionFailure,
+    > {
         let result = (|| {
             let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
             source_facts(&inner.state.lock().unwrap(), self.owner, &self.fence)?;
@@ -530,7 +541,7 @@ impl NativeAsyncActionSource {
             let attempt = JointAdmissionHandle {
                 inner: Arc::clone(&inner),
             }
-            .try_begin_paid_proposal_for_scope(scope.clone())?;
+            .try_begin_paid_proposal_for_scope_signal(scope.clone())?;
             source_facts(&inner.state.lock().unwrap(), self.owner, &self.fence)?;
             match attempt {
                 JointTryBegin::Full(wait) => Ok(JointTryBegin::Full(wait)),
@@ -684,11 +695,15 @@ impl NativeQueuedInputAdmission {
     pub fn is_waiting_for_proposal_slot(&self) -> bool {
         self.original.is_waiting_for_proposal_slot()
     }
-}
-impl Future for NativeQueuedInputAdmission {
-    type Output = Result<NativeQueuedInputReady, JointAdmissionFailure>;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.original.poll_constructor(cx) {
+    pub fn poll_with_slot_observer(
+        &mut self,
+        cx: &mut Context<'_>,
+        observe: &mut impl FnMut(
+            &JointProposalSlotSignal,
+            &mut Context<'_>,
+        ) -> Poll<Result<(), WorkError>>,
+    ) -> Poll<Result<NativeQueuedInputReady, JointAdmissionFailure>> {
+        match self.original.poll_constructor(cx, observe) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Ready(Ok(())) => {}

@@ -116,30 +116,11 @@ impl MetadataMaintenanceAction {
             .result
             .take()
             .expect("stable original maintenance result");
-        let result = match result {
-            Err(error) => {
-                let routed = product_command_error(maintenance_command_error(error));
-                let service = match cancellation.reason() {
-                    Some(reason) => selected_execution_or_worker_fallback(
-                        Err(routed),
-                        cancellation_error(reason),
-                    ),
-                    None => routed_execution_service_error(routed),
-                };
-                return Poll::Ready(Err(service));
-            }
+        let result = match select_maintenance_completion(result, disposition, cancellation.reason())
+        {
             Ok(result) => result,
+            Err(error) => return Poll::Ready(Err(error)),
         };
-        if let Some(reason) = cancellation.reason() {
-            let mut error = cancellation_error(reason);
-            if let Some(disposition) = disposition {
-                error = error.attach_maintenance_publication_disposition(disposition);
-            }
-            // Closed maintenance presentation data is destroyed while the
-            // same source still holds its original owner and result window.
-            drop(result);
-            return Poll::Ready(Err(error));
-        }
         Poll::Ready(match result {
             MaintenanceStatementResult::Ok => Ok(StatementActionValue::Ok),
             MaintenanceStatementResult::Query(result) => {
@@ -193,5 +174,98 @@ impl GovernedStatementAction for MetadataMaintenanceAction {
             }
             result => result,
         }
+    }
+}
+
+/// A real publication is irreversible. Cancellation still vetoes new work,
+/// while the original completed Product selects its necessary business result.
+fn select_maintenance_completion(
+    result: Result<MaintenanceStatementResult, novarocks_table_maintenance::runtime::TerminalError>,
+    disposition: Option<novarocks_spi::connector::LakePublicationDisposition>,
+    cancellation: Option<QueryCancellationReason>,
+) -> Result<MaintenanceStatementResult, QueryServiceError> {
+    use novarocks_spi::connector::LakePublicationDisposition;
+    let committed = disposition == Some(LakePublicationDisposition::KnownCommitted);
+    match result {
+        Err(error) => {
+            let routed = product_command_error(maintenance_command_error(error));
+            Err(match cancellation {
+                Some(reason) if !committed => {
+                    selected_execution_or_worker_fallback(Err(routed), cancellation_error(reason))
+                }
+                _ => routed_execution_service_error(routed),
+            })
+        }
+        Ok(result) => match cancellation {
+            Some(reason) if !committed => {
+                let mut error = cancellation_error(reason);
+                if let Some(disposition) = disposition {
+                    error = error.attach_maintenance_publication_disposition(disposition);
+                }
+                drop(result);
+                Err(error)
+            }
+            _ => Ok(result),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks_spi::connector::LakePublicationDisposition;
+    use novarocks_table_maintenance::runtime::TerminalError;
+
+    #[test]
+    fn irreversible_maintenance_keeps_success_and_required_failure_after_cancel() {
+        for reason in [
+            QueryCancellationReason::ExplicitKill {
+                requester_connection_id: 7,
+            },
+            QueryCancellationReason::DeadlineExceeded { timeout_ms: 1 },
+            QueryCancellationReason::ClientDisconnected,
+            QueryCancellationReason::ServerShutdown,
+        ] {
+            assert!(matches!(
+                select_maintenance_completion(
+                    Ok(MaintenanceStatementResult::Ok),
+                    Some(LakePublicationDisposition::KnownCommitted),
+                    Some(reason.clone()),
+                ),
+                Ok(MaintenanceStatementResult::Ok)
+            ));
+            let error = select_maintenance_completion(
+                Err(TerminalError::known_committed_finalization_failed(
+                    "required cache invalidation failed",
+                )),
+                Some(LakePublicationDisposition::KnownCommitted),
+                Some(reason),
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("required cache invalidation failed")
+            );
+            assert_eq!(
+                error.maintenance_publication_disposition(),
+                Some(LakePublicationDisposition::KnownCommitted)
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_still_vetoes_unpublished_maintenance() {
+        let error = select_maintenance_completion(
+            Ok(MaintenanceStatementResult::Ok),
+            None,
+            Some(QueryCancellationReason::DeadlineExceeded { timeout_ms: 1 }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            cancellation_error(QueryCancellationReason::DeadlineExceeded { timeout_ms: 1 }).kind()
+        );
+        assert_eq!(error.maintenance_publication_disposition(), None);
     }
 }

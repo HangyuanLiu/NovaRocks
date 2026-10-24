@@ -78,7 +78,9 @@ use proposal_storage::{
     ChangeBody, ProposalConstruction, ProposalKey, ProposalReservation, queue_proposal,
     retire_proposal,
 };
-pub use proposal_storage::{JointGrantedClaims, JointProposalSlotWait, JointTryBegin};
+pub use proposal_storage::{
+    JointGrantedClaims, JointProposalSlotSignal, JointProposalSlotWait, JointTryBegin,
+};
 
 pub(super) struct DependencyRecord {
     pub(super) ordinal: u64,

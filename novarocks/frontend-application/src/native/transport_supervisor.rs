@@ -255,6 +255,14 @@ pub(crate) struct NativeTransportSupervisor {
 }
 
 impl NativeTransportSupervisor {
+    /// The same preexisting registration lease bounds live operation sinks.
+    /// No queue/action permit or extra waiter inventory is introduced here.
+    pub(crate) fn source_waiter_records_for_transport(
+        transport: TransportBudget,
+    ) -> Result<usize, String> {
+        Ok(NativeTransportSupervisorBudget::from_transport(transport)?.max_waiters)
+    }
+
     pub(crate) fn capacity_sources(&self) -> NativeTaskOperationCapacityFacts {
         let budget = self.inner.budget;
         NativeTaskOperationCapacityFacts {

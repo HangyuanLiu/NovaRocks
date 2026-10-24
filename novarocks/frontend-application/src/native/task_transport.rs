@@ -827,8 +827,29 @@ pub(crate) struct NativeTaskOperationSink {
     attempt: AttemptWireFacts,
     acks: TaskAckIntakeHandle,
     data_runtime: FrontendDataRuntime,
-    transport_waiter: NativeTransportWaiter,
+    proposal_wait: proposal_wait::OriginalProposalWait,
+    transport_waiter: std::mem::ManuallyDrop<NativeTransportWaiter>,
     authority: novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
+}
+
+// The original registration position cannot be returned while its shared
+// notification F is still registered. No preparation owns an alias to this F.
+impl Drop for NativeTaskOperationSink {
+    fn drop(&mut self) {
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.proposal_wait.retire()));
+        // SAFETY: this Drop is the only release/take author. ManuallyDrop
+        // prevents field cleanup from releasing the registration on unwind.
+        match result {
+            Ok(()) => unsafe { std::mem::ManuallyDrop::drop(&mut self.transport_waiter) },
+            Err(cause) => {
+                let lease = unsafe { std::mem::ManuallyDrop::take(&mut self.transport_waiter) };
+                std::panic::resume_unwind(Box::new(proposal_wait::OriginalWaitExitFailure::new(
+                    cause, lease,
+                )));
+            }
+        }
+    }
 }
 
 impl fmt::Debug for NativeTaskOperationSink {
@@ -864,7 +885,8 @@ impl NativeTaskOperationSink {
             attempt,
             acks,
             data_runtime,
-            transport_waiter,
+            proposal_wait: proposal_wait::OriginalProposalWait::default(),
+            transport_waiter: std::mem::ManuallyDrop::new(transport_waiter),
             authority,
         })
     }
@@ -7986,3 +8008,5 @@ mod tests {
 #[path = "task_transport/action_input.rs"]
 mod action_input;
 pub(crate) use action_input::{NativeApplyKnownInputLayouts, known_input_layouts_for_composition};
+
+mod proposal_wait;

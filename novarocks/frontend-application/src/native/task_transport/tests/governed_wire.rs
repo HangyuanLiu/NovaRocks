@@ -40,7 +40,19 @@ pub(super) struct GovernedWireRole {
 impl GovernedWireRole {
     pub(super) fn new(peer: &Loopback) -> Self {
         let count = 8;
-        let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 4, 2, &[]);
+        let wait_source =
+            NativeTaskOperationSink::proposal_wait_source_geometry(TransportBudget::DEFAULT)
+                .unwrap();
+        let wait_backing =
+            std::alloc::Layout::array::<u8>(wait_source.resident_bytes().unwrap()).unwrap();
+        let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 4, 2, &[])
+            .with_process_source_backing(
+                novarocks_workload_control::PollRoleSourceBacking::from_layouts(
+                    &[],
+                    &[wait_backing],
+                )
+                .unwrap(),
+            );
         let mut config = JointCapacityConfig {
             global: JointResourceLimits::default(),
             classes: [JointResourceLimits::default(); 5],
@@ -432,4 +444,171 @@ async fn unpublished_paid_input_withdrawal_recycles_queue_but_keeps_retained_pay
         control.shutdown().is_ok(),
         "same original governor truly drains after the final payload exit"
     );
+}
+
+/// Multiple original inputs and the action observer share one Source wait.
+/// No request is dispatched and no cheap Full signal owns a boxed F.
+#[tokio::test(flavor = "multi_thread")]
+async fn same_sink_q_full_preparations_share_one_original_wait_source() {
+    use crate::task_execution::intent::TaskOperationSink;
+    use futures::FutureExt;
+    let backend = BackendProcessId::new_v7();
+    let mut peer = Loopback::start().await;
+    let governed = GovernedWireRole::new(&peer);
+    let mut runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+    let wake = Arc::new(CountingWake::default());
+    let acks = TaskAckIntake::new(wake.clone());
+    let sink = NativeTaskOperationSink::new(
+        &[peer.descriptor(backend)],
+        TransportBudget::DEFAULT,
+        test_attempt_facts(),
+        acks.handle(),
+        runtime.clone(),
+        governed.authority(),
+    )
+    .unwrap();
+    let mut preparations: [TaskOperationQueuePreparation; 3] =
+        std::array::from_fn(|_| TaskOperationQueuePreparation::new());
+    let intents = [
+        cancel_intent(1, backend),
+        cancel_intent(2, backend),
+        cancel_intent(3, backend),
+    ];
+    let original_permit = governed.reserve(&sink, &intents[0]);
+    // Installation retires the constructor; the original driver must reap
+    // its empty reply cell before both Q2 positions can be held below.
+    governed.drive();
+    let action_input = DispatchBatch::with_queued_at(
+        backend,
+        DispatchLane::Lifecycle,
+        vec![intents[0].clone()],
+        vec![original_permit],
+        intents[0].queued_bytes(),
+        novarocks_coordination_contract::MonotonicInstant::ORIGIN,
+    );
+    let action_quote = sink.quote_original_batch(&action_input).unwrap();
+    let scope = governed._root.owner.scope();
+    let first = scope.begin_control_binding().unwrap();
+    let second = scope.begin_control_binding().unwrap();
+    let mut blockers = [Some(first), Some(second)];
+    let body = std::panic::AssertUnwindSafe(async {
+        for (intent, preparation) in intents.iter().zip(&mut preparations) {
+            assert!(matches!(
+                sink.try_reserve_queue(intent.queue_request(), preparation),
+                TaskOperationQueueAdmission::ProcessFull
+            ));
+            assert!(
+                preparation
+                    .admission
+                    .as_ref()
+                    .unwrap()
+                    .is_waiting_for_proposal_slot()
+            );
+        }
+        assert_eq!(sink.proposal_wait.created_wait_futures(), 1);
+        assert!(sink.proposal_wait.has_wait_future());
+        // A method-run action uses the same original Source observer and wake.
+        let mut action = governed
+            .authority()
+            .action_source(JointLane::Settlement, action_quote)
+            .unwrap()
+            .begin_when_available()
+            .unwrap();
+        let waker = Waker::from(Arc::clone(&acks.inner));
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            action
+                .poll_local_offer(&mut cx, &mut |signal, cx| sink.proposal_wait.poll(
+                    signal,
+                    cx,
+                    &acks.inner
+                ))
+                .is_pending()
+        );
+        assert_eq!(sink.proposal_wait.created_wait_futures(), 1);
+        let before = governed.control.progress_revision();
+        let wakes_before = wake.count();
+        // Repeated scanning while the original driver is stopped cannot
+        // produce its own progress notification or another boxed wait.
+        for (intent, preparation) in intents.iter().zip(&mut preparations) {
+            assert!(matches!(
+                sink.try_reserve_queue(intent.queue_request(), preparation),
+                TaskOperationQueueAdmission::ProcessFull
+            ));
+        }
+        assert_eq!(governed.control.progress_revision(), before);
+        assert_eq!(wake.count(), wakes_before);
+        assert_eq!(sink.proposal_wait.created_wait_futures(), 1);
+        drop(action);
+        drop(blockers[0].take());
+        governed.drive();
+        // The original driver releases a real Q cell. Each same preparation
+        // can then receive its own original finite ticket without reticketing.
+        for (intent, preparation) in intents.iter().zip(&mut preparations) {
+            assert!(!matches!(
+                sink.try_reserve_queue(intent.queue_request(), preparation),
+                TaskOperationQueueAdmission::Rejected(_)
+            ));
+            governed.drive();
+            let permit = match sink.try_reserve_queue(intent.queue_request(), preparation) {
+                TaskOperationQueueAdmission::Admitted(permit) => permit,
+                value => panic!("same original Q source did not resume: {value:?}"),
+            };
+            drop(permit);
+            preparation.withdraw_unpublished();
+            governed.drive();
+        }
+        // Leave one real registered wait in the original Source for teardown.
+        // Withdrawing the cheap preparation does not itself destroy that F.
+        blockers[0] = Some(scope.begin_control_binding().unwrap());
+        assert!(matches!(
+            sink.try_reserve_queue(intents[0].queue_request(), &mut preparations[0]),
+            TaskOperationQueueAdmission::ProcessFull
+        ));
+        assert!(sink.proposal_wait.has_wait_future());
+        assert!(peer.peer.applied().is_empty());
+        assert_eq!(peer.peer.control_requests(), 0);
+    })
+    .catch_unwind()
+    .await;
+    drop(blockers);
+    for preparation in &mut preparations {
+        preparation.withdraw_unpublished();
+    }
+    drop(preparations);
+    drop(intents);
+    drop(action_input);
+    drop(sink); // wait F exits before this source's original registration lease
+    drop(acks);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let subscriptions = runtime.drain_original_subscriptions_until(deadline).await;
+    let apply = runtime.drain_original_apply_until(deadline).await;
+    let outgoing = runtime.drain_native_outgoing_until(deadline).await;
+    let peer_exit = peer.settle().await;
+    drop(runtime);
+    drop(peer);
+    let GovernedWireRole {
+        control,
+        driver,
+        _root: root,
+        window,
+    } = governed;
+    let mut driver = driver.into_inner().unwrap();
+    drop(window);
+    root.owner.complete_after_terminal_cancel_settled();
+    root.business.release();
+    control.close_admission();
+    drive_original(&mut driver);
+    let shutdown = control.shutdown();
+    // Keep original cleanup results until the primary has a stable receiver.
+    // The tuple has no diagnostic formatting of arbitrary original causes.
+    if body.is_err()
+        || subscriptions.is_err()
+        || apply.is_err()
+        || outgoing.is_err()
+        || !peer_exit
+        || shutdown.is_err()
+    {
+        std::panic::panic_any((body, subscriptions, apply, outgoing, peer_exit, shutdown));
+    }
 }

@@ -98,9 +98,9 @@ impl Drop for ProposalConstruction {
 
 /// A temporary unacquired constructor slot is distinct from every capacity
 /// proof/configuration/backing error. Full owns no request ticket or body.
-pub enum JointTryBegin<T> {
+pub enum JointTryBegin<T, W = JointProposalSlotWait> {
     Started(T),
-    Full(JointProposalSlotWait),
+    Full(W),
 }
 
 #[derive(Clone, Copy)]
@@ -115,16 +115,45 @@ pub(crate) enum ProposalReservation {
     Full(ProposalSlotWaitTarget),
 }
 
+/// Cheap same-source reobservation facts. This carries no heap wait, ticket,
+/// grant or physical authority and can move with its original preparation.
+#[derive(Clone)]
+pub struct JointProposalSlotSignal {
+    inner: Weak<Inner>,
+    target: ProposalSlotWaitTarget,
+}
+impl JointProposalSlotSignal {
+    pub(super) fn new(inner: Weak<Inner>, target: ProposalSlotWaitTarget) -> Self {
+        Self { inner, target }
+    }
+    /// Only the original stable Source calls this to fill its one paid wait
+    /// position. Per-request preparations retain this cheap signal instead.
+    pub fn into_wait(self) -> JointProposalSlotWait {
+        JointProposalSlotWait::new(self.inner, self.target)
+    }
+    pub fn is_same_source(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.inner, &other.inner)
+            && self.target.owner == other.target.owner
+            && self.target.slot == other.target.slot
+            && self.target.generation == other.target.generation
+    }
+}
+
 /// An event subscription in the original producer's existing fixed field.
 /// Ready asks that SAME source to reobserve; it never reserves a Q cell.
 pub struct JointProposalSlotWait {
+    source: JointProposalSlotSignal,
     future: Pin<Box<dyn Future<Output = Result<(), WorkError>> + Send>>,
 }
 impl JointProposalSlotWait {
     pub(super) fn new(inner: Weak<Inner>, target: ProposalSlotWaitTarget) -> Self {
         Self {
+            source: JointProposalSlotSignal::new(Weak::clone(&inner), target),
             future: Box::pin(wait_proposal_slot(inner, target)),
         }
+    }
+    pub fn is_for_signal(&self, signal: &JointProposalSlotSignal) -> bool {
+        self.source.is_same_source(signal)
     }
     /// Inline layout is already included by the containing original row.
     /// Charge the second, actual named F pointee once per fixed wait position.

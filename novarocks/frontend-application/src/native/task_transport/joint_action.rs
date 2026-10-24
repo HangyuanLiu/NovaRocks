@@ -503,7 +503,11 @@ impl NativeTaskOperationSink {
             .native_pending
             .as_mut()
             .expect("same original batch ticket");
-        let mut offer = match pending.admission.poll_local_offer(&mut cx) {
+        let mut offer = match pending
+            .admission
+            .poll_local_offer(&mut cx, &mut |signal, cx| {
+                self.proposal_wait.poll(signal, cx, &self.acks.inner)
+            }) {
             Poll::Pending => return Ok(None),
             Poll::Ready(Err(error)) => return Err(error.error.into()),
             Poll::Ready(Ok(offer)) => offer,
