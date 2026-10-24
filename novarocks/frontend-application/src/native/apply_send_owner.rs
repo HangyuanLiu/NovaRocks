@@ -74,6 +74,30 @@ impl JoinFacts {
 type ReservationBacking = Mutex<ApplyReservations>;
 type OriginalFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
+/// Requested payload layouts of the actual original Apply holder. This does
+/// not estimate a Tokio task, platform mutex backing or captured pointees.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OriginalInputLayouts {
+    pub(crate) future: std::alloc::Layout,
+    pub(crate) input: std::alloc::Layout,
+    pub(crate) reservations: std::alloc::Layout,
+    pub(crate) task_inline: std::alloc::Layout,
+}
+pub(crate) fn original_input_layouts<F: Future<Output = ()>>()
+-> Result<OriginalInputLayouts, novarocks_workload_control::WorkError> {
+    use novarocks_type_contract::owned_resources::layout::arc_layout;
+    use novarocks_workload_control::WorkError;
+    use std::alloc::Layout;
+    Ok(OriginalInputLayouts {
+        future: Layout::new::<F>(),
+        input: arc_layout(Layout::new::<OriginalInput>())
+            .map_err(|_| WorkError::ArithmeticOverflow)?,
+        reservations: arc_layout(Layout::new::<ReservationBacking>())
+            .map_err(|_| WorkError::ArithmeticOverflow)?,
+        task_inline: Layout::new::<OriginalTask>(),
+    })
+}
+
 // The one original future stays in the record even if Handle::spawn unwinds.
 // This is the ORIGINAL send task, not a second observer or retry task.
 struct OriginalInput {

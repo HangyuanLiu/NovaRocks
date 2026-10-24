@@ -41,8 +41,8 @@ use crate::query_execution::split_assignment::{
     SupervisedSplitSource, TaskUpdateTransport,
 };
 use crate::task_execution::blocking_io::{
-    ConnectorBlockingIoBacking, ConnectorBlockingIoJob, ConnectorBlockingIoResponsibility,
-    ConnectorBlockingIoSupervisor,
+    ConnectorBlockingIoBacking, ConnectorBlockingIoResponsibility, ConnectorBlockingIoSupervisor,
+    ConnectorOperationJob as ConnectorBlockingIoJob, ConnectorSourceCloseResult,
 };
 use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::execution::QueryTaskExecution;
@@ -186,8 +186,9 @@ impl OpenedRoundSplitSource {
 
 impl Drop for OpenedRoundSplitSource {
     fn drop(&mut self) {
-        // The source's fixed original join pin is minted by its Drop before
-        // encoder and feedback fields retire. No new admission is needed.
+        // Normal late results are adopted into the original close job. An
+        // invalid whole-owner Drop requests stop and retains the same source
+        // custody; it never publishes a detached cleanup task.
         drop(self.source.take());
     }
 }
@@ -195,67 +196,69 @@ impl Drop for OpenedRoundSplitSource {
 /// Open one exact scan source from frozen logical semantics and one attempt's
 /// request capability.
 ///
-/// The attempt initializer is the only source-open owner. Keeping provider
-/// reacquisition and `get_splits` in this narrow operation makes the exact
-/// generation, pushed constraint, and runtime-filter columns travel through
-/// one managed blocking-I/O call.
-pub(crate) fn open_round_split_source(
-    recipe: RoundSplitSourceRecipe,
-    session: &novarocks_spi::connector::read_stack::ConnectorSession,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    blocking_io: ConnectorBlockingIoSupervisor,
-    responsibility: ConnectorBlockingIoResponsibility,
-) -> Result<OpenedRoundSplitSource, ConnectorError> {
-    let access = &recipe.access;
-    let connector_context = crate::connector::context_for_planning_lease_typed(
-        access.planning_lease(),
-        connector_context.clone(),
-    )?;
-    let attempt_context =
-        novarocks_spi::connector::ConnectorAttemptContext::from_admitted_request(connector_context);
-    let capabilities = access
-        .access()
-        .for_attempt(&attempt_context, access.planning_lease())?;
-    let source = capabilities
-        .splits()
-        .get_splits(
-            session,
-            capabilities.frozen(),
-            &recipe.assignments,
-            &recipe
-                .dynamic_filters
-                .iter()
-                .map(|(_, column)| column.clone())
-                .collect(),
-            &recipe.constraint,
+/// The attempt initializer retains both original async preparation futures.
+/// Exact generation, pushed constraint and runtime-filter columns come from
+/// this same frozen recipe; only completed facts enter the pure finish move.
+impl RoundSplitSourceRecipe {
+    pub(crate) fn begin_access(
+        &self,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<novarocks_spi::connector::ConnectorReadAttemptCapabilitiesFuture, ConnectorError>
+    {
+        let request = crate::connector::context_for_planning_lease_typed(
+            self.access.planning_lease(),
+            context.clone(),
+        )?;
+        Ok(self.access.access().for_attempt(
+            novarocks_spi::connector::ConnectorAttemptContext::from_admitted_request(request),
+            self.access.planning_lease().clone(),
+        ))
+    }
+    pub(crate) fn begin_split_open(
+        &self,
+        session: &novarocks_spi::connector::read_stack::ConnectorSession,
+        capabilities: &novarocks_spi::connector::ConnectorReadAttemptCapabilities,
+    ) -> novarocks_spi::connector::read_stack::ConnectorReadSplitOpenFuture {
+        capabilities.splits().get_splits(
+            novarocks_spi::connector::read_stack::ConnectorReadSplitOpenRequest::new(
+                session.clone(),
+                capabilities.frozen().clone(),
+                self.assignments.clone(),
+                self.dynamic_filters
+                    .iter()
+                    .map(|(_, column)| column.clone())
+                    .collect(),
+                self.constraint.clone(),
+            ),
         )
-        .map_err(|error| {
-            error.map_message(|message| {
-                format!(
-                    "typed connector scan node_id={} cannot open its split source: {message}",
-                    recipe.plan_node_id
-                )
-            })
-        })?;
-    let backing = responsibility.retain_backing();
-    let source =
-        SupervisedSplitSource::new(source, recipe.plan_node_id, blocking_io, responsibility);
-    Ok(OpenedRoundSplitSource {
-        scan: ScanNodeKey::new(recipe.fragment_id, recipe.plan_node_id),
-        source: Some(source),
-        encoder: Some(capabilities.encoder()),
-        feedback_bindings: recipe.dynamic_filters,
-        backing: Some(backing),
-    })
+    }
+    pub(crate) fn finish_open(
+        self,
+        raw: Box<dyn novarocks_spi::connector::read_stack::ConnectorReadSplitSource>,
+        capabilities: novarocks_spi::connector::ConnectorReadAttemptCapabilities,
+        responsibility: ConnectorBlockingIoResponsibility,
+    ) -> OpenedRoundSplitSource {
+        let backing = responsibility.retain_backing();
+        OpenedRoundSplitSource {
+            scan: ScanNodeKey::new(self.fragment_id, self.plan_node_id),
+            source: Some(SupervisedSplitSource::new(
+                raw,
+                self.plan_node_id,
+                responsibility,
+            )),
+            encoder: Some(capabilities.encoder()),
+            feedback_bindings: self.dynamic_filters,
+            backing: Some(backing),
+        }
+    }
 }
 
 /// Everything one round needs to start assigning splits, built before the
 /// prepared artifacts are consumed by staging.
 ///
-/// It already owns open connector split sources, so it closes them if the
-/// round never starts — staging or Start can still fail between here and
-/// there, and a source dropped without closing leaves the connector holding
-/// whatever the enumeration opened.
+/// It already owns open connector split sources. The original Ready/active
+/// owner must borrow close_in if staging or Start fails before the round starts;
+/// dropping the plan is neither cleanup dispatch nor a successful exit proof.
 pub(crate) struct RoundSplitAssignmentPlan {
     targets: BTreeMap<ScanNodeKey, Vec<AssignmentTarget>>,
     sources: Vec<RoundSplitSource>,
@@ -305,26 +308,27 @@ impl OpenRoundSplitSources {
 
 impl Drop for OpenRoundSplitSources {
     fn drop(&mut self) {
-        schedule_source_close(&self.blocking_io, std::mem::take(&mut self.sources));
+        // Only the existing stable close_in driver performs source retirement.
+        // A dropped invalid owner cannot publish detached cleanup work.
     }
 }
 
-fn schedule_source_close(
-    blocking_io: &ConnectorBlockingIoSupervisor,
+struct SourceCloseInput {
     sources: Vec<RoundSplitSource>,
-) {
-    if sources.is_empty() {
-        return;
-    }
-    let pins = sources
-        .iter()
-        .filter_map(|source| source.source.join_pin())
-        .collect();
-    let _ = blocking_io.spawn_pinned(pins, move || {
-        for source in sources {
-            RoundSplitAssignment::close_source(source);
+}
+fn close_source_input(
+    input: &mut SourceCloseInput,
+    result: &ConnectorSourceCloseResult<'_>,
+) -> Option<()> {
+    for source in &mut input.sources {
+        if let Err(error) = source.source.retire_in(result) {
+            result.record_error(error);
         }
-    });
+    }
+    // Source/encoder/feedback backing exits only on the actual worker after
+    // every original typed error is already in the same stable primary slot.
+    input.sources.clear();
+    Some(())
 }
 
 fn start_source_close_in(
@@ -341,16 +345,11 @@ fn start_source_close_in(
         .filter_map(|source| source.source.join_pin())
         .collect();
     let sources = std::mem::take(sources);
-    *job = Some(blocking_io.spawn_pinned_source_close(pins, move |result| {
-        for mut source in sources {
-            if let Err(error) = RoundSplitAssignment::close_source_result(&mut source) {
-                // The same original result header receives the typed error
-                // BEFORE this source drops or the next provider is called.
-                result.record_error(error);
-            }
-            drop(source);
-        }
-    }));
+    *job = Some(blocking_io.prepare_cpu_retirement(
+        pins,
+        SourceCloseInput { sources },
+        close_source_input,
+    ));
 }
 
 impl RoundSplitAssignmentPlan {
@@ -390,33 +389,14 @@ impl RoundSplitAssignmentPlan {
 
 impl Drop for RoundSplitAssignmentPlan {
     fn drop(&mut self) {
-        schedule_source_close(&self.blocking_io, std::mem::take(&mut self.sources));
-    }
-}
-
-struct OwnerSlot<T> {
-    owner_live: bool,
-    result: Option<T>,
-}
-
-impl<T> OwnerSlot<T> {
-    fn publish(&mut self, result: T) -> Result<(), T> {
-        if self.owner_live {
-            self.result = Some(result);
-            Ok(())
-        } else {
-            Err(result)
-        }
-    }
-
-    fn abandon(&mut self) -> Option<T> {
-        self.owner_live = false;
-        self.result.take()
+        // Only the existing stable close_in driver performs source retirement.
+        // A dropped invalid owner cannot publish detached cleanup work.
     }
 }
 
 #[derive(Default)]
 struct SplitUnresolved {
+    provider_close: Option<Arc<ConnectorError>>,
     enumeration: Option<Arc<crate::task_execution::blocking_io::ConnectorBlockingIoError>>,
     close: Option<Arc<crate::task_execution::blocking_io::ConnectorBlockingIoError>>,
 }
@@ -426,178 +406,272 @@ struct SplitAssignmentPump {
     stop: RoundSplitAssignmentStop,
     data_runtime: FrontendDataRuntime,
     wake: Arc<dyn StatusIntakeWake>,
-    enumeration: Arc<
-        Mutex<
-            OwnerSlot<
-                Result<
-                    RoundSplitEnumerationResult,
-                    crate::task_execution::blocking_io::ConnectorBlockingIoError,
-                >,
-            >,
-        >,
-    >,
+    enumeration: Option<ConnectorBlockingIoJob<RoundSplitEnumerationResult>>,
+    enumeration_result: Option<RoundSplitEnumerationResult>,
     enumeration_in_flight: bool,
+    close_job:
+        Option<ConnectorBlockingIoJob<Result<SplitSourceProfile, SplitAssignmentDriverError>>>,
+    closing_reason: Option<SplitAssignmentDriverError>,
+    source_waker: std::task::Waker,
+    timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     retry_at: Option<Instant>,
     timer_at: Option<Instant>,
     failure: Arc<Mutex<Option<SplitAssignmentDriverError>>>,
     outcome: Arc<Mutex<Option<Result<SplitSourceProfile, SplitAssignmentDriverError>>>>,
     closing: bool,
-    close_joined: Arc<AtomicBool>,
+    close_joined: bool,
     cleanup_failure: Arc<Mutex<Option<SplitAssignmentDriverError>>>,
     cleanup_failure_reported: bool,
     unresolved: Arc<Mutex<SplitUnresolved>>,
     unresolved_reported: bool,
 }
 
+struct PumpWake(Arc<dyn StatusIntakeWake>);
+impl std::task::Wake for PumpWake {
+    fn wake(self: Arc<Self>) {
+        self.0.wake();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.wake();
+    }
+}
+struct CloseInput {
+    assignment: RoundSplitAssignment,
+    enumeration: Option<RoundSplitEnumerationResult>,
+}
+fn close_assignment(
+    input: &mut CloseInput,
+    result: &ConnectorSourceCloseResult<'_>,
+) -> Option<Result<SplitSourceProfile, SplitAssignmentDriverError>> {
+    let unused = input
+        .enumeration
+        .take()
+        .map(|enumeration| input.assignment.adopt_enumeration(enumeration));
+    let closed = input.assignment.close_with_profile_in(result);
+    drop(unused);
+    Some(closed)
+}
+fn enumerate_input(
+    input: &mut Option<crate::query_execution::split_assignment::RoundSplitEnumerationRequest>,
+    result: &ConnectorSourceCloseResult<'_>,
+) -> Option<RoundSplitEnumerationResult> {
+    Some(RoundSplitAssignment::enumerate_source_retained(
+        input.take().expect("one original enumeration request"),
+        result,
+    ))
+}
 impl SplitAssignmentPump {
     const PUMP_NAME: &'static str = "split_assignment";
-
     fn arm_wake(&mut self, deadline: Instant) {
         if self.timer_at.is_some_and(|armed| armed <= deadline) {
             return;
         }
         self.timer_at = Some(deadline);
-        let wake = Arc::clone(&self.wake);
-        self.data_runtime.spawn(async move {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
-            wake.wake();
-        });
+        let deadline = tokio::time::Instant::from_std(deadline);
+        if let Some(timer) = &mut self.timer {
+            timer.as_mut().reset(deadline);
+        } else {
+            let _entered = self.data_runtime.handle().enter();
+            self.timer = Some(Box::pin(tokio::time::sleep_until(deadline)));
+        }
     }
-
-    fn close_enumeration_after_owner_exit(
-        data_runtime: &FrontendDataRuntime,
-        enumeration: RoundSplitEnumerationResult,
-    ) {
-        let supervisor = data_runtime.connector_blocking_io().clone();
-        let pins = enumeration.source.source.join_pin().into_iter().collect();
-        let _ = supervisor.spawn_pinned(pins, move || {
-            // Both arbitrary batch payload destruction and original source
-            // close occur outside the owner-slot mutex, under the same join.
-            let source = enumeration.discard_batch();
-            RoundSplitAssignment::close_source(source);
-        });
-    }
-
     fn start_close(&mut self, error: Option<SplitAssignmentDriverError>) {
         self.start_close_with_enumeration(error, None);
     }
-
     fn start_close_with_enumeration(
         &mut self,
         error: Option<SplitAssignmentDriverError>,
         enumeration: Option<RoundSplitEnumerationResult>,
     ) {
-        let Some(mut assignment) = self.assignment.take() else {
-            return;
-        };
         self.closing = true;
-        if let Some(error) = &error {
-            let mut failure = self.failure.lock().unwrap_or_else(|lock| lock.into_inner());
-            if failure.is_none() {
-                *failure = Some(error.clone());
+        if self.closing_reason.is_none() {
+            self.closing_reason = error;
+        }
+        if let Some(error) = &self.closing_reason {
+            let mut first = self.failure.lock().unwrap_or_else(|e| e.into_inner());
+            if first.is_none() {
+                *first = Some(error.clone());
             }
         }
-        let outcome = Arc::clone(&self.outcome);
-        let wake = Arc::clone(&self.wake);
-        let mut pins = assignment.join_pins();
-        if let Some(pin) = enumeration
-            .as_ref()
-            .and_then(|result| result.source.source.join_pin())
-        {
-            pins.push(pin);
+        if let Some(enumeration) = enumeration {
+            assert!(
+                self.enumeration_result.is_none(),
+                "one original late enumeration"
+            );
+            self.enumeration_result = Some(enumeration);
         }
-        let blocking_io = self.data_runtime.connector_blocking_io().clone();
-        let close_joined = Arc::clone(&self.close_joined);
-        let cleanup_failure = Arc::clone(&self.cleanup_failure);
-        let unresolved = Arc::clone(&self.unresolved);
-        let job = blocking_io.spawn_pinned(pins, move || {
-            // The in-flight source and its unused provider batch stay on this
-            // original job. No opaque split destructor runs on the async lane.
-            let unused_batch = enumeration.map(|result| assignment.adopt_enumeration(result));
-            let closed = assignment.close_with_profile();
-            drop(unused_batch);
-            closed
-        });
-        self.data_runtime.spawn(async move {
-            let cleanup = match job.finish().await {
-                Ok(result) => {
-                    // A normal domain Err is still an actual returned job:
-                    // the consumed assignment and raw payloads already dropped.
-                    close_joined.store(true, Ordering::Release);
-                    result
-                }
-                Err(worker_error) => {
-                    // This exact original error/payload and its existing
-                    // backing remain in the pump's one bounded health slot.
-                    // It is not a Task originating cause or a normal exit.
-                    let worker_error = Arc::new(worker_error);
-                    let detail = worker_error.to_string();
-                    unresolved
-                        .lock()
-                        .unwrap_or_else(|lock| lock.into_inner())
-                        .close = Some(worker_error);
-                    Err(SplitAssignmentDriverError::SplitSource { scan: None, detail })
-                }
-            };
-            if let Err(error) = &cleanup {
-                *cleanup_failure
-                    .lock()
-                    .unwrap_or_else(|lock| lock.into_inner()) = Some(error.clone());
-            }
-            // Cleanup may add diagnostics but cannot replace the original
-            // failure that caused this exact assignment to stop.
-            let result = match error {
-                Some(error) => Err(error),
-                None => cleanup,
-            };
-            // Only the original enumeration/delivery error published above
-            // can fail computation. Closing an exhausted or stopped source
-            // retains its diagnostic/outcome and actual-exit obligations but
-            // cannot race an internal consumer's End-to-Ready proof.
-            *outcome.lock().unwrap_or_else(|lock| lock.into_inner()) = Some(result);
-            wake.wake();
-        });
     }
-
     fn start_enumeration(
         &mut self,
         request: crate::query_execution::split_assignment::RoundSplitEnumerationRequest,
     ) {
-        self.enumeration_in_flight = true;
+        assert!(
+            self.enumeration.is_none(),
+            "same source has one in-flight original call"
+        );
         let pins = request.join_pin().into_iter().collect();
-        let job = self
-            .data_runtime
-            .connector_blocking_io()
-            .spawn_pinned(pins, move || {
-                RoundSplitAssignment::enumerate_source(request)
-            });
-        let slot = Arc::clone(&self.enumeration);
-        let runtime = self.data_runtime.clone();
-        let wake = Arc::clone(&self.wake);
-        self.data_runtime.spawn(async move {
-            let result = job.finish().await;
-            let reap = {
-                let mut slot = slot.lock().unwrap_or_else(|lock| lock.into_inner());
-                slot.publish(result).err()
-            };
-            match reap {
-                Some(Ok(enumeration)) => {
-                    Self::close_enumeration_after_owner_exit(&runtime, enumeration)
-                }
-                Some(Err(error)) => runtime
-                    .connector_blocking_io()
-                    .retire_original_failure(error),
-                None => {}
+        self.enumeration = Some(self.data_runtime.connector_blocking_io().prepare_cpu_owned(
+            pins,
+            Some(request),
+            enumerate_input,
+        ));
+        self.enumeration_in_flight = true;
+    }
+    fn poll_calls(&mut self) -> usize {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+        let waker = self.source_waker.clone();
+        let mut cx = Context::from_waker(&waker);
+        let mut changed = 0;
+        if let Some(timer) = &mut self.timer {
+            if timer.as_mut().poll(&mut cx).is_ready() {
+                self.timer = None;
+                self.timer_at = None;
             }
-            wake.wake();
-        });
+        }
+        if self.enumeration_in_flight {
+            let job = self
+                .enumeration
+                .as_mut()
+                .expect("original enumeration job retained");
+            match job.poll_progress(&mut cx) {
+                Poll::Pending => {}
+                Poll::Ready(Ok(())) => {
+                    let result = job
+                        .try_take()
+                        .expect("original enumeration result")
+                        .expect("successful worker result");
+                    self.enumeration_result = Some(result);
+                    self.enumeration_in_flight = false;
+                    // Actual result is already stable before the original receipt Drop.
+                    drop(self.enumeration.take());
+                    changed += 1;
+                }
+                Poll::Ready(Err(error)) => {
+                    job.take_completed_value_in(&mut self.enumeration_result);
+                    let detail = error.to_string();
+                    self.unresolved
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .enumeration = Some(Arc::new(error));
+                    self.enumeration_in_flight = false;
+                    self.start_close(Some(SplitAssignmentDriverError::SplitSource {
+                        scan: None,
+                        detail,
+                    }));
+                    // Keep the failed original job and its call/input/cause.
+                    changed += 1;
+                }
+            }
+        }
+        if self.closing && !self.enumeration_in_flight && self.close_job.is_none() {
+            if let Some(assignment) = self.assignment.take() {
+                let mut pins = assignment.join_pins();
+                if let Some(pin) = self
+                    .enumeration_result
+                    .as_ref()
+                    .and_then(|e| e.source.source.join_pin())
+                {
+                    pins.push(pin);
+                }
+                let input = CloseInput {
+                    assignment,
+                    enumeration: self.enumeration_result.take(),
+                };
+                self.close_job = Some(
+                    self.data_runtime
+                        .connector_blocking_io()
+                        .prepare_cpu_retirement(pins, input, close_assignment),
+                );
+                changed += 1;
+            }
+        }
+        if let Some(job) = self.close_job.as_mut() {
+            match job.poll_progress(&mut cx) {
+                Poll::Pending => {}
+                Poll::Ready(Ok(())) => {
+                    let closed = job
+                        .try_take()
+                        .expect("original close output")
+                        .expect("successful close worker");
+                    self.close_joined = true;
+                    if let Some(primary) = job.source_close_failure() {
+                        self.unresolved
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .provider_close = Some(primary);
+                    }
+                    let result = self.closing_reason.clone().map_or(closed, Err);
+                    if let Err(error) = &result {
+                        *self
+                            .cleanup_failure
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = Some(error.clone());
+                    }
+                    let old = self
+                        .outcome
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .replace(result);
+                    drop(old);
+                    // Original close failure is business/diagnostic data, not fake exit.
+                    drop(self.close_job.take());
+                    changed += 1;
+                    self.wake.wake();
+                }
+                Poll::Ready(Err(error)) => {
+                    let mut completed = None;
+                    job.take_completed_value_in(&mut completed);
+                    if let Some(primary) = job.source_close_failure() {
+                        self.unresolved
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .provider_close = Some(primary);
+                    }
+                    let detail = error.to_string();
+                    let mut unresolved = self.unresolved.lock().unwrap_or_else(|e| e.into_inner());
+                    let first = unresolved.close.is_none();
+                    if first {
+                        unresolved.close = Some(Arc::new(error));
+                    }
+                    drop(unresolved);
+                    if first {
+                        let result = match completed {
+                            Some(closed) => self.closing_reason.clone().map_or(closed, Err),
+                            None => Err(self.closing_reason.clone().unwrap_or(
+                                SplitAssignmentDriverError::SplitSource { scan: None, detail },
+                            )),
+                        };
+                        if let Err(error) = &result {
+                            *self
+                                .cleanup_failure
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = Some(error.clone());
+                        }
+                        self.close_joined = job.actual_exit_observed()
+                            && !job.source_drop_unproven()
+                            && !job.input_or_value_retained();
+                        let old = self
+                            .outcome
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .replace(result);
+                        drop(old);
+                        self.wake.wake();
+                        changed += 1;
+                    }
+                }
+            }
+        }
+        changed
     }
 }
 
 impl SplitAssignmentPump {
     fn advance(&mut self) -> Result<usize, TaskExecutionError> {
+        let changed = self.poll_calls();
         if self.closing {
-            return Ok(0);
+            return Ok(changed);
         }
         if self
             .timer_at
@@ -606,16 +680,11 @@ impl SplitAssignmentPump {
             self.timer_at = None;
         }
         if self.enumeration_in_flight {
-            let result = self
-                .enumeration
-                .lock()
-                .unwrap_or_else(|lock| lock.into_inner())
-                .result
-                .take();
-            let Some(result) = result else {
-                return Ok(0);
-            };
-            self.enumeration_in_flight = false;
+            return Ok(changed);
+        }
+        if let Some(result) = self.enumeration_result.take() {
+            let result: Result<_, crate::task_execution::blocking_io::ConnectorBlockingIoError> =
+                Ok(result);
             let result = match result {
                 Ok(result) => result,
                 Err(error) => {
@@ -660,7 +729,7 @@ impl SplitAssignmentPump {
 
         if self.stop.is_stopped() {
             self.start_close(None);
-            return Ok(1);
+            return Ok(1 + self.poll_calls());
         }
 
         let assignment = self
@@ -692,7 +761,7 @@ impl SplitAssignmentPump {
         match assignment.enumerate_once() {
             Ok(RoundSplitEnumeration::Ready(request)) => {
                 self.start_enumeration(*request);
-                Ok(1)
+                Ok(1 + self.poll_calls())
             }
             Ok(RoundSplitEnumeration::Idle(wait)) => {
                 let retry_at = Instant::now() + wait;
@@ -702,7 +771,7 @@ impl SplitAssignmentPump {
             }
             Ok(RoundSplitEnumeration::Finished) => {
                 self.start_close(None);
-                Ok(1)
+                Ok(1 + self.poll_calls())
             }
             Err(error) => {
                 self.start_close(Some(error));
@@ -744,34 +813,31 @@ impl TurnPump for SplitAssignmentPump {
         Ok(moved)
     }
     fn is_closed(&self) -> bool {
-        self.close_joined.load(Ordering::Acquire)
+        self.close_joined
             && self
                 .outcome
                 .lock()
                 .unwrap_or_else(|lock| lock.into_inner())
                 .is_some()
-            && {
-                let fault = self
-                    .unresolved
-                    .lock()
-                    .unwrap_or_else(|lock| lock.into_inner());
-                fault.enumeration.is_none() && fault.close.is_none()
-            }
+            && self
+                .enumeration
+                .as_ref()
+                .is_none_or(|job| !job.input_or_value_retained())
     }
     fn take_close_unresolved(&mut self) -> Option<PumpCloseUnresolved> {
         if self.unresolved_reported {
             return None;
         }
-        let cause = {
+        let cause: Arc<dyn std::error::Error + Send + Sync> = {
             let fault = self
                 .unresolved
                 .lock()
                 .unwrap_or_else(|lock| lock.into_inner());
-            fault
-                .enumeration
-                .as_ref()
-                .or(fault.close.as_ref())
-                .cloned()?
+            if let Some(cause) = fault.enumeration.as_ref().or(fault.close.as_ref()) {
+                cause.clone()
+            } else {
+                fault.provider_close.as_ref()?.clone()
+            }
         };
         self.unresolved_reported = true;
         Some(PumpCloseUnresolved {
@@ -783,28 +849,14 @@ impl TurnPump for SplitAssignmentPump {
 
 impl Drop for SplitAssignmentPump {
     fn drop(&mut self) {
+        // Original TaskRound/role bank retains this owner until real close.
+        // Whole-owner destruction is never a detached publisher or exit proof.
         self.stop.stop();
-        let pending_enumeration = {
-            let mut slot = self
-                .enumeration
-                .lock()
-                .unwrap_or_else(|lock| lock.into_inner());
-            slot.abandon()
-        };
-        match pending_enumeration {
-            Some(Ok(enumeration)) => {
-                Self::close_enumeration_after_owner_exit(&self.data_runtime, enumeration)
-            }
-            Some(Err(error)) => self
-                .data_runtime
-                .connector_blocking_io()
-                .retire_original_failure(error),
-            None => {}
+        if let Some(job) = &mut self.enumeration {
+            job.request_close();
         }
-        if let Some(mut assignment) = self.assignment.take() {
-            let supervisor = self.data_runtime.connector_blocking_io().clone();
-            let pins = assignment.join_pins();
-            let _ = supervisor.spawn_pinned(pins, move || assignment.close());
+        if let Some(job) = &mut self.close_job {
+            job.request_close();
         }
     }
 }
@@ -872,17 +924,19 @@ impl SplitAssignmentRoundGuard {
             stop: stop.clone(),
             data_runtime,
             wake: Arc::clone(&wake),
-            enumeration: Arc::new(Mutex::new(OwnerSlot {
-                owner_live: true,
-                result: None,
-            })),
+            enumeration: None,
+            enumeration_result: None,
             enumeration_in_flight: false,
+            close_job: None,
+            closing_reason: None,
+            source_waker: std::task::Waker::from(Arc::new(PumpWake(Arc::clone(&wake)))),
+            timer: None,
             retry_at: None,
             timer_at: None,
             failure: Arc::clone(&failure),
             outcome: Arc::clone(&outcome),
             closing: false,
-            close_joined: Arc::new(AtomicBool::new(false)),
+            close_joined: false,
             cleanup_failure: Arc::new(Mutex::new(None)),
             cleanup_failure_reported: false,
             unresolved: Arc::new(Mutex::new(SplitUnresolved::default())),
@@ -1417,7 +1471,9 @@ mod tests {
                 started.send(()).expect("close entered");
             }
             if let Some(release) = self.release.take() {
-                release.recv().expect("release original close");
+                release
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("release original close");
             }
             assert!(!self.panic_close, "injected original close panic");
             Ok(())
@@ -1432,14 +1488,14 @@ mod tests {
     fn owned_round_source<S: ConnectorReadSplitSource + 'static>(
         source: S,
         responsibility: ConnectorBlockingIoResponsibility,
-        supervisor: ConnectorBlockingIoSupervisor,
+        _supervisor: ConnectorBlockingIoSupervisor,
     ) -> RoundSplitSource {
         let execution =
             QueryExecutionId::new(QueryId::new(17, 19), AttemptId::new(1).unwrap()).unwrap();
         let backing = responsibility.retain_backing();
         RoundSplitSource {
             scan: ScanNodeKey::new(FragmentId::from(1u32), 7),
-            source: SupervisedSplitSource::new(Box::new(source), 7, supervisor, responsibility),
+            source: SupervisedSplitSource::new(Box::new(source), 7, responsibility),
             encoder: Arc::new(CleanupTestEncoder),
             feedback: Arc::new(
                 crate::runtime_filter::feedback::RuntimeFilterFeedbackState::new(
@@ -1474,7 +1530,8 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let supervisor = ConnectorBlockingIoSupervisor::new(runtime.handle().clone());
+        let (mut executors, supervisor) =
+            crate::task_execution::blocking_io::tests::original_executors(runtime.handle().clone());
         let (control, root, window) = admitted();
         let responsibility =
             ConnectorBlockingIoResponsibility::admit(&root.owner.scope(), &window.retain_alias())
@@ -1499,10 +1556,14 @@ mod tests {
         ));
         let mut job = None;
         opened.close_in(&mut job);
+        runtime.block_on(std::future::poll_fn(|cx| {
+            let _ = job.as_mut().unwrap().poll_progress(cx);
+            std::task::Poll::Ready(())
+        }));
         entered.recv_timeout(Duration::from_secs(2)).unwrap();
         let mut outcome = None;
         runtime.block_on(async {
-            let wait = job.as_ref().unwrap().finish_in(&mut outcome);
+            let wait = job.as_mut().unwrap().finish_in(&mut outcome);
             tokio::pin!(wait);
             std::future::poll_fn(|cx| {
                 assert!(wait.as_mut().poll(cx).is_pending());
@@ -1523,7 +1584,7 @@ mod tests {
         runtime.block_on(async {
             tokio::time::timeout(
                 Duration::from_secs(2),
-                job.as_ref().unwrap().finish_in(&mut outcome),
+                job.as_mut().unwrap().finish_in(&mut outcome),
             )
             .await
             .expect("the same source-close job really joins");
@@ -1537,11 +1598,15 @@ mod tests {
         until(|| control.snapshot().scopes.is_empty());
         control.close_admission();
         assert!(control.shutdown().is_ok());
+        runtime.block_on(executors.shutdown());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn borrowed_plan_close_returns_the_original_provider_error() {
-        let supervisor = ConnectorBlockingIoSupervisor::new(tokio::runtime::Handle::current());
+        let (mut executors, supervisor) =
+            crate::task_execution::blocking_io::tests::original_executors(
+                tokio::runtime::Handle::current(),
+            );
         let execution =
             QueryExecutionId::new(QueryId::new(17, 19), AttemptId::new(1).unwrap()).unwrap();
         let (release, released) = mpsc::channel();
@@ -1552,7 +1617,7 @@ mod tests {
         let mut outcome = None;
         tokio::time::timeout(
             Duration::from_secs(2),
-            job.as_ref().unwrap().finish_in(&mut outcome),
+            job.as_mut().unwrap().finish_in(&mut outcome),
         )
         .await
         .expect("original close join returns its typed cause");
@@ -1582,6 +1647,7 @@ mod tests {
         );
         assert_eq!(closes.load(Ordering::SeqCst), 1);
         assert!(plan.sources.is_empty());
+        executors.shutdown().await;
     }
 
     #[test]
@@ -1655,7 +1721,8 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let supervisor = ConnectorBlockingIoSupervisor::new(runtime.handle().clone());
+        let (mut executors, supervisor) =
+            crate::task_execution::blocking_io::tests::original_executors(runtime.handle().clone());
         let (control, root, window) = admitted();
         let responsibility =
             ConnectorBlockingIoResponsibility::admit(&root.owner.scope(), &window.retain_alias())
@@ -1681,22 +1748,23 @@ mod tests {
         runtime.block_on(async {
             tokio::time::timeout(
                 Duration::from_secs(2),
-                job.as_ref().unwrap().finish_in(&mut outcome),
+                job.as_mut().unwrap().finish_in(&mut outcome),
             )
             .await
             .expect("the actual source Drop panic is joined");
-            tokio::time::timeout(
-                Duration::from_secs(2),
-                job.as_mut().unwrap().join_original_publisher(),
-            )
-            .await
-            .expect("the same original publisher exits")
-            .expect("publisher join succeeds");
+            assert!(job.as_ref().unwrap().actual_exit_observed());
         });
         assert!(
             matches!(outcome, Some(Err(_))),
             "secondary raw worker cause remains in original outcome"
         );
+        let mut completed_unit = None;
+        assert!(
+            job.as_mut()
+                .unwrap()
+                .take_completed_value_in(&mut completed_unit)
+        );
+        assert_eq!(completed_unit, Some(()));
         let primary = job
             .as_ref()
             .unwrap()
@@ -1731,13 +1799,15 @@ mod tests {
             0,
             "original job still anchors primary"
         );
-        assert_eq!(panic_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(panic_drops.load(Ordering::SeqCst), 0);
         drop(job);
+        assert_eq!(panic_drops.load(Ordering::SeqCst), 1);
         drop(sources);
         assert_eq!(cause_drops.load(Ordering::SeqCst), 1);
         until(|| control.snapshot().scopes.is_empty());
         control.close_admission();
         assert!(control.shutdown().is_ok());
+        runtime.block_on(executors.shutdown());
     }
 
     #[test]
@@ -1748,7 +1818,8 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let supervisor = ConnectorBlockingIoSupervisor::new(runtime.handle().clone());
+        let (mut executors, supervisor) =
+            crate::task_execution::blocking_io::tests::original_executors(runtime.handle().clone());
         let (control, root, window) = admitted();
         let responsibility =
             ConnectorBlockingIoResponsibility::admit(&root.owner.scope(), &window.retain_alias())
@@ -1767,15 +1838,13 @@ mod tests {
             panic_close: false,
             panic_profile: false,
         };
-        let close_supervisor = supervisor.clone();
         let (opened, open) = mpsc::channel();
-        let job = supervisor.spawn_pinned(vec![pin], move || {
+        let mut job = supervisor.prepare_cpu_pinned(vec![pin], move || {
             let outcome = OpenedRoundSplitSource {
                 scan: ScanNodeKey::new(FragmentId::from(1u32), 7),
                 source: Some(SupervisedSplitSource::new(
                     Box::new(source),
                     7,
-                    close_supervisor,
                     responsibility,
                 )),
                 encoder: Some(Arc::new(CleanupTestEncoder)),
@@ -1785,18 +1854,46 @@ mod tests {
             opened.send(()).expect("original open returned");
             outcome
         });
+        runtime.block_on(std::future::poll_fn(|cx| {
+            let _ = job.poll_progress(cx);
+            std::task::Poll::Ready(())
+        }));
         open.recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         root.owner.complete();
         root.business.release();
         drop(window);
-        drop(job);
+        let mut late = None;
+        runtime.block_on(job.finish_in(&mut late));
+        let execution =
+            QueryExecutionId::new(QueryId::new(17, 19), AttemptId::new(1).unwrap()).unwrap();
+        let feedback = Arc::new(
+            crate::runtime_filter::feedback::RuntimeFilterFeedbackState::new(
+                execution,
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let mut retiring = OpenRoundSplitSources::with_capacity(1, supervisor.clone());
+        retiring.push(late.take().unwrap().unwrap().into_round_source(feedback));
+        let mut close_job = None;
+        retiring.close_in(&mut close_job);
+        runtime.block_on(std::future::poll_fn(|cx| {
+            let _ = close_job.as_mut().unwrap().poll_progress(cx);
+            std::task::Poll::Ready(())
+        }));
         entered
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         let held = control.snapshot();
         let still_live = drops.load(std::sync::atomic::Ordering::SeqCst) == 0;
         release.send(()).unwrap();
+        let mut closed = None;
+        runtime.block_on(close_job.as_mut().unwrap().finish_in(&mut closed));
+        assert!(matches!(closed, Some(Ok(()))));
+        drop(close_job);
+        drop(retiring);
+        drop(job);
         until(|| control.snapshot().scopes.is_empty());
         assert_eq!(held.root_responsibilities, 1);
         assert_eq!(held.result_windows.held_positions, [0, 0, 1, 0]);
@@ -1805,6 +1902,7 @@ mod tests {
         assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
         control.close_admission();
         assert!(control.shutdown().is_ok());
+        runtime.block_on(executors.shutdown());
     }
 
     fn source_batch_cleanup(panic_close: bool, panic_profile: bool) {
@@ -1814,7 +1912,8 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let supervisor = ConnectorBlockingIoSupervisor::new(runtime.handle().clone());
+        let (mut executors, supervisor) =
+            crate::task_execution::blocking_io::tests::original_executors(runtime.handle().clone());
         let (control, root, window) = admitted();
         let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1841,22 +1940,33 @@ mod tests {
         root.owner.complete();
         root.business.release();
         drop(window);
-        drop(opened);
-        until(|| drops.load(std::sync::atomic::Ordering::SeqCst) == 2);
+        let mut job = None;
+        opened.close_in(&mut job);
+        let mut outcome = None;
+        runtime.block_on(job.as_mut().unwrap().finish_in(&mut outcome));
+        assert!(job.as_ref().unwrap().actual_exit_observed());
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 2);
         if panic_close {
-            let mut original = None;
-            until(|| {
-                original = supervisor.take_original_failure();
-                original.is_some()
-            });
-            assert!(original.as_ref().unwrap().to_string().contains("panicked"));
-            drop(original);
+            assert!(outcome.as_ref().unwrap().is_err());
+            let mut completed = None;
+            assert!(
+                job.as_mut()
+                    .unwrap()
+                    .take_completed_value_in(&mut completed)
+            );
+            assert_eq!(completed, Some(()));
+        } else {
+            assert!(matches!(outcome, Some(Ok(()))));
         }
+        drop(outcome);
+        drop(job);
+        drop(opened);
         until(|| control.snapshot().scopes.is_empty());
         assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(supervisor.take_original_failure().is_none());
         control.close_admission();
         assert!(control.shutdown().is_ok());
+        runtime.block_on(executors.shutdown());
     }
 
     #[test]
@@ -1883,7 +1993,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn partially_opened_sources_close_while_another_call_is_held() {
-        let supervisor = ConnectorBlockingIoSupervisor::new(tokio::runtime::Handle::current());
+        let (mut executors, supervisor) =
+            crate::task_execution::blocking_io::tests::original_executors(
+                tokio::runtime::Handle::current(),
+            );
         let (release, released) = mpsc::channel();
         let (started, ordinary_started) = mpsc::channel();
         let ordinary = supervisor.spawn_ordinary(move || {
@@ -1897,6 +2010,16 @@ mod tests {
         let (closed, observe_close) = mpsc::channel();
         let mut opened = OpenRoundSplitSources::with_capacity(1, supervisor);
         opened.push(cleanup_test_source(closed));
+        let mut close_job = None;
+        opened.close_in(&mut close_job);
+        let mut close_outcome = None;
+        close_job
+            .as_mut()
+            .unwrap()
+            .finish_in(&mut close_outcome)
+            .await;
+        assert!(matches!(close_outcome, Some(Ok(()))));
+        drop(close_job);
         drop(opened);
 
         observe_close
@@ -1904,6 +2027,7 @@ mod tests {
             .expect("cleanup must progress while another call is held");
         release.send(()).expect("release ordinary call");
         ordinary.finish().await.expect("ordinary call finishes");
+        executors.shutdown().await;
     }
 
     #[test]
@@ -2061,6 +2185,10 @@ mod tests {
             .unwrap();
         let data_runtime = FrontendDataRuntime::new(runtime.handle().clone());
         let supervisor = data_runtime.connector_blocking_io().clone();
+        let mut executors =
+            crate::task_execution::blocking_io::tests::OriginalExecutorsFixture::install(
+                &supervisor,
+            );
         let (control, root, window) = admitted();
         let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2171,7 +2299,10 @@ mod tests {
         let before_drops = drops.load(Ordering::SeqCst);
         // Always release the real foreign close before any negative assertion.
         let released = release.send(());
-        until(|| guard.is_finished());
+        until(|| {
+            round.turn().unwrap();
+            guard.is_finished()
+        });
         if !terminal_cleanup {
             statuses.publish(StatusEvent::Published(Box::new(
                 TaskStatus::try_new(
@@ -2270,6 +2401,7 @@ mod tests {
             assert!(close_error.is_none());
         }
         assert!(shutdown.is_ok());
+        runtime.block_on(executors.shutdown());
     }
 
     #[test]
@@ -2349,6 +2481,10 @@ mod tests {
             .unwrap();
         let data_runtime = FrontendDataRuntime::new(runtime.handle().clone());
         let supervisor = data_runtime.connector_blocking_io().clone();
+        let mut executors =
+            crate::task_execution::blocking_io::tests::OriginalExecutorsFixture::install(
+                &supervisor,
+            );
         let (control, root, window) = admitted();
         let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2389,7 +2525,10 @@ mod tests {
         .unwrap();
         round.begin_normal_drain();
         let started = round.turn();
-        until(|| guard.is_finished());
+        until(|| {
+            round.turn().unwrap();
+            guard.is_finished()
+        });
         let advanced = round.turn();
         let local_closed = round.pumps_closed();
         let health = round
@@ -2414,7 +2553,7 @@ mod tests {
         drop(data_runtime);
         // Fixture teardown is explicit protected retirement of its known
         // static payload, not production permission to finish an unknown T.
-        supervisor.retire_original_failure(captured);
+        drop(captured);
         until(|| control.snapshot().scopes.is_empty());
         control.close_admission();
         let shutdown = control.shutdown();
@@ -2438,6 +2577,7 @@ mod tests {
             (1, 1)
         );
         assert!(shutdown.is_ok());
+        runtime.block_on(executors.shutdown());
     }
 
     struct EnumeratingGateSource {
@@ -2459,7 +2599,9 @@ mod tests {
                 .unwrap()
                 .send(())
                 .expect("enumeration entered");
-            self.release.recv().expect("release actual enumeration");
+            self.release
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release actual enumeration");
             Ok(ConnectorSplitBatch::empty())
         }
         fn is_finished(&self) -> bool {
@@ -2481,6 +2623,10 @@ mod tests {
             .unwrap();
         let data_runtime = FrontendDataRuntime::new(runtime.handle().clone());
         let supervisor = data_runtime.connector_blocking_io().clone();
+        let mut executors =
+            crate::task_execution::blocking_io::tests::OriginalExecutorsFixture::install(
+                &supervisor,
+            );
         let (control, root, window) = admitted();
         let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2535,6 +2681,7 @@ mod tests {
         )
         .unwrap();
         let first_turn = round.turn();
+        let publish_turn = round.turn();
         enum_entered
             .recv_timeout(Duration::from_secs(2))
             .expect("the original enumeration entered");
@@ -2562,7 +2709,10 @@ mod tests {
         let waiting_close = control.snapshot();
         let closed_before_release = round.pumps_closed() || guard.is_finished();
         let released_close = close_release.send(());
-        until(|| guard.is_finished());
+        until(|| {
+            round.turn().unwrap();
+            guard.is_finished()
+        });
         let joined = round.turn();
         let closed = round.pumps_closed();
         let outcome = guard.finish_after_attempt(false);
@@ -2571,7 +2721,7 @@ mod tests {
         until(|| control.snapshot().scopes.is_empty());
         control.close_admission();
         let shutdown = control.shutdown();
-        assert!(first_turn.is_ok() && close_turn.is_ok() && joined.is_ok());
+        assert!(first_turn.is_ok() && publish_turn.is_ok() && close_turn.is_ok() && joined.is_ok());
         assert!(released_enum.is_ok() && released_close.is_ok());
         assert!(!falsely_closed && !closed_before_release);
         assert_eq!(prematurely_closed_source, 0);
@@ -2584,5 +2734,6 @@ mod tests {
             (1, 1)
         );
         assert!(shutdown.is_ok());
+        runtime.block_on(executors.shutdown());
     }
 }

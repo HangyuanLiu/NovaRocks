@@ -954,6 +954,149 @@ struct InternalNativeRegistration {
 }
 
 impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
+    fn start_computation_in(
+        &self,
+        computation: &mut Option<PreparedLogicalComputation>,
+        owner: &mut Option<WorkOwner>,
+        capacity: &QueryResultCapacityBinding,
+        original: &mut crate::query_execution::logical_execution::OriginalComputationStart,
+        #[cfg(novarocks_dev_controls)] observation: Option<
+            crate::preparation_diagnostics::StatementObservationHandle,
+        >,
+    ) -> Result<novarocks_query_application::api::LogicalExecutionStartAttempt, QueryExecutionError>
+    {
+        let refused = |detail: &'static str| {
+            QueryExecutionError::from_execution(ExecutionFailureInput::new(
+                QueryFailureReason::PreparationProtocol.failure_fact(),
+                SafeDetail::truncating(detail),
+                ExecutionFailureSite::Coordinator,
+            ))
+        };
+        if original.ready.is_some() || original.exit.is_some() {
+            return Err(refused("computation start target is occupied"));
+        }
+        let work = owner
+            .as_ref()
+            .ok_or_else(|| refused("computation start owner is absent"))?;
+        if !capacity.window_alias().is_for_scope(&work.scope()) {
+            return Err(refused(
+                "logical execution result window belongs to a foreign scope",
+            ));
+        }
+        if original.input.is_none() && original.request.is_none() {
+            let prepared = computation
+                .as_ref()
+                .ok_or_else(|| refused("prepared computation is absent"))?;
+            if prepared.diagnostics != ComputationDiagnostics::Profile
+                || prepared.description.effect()
+                    != novarocks_coordination_contract::ExecutionEffect::None
+                || prepared.description.finish_boundary()
+                    != novarocks_query_application::preparation::ExecutionFinishBoundary::ComputationReady
+            {
+                return Err(refused(
+                    "observed statement start requires the closed effect-free Profile computation",
+                ));
+            }
+            if prepared.initial_credentials.is_some() {
+                return Err(refused(
+                    "observed Profile start cannot consume an effectful initial reservation",
+                ));
+            }
+            if !prepared
+                .description
+                .matches_plan_seal(prepared.template.native_manifest_template().plan())
+            {
+                return Err(refused(
+                    "prepared logical execution Native template has a foreign plan seal",
+                ));
+            }
+            let carrier = prepared.description.row_carrier().map_err(|error| {
+                attempt_runtime_failure(QueryFailureReason::PreparationProtocol, error)
+                    .error()
+                    .clone()
+            })?;
+            let delivery = ProductionRootDelivery::bind(carrier, Some(capacity.window_alias()))?;
+            drop(delivery);
+            let PreparedLogicalComputation {
+                description,
+                template,
+                options,
+                consumer,
+                handoffs,
+                diagnostics,
+                initial_credentials: _,
+            } = computation.take().unwrap();
+            let aborts = LogicalAbortRouter::new();
+            let replacements = LogicalReplacementQualificationPort::new(
+                self.runtime.clone(),
+                aborts.worker_closed_contexts(),
+                aborts.closure_epoch(),
+            );
+            let factory = ProductionDormantAttemptFactory {
+                runtime: self.runtime.clone(),
+                options,
+                aborts: Arc::clone(&aborts),
+                diagnostics,
+                initial_credentials: None,
+                replacements: replacements.clone(),
+                handoffs: Some(handoffs.reserve_view()),
+                pending_projection: None,
+                pending_handoff: None,
+            };
+            let attempts = FrontendNativeAttemptPreparationPort::new(
+                template,
+                Arc::clone(&self.runtime.topology),
+                factory,
+                #[cfg(novarocks_dev_controls)]
+                observation,
+                #[cfg(novarocks_dev_controls)]
+                self.runtime.test_controls.clone(),
+                #[cfg(novarocks_dev_controls)]
+                self.runtime.observations.clone(),
+            );
+            let replacement_port = match description.recovery() {
+                RecoveryMode::NoRecovery => None,
+                RecoveryMode::RestartAttemptBeforeVisibility => {
+                    Some(Arc::new(replacements) as Arc<dyn ReplacementQualificationEffectPort>)
+                }
+            };
+            // All fallible carrier checks ran while the original computation
+            // and unique owner still occupied the caller's stable fields.
+            let request = QueryExecutionRequest::bind_native(
+                description,
+                aborts as Arc<dyn AbortQueryContextEffectPort>,
+                replacement_port,
+                attempts,
+            )
+            .with_result_capacity(capacity.clone())?
+            .with_internal_consumer(consumer)?;
+            original.request = Some(request);
+        }
+        if original.input.is_none() {
+            let request = original
+                .request
+                .take()
+                .ok_or_else(|| refused("original computation request is absent"))?;
+            match self.client.prepare_observed_start(request, None) {
+                Ok(input) => original.input = Some(input),
+                Err((error, request, reserved)) => {
+                    debug_assert!(reserved.is_none());
+                    original.request = Some(request);
+                    return Err(error);
+                }
+            }
+        }
+        // The same fixed input, owner, response and exact-exit targets exist
+        // before the first foreign notification. The caller finishes outside
+        // every metadata lock; a callback panic cannot roll these moves back.
+        self.client.start_observed_in(
+            &mut original.input,
+            owner,
+            &mut original.ready,
+            &mut original.exit,
+        )
+    }
+
     fn reserve_identity(
         &self,
     ) -> Result<novarocks_query_application::api::ReservedExecutionIdentity, QueryExecutionError>
@@ -1703,6 +1846,22 @@ impl ProductionManifestAttemptProjection {
             ))
             })
             .transpose()?;
+        if manifest.writer_cohorts().next().is_some() {
+            let session = self
+                .credential_anchor
+                .as_ref()
+                .and_then(|initial| initial.write_production_session())
+                .and_then(|original| original.upgrade())
+                .ok_or_else(|| {
+                    projection_message("Native writers have no original write production receiver")
+                })?;
+            // Original complete control D must already be bound. Registration
+            // precedes initializer effects, round stage and every Create RPC.
+            session
+                .register_manifest_productions(manifest, &self.work_scope)
+                .await
+                .map_err(|error| projection_message(error.to_string()))?;
+        }
         self.pending_credential_source = Some(match &self.credential_anchor {
             Some(credentials) => credentials
                 .take_source(execution)

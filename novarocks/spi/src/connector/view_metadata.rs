@@ -126,6 +126,25 @@ pub trait ConnectorViewMetadata: Send + Sync {
         request: ConnectorViewRequest,
     ) -> Result<ConnectorViewMetadataValue, ConnectorError>;
 
+    fn load_view_async(
+        &self,
+        request: ConnectorViewRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorViewMetadataValue, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let _ = request;
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector view metadata does not support asynchronous loading",
+            ))
+        })
+    }
+
     fn list_views(
         &self,
         request: ConnectorListViewsRequest,

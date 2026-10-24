@@ -74,6 +74,16 @@ impl ViewService for EmptyViewService {
         Ok(())
     }
 
+    fn rewrite_query_async<'a>(
+        &'a self,
+        engine: &'a dyn ViewEngine,
+        query: &'a mut Query,
+        context: ViewRequestContext<'a>,
+        semantics: &'a novarocks_sql::sql_mode::SqlSemanticSettings,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move { self.rewrite_query(engine, query, context, semantics) })
+    }
+
     fn drop_database(&self, _catalog: &str, _database: &str) -> Result<(), String> {
         Ok(())
     }
@@ -180,6 +190,68 @@ impl ViewEngine for FrontendViewEngine {
             }
             Err(error) => Err(error.to_string()),
         }
+    }
+
+    fn resolve_external_view_async<'a>(
+        &'a self,
+        target: &'a ViewTarget,
+        context: &'a ConnectorRequestContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ExternalViewResolution, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let lease = crate::connector::acquire_metadata_planning_lease(
+                self.connector_control(),
+                &target.catalog,
+            )?;
+            if crate::connector::metadata_table_exists_with_planning_lease_async(
+                lease.clone(),
+                context.clone(),
+                &target.database,
+                &target.view,
+            )
+            .await?
+            {
+                return Ok(ExternalViewResolution::Table);
+            }
+            let binding = lease.binding();
+            let Some(capability) = binding.view_metadata() else {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "connector control generation does not declare view metadata",
+                )
+                .to_string());
+            };
+            let instance_id = binding.descriptor().instance_id.clone();
+            match capability
+                .load_view_async(ConnectorViewRequest {
+                    view: ConnectorViewIdentity {
+                        instance_id,
+                        namespace: Arc::from(target.database.as_str()),
+                        view: Arc::from(target.view.as_str()),
+                    },
+                    context: context.clone(),
+                })
+                .await
+            {
+                Ok(view) => Ok(ExternalViewResolution::View(resolved_external_view(
+                    target, view,
+                )?)),
+                // A catalog that cannot host views has none, so resolution treats
+                // that exactly like an absent view and the name falls through to
+                // the ordinary unknown-relation error. Creating a view still fails
+                // loudly with the provider's capability error.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ConnectorErrorKind::NotFound | ConnectorErrorKind::Unsupported
+                    ) =>
+                {
+                    Ok(ExternalViewResolution::Missing)
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        })
     }
 
     fn create_external_view(
@@ -537,6 +609,20 @@ mod tests {
             _context: &ConnectorRequestContext,
         ) -> Result<ExternalViewResolution, String> {
             unreachable!("empty view service must not access the engine")
+        }
+
+        fn resolve_external_view_async<'a>(
+            &'a self,
+            target: &'a ViewTarget,
+            context: &'a ConnectorRequestContext,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ExternalViewResolution, String>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { self.resolve_external_view(target, context) })
         }
 
         fn create_external_view(

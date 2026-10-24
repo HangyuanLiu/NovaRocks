@@ -99,6 +99,19 @@ pub(crate) fn control_storage_base(
     resources_for_bytes(per_slot)
 }
 
+pub(crate) fn control_storage_dependency_records(
+    config: ControlStorageConfig<'_>,
+    joint: &JointCapacityConfig,
+) -> Result<usize, WorkError> {
+    let proposals = config
+        .count()?
+        .checked_mul(config.proposals_per_slot)
+        .ok_or(WorkError::ArithmeticOverflow)?;
+    metadata_geometry::maximum_fact_roots(joint, proposals)?
+        .checked_mul(joint.max_dependencies_per_claim)
+        .ok_or(WorkError::ArithmeticOverflow)
+}
+
 impl WorkloadControl {
     /// Prepay and install fixed local containers in this original authority.
     /// This validates storage and ledger limits only; the application owner
@@ -185,14 +198,7 @@ impl WorkloadControl {
                 .next_id
                 .checked_add(total_scopes)
                 .ok_or(WorkError::ArithmeticOverflow)?;
-            let rows = metadata_geometry::maximum_fact_roots(
-                declared,
-                count
-                    .checked_mul(config.proposals_per_slot)
-                    .ok_or(WorkError::ArithmeticOverflow)?,
-            )?
-            .checked_mul(declared.max_dependencies_per_claim)
-            .ok_or(WorkError::ArithmeticOverflow)?;
+            let rows = control_storage_dependency_records(config, declared)?;
             if declared.max_registered_dependencies < rows {
                 return Err(WorkError::InvalidConfig(
                     "fixed dependency membership inventory",

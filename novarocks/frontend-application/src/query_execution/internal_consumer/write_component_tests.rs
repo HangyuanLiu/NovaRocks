@@ -169,6 +169,9 @@ async fn run_case(fail_writer: bool) {
         decode: session.computation_decode(&frozen_targets).unwrap(),
         session: Arc::clone(&session),
         initial: Arc::clone(&credentials),
+        // This fixture exercises a pure registered-consumer relation without
+        // starting Native writers; production from_frozen always binds a source.
+        production_execution: None,
     };
     session
         .retain_computation_storage_resolver(credentials.terminal_storage_resolver())

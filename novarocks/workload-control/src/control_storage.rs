@@ -111,6 +111,15 @@ impl<'a> ControlStorageConfig<'a> {
         crate::joint_admission::ledger::control_storage_base(self, joint)
     }
 
+    /// Canonical dependency slots required by these exact fixed proposal and
+    /// ledger containers. This is a checked layout fact, never admission.
+    pub fn minimum_dependency_records(
+        self,
+        joint: &crate::joint_admission::JointCapacityConfig,
+    ) -> Result<usize, WorkError> {
+        crate::joint_admission::ledger::control_storage_dependency_records(self, joint)
+    }
+
     pub(crate) fn count(self) -> Result<usize, WorkError> {
         self.slots_per_class.into_iter().try_fold(0usize, |sum, n| {
             sum.checked_add(n).ok_or(WorkError::ArithmeticOverflow)

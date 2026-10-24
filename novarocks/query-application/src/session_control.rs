@@ -885,6 +885,13 @@ impl GovernedQueryStatementOwner {
         self.result_window.take();
     }
 
+    /// Borrow the original stable slot for a synchronous, in-place QA start.
+    /// A refusal must leave this slot intact; a successful start installs the
+    /// same owner in QA before returning any notification tail.
+    pub fn execution_owner_slot(&mut self) -> &mut Option<WorkOwner> {
+        &mut self.execution_owner
+    }
+
     /// Transfer the unique root owner into `QueryExecutionClient::start`.
     /// The statement generation and business permit stay with this protocol owner.
     pub fn take_execution_owner(&mut self) -> Option<WorkOwner> {

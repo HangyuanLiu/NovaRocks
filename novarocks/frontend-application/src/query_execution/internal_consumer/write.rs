@@ -58,6 +58,10 @@ pub(crate) struct WriteComputationSeed {
     initial: Arc<InitialComputationCredentials>,
     contract: RootWriteDecodeContract,
     decode: WriteComputationDecode,
+    production_execution: Option<(
+        novarocks_types::QueryExecutionId,
+        novarocks_query_application::api::PlanSeal,
+    )>,
 }
 impl WriteComputationSeed {
     pub(crate) fn from_frozen(
@@ -86,11 +90,19 @@ impl WriteComputationSeed {
         session
             .retain_computation_storage_resolver(resolver)
             .map_err(domain_error_with_source)?;
+        initial
+            .bind_write_production_session(&session)
+            .map_err(domain_error)?;
+        let production_execution = Some((
+            initial.execution(),
+            template.native_manifest_template().plan(),
+        ));
         Ok(Self {
             session,
             initial,
             contract,
             decode,
+            production_execution,
         })
     }
 }
@@ -252,8 +264,11 @@ pub(crate) fn write_computation_consumer(
             "write computation requires its exact frozen External NoRecovery carrier",
         ));
     }
-    let decoder = RootWriteResultDecoder::new_with_capacity(seed.contract, &runtime.binding)
+    let mut decoder = RootWriteResultDecoder::new_with_capacity(seed.contract, &runtime.binding)
         .map_err(|_| domain_error("write decoder has no original admitted capacity"))?;
+    if let Some((execution, plan)) = seed.production_execution {
+        decoder.bind_production_execution(execution, plan);
+    }
     let state = InternalDomainState::WriteComputation {
         decoder,
         decode: seed.decode,

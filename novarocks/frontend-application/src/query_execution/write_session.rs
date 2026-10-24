@@ -23,11 +23,9 @@
 //! the recipes, the backends execute them, and this session -- and only this
 //! session -- can turn the result into an external commit.
 //!
-//! What it deliberately is not: there is no operation id, no cohort, no
-//! execution attempt, no expected-physical-writer manifest, and no report
-//! coverage. Those existed because a writer handle used to be bound to a
-//! placement. It no longer is, so completeness comes from the execution graph
-//! closing rather than from a pre-enumerated identity tree.
+//! Frozen writer/target occurrences pre-register potential output responsibility
+//! before dispatch. They do not enumerate unknown BE-local objects or replace
+//! complete End/domain validation, local sealing, or Provider disposition.
 //!
 //! The terminal decision is single-shot. A session that has committed cannot
 //! abort, one that has aborted cannot commit, and the invocation counter makes
@@ -60,9 +58,12 @@ use novarocks_plan_codec::SealedWriteTargets;
 
 #[path = "write_computation.rs"]
 mod computation;
+#[path = "write_production.rs"]
+mod production;
 pub(crate) use computation::{
     AcceptedWriteSegment, SessionDecodedWriteSegment, WriteComputationDecode, WriteReceivingPort,
 };
+pub(crate) use production::WriteProductionQuote;
 
 /// What a session has already decided. Recorded so a second, different
 /// decision is refused rather than silently issuing two external effects.
@@ -90,6 +91,7 @@ enum WritePublicationState {
 /// One distributed write's frontend session.
 pub(crate) struct ConnectorWriteSession {
     decode_origin: Arc<()>,
+    productions: Mutex<production::WriteProductionReceiving>,
     statistics_expected: Arc<
         std::collections::BTreeSet<(
             WriteTargetOrdinal,
@@ -289,6 +291,7 @@ impl ConnectorWriteSession {
         let plan = lease.session().begin_write(request)?;
         Ok(Self {
             decode_origin: Arc::new(()),
+            productions: Mutex::new(production::WriteProductionReceiving::default()),
             statistics_expected: Arc::new(
                 plan.targets()
                     .iter()
@@ -345,6 +348,7 @@ impl ConnectorWriteSession {
         }
         Ok(Self {
             decode_origin: Arc::new(()),
+            productions: Mutex::new(production::WriteProductionReceiving::default()),
             statistics_expected: Arc::new(
                 plan.targets()
                     .iter()
@@ -647,6 +651,7 @@ impl ConnectorWriteSession {
         context: ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         ensure_finish_context_active(&context)?;
+        self.require_received_productions()?;
         let publication = self.finish_publication_for_commit()?;
         self.claim_terminal(TerminalDecision::Committed)?;
         let outcome = self.commit_accumulated(context, publication);
@@ -665,6 +670,7 @@ impl ConnectorWriteSession {
         context: ConnectorRequestContext,
         publication: ConnectorWriteFinishPublication,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        self.require_received_productions()?;
         let context = self.terminal_context(context)?;
         self.commit_accumulated_with_context(context, publication)
     }
@@ -674,6 +680,7 @@ impl ConnectorWriteSession {
         context: ConnectorRequestContext,
         publication: ConnectorWriteFinishPublication,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        self.require_received_productions()?;
         let (row_count, fragments, statistics, _retention) = {
             let mut accumulated = self.lock_accumulated()?;
             (
@@ -828,7 +835,12 @@ impl ConnectorWriteSession {
         });
         // An aborted session can reach nothing else, whether the provider's
         // cleanup succeeded or not.
-        self.release_terminal_storage_resolver();
+        let outcome = outcome.map(|outcome| self.qualify_abort_cleanup(outcome));
+        // A later observation failure must not discard the original Provider
+        // verdict. Unknown/poisoned responsibility keeps its resolver custody.
+        if matches!(self.has_unreceived_productions(), Ok(false)) {
+            self.release_terminal_storage_resolver();
+        }
         outcome
     }
 

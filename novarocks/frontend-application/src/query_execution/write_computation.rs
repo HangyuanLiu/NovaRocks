@@ -36,6 +36,10 @@ pub(crate) struct WriteComputationDecode {
 /// Provider publication predicate or terminal action has been invoked.
 pub(crate) struct SessionDecodedWriteSegment {
     origin: Arc<()>,
+    production_execution: Option<(
+        novarocks_types::QueryExecutionId,
+        novarocks_query_application::api::PlanSeal,
+    )>,
     prepared: ConnectorPreparedWriteSet,
     fragment_sizes: Vec<usize>,
     statistics: Vec<novarocks_spi::connector::write_stack::WriteStatisticsArtifact>,
@@ -65,7 +69,8 @@ impl WriteComputationDecode {
         &self,
         prepared: DecodedPreparedWriteSet,
     ) -> Result<SessionDecodedWriteSegment, RootWriteDecodeFailure> {
-        let (row_count, fragments, statistics, retention) = prepared.into_parts();
+        let (row_count, fragments, statistics, retention, production_execution) =
+            prepared.into_parts();
         let fragment_sizes = fragments.iter().map(|(_, bytes)| bytes.len()).collect();
         // The original buffers remain governed until all decoded Provider
         // objects have been admitted; no independent byte clone is made.
@@ -73,6 +78,7 @@ impl WriteComputationDecode {
         drop(fragments);
         Ok(SessionDecodedWriteSegment {
             origin: Arc::clone(&self.origin),
+            production_execution,
             prepared: decoded,
             fragment_sizes,
             statistics,
@@ -211,6 +217,22 @@ impl ConnectorWriteSession {
         &self,
         segment: SessionDecodedWriteSegment,
     ) -> Result<AcceptedWriteSegment, ConnectorError> {
+        let (accepted, notification) = self.accept_interpreted_in(segment)?;
+        if let Some(notification) = notification {
+            notification.notify();
+        }
+        Ok(accepted)
+    }
+    fn accept_interpreted_in(
+        &self,
+        segment: SessionDecodedWriteSegment,
+    ) -> Result<
+        (
+            AcceptedWriteSegment,
+            Option<novarocks_workload_control::WorkloadProgressNotification>,
+        ),
+        ConnectorError,
+    > {
         // Keep the original decision lock through the pure receiving cut.
         // A concurrent abort cannot pass between the check and payload move.
         let _terminal = self.receiving_terminal_guard()?;
@@ -219,6 +241,32 @@ impl ConnectorWriteSession {
                 ConnectorErrorKind::InvalidRequest,
                 "write segment belongs to a different original session",
             ));
+        }
+        let mut production = self.productions.lock().map_err(|_| {
+            production::production_error("write production receiving state is poisoned")
+        })?;
+        let registration = production.current.as_ref();
+        match (segment.production_execution, registration) {
+            (Some((execution, plan)), Some(original))
+                if execution == original.execution && plan == original.plan =>
+            {
+                original
+                    .grant
+                    .as_ref()
+                    .ok_or_else(|| {
+                        production::production_error(
+                            "original production registration is incomplete",
+                        )
+                    })?
+                    .check_receive()
+                    .map_err(production::production_work_error)?;
+            }
+            (None, None) => {} // Non-producing pure/legacy relation fixture; Native writer ingress never uses this path.
+            _ => {
+                return Err(production::production_error(
+                    "complete write End has no matching original production record",
+                ));
+            }
         }
         let SessionDecodedWriteSegment {
             prepared,
@@ -331,10 +379,34 @@ impl ConnectorWriteSession {
         accumulated.statistics_property_bytes = next_property_bytes;
         accumulated.statistics_identities.extend(observed);
         accumulated.statistics.extend(statistics);
-        Ok(AcceptedWriteSegment {
-            origin: Arc::clone(&self.decode_origin),
-            row_count,
-            empty,
-        })
+        // The original payload/retention union is already stable. No callback
+        // runs while the same production/terminal/union locks are held.
+        let notification = if let Some(original) = production.current.as_ref() {
+            Some(
+                original
+                    .grant
+                    .as_ref()
+                    .unwrap()
+                    .receive_in()
+                    .map_err(production::production_work_error)?,
+            )
+        } else {
+            None
+        };
+        let received = production.current.take();
+        drop(accumulated);
+        drop(production);
+        drop(_terminal);
+        // A typed production handle has no release-on-Drop behavior. Its
+        // known canonical record/metadata remains charged until disposition.
+        drop(received);
+        Ok((
+            AcceptedWriteSegment {
+                origin: Arc::clone(&self.decode_origin),
+                row_count,
+                empty,
+            },
+            notification,
+        ))
     }
 }

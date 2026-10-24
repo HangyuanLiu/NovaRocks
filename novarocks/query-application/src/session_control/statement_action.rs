@@ -20,16 +20,8 @@
 use super::*;
 /// An action cannot return a second governed owner through its value slot.
 pub enum StatementActionValue {
-    Query(crate::api::QueryResult),
+    Local(crate::api::OwnedLocalResult),
     Ok,
-}
-impl StatementActionValue {
-    pub fn into_output(self) -> crate::protocol_delivery::QuerySessionOutput {
-        match self {
-            Self::Query(result) => crate::protocol_delivery::QuerySessionOutput::Query(result),
-            Self::Ok => crate::protocol_delivery::QuerySessionOutput::Ok,
-        }
-    }
 }
 use crate::session_error::QueryServiceError;
 use futures::task::AtomicWaker;
@@ -83,6 +75,39 @@ pub enum StatementActionWaitError {
 pub struct StatementActionReady {
     pub result: Result<StatementActionValue, QueryServiceError>,
     pub owner: GovernedQueryStatementOwner,
+}
+impl StatementActionReady {
+    /// Validate before either move. Refusal leaves both stable slots unchanged.
+    /// Success performs only moves and closed constructors, with no callback.
+    pub fn transfer_protocol_in(
+        source: &mut Option<Self>,
+        target: &mut Option<crate::protocol_delivery::QuerySessionOutput>,
+    ) -> Result<(), &'static str> {
+        use crate::protocol_delivery::*;
+        if target.is_some() {
+            return Err("protocol destination is occupied");
+        }
+        let ready = source.as_ref().ok_or("statement receiver is empty")?;
+        if let Ok(StatementActionValue::Local(result)) = &ready.result {
+            if !result.is_for_scope(ready.owner.scope()) {
+                return Err("Local result belongs to another statement");
+            }
+        }
+        let ready = source.take().expect("checked original receiver");
+        *target = Some(match ready.result {
+            Ok(StatementActionValue::Local(result)) => QuerySessionOutput::GovernedQuery(
+                GovernedImmediateStatementResult::from_verified_owned_local(result, ready.owner),
+            ),
+            Ok(StatementActionValue::Ok) => QuerySessionOutput::GovernedCompletion(
+                GovernedCompletionStatementResult::new(ready.owner),
+            ),
+            Err(error) => QuerySessionOutput::GovernedError(GovernedErrorStatementResult::new(
+                error,
+                ready.owner,
+            )),
+        });
+        Ok(())
+    }
 }
 /// Move-only observation of Ready. The original source STILL owns both the
 /// result and owner until silent installation in a real stable destination.

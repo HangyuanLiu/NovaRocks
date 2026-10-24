@@ -1057,6 +1057,26 @@ pub trait StatisticsReader: Send + Sync {
         &self,
         request: StatisticsReadRequest,
     ) -> Result<StatisticsEvidence, ConnectorError>;
+
+    /// Observe the original pinned evidence without a synchronous runtime bridge.
+    fn read_statistics_async(
+        &self,
+        request: StatisticsReadRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<StatisticsEvidence, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let _ = request;
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector statistics does not support asynchronous observation",
+            ))
+        })
+    }
 }
 
 /// Optional collection and publication half of a connector statistics

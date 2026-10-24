@@ -1746,6 +1746,30 @@ impl IcebergMetadataContext {
             .block_on(async move { owner.table_exists_for_read(target, binding).await })?
             .map_err(|error| format!("check Iceberg table {ident_label}: {error}"))
     }
+
+    pub(crate) async fn table_exists_for_request_async(
+        &self,
+        namespace: &str,
+        table: &str,
+        request: &ConnectorRequestContext,
+    ) -> Result<bool, String> {
+        let ident = TableIdent::new(
+            NamespaceIdent::new(normalize_identifier(namespace)?),
+            normalize_identifier(table)?,
+        );
+        let ident_label = ident.to_string();
+        let owner = Arc::clone(self.novarocks_catalog());
+        let target =
+            crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
+        let binding = self
+            .resources
+            .planning_binding()
+            .for_request(request.clone());
+        owner
+            .table_exists_for_read(target, binding)
+            .await
+            .map_err(|error| format!("check Iceberg table {ident_label}: {error}"))
+    }
 }
 
 fn invalid_request(message: String) -> (ConnectorErrorKind, String) {

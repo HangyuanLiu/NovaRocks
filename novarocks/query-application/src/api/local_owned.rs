@@ -102,6 +102,11 @@ struct LocalSourceInput {
     window: ResultWindowAlias,
 }
 impl OwnedLocalResult {
+    /// Pure identity observation; no alias or capacity is created.
+    pub fn is_for_scope(&self, scope: &WorkScope) -> bool {
+        self.window.is_for_scope(scope)
+    }
+
     pub(crate) fn seal_exclusive(
         result: QueryResult,
         window: ResultWindowAlias,

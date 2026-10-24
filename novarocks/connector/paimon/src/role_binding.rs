@@ -866,6 +866,26 @@ impl ConnectorMetadata for PaimonGenericControl {
         })?
     }
 
+    fn table_exists_async(
+        &self,
+        request: ConnectorTableRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<bool, ConnectorError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            self.ensure_instance(&request.table.instance_id)?;
+            let resources = PaimonRequestControl::from_request(&request.context);
+            let catalog = self.catalog(&request.context)?;
+            resources
+                .until(async move {
+                    catalog
+                        .table_exists(&request.table.namespace, &request.table.table)
+                        .await
+                })
+                .await?
+        })
+    }
+
     fn list_tables(
         &self,
         request: ConnectorListTablesRequest,

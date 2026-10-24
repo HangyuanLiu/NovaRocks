@@ -73,196 +73,212 @@ impl StatisticsReader for IcebergMetadata {
         &self,
         request: StatisticsReadRequest,
     ) -> Result<StatisticsEvidence, ConnectorError> {
-        validate_context(&request.context)?;
-        let table = self.table_payload(&request.table)?;
-        let table_info = base_table_info(&table, "statistics read")?;
-        let expected = pinned_data_version(table_info)?;
-        if request.data_version != expected {
-            return Err(invalid(
-                "Iceberg statistics request does not match its resolved table pin",
-            ));
-        }
-        let snapshot_id = table_info.current_snapshot_id.ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::NotFound,
-                "Iceberg table has no current snapshot for statistics",
-            )
-        })?;
-        let physical = self
-            .runtime()
-            .load_table_for_request(&table.namespace, &table.table, &request.context)
-            .map_err(unavailable)?;
-        let metadata = physical.table.metadata();
-        // Deliberately no currentness check. The query was planned on this
-        // snapshot; the table moving on afterwards does not make that snapshot's
-        // statistics wrong, it only makes them describe an older state — which
-        // is what the per-metric basis facts are for.
-
-        // Manifest-derivable metrics always come from the snapshot being
-        // queried, whether or not a statistics file exists. Letting a published
-        // artifact supply them would answer with whichever snapshot ANALYZE
-        // happened to measure, and letting its absence blank them out was how a
-        // table with no Puffin ended up with no statistics at all.
-        let table_for_files = physical.table.clone();
-        let control = request.context.clone();
-        let files_result = self
-            .runtime()
+        let owner = self.clone();
+        self.runtime()
             .resources()
             .catalog_runtime()
-            .block_on(async move {
-                extract_data_files_with_stats_at_with_control(
-                    &table_for_files,
-                    snapshot_id,
-                    Some(&control as &dyn ConnectorOperationControl),
+            .block_on(async move { owner.read_statistics_async(request).await })
+            .map_err(unavailable)?
+    }
+
+    fn read_statistics_async(
+        &self,
+        request: StatisticsReadRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<StatisticsEvidence, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            validate_context(&request.context)?;
+            let table = self.table_payload(&request.table)?;
+            let table_info = base_table_info(&table, "statistics read")?;
+            let expected = pinned_data_version(table_info)?;
+            if request.data_version != expected {
+                return Err(invalid(
+                    "Iceberg statistics request does not match its resolved table pin",
+                ));
+            }
+            let snapshot_id = table_info.current_snapshot_id.ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    "Iceberg table has no current snapshot for statistics",
                 )
-                .await
-            });
-        self.validate_context(&request.context)?;
-        let files = files_result.map_err(unavailable)?.map_err(unavailable)?;
-        let arrow_schema =
-            crate::scalar_integer_domain::metadata_sql_schema(metadata, metadata.current_schema())?;
-        for file in &files {
-            for field in arrow_schema.fields() {
-                let domain = match field.data_type() {
-                    DataType::Int8 => Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int8),
-                    DataType::Int16 => {
-                        Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int16)
-                    }
-                    _ => None,
-                };
-                let Some(domain) = domain else {
-                    continue;
-                };
-                if let Some(metric) = column_stats(file, field.name()) {
-                    for bytes in [metric.lower_bound.as_deref(), metric.upper_bound.as_deref()]
-                        .into_iter()
-                        .flatten()
-                    {
-                        let value = i32::from_le_bytes(bytes.try_into().map_err(|_| {
-                            corrupt("Iceberg scalar integer bound is not four bytes")
-                        })?);
-                        domain.value(value)?;
-                    }
-                }
-            }
-        }
-        let field_ids = metadata
-            .current_schema()
-            .as_struct()
-            .fields()
-            .iter()
-            .map(|field| (field.name.to_ascii_lowercase(), field.id))
-            .collect::<HashMap<_, _>>();
-        let data_types = arrow_schema
-            .fields()
-            .iter()
-            .map(|field| (field.name().to_ascii_lowercase(), field.data_type().clone()))
-            .collect::<HashMap<_, _>>();
-        // Two independent questions that used to share one boolean. Whether the
-        // manifest accounts for every row is a coverage fact; whether delete
-        // files make a summed number an over-count is a per-metric numeric
-        // fact, and it only bends the metrics it actually affects.
-        let row_coverage = if files.iter().all(|file| file.record_count.is_some()) {
-            StatisticsRowCoverage::AllVisibleRows
-        } else {
-            StatisticsRowCoverage::PartialRows
-        };
-        let has_deletes = files.iter().any(|file| !file.delete_files.is_empty());
-
-        let mut metrics: BTreeMap<StatisticsMetric, StatisticsMetricState> = request
-            .metrics
-            .metrics()
-            .iter()
-            .filter(|metric| !matches!(metric, StatisticsMetric::ThetaNdv { .. }))
-            .cloned()
-            .map(|metric| {
-                let state = manifest_metric(&metric, &files, &data_types, has_deletes, &expected);
-                (metric, state)
-            })
-            .collect();
-
-        // NDV lives only in Puffin, and Puffin is published against the snapshot
-        // that was measured — so each column searches its own ancestry.
-        let wanted_ndv: BTreeMap<i32, StatisticsMetric> = request
-            .metrics
-            .metrics()
-            .iter()
-            .filter(|metric| matches!(metric, StatisticsMetric::ThetaNdv { .. }))
-            .filter_map(|metric| {
-                let column = statistics_metric_column(metric)?;
-                let field_id = field_ids.get(&column.to_ascii_lowercase())?;
-                Some((*field_id, metric.clone()))
-            })
-            .collect();
-        let resolved_ndv = if wanted_ndv.is_empty() {
-            HashMap::new()
-        } else {
-            let table_for_ndv = physical.table.clone();
-            let field_set = wanted_ndv.keys().copied().collect::<BTreeSet<_>>();
-            let result = self
+            })?;
+            let physical = self
                 .runtime()
-                .resources()
-                .catalog_runtime()
-                .block_on(async move {
-                    resolve_ancestor_ndv(
-                        table_for_ndv.metadata(),
-                        table_for_ndv.file_io(),
-                        snapshot_id,
-                        &field_set,
-                    )
-                    .await
-                });
-            self.validate_context(&request.context)?;
-            result.map_err(unavailable)?
-        };
-        let row_count_ceiling = row_count_ceiling(&metrics);
-        for metric in request.metrics.metrics() {
-            if !matches!(metric, StatisticsMetric::ThetaNdv { .. }) {
-                continue;
-            }
-            let resolved = wanted_ndv
-                .iter()
-                .find(|(_, wanted)| *wanted == metric)
-                .and_then(|(field_id, _)| resolved_ndv.get(field_id));
-            let state = match resolved {
-                Some(resolved) => {
-                    let basis_version = statistics_data_version(
-                        table_info
-                            .table_uuid
-                            .as_deref()
-                            .expect("pinned data version requires a table UUID"),
-                        Some(resolved.basis_snapshot_id),
-                    )?;
-                    StatisticsMetricState::Available(StatisticsMetricObservation::new(
-                        StatisticsMetricValue::F64(cap_ndv(resolved.ndv, row_count_ceiling)),
-                        basis_version,
-                        StatisticsMetricSource::ProviderArtifact,
-                        // A Theta sketch estimates in both directions however
-                        // complete its input was.
-                        StatisticsNumericNature::TwoSidedApproximate,
-                        basis_relation(metadata, resolved.basis_snapshot_id, snapshot_id),
-                    ))
-                }
-                None => StatisticsMetricState::Missing(StatisticsMissing {
-                    kind: StatisticsMissingKind::NotCollected,
-                    message: Arc::from("no ancestor snapshot published a sketch for this column"),
-                }),
-            };
-            metrics.insert(metric.clone(), state);
-        }
+                .load_table_for_request_async(&table.namespace, &table.table, &request.context)
+                .await
+                .map_err(unavailable)?;
+            let metadata = physical.table.metadata();
+            // Deliberately no currentness check. The query was planned on this
+            // snapshot; the table moving on afterwards does not make that snapshot's
+            // statistics wrong, it only makes them describe an older state — which
+            // is what the per-metric basis facts are for.
 
-        // The revision identifies the exact set of artifacts behind this answer.
-        // Ancestors matter: a statistics file may be replaced on any snapshot in
-        // the chain, and the cache must not keep serving the previous one.
-        let revision = evidence_revision(
-            table_info
-                .table_uuid
-                .as_deref()
-                .expect("pinned data version requires a table UUID"),
-            snapshot_id,
-            &resolved_ndv,
-        )?;
-        StatisticsEvidence::try_new(expected, revision, row_coverage, metrics)
+            // Manifest-derivable metrics always come from the snapshot being
+            // queried, whether or not a statistics file exists. Letting a published
+            // artifact supply them would answer with whichever snapshot ANALYZE
+            // happened to measure, and letting its absence blank them out was how a
+            // table with no Puffin ended up with no statistics at all.
+            let table_for_files = physical.table.clone();
+            let control = request.context.clone();
+            let files_result = extract_data_files_with_stats_at_with_control(
+                &table_for_files,
+                snapshot_id,
+                Some(&control as &dyn ConnectorOperationControl),
+            )
+            .await;
+            self.validate_context(&request.context)?;
+            let files = files_result.map_err(unavailable)?;
+            let arrow_schema = crate::scalar_integer_domain::metadata_sql_schema(
+                metadata,
+                metadata.current_schema(),
+            )?;
+            for file in &files {
+                for field in arrow_schema.fields() {
+                    let domain = match field.data_type() {
+                        DataType::Int8 => {
+                            Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int8)
+                        }
+                        DataType::Int16 => {
+                            Some(crate::scalar_integer_domain::ScalarIntegerDomain::Int16)
+                        }
+                        _ => None,
+                    };
+                    let Some(domain) = domain else {
+                        continue;
+                    };
+                    if let Some(metric) = column_stats(file, field.name()) {
+                        for bytes in [metric.lower_bound.as_deref(), metric.upper_bound.as_deref()]
+                            .into_iter()
+                            .flatten()
+                        {
+                            let value = i32::from_le_bytes(bytes.try_into().map_err(|_| {
+                                corrupt("Iceberg scalar integer bound is not four bytes")
+                            })?);
+                            domain.value(value)?;
+                        }
+                    }
+                }
+            }
+            let field_ids = metadata
+                .current_schema()
+                .as_struct()
+                .fields()
+                .iter()
+                .map(|field| (field.name.to_ascii_lowercase(), field.id))
+                .collect::<HashMap<_, _>>();
+            let data_types = arrow_schema
+                .fields()
+                .iter()
+                .map(|field| (field.name().to_ascii_lowercase(), field.data_type().clone()))
+                .collect::<HashMap<_, _>>();
+            // Two independent questions that used to share one boolean. Whether the
+            // manifest accounts for every row is a coverage fact; whether delete
+            // files make a summed number an over-count is a per-metric numeric
+            // fact, and it only bends the metrics it actually affects.
+            let row_coverage = if files.iter().all(|file| file.record_count.is_some()) {
+                StatisticsRowCoverage::AllVisibleRows
+            } else {
+                StatisticsRowCoverage::PartialRows
+            };
+            let has_deletes = files.iter().any(|file| !file.delete_files.is_empty());
+
+            let mut metrics: BTreeMap<StatisticsMetric, StatisticsMetricState> = request
+                .metrics
+                .metrics()
+                .iter()
+                .filter(|metric| !matches!(metric, StatisticsMetric::ThetaNdv { .. }))
+                .cloned()
+                .map(|metric| {
+                    let state =
+                        manifest_metric(&metric, &files, &data_types, has_deletes, &expected);
+                    (metric, state)
+                })
+                .collect();
+
+            // NDV lives only in Puffin, and Puffin is published against the snapshot
+            // that was measured — so each column searches its own ancestry.
+            let wanted_ndv: BTreeMap<i32, StatisticsMetric> = request
+                .metrics
+                .metrics()
+                .iter()
+                .filter(|metric| matches!(metric, StatisticsMetric::ThetaNdv { .. }))
+                .filter_map(|metric| {
+                    let column = statistics_metric_column(metric)?;
+                    let field_id = field_ids.get(&column.to_ascii_lowercase())?;
+                    Some((*field_id, metric.clone()))
+                })
+                .collect();
+            let resolved_ndv = if wanted_ndv.is_empty() {
+                HashMap::new()
+            } else {
+                let table_for_ndv = physical.table.clone();
+                let field_set = wanted_ndv.keys().copied().collect::<BTreeSet<_>>();
+                let result = resolve_ancestor_ndv(
+                    table_for_ndv.metadata(),
+                    table_for_ndv.file_io(),
+                    snapshot_id,
+                    &field_set,
+                )
+                .await;
+                self.validate_context(&request.context)?;
+                result
+            };
+            let row_count_ceiling = row_count_ceiling(&metrics);
+            for metric in request.metrics.metrics() {
+                if !matches!(metric, StatisticsMetric::ThetaNdv { .. }) {
+                    continue;
+                }
+                let resolved = wanted_ndv
+                    .iter()
+                    .find(|(_, wanted)| *wanted == metric)
+                    .and_then(|(field_id, _)| resolved_ndv.get(field_id));
+                let state = match resolved {
+                    Some(resolved) => {
+                        let basis_version = statistics_data_version(
+                            table_info
+                                .table_uuid
+                                .as_deref()
+                                .expect("pinned data version requires a table UUID"),
+                            Some(resolved.basis_snapshot_id),
+                        )?;
+                        StatisticsMetricState::Available(StatisticsMetricObservation::new(
+                            StatisticsMetricValue::F64(cap_ndv(resolved.ndv, row_count_ceiling)),
+                            basis_version,
+                            StatisticsMetricSource::ProviderArtifact,
+                            // A Theta sketch estimates in both directions however
+                            // complete its input was.
+                            StatisticsNumericNature::TwoSidedApproximate,
+                            basis_relation(metadata, resolved.basis_snapshot_id, snapshot_id),
+                        ))
+                    }
+                    None => StatisticsMetricState::Missing(StatisticsMissing {
+                        kind: StatisticsMissingKind::NotCollected,
+                        message: Arc::from(
+                            "no ancestor snapshot published a sketch for this column",
+                        ),
+                    }),
+                };
+                metrics.insert(metric.clone(), state);
+            }
+
+            // The revision identifies the exact set of artifacts behind this answer.
+            // Ancestors matter: a statistics file may be replaced on any snapshot in
+            // the chain, and the cache must not keep serving the previous one.
+            let revision = evidence_revision(
+                table_info
+                    .table_uuid
+                    .as_deref()
+                    .expect("pinned data version requires a table UUID"),
+                snapshot_id,
+                &resolved_ndv,
+            )?;
+            StatisticsEvidence::try_new(expected, revision, row_coverage, metrics)
+        })
     }
 }
 

@@ -448,6 +448,30 @@ pub fn metadata_table_exists_with_planning_lease(
         .map_err(|error| error.to_string())
 }
 
+pub(crate) async fn metadata_table_exists_with_planning_lease_async(
+    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+    namespace: &str,
+    table: &str,
+) -> Result<bool, String> {
+    let instance_id = binding.binding().descriptor().instance_id.clone();
+    let context = context_for_planning_lease(&binding, context)?;
+    binding
+        .binding()
+        .metadata()
+        .table_exists_async(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+                table: Arc::from(table),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context,
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Enumerate namespaces through an admission-frozen connector control lease.
 /// Ordering and duplicate handling stay application-owned so providers only
 /// expose their authoritative catalog facts. The provider refuses a listing
@@ -526,6 +550,29 @@ pub fn metadata_read_reference_facts_with_planning_lease(
             },
             context,
         })
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) async fn metadata_read_reference_facts_with_planning_lease_async(
+    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+    namespace: &str,
+    table: &str,
+) -> Result<ConnectorReadReferenceFacts, String> {
+    let instance_id = binding.binding().descriptor().instance_id.clone();
+    let context = context_for_planning_lease(&binding, context)?;
+    binding
+        .binding()
+        .metadata()
+        .read_reference_facts_async(ConnectorReadReferenceFactsRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+                table: Arc::from(table),
+            },
+            context,
+        })
+        .await
         .map_err(|error| error.to_string())
 }
 

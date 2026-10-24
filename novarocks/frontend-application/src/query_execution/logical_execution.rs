@@ -46,6 +46,17 @@ use crate::query_execution::completion::PreparedLogicalRead;
 pub(crate) trait LogicalExecutionLauncher: Send + Sync + 'static {
     fn reserve_identity(&self) -> Result<ReservedExecutionIdentity, QueryExecutionError>;
 
+    fn start_computation_in(
+        &self,
+        computation: &mut Option<PreparedLogicalComputation>,
+        owner: &mut Option<WorkOwner>,
+        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        original: &mut OriginalComputationStart,
+        #[cfg(novarocks_dev_controls)] observation: Option<
+            crate::preparation_diagnostics::StatementObservationHandle,
+        >,
+    ) -> Result<novarocks_query_application::api::LogicalExecutionStartAttempt, QueryExecutionError>;
+
     fn start_computation(
         &self,
         computation: PreparedLogicalComputation,
@@ -68,6 +79,16 @@ pub(crate) trait LogicalExecutionLauncher: Send + Sync + 'static {
     ) -> QueryExecutionFuture;
 }
 
+/// Fixed fields inside the statement's existing stable action. These are
+/// original QA inputs/results, not another execution identity or task owner.
+#[derive(Default)]
+pub(crate) struct OriginalComputationStart {
+    pub(crate) request: Option<novarocks_query_application::api::QueryExecutionRequest>,
+    pub(crate) input: Option<novarocks_query_application::api::OriginalLogicalStartInput>,
+    pub(crate) ready: Option<QueryExecutionFuture>,
+    pub(crate) exit: Option<novarocks_query_application::api::LogicalExecutionExitObserver>,
+}
+
 /// Original first-attempt ownership established before effectful preparation.
 /// Credentials remain FA-owned; the QA token is moved unchanged into start.
 pub(crate) struct InitialComputationReservation {
@@ -84,6 +105,7 @@ impl InitialComputationReservation {
                 execution: reserved.execution(),
                 reservation: Mutex::new(Some(reservation)),
                 terminal,
+                write_production_session: Mutex::new(None),
             }),
             reserved: Some(reserved),
         })
@@ -147,9 +169,38 @@ pub(crate) struct InitialComputationCredentials {
     execution: QueryExecutionId,
     reservation: Mutex<Option<QueryAttemptReservation>>,
     terminal: Arc<AttemptTerminalCredentialResolver>,
+    write_production_session:
+        Mutex<Option<std::sync::Weak<super::write_session::ConnectorWriteSession>>>,
 }
 
 impl InitialComputationCredentials {
+    pub(crate) fn bind_write_production_session(
+        &self,
+        session: &Arc<super::write_session::ConnectorWriteSession>,
+    ) -> Result<(), &'static str> {
+        let incoming = Arc::downgrade(session);
+        let mut route = self
+            .write_production_session
+            .lock()
+            .map_err(|_| "write production route is poisoned")?;
+        match route.as_ref() {
+            Some(original) if !std::sync::Weak::ptr_eq(original, &incoming) => {
+                Err("initial write production session changed")
+            }
+            Some(_) => Ok(()),
+            None => {
+                *route = Some(incoming);
+                Ok(())
+            }
+        }
+    }
+    /// Only clone the same Weak under the route lock; upgrade and all work are
+    /// outside it. This does not extend WeakReceivingPort/session lifetime.
+    pub(crate) fn write_production_session(
+        &self,
+    ) -> Option<std::sync::Weak<super::write_session::ConnectorWriteSession>> {
+        self.write_production_session.lock().ok()?.clone()
+    }
     pub(crate) const fn execution(&self) -> QueryExecutionId {
         self.execution
     }

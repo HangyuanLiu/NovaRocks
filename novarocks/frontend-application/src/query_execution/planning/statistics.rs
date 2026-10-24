@@ -305,6 +305,139 @@ fn project_binding_statistics_for_metrics(
     })
 }
 
+pub(crate) async fn resolve_statistics_need_async(
+    resolver: &UnifiedStatisticsResolver,
+    bindings: &QueryTableBindingStore,
+    need: &StatisticsNeed,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatisticsFact, String> {
+    let binding_id = need.binding();
+    let evidence = match bindings.binding(binding_id) {
+        Ok(binding) => {
+            let facts = materialization_statistics_facts(&binding.resolved);
+            project_binding_statistics_for_metrics_async(
+                resolver,
+                binding_id,
+                facts.label(),
+                facts.columns(),
+                &binding,
+                need.metrics(),
+                connector_context,
+            )
+            .await?
+        }
+        // An unknown token is a contradiction with the exact catalog fact
+        // that introduced this SQL binding. It must not become a best-effort
+        // current lookup or a conservative Missing observation.
+        Err(_) => {
+            let label = format!("SQL binding {binding_id:?}");
+            fatal_statistics_evidence(binding_id, &label, DmlStatisticsFailure::BindingMissing)
+        }
+    };
+    StatisticsFact::try_new(need, need.metrics().to_vec(), evidence)
+        .map_err(|error| format!("build statistics completion fact: {error}"))
+}
+
+async fn project_binding_statistics_for_metrics_async(
+    resolver: &UnifiedStatisticsResolver,
+    binding_id: novarocks_sql::binding::SqlTableBindingId,
+    label: &str,
+    columns: &[novarocks_types::schema::ColumnDef],
+    binding: &QueryTableBinding,
+    requested_metrics: &[StatisticsMetric],
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<DmlStatisticsEvidence, String> {
+    let Some(pin) = binding.statistics_pin.as_ref() else {
+        return Ok(DmlStatisticsEvidence::Missing {
+            binding: binding_id,
+            label: label.to_string(),
+            reason: "resolved table does not expose connector statistics".to_string(),
+        });
+    };
+    let planning_lease = match binding.admission.exact_planning_lease() {
+        Ok(lease) => lease,
+        Err(_) => {
+            return Ok(fatal_statistics_evidence(
+                binding_id,
+                label,
+                DmlStatisticsFailure::BindingMissing,
+            ));
+        }
+    };
+    let control_binding = planning_lease.binding();
+    if control_binding.descriptor().instance_id != *pin.table.owner() {
+        return Ok(fatal_statistics_evidence(
+            binding_id,
+            label,
+            DmlStatisticsFailure::OwnerMismatch,
+        ));
+    }
+    let Some(statistics) = control_binding.statistics() else {
+        return Ok(DmlStatisticsEvidence::Missing {
+            binding: binding_id,
+            label: label.to_string(),
+            reason: "resolved connector generation does not expose statistics".to_string(),
+        });
+    };
+    let metrics = match StatisticsMetricRequest::try_new(requested_metrics.to_vec()) {
+        Ok(metrics) => metrics,
+        Err(error) => {
+            return Ok(fatal_statistics_evidence(
+                binding_id,
+                label,
+                DmlStatisticsFailure::CorruptEvidence(format!("build metric request: {error}")),
+            ));
+        }
+    };
+    let evidence = match resolver
+        .resolve_async(
+            &ResolvedStatisticsTable {
+                table: pin.table.clone(),
+                data_version: pin.data_version.clone(),
+                incarnation: control_binding.incarnation(),
+            },
+            statistics.as_ref(),
+            metrics,
+            connector_context.clone(),
+        )
+        .await
+    {
+        Ok(evidence) => evidence,
+        // A provider that cannot supply evidence remains the normal
+        // conservative path.  Only a fact that contradicts the retained
+        // binding is fatal to compilation.
+        Err(StatisticsResolutionFailure::Connector(error))
+            if matches!(
+                error.kind(),
+                novarocks_spi::connector::ConnectorErrorKind::Cancelled
+                    | novarocks_spi::connector::ConnectorErrorKind::DeadlineExceeded
+            ) =>
+        {
+            return Err(format!("freeze statistics for {label}: {error}"));
+        }
+        Err(StatisticsResolutionFailure::Connector(error)) => {
+            return Ok(DmlStatisticsEvidence::Missing {
+                binding: binding_id,
+                label: label.to_string(),
+                reason: error.to_string(),
+            });
+        }
+        Err(error) => {
+            return Ok(fatal_statistics_evidence(
+                binding_id,
+                label,
+                map_resolution_failure(error),
+            ));
+        }
+    };
+    Ok(DmlStatisticsEvidence::Available {
+        binding: binding_id,
+        label: label.to_string(),
+        columns: columns.to_vec(),
+        evidence: (*evidence).clone(),
+    })
+}
+
 fn fatal_statistics_evidence(
     binding: novarocks_sql::binding::SqlTableBindingId,
     label: &str,

@@ -268,7 +268,19 @@ impl RoundSplitAssignment {
 
     /// Performs the only Connector call in one ordinary blocking job.
     pub(crate) fn enumerate_source(
+        request: RoundSplitEnumerationRequest,
+    ) -> RoundSplitEnumerationResult {
+        Self::enumerate_source_inner(request, None)
+    }
+    pub(crate) fn enumerate_source_retained(
+        request: RoundSplitEnumerationRequest,
+        retained: &crate::task_execution::blocking_io::ConnectorSourceCloseResult<'_>,
+    ) -> RoundSplitEnumerationResult {
+        Self::enumerate_source_inner(request, Some(retained))
+    }
+    fn enumerate_source_inner(
         mut request: RoundSplitEnumerationRequest,
+        retained: Option<&crate::task_execution::blocking_io::ConnectorSourceCloseResult<'_>>,
     ) -> RoundSplitEnumerationResult {
         use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
         use novarocks_query_application::execution_error::QueryFailureReason;
@@ -291,10 +303,19 @@ impl RoundSplitAssignment {
                 .next_batch(DEFAULT_PUMP_BATCH_SIZE, dynamic_filter)
                 .map(Some)
         }))
-        .map_err(|_| SplitAssignmentDriverError::SourceEnumeration {
-            scan,
-            fact: QueryFailureReason::SplitAssignmentFailed.failure_fact(),
-            detail: SafeDetail::truncating("the connector split source panicked while enumerating"),
+        .map_err(|original| {
+            if let Some(retained) = retained {
+                retained.record_panic(original);
+            } else {
+                drop(original);
+            }
+            SplitAssignmentDriverError::SourceEnumeration {
+                scan,
+                fact: QueryFailureReason::SplitAssignmentFailed.failure_fact(),
+                detail: SafeDetail::truncating(
+                    "the connector split source panicked while enumerating",
+                ),
+            }
         })
         .and_then(|batch| {
             batch.map_err(|error| SplitAssignmentDriverError::SourceEnumeration {
@@ -370,30 +391,12 @@ impl RoundSplitAssignment {
         self.driver.delivery_in_progress()
     }
 
-    pub(crate) fn close_source(mut source: RoundSplitSource) {
-        let scan = source.scan;
-        if let Err(error) = Self::close_source_result(&mut source) {
-            tracing::warn!(
-                plan_node_id = scan.plan_node_id(),
-                error = %error,
-                "closing a split source failed"
-            );
-        }
-    }
-
-    /// The same original close author, retaining its typed domain cause for
-    /// an initializer that must explicitly observe its cleanup job.
-    pub(crate) fn close_source_result(
-        source: &mut RoundSplitSource,
-    ) -> Result<(), novarocks_spi::connector::ConnectorError> {
-        source.source.close()
-    }
-
     /// Close every source once, isolating each provider hook. Normal domain
     /// errors are facts; only the outer original job proves physical exit.
     fn close_sources(
         &mut self,
         collect_profile: bool,
+        retained: Option<&crate::task_execution::blocking_io::ConnectorSourceCloseResult<'_>>,
     ) -> Result<SplitSourceProfile, SplitAssignmentDriverError> {
         use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
         if self.closed {
@@ -427,7 +430,11 @@ impl RoundSplitAssignment {
                         // This runs on the same original blocking job. A real
                         // payload destructor panic escapes to its existing
                         // supervisor and cannot mint the normal join proof.
-                        drop(payload);
+                        if let Some(retained) = retained {
+                            retained.record_panic(payload);
+                        } else {
+                            drop(payload);
+                        }
                     }
                 }
             }
@@ -441,15 +448,28 @@ impl RoundSplitAssignment {
                         fact: error.failure_fact(),
                         detail: SafeDetail::truncating("closing the connector split source failed"),
                     });
-                    // Preserve only neutral facts across the thread boundary;
-                    // the original error and any captured owners retire here.
-                    drop(error);
+                    if let Some(retained) = retained {
+                        retained.record_error(error);
+                    } else {
+                        drop(error);
+                    }
                 }
                 Err(payload) => {
                     first_error.get_or_insert_with(|| {
                         source_close_panic(entry.scan, SourceClosePanic::Close)
                     });
-                    drop(payload);
+                    if let Some(retained) = retained {
+                        retained.record_panic(payload);
+                    } else {
+                        drop(payload);
+                    }
+                }
+            }
+        }
+        if let Some(retained) = retained {
+            for entry in self.sources.iter_mut().flatten() {
+                if let Err(error) = entry.source.retire_in(retained) {
+                    retained.record_error(error);
                 }
             }
         }
@@ -458,17 +478,38 @@ impl RoundSplitAssignment {
 
     /// Consumes the original assignment so its actual sources, transport and
     /// captures have all retired before this original blocking job returns.
+    #[cfg(test)]
     pub(crate) fn close_with_profile(
         mut self,
     ) -> Result<SplitSourceProfile, SplitAssignmentDriverError> {
-        let result = self.close_sources(true);
+        let failure = std::sync::Mutex::new(None);
+        let panic = std::sync::Mutex::new(None);
+        let unproven = std::sync::atomic::AtomicBool::new(false);
+        let retained = crate::task_execution::blocking_io::ConnectorSourceCloseResult::for_fixture(
+            &failure, &panic, &unproven,
+        );
+        let result = self.close_sources(true, Some(&retained));
         drop(self);
         result
     }
 
+    pub(crate) fn close_with_profile_in(
+        &mut self,
+        retained: &crate::task_execution::blocking_io::ConnectorSourceCloseResult<'_>,
+    ) -> Result<SplitSourceProfile, SplitAssignmentDriverError> {
+        self.close_sources(true, Some(retained))
+    }
+
     /// Idempotent fallback for owners that have not reached serial close.
+    #[cfg(test)]
     pub(crate) fn close(&mut self) {
-        if let Err(error) = self.close_sources(false) {
+        let failure = std::sync::Mutex::new(None);
+        let panic = std::sync::Mutex::new(None);
+        let unproven = std::sync::atomic::AtomicBool::new(false);
+        let retained = crate::task_execution::blocking_io::ConnectorSourceCloseResult::for_fixture(
+            &failure, &panic, &unproven,
+        );
+        if let Err(error) = self.close_sources(false, Some(&retained)) {
             tracing::warn!(error = %error, "closing the original split assignment failed");
         }
     }
@@ -476,7 +517,9 @@ impl RoundSplitAssignment {
 
 impl Drop for RoundSplitAssignment {
     fn drop(&mut self) {
-        self.close();
+        // Actual close is borrowed by the original pump/initializer. View Drop
+        // only stops production; it never invokes Provider callbacks or jobs.
+        self.stop.stop();
     }
 }
 

@@ -322,6 +322,9 @@ impl PreReadyRetryBoundary for FrontendDistributedAttemptFactory {
     }
 }
 
+mod async_explain;
+pub(crate) use async_explain::{PreparedAsyncExplain, PreparedAsyncProfile};
+
 impl FrontendQueryCompiler {
     pub(crate) fn connector_runtime(&self) -> &tokio::runtime::Handle {
         self.connector_blocking_io.runtime()

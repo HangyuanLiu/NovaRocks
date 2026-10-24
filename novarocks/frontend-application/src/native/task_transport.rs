@@ -617,6 +617,12 @@ impl TaskAckIntake {
 /// Everything else is settled and fails closed, however transient its wording
 /// looks: this never reads a status message.
 fn classify_apply_status(status: &tonic::Status) -> OperationDispatchResult {
+    if novarocks_native_adapter::native_codec::is_operation_reply_preflight_failure(status) {
+        // A reply arrived but its generated tree exceeded the original reply
+        // grammar. Match the existing unusable-response verdict: this is not
+        // evidence of a remote pre-admission refusal and must not be retried.
+        return worker_result(OperationOutcome::InvalidStateOrRequest);
+    }
     match status.code() {
         tonic::Code::Unavailable
         | tonic::Code::DeadlineExceeded
@@ -915,6 +921,25 @@ impl TaskOperationSink for NativeTaskOperationSink {
             drop(batch.commit_queue_permits());
             return TaskOperationSubmit::Accepted;
         }
+        let input = match action_input::NativeApplyInputPlan::from_operations(
+            batch.operations(),
+            self.transport,
+        ) {
+            Ok(input) => input,
+            Err(detail) => {
+                tracing::warn!(
+                    detail,
+                    "Native Apply input exceeds its original batch bound"
+                );
+                self.settle_batch_locally(
+                    &batch,
+                    OperationOutcome::ResourceExhausted,
+                    REFUSAL_OVER_BUDGET,
+                );
+                drop(batch.commit_queue_permits());
+                return TaskOperationSubmit::Accepted;
+            }
+        };
         // The original batch still holds its exact process-item grants. Reserve
         // only fixed bookkeeping custody BEFORE constructing any Native F.
         let original_slot = match self
@@ -944,9 +969,9 @@ impl TaskOperationSink for NativeTaskOperationSink {
             }
         };
 
-        let mut operations = Vec::with_capacity(batch.operations().len());
-        let mut sent = Vec::with_capacity(batch.operations().len());
-        let mut unencodable = Vec::new();
+        let mut operations = Vec::with_capacity(input.items());
+        let mut sent = Vec::with_capacity(input.items());
+        let mut unencodable = Vec::with_capacity(input.items());
         for intent in batch.operations() {
             let encoded = encode_operation(intent, &self.attempt);
             match encoded {
@@ -1104,23 +1129,44 @@ fn encode_method_batches(
     operations: Vec<(bool, proto::TaskOperation)>,
     budget: TransportBudget,
 ) -> Result<Vec<EncodedMethodBatch>, novarocks_proto_codec::ProtocolError> {
-    let mut batches = Vec::new();
-    let mut iter = operations.into_iter().peekable();
+    // This is also a direct internal test seam: apply the same source bound
+    // before allocating any method-run carrier, even without a dispatcher.
+    if operations.is_empty() || operations.len() > budget.max_batch_items() {
+        return Err(novarocks_proto_codec::ProtocolError::new(
+            FieldPath::root("task_operation_method_batches"),
+            novarocks_proto_codec::ProtocolErrorKind::OutOfRange,
+            "operation method batches exceed the original item bound",
+        ));
+    }
+    fn key(item: &(bool, proto::TaskOperation)) -> (bool, Option<u64>) {
+        (
+            item.0,
+            item.1
+                .envelope
+                .as_ref()
+                .map(|envelope| envelope.max_wait_millis),
+        )
+    }
+    let runs = 1 + operations
+        .windows(2)
+        .filter(|pair| key(&pair[0]) != key(&pair[1]))
+        .count();
+    let mut batches = Vec::with_capacity(runs);
+    let mut iter = operations.into_iter();
     while let Some((control, first)) = iter.next() {
         let wait_millis = first
             .envelope
             .as_ref()
             .map(|envelope| envelope.max_wait_millis);
-        let mut run = vec![first];
-        while iter.peek().is_some_and(|(next_control, operation)| {
-            *next_control == control
-                && operation
-                    .envelope
-                    .as_ref()
-                    .map(|envelope| envelope.max_wait_millis)
-                    == wait_millis
-        }) {
-            run.push(iter.next().expect("peeked operation exists").1);
+        let run_items = 1 + iter
+            .as_slice()
+            .iter()
+            .take_while(|item| key(item) == (control, wait_millis))
+            .count();
+        let mut run = Vec::with_capacity(run_items);
+        run.push(first);
+        for (_, operation) in iter.by_ref().take(run_items - 1) {
+            run.push(operation);
         }
         let deadline = Duration::from_millis(wait_millis.unwrap_or_default());
         let items = run.len();
@@ -1196,22 +1242,35 @@ impl AcceptedOperationReceipts {
     }
 
     fn prefix_ids(&self, count: usize) -> Vec<TaskOperationId> {
-        self.pending
-            .iter()
-            .take(count)
-            .map(|item| item.operation_id)
-            .collect()
+        assert!(
+            count <= self.pending.len(),
+            "prefix is part of the same accepted batch"
+        );
+        let mut ids = Vec::with_capacity(count);
+        for item in self.pending.iter().take(count) {
+            ids.push(item.operation_id);
+        }
+        ids
     }
 
     fn prefix_establishes(&self, count: usize) -> Vec<(TaskOperationId, QueryContextRef)> {
-        self.pending
+        assert!(
+            count <= self.pending.len(),
+            "prefix is part of the same accepted batch"
+        );
+        let selected = self
+            .pending
             .iter()
             .take(count)
-            .filter_map(|item| {
-                item.establish_context
-                    .map(|context| (item.operation_id, context))
-            })
-            .collect()
+            .filter(|item| item.establish_context.is_some())
+            .count();
+        let mut establishes = Vec::with_capacity(selected);
+        for item in self.pending.iter().take(count) {
+            if let Some(context) = item.establish_context {
+                establishes.push((item.operation_id, context));
+            }
+        }
+        establishes
     }
 
     fn front(&self) -> Option<SentOperation> {
@@ -3056,6 +3115,46 @@ mod tests {
     //! from the frontend's own generated stub, so batch framing, receipt
     //! attribution, status streaming, and the deployment JWT interceptor are
     //! exercised rather than mocked.
+
+    #[test]
+    fn original_dispatch_batch_drives_the_input_gate_before_dto_construction() {
+        use super::action_input::{NativeApplyInputPlan, known_input_layouts_for_composition};
+        use std::{alloc::Layout, num::NonZeroUsize};
+        let backend = BackendProcessId::new_v7();
+        let batch = released_batch(
+            backend,
+            vec![cancel_intent(1, backend), cancel_intent(2, backend)],
+        );
+        let plan =
+            NativeApplyInputPlan::from_operations(batch.operations(), TransportBudget::DEFAULT)
+                .unwrap();
+        assert_eq!(plan.items(), batch.operations().len());
+        let layouts = known_input_layouts_for_composition(
+            NonZeroUsize::new(plan.items()).unwrap(),
+            TransportBudget::DEFAULT,
+        )
+        .unwrap();
+        fn frame<F: Future<Output = ()>>(
+            _: fn(ApplySend, Vec<EncodedMethodBatch>, tokio::time::Instant) -> F,
+        ) -> Layout {
+            Layout::new::<F>()
+        }
+        assert_eq!(layouts.original.future, frame(apply_operations));
+        let too_many =
+            vec![cancel_intent(1, backend); TransportBudget::DEFAULT.max_batch_items() + 1];
+        assert!(
+            NativeApplyInputPlan::from_operations(&too_many, TransportBudget::DEFAULT).is_err()
+        );
+        assert!(NativeApplyInputPlan::from_operations(&[], TransportBudget::DEFAULT).is_err());
+        let error = encode_method_batches(
+            vec![
+                (false, proto::TaskOperation::default());
+                TransportBudget::DEFAULT.max_batch_items() + 1
+            ],
+            TransportBudget::DEFAULT,
+        );
+        assert!(error.is_err());
+    }
 
     use std::collections::VecDeque;
     use std::num::NonZeroUsize;
@@ -7463,3 +7562,7 @@ mod tests {
         assert_eq!(*acks[0].payload(), AckPayload::None);
     }
 }
+
+#[path = "task_transport/action_input.rs"]
+mod action_input;
+pub(crate) use action_input::{NativeApplyKnownInputLayouts, known_input_layouts_for_composition};

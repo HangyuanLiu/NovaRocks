@@ -31,7 +31,8 @@ mod task_manifest_binding;
 pub(crate) use task_manifest_binding::{
     BoundManifestBackend, BoundManifestContext, BoundManifestEdge, BoundManifestFrozenUnits,
     BoundManifestPartitionKind, BoundManifestProducer, BoundManifestScanAssignment,
-    BoundManifestScanWork, BoundManifestTask, FrozenAttemptTopology, TaskManifestBinding,
+    BoundManifestScanWork, BoundManifestTask, BoundWriterCohort, FrozenAttemptTopology,
+    TaskManifestBinding,
 };
 
 pub use native_submission::{

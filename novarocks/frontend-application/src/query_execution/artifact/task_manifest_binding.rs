@@ -405,6 +405,11 @@ impl std::fmt::Debug for TaskManifestBinding {
 }
 
 impl TaskManifestBinding {
+    #[cfg(test)]
+    pub(crate) fn original_writer_occurrences_for_test() -> Vec<BoundWriterCohort> {
+        tests::original_writer_occurrences()
+    }
+
     pub(super) const fn request_bound_native(&self) -> &RequestBoundNativeTemplate {
         &self.native_template
     }
@@ -2461,6 +2466,37 @@ mod tests {
         let error = derive_and_record_fragment_instance_id(&mut seen, || Ok(collision))
             .expect_err("a repeated derived identity must fail closed");
         assert!(error.message().contains("identity collision"));
+    }
+
+    pub(super) fn original_writer_occurrences() -> Vec<super::BoundWriterCohort> {
+        let (plan, fragments) =
+            crate::query_execution::package_writes::tests::frozen_write_fragments();
+        let seal = PlanSeal::Version(plan.version());
+        let execution = execution();
+        let mut tasks = Vec::new();
+        let mut ordinal = 1;
+        for fragment in plan.fragments().values() {
+            // Two placements deliberately share static facts but never Task identity.
+            for instance in 0..2 {
+                let (identity, context) = task(
+                    execution,
+                    fragment.id().get(),
+                    ordinal,
+                    BackendProcessId::new_v7(),
+                );
+                ordinal += 1;
+                tasks.push(super::BoundManifestTask {
+                    identity,
+                    context,
+                    fragment_id: fragment.id().get(),
+                    instance_index: instance,
+                    fragment_instance_id: UniqueId::new(1, ordinal as i64),
+                    scan_work: Box::default(),
+                });
+            }
+        }
+        let cohorts = super::bound_writer_cohorts(seal, &tasks, &fragments).collect::<Vec<_>>();
+        cohorts
     }
 
     #[test]

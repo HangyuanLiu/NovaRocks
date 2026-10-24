@@ -527,6 +527,38 @@ impl ConnectorMetadata for IcebergMetadata {
         result.map_err(unavailable)
     }
 
+    fn table_exists_async(
+        &self,
+        request: ConnectorTableRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<bool, ConnectorError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            self.validate_context(&request.context)?;
+            self.ensure_owner(&request.table.instance_id)?;
+            let (table, metadata_type) =
+                resolve_table_request(&request.table.table, request.resolution)?;
+            if metadata_type.is_some() {
+                let result = self
+                    .runtime
+                    .table_exists_for_request_async(
+                        &request.table.namespace,
+                        &table,
+                        &request.context,
+                    )
+                    .await;
+                self.validate_context(&request.context)?;
+                return result.map_err(unavailable);
+            }
+            let result = self
+                .runtime
+                .table_exists_for_request_async(&request.table.namespace, &table, &request.context)
+                .await;
+            self.validate_context(&request.context)?;
+            result.map_err(unavailable)
+        })
+    }
+
     fn list_tables(
         &self,
         request: ConnectorListTablesRequest,
@@ -573,6 +605,37 @@ impl ConnectorMetadata for IcebergMetadata {
             )
             .map_err(unavailable)?;
         read_reference_facts(loaded.table.metadata(), &request.context)
+    }
+
+    fn read_reference_facts_async(
+        &self,
+        request: ConnectorReadReferenceFactsRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorReadReferenceFacts, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            self.validate_context(&request.context)?;
+            self.ensure_owner(&request.table.instance_id)?;
+            // A new statement must resolve a named ref against current catalog
+            // metadata. Keep the request-local snapshot frozen after this load.
+            self.runtime
+                .control_state()
+                .invalidate_table(&request.table.namespace, &request.table.table);
+            let loaded = self
+                .runtime
+                .load_table_for_request_async(
+                    &request.table.namespace,
+                    &request.table.table,
+                    &request.context,
+                )
+                .await
+                .map_err(unavailable)?;
+            read_reference_facts(loaded.table.metadata(), &request.context)
+        })
     }
 
     fn capture_table_object_binding(

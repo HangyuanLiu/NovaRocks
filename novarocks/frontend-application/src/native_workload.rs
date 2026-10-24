@@ -228,6 +228,8 @@ impl FrontendNativeCapacityInputs {
             internal_metadata: result
                 .internal_cpu_metadata_geometry()
                 .map_err(|_| WorkError::ArithmeticOverflow)?,
+            progress_service: crate::application::workload_progress::progress_geometry()
+                .map_err(|_| WorkError::ArithmeticOverflow)?,
         })
     }
 }
@@ -246,6 +248,8 @@ pub(crate) struct FrontendNativeCapacitySources {
     pub(crate) internal_cpu: QueryBlockingExecutorConfig,
     pub(crate) internal_action: InternalCpuActionQuote,
     pub(crate) internal_metadata: InternalCpuMetadataGeometry,
+    pub(crate) progress_service:
+        crate::application::workload_progress::FrontendWorkloadProgressGeometry,
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NativeProcessCapacitySources {
@@ -478,3 +482,8 @@ mod tests {
         assert_eq!(mixed_required.global.get(R::InternalCpuJobs), 1);
     }
 }
+
+mod installation;
+pub use installation::FrontendWorkloadCapacityProfile;
+#[cfg(test)]
+pub(crate) use installation::{original_owner_test_profile, original_owner_test_workload};

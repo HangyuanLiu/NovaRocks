@@ -114,6 +114,16 @@ impl ViewEngine for SessionViewEngine {
         unreachable!("session view must not resolve external views")
     }
 
+    fn resolve_external_view_async<'a>(
+        &'a self,
+        target: &'a ViewTarget,
+        context: &'a novarocks_spi::connector::ConnectorRequestContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ExternalViewResolution, String>> + Send + 'a>,
+    > {
+        Box::pin(async move { self.resolve_external_view(target, context) })
+    }
+
     fn create_external_view(
         &self,
         _request: CreateExternalViewRequest,
@@ -223,6 +233,7 @@ async fn fe_without_state_store_fails_before_durable_services_open() {
 async fn failed_original_subscription_reaper_cannot_strand_the_host_workload_drain() {
     use novarocks_workload_control::{WorkClass, WorkRequest};
     let mut host = open_host(Some(state_store_input())).await.unwrap();
+    host.install_statement_control_for_test();
     host.mark_ready().unwrap();
     let root = host
         .execution_runtime_owner

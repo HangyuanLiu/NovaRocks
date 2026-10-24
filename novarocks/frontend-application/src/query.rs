@@ -115,6 +115,10 @@ use novarocks_workload_control::{
 use novarocks_workload_control::{WorkError, WorkOwner};
 
 pub(crate) mod compiler;
+mod explain_action;
+pub(crate) use explain_action::{
+    ExplainStatementGeometry, statement_action_geometry as explain_statement_geometry,
+};
 
 const DEFAULT_CATALOG: &str = "default_catalog";
 
@@ -1043,40 +1047,6 @@ where
     }
 }
 
-/// Keep EXPLAIN dispatch and its result alias on the bounded blocking executor.
-/// The profile coordinator waits synchronously for native task progress, so the
-/// data runtime must remain free to poll admission and observation RPCs.
-async fn execute_prepared_explain_statement<P, Execute>(
-    executor: QueryBlockingExecutor,
-    cancellation: QueryCancellationView,
-    execution_owner: WorkOwner,
-    result_window: Option<ResultWindowAlias>,
-    prepared: Result<P, RoutedExecutionError>,
-    execute: Execute,
-) -> Result<(Result<StatementResult, RoutedExecutionError>, WorkOwner), String>
-where
-    P: Send + 'static,
-    Execute: FnOnce(P) -> Result<StatementResult, RoutedExecutionError> + Send + 'static,
-{
-    match prepared {
-        Ok(prepared) => executor
-            .execute(move || {
-                let result = if cancellation.is_cancelled() {
-                    Err(RoutedExecutionError::Engine(
-                        "typed statement was cancelled before prepared query execution began"
-                            .to_owned(),
-                    ))
-                } else {
-                    execute(prepared)
-                };
-                (result, execution_owner, result_window)
-            })
-            .await
-            .map(|(result, owner, _window)| (result, owner)),
-        Err(error) => Ok((Err(error), execution_owner)),
-    }
-}
-
 async fn execute_product_statement(
     router: ProductCommandRouter,
     command: ProductSqlCommand,
@@ -1277,6 +1247,7 @@ impl QuerySessionFactory for FrontendQueryService {
             service: self.clone(),
             lease: Mutex::new(Some(lease)),
             state: Mutex::new(SessionSqlState::default()),
+            explain_ready: explain_action::ExplainReadyReceiver::default(),
             principal: Arc::from(request.principal()),
         }))
     }
@@ -1302,6 +1273,7 @@ struct FrontendQuerySession {
     service: FrontendQueryService,
     lease: Mutex<Option<QuerySessionLease>>,
     state: Mutex<SessionSqlState>,
+    explain_ready: explain_action::ExplainReadyReceiver,
     /// Who the server authenticated on this connection. A command that records
     /// what someone did takes this, never an argument that claims an identity.
     principal: Arc<str>,
@@ -2112,15 +2084,6 @@ impl FrontendQuerySession {
         let timeout_ms = timeout_duration.map(timeout_message_millis);
         let token = self.token()?;
         let work_class = typed_statement_work_class(&parsed_statement);
-        let preparation_purpose = match &parsed_statement {
-            ParsedStatement::ExplainQuery(explain)
-                if explain.format == ast::ExplainFormat::Analyze =>
-            {
-                Some(FrontendQueryPurpose::ProfileCountOnly)
-            }
-            ParsedStatement::ExplainQuery(_) => Some(FrontendQueryPurpose::LocalRows),
-            _ => None,
-        };
         let window_class = typed_statement_result_window_class(&parsed_statement);
         let mut statement = if work_class == WorkClass::Query {
             self.service
@@ -2168,6 +2131,22 @@ impl FrontendQuerySession {
             &parsed_statement,
             state.sql_semantics(),
         )?;
+        let parsed_statement = match parsed_statement {
+            ParsedStatement::ExplainQuery(explain) => {
+                return self
+                    .execute_observed_explain(
+                        sql,
+                        explain,
+                        state,
+                        deadline,
+                        statement,
+                        #[cfg(novarocks_dev_controls)]
+                        observation,
+                    )
+                    .await;
+            }
+            other => other,
+        };
         let cancellation = QueryCancellationView::governed(
             statement.cancellation().clone(),
             statement.timeout_ms(),
@@ -2233,10 +2212,8 @@ impl FrontendQuerySession {
             optimizer_settings,
             sql_semantics.clone(),
         ));
-        let compiler = self.service.query_compiler.clone();
         let command_executor = Arc::clone(&self.service.command_executor);
         let product_command_router = self.service.product_command_router.clone();
-        let query_execution = self.service.query_execution.clone();
         let dml = Arc::clone(&self.service.dml);
         let insert_engine = Arc::clone(&self.service.insert_engine);
         let delete_engine = Arc::clone(&self.service.delete_engine);
@@ -2334,49 +2311,12 @@ impl FrontendQuerySession {
         let execution_owner = statement
             .take_execution_owner()
             .expect("governed typed statement transfers its execution owner exactly once");
-        let preparation_scope = statement.scope().clone();
         let worker_cancellation = cancellation.clone();
         let synchronous_command_executor = self.service.query_blocking_executor.clone();
-        let query_cpu_executor = self.service.query_cpu_executor.clone();
         let mut worker: Pin<Box<dyn Future<Output = _> + Send>> = match parsed_statement {
-            statement @ ParsedStatement::ExplainQuery(_) => Box::pin(async move {
-                let execution_cancellation = worker_cancellation.clone();
-                let (prepared, execution_owner, producer_window) = query_cpu_executor
-                    .run(move || {
-                        let result = if worker_cancellation.is_cancelled() {
-                            Err(RoutedExecutionError::Engine(
-                                "typed statement was cancelled before query compilation began"
-                                    .to_owned(),
-                            ))
-                        } else {
-                            compiler
-                                .prepare_statement(
-                                    &statement,
-                                    preparation_purpose
-                                        .expect("EXPLAIN has an admitted preparation purpose"),
-                                    &context,
-                                    Some(query_options),
-                                    &preparation_scope,
-                                    #[cfg(novarocks_dev_controls)]
-                                    None,
-                                )
-                                .map_err(|error| routed_compiler_failure(error, &sql))
-                        };
-                        // The result receipt retains the alias even when its
-                        // awaiting session disappears before CPU work exits.
-                        (result, execution_owner, producer_window)
-                    })
-                    .await?;
-                execute_prepared_explain_statement(
-                    synchronous_command_executor,
-                    execution_cancellation,
-                    execution_owner,
-                    producer_window,
-                    prepared,
-                    move |operation| execute_prepared_query(operation, &query_execution),
-                )
-                .await
-            }),
+            ParsedStatement::ExplainQuery(_) => {
+                unreachable!("EXPLAIN was transferred to its original statement source")
+            }
             ParsedStatement::Dml(novarocks_parser::ast::DmlStatement::Delete(statement)) => {
                 let prepare_dml = Arc::clone(&dml);
                 let execute_dml = dml;
@@ -2890,21 +2830,6 @@ fn with_query_hints(
         raw.query_mem_limit = limit;
     }
     QueryOptions::from_proto(raw)
-}
-
-fn execute_prepared_query(
-    operation: PreparedQueryOperation,
-    query_execution: &QueryExecutionService,
-) -> Result<StatementResult, RoutedExecutionError> {
-    match operation {
-        PreparedQueryOperation::Immediate(operation) => Ok(operation.into_result()),
-        PreparedQueryOperation::LogicalRead(_) => Err(RoutedExecutionError::Engine(
-            "logical read requires the governed Query Application launcher".to_string(),
-        )),
-        PreparedQueryOperation::Distributed(operation) => query_execution
-            .execute_prepared(operation)
-            .map_err(routed_distributed_query_failure),
-    }
 }
 
 #[async_trait]
@@ -4737,7 +4662,7 @@ mod tests {
         (workload, root, cancellation)
     }
 
-    async fn assert_abandoned_synchronous_window(for_explain: bool) {
+    async fn assert_abandoned_synchronous_window() {
         use novarocks_query_application::cpu::{
             QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
         };
@@ -4756,29 +4681,14 @@ mod tests {
             .configure_result_capacity(ResultCapacityConfig::V1)
             .unwrap();
         workload.mark_ready().unwrap();
-        let (owner, business, query_permit, window) = if for_explain {
-            let root = workload
-                .root_admission()
-                .begin_query_root(WorkRequest::new(WorkClass::Query))
-                .unwrap();
-            let (permit, window) = root
-                .owner
-                .scope()
-                .admit_query_with_result(ResultWindowClass::Local)
-                .unwrap()
-                .await
-                .unwrap();
-            (root.owner, None, Some(permit), window)
-        } else {
-            let (root, window) = workload
-                .root_admission()
-                .try_begin_root_with_result(
-                    WorkRequest::new(WorkClass::Management),
-                    ResultWindowClass::Local,
-                )
-                .unwrap();
-            (root.owner, Some(root.business), None, window)
-        };
+        let (root, window) = workload
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Local,
+            )
+            .unwrap();
+        let (owner, business) = (root.owner, Some(root.business));
         let cancellation =
             QueryCancellationView::governed(owner.scope().cancellation().unwrap(), None);
         let mut blocking = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
@@ -4801,21 +4711,9 @@ mod tests {
                 assert!(*open, "test worker gate timed out");
                 Ok(StatementResult::Ok)
             };
-            if for_explain {
-                execute_prepared_explain_statement(
-                    executor,
-                    cancellation,
-                    owner,
-                    Some(alias),
-                    Ok(()),
-                    move |()| produce(),
-                )
+            execute_synchronous_stage(executor, cancellation, owner, Some(alias), produce)
                 .await
-            } else {
-                execute_synchronous_stage(executor, cancellation, owner, Some(alias), produce)
-                    .await
-                    .map(|(result, owner, _window)| (result, owner))
-            }
+                .map(|(result, owner, _window)| (result, owner))
         });
         tokio::time::timeout(Duration::from_secs(2), running)
             .await
@@ -4824,7 +4722,6 @@ mod tests {
         if let Some(business) = business {
             business.release();
         }
-        drop(query_permit);
         drop(window);
         caller.abort();
         assert!(matches!(caller.await, Err(error) if error.is_cancelled()));
@@ -4841,12 +4738,7 @@ mod tests {
 
     #[tokio::test]
     async fn abandoned_synchronous_command_retains_its_window_until_actual_worker_exit() {
-        assert_abandoned_synchronous_window(false).await;
-    }
-
-    #[tokio::test]
-    async fn abandoned_explain_dispatch_retains_local_window_until_actual_worker_exit() {
-        assert_abandoned_synchronous_window(true).await;
+        assert_abandoned_synchronous_window().await;
     }
 
     async fn assert_cancelled_preparation_window_until_worker_exit(class: ResultWindowClass) {
@@ -4943,103 +4835,6 @@ mod tests {
     #[tokio::test]
     async fn cancelled_local_read_preparation_keeps_local_window_until_worker_exit() {
         assert_cancelled_preparation_window_until_worker_exit(ResultWindowClass::Local).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn prepared_explain_wait_leaves_native_runtime_free_to_poll_first_send() {
-        use novarocks_query_application::cpu::{
-            QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
-        };
-        let mut blocking = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
-            std::num::NonZeroUsize::new(1).unwrap(),
-            std::num::NonZeroUsize::new(2).unwrap(),
-        ))
-        .expect("open bounded profile execution edge");
-        let executor = blocking.executor();
-        let runtime = tokio::runtime::Handle::current();
-        let (_workload, root, cancellation) = test_governed_cancellation();
-        let business = root.business;
-        let returned = tokio::spawn(async move {
-            execute_prepared_explain_statement(
-                executor,
-                cancellation,
-                root.owner,
-                None,
-                Ok(()),
-                move |()| {
-                    let signal = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-                    let delivered = Arc::clone(&signal);
-                    // A single asynchronous send is sufficient. On a scheduler
-                    // worker it can stay in that worker's unstealable LIFO slot.
-                    runtime.spawn(async move {
-                        let (ready, changed) = &*delivered;
-                        *ready.lock().unwrap() = true;
-                        changed.notify_all();
-                    });
-                    let (ready, changed) = &*signal;
-                    let (ready, _) = changed
-                        .wait_timeout_while(
-                            ready.lock().unwrap(),
-                            Duration::from_secs(2),
-                            |ready| !*ready,
-                        )
-                        .unwrap();
-                    if !*ready {
-                        return Err(RoutedExecutionError::Engine(
-                            "the profile wait prevented its first native send from being polled"
-                                .to_owned(),
-                        ));
-                    }
-                    Ok(StatementResult::Ok)
-                },
-            )
-            .await
-        })
-        .await
-        .expect("profile execution caller joins")
-        .expect("profile edge returns its execution owner");
-        let (result, execution_owner) = returned;
-        assert!(matches!(result, Ok(StatementResult::Ok)));
-        execution_owner.complete();
-        business.release();
-        blocking
-            .shutdown_until(Instant::now() + Duration::from_secs(2))
-            .await
-            .expect("join profile execution worker");
-    }
-
-    #[tokio::test]
-    async fn prepared_explain_checks_cancellation_before_dispatch() {
-        use novarocks_query_application::cpu::{
-            QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
-        };
-        let mut blocking = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
-            std::num::NonZeroUsize::new(1).unwrap(),
-            std::num::NonZeroUsize::new(1).unwrap(),
-        ))
-        .expect("open profile execution edge");
-        let (_workload, root, cancellation) = test_governed_cancellation();
-        root.owner.cancel(WorkCancellationReason::ExplicitKill {
-            requester_connection_id: 91,
-        });
-        let (result, execution_owner) = execute_prepared_explain_statement(
-            blocking.executor(),
-            cancellation,
-            root.owner,
-            None,
-            Ok(()),
-            |()| panic!("cancelled profile must not dispatch prepared execution"),
-        )
-        .await
-        .expect("cancelled profile returns its execution owner");
-        assert!(matches!(result, Err(RoutedExecutionError::Engine(message))
-            if message == "typed statement was cancelled before prepared query execution began"));
-        execution_owner.complete();
-        root.business.release();
-        blocking
-            .shutdown_until(Instant::now() + Duration::from_secs(2))
-            .await
-            .expect("join profile execution worker");
     }
 
     #[tokio::test]

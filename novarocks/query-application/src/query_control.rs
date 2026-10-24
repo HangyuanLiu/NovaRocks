@@ -2441,4 +2441,226 @@ mod tests {
         assert_eq!(workload.snapshot().root_responsibilities, 0);
         assert_eq!(workload.snapshot().businesses, 0);
     }
+    struct OriginalLocalExplainGate {
+        gate: futures::channel::oneshot::Receiver<()>,
+        dropped: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl crate::session_control::GovernedStatementAction for OriginalLocalExplainGate {
+        fn poll_action(
+            &mut self,
+            owner: &mut crate::session_control::GovernedQueryStatementOwner,
+            cx: &mut Context<'_>,
+        ) -> Poll<
+            Result<
+                crate::session_control::StatementActionValue,
+                crate::session_error::QueryServiceError,
+            >,
+        > {
+            if std::pin::Pin::new(&mut self.gate).poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            let window = owner.result_window_alias().expect("same Local window");
+            let value = crate::api::LocalResultProducer::try_new(owner.scope(), window)
+                .and_then(|producer| {
+                    producer.produce(|| {
+                        crate::api::build_string_query_result(
+                            "Explain String",
+                            vec!["ready".into()],
+                        )
+                    })
+                })
+                .map(crate::session_control::StatementActionValue::Local)
+                .map_err(|error| {
+                    crate::session_error::QueryServiceError::new(
+                        crate::session_error::QueryServiceErrorKind::Internal,
+                        error,
+                    )
+                });
+            Poll::Ready(value)
+        }
+    }
+    impl Drop for OriginalLocalExplainGate {
+        fn drop(&mut self) {
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    async fn original_local_statement(
+        control: &Arc<QueryApplicationControl>,
+        service: &QueryControlService,
+        workload: &WorkloadControl,
+        id: u32,
+    ) -> crate::session_control::GovernedQueryStatementOwner {
+        let session = register(control, id, 1, "root");
+        service
+            .begin_queued_governed_query_statement_with_result(
+                session,
+                &workload.root_admission(),
+                None,
+                None,
+                None,
+                novarocks_workload_control::ResultWindowClass::Local,
+            )
+            .await
+            .unwrap()
+    }
+    fn local_workload() -> (
+        WorkloadControl,
+        novarocks_workload_control::ResultCapacityHandle,
+    ) {
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
+            },
+        )
+        .unwrap();
+        let capacity = workload
+            .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+            .unwrap();
+        workload.mark_ready().unwrap();
+        (workload, capacity)
+    }
+    #[tokio::test]
+    async fn abandoned_explain_dispatch_retains_local_window_until_actual_action_exit() {
+        let control = Arc::new(QueryApplicationControl::default());
+        let service = QueryControlService::new(control.clone());
+        let (workload, capacity) = local_workload();
+        let slot = crate::session_control::StatementProgressSlot::empty();
+        slot.install(service.clone()).unwrap();
+        let mut owner = Some(original_local_statement(&control, &service, &workload, 7).await);
+        let (release, gate) = futures::channel::oneshot::channel();
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut action: Option<Box<dyn crate::session_control::GovernedStatementAction>> =
+            Some(Box::new(OriginalLocalExplainGate {
+                gate,
+                dropped: Arc::clone(&dropped),
+            }));
+        let mut wait = None;
+        service
+            .publish_statement_action_in(&mut owner, &mut action, &mut wait)
+            .unwrap()
+            .finish()
+            .unwrap();
+        drive_original_statement_actions(&slot);
+        drop(wait.take());
+        drive_original_statement_actions(&slot);
+        assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 0);
+        release.send(()).unwrap();
+        drive_original_statement_actions(&slot);
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
+    }
+    #[tokio::test]
+    async fn local_ready_is_stable_before_tail_panic_and_protocol_transfer_is_pure() {
+        use crate::session_control::{StatementActionReady, StatementActionValue};
+        let control = Arc::new(QueryApplicationControl::default());
+        let service = QueryControlService::new(control.clone());
+        let (workload, capacity) = local_workload();
+        let slot = crate::session_control::StatementProgressSlot::empty();
+        slot.install(service.clone()).unwrap();
+        let mut owner = Some(original_local_statement(&control, &service, &workload, 7).await);
+        let token = owner.as_ref().unwrap().token();
+        let (release, gate) = futures::channel::oneshot::channel();
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut action: Option<Box<dyn crate::session_control::GovernedStatementAction>> =
+            Some(Box::new(OriginalLocalExplainGate { gate, dropped }));
+        let mut wait = None;
+        service
+            .publish_statement_action_in(&mut owner, &mut action, &mut wait)
+            .unwrap()
+            .finish()
+            .unwrap();
+        release.send(()).unwrap();
+        drive_original_statement_actions(&slot);
+        let receipt = wait.take().unwrap().await.unwrap();
+        let receiver = Arc::new(Mutex::new(None::<StatementActionReady>));
+        struct PanicReceiverWake(Arc<Mutex<Option<StatementActionReady>>>);
+        impl std::task::Wake for PanicReceiverWake {
+            fn wake(self: Arc<Self>) {
+                assert!(
+                    self.0.try_lock().is_ok(),
+                    "receiver notification is outside its lock"
+                );
+                std::panic::panic_any(17u32);
+            }
+        }
+        let waker = std::task::Waker::from(Arc::new(PanicReceiverWake(Arc::clone(&receiver))));
+        let mut cx = Context::from_waker(&waker);
+        let mut cursor = crate::session_control::StatementProgressCursor::default();
+        let _ = slot.poll_turn(
+            &mut cursor,
+            std::num::NonZeroUsize::new(7).unwrap(),
+            &mut cx,
+        );
+        let tail = {
+            let mut target = receiver.lock().unwrap();
+            receipt
+                .take_ready_in(&mut target)
+                .unwrap_or_else(|_| panic!("same empty receiver"))
+        };
+        let cause = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tail.finish()));
+        assert!(matches!(cause,Err(ref payload) if payload.downcast_ref::<u32>()==Some(&17)));
+        assert_eq!(
+            receiver.lock().unwrap().as_ref().unwrap().owner.token(),
+            token
+        );
+        assert!(matches!(
+            receiver.lock().unwrap().as_ref().unwrap().result,
+            Ok(StatementActionValue::Local(_))
+        ));
+        assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+        let mut output = None;
+        {
+            let mut source = receiver.lock().unwrap();
+            StatementActionReady::transfer_protocol_in(&mut source, &mut output).unwrap();
+        }
+        let crate::protocol_delivery::QuerySessionOutput::GovernedQuery(result) = output.unwrap()
+        else {
+            panic!("same Local graph")
+        };
+        let (local, mut protocol) = result.into_parts();
+        assert_eq!(local.row_count(), 1);
+        drop(local);
+        assert_eq!(
+            protocol.complete(),
+            GovernedStatementFinishOutcome::Completed
+        );
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+    #[tokio::test]
+    async fn local_protocol_refusal_preserves_foreign_graph_and_original_owner() {
+        use crate::session_control::{StatementActionReady, StatementActionValue};
+        let control = Arc::new(QueryApplicationControl::default());
+        let service = QueryControlService::new(control.clone());
+        let (workload, capacity) = local_workload();
+        let owner = original_local_statement(&control, &service, &workload, 7).await;
+        let foreign = original_local_statement(&control, &service, &workload, 8).await;
+        let local = crate::api::LocalResultProducer::try_new(
+            foreign.scope(),
+            foreign.result_window_alias().unwrap(),
+        )
+        .unwrap()
+        .produce(|| crate::api::build_string_query_result("Explain String", vec!["foreign".into()]))
+        .unwrap();
+        let token = owner.token();
+        let mut source = Some(StatementActionReady {
+            result: Ok(StatementActionValue::Local(local)),
+            owner,
+        });
+        let mut target = None;
+        assert!(StatementActionReady::transfer_protocol_in(&mut source, &mut target).is_err());
+        assert!(target.is_none());
+        assert_eq!(capacity.snapshot().held_positions, [0, 2, 0, 0]);
+        assert_eq!(source.as_ref().unwrap().owner.token(), token);
+        let ready = source.take().unwrap();
+        drop(ready.result);
+        ready.owner.finish();
+        foreign.finish();
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
 }

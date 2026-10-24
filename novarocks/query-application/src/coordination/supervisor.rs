@@ -440,6 +440,12 @@ impl Drop for LogicalExecutionSupervisor {
 }
 
 impl LogicalExecutionSupervisor {
+    /// Observe the original service task without joining or consuming its
+    /// retained outcome. Role readiness must reject an already exited root.
+    pub fn service_has_exited(&self) -> bool {
+        self.join.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
     /// Borrows the original source's same cause; no absence or root task
     /// completion is projected as action exit.
     pub fn statement_action_failure(

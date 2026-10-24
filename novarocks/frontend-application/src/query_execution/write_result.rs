@@ -74,6 +74,10 @@ pub(crate) type RootWriteResultParts = (
     Vec<(WriteTargetOrdinal, Vec<u8>)>,
     Vec<WriteStatisticsArtifact>,
     Option<InternalResultRetention>,
+    Option<(
+        novarocks_types::QueryExecutionId,
+        novarocks_query_application::api::PlanSeal,
+    )>,
 );
 
 /// Source-preserving rejection from the original write decoder.
@@ -198,6 +202,10 @@ pub(crate) struct DecodedPreparedWriteSet {
     fragments: Vec<(WriteTargetOrdinal, Vec<u8>)>,
     statistics: Vec<WriteStatisticsArtifact>,
     retention: Option<InternalResultRetention>,
+    production_execution: Option<(
+        novarocks_types::QueryExecutionId,
+        novarocks_query_application::api::PlanSeal,
+    )>,
 }
 
 impl DecodedPreparedWriteSet {
@@ -214,6 +222,7 @@ impl DecodedPreparedWriteSet {
             fragments,
             statistics: Vec::new(),
             retention: None,
+            production_execution: None,
         }
     }
 
@@ -228,6 +237,7 @@ impl DecodedPreparedWriteSet {
             fragments,
             statistics,
             retention: None,
+            production_execution: None,
         }
     }
 
@@ -254,6 +264,7 @@ impl DecodedPreparedWriteSet {
             self.fragments,
             self.statistics,
             self.retention,
+            self.production_execution,
         )
     }
 }
@@ -351,6 +362,10 @@ pub(crate) struct RootWriteResultDecoder {
     property_bytes: usize,
     root_eof: bool,
     retention: Option<InternalResultRetention>,
+    production_execution: Option<(
+        novarocks_types::QueryExecutionId,
+        novarocks_query_application::api::PlanSeal,
+    )>,
 }
 
 impl RootWriteResultDecoder {
@@ -371,6 +386,7 @@ impl RootWriteResultDecoder {
             property_bytes: 0,
             root_eof: false,
             retention: None,
+            production_execution: None,
         }
     }
 
@@ -382,6 +398,15 @@ impl RootWriteResultDecoder {
         let mut decoder = Self::new(contract);
         decoder.retention = Some(retention);
         Ok(decoder)
+    }
+
+    /// Original attempt identity only; it grants no capacity or completeness.
+    pub(crate) fn bind_production_execution(
+        &mut self,
+        execution: novarocks_types::QueryExecutionId,
+        plan: novarocks_query_application::api::PlanSeal,
+    ) {
+        self.production_execution = Some((execution, plan));
     }
 
     #[cfg(test)]
@@ -745,6 +770,7 @@ impl RootWriteResultDecoder {
             fragments: self.fragments,
             statistics: self.statistics.into_values().collect(),
             retention: self.retention,
+            production_execution: self.production_execution,
         })
     }
 }

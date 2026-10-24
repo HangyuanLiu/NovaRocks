@@ -353,6 +353,16 @@ pub struct GovernedImmediateStatementResult {
 }
 
 impl GovernedImmediateStatementResult {
+    pub(crate) fn from_verified_owned_local(
+        result: OwnedLocalResult,
+        statement: GovernedQueryStatementOwner,
+    ) -> Self {
+        Self {
+            result,
+            protocol: GovernedProtocolOwner::new(statement),
+        }
+    }
+
     /// Transfer a freshly produced, closed Local graph while the admitted
     /// statement still retains the exact producer window. The application
     /// source audit, not the graph's runtime shape, establishes exclusivity.

@@ -1661,6 +1661,22 @@ pub trait ConnectorMetadata: Send + Sync {
 
     fn table_exists(&self, request: ConnectorTableRequest) -> Result<bool, ConnectorError>;
 
+    /// Await the provider's original existence probe without a joining bridge.
+    fn table_exists_async(
+        &self,
+        request: ConnectorTableRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<bool, ConnectorError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            let _ = request;
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata does not support asynchronous table existence",
+            ))
+        })
+    }
+
     fn list_tables(
         &self,
         request: ConnectorListTablesRequest,
@@ -1674,6 +1690,26 @@ pub trait ConnectorMetadata: Send + Sync {
             super::ConnectorErrorKind::Unsupported,
             "connector metadata does not support read reference facts",
         ))
+    }
+
+    /// Observe the same frozen reference facts before synchronous SQL projection.
+    fn read_reference_facts_async(
+        &self,
+        request: ConnectorReadReferenceFactsRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorReadReferenceFacts, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let _ = request;
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata does not support asynchronous read reference facts",
+            ))
+        })
     }
 
     /// Capture a current metadata binding and its provider-owned physical object

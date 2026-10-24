@@ -60,6 +60,9 @@ pub(crate) struct ProfileDiagnosticSnapshot {
     pub(crate) ready: ComputationReadyToken,
     pub(crate) closure: ProfileDiagnosticClosure,
     pub(crate) tasks: Box<[(TaskIdentity, ProfileTaskDiagnostic)]>,
+    /// Actual graph attribution, in the same original expected Task order.
+    /// Stage IDs are not fragment IDs and must never be reinterpreted as one.
+    pub(crate) fragments: Box<[(TaskIdentity, crate::query_execution::artifact::FragmentId)]>,
 }
 
 impl ProfileDiagnosticSnapshot {
@@ -282,6 +285,12 @@ impl TaskFinalInfoCollector {
                 ready,
                 closure,
                 tasks,
+                fragments: round
+                    .execution()
+                    .graph()
+                    .tasks()
+                    .map(|task| (task.identity(), task.fragment_id()))
+                    .collect(),
             })));
     }
     pub(crate) fn stop_starting(&mut self) {

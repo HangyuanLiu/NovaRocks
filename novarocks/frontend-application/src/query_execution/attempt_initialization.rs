@@ -43,12 +43,12 @@ use crate::query_execution::lifecycle_plan::{
 };
 use crate::query_execution::split_assignment_round::{
     OpenRoundSplitSources, OpenedRoundSplitSource, RoundSplitAssignmentPlan,
-    RoundSplitSourceRecipe, assignment_targets, open_round_split_source,
+    RoundSplitSourceRecipe, assignment_targets,
 };
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::task_execution::blocking_io::{
-    ConnectorBlockingIoError, ConnectorBlockingIoJob, ConnectorBlockingIoJoinPin,
-    ConnectorBlockingIoResponsibility, ConnectorBlockingIoSupervisor,
+    ConnectorBlockingIoAdmission, ConnectorBlockingIoError, ConnectorBlockingIoResponsibility,
+    ConnectorBlockingIoSupervisor, ConnectorOperationJob as ConnectorBlockingIoJob,
 };
 use crate::task_protocol_config::TaskUpdateRetryPolicy;
 use novarocks_query_application::api::StatementNativeHealthFailure;
@@ -198,6 +198,7 @@ trait SerialAttemptInitialization: Send + Sized + 'static {
     type Ready: Send + 'static;
     type Recipe: Send + 'static;
     type Opened: Send + 'static;
+    type Opening: Send + 'static;
 
     fn execution_id(&self) -> QueryExecutionId;
 
@@ -205,13 +206,20 @@ trait SerialAttemptInitialization: Send + Sized + 'static {
         &mut self,
     ) -> Result<Option<AttemptSourceRecipe<Self::Recipe>>, DistributedQueryError>;
 
-    fn source_join_pin(
-        recipe: &AttemptSourceRecipe<Self::Recipe>,
-    ) -> Option<ConnectorBlockingIoJoinPin>;
-
-    fn open_source(
+    fn begin_open(
         recipe: AttemptSourceRecipe<Self::Recipe>,
-    ) -> Result<OpenedAttemptSource<Self::Opened>, DistributedQueryError>;
+        supervisor: &ConnectorBlockingIoSupervisor,
+    ) -> Self::Opening;
+    fn poll_open_in(
+        opening: &mut Self::Opening,
+        cx: &mut std::task::Context<'_>,
+        outcome: &mut Option<
+            Result<
+                Result<OpenedAttemptSource<Self::Opened>, DistributedQueryError>,
+                ConnectorBlockingIoError,
+            >,
+        >,
+    ) -> std::task::Poll<()>;
 
     fn accept_opened(&mut self, opened: Self::Opened) -> Result<(), DistributedQueryError>;
 
@@ -291,9 +299,7 @@ struct InitializationProgress<S: SerialAttemptInitialization> {
     supervisor: ConnectorBlockingIoSupervisor,
     lifecycle: AttemptInitializationLifecycle,
     expected: Option<AttemptSourceIdentity>,
-    job: Option<
-        ConnectorBlockingIoJob<Result<OpenedAttemptSource<S::Opened>, DistributedQueryError>>,
-    >,
+    opening: Option<S::Opening>,
     outcome: Option<
         Result<
             Result<OpenedAttemptSource<S::Opened>, DistributedQueryError>,
@@ -319,7 +325,7 @@ impl<S: SerialAttemptInitialization> InitializationProgress<S> {
             supervisor,
             lifecycle,
             expected: None,
-            job: None,
+            opening: None,
             outcome: None,
             close_job: None,
             close_outcome: None,
@@ -350,7 +356,7 @@ impl<S: SerialAttemptInitialization> InitializationProgress<S> {
             if self.ready.is_some() {
                 return Ok(());
             }
-            if self.job.is_none() {
+            if self.opening.is_none() {
                 let Some(recipe) = self.state.next_source_recipe()? else {
                     return self.state.finish_in(&mut self.ready);
                 };
@@ -360,15 +366,11 @@ impl<S: SerialAttemptInitialization> InitializationProgress<S> {
                         "attempt initializer produced a source recipe for another execution",
                     ));
                 }
-                let pins = S::source_join_pin(&recipe).into_iter().collect();
-                self.job = Some(
-                    self.supervisor
-                        .spawn_pinned(pins, move || S::open_source(recipe)),
-                );
+                self.opening = Some(S::begin_open(recipe, &self.supervisor));
             }
             if self.outcome.is_none() {
                 tokio::select! {
-                    () = self.job.as_ref().unwrap().finish_in(&mut self.outcome) => {}
+                    () = std::future::poll_fn(|cx|S::poll_open_in(self.opening.as_mut().unwrap(),cx,&mut self.outcome)) => {}
                     _ = self.lifecycle.cancellation.cancelled() => {
                         return Err(failed("query cancelled while opening an attempt split source"));
                     }
@@ -397,7 +399,7 @@ impl<S: SerialAttemptInitialization> InitializationProgress<S> {
             // Production acceptance is a pure transfer into the original
             // pre-reserved source Vec. It invokes no provider callback.
             self.state.accept_opened(opened.opened)?;
-            self.job = None;
+            self.opening = None;
             self.expected = None;
         }
     }
@@ -408,9 +410,9 @@ impl<S: SerialAttemptInitialization> InitializationProgress<S> {
         self.closing = true;
         // Close already accepted sources before waiting for a late provider.
         self.close_accepted().await?;
-        if let Some(job) = &self.job {
+        if let Some(opening) = &mut self.opening {
             if self.outcome.is_none() {
-                job.finish_in(&mut self.outcome).await;
+                std::future::poll_fn(|cx| S::poll_open_in(opening, cx, &mut self.outcome)).await;
             }
         }
         if let Some(Err(error)) = &self.outcome {
@@ -433,7 +435,7 @@ impl<S: SerialAttemptInitialization> InitializationProgress<S> {
             Some(Err(_)) => unreachable!("failed worker stays in its original outcome"),
             None => {}
         }
-        self.job = None;
+        self.opening = None;
         self.expected = None;
         self.close_accepted().await
     }
@@ -442,7 +444,7 @@ impl<S: SerialAttemptInitialization> InitializationProgress<S> {
         if self.close_job.is_none() {
             self.state.close_in(&mut self.close_job);
         }
-        if let Some(job) = &self.close_job {
+        if let Some(job) = &mut self.close_job {
             if self.close_outcome.is_none() {
                 job.finish_in(&mut self.close_outcome).await;
             }
@@ -494,17 +496,180 @@ struct ProductionInitializationState {
 }
 
 struct ProductionSourceRecipe {
-    responsibility: ConnectorBlockingIoResponsibility,
+    admission: ConnectorBlockingIoAdmission,
     source: RoundSplitSourceRecipe,
     session: novarocks_spi::connector::read_stack::ConnectorSession,
     connector_context: ConnectorRequestContext,
-    blocking_io: ConnectorBlockingIoSupervisor,
+}
+
+struct ProductionSourceOpening {
+    recipe: Option<AttemptSourceRecipe<ProductionSourceRecipe>>,
+    responsibility: Option<ConnectorBlockingIoResponsibility>,
+    access_future: Option<novarocks_spi::connector::ConnectorReadAttemptCapabilitiesFuture>,
+    access_result:
+        Option<Result<novarocks_spi::connector::ConnectorReadAttemptCapabilities, ConnectorError>>,
+    capabilities: Option<novarocks_spi::connector::ConnectorReadAttemptCapabilities>,
+    open_future: Option<novarocks_spi::connector::read_stack::ConnectorReadSplitOpenFuture>,
+    open_result: Option<
+        Result<
+            Box<dyn novarocks_spi::connector::read_stack::ConnectorReadSplitSource>,
+            ConnectorError,
+        >,
+    >,
+    poisoned: bool,
+}
+fn poll_original_preparation<T>(
+    future: &mut Option<futures::future::BoxFuture<'static, T>>,
+    destination: &mut Option<T>,
+    poisoned: &mut bool,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<()> {
+    use std::{future::Future, task::Poll};
+    if destination.is_some() {
+        return Poll::Ready(());
+    }
+    assert!(
+        !*poisoned,
+        "an unwound original Provider future is never repolled"
+    );
+    struct Polling<'a> {
+        poisoned: &'a mut bool,
+        done: bool,
+    }
+    impl Drop for Polling<'_> {
+        fn drop(&mut self) {
+            if !self.done {
+                *self.poisoned = true;
+            }
+        }
+    }
+    let mut mark = Polling {
+        poisoned,
+        done: false,
+    };
+    match future
+        .as_mut()
+        .expect("same original Provider preparation F")
+        .as_mut()
+        .poll(cx)
+    {
+        Poll::Pending => {
+            mark.done = true;
+            Poll::Pending
+        }
+        Poll::Ready(result) => {
+            *destination = Some(result);
+            // Original raw result/error is stable BEFORE foreign Future Drop.
+            drop(future.take());
+            mark.done = true;
+            Poll::Ready(())
+        }
+    }
+}
+impl ProductionSourceOpening {
+    fn poll_in(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        outcome: &mut Option<
+            Result<
+                Result<OpenedAttemptSource<OpenedRoundSplitSource>, DistributedQueryError>,
+                ConnectorBlockingIoError,
+            >,
+        >,
+    ) -> std::task::Poll<()> {
+        use std::task::Poll;
+        if outcome.is_some() {
+            return Poll::Ready(());
+        }
+        assert!(
+            !self.poisoned,
+            "poisoned original source opening retains its actual state"
+        );
+        if self.responsibility.is_none() {
+            match self
+                .recipe
+                .as_mut()
+                .unwrap()
+                .recipe
+                .admission
+                .poll_ready(cx)
+            {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => {
+                    *outcome = Some(Ok(Err(failed(error.to_string()))));
+                    return Poll::Ready(());
+                }
+                Poll::Ready(Ok(owner)) => self.responsibility = Some(owner),
+            }
+        }
+        if self.capabilities.is_none() {
+            if self.access_future.is_none() && self.access_result.is_none() {
+                let recipe = &self.recipe.as_ref().unwrap().recipe;
+                match recipe.source.begin_access(&recipe.connector_context) {
+                    Ok(future) => self.access_future = Some(future),
+                    Err(error) => {
+                        *outcome = Some(Ok(Err(failed_connector(error))));
+                        return Poll::Ready(());
+                    }
+                }
+            }
+            std::task::ready!(poll_original_preparation(
+                &mut self.access_future,
+                &mut self.access_result,
+                &mut self.poisoned,
+                cx
+            ));
+            match self.access_result.take().unwrap() {
+                Ok(capabilities) => self.capabilities = Some(capabilities),
+                Err(error) => {
+                    *outcome = Some(Ok(Err(failed_connector(error))));
+                    return Poll::Ready(());
+                }
+            }
+        }
+        if self.open_future.is_none() && self.open_result.is_none() {
+            let recipe = &self.recipe.as_ref().unwrap().recipe;
+            self.open_future = Some(
+                recipe
+                    .source
+                    .begin_split_open(&recipe.session, self.capabilities.as_ref().unwrap()),
+            );
+        }
+        std::task::ready!(poll_original_preparation(
+            &mut self.open_future,
+            &mut self.open_result,
+            &mut self.poisoned,
+            cx
+        ));
+        // Only pure moves remain; original recipe/context/authority stays in
+        // this exact field until the real raw source has been installed.
+        let raw = match self.open_result.take().unwrap() {
+            Ok(raw) => raw,
+            Err(error) => {
+                let node = self.recipe.as_ref().unwrap().recipe.source.plan_node_id();
+                let error = error.map_message(|message| format!(
+                    "typed connector scan node_id={node} cannot open its split source: {message}"
+                ));
+                *outcome = Some(Ok(Err(failed_connector(error))));
+                return Poll::Ready(());
+            }
+        };
+        let AttemptSourceRecipe { identity, recipe } = self.recipe.take().unwrap();
+        let opened = recipe.source.finish_open(
+            raw,
+            self.capabilities.take().unwrap(),
+            self.responsibility.take().unwrap(),
+        );
+        *outcome = Some(Ok(Ok(OpenedAttemptSource { identity, opened })));
+        Poll::Ready(())
+    }
 }
 
 impl SerialAttemptInitialization for ProductionInitializationState {
     type Ready = AttemptReady;
     type Recipe = ProductionSourceRecipe;
     type Opened = OpenedRoundSplitSource;
+    type Opening = ProductionSourceOpening;
 
     fn execution_id(&self) -> QueryExecutionId {
         self.execution_id
@@ -535,7 +700,7 @@ impl SerialAttemptInitialization for ProductionInitializationState {
         Ok(Some(AttemptSourceRecipe {
             identity,
             recipe: ProductionSourceRecipe {
-                responsibility: ConnectorBlockingIoResponsibility::admit(
+                admission: ConnectorBlockingIoResponsibility::request(
                     &self.work_scope,
                     &self.result_window,
                 )
@@ -547,33 +712,36 @@ impl SerialAttemptInitialization for ProductionInitializationState {
                 // coalesce repeated frozen-table access without crossing an
                 // attempt boundary.
                 connector_context: self.connector_context.clone(),
-                blocking_io: self.blocking_io.clone(),
             },
         }))
     }
 
-    fn source_join_pin(
-        recipe: &AttemptSourceRecipe<Self::Recipe>,
-    ) -> Option<ConnectorBlockingIoJoinPin> {
-        Some(recipe.recipe.responsibility.join_pin())
-    }
-
-    fn open_source(
+    fn begin_open(
         recipe: AttemptSourceRecipe<Self::Recipe>,
-    ) -> Result<OpenedAttemptSource<Self::Opened>, DistributedQueryError> {
-        let AttemptSourceRecipe { identity, recipe } = recipe;
-        let source = open_round_split_source(
-            recipe.source,
-            &recipe.session,
-            &recipe.connector_context,
-            recipe.blocking_io,
-            recipe.responsibility,
-        )
-        .map_err(failed_connector)?;
-        Ok(OpenedAttemptSource {
-            identity,
-            opened: source,
-        })
+        _: &ConnectorBlockingIoSupervisor,
+    ) -> Self::Opening {
+        ProductionSourceOpening {
+            recipe: Some(recipe),
+            responsibility: None,
+            access_future: None,
+            access_result: None,
+            capabilities: None,
+            open_future: None,
+            open_result: None,
+            poisoned: false,
+        }
+    }
+    fn poll_open_in(
+        opening: &mut Self::Opening,
+        cx: &mut std::task::Context<'_>,
+        outcome: &mut Option<
+            Result<
+                Result<OpenedAttemptSource<Self::Opened>, DistributedQueryError>,
+                ConnectorBlockingIoError,
+            >,
+        >,
+    ) -> std::task::Poll<()> {
+        opening.poll_in(cx, outcome)
     }
 
     fn accept_opened(&mut self, opened: Self::Opened) -> Result<(), DistributedQueryError> {
@@ -842,7 +1010,7 @@ impl AttemptReady {
                 plan.close_in(&mut self.close_job);
             }
         }
-        if let Some(job) = &self.close_job {
+        if let Some(job) = &mut self.close_job {
             if self.close_outcome.is_none() {
                 job.finish_in(&mut self.close_outcome).await;
             }
@@ -1013,8 +1181,13 @@ mod tests {
         }
     }
 
-    fn supervisor() -> ConnectorBlockingIoSupervisor {
-        ConnectorBlockingIoSupervisor::new(tokio::runtime::Handle::current())
+    fn supervisor() -> (
+        crate::task_execution::blocking_io::tests::OriginalExecutorsFixture,
+        ConnectorBlockingIoSupervisor,
+    ) {
+        crate::task_execution::blocking_io::tests::original_executors(
+            tokio::runtime::Handle::current(),
+        )
     }
 
     struct ProtectedCleanup {
@@ -1053,36 +1226,10 @@ mod tests {
         cleanup: ProtectedCleanup,
     }
 
-    impl SerialAttemptInitialization for FixtureInitializationState {
-        type Ready = usize;
-        type Recipe = FixtureSourceRecipe;
-        type Opened = ProtectedCleanup;
-
-        fn execution_id(&self) -> QueryExecutionId {
-            self.execution_id
-        }
-
-        fn next_source_recipe(
-            &mut self,
-        ) -> Result<Option<AttemptSourceRecipe<Self::Recipe>>, DistributedQueryError> {
-            let Some(identity) = self.identities.get(self.next).cloned() else {
-                return Ok(None);
-            };
-            let recipe = self.recipes[self.next]
-                .take()
-                .expect("fixture recipe is consumed once");
-            Ok(Some(AttemptSourceRecipe { identity, recipe }))
-        }
-
-        fn source_join_pin(
-            _: &AttemptSourceRecipe<Self::Recipe>,
-        ) -> Option<ConnectorBlockingIoJoinPin> {
-            None
-        }
-
-        fn open_source(
-            recipe: AttemptSourceRecipe<Self::Recipe>,
-        ) -> Result<OpenedAttemptSource<Self::Opened>, DistributedQueryError> {
+    impl FixtureInitializationState {
+        fn open_fixture_source(
+            recipe: AttemptSourceRecipe<FixtureSourceRecipe>,
+        ) -> Result<OpenedAttemptSource<ProtectedCleanup>, DistributedQueryError> {
             let AttemptSourceRecipe {
                 identity,
                 mut recipe,
@@ -1100,6 +1247,60 @@ mod tests {
                 identity,
                 opened: recipe.cleanup,
             })
+        }
+    }
+
+    impl SerialAttemptInitialization for FixtureInitializationState {
+        type Ready = usize;
+        type Recipe = FixtureSourceRecipe;
+        type Opened = ProtectedCleanup;
+        type Opening = ConnectorBlockingIoJob<
+            Result<OpenedAttemptSource<ProtectedCleanup>, DistributedQueryError>,
+        >;
+
+        fn execution_id(&self) -> QueryExecutionId {
+            self.execution_id
+        }
+
+        fn next_source_recipe(
+            &mut self,
+        ) -> Result<Option<AttemptSourceRecipe<Self::Recipe>>, DistributedQueryError> {
+            let Some(identity) = self.identities.get(self.next).cloned() else {
+                return Ok(None);
+            };
+            let recipe = self.recipes[self.next]
+                .take()
+                .expect("fixture recipe is consumed once");
+            Ok(Some(AttemptSourceRecipe { identity, recipe }))
+        }
+
+        fn begin_open(
+            recipe: AttemptSourceRecipe<Self::Recipe>,
+            supervisor: &ConnectorBlockingIoSupervisor,
+        ) -> Self::Opening {
+            supervisor.prepare_cpu_pinned(Vec::new(), move || Self::open_fixture_source(recipe))
+        }
+        fn poll_open_in(
+            opening: &mut Self::Opening,
+            cx: &mut std::task::Context<'_>,
+            outcome: &mut Option<
+                Result<
+                    Result<OpenedAttemptSource<Self::Opened>, DistributedQueryError>,
+                    ConnectorBlockingIoError,
+                >,
+            >,
+        ) -> std::task::Poll<()> {
+            match opening.poll_progress(cx) {
+                std::task::Poll::Pending => std::task::Poll::Pending,
+                std::task::Poll::Ready(Err(error)) => {
+                    *outcome = Some(Err(error));
+                    std::task::Poll::Ready(())
+                }
+                std::task::Poll::Ready(Ok(())) => {
+                    *outcome = opening.try_take();
+                    std::task::Poll::Ready(())
+                }
+            }
         }
 
         fn accept_opened(&mut self, opened: Self::Opened) -> Result<(), DistributedQueryError> {
@@ -1126,7 +1327,7 @@ mod tests {
             }
             let supervisor = self.accepted[0].supervisor.clone();
             let accepted = std::mem::take(&mut self.accepted);
-            *job = Some(supervisor.spawn_pinned_source_close(Vec::new(), move |_| {
+            *job = Some(supervisor.prepare_cpu_source_close(Vec::new(), move |_| {
                 for mut cleanup in accepted {
                     cleanup.armed = false;
                     if let Some(closed) = cleanup.closed.take() {
@@ -1319,7 +1520,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn no_scan_becomes_ready_without_submitting_connector_work() {
-        let supervisor = supervisor();
+        let (mut executors, supervisor) = supervisor();
         let execution_id = execution_id(1);
         let cancellation = QueryCancellationSource::new();
         let (closed, _observe_close) = mpsc::channel();
@@ -1332,12 +1533,13 @@ mod tests {
             .await
             .expect("scanless attempt becomes ready");
         assert_eq!(initializing.ready, Some(0));
-        assert!(initializing.job.is_none());
+        assert!(initializing.opening.is_none());
+        executors.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancellation_before_submission_keeps_recipe_unopened() {
-        let supervisor = supervisor();
+        let (mut executors, supervisor) = supervisor();
         let execution_id = execution_id(1);
         let cancellation = QueryCancellationSource::new();
         let (started, observe_started) = mpsc::channel();
@@ -1364,11 +1566,12 @@ mod tests {
             observe_started.try_recv().is_err(),
             "a cancelled recipe must remain unopened"
         );
+        executors.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancellation_during_source_open_reaps_late_success() {
-        let supervisor = supervisor();
+        let (mut executors, supervisor) = supervisor();
         let execution_id = execution_id(1);
         let cancellation = QueryCancellationSource::new();
         let (started, observe_started) = mpsc::channel();
@@ -1401,7 +1604,7 @@ mod tests {
         let error = result.expect_err("cancelled initializer cannot become ready");
         assert!(error.message().contains("cancelled"), "{error}");
         assert!(
-            initializing.job.is_some(),
+            initializing.opening.is_some(),
             "the original open job survives cancellation"
         );
         assert!(
@@ -1419,21 +1622,22 @@ mod tests {
             })
             .await;
         }
-        assert!(initializing.job.is_some());
+        assert!(initializing.opening.is_some());
         release.send(()).expect("release late source-open success");
         tokio::time::timeout(Duration::from_secs(2), initializing.close())
             .await
             .expect("original cleanup joins")
             .expect("original source close succeeds");
-        assert!(initializing.job.is_none());
+        assert!(initializing.opening.is_none());
         observe_close
             .recv_timeout(Duration::from_secs(2))
             .expect("late state is reaped after actual source-open exit");
+        executors.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancellation_closes_accepted_source_without_dropping_the_shared_attempt_scope() {
-        let supervisor = supervisor();
+        let (mut executors, supervisor) = supervisor();
         let execution_id = execution_id(1);
         let cancellation = QueryCancellationSource::new();
         let (source_two_started, observe_source_two_started) = mpsc::channel();
@@ -1509,11 +1713,12 @@ mod tests {
         observe_scope_dropped
             .recv_timeout(Duration::from_secs(2))
             .expect("the shared attempt scope releases after the late provider return");
+        executors.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn source_result_from_another_generation_is_rejected_before_ready() {
-        let supervisor = supervisor();
+        let (mut executors, supervisor) = supervisor();
         let execution_id = execution_id(1);
         let cancellation = QueryCancellationSource::new();
         let expected = identity(execution_id, 7);
@@ -1551,5 +1756,6 @@ mod tests {
         observe_close
             .recv_timeout(Duration::from_secs(2))
             .expect("rejected source state is reaped");
+        executors.shutdown().await;
     }
 }

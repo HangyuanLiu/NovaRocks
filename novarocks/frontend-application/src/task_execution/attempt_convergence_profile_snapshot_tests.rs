@@ -322,6 +322,16 @@ mod profile_snapshot_tests {
             .expect("the exact diagnostic cut publishes before RPC exit");
         assert_eq!(snapshot.ready, ready);
         assert_eq!(
+            snapshot.fragments.as_ref(),
+            round
+                .execution()
+                .graph()
+                .tasks()
+                .map(|task| (task.identity(), task.fragment_id()))
+                .collect::<Vec<_>>()
+                .as_slice()
+        );
+        assert_eq!(
             snapshot.closure,
             ProfileDiagnosticClosure::ObservationDeadline
         );

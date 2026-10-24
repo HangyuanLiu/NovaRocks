@@ -24,6 +24,9 @@
 
 use std::fmt;
 
+mod operation_reply;
+pub use operation_reply::check_operation_reply;
+
 use crate::TransportBudget;
 use crate::creation::MAX_INITIAL_SCAN_NODES;
 use crate::descriptor::{

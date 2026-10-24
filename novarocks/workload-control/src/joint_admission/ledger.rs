@@ -61,7 +61,7 @@ pub use paid_proposal::{
     JointProposal, RootStageAdmission, RootStageProposal, RootStageReady, RootStageSource,
 };
 pub(crate) mod proposal_storage;
-pub(crate) use control_storage::control_storage_base;
+pub(crate) use control_storage::{control_storage_base, control_storage_dependency_records};
 use dependency_storage::{DependencyRef, DependencyRegistry};
 pub use proposal_storage::JointGrantedClaims;
 use proposal_storage::{

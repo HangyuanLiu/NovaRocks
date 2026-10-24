@@ -17,6 +17,7 @@
 
 use std::any::TypeId;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use bytes::Buf;
 use novarocks_proto_models::novarocks as proto;
@@ -133,7 +134,38 @@ where
     }
 }
 
+/// A local reply preflight failure is not a remote ingress refusal and does
+/// not prove that the original mutation was not applied.
+#[derive(Debug)]
+struct OperationReplyPreflightFailure(resource_preflight::ResourcePreflightError);
+impl std::fmt::Display for OperationReplyPreflightFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, formatter)
+    }
+}
+impl std::error::Error for OperationReplyPreflightFailure {}
+
+/// Checks the original local source, never a remote status message or marker.
+pub fn is_operation_reply_preflight_failure(status: &Status) -> bool {
+    let mut source = std::error::Error::source(status);
+    while let Some(error) = source {
+        if error.is::<OperationReplyPreflightFailure>() {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
 fn check_resource_shape<U: 'static>(raw: &[u8]) -> Result<(), Status> {
+    if TypeId::of::<U>() == TypeId::of::<proto::ApplyTaskOperationsResponse>() {
+        return resource_preflight::check_operation_reply(raw).map_err(|error| {
+            let mut status =
+                Status::data_loss("Native operation reply exceeds its resource grammar");
+            status.set_source(Arc::new(OperationReplyPreflightFailure(error)));
+            status
+        });
+    }
     let result = if TypeId::of::<U>() == TypeId::of::<proto::ApplyTaskOperationsRequest>() {
         resource_preflight::check_operation_batch(raw)
     } else if TypeId::of::<U>() == TypeId::of::<proto::ApplyTaskControlOperationsRequest>() {
@@ -176,3 +208,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "native_codec/reply_tests.rs"]
+mod reply_tests;

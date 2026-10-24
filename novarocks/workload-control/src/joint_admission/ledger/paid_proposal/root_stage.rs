@@ -130,14 +130,25 @@ impl RetainedPayloadGrant {
         })
     }
 }
+const ROOT_STAGE_BASE_CHANGES: usize = 4;
 impl RootStageSource {
+    /// Actual closed batch shape before appending canonical Production rows.
+    /// This is a pure backing fact; it neither captures a source nor grants.
+    pub const fn minimum_change_records() -> usize {
+        ROOT_STAGE_BASE_CHANGES
+    }
+
     /// Actual current originals in this closed action, including every
     /// production row of both exact works. This is a fact, not maxL policy.
     pub fn required_change_records(&self) -> Result<usize, WorkError> {
         let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
         let state = inner.state.lock().unwrap();
         validate_nodes(&state, self.root, self.fence.stage)?;
-        production_change_count(&state, &[self.root, self.fence.stage], 4)
+        production_change_count(
+            &state,
+            &[self.root, self.fence.stage],
+            ROOT_STAGE_BASE_CHANGES,
+        )
     }
     /// Reserve the Root's original proposal cell before body allocation. Only
     /// PayloadBytes can grow here; no CPU/queue/physical geometry is guessed.
@@ -364,8 +375,8 @@ pub(in crate::joint_admission::ledger) fn validate_root_stage(
     changes: &[ChangeRecord],
 ) -> Result<(), WorkError> {
     validate_nodes(state, root, fence.stage)?;
-    if changes.len() < 4
-        || changes.iter().skip(4).any(|change| {
+    if changes.len() < ROOT_STAGE_BASE_CHANGES
+        || changes.iter().skip(ROOT_STAGE_BASE_CHANGES).any(|change| {
             change
                 .source
                 .as_ref()

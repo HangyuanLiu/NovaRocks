@@ -57,7 +57,7 @@ use crate::catalog_application::query_materializer::{
 use crate::connector::UnifiedStatisticsResolver;
 use crate::mv::domain::readiness::MvCandidateReader;
 use crate::mv::domain::rewrite_prep::freeze_materialized_view_fact_with_ports;
-use crate::query_execution::planning::statistics::resolve_statistics_need;
+use crate::query_execution::planning::statistics::resolve_statistics_need_async;
 use crate::query_execution::provider_read_facts::{FrontendProviderReadFacts, FrozenProviderRead};
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 
@@ -135,11 +135,18 @@ impl StatementFactScope {
 pub(crate) struct FrontendCatalogFacts {
     owners: CompletionFactOwners,
     scope: StatementFactScope,
+    // One original fact source serializes its own observation rounds. This
+    // does not allocate another binding identity or provider cache.
+    resolving: tokio::sync::Mutex<()>,
 }
 
 impl FrontendCatalogFacts {
     pub(crate) const fn new(owners: CompletionFactOwners, scope: StatementFactScope) -> Self {
-        Self { owners, scope }
+        Self {
+            owners,
+            scope,
+            resolving: tokio::sync::Mutex::const_new(()),
+        }
     }
 }
 
@@ -149,27 +156,45 @@ impl CatalogFactPort for FrontendCatalogFacts {
         &self,
         needs: &[CatalogRelationNeed],
     ) -> Result<Vec<CatalogRelationFact>, String> {
-        let needs = needs.to_vec();
-        let owners = self.owners.clone();
-        let scope = self.scope.clone();
-        admitted(&self.owners, &self.scope.capacity, move || {
-            let loader = iceberg_table_binding_loader(
-                owners.connector_control.as_ref(),
-                scope.connector_context.clone(),
-            );
-            let materializer = CatalogServiceMaterializer::new(
-                scope.current_catalog.as_deref(),
-                owners.catalog_service.as_ref(),
-                Arc::clone(&scope.bindings),
-                loader,
-            )
-            .with_catalog_application(owners.catalog_application.as_deref());
-            needs
-                .iter()
-                .map(|need| catalog_fact(&materializer, need))
-                .collect()
-        })
-        .await
+        let _round = self.resolving.lock().await;
+        let loader = iceberg_table_binding_loader(
+            self.owners.connector_control.as_ref(),
+            self.scope.connector_context.clone(),
+        );
+        let materializer = CatalogServiceMaterializer::new(
+            self.scope.current_catalog.as_deref(),
+            self.owners.catalog_service.as_ref(),
+            Arc::clone(&self.scope.bindings),
+            loader,
+        )
+        .with_catalog_application(self.owners.catalog_application.as_deref());
+        let mut facts = Vec::with_capacity(needs.len());
+        for need in needs {
+            let relation = need.relation();
+            let resolved = match need.target() {
+                CatalogLookupTarget::Table { .. } => {
+                    materializer
+                        .resolve_table_for_analysis_async(
+                            Some(&relation.catalog),
+                            &relation.namespace,
+                            &relation.table,
+                        )
+                        .await
+                }
+                CatalogLookupTarget::IcebergMetadata { kind } => {
+                    materializer
+                        .resolve_metadata_table_async(
+                            Some(&relation.catalog),
+                            &relation.namespace,
+                            &relation.table,
+                            kind,
+                        )
+                        .await
+                }
+            };
+            facts.push(catalog_fact_from(need, resolved)?);
+        }
+        Ok(facts)
     }
 }
 
@@ -235,23 +260,19 @@ impl StatisticsFactPort for FrontendStatisticsFacts {
         &self,
         needs: &[StatisticsNeed],
     ) -> Result<Vec<StatisticsFact>, String> {
-        let needs = needs.to_vec();
-        let owners = self.owners.clone();
-        let scope = self.scope.clone();
-        admitted(&self.owners, &self.scope.capacity, move || {
-            needs
-                .iter()
-                .map(|need| {
-                    resolve_statistics_need(
-                        owners.statistics.as_ref(),
-                        scope.bindings.as_ref(),
-                        need,
-                        &scope.connector_context,
-                    )
-                })
-                .collect()
-        })
-        .await
+        let mut facts = Vec::with_capacity(needs.len());
+        for need in needs {
+            facts.push(
+                resolve_statistics_need_async(
+                    self.owners.statistics.as_ref(),
+                    self.scope.bindings.as_ref(),
+                    need,
+                    &self.scope.connector_context,
+                )
+                .await?,
+            );
+        }
+        Ok(facts)
     }
 }
 

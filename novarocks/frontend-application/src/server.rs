@@ -328,6 +328,7 @@ async fn build_frontend_role_products(
     let query_control = novarocks_query_application::session_control::QueryControlService::new(
         query_application_control.clone(),
     );
+    host.install_statement_control(query_control.clone())?;
     #[cfg(novarocks_dev_controls)]
     if let Some(owner) = host
         .test_session
@@ -1223,7 +1224,7 @@ where
             let _ = finalize_tx.send(true);
             mysql_server.await.map_err(FrontendApplicationError::server)
         }
-        error = wait_for_frontend_listener_failure(report_server, management_server) => {
+        error = wait_for_frontend_listener_failure(report_server, management_server, host) => {
             host.begin_serving_drain(drain_timeout);
             let _ = drain_tx.send(true);
             host.cancel_governed_work_at_drain_deadline();
@@ -1260,8 +1261,12 @@ fn emit_frontend_mysql_ready(bind_addr: std::net::SocketAddr, user: &str) {
 async fn wait_for_frontend_listener_failure(
     report_server: &mut crate::native::report_server::FrontendReportServerHandle,
     management_server: &mut FrontendManagementServer,
+    host: &FrontendApplicationHost,
 ) -> String {
     loop {
+        if host.workload_progress_has_exited() {
+            return "frontend governed role service terminated unexpectedly".to_string();
+        }
         match report_server.poll_failure() {
             Ok(Some(error)) => return format!("frontend report listener failed: {error}"),
             Ok(None) => {}
@@ -2011,6 +2016,7 @@ mod tests {
         )
         .await
         .expect("open frontend application host");
+        host.install_statement_control_for_test();
         host.mark_ready().expect("mark frontend host ready");
         let work = host
             .workload_root_admission()
@@ -2060,6 +2066,7 @@ mod tests {
         )
         .await
         .expect("open frontend application host");
+        host.install_statement_control_for_test();
         host.mark_ready().expect("mark frontend host ready");
 
         let active = host

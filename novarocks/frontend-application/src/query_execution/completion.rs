@@ -533,6 +533,16 @@ fn complete_profile(
     if fragment_profiles.is_empty() {
         return Err("EXPLAIN ANALYZE completed without fragment runtime profiles".into());
     }
+    render_profile_result(formatter, output_rows, fragment_profiles, Vec::new())
+        .map(StatementResult::Query)
+}
+
+fn render_profile_result(
+    formatter: PreparedProfileFormatter,
+    output_rows: u64,
+    fragment_profiles: Vec<crate::query_execution::profile::FragmentProfileTree>,
+    diagnostics: Vec<String>,
+) -> Result<novarocks_query_application::api::QueryResult, String> {
     // Per-fragment attribution is read while each tree still carries the
     // fragment its producer named; every other summary below is a counter sum
     // over the trees themselves and needs no attribution.
@@ -557,7 +567,10 @@ fn complete_profile(
         format_explain_analyze_duration(formatter.execution_started_at.elapsed()),
         output_rows
     ));
-    lines.push(format_distributed_profile_summary(&profile_summary));
+    if !fragment_profiles.is_empty() || diagnostics.is_empty() {
+        lines.push(format_distributed_profile_summary(&profile_summary));
+    }
+    lines.extend(diagnostics);
     if let Some(apply) =
         crate::query_execution::profile::collect_native_runtime_filter_apply_from_profile_trees(
             &fragment_profiles,
@@ -603,7 +616,96 @@ fn complete_profile(
             &formatter.control,
         )?,
     });
-    build_string_query_result("Explain String", lines).map(StatementResult::Query)
+    build_string_query_result("Explain String", lines)
+}
+
+impl PreparedQueryCompletion {
+    /// Render the accepted computation with its independent, exact Native
+    /// diagnostic snapshot. A missing diagnostic is not a missing Ready cut.
+    pub(crate) fn complete_profile_observation(
+        self,
+        ready: &crate::query_execution::internal_consumer::profile::ReadyProfileComputation,
+        observation: Result<
+            &crate::task_execution::profile_diagnostics::ProfileDiagnosticSnapshot,
+            crate::query_execution::internal_consumer::profile::ProfileSnapshotMissing,
+        >,
+    ) -> Result<novarocks_query_application::api::QueryResult, String> {
+        use crate::task_execution::profile_diagnostics::ProfileTaskDiagnostic;
+        let PreparedQueryFormatter::Profile(formatter) = self.formatter;
+        let ProfilePlan::Completed { plan, .. } = &formatter.plan;
+        let mut profiles = crate::query_execution::profile::ProfileTerminalBuilder::new();
+        let mut diagnostics = Vec::new();
+        match observation {
+            Ok(snapshot) => {
+                if snapshot.ready != ready.ready_token()
+                    || !snapshot
+                        .tasks
+                        .iter()
+                        .map(|(task, _)| *task)
+                        .eq(ready.expected_tasks().iter().copied())
+                    || snapshot.fragments.len() != snapshot.tasks.len()
+                    || !snapshot
+                        .fragments
+                        .iter()
+                        .map(|(task, _)| *task)
+                        .eq(snapshot.tasks.iter().map(|(task, _)| *task))
+                {
+                    return Err(
+                        "EXPLAIN ANALYZE diagnostics do not match the accepted computation"
+                            .to_string(),
+                    );
+                }
+                diagnostics.push(format!(
+                    "Diagnostics: {:?}; complete={}",
+                    snapshot.closure,
+                    snapshot.complete()
+                ));
+                for ((task, fact), (_, fragment)) in
+                    snapshot.tasks.iter().zip(snapshot.fragments.iter())
+                {
+                    match fact {
+                        ProfileTaskDiagnostic::Available(info) => {
+                            if info.final_status().identity() != *task {
+                                return Err(
+                                    "EXPLAIN ANALYZE final info has a foreign Task identity"
+                                        .to_string(),
+                                );
+                            }
+                            let fragment = plan
+                                .fragments()
+                                .get(&novarocks_physical_plan::FragmentId::new(*fragment))
+                                .ok_or_else(|| {
+                                    "EXPLAIN ANALYZE diagnostic Task names an absent plan fragment"
+                                        .to_string()
+                                })?;
+                            let root = i32::try_from(fragment.root().get()).map_err(|_| {
+                                "EXPLAIN ANALYZE fragment root exceeds native profile range"
+                                    .to_string()
+                            })?;
+                            profiles
+                                .apply_task_operator_statistics(info, root)
+                                .map_err(|error| error.to_string())?;
+                        }
+                        ProfileTaskDiagnostic::Missing(reason) => diagnostics.push(format!(
+                            "Diagnostics missing: stage={} task={}; reason={reason:?}",
+                            task.stage_id(),
+                            task.task_id()
+                        )),
+                    }
+                }
+            }
+            Err(crate::query_execution::internal_consumer::profile::ProfileSnapshotMissing::ForeignComputationCut) => {
+                return Err("EXPLAIN ANALYZE diagnostic observer has a foreign computation cut".to_string());
+            }
+            Err(reason) => diagnostics.push(format!("Diagnostics unavailable: {reason:?}")),
+        }
+        render_profile_result(
+            formatter,
+            ready.output_rows(),
+            profiles.finish().into_profiles(),
+            diagnostics,
+        )
+    }
 }
 
 fn render_completed_profile(

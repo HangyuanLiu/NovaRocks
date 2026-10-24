@@ -17,11 +17,10 @@
 
 //! Supervision for blocking Connector calls made by the frontend.
 //!
-//! Connector implementations may expose synchronous split enumeration and
-//! credential vending. A submitted call keeps running on Tokio's blocking pool
-//! when its query waiter is dropped. The worker publishes its actual outcome
-//! only after the synchronous call returns. Query admission, rather than a
-//! second Connector permit, controls whether the call may be submitted.
+//! Original Connector call/source custody. New source consumers borrow their
+//! stable fields and use the installed original CPU/QB owners; actual result
+//! delivery is distinct from worker exit. The legacy Tokio bridge below remains
+//! only for explicitly listed consumers pending their async-owner migration.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -30,6 +29,11 @@ use std::sync::{Arc, Mutex};
 use novarocks_workload_control::{ResultWindowAlias, WorkError, WorkOwner, WorkScope};
 
 use tokio::runtime::Handle;
+
+mod child_admission;
+mod stable_job;
+pub(crate) use child_admission::ConnectorBlockingIoAdmission;
+pub(crate) use stable_job::{ConnectorBlockingIoActionQuote, ConnectorOperationJob};
 
 /// Why a submitted blocking call produced no Connector outcome.
 #[derive(Clone, Debug)]
@@ -46,6 +50,11 @@ struct OriginalFailure {
 
 enum OriginalFailureCause {
     WorkerJoin(tokio::task::JoinError),
+    Preserving(novarocks_query_application::cpu::QueryBlockingFailure),
+    Admission(WorkError),
+    CpuPublication(novarocks_query_application::cpu::QueryCpuPublishRefusal),
+    BlockingReserve(novarocks_query_application::cpu::QueryBlockingReserveRefusal),
+    BlockingPublication(novarocks_query_application::cpu::QueryBlockingPublishRefusal),
     OutcomeDrop(#[allow(dead_code)] Mutex<Box<dyn std::any::Any + Send>>),
 }
 
@@ -64,7 +73,12 @@ impl std::error::Error for OriginalFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.cause {
             OriginalFailureCause::WorkerJoin(error) => Some(error),
-            OriginalFailureCause::OutcomeDrop(_) => None,
+            OriginalFailureCause::Preserving(error) => Some(error),
+            OriginalFailureCause::Admission(error) => Some(error),
+            OriginalFailureCause::CpuPublication(_)
+            | OriginalFailureCause::BlockingReserve(_)
+            | OriginalFailureCause::BlockingPublication(_)
+            | OriginalFailureCause::OutcomeDrop(_) => None,
         }
     }
 }
@@ -87,7 +101,12 @@ impl std::error::Error for ConnectorBlockingIoError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.original.cause {
             OriginalFailureCause::WorkerJoin(error) => Some(error),
-            OriginalFailureCause::OutcomeDrop(_) => None,
+            OriginalFailureCause::Preserving(error) => Some(error),
+            OriginalFailureCause::Admission(error) => Some(error),
+            OriginalFailureCause::CpuPublication(_)
+            | OriginalFailureCause::BlockingReserve(_)
+            | OriginalFailureCause::BlockingPublication(_)
+            | OriginalFailureCause::OutcomeDrop(_) => None,
         }
     }
 }
@@ -100,15 +119,14 @@ pub(crate) struct ConnectorBlockingIoResponsibility(Arc<ResponsibilityCell>);
 struct ResponsibilityCell {
     owner: Option<WorkOwner>,
     pending_joins: AtomicUsize,
-    _window: ResultWindowAlias,
+    _window: Option<ResultWindowAlias>,
 }
 
 impl Drop for ResponsibilityCell {
     fn drop(&mut self) {
-        let owner = self
-            .owner
-            .take()
-            .expect("one Connector responsibility owner");
+        let Some(owner) = self.owner.take() else {
+            return;
+        };
         if *self.pending_joins.get_mut() == 0 {
             // This private child owns no receiver or remote cancellation
             // delivery. Its last backing alias and every original join have
@@ -140,7 +158,7 @@ impl ConnectorBlockingIoResponsibility {
         Ok(Self(Arc::new(ResponsibilityCell {
             owner: Some(owner),
             pending_joins: AtomicUsize::new(0),
-            _window: delegated,
+            _window: Some(delegated),
         })))
     }
 
@@ -295,8 +313,46 @@ impl<T: Send + 'static> Drop for JobOutcome<T> {
 /// Installing a cause is not completion: only that job's original join does it.
 pub(crate) struct ConnectorSourceCloseResult<'a> {
     failure: &'a Mutex<Option<Arc<novarocks_spi::connector::ConnectorError>>>,
+    worker_failure:
+        Option<&'a Mutex<Option<novarocks_query_application::cpu::QueryBlockingFailure>>>,
+    source_drop_unproven: Option<&'a AtomicBool>,
 }
-impl ConnectorSourceCloseResult<'_> {
+impl<'a> ConnectorSourceCloseResult<'a> {
+    #[cfg(test)]
+    pub(crate) fn for_fixture(
+        failure: &'a Mutex<Option<Arc<novarocks_spi::connector::ConnectorError>>>,
+        worker_failure: &'a Mutex<Option<novarocks_query_application::cpu::QueryBlockingFailure>>,
+        source_drop_unproven: &'a AtomicBool,
+    ) -> Self {
+        Self {
+            failure,
+            worker_failure: Some(worker_failure),
+            source_drop_unproven: Some(source_drop_unproven),
+        }
+    }
+
+    pub(crate) fn record_source_drop_panic(&self, original: Box<dyn std::any::Any + Send>) {
+        if let Some(unproven) = self.source_drop_unproven {
+            unproven.store(true, Ordering::Release);
+        }
+        self.record_panic(original);
+    }
+    pub(crate) fn record_panic(&self, original: Box<dyn std::any::Any + Send>) {
+        let failure = novarocks_query_application::cpu::QueryBlockingFailure::panicked(original);
+        let rejected = if let Some(slot) = self.worker_failure {
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.is_none() {
+                *slot = Some(failure);
+                None
+            } else {
+                Some(failure)
+            }
+        } else {
+            Some(failure)
+        };
+        // The same first raw cause is stable before any later foreign Drop.
+        drop(rejected);
+    }
     pub(crate) fn record_error(&self, error: novarocks_spi::connector::ConnectorError) {
         let rejected = {
             let mut first = self
@@ -379,10 +435,16 @@ impl<T: Send + 'static> ConnectorBlockingIoJob<T> {
     }
 }
 
+#[derive(Clone)]
+struct OriginalExecutors {
+    cpu: novarocks_query_application::cpu::QueryCpuExecutor,
+    blocking: novarocks_query_application::cpu::QueryBlockingExecutor,
+}
 /// The one process owner that supervises frontend Connector blocking calls.
 #[derive(Clone)]
 pub(crate) struct ConnectorBlockingIoSupervisor {
     runtime: Handle,
+    executors: Arc<std::sync::OnceLock<OriginalExecutors>>,
     failure: Arc<Mutex<Option<ConnectorBlockingIoError>>>,
     failure_ready: Arc<tokio::sync::Notify>,
 }
@@ -420,9 +482,21 @@ impl ConnectorBlockingIoSupervisor {
     pub(crate) fn new(runtime: Handle) -> Self {
         Self {
             runtime,
+            executors: Arc::new(std::sync::OnceLock::new()),
             failure: Arc::new(Mutex::new(None)),
             failure_ready: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+    /// Only the role composition owner has both original physical views. No
+    /// fallback pool is created by a Connector, session or Operator clone.
+    pub(crate) fn install_original_executors(
+        &self,
+        cpu: novarocks_query_application::cpu::QueryCpuExecutor,
+        blocking: novarocks_query_application::cpu::QueryBlockingExecutor,
+    ) -> Result<(), WorkError> {
+        self.executors
+            .set(OriginalExecutors { cpu, blocking })
+            .map_err(|_| WorkError::Conflict)
     }
 
     /// The runtime this lane's work is admitted onto.
@@ -484,6 +558,8 @@ impl ConnectorBlockingIoSupervisor {
             move || {
                 call(&ConnectorSourceCloseResult {
                     failure: &outcome.source_close_failure,
+                    worker_failure: None,
+                    source_drop_unproven: None,
                 })
             }
         })
@@ -683,6 +759,51 @@ pub(crate) mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    pub(crate) struct OriginalExecutorsFixture {
+        cpu: novarocks_query_application::cpu::QueryCpuExecutorOwner,
+        blocking: novarocks_query_application::cpu::QueryBlockingExecutorOwner,
+    }
+    impl OriginalExecutorsFixture {
+        pub(crate) async fn shutdown(&mut self) {
+            self.cpu
+                .shutdown_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap();
+            self.blocking
+                .shutdown_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap();
+        }
+    }
+    pub(crate) fn original_executors(
+        handle: Handle,
+    ) -> (OriginalExecutorsFixture, ConnectorBlockingIoSupervisor) {
+        let supervisor = ConnectorBlockingIoSupervisor::new(handle);
+        let fixture = OriginalExecutorsFixture::install(&supervisor);
+        (fixture, supervisor)
+    }
+    impl OriginalExecutorsFixture {
+        pub(crate) fn install(supervisor: &ConnectorBlockingIoSupervisor) -> Self {
+            use novarocks_query_application::cpu::{
+                QueryBlockingExecutorConfig, QueryBlockingExecutorOwner, QueryCpuExecutorConfig,
+                QueryCpuExecutorOwner,
+            };
+            let cpu = QueryCpuExecutorOwner::try_new(QueryCpuExecutorConfig::with_idle_keepalive(
+                Duration::from_secs(1),
+            ))
+            .unwrap();
+            let blocking = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
+                std::num::NonZeroUsize::new(1).unwrap(),
+                std::num::NonZeroUsize::new(1).unwrap(),
+            ))
+            .unwrap();
+            supervisor
+                .install_original_executors(cpu.executor(), blocking.executor())
+                .unwrap();
+            Self { cpu, blocking }
+        }
+    }
 
     pub(crate) fn admitted() -> (
         novarocks_workload_control::WorkloadControl,

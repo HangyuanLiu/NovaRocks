@@ -125,6 +125,55 @@ impl UnifiedStatisticsResolver {
                 }
                 _ => StatisticsResolutionFailure::Connector(error),
             })?;
+        self.retain_evidence(table, key, evidence)
+    }
+
+    pub async fn resolve_async(
+        &self,
+        table: &ResolvedStatisticsTable,
+        statistics: &dyn ConnectorStatistics,
+        metrics: StatisticsMetricRequest,
+        context: ConnectorRequestContext,
+    ) -> Result<Arc<StatisticsEvidence>, StatisticsResolutionFailure> {
+        if statistics.descriptor().instance_id != *table.table.owner() {
+            return Err(StatisticsResolutionFailure::OwnerMismatch);
+        }
+        if statistics.incarnation() != table.incarnation {
+            return Err(StatisticsResolutionFailure::IncarnationMismatch);
+        }
+        let key = ResolvedCacheKey {
+            instance_id: table.table.owner().clone(),
+            incarnation: table.incarnation,
+            table_payload: table.table.payload().clone(),
+            data_version: table.data_version.clone(),
+            metrics: metrics.metrics().to_vec(),
+        };
+        let evidence = statistics
+            .read_statistics_async(StatisticsReadRequest {
+                // No negotiation has happened at this point, so this asks
+                // about the table rather than about a narrowed read.
+                narrowed_read: None,
+                table: table.table.clone(),
+                data_version: table.data_version.clone(),
+                metrics,
+                context,
+            })
+            .await
+            .map_err(|error| match error.kind() {
+                novarocks_spi::connector::ConnectorErrorKind::CorruptData => {
+                    StatisticsResolutionFailure::CorruptEvidence(error.to_string())
+                }
+                _ => StatisticsResolutionFailure::Connector(error),
+            })?;
+        self.retain_evidence(table, key, evidence)
+    }
+
+    fn retain_evidence(
+        &self,
+        table: &ResolvedStatisticsTable,
+        key: ResolvedCacheKey,
+        evidence: StatisticsEvidence,
+    ) -> Result<Arc<StatisticsEvidence>, StatisticsResolutionFailure> {
         if *evidence.data_version() != table.data_version {
             return Err(StatisticsResolutionFailure::DataVersionMismatch);
         }
@@ -300,5 +349,128 @@ mod tests {
             ),
             Err(StatisticsResolutionFailure::DataVersionMismatch)
         );
+    }
+
+    struct AsyncOnlyStatistics {
+        inner: TestStatistics,
+        gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl StatisticsReader for AsyncOnlyStatistics {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.inner.descriptor
+        }
+        fn incarnation(&self) -> ProviderBindingEpoch {
+            self.inner.incarnation
+        }
+        fn read_statistics(
+            &self,
+            _: StatisticsReadRequest,
+        ) -> Result<StatisticsEvidence, ConnectorError> {
+            panic!("async statistics must never invoke the joining reader")
+        }
+        fn read_statistics_async(
+            &self,
+            request: StatisticsReadRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<StatisticsEvidence, ConnectorError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(request.table.owner(), &self.inner.descriptor.instance_id);
+                assert_eq!(request.data_version, data_version(b"data-v1"));
+                assert_eq!(request.metrics.metrics(), metric_request().metrics());
+                let gate = self.gate.lock().unwrap().take();
+                if let Some(gate) = gate {
+                    gate.await.expect("observation released");
+                }
+                Ok(self.inner.evidence.clone())
+            })
+        }
+    }
+    impl ConnectorStatistics for AsyncOnlyStatistics {}
+
+    #[tokio::test]
+    async fn asynchronous_resolution_waits_without_cache_lock_and_reuses_the_same_revision() {
+        let resolver = UnifiedStatisticsResolver::default();
+        let epoch = ProviderBindingEpoch::from_bytes([9; 16]);
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let reader = AsyncOnlyStatistics {
+            inner: TestStatistics {
+                descriptor: descriptor("ice"),
+                incarnation: epoch,
+                evidence: evidence(),
+            },
+            gate: Mutex::new(Some(gate)),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let table = resolved_table("ice", epoch);
+        let mut waiting =
+            Box::pin(resolver.resolve_async(&table, &reader, metric_request(), request_context()));
+        assert!(futures::poll!(&mut waiting).is_pending());
+        assert!(resolver.artifacts.try_lock().is_ok());
+        release.send(()).unwrap();
+        let first = waiting.await.unwrap();
+        let second = resolver
+            .resolve_async(&table, &reader, metric_request(), request_context())
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            reader.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the provider is observed again; only the exact immutable revision is cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn asynchronous_resolution_preserves_source_fences_and_rejects_foreign_evidence() {
+        let resolver = UnifiedStatisticsResolver::default();
+        let epoch = ProviderBindingEpoch::from_bytes([9; 16]);
+        let wrong_evidence = StatisticsEvidence::try_new(
+            data_version(b"foreign-data"),
+            StatisticsEvidenceRevision::try_new(Bytes::from_static(b"rev-foreign")).unwrap(),
+            StatisticsRowCoverage::AllVisibleRows,
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let reader = AsyncOnlyStatistics {
+            inner: TestStatistics {
+                descriptor: descriptor("ice"),
+                incarnation: epoch,
+                evidence: wrong_evidence,
+            },
+            gate: Mutex::new(None),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        assert!(matches!(
+            resolver
+                .resolve_async(
+                    &resolved_table("other", epoch),
+                    &reader,
+                    metric_request(),
+                    request_context()
+                )
+                .await,
+            Err(StatisticsResolutionFailure::OwnerMismatch)
+        ));
+        assert_eq!(reader.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(matches!(
+            resolver
+                .resolve_async(
+                    &resolved_table("ice", epoch),
+                    &reader,
+                    metric_request(),
+                    request_context()
+                )
+                .await,
+            Err(StatisticsResolutionFailure::DataVersionMismatch)
+        ));
+        assert_eq!(reader.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(resolver.artifacts.lock().unwrap().is_empty());
     }
 }

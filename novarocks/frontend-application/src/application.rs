@@ -21,6 +21,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 
+pub(crate) mod workload_progress;
+use workload_progress::{FrontendWorkloadDeadlineSupervisor, FrontendWorkloadProgressPolicy};
+
 use crate::query_execution::internal_result_cpu::{InternalResultCpu, InternalResultCpuOwner};
 use crate::query_execution::service::QueryExecutionService;
 use crate::task_protocol_config::CoordinationBudgets;
@@ -35,7 +38,7 @@ use novarocks_query_application::cpu::{
     QueryCpuExecutor, QueryCpuExecutorConfig, QueryCpuExecutorOwner,
 };
 use novarocks_workload_control::{
-    CancellationReason, DeadlineExpiryHandle, RootAdmissionHandle, WorkloadConfig, WorkloadControl,
+    CancellationReason, RootAdmissionHandle, WorkloadConfig, WorkloadControl,
     WorkloadObservationHandle, WorkloadShutdownError,
 };
 
@@ -312,7 +315,7 @@ impl std::error::Error for FrontendApplicationError {
 /// supervisor, Registry, workload control, or decode join handles.
 // Design: ADR-0147 (docs/adr/ADR-0147-process-local-work-governance-separates-responsibility-and-resources.md)
 struct FrontendExecutionRuntimeOwner {
-    native_capacity_inputs: crate::native_workload::FrontendNativeCapacityInputs,
+    native_capacity_profile: crate::native_workload::FrontendWorkloadCapacityProfile,
     native_capacity_sources: crate::native_workload::FrontendNativeCapacitySources,
     clock: Arc<dyn novarocks_coordination_contract::MonotonicClock>,
     connector_blocking_io: ConnectorBlockingIoSupervisor,
@@ -336,70 +339,7 @@ struct FrontendExecutionRuntimeOwner {
     result_capacity: novarocks_workload_control::ResultCapacityHandle,
     terminal_error: Option<String>,
     shutdown_complete: bool,
-}
-
-/// FE-owned, asynchronous deadline progression for the unique workload
-/// authority. The worker holds only a narrow expiry capability: it cannot
-/// admit, complete, or release business work.
-struct FrontendWorkloadDeadlineSupervisor {
-    stop: tokio::sync::watch::Sender<bool>,
-    worker: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl FrontendWorkloadDeadlineSupervisor {
-    fn start(runtime: &Handle, deadlines: DeadlineExpiryHandle) -> Self {
-        let (stop, mut stopped) = tokio::sync::watch::channel(false);
-        let worker = runtime.spawn(async move {
-            loop {
-                deadlines.expire_deadlines();
-                let after = deadlines.progress_revision();
-                let next_deadline = deadlines.next_deadline();
-                tokio::select! {
-                    changed = stopped.changed() => {
-                        if changed.is_err() || *stopped.borrow() {
-                            break;
-                        }
-                    }
-                    _ = deadlines.wait_state_change(after) => {}
-                    _ = async {
-                        match next_deadline {
-                            Some(deadline) => tokio::time::sleep_until(deadline).await,
-                            None => std::future::pending::<()>().await,
-                        }
-                    } => {}
-                }
-            }
-        });
-        Self {
-            stop,
-            worker: Some(worker),
-        }
-    }
-
-    async fn shutdown(&mut self) {
-        self.stop.send_replace(true);
-        if let Some(worker) = self.worker.as_mut() {
-            let _ = worker.await;
-            // Keep the original handle on a cancelled await; consume it only
-            // after actual join, before a later Host owner can time out.
-            self.worker.take();
-        }
-    }
-
-    fn abort_for_process_exit(&self) {
-        self.stop.send_replace(true);
-        if let Some(worker) = &self.worker {
-            worker.abort();
-        }
-    }
-}
-
-impl Drop for FrontendWorkloadDeadlineSupervisor {
-    fn drop(&mut self) {
-        if let Some(worker) = &self.worker {
-            worker.abort();
-        }
-    }
+    statement_control_installed: bool,
 }
 
 pub use crate::query_execution::internal_result_cpu::FrontendResultCapacityProfile;
@@ -431,9 +371,9 @@ impl FrontendExecutionRuntimeOwner {
         result_profile: FrontendResultCapacityProfile,
         query_cpu_config: QueryCpuExecutorConfig,
         query_blocking_config: QueryBlockingExecutorConfig,
-        native_capacity_inputs: crate::native_workload::FrontendNativeCapacityInputs,
+        native_capacity_profile: crate::native_workload::FrontendWorkloadCapacityProfile,
     ) -> Result<Self, FrontendApplicationError> {
-        native_capacity_inputs
+        native_capacity_profile
             .validate_pool_declarations(&workload_config, query_blocking_config)
             .map_err(|error| {
                 FrontendApplicationError::new(
@@ -471,6 +411,14 @@ impl FrontendExecutionRuntimeOwner {
                 )
             })?;
         let query_blocking_executor = query_blocking.executor();
+        connector_blocking_io
+            .install_original_executors(query_cpu_executor.clone(), query_blocking_executor.clone())
+            .map_err(|error| {
+                FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::WorkloadControlOpen,
+                    format!("install original connector executors: {error}"),
+                )
+            })?;
         let internal_result_cpu =
             InternalResultCpuOwner::try_new(result_profile, &mut workload.owner).map_err(
                 |error| {
@@ -482,13 +430,27 @@ impl FrontendExecutionRuntimeOwner {
             )?;
         let internal_result_cpu_runtime = internal_result_cpu.runtime();
         // Actual pool/factory capture precedes starting the logical-role service.
-        let native_capacity_sources = native_capacity_inputs
+        let native_capacity_sources = native_capacity_profile
             .capture_sources(
                 &workload_config,
                 result_profile,
                 &query_blocking_executor,
                 &internal_result_cpu_runtime,
             )
+            .map_err(|error| {
+                FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::WorkloadControlOpen,
+                    error,
+                )
+            })?;
+        let progress_policy = FrontendWorkloadProgressPolicy::validate(
+            native_capacity_profile.policy().recheck_interval(),
+        )
+        .map_err(|error| {
+            FrontendApplicationError::new(FrontendApplicationErrorKind::WorkloadControlOpen, error)
+        })?;
+        let (_joint_admission, joint_driver) = native_capacity_profile
+            .install(&mut workload.owner, &native_capacity_sources)
             .map_err(|error| {
                 FrontendApplicationError::new(
                     FrontendApplicationErrorKind::WorkloadControlOpen,
@@ -508,20 +470,28 @@ impl FrontendExecutionRuntimeOwner {
         let lifecycle_diagnostics = Arc::new(FrontendLifecycleDiagnostics::default());
         let clock: Arc<dyn novarocks_coordination_contract::MonotonicClock> =
             Arc::new(novarocks_query_application::coordination::ProcessMonotonicClock::new());
-        let (supervisor, logical_execution_client) = LogicalExecutionSupervisor::with_clock(
+        let (supervisor, logical_execution_client) = LogicalExecutionSupervisor::try_with_clock(
+            &mut workload.owner,
+            0,
+            native_capacity_profile.policy().turn_budget(),
             runtime.clone(),
             Arc::new(FrontendLogicalExecutionNativePort),
             namespace,
             frontend_process_id,
             supervisor_config,
             Arc::clone(&clock),
-        );
+        )
+        .map_err(|error| {
+            FrontendApplicationError::new(FrontendApplicationErrorKind::WorkloadControlOpen, error)
+        })?;
         let deadline_supervisor = FrontendWorkloadDeadlineSupervisor::start(
             &runtime,
             workload.owner.deadline_expiry_handle(),
+            joint_driver,
+            progress_policy,
         );
         Ok(Self {
-            native_capacity_inputs,
+            native_capacity_profile,
             native_capacity_sources,
             clock,
             connector_blocking_io,
@@ -541,10 +511,15 @@ impl FrontendExecutionRuntimeOwner {
             result_capacity,
             terminal_error: None,
             shutdown_complete: false,
+            statement_control_installed: false,
         })
     }
 
     fn mark_ready(&self) -> Result<(), novarocks_workload_control::WorkError> {
+        if self.deadline_supervisor.has_exited() || self.supervisor.service_has_exited() {
+            self.close_admission();
+            return Err(novarocks_workload_control::WorkError::Closed);
+        }
         self.workload
             .as_ref()
             .expect("workload owner exists until execution runtime shutdown")
@@ -569,44 +544,55 @@ impl FrontendExecutionRuntimeOwner {
             return Ok(());
         }
 
-        let mut registry_errors = 0;
-        loop {
-            match self.supervisor.shutdown_until(deadline).await {
-                Ok(()) => break,
-                Err(LogicalExecutionSupervisorShutdownError::DeadlineExceeded) => {
-                    return Err(
-                        "frontend logical execution supervisor shutdown deadline exceeded"
-                            .to_string(),
-                    );
-                }
-                Err(LogicalExecutionSupervisorShutdownError::Registry(error)) => {
-                    let message = error.to_string();
-                    self.record_terminal_error(message);
-                    registry_errors += 1;
-                    if registry_errors == 1 {
-                        // A concurrent Registry transition, or a one-shot
-                        // observation failure, may already have made the exact
-                        // owner convergent. Retry once in place while retaining
-                        // the first invariant failure for the final report.
-                        tokio::task::yield_now().await;
-                        continue;
+        // Once the same WC has actually drained, later executor-join retries
+        // must not classify the already requested service stop as a failure.
+        if self.workload.is_some() {
+            let mut registry_errors = 0;
+            loop {
+                let outcome = tokio::select! {
+                    outcome = self.supervisor.shutdown_until(deadline) => outcome,
+                    _ = std::future::poll_fn(|cx| self.deadline_supervisor.poll_exit(cx)) => {
+                        return Err("frontend joint progress service terminated before workload drain".to_string());
                     }
-                    return Err(self
-                        .terminal_error
-                        .clone()
-                        .expect("the Registry error is retained"));
-                }
-                Err(error) => {
-                    self.record_terminal_error(error.to_string());
-                    break;
+                };
+                match outcome {
+                    Ok(()) => break,
+                    Err(LogicalExecutionSupervisorShutdownError::DeadlineExceeded) => {
+                        return Err(
+                            "frontend logical execution supervisor shutdown deadline exceeded"
+                                .to_string(),
+                        );
+                    }
+                    Err(LogicalExecutionSupervisorShutdownError::Registry(error)) => {
+                        let message = error.to_string();
+                        self.record_terminal_error(message);
+                        registry_errors += 1;
+                        if registry_errors == 1 {
+                            // A concurrent Registry transition, or a one-shot
+                            // observation failure, may already have made the exact
+                            // owner convergent. Retry once in place while retaining
+                            // the first invariant failure for the final report.
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        return Err(self
+                            .terminal_error
+                            .clone()
+                            .expect("the Registry error is retained"));
+                    }
+                    Err(error) => {
+                        self.record_terminal_error(error.to_string());
+                        break;
+                    }
                 }
             }
-        }
 
-        if self.workload.is_some() {
             self.shutdown_workload_until(deadline).await?;
         }
-        self.deadline_supervisor.shutdown().await;
+        self.deadline_supervisor
+            .shutdown_after_workload_drained()
+            .await
+            .map_err(|_| "frontend joint progress service failed before actual join".to_string())?;
 
         self.query_cpu.shutdown_until(deadline).await?;
 
@@ -641,6 +627,12 @@ impl FrontendExecutionRuntimeOwner {
 
     async fn shutdown_workload_until(&mut self, deadline: Instant) -> Result<(), String> {
         loop {
+            if self.deadline_supervisor.has_exited() {
+                let _ = std::future::poll_fn(|cx| self.deadline_supervisor.poll_exit(cx)).await;
+                return Err(
+                    "frontend joint progress service terminated before workload drain".to_string(),
+                );
+            }
             if let Some(error) = self.connector_blocking_io.take_original_failure() {
                 // Keep arbitrary provider payload destruction off the Host
                 // future and hold its original backing until actual join.
@@ -706,6 +698,9 @@ impl FrontendExecutionRuntimeOwner {
             tokio::select! {
                 _ = wait => {},
                 _ = self.connector_blocking_io.wait_failure() => {},
+                _ = std::future::poll_fn(|cx| self.deadline_supervisor.poll_exit(cx)) => {
+                    return Err("frontend joint progress service terminated before workload drain".to_string());
+                }
                 _ = tokio::time::sleep_until(deadline.into()) => {
                     return Err("frontend workload shutdown deadline exceeded before drain".to_string());
                 }
@@ -896,7 +891,7 @@ impl Default for FrontendQueryControlTimeouts {
 
 #[derive(Clone)]
 pub struct FrontendLogicalExecutionRuntimeConfig {
-    native_capacity_inputs: crate::native_workload::FrontendNativeCapacityInputs,
+    native_capacity_profile: crate::native_workload::FrontendWorkloadCapacityProfile,
     supervisor: LogicalExecutionSupervisorConfig,
     workload: WorkloadConfig,
     result_profile: FrontendResultCapacityProfile,
@@ -909,10 +904,10 @@ impl FrontendLogicalExecutionRuntimeConfig {
         workload: WorkloadConfig,
         abort_effect_capacity: NonZeroUsize,
         result_profile: FrontendResultCapacityProfile,
-        native_capacity_inputs: crate::native_workload::FrontendNativeCapacityInputs,
+        native_capacity_profile: crate::native_workload::FrontendWorkloadCapacityProfile,
     ) -> Self {
         Self {
-            native_capacity_inputs,
+            native_capacity_profile,
             supervisor,
             workload,
             result_profile,
@@ -920,30 +915,14 @@ impl FrontendLogicalExecutionRuntimeConfig {
         }
     }
 
-    fn test_capacity_inputs(
+    #[cfg(test)]
+    fn test_capacity_profile(
         query_blocking: QueryBlockingExecutorConfig,
-    ) -> crate::native_workload::FrontendNativeCapacityInputs {
-        use crate::native_workload::{
-            FrontendDependencyCustodyLimits, FrontendNativeCapacityInputs,
-            FrontendWorkloadCapacityConfig,
-        };
-        // Explicit in-process convenience policy only; Server supplies its own.
-        let policy = FrontendWorkloadCapacityConfig::try_new(
-            [4096, 1024, 1024, 1024, 1024],
-            FrontendDependencyCustodyLimits {
-                unreceived_productions: 256,
-                publications: 256,
-                residuals: 256,
-                retained_payload_bytes: 4 * 1024 * 1024 * 1024,
-            },
-            NonZeroUsize::new(7).unwrap(),
-            Duration::from_millis(25),
-        )
-        .expect("explicit test policy");
-        FrontendNativeCapacityInputs::try_new(policy, query_blocking)
-            .expect("explicit test pool geometry")
+    ) -> crate::native_workload::FrontendWorkloadCapacityProfile {
+        crate::native_workload::original_owner_test_profile(query_blocking)
     }
 
+    #[cfg(test)]
     fn for_test() -> Self {
         Self::new(
             LogicalExecutionSupervisorConfig::new(
@@ -956,13 +935,13 @@ impl FrontendLogicalExecutionRuntimeConfig {
                     DEFAULT_REPLACEMENT_RESERVATION_VALID_FOR,
                 ),
             ),
-            WorkloadConfig::default(),
+            crate::native_workload::original_owner_test_workload(),
             DEFAULT_LOGICAL_ABORT_EFFECT_CAPACITY,
             FrontendResultCapacityProfile::try_new(
                 novarocks_workload_control::ResultCapacityConfig::V1,
             )
             .expect("test result profile"),
-            Self::test_capacity_inputs(QueryBlockingExecutorConfig::new(
+            Self::test_capacity_profile(QueryBlockingExecutorConfig::new(
                 DEFAULT_QUERY_BLOCKING_WORKER_COUNT,
                 DEFAULT_QUERY_BLOCKING_QUEUE_CAPACITY,
             )),
@@ -972,7 +951,7 @@ impl FrontendLogicalExecutionRuntimeConfig {
 
 #[derive(Clone)]
 pub struct FrontendExecutionConfig {
-    native_capacity_inputs: crate::native_workload::FrontendNativeCapacityInputs,
+    native_capacity_profile: crate::native_workload::FrontendWorkloadCapacityProfile,
     #[cfg(novarocks_dev_controls)]
     test_session: Option<crate::test_session::FrontendTestSessionConfig>,
     runtime_filter_worker_count: NonZeroUsize,
@@ -1080,7 +1059,7 @@ impl FrontendExecutionConfig {
                 DEFAULT_QUERY_BLOCKING_WORKER_COUNT,
                 DEFAULT_QUERY_BLOCKING_QUEUE_CAPACITY,
             ),
-            native_capacity_inputs: logical_runtime.native_capacity_inputs,
+            native_capacity_profile: logical_runtime.native_capacity_profile,
             logical_execution_supervisor: logical_runtime.supervisor,
             workload: logical_runtime.workload,
             result_profile: logical_runtime.result_profile,
@@ -1114,6 +1093,7 @@ impl FrontendExecutionConfig {
 
     /// In-process test convenience with deterministic local governance bounds.
     #[doc(hidden)]
+    #[cfg(test)]
     pub fn new_for_test(
         runtime_filter_worker_count: NonZeroUsize,
         native_compatibility_id: NativeCompatibilityId,
@@ -1411,8 +1391,8 @@ impl FrontendApplicationHost {
             FrontendApplicationError::new(FrontendApplicationErrorKind::CoordinatorOpen, error)
         })?;
         // Same original Native owners, checked before any logical-role service.
-        let native_capacity_inputs = execution
-            .native_capacity_inputs
+        let native_capacity_profile = execution
+            .native_capacity_profile
             .clone()
             .with_native_sources(&data_runtime)
             .map_err(|error| {
@@ -1430,7 +1410,7 @@ impl FrontendApplicationHost {
             execution.result_profile,
             execution.query_cpu_executor_config,
             execution.query_blocking_executor_config,
-            native_capacity_inputs,
+            native_capacity_profile,
         )?;
         let catalog_runtime_projection =
             crate::catalog_application::CatalogRuntimeProjection::new();
@@ -1869,9 +1849,55 @@ impl FrontendApplicationHost {
             .cancel_active_roots_at_drain_deadline()
     }
 
-    /// Opens both the legacy serving gate and the new governed root gate after
-    /// Server composition has installed every required service.
+    /// Pure level observation; original joins and causes stay with their owners.
+    pub(crate) fn workload_progress_has_exited(&self) -> bool {
+        self.execution_runtime_owner
+            .deadline_supervisor
+            .has_exited()
+            || self.execution_runtime_owner.supervisor.service_has_exited()
+    }
+
+    /// Diagnostic borrowing never consumes or disposes the original cause.
+    pub fn original_workload_progress_failure(&self) -> Option<&tokio::task::JoinError> {
+        self.execution_runtime_owner
+            .deadline_supervisor
+            .original_failure()
+    }
+
+    /// Bind the same session-control owner before any statement or Ready cut.
+    pub(crate) fn install_statement_control(
+        &mut self,
+        control: novarocks_query_application::session_control::QueryControlService,
+    ) -> Result<(), FrontendApplicationError> {
+        self.execution_runtime_owner
+            .supervisor
+            .install_statement_control(control)
+            .map_err(|error| {
+                FrontendApplicationError::server(format!("install statement control: {error:?}"))
+            })?;
+        self.execution_runtime_owner.statement_control_installed = true;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_statement_control_for_test(&mut self) {
+        let owner = Arc::new(
+            novarocks_query_application::query_control::QueryApplicationControl::default(),
+        );
+        self.install_statement_control(
+            novarocks_query_application::session_control::QueryControlService::new(owner),
+        )
+        .expect("install the original test statement-control owner");
+    }
+
+    /// Open the original serving and root gates after mandatory installation.
     pub(crate) fn mark_ready(&self) -> Result<(), FrontendApplicationError> {
+        if !self.execution_runtime_owner.statement_control_installed {
+            self.execution_runtime_owner.close_admission();
+            return Err(FrontendApplicationError::server(
+                "original statement control was not installed",
+            ));
+        }
         self.execution_runtime_owner.mark_ready().map_err(|error| {
             FrontendApplicationError::server(format!(
                 "mark frontend workload authority ready after bootstrap: {error}"
@@ -2478,19 +2504,60 @@ mod tests {
 
     #[tokio::test]
     async fn deadline_supervisor_keeps_an_observed_join_terminal_on_shutdown_retry() {
-        let workload =
-            novarocks_workload_control::WorkloadControl::try_new_counted(WorkloadConfig::default())
-                .unwrap();
+        let profile =
+            crate::native_workload::original_owner_test_profile(QueryBlockingExecutorConfig::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+            ));
+        let mut workload = novarocks_workload_control::WorkloadControl::try_new_counted(
+            crate::native_workload::original_owner_test_workload(),
+        )
+        .unwrap();
+        let mut blocking = novarocks_query_application::cpu::QueryBlockingExecutorOwner::try_new(
+            profile.inputs().query_blocking_capacity(),
+        )
+        .unwrap();
+        let mut cpu = crate::query_execution::internal_result_cpu::InternalResultCpuOwner::try_new(
+            FrontendResultCapacityProfile::for_test(),
+            &mut workload.owner,
+        )
+        .unwrap();
+        let sources = profile
+            .capture_sources(
+                &crate::native_workload::original_owner_test_workload(),
+                FrontendResultCapacityProfile::for_test(),
+                &blocking.executor(),
+                &cpu.runtime(),
+            )
+            .unwrap();
+        let (_, driver) = profile.install(&mut workload.owner, &sources).unwrap();
         let mut supervisor = super::FrontendWorkloadDeadlineSupervisor::start(
             &tokio::runtime::Handle::current(),
             workload.owner.deadline_expiry_handle(),
+            driver,
+            super::FrontendWorkloadProgressPolicy::validate(Duration::from_millis(25)).unwrap(),
         );
-        supervisor.shutdown().await;
-        // A later owner can exhaust the Host deadline after this original join
-        // has completed. Retrying teardown must not poll that handle again.
-        supervisor.shutdown().await;
         workload.owner.close_admission();
         assert!(workload.owner.shutdown().is_ok());
+        // Cancel a borrowed wait after requesting stop; the same owner still
+        // holds its original join and driver until the subsequent actual join.
+        let mut first = Box::pin(supervisor.shutdown_after_workload_drained());
+        let was_pending = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(first.as_mut(), cx).is_pending())
+        })
+        .await;
+        drop(first);
+        let joined = supervisor.shutdown_after_workload_drained().await;
+        let retried = supervisor.shutdown_after_workload_drained().await;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let cpu_exit = cpu.shutdown_until(deadline).await;
+        let blocking_exit = blocking.shutdown_until(deadline).await;
+        // Observe all original exits before assertions can unwind the fixture.
+        assert!(was_pending);
+        assert_eq!(joined, Ok(()));
+        assert_eq!(retried, Ok(()));
+        assert!(cpu_exit.is_ok());
+        assert!(blocking_exit.is_ok());
     }
 
     #[tokio::test]
@@ -2509,14 +2576,14 @@ mod tests {
                     Duration::from_secs(1),
                 ),
             ),
-            WorkloadConfig::default(),
+            crate::native_workload::original_owner_test_workload(),
             FrontendResultCapacityProfile::for_test(),
             QueryCpuExecutorConfig::with_idle_keepalive(Duration::from_millis(20)),
             QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
             ),
-            super::FrontendLogicalExecutionRuntimeConfig::test_capacity_inputs(
+            super::FrontendLogicalExecutionRuntimeConfig::test_capacity_profile(
                 QueryBlockingExecutorConfig::new(
                     NonZeroUsize::new(1).unwrap(),
                     NonZeroUsize::new(1).unwrap(),
@@ -2560,14 +2627,14 @@ mod tests {
                     Duration::from_secs(1),
                 ),
             ),
-            WorkloadConfig::default(),
+            crate::native_workload::original_owner_test_workload(),
             FrontendResultCapacityProfile::for_test(),
             QueryCpuExecutorConfig::with_idle_keepalive(Duration::from_millis(20)),
             QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
             ),
-            super::FrontendLogicalExecutionRuntimeConfig::test_capacity_inputs(
+            super::FrontendLogicalExecutionRuntimeConfig::test_capacity_profile(
                 QueryBlockingExecutorConfig::new(
                     NonZeroUsize::new(1).unwrap(),
                     NonZeroUsize::new(1).unwrap(),
@@ -2597,6 +2664,7 @@ mod tests {
             novarocks_workload_control::CancellationReason::DeadlineExceeded
         );
 
+        drop(cancellation);
         work.owner.complete();
         work.business.release();
         runtime
@@ -2621,14 +2689,14 @@ mod tests {
                     Duration::from_secs(1),
                 ),
             ),
-            WorkloadConfig::default(),
+            crate::native_workload::original_owner_test_workload(),
             FrontendResultCapacityProfile::for_test(),
             QueryCpuExecutorConfig::with_idle_keepalive(Duration::from_millis(20)),
             QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
             ),
-            super::FrontendLogicalExecutionRuntimeConfig::test_capacity_inputs(
+            super::FrontendLogicalExecutionRuntimeConfig::test_capacity_profile(
                 QueryBlockingExecutorConfig::new(
                     NonZeroUsize::new(1).unwrap(),
                     NonZeroUsize::new(1).unwrap(),
@@ -2716,7 +2784,7 @@ mod tests {
             Duration::from_secs(1),
         )
         .unwrap();
-        let host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+        let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
             Some(test_state_store_input(name)),
             &registry,
             FrontendExecutionConfig::new_for_test(
@@ -2735,6 +2803,7 @@ mod tests {
         )
         .await
         .unwrap();
+        host.install_statement_control_for_test();
         host.mark_ready()
             .expect("original Host admission becomes ready");
         host

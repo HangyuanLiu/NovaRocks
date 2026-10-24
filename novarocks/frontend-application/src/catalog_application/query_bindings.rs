@@ -471,6 +471,19 @@ impl QueryTableBindingStore {
             .scope()
     }
 
+    /// Observe a completed binding without starting another provider load.
+    /// This is not a token mint or a permission to materialize a new relation.
+    pub(crate) fn resolved_lookup(
+        &self,
+        key: &QueryTableBindingKey,
+    ) -> Option<Result<SqlTableBindingId, String>> {
+        self.entries
+            .lock()
+            .expect("query table binding lock")
+            .get(key)
+            .map(|entry| entry.as_ref().map(|stored| stored.id).map_err(Clone::clone))
+    }
+
     /// Memoize both success and failure.  The supplied load closure executes
     /// at most once for a canonical key in this request.
     #[cfg(test)]
