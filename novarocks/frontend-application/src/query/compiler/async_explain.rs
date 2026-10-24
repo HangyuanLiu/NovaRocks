@@ -39,6 +39,7 @@ impl FrontendQueryCompiler {
         context: &RequestContext,
         query_options: Option<QueryOptions>,
         scope: &novarocks_workload_control::WorkScope,
+        provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
     ) -> Result<PreparedAsyncExplain, FrontendQueryCompilerError> {
         let connector_planning_context = connector_planning_context_for_query_on_runtime(
             self.connector_blocking_io.runtime(),
@@ -85,6 +86,7 @@ impl FrontendQueryCompiler {
                     execution,
                     scope,
                     std::time::Instant::now(),
+                    provider_source,
                 )
                 .await;
         }
@@ -146,6 +148,7 @@ impl FrontendQueryCompiler {
             execution,
             scope,
             level,
+            provider_source,
         )
         .await
     }
@@ -164,15 +167,15 @@ impl FrontendQueryCompiler {
         execution: &QueryExecutionContext,
         scope: &novarocks_workload_control::WorkScope,
         level: ExplainLevel,
+        provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
     ) -> Result<PreparedAsyncExplain, FrontendQueryCompilerError> {
-        use novarocks_query_application::preparation::FinalPlanCompletionDriver;
-
         let connector_context = connector_planning_context.request();
         let bindings = Arc::new(
             crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()
                 .expect("query table binding scope allocation must not fail"),
         );
-        let facts = crate::query_execution::completion_facts::frontend_fact_source(
+        crate::query_execution::completion_facts::install_frontend_fact_source(
+            provider_source,
             self.completion_fact_owners(),
             crate::query_execution::completion_facts::StatementFactScope::new(
                 Arc::clone(&bindings),
@@ -188,7 +191,8 @@ impl FrontendQueryCompiler {
             .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?,
             crate::query_execution::compiler::typed_connector_session()
                 .map_err(FrontendQueryCompilerError::Engine)?,
-        );
+        )
+        .map_err(FrontendQueryCompilerError::Engine)?;
         let request = novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
             crate::query_execution::physical_encoding::mint_plan_version(),
             SqlStatementInput::parsed_query(Box::new(query.clone())),
@@ -212,9 +216,17 @@ impl FrontendQueryCompiler {
             novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
         );
         let control = request.control().clone();
-        let completed = FinalPlanCompletionDriver::new(Arc::new(facts))
+        let completed = provider_source
             .complete(request, scope)
             .await
+            // The original typed health and entire Provider/result remain in
+            // the action's source. This safe value is never published as a
+            // domain verdict: QA checks local_health_failure before Ready.
+            .map_err(|_| {
+                FrontendQueryCompilerError::Engine(
+                    "completion Provider actual exit is unproven".to_owned(),
+                )
+            })?
             .map_err(|failure| FrontendQueryCompilerError::from_completion(failure.error()))?;
         let lines = completed
             .candidate()
@@ -240,14 +252,14 @@ impl FrontendQueryCompiler {
         execution: &QueryExecutionContext,
         scope: &novarocks_workload_control::WorkScope,
         planning_started_at: std::time::Instant,
+        provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
     ) -> Result<PreparedAsyncExplain, FrontendQueryCompilerError> {
-        use novarocks_query_application::preparation::FinalPlanCompletionDriver;
-
         let bindings = Arc::new(
             QueryTableBindingStore::try_new()
                 .expect("query table binding scope allocation must not fail"),
         );
-        let facts = crate::query_execution::completion_facts::frontend_fact_source(
+        crate::query_execution::completion_facts::install_frontend_fact_source(
+            provider_source,
             self.completion_fact_owners(),
             crate::query_execution::completion_facts::StatementFactScope::new(
                 Arc::clone(&bindings),
@@ -263,7 +275,8 @@ impl FrontendQueryCompiler {
             .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?,
             crate::query_execution::compiler::typed_connector_session()
                 .map_err(FrontendQueryCompilerError::Engine)?,
-        );
+        )
+        .map_err(FrontendQueryCompilerError::Engine)?;
         let version = crate::query_execution::physical_encoding::mint_plan_version();
         let request = novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
             version,
@@ -288,9 +301,17 @@ impl FrontendQueryCompiler {
             novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
         );
         let encoding_control = request.control().clone();
-        let completed = FinalPlanCompletionDriver::new(Arc::new(facts))
+        let completed = provider_source
             .complete(request, scope)
             .await
+            // The original typed health and entire Provider/result remain in
+            // the action's source. This safe value is never published as a
+            // domain verdict: QA checks local_health_failure before Ready.
+            .map_err(|_| {
+                FrontendQueryCompilerError::Engine(
+                    "completion Provider actual exit is unproven".to_owned(),
+                )
+            })?
             .map_err(|failure| FrontendQueryCompilerError::from_completion(failure.error()))?;
         let completed = completed
             .freeze_root_output(novarocks_result_contract::FrozenRootOutput::CountOnly)

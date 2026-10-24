@@ -44,6 +44,12 @@ pub trait GovernedStatementAction: Send + 'static {
         None
     }
 
+    /// A stable local source could not prove actual exit. This is independent
+    /// of a query-domain error and retains this same action without repolling.
+    fn local_health_failure(&self) -> Option<crate::api::StatementNativeHealthFailure> {
+        None
+    }
+
     fn poll_action(
         &mut self,
         owner: &mut GovernedQueryStatementOwner,
@@ -51,8 +57,13 @@ pub trait GovernedStatementAction: Send + 'static {
     ) -> Poll<Result<StatementActionValue, QueryServiceError>>;
 }
 
+enum StatementActionFailureCause {
+    Panic(Mutex<Box<dyn Any + Send>>),
+    LocalHealth(crate::api::StatementNativeHealthFailure),
+}
+
 pub struct StatementActionFailure {
-    primary: Mutex<Box<dyn Any + Send>>,
+    primary: StatementActionFailureCause,
     publication: AtomicU8,
 }
 impl StatementActionFailure {
@@ -66,8 +77,19 @@ impl StatementActionFailure {
         }
     }
 
-    pub fn payload(&self) -> std::sync::MutexGuard<'_, Box<dyn Any + Send>> {
-        self.primary.lock().unwrap_or_else(|p| p.into_inner())
+    pub fn panic_payload(&self) -> Option<std::sync::MutexGuard<'_, Box<dyn Any + Send>>> {
+        match &self.primary {
+            StatementActionFailureCause::Panic(payload) => {
+                Some(payload.lock().unwrap_or_else(|p| p.into_inner()))
+            }
+            StatementActionFailureCause::LocalHealth(_) => None,
+        }
+    }
+    pub fn health(&self) -> Option<&crate::api::StatementNativeHealthFailure> {
+        match &self.primary {
+            StatementActionFailureCause::Panic(_) => None,
+            StatementActionFailureCause::LocalHealth(health) => Some(health),
+        }
     }
 }
 impl std::fmt::Debug for StatementActionFailure {
@@ -338,13 +360,16 @@ impl StatementActionSource {
         drop((primary, secondary));
     }
     fn record_failure(&self, primary: Box<dyn Any + Send>) {
+        self.record_cause(StatementActionFailureCause::Panic(Mutex::new(primary)));
+    }
+    fn record_cause(&self, primary: StatementActionFailureCause) {
         let packet = Arc::new(StatementActionFailure {
-            primary: Mutex::new(primary),
+            primary,
             publication: AtomicU8::new(0),
         });
         // The actual packet's raw cause is already retained. Initialize its
         // one quoted platform backing before sharing the packet with observers.
-        drop(packet.primary.lock().unwrap_or_else(|p| p.into_inner()));
+        drop(packet.panic_payload());
         let overflow = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             packet
@@ -365,6 +390,21 @@ impl StatementActionSource {
         // never ordinary opaque-cause destruction under this metadata lock.
         if let Some(packet) = overflow {
             std::panic::panic_any(packet);
+        }
+    }
+    fn retain_local_health(&self, action: &dyn GovernedStatementAction) -> bool {
+        // Borrow foreign metadata outside State. The original action remains
+        // in its restoration loan on panic and on an actual-exit refusal.
+        match catch_unwind(AssertUnwindSafe(|| action.local_health_failure())) {
+            Ok(None) => true,
+            Ok(Some(failure)) => {
+                self.record_cause(StatementActionFailureCause::LocalHealth(failure));
+                false
+            }
+            Err(primary) => {
+                self.record_failure(primary);
+                false
+            }
         }
     }
     fn retain_publication(&self, action: &dyn GovernedStatementAction) -> bool {
@@ -432,7 +472,15 @@ impl StatementActionSource {
         }));
         match result {
             Ok(Poll::Pending) => {
+                let healthy =
+                    self.retain_local_health(loan.action.as_deref().expect("same original action"));
+                if !healthy {
+                    self.retain_publication(loan.action.as_deref().expect("same original action"));
+                }
                 drop(loan);
+                if !healthy {
+                    self.waiter.wake();
+                }
             }
             Err(primary) => {
                 // The same original cause becomes stable BEFORE any action/F
@@ -446,6 +494,15 @@ impl StatementActionSource {
                 {
                     let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     state.result = Some(result);
+                }
+                // A close failure preserves the whole action/owner even when
+                // its safe business result is Ready. It is not a fake panic.
+                if !self.retain_local_health(loan.action.as_deref().expect("same original action"))
+                {
+                    self.retain_publication(loan.action.as_deref().expect("same original action"));
+                    drop(loan);
+                    self.waiter.wake();
+                    return;
                 }
                 // The value is stable before reading the original effect fact,
                 // which must survive a subsequent action destructor panic.

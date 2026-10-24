@@ -28,6 +28,9 @@
 //! revision and selection interpretation then consume those completed facts;
 //! the shared connector worker remains only for explicitly authored leaf work.
 
+mod provider_source;
+pub(crate) use provider_source::FrontendCompletionCustody;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -329,6 +332,32 @@ pub(crate) fn frontend_fact_source(
         scope.capacity.clone(),
     ));
     statement_fact_source(owners, scope, provider_reads)
+}
+
+/// Install the same concrete Provider and fact ports in the original action's
+/// fixed source before constructing the driver future. Refusal never replaces
+/// an older, potentially unfinished source.
+pub(crate) fn install_frontend_fact_source(
+    custody: &FrontendCompletionCustody,
+    owners: CompletionFactOwners,
+    scope: StatementFactScope,
+    session: ConnectorSession,
+) -> Result<(), String> {
+    let provider = Arc::new(FrontendProviderReadFacts::new(
+        Arc::clone(&owners.connector_control),
+        Arc::clone(&scope.bindings),
+        session,
+        scope.connector_context.clone(),
+        owners.blocking.clone(),
+        scope.capacity.clone(),
+    ));
+    let facts = Arc::new(statement_fact_source(owners, scope, provider.clone()));
+    custody.install(facts, provider).map_err(|original| {
+        // No work can have been issued by this rejected new port. Destruction
+        // is outside the fixed custody lock; the old source remains unchanged.
+        drop(original);
+        "completion Provider source is already installed".to_owned()
+    })
 }
 
 /// The one fact source one statement's completion is driven with.

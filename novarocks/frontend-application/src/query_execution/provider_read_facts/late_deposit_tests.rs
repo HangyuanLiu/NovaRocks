@@ -30,6 +30,7 @@ use novarocks_spi::connector::read_stack::*;
 use novarocks_spi::connector::*;
 use novarocks_workload_control::{CancellationReason, ResultWindowClass};
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime};
@@ -649,6 +650,9 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
         )
         .for_cpu_fixture(provider_cpu.runtime()),
     );
+    let completion_source =
+        crate::query_execution::completion_facts::FrontendCompletionCustody::new();
+    completion_source.install_provider_for_test(Arc::clone(&port));
     let column = novarocks_sql::compiler::fixtures::provider_read_column_need(
         0,
         "k",
@@ -701,8 +705,15 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
     root.business.release();
     drop(window);
     let held_call = control.snapshot();
-    let close_port = Arc::clone(&port);
-    let mut closed = runtime.spawn(async move { close_port.join_local_closed().await });
+    // Really poll and then cancel a borrowed close while the original worker
+    // is paused in sealing. No task, receipt or input is replaced by this Drop.
+    let mut borrowed_close = Box::pin(completion_source.close());
+    let borrowed_close_pending = runtime.block_on(std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(borrowed_close.as_mut().poll(cx).is_pending())
+    }));
+    drop(borrowed_close);
+    let close_source = Arc::clone(&completion_source);
+    let mut closed = runtime.spawn(async move { close_source.close().await });
     let _ = release_seal.send(());
     let table_drop_entered = drop_entered.recv_timeout(Duration::from_secs(2)).is_ok();
     let held_output = control.snapshot();
@@ -717,15 +728,17 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
     // retained in this concrete failure packet through test-harness disposition.
     if !closed_ok {
         struct CloseFailure {
-            _join: tokio::task::JoinHandle<Result<(), Arc<dyn std::error::Error + Send + Sync>>>,
+            _join: tokio::task::JoinHandle<
+                Result<(), novarocks_query_application::api::StatementNativeHealthFailure>,
+            >,
             _outcome: Result<
                 Result<
-                    Result<(), Arc<dyn std::error::Error + Send + Sync>>,
+                    Result<(), novarocks_query_application::api::StatementNativeHealthFailure>,
                     tokio::task::JoinError,
                 >,
                 tokio::time::error::Elapsed,
             >,
-            _source: Arc<FrontendProviderReadFacts>,
+            _source: Arc<crate::query_execution::completion_facts::FrontendCompletionCustody>,
             _cpu: std::mem::ManuallyDrop<
                 crate::query_execution::internal_result_cpu::InternalResultCpuOwner,
             >,
@@ -734,7 +747,7 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
         std::panic::panic_any(CloseFailure {
             _join: closed,
             _outcome: actual_closed,
-            _source: port,
+            _source: completion_source,
             _cpu: std::mem::ManuallyDrop::new(provider_cpu),
             _runtime: std::mem::ManuallyDrop::new(runtime),
         });
@@ -742,7 +755,9 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
     runtime
         .block_on(provider_cpu.shutdown_until(Instant::now() + Duration::from_secs(2)))
         .unwrap();
+    let source_healthy = completion_source.local_health_failure().is_none();
     drop(port);
+    drop(completion_source);
     let deadline = Instant::now() + Duration::from_secs(2);
     let after = loop {
         let facts = control.snapshot();
@@ -770,6 +785,8 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
             && held
             && watchdog_joined
             && closed_ok
+            && borrowed_close_pending
+            && source_healthy
     );
     for facts in [&held_call, &held_output] {
         assert_eq!(facts.root_responsibilities, 1);

@@ -2262,7 +2262,7 @@ mod tests {
         *observer.lock().unwrap() = receiver.take();
         drive_original_statement_actions(&slot);
         let failure = slot.failure().expect("same original cause");
-        assert!(failure.payload().is::<Cause>());
+        assert!(failure.panic_payload().unwrap().is::<Cause>());
         assert_eq!(
             failure.publication_disposition(),
             Some(LakePublicationDisposition::KnownCommitted)
@@ -2295,6 +2295,194 @@ mod tests {
         source.dispose_poisoned_for_test(&service);
         drop(source);
         assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
+    }
+
+    #[test]
+    fn original_statement_retains_typed_local_health_on_pending_and_ready_without_repoll() {
+        use crate::session_control::{GovernedStatementAction, StatementActionValue};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct OriginalHealthCause(Arc<AtomicUsize>);
+        impl std::fmt::Display for OriginalHealthCause {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("original local source exit is unproven")
+            }
+        }
+        impl std::error::Error for OriginalHealthCause {}
+        impl Drop for OriginalHealthCause {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct HealthAction {
+            failure: crate::api::StatementNativeHealthFailure,
+            ready: bool,
+            polls: Arc<AtomicUsize>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl GovernedStatementAction for HealthAction {
+            fn local_health_failure(&self) -> Option<crate::api::StatementNativeHealthFailure> {
+                Some(self.failure.clone())
+            }
+            fn poll_action(
+                &mut self,
+                _: &mut crate::session_control::GovernedQueryStatementOwner,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<
+                Result<StatementActionValue, crate::session_error::QueryServiceError>,
+            > {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                if self.ready {
+                    std::task::Poll::Ready(Ok(StatementActionValue::Ok))
+                } else {
+                    std::task::Poll::Pending
+                }
+            }
+        }
+        impl Drop for HealthAction {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        for ready in [false, true] {
+            let (control, service, workload) = governed_control();
+            let session = register(&control, 7, 1, "root");
+            let slot = crate::session_control::StatementProgressSlot::empty();
+            slot.install(service.clone()).unwrap();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let cause_drops = Arc::new(AtomicUsize::new(0));
+            let mut owner = Some(
+                service
+                    .begin_governed_query_statement(
+                        session,
+                        &workload.root_admission(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+            );
+            let mut action: Option<Box<dyn GovernedStatementAction>> =
+                Some(Box::new(HealthAction {
+                    failure: crate::api::StatementNativeHealthFailure::actual_exit_unproven(
+                        "original local failure",
+                        Arc::new(OriginalHealthCause(Arc::clone(&cause_drops))),
+                    ),
+                    ready,
+                    polls: Arc::clone(&polls),
+                    drops: Arc::clone(&drops),
+                }));
+            let mut observer = None;
+            service
+                .publish_statement_action_in(&mut owner, &mut action, &mut observer)
+                .unwrap()
+                .finish()
+                .unwrap();
+            drive_original_statement_actions(&slot);
+            let failure = slot.failure().expect("same typed health packet");
+            assert!(failure.panic_payload().is_none());
+            assert!(
+                failure
+                    .health()
+                    .unwrap()
+                    .cause()
+                    .is::<OriginalHealthCause>()
+            );
+            assert_eq!(cause_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            assert_eq!(workload.snapshot().root_responsibilities, 1);
+            let mut observer = observer.take().unwrap();
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            use std::future::Future;
+            match std::pin::Pin::new(&mut observer).poll(&mut cx) {
+                std::task::Poll::Ready(Err(
+                    crate::session_control::StatementActionWaitError::Failed(packet),
+                )) => {
+                    assert!(Arc::ptr_eq(&failure, &packet));
+                    assert!(packet.health().is_some());
+                }
+                _ => panic!("typed health must not publish the safe Ready value"),
+            }
+            drop(observer);
+            drive_original_statement_actions(&slot);
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            let source = control.next_statement_action(None).unwrap().1.unwrap();
+            drop(failure);
+            source.dispose_poisoned_for_test(&service);
+            drop(source);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(cause_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(workload.snapshot().root_responsibilities, 0);
+        }
+    }
+
+    #[test]
+    fn ordinary_statement_service_error_is_not_a_local_health_failure() {
+        struct DomainError;
+        impl crate::session_control::GovernedStatementAction for DomainError {
+            fn poll_action(
+                &mut self,
+                _: &mut crate::session_control::GovernedQueryStatementOwner,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<
+                Result<
+                    crate::session_control::StatementActionValue,
+                    crate::session_error::QueryServiceError,
+                >,
+            > {
+                std::task::Poll::Ready(Err(crate::session_error::QueryServiceError::new(
+                    crate::session_error::QueryServiceErrorKind::InvalidValue,
+                    "original business rejection",
+                )))
+            }
+        }
+        let (control, service, workload) = governed_control();
+        let session = register(&control, 7, 1, "root");
+        let slot = crate::session_control::StatementProgressSlot::empty();
+        slot.install(service.clone()).unwrap();
+        let mut owner = Some(
+            service
+                .begin_governed_query_statement(
+                    session,
+                    &workload.root_admission(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+        );
+        let mut action: Option<Box<dyn crate::session_control::GovernedStatementAction>> =
+            Some(Box::new(DomainError));
+        let mut observer = None;
+        service
+            .publish_statement_action_in(&mut owner, &mut action, &mut observer)
+            .unwrap()
+            .finish()
+            .unwrap();
+        drive_original_statement_actions(&slot);
+        assert!(slot.failure().is_none());
+        let mut observer = observer.take().unwrap();
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        use std::future::Future;
+        let std::task::Poll::Ready(Ok(receipt)) = std::pin::Pin::new(&mut observer).poll(&mut cx)
+        else {
+            panic!("ordinary domain result retains the normal receipt protocol");
+        };
+        let mut ready = None;
+        receipt
+            .take_ready_in(&mut ready)
+            .unwrap_or_else(|_| panic!("original receipt destination must be empty"))
+            .finish()
+            .unwrap();
+        let ready = ready.take().unwrap();
+        let error = ready.result.err().expect("original service error");
+        assert_eq!(
+            error.kind(),
+            crate::session_error::QueryServiceErrorKind::InvalidValue
+        );
+        ready.owner.finish();
         assert_eq!(workload.snapshot().root_responsibilities, 0);
     }
 
@@ -2374,7 +2562,7 @@ mod tests {
                 .unwrap();
             drive_original_statement_actions(&slot);
             let failure = slot.failure().expect("same original destructor cause");
-            assert!(failure.payload().is::<Cause>());
+            assert!(failure.panic_payload().unwrap().is::<Cause>());
             assert_eq!(failure.publication_disposition(), Some(disposition));
             assert_eq!(drops.load(Ordering::SeqCst), 0);
             assert_eq!(workload.snapshot().root_responsibilities, 1);
@@ -2599,7 +2787,7 @@ mod tests {
         }
         drive_original_statement_actions(&slot);
         let failure = slot.failure().expect("actual cleanup wake preserved");
-        assert!(failure.payload().is::<CleanupCause>());
+        assert!(failure.panic_payload().unwrap().is::<CleanupCause>());
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         assert!(
             slot.has_sources(),

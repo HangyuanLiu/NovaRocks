@@ -45,6 +45,7 @@ struct ExplainPreparationInput {
     cancellation: QueryCancellationView,
     scope: novarocks_workload_control::WorkScope,
     window: ResultWindowAlias,
+    provider_source: Arc<crate::query_execution::completion_facts::FrontendCompletionCustody>,
     #[cfg(novarocks_dev_controls)]
     observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
 }
@@ -119,7 +120,13 @@ async fn make_explain_preparation(
     };
     let value = input
         .compiler
-        .prepare_explain_async(&input.explain, &context, Some(options), &input.scope)
+        .prepare_explain_async(
+            &input.explain,
+            &context,
+            Some(options),
+            &input.scope,
+            &input.provider_source,
+        )
         .await
         .map_err(|e| routed_execution_service_error(routed_compiler_failure(e, &input.sql)))?;
     Ok(PreparedExplain { value, capacity })
@@ -139,6 +146,8 @@ async fn make_profile_diagnostics(
 }
 
 struct ExplainStatementAction {
+    // Outside the polled preparation F: async unwind may destroy its fields.
+    provider_source: Arc<crate::query_execution::completion_facts::FrontendCompletionCustody>,
     preparation: Option<PreparationFuture>,
     preparation_started: bool,
     prepared: Option<Result<PreparedExplain, QueryServiceError>>,
@@ -154,6 +163,11 @@ struct ExplainStatementAction {
     observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
 }
 impl GovernedStatementAction for ExplainStatementAction {
+    fn local_health_failure(
+        &self,
+    ) -> Option<novarocks_query_application::api::StatementNativeHealthFailure> {
+        self.provider_source.local_health_failure()
+    }
     fn poll_action(
         &mut self,
         owner: &mut GovernedQueryStatementOwner,
@@ -200,6 +214,12 @@ impl ExplainStatementAction {
             match future.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(value) => self.prepared = Some(value),
+            }
+            // A failed close is already in the outside source. Let QA first
+            // receive that typed health while this same completed F remains
+            // retained; a secondary F destructor cannot replace the health cut.
+            if self.provider_source.local_health_failure().is_some() {
+                return Poll::Pending;
             }
             // Original output is stable before destroying the completed F.
             drop(self.preparation.take());
@@ -337,6 +357,8 @@ impl FrontendQuerySession {
                 ));
             }
         };
+        let provider_source =
+            crate::query_execution::completion_facts::FrontendCompletionCustody::new();
         let input = ExplainPreparationInput {
             compiler: self.service.query_compiler.clone(),
             topology: self.service.topology.clone(),
@@ -352,10 +374,12 @@ impl FrontendQuerySession {
             ),
             scope: statement.scope().clone(),
             window,
+            provider_source: Arc::clone(&provider_source),
             #[cfg(novarocks_dev_controls)]
             observation: observation.clone(),
         };
         let action = Box::new(ExplainStatementAction {
+            provider_source,
             preparation: Some(Box::pin(make_explain_preparation(input))),
             preparation_started: false,
             prepared: None,
@@ -382,6 +406,7 @@ pub(crate) struct ExplainStatementGeometry {
     pub(crate) preparation: std::alloc::Layout,
     pub(crate) diagnostics: std::alloc::Layout,
     pub(crate) receiver: std::alloc::Layout,
+    pub(crate) provider_custody: [std::alloc::Layout; 8],
 }
 pub(crate) fn statement_action_geometry() -> ExplainStatementGeometry {
     fn future_layout<I, F: Future>(_: impl Fn(I) -> F) -> std::alloc::Layout {
@@ -392,6 +417,9 @@ pub(crate) fn statement_action_geometry() -> ExplainStatementGeometry {
         preparation: future_layout(make_explain_preparation),
         diagnostics: future_layout(make_profile_diagnostics),
         receiver: std::alloc::Layout::new::<StatementReadyReceiver>(),
+        provider_custody:
+            crate::query_execution::completion_facts::FrontendCompletionCustody::known_layouts()
+                .expect("supported fixed completion Source layouts"),
     }
 }
 
@@ -495,6 +523,8 @@ mod tests {
     }
     fn action(preparation: PreparationFuture) -> ExplainStatementAction {
         ExplainStatementAction {
+            provider_source:
+                crate::query_execution::completion_facts::FrontendCompletionCustody::new(),
             preparation: Some(preparation),
             preparation_started: false,
             prepared: None,
