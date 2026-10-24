@@ -114,6 +114,72 @@ impl ProviderReadRuntime for LateProvider {
     fn transaction(&self) -> Self::Transaction {}
 }
 impl ProviderReadMetadata for LateProvider {
+    type PreparedRelation = (
+        Self::Table,
+        Option<novarocks_spi::connector::read_stack::SystemTableUnitHint>,
+    );
+    fn prepare_relation<'a>(
+        &'a self,
+        session: &'a novarocks_spi::connector::read_stack::ConnectorSession,
+        request: &'a novarocks_spi::connector::read_stack::ConnectorReadRelationPreparationRequest,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<Option<Self::PreparedRelation>, novarocks_spi::connector::ConnectorError>,
+    > {
+        Box::pin(async move {
+            use novarocks_spi::connector::read_stack::ConnectorReadRelationPreparationKind as K;
+            let name = request.name();
+            match request.kind() {
+                K::Table { version, reference } => self
+                    .get_table_handle(session, name, *version, reference.as_deref())
+                    .map(|v| v.map(|v| (v, None))),
+                K::Metadata { request } => match request {
+                    Some(request) => self.get_system_table_plan_for_request(session, name, request),
+                    None => self.get_system_table_plan(session, name),
+                }
+                .map(|v| {
+                    v.map(|v| {
+                        let hint = v.unit_hint();
+                        (v.into_handle(), Some(hint))
+                    })
+                }),
+                K::Delta { window } => self
+                    .get_change_window_plan(session, name, *window)
+                    .map(|v| v.map(|v| (v, None))),
+                K::MvTarget {
+                    object_id,
+                    snapshot_id,
+                } => self
+                    .get_mv_target_handle(session, name, object_id, *snapshot_id)
+                    .map(|v| v.map(|v| (v, None))),
+                K::MvTargetPartition { selection } => self
+                    .get_mv_target_partition_handle(session, name, selection)
+                    .map(|v| v.map(|v| (v, None))),
+                K::PinnedFileSet { pinned } => self
+                    .get_pinned_file_set_handle(session, name, pinned)
+                    .map(|v| v.map(|v| (v, None))),
+                K::TableExecute { procedure } => self
+                    .get_table_execute_plan(session, name, procedure.clone())
+                    .map(|v| v.map(|v| (v, None))),
+            }
+        })
+    }
+    fn create_prepared_relation(
+        &self,
+        prepared: Self::PreparedRelation,
+    ) -> Result<
+        Option<
+            novarocks_spi::connector::read_stack::adapter::ProviderReadOpenedRelation<Self::Table>,
+        >,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Ok(Some(
+            novarocks_spi::connector::read_stack::adapter::ProviderReadOpenedRelation::new(
+                prepared.0, prepared.1,
+            ),
+        ))
+    }
+
     type FrozenSource = novarocks_spi::connector::read_stack::adapter::UnsupportedFrozenReadSource;
 
     fn get_table_handle(
@@ -302,18 +368,23 @@ impl ProviderReadMetadata for LateProvider {
     }
 }
 impl ProviderReadSplitManager for LateProvider {
-    fn get_splits(
-        &self,
-        _: &ConnectorSession,
-        _: &Self::Table,
-        _: &[Assignment<Self::Column>],
-        _: &BTreeSet<Self::Column>,
-        _: &Constraint<Self::Column>,
-    ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "fixture does not enumerate splits",
-        ))
+    fn get_splits<'a>(
+        &'a self,
+        _: &'a ConnectorSession,
+        _: &'a Self::Table,
+        _: &'a [Assignment<Self::Column>],
+        _: &'a BTreeSet<Self::Column>,
+        _: &'a Constraint<Self::Column>,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError>,
+    > {
+        Box::pin(async move {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "fixture does not enumerate splits",
+            ))
+        })
     }
 }
 
@@ -339,11 +410,11 @@ impl ConnectorReadAttemptAccessSealer for LateAccessSealer {
 }
 struct LateReacquirer(Arc<ReadRuntimeAdapter<LateProvider>>);
 impl ConnectorReadAttemptAccessReacquirer for LateReacquirer {
-    fn for_attempt(
-        &self,
-        _: &ConnectorAttemptContext,
-    ) -> Result<ConnectorReadAttemptRuntime, ConnectorError> {
-        Ok(ConnectorReadAttemptRuntime::new(self.0.clone()))
+    fn for_attempt<'a>(
+        &'a self,
+        _: &'a ConnectorAttemptContext,
+    ) -> futures::future::BoxFuture<'a, Result<ConnectorReadAttemptRuntime, ConnectorError>> {
+        Box::pin(async move { Ok(ConnectorReadAttemptRuntime::new(self.0.clone())) })
     }
 }
 struct LateRequestFactory {

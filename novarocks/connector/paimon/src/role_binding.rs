@@ -354,6 +354,76 @@ impl ProviderReadRuntime for PaimonReadRuntime {
 }
 
 impl ProviderReadMetadata for PaimonReadRuntime {
+    type PreparedRelation = Arc<PaimonFrozenRead>;
+    fn prepare_relation<'a>(
+        &'a self,
+        _session: &'a ConnectorSession,
+        request: &'a novarocks_spi::connector::read_stack::ConnectorReadRelationPreparationRequest,
+    ) -> BoxFuture<'a, Result<Option<Self::PreparedRelation>, ConnectorError>> {
+        Box::pin(async move {
+            use novarocks_spi::connector::read_stack::ConnectorReadRelationPreparationKind as K;
+            match request.kind() {
+                K::Table { version, reference } => {
+                    if *version != ConnectorReadRelationVersion::Current || reference.is_some() {
+                        return Err(unsupported(
+                            "Paimon snapshot and named-reference reads are unsupported in PAI-1",
+                        ));
+                    }
+                    let catalog = self.catalog.as_ref().ok_or_else(request_binding_required)?;
+                    let cache = self
+                        .request_cache
+                        .as_ref()
+                        .ok_or_else(request_binding_required)?;
+                    self.control
+                        .as_ref()
+                        .ok_or_else(request_binding_required)?
+                        .checkpoint()?;
+                    let name = request.name();
+                    cache
+                        .get_or_prepare(&self.catalog_handle, name, || catalog.prepare_read(name))
+                        .await
+                        .map(Some)
+                }
+                K::Metadata { .. } => {
+                    Err(unsupported("Paimon system tables are unsupported in PAI-1"))
+                }
+                K::Delta { .. } => Err(unsupported("Paimon change-window reads are unsupported")),
+                K::PinnedFileSet { .. } => {
+                    Err(unsupported("Paimon pinned-file-set reads are unsupported"))
+                }
+                K::TableExecute { .. } => {
+                    Err(unsupported("Paimon table procedures are unsupported"))
+                }
+                K::MvTarget { .. } => Err(unsupported(
+                    "provider read generation does not support frozen MV target reads",
+                )),
+                K::MvTargetPartition { .. } => Err(unsupported(
+                    "provider read generation does not support MV target partition selection",
+                )),
+            }
+        })
+    }
+    fn create_prepared_relation(
+        &self,
+        prepared: Self::PreparedRelation,
+    ) -> Result<
+        Option<
+            novarocks_spi::connector::read_stack::adapter::ProviderReadOpenedRelation<Self::Table>,
+        >,
+        ConnectorError,
+    > {
+        self.control
+            .as_ref()
+            .ok_or_else(request_binding_required)?
+            .checkpoint()?;
+        Ok(Some(
+            novarocks_spi::connector::read_stack::adapter::ProviderReadOpenedRelation::new(
+                PaimonBoundTable::prepared(prepared),
+                None,
+            ),
+        ))
+    }
+
     type FrozenSource = novarocks_spi::connector::read_stack::adapter::UnsupportedFrozenReadSource;
 
     fn get_table_handle(
@@ -534,28 +604,27 @@ impl ProviderReadSplitSource<PaimonReadRuntime> for BoundPaimonSplitSource {
 }
 
 impl ProviderReadSplitManager for PaimonReadRuntime {
-    fn get_splits(
-        &self,
-        _session: &ConnectorSession,
-        table: &Self::Table,
-        _columns: &[Assignment<Self::Column>],
-        _dynamic_filter_columns: &BTreeSet<Self::Column>,
-        _constraint: &Constraint<Self::Column>,
-    ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> {
-        let frozen = self.rebind_read(table)?;
-        let control = self.control.clone().ok_or_else(request_binding_required)?;
-        let planning_control = control.clone();
-        let planned = self.metadata_runtime()?.block_on(&control, async move {
-            plan_splits(
+    fn get_splits<'a>(
+        &'a self,
+        _session: &'a ConnectorSession,
+        table: &'a Self::Table,
+        _columns: &'a [Assignment<Self::Column>],
+        _dynamic_filter_columns: &'a BTreeSet<Self::Column>,
+        _constraint: &'a Constraint<Self::Column>,
+    ) -> BoxFuture<'a, Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError>> {
+        Box::pin(async move {
+            let frozen = self.rebind_read(table)?;
+            let control = self.control.clone().ok_or_else(request_binding_required)?;
+            let planned = plan_splits(
                 frozen.as_ref(),
-                planning_control,
+                control.clone(),
                 PaimonSplitPlanningLimits::default(),
             )
-            .await
-        })??;
-        Ok(Box::new(BoundPaimonSplitSource(PaimonSplitSource::new(
-            planned, control,
-        )?)))
+            .await?;
+            Ok(Box::new(BoundPaimonSplitSource(PaimonSplitSource::new(
+                planned, control,
+            )?)) as Box<dyn ProviderReadSplitSource<Self>>)
+        })
     }
 }
 
@@ -662,18 +731,20 @@ struct PaimonAttemptAccessReacquirer {
 }
 
 impl ConnectorReadAttemptAccessReacquirer for PaimonAttemptAccessReacquirer {
-    fn for_attempt(
-        &self,
-        request: &novarocks_spi::connector::ConnectorAttemptContext,
-    ) -> Result<ConnectorReadAttemptRuntime, ConnectorError> {
-        let adapter = Arc::new(
-            self.factory
-                .bind_attempt_runtime(request.request(), Arc::clone(&self.recipe))?,
-        );
-        let control = self
-            .factory
-            .control_for_adapter(adapter, Some(Arc::clone(&self.recipe)));
-        Ok(ConnectorReadAttemptRuntime::new(control.splits()))
+    fn for_attempt<'a>(
+        &'a self,
+        request: &'a novarocks_spi::connector::ConnectorAttemptContext,
+    ) -> futures::future::BoxFuture<'a, Result<ConnectorReadAttemptRuntime, ConnectorError>> {
+        Box::pin(async move {
+            let adapter = Arc::new(
+                self.factory
+                    .bind_attempt_runtime(request.request(), Arc::clone(&self.recipe))?,
+            );
+            let control = self
+                .factory
+                .control_for_adapter(adapter, Some(Arc::clone(&self.recipe)));
+            Ok(ConnectorReadAttemptRuntime::new(control.splits()))
+        })
     }
 }
 
@@ -2562,6 +2633,97 @@ mod table_preparation_cache_tests {
     use futures::FutureExt;
     use novarocks_spi::connector::CatalogVersion;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn async_table_preparation_and_ready_replay_use_the_same_frozen_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let warehouse = directory.path().join("warehouse");
+        let table_path = warehouse.join("db.db/t");
+        std::fs::create_dir_all(table_path.join("schema")).unwrap();
+        std::fs::create_dir_all(table_path.join("snapshot")).unwrap();
+        let schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column(
+                    "id",
+                    paimon::spec::DataType::Int(paimon::spec::IntType::new()),
+                )
+                .build()
+                .unwrap(),
+        );
+        std::fs::write(
+            table_path.join("schema/schema-0"),
+            serde_json::to_vec(&schema).unwrap(),
+        )
+        .unwrap();
+        let warehouse = warehouse.to_string_lossy().to_string();
+        let access = novarocks_fs::FsAccessResolver::new()
+            .resolve_location(
+                novarocks_spi::connector::StorageAccessDomainId::from_bytes([3; 32]),
+                &warehouse,
+                None,
+            )
+            .unwrap();
+        let host_io = PaimonHostFileIo::try_new(
+            access,
+            &warehouse,
+            novarocks_fs::FileCancellation::new(),
+            Arc::new(crate::io::PaimonFsAuthorizedListing),
+        )
+        .unwrap();
+        let stop = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
+        let control = PaimonRequestControl::new(
+            stop.view(),
+            Instant::now() + std::time::Duration::from_secs(60),
+        );
+        let catalog =
+            PaimonFileSystemCatalog::try_new(&warehouse, host_io, control.clone()).unwrap();
+        let (catalog_handle, name) = key();
+        let template = PaimonReadRuntime::template(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse(PROVIDER_ID).unwrap(),
+                instance_id: catalog_handle.catalog_name().clone(),
+            },
+            catalog_handle.clone(),
+            None,
+        );
+        let cache = Arc::new(PaimonRequestCache::default());
+        let runtime = template.for_request(catalog, control, Arc::clone(&cache));
+        let session =
+            ConnectorSession::try_new("q", "u", "UTC", "en_US", std::time::SystemTime::UNIX_EPOCH)
+                .unwrap();
+        use novarocks_spi::connector::read_stack::{
+            ConnectorReadRelationPreparationKind as K, ConnectorReadRelationPreparationRequest as R,
+        };
+        let request = R::new(
+            name.clone(),
+            K::Table {
+                version: ConnectorReadRelationVersion::Current,
+                reference: None,
+            },
+        );
+        let prepared = ProviderReadMetadata::prepare_relation(&runtime, &session, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &prepared,
+            &cache.get_ready(&catalog_handle, &name).unwrap().unwrap()
+        ));
+        std::fs::remove_dir_all(&warehouse).unwrap();
+        let replay = ProviderReadMetadata::prepare_relation(&runtime, &session, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&prepared, &replay));
+        let (table, _) = runtime
+            .create_prepared_relation(prepared)
+            .unwrap()
+            .unwrap()
+            .into_parts();
+        let rebound = runtime.rebind_read(&table).unwrap();
+        assert_eq!(rebound.output_schema().as_ref(), &schema);
+    }
 
     #[tokio::test]
     async fn request_cache_keys_same_named_tables_by_exact_catalog_generation() {

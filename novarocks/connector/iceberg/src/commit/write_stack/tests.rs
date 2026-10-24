@@ -4731,16 +4731,19 @@ fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_a
             .get_table_execute_plan(&session, &name, procedure)
             .unwrap()
             .unwrap();
-        let mut source = split_manager
-            .get_splits(
-                &session,
-                &opened,
-                &[],
-                &std::collections::BTreeSet::new(),
-                &ConnectorReadConstraint::of_summary(
-                    novarocks_spi::connector::read_stack::TupleDomain::all(),
+        let mut source = lake
+            .executor
+            .block_on(split_manager.get_splits(
+                novarocks_spi::connector::read_stack::ConnectorReadSplitOpenRequest::new(
+                    session.clone(),
+                    opened,
+                    Vec::new(),
+                    std::collections::BTreeSet::new(),
+                    ConnectorReadConstraint::of_summary(
+                        novarocks_spi::connector::read_stack::TupleDomain::all(),
+                    ),
                 ),
-            )
+            ))
             .unwrap();
         let batch = source
             .next_batch(1, &ConnectorReadDynamicFilterSnapshot::all_complete())

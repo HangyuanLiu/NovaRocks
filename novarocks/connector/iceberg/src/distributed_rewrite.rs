@@ -1102,6 +1102,27 @@ pub(crate) fn plan_rewrite_position_delete_splits(
     select_rewrite_position_delete_artifacts(group, &live, snapshot_id)
 }
 
+pub(crate) async fn plan_rewrite_position_delete_splits_async(
+    table: &crate::iceberg::table::Table,
+    snapshot_id: i64,
+    content: &IcebergFrozenRewriteArtifactV1,
+    group_digest: &str,
+    context: &ConnectorRequestContext,
+) -> Result<(IcebergDataFileInfo, Vec<IcebergDeleteFileInfo>), ConnectorError> {
+    validate_context(context)?;
+    let group = content.group(group_digest)?;
+    validate_context(context)?;
+    // The table can advance after the TableExecute relation was frozen. Its
+    // later current snapshot must never become a substitute generation for the
+    // immutable rewrite artifact, so fail before split dispatch if that fence
+    // no longer holds.
+    validate_frozen_rewrite_table(content, table.metadata())?;
+    let live =
+        live_delete_file_paths_at_with_control_async(table, snapshot_id, Some(context)).await?;
+    validate_context(context)?;
+    select_rewrite_position_delete_artifacts(group, &live, snapshot_id)
+}
+
 /// Pick out exactly the delete artifacts one frozen group names.
 ///
 /// Everything this decides is a comparison against the group. It selects no
@@ -1242,6 +1263,65 @@ fn live_delete_file_paths_of(
         validate_context(context)?;
     }
     result.map_err(unavailable)?.map_err(unavailable)
+}
+
+async fn live_delete_file_paths_at_with_control_async(
+    table: &crate::iceberg::table::Table,
+    snapshot_id: i64,
+    context: Option<&ConnectorRequestContext>,
+) -> Result<BTreeSet<EntryIdentity>, ConnectorError> {
+    let snapshot=table.metadata().snapshot_by_id(snapshot_id).cloned().ok_or_else(|| corrupt(format!(
+        "Iceberg relation no longer holds snapshot {snapshot_id}, which a rewrite was frozen at")))?;
+    if let Some(context) = context {
+        validate_context(context)?;
+    }
+    let file_io = table.file_io().clone();
+    let metadata = table.metadata().clone();
+    let control = context.cloned();
+    let result = (async move {
+        let check_active = || -> Result<(), String> {
+            if let Some(control) = &control {
+                ConnectorOperationControl::check_active(control)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        };
+        check_active()?;
+        let manifest_list = crate::manifest::load_manifest_list(&snapshot, &file_io, &metadata)
+            .await
+            .map_err(|error| format!("load Iceberg rewrite manifest list: {error}"))?;
+        check_active()?;
+        let mut paths = BTreeSet::new();
+        for manifest_file in manifest_list.entries() {
+            check_active()?;
+            if manifest_file.content != crate::iceberg::spec::ManifestContentType::Deletes {
+                continue;
+            }
+            let manifest = crate::manifest::load_manifest(manifest_file, &file_io)
+                .await
+                .map_err(|error| format!("load Iceberg rewrite delete manifest: {error}"))?;
+            check_active()?;
+            for entry in manifest.entries() {
+                check_active()?;
+                if entry.is_alive() {
+                    let identity = EntryIdentity::try_from(entry.data_file())
+                        .map_err(|error| error.to_string())?;
+                    if !paths.insert(identity) {
+                        return Err(
+                            "Iceberg rewrite snapshot repeats a logical delete entry".to_string()
+                        );
+                    }
+                }
+            }
+        }
+        check_active()?;
+        Ok::<_, String>(paths)
+    })
+    .await;
+    if let Some(context) = context {
+        validate_context(context)?;
+    }
+    result.map_err(unavailable)
 }
 
 fn validate_frozen_rewrite_table(

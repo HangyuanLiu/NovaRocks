@@ -452,6 +452,18 @@ impl IcebergMetadataContext {
         table: &str,
         request: &ConnectorRequestContext,
     ) -> Result<IcebergPhysicalTable, String> {
+        self.load_table_classified_for_request_async(namespace, table, request)
+            .await
+            .map_err(|(_, message)| message)
+    }
+
+    /// Preserve absence and control classification at the typed read boundary.
+    pub(crate) async fn load_table_classified_for_request_async(
+        &self,
+        namespace: &str,
+        table: &str,
+        request: &ConnectorRequestContext,
+    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
         let load = async {
             ConnectorOperationControl::check_active(request)
                 .map_err(|e| (e.kind(), e.to_string()))?;
@@ -517,7 +529,32 @@ impl IcebergMetadataContext {
                 )
                 .map_err(|e| (e.kind(), e.to_string()))
         };
-        load.await.map_err(|(_, message)| message)
+        load.await
+    }
+
+    pub(crate) async fn load_table_classified_async(
+        &self,
+        namespace: &str,
+        table: &str,
+    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
+        let namespace = normalize_identifier(namespace).map_err(invalid_request)?;
+        let table = normalize_identifier(table).map_err(invalid_request)?;
+        if let Some(cached) = self
+            .control_state
+            .physical_table_cache()
+            .get(&namespace, &table)
+            .map_err(unavailable)?
+        {
+            return Ok(cached);
+        }
+        self.observe_table_classified_with_snapshots_async(
+            &namespace,
+            &table,
+            None,
+            None,
+            crate::catalog::SnapshotLoading::All,
+        )
+        .await
     }
 
     /// Load an explicit REST snapshot scope without allowing a partial
@@ -881,6 +918,153 @@ impl IcebergMetadataContext {
             .catalog_runtime()
             .block_on(async move { owner.load_table(target).await })
             .map_err(unavailable)?;
+        ConnectorOperationControl::check_active(request_context)
+            .map_err(|error| (error.kind(), error.to_string()))?;
+        let loaded = loaded.map_err(|error| {
+            (
+                error.kind(),
+                format!("reacquire Iceberg table {namespace}.{table}: {error}"),
+            )
+        })?;
+        let (materialization, access_delegation) = loaded.into_parts();
+        let seed = access_delegation.into_vended_lease_seed().ok_or_else(|| {
+            (
+                ConnectorErrorKind::Unsupported,
+                format!(
+                    "reacquire Iceberg table {namespace}.{table}: catalog did not return vended access delegation"
+                ),
+            )
+        })?;
+        let metadata_binding = self.resources.planning_binding().clone();
+        let observed = materialization
+            .materialize_for_request(metadata_binding)
+            .map_err(|error| (error.kind(), error.to_string()))?;
+        let contribution = match capability {
+            IcebergVendedS3RenewalCapability::CredentialsEndpoint(_) => {
+                let attempt_scope = frozen
+                    .validate_credentials_endpoint_attempt_acquisition(&observed, &seed)
+                    .map_err(|error| (error.kind(), error.to_string()))?;
+                let catalog = self
+                    .novarocks_catalog
+                    .vended_credential_refresh_catalog()
+                    .ok_or_else(|| {
+                        (
+                            ConnectorErrorKind::Unsupported,
+                            format!(
+                                "reacquire Iceberg table {namespace}.{table}: vended access has no REST catalog owner"
+                            ),
+                        )
+                    })?;
+                // The same routed path a fresh observation would announce: an
+                // execution node acquiring for itself must be told it (L15).
+                let announcement = self.vended_renewal_path(
+                    &seed.renewal_capability(),
+                    &ident,
+                    frozen.metadata().uuid(),
+                )?;
+                seed.into_vended_s3_credential_lease_contribution()
+                    .and_then(|contribution| {
+                        contribution.with_refresher(
+                            catalog.acquisition_owner(),
+                            Arc::new(IcebergRestVendedS3LeaseRefresher::new(
+                                catalog,
+                                self.resources.catalog_runtime().clone(),
+                                attempt_scope,
+                            )),
+                        )
+                    })
+                    .map(|contribution| contribution.with_renewal_path(announcement))
+                    .map_err(|error| (error.kind(), error.to_string()))?
+            }
+            IcebergVendedS3RenewalCapability::LoadTableDelegation(_) => {
+                frozen
+                    .validate_attempt_reacquisition(&observed, &seed)
+                    .map_err(|error| (error.kind(), error.to_string()))?;
+                self.vended_attempt_contribution(seed, ident, frozen.metadata().uuid())?
+            }
+        };
+        collection
+            .offer_vended_s3_credential_lease(contribution)
+            .map_err(|error| {
+                (
+                    error.kind(),
+                    format!(
+                        "reacquire Iceberg table {namespace}.{table}: collect vended credentials: {error}"
+                    ),
+                )
+            })?;
+        ConnectorOperationControl::check_active(request_context)
+            .map_err(|error| (error.kind(), error.to_string()))?;
+        let request_binding = self
+            .resources
+            .planning_binding()
+            .for_request(request_context.clone());
+        frozen
+            .reacquired_request_scoped(
+                request_binding,
+                self.resources.catalog_runtime().iceberg_runtime().clone(),
+            )
+            .map_err(|error| (error.kind(), error.to_string()))
+    }
+
+    pub(crate) async fn reacquire_table_access_for_request_async(
+        &self,
+        namespace: &str,
+        table: &str,
+        access: &IcebergAttemptTableAccess,
+        request_context: &ConnectorRequestContext,
+    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
+        let namespace = normalize_identifier(namespace).map_err(invalid_request)?;
+        let table = normalize_identifier(table).map_err(invalid_request)?;
+        let ident = TableIdent::from_strs([namespace.as_str(), table.as_str()])
+            .map_err(|error| invalid_request(format!("build Iceberg table identity: {error}")))?;
+        if access.identifier() != &ident {
+            return Err((
+                ConnectorErrorKind::InvalidRequest,
+                format!(
+                    "reacquire Iceberg table {namespace}.{table}: target does not match the frozen table identity"
+                ),
+            ));
+        }
+        if request_context.is_cancelled() {
+            return Err((
+                ConnectorErrorKind::Cancelled,
+                "reacquire Iceberg table access was cancelled".to_string(),
+            ));
+        }
+        if std::time::Instant::now() >= request_context.deadline() {
+            return Err((
+                ConnectorErrorKind::DeadlineExceeded,
+                "reacquire Iceberg table access deadline elapsed".to_string(),
+            ));
+        }
+        let Some(capability) = access.renewal() else {
+            let request_binding = self
+                .resources
+                .planning_binding()
+                .for_request(request_context.clone());
+            return access
+                .reacquired_request_scoped(
+                    request_binding,
+                    self.resources.catalog_runtime().iceberg_runtime().clone(),
+                )
+                .map_err(|error| (error.kind(), error.to_string()));
+        };
+        let frozen = access;
+        let collection = request_context
+            .vended_credential_lease_collection()
+            .ok_or_else(|| {
+                (
+                    ConnectorErrorKind::InvalidRequest,
+                    format!(
+                        "reacquire Iceberg table {namespace}.{table}: missing attempt credential collection"
+                    ),
+                )
+            })?;
+        let target =
+            crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
+        let owner = Arc::clone(self.novarocks_catalog());
+        let loaded = owner.load_table(target).await;
         ConnectorOperationControl::check_active(request_context)
             .map_err(|error| (error.kind(), error.to_string()))?;
         let loaded = loaded.map_err(|error| {
