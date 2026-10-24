@@ -23,6 +23,7 @@ use novarocks_resource_contract::{ExistingOwnerRetentionLease, RetentionOwner, R
 #[derive(Clone, Copy)]
 pub(super) enum ClaimCustody {
     Raw,
+    Production { epoch: u64 },
     Payload { epoch: u64, pins: usize },
     Computation { epoch: u64, pins: usize },
 }
@@ -536,3 +537,9 @@ pub(super) fn install_computation_pin(
 
 #[cfg(test)]
 mod tests;
+
+pub(super) mod unreceived;
+pub use unreceived::{
+    UnreceivedProductionAdmission, UnreceivedProductionGrant, UnreceivedProductionOwner,
+    UnreceivedProductionQuote, UnreceivedProductionReady,
+};

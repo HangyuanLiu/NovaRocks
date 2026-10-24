@@ -273,6 +273,7 @@ impl WorkloadControl {
                         claim,
                         ClaimRecord {
                             custody: ClaimCustody::Raw,
+                            production: None,
                             owner: ClaimOwner::ControlSlot(id),
                             facts: Arc::clone(&facts),
                             amounts: base,

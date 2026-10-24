@@ -34,6 +34,8 @@ pub use ledger::{
     JointAdmissionFailure, JointAdmissionHandle, JointClaim, JointClaimView, JointGrantedBatch,
     JointGrantedClaims, JointLocalGrant, JointLocalOffer, JointProposal, RetainedPayloadAlias,
     RetainedPayloadGrant, RootStageAdmission, RootStageProposal, RootStageReady, RootStageSource,
+    UnreceivedProductionAdmission, UnreceivedProductionGrant, UnreceivedProductionOwner,
+    UnreceivedProductionQuote, UnreceivedProductionReady,
 };
 #[cfg(test)]
 pub use ledger::{JointClaimChange, JointDependency};

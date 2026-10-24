@@ -37,6 +37,8 @@ mod typed_custody;
 use typed_custody::ClaimCustody;
 pub use typed_custody::{
     InternalComputationAlias, InternalComputationGrant, RetainedPayloadAlias, RetainedPayloadGrant,
+    UnreceivedProductionAdmission, UnreceivedProductionGrant, UnreceivedProductionOwner,
+    UnreceivedProductionQuote, UnreceivedProductionReady,
 };
 mod control_binding;
 pub use control_binding::ControlBindingProposal;
@@ -130,6 +132,7 @@ pub(crate) enum ClaimOwner {
 
 pub(super) struct ClaimRecord {
     custody: ClaimCustody,
+    production: Option<typed_custody::unreceived::ProductionRecord>,
     pub(super) owner: ClaimOwner,
     /// Charged proposal, including any not-yet-installed delta and DI union.
     pub(super) facts: Arc<ProfileFacts>,
@@ -1562,6 +1565,7 @@ pub(super) fn grant_request(state: &mut State, id: u64) -> Result<(), WorkError>
                 new_id,
                 ClaimRecord {
                     custody: ClaimCustody::Raw,
+                    production: None,
                     owner: ClaimOwner::PhysicalWork(physical_owner),
                     facts: Arc::clone(&change.claim.facts),
                     amounts: change.claim.amounts,

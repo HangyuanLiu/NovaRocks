@@ -35,6 +35,14 @@ fn fixture_with_cpu_lane(
     cpu_jobs: u64,
     lane: JointLane,
 ) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+    fixture_with_cpu_lane_and_productions(cpu_jobs, lane, 1, 0)
+}
+fn fixture_with_cpu_lane_and_productions(
+    cpu_jobs: u64,
+    lane: JointLane,
+    production_records: u64,
+    publications: u64,
+) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     let count = 8;
     let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 1, 2, &[]);
     let mut config = JointCapacityConfig {
@@ -61,13 +69,15 @@ fn fixture_with_cpu_lane(
             .with(JointResource::ClaimRecords, 12)
             .with(JointResource::MetadataBytes, m * 16)
             .with(JointResource::PayloadBytes, 64)
-            .with(JointResource::UnreceivedProductions, 1),
+            .with(JointResource::UnreceivedProductions, production_records)
+            .with(JointResource::Publications, publications),
         per_dependency: JointResources::ZERO
             .with(JointResource::ScopeRecords, 7)
             .with(JointResource::ClaimRecords, 12)
             .with(JointResource::MetadataBytes, m * 8)
             .with(JointResource::PayloadBytes, 64)
-            .with(JointResource::UnreceivedProductions, 1),
+            .with(JointResource::UnreceivedProductions, production_records)
+            .with(JointResource::Publications, publications),
         protected_progress: base,
     };
     let foreground = JointResourceLimits {
@@ -1168,5 +1178,109 @@ fn ordinary_positive_grant_does_not_certify_a_closed_cpu_factory() {
     // No invented physical value is accepted. The actual queue/factory
     // integration regression lives with the original QA worker author.
     drop((action, external, computation));
+    finish(work, &mut driver);
+}
+
+#[test]
+fn unknown_production_survives_last_handle_and_received_keeps_publication_until_disposition() {
+    let (control, _handle, mut driver) =
+        fixture_with_cpu_lane_and_productions(0, JointLane::Foreground, 4, 4);
+    let work = root(&control);
+    let scope = work.owner.scope();
+    bind(&scope, &[fact("writer")], &mut driver);
+    let quote = UnreceivedProductionQuote::new(
+        std::num::NonZeroU64::new(2).unwrap(),
+        std::num::NonZeroUsize::new(16).unwrap(),
+    )
+    .unwrap();
+    let origin: Arc<dyn Send + Sync> = Arc::new(());
+    let mut pending = scope
+        .begin_unreceived_productions(Arc::downgrade(&origin), quote)
+        .unwrap();
+    drive(&mut driver);
+    let mut ready = match Pin::new(&mut pending).poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(ready)) => ready,
+        _ => panic!("original production grant"),
+    };
+    let mut facts = Some(vec![7; 16].into_boxed_slice());
+    let mut grant = None;
+    ready.register_in(&mut facts, &mut grant).unwrap().notify();
+    drop((ready, pending));
+    let owner = grant.as_ref().unwrap().owner();
+    assert_eq!(owner.pending_records().unwrap(), 2);
+    assert_eq!(held(&control, JointResource::UnreceivedProductions), 2);
+    assert_eq!(held(&control, JointResource::Publications), 1);
+    assert!(matches!(
+        owner.settle_received_in(),
+        Err(WorkError::Conflict)
+    ));
+    grant.as_ref().unwrap().check_receive().unwrap();
+    grant.as_ref().unwrap().receive_in().unwrap().notify();
+    drop(grant.take());
+    assert_eq!(owner.pending_records().unwrap(), 0);
+    assert_eq!(held(&control, JointResource::UnreceivedProductions), 0);
+    assert_eq!(held(&control, JointResource::Publications), 1);
+    assert!(owner.retains_facts(&[7; 16]).unwrap());
+    owner.settle_received_in().unwrap().notify();
+    assert_eq!(held(&control, JointResource::Publications), 0);
+    assert!(!owner.retains_facts(&[7; 16]).unwrap());
+
+    // The second actual record is deliberately missing End/receive. Neither
+    // last grant Drop nor the original logical terminal may refund it.
+    let mut pending = scope
+        .begin_unreceived_productions(Arc::downgrade(&origin), quote)
+        .unwrap();
+    drive(&mut driver);
+    let mut ready = match Pin::new(&mut pending).poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(ready)) => ready,
+        _ => panic!("original second production grant"),
+    };
+    let mut facts = Some(vec![9; 16].into_boxed_slice());
+    ready.register_in(&mut facts, &mut grant).unwrap().notify();
+    drop((ready, pending));
+    let retirement = work.owner.retirement_observer().unwrap();
+    drop(grant.take());
+    drop(origin);
+    finish(work, &mut driver);
+    assert_eq!(owner.pending_records().unwrap(), 2);
+    assert!(owner.retains_facts(&[9; 16]).unwrap());
+    assert_eq!(held(&control, JointResource::UnreceivedProductions), 2);
+    assert!(!retirement.is_reclaimed().unwrap());
+}
+
+#[test]
+fn production_registration_rechecks_cancel_after_real_grant_before_metadata_move() {
+    let (control, _handle, mut driver) =
+        fixture_with_cpu_lane_and_productions(0, JointLane::Foreground, 4, 4);
+    let work = root(&control);
+    let scope = work.owner.scope();
+    bind(&scope, &[fact("writer")], &mut driver);
+    let origin: Arc<dyn Send + Sync> = Arc::new(());
+    let quote = UnreceivedProductionQuote::new(
+        std::num::NonZeroU64::new(2).unwrap(),
+        std::num::NonZeroUsize::new(16).unwrap(),
+    )
+    .unwrap();
+    let mut pending = scope
+        .begin_unreceived_productions(Arc::downgrade(&origin), quote)
+        .unwrap();
+    drive(&mut driver);
+    let mut ready = match Pin::new(&mut pending).poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(ready)) => ready,
+        _ => panic!("original grant before cancellation"),
+    };
+    work.owner.cancel(crate::CancellationReason::ServerShutdown);
+    let mut facts = Some(vec![3; 16].into_boxed_slice());
+    let mut grant = None;
+    assert!(matches!(
+        ready.register_in(&mut facts, &mut grant),
+        Err(WorkError::Cancelled(_))
+    ));
+    assert!(grant.is_none() && facts.is_some());
+    drop(facts);
+    drop((ready, pending));
+    drive(&mut driver);
+    assert_eq!(held(&control, JointResource::UnreceivedProductions), 0);
+    assert_eq!(held(&control, JointResource::Publications), 0);
     finish(work, &mut driver);
 }
