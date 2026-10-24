@@ -42,6 +42,9 @@ pub struct QueryApplicationControl {
 #[derive(Default)]
 struct QueryControlState {
     next_session_epoch: u64,
+    statement_progress: std::sync::Weak<crate::session_control::StatementProgressSlot>,
+    statement_actions_open: bool,
+    statement_progress_installed: bool,
     sessions: BTreeMap<u32, SessionEntry>,
 }
 
@@ -59,6 +62,7 @@ struct SessionEntry {
 
 struct ActiveStatement {
     generation: u64,
+    action: Option<Arc<crate::session_control::StatementActionSource>>,
     cancellation: ActiveStatementCancellation,
     success_visibility_sealed: bool,
     /// When this statement began, and the text it began with. Both exist only
@@ -171,7 +175,21 @@ fn query_cancellation_reason(
     }
 }
 
+/// Actual existing session-registry values, including its inline action slot.
+/// The caller supplies the real client/session bound and BTree allocator fee.
+#[derive(Clone, Copy, Debug)]
+pub struct QueryControlSessionGeometry {
+    pub owner: std::alloc::Layout,
+    pub record: std::alloc::Layout,
+}
+
 impl QueryApplicationControl {
+    pub fn session_geometry() -> QueryControlSessionGeometry {
+        QueryControlSessionGeometry {
+            owner: std::alloc::Layout::new::<Self>(),
+            record: std::alloc::Layout::new::<(u32, SessionEntry)>(),
+        }
+    }
     pub fn service() -> QueryControlService {
         QueryControlService::new(Arc::new(Self::default()))
     }
@@ -206,6 +224,202 @@ impl QueryApplicationControl {
 }
 
 impl QueryControlPort for QueryApplicationControl {
+    fn attach_statement_progress(
+        &self,
+        slot: &Arc<crate::session_control::StatementProgressSlot>,
+    ) -> Result<(), QueryControlError> {
+        let mut state = self.lock();
+        if state.statement_progress_installed
+            || state.sessions.values().any(|entry| {
+                entry
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.action.is_some())
+            })
+        {
+            return Err(QueryControlError::StatementBusy);
+        }
+        state.statement_progress = Arc::downgrade(slot);
+        state.statement_actions_open = true;
+        state.statement_progress_installed = true;
+        Ok(())
+    }
+    fn statement_progress_slot(
+        &self,
+    ) -> Option<Arc<crate::session_control::StatementProgressSlot>> {
+        self.lock().statement_progress.upgrade()
+    }
+    fn publish_statement_action_in(
+        &self,
+        owner: &mut Option<crate::session_control::GovernedQueryStatementOwner>,
+        action: &mut Option<Box<dyn crate::session_control::GovernedStatementAction>>,
+        source: &Arc<crate::session_control::StatementActionSource>,
+    ) -> Result<(), QueryControlError> {
+        let token = owner
+            .as_ref()
+            .ok_or(QueryControlError::StatementBusy)?
+            .token();
+        if action.is_none() {
+            return Err(QueryControlError::StatementBusy);
+        }
+        let mut state = self.lock();
+        if !state.statement_actions_open {
+            return Err(QueryControlError::StatementBusy);
+        }
+        let entry = state
+            .sessions
+            .get_mut(&token.session().connection_id())
+            .ok_or(QueryControlError::UnknownSession)?;
+        if entry.session_epoch != token.session().session_epoch() {
+            return Err(QueryControlError::StaleSession);
+        }
+        let active = entry
+            .active
+            .as_mut()
+            .filter(|active| active.generation == token.generation())
+            .ok_or(QueryControlError::StatementBusy)?;
+        if active.action.is_some() || active.success_visibility_sealed {
+            return Err(QueryControlError::StatementBusy);
+        }
+        let ActiveStatementCancellation::Governed(cancellation) = &active.cancellation else {
+            return Err(QueryControlError::StatementBusy);
+        };
+        source.install(owner, action, cancellation);
+        active.action = Some(Arc::clone(source));
+        Ok(())
+    }
+    fn next_statement_action(
+        &self,
+        after: Option<u32>,
+    ) -> Option<(
+        u32,
+        Option<Arc<crate::session_control::StatementActionSource>>,
+    )> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let state = self.lock();
+        let (id, entry) = state
+            .sessions
+            .range((after.map_or(Unbounded, Excluded), Unbounded))
+            .next()?;
+        Some((
+            *id,
+            entry
+                .active
+                .as_ref()
+                .and_then(|active| active.action.as_ref())
+                .map(Arc::clone),
+        ))
+    }
+    fn detach_statement_action(
+        &self,
+        token: StatementToken,
+        source: &Arc<crate::session_control::StatementActionSource>,
+    ) -> bool {
+        let removed = {
+            let mut state = self.lock();
+            let Some(entry) = state
+                .sessions
+                .get_mut(&token.session().connection_id())
+                .filter(|entry| entry.session_epoch == token.session().session_epoch())
+            else {
+                return false;
+            };
+            let Some(active) = entry
+                .active
+                .as_mut()
+                .filter(|active| active.generation == token.generation())
+            else {
+                return false;
+            };
+            if !active
+                .action
+                .as_ref()
+                .is_some_and(|original| Arc::ptr_eq(original, source))
+            {
+                return false;
+            }
+            active.action.take()
+        };
+        drop(removed);
+        true
+    }
+    fn settle_statement_action_silent(
+        &self,
+        token: StatementToken,
+        source: &Arc<crate::session_control::StatementActionSource>,
+    ) -> bool {
+        let retired = {
+            let mut state = self.lock();
+            let Some(entry) = state
+                .sessions
+                .get_mut(&token.session().connection_id())
+                .filter(|entry| entry.session_epoch == token.session().session_epoch())
+            else {
+                return false;
+            };
+            let Some(active) = entry
+                .active
+                .as_ref()
+                .filter(|active| active.generation == token.generation())
+            else {
+                return false;
+            };
+            if !active
+                .action
+                .as_ref()
+                .is_some_and(|original| Arc::ptr_eq(original, source))
+                || !source.is_settled()
+            {
+                return false;
+            }
+            let unregister_pending = entry.unregister_pending;
+            let retired = entry.active.take();
+            if unregister_pending {
+                state.sessions.remove(&token.session().connection_id());
+            }
+            retired
+        };
+        // Source/cancellation remain held by the original caller. The metadata
+        // record's actual Drop is also outside the QueryControl lock.
+        drop(retired);
+        true
+    }
+    fn close_statement_actions(&self) {
+        let mut state = self.lock();
+        state.statement_actions_open = false;
+        for entry in state.sessions.values() {
+            if let Some(source) = entry
+                .active
+                .as_ref()
+                .and_then(|active| active.action.as_ref())
+            {
+                source.stop();
+            }
+        }
+    }
+    fn statement_action_failure(
+        &self,
+    ) -> Option<Arc<crate::session_control::StatementActionFailure>> {
+        self.lock()
+            .sessions
+            .values()
+            .filter_map(|entry| {
+                entry
+                    .active
+                    .as_ref()
+                    .and_then(|active| active.action.as_ref())
+            })
+            .find_map(|source| source.failure())
+    }
+    fn has_statement_actions(&self) -> bool {
+        self.lock().sessions.values().any(|entry| {
+            entry
+                .active
+                .as_ref()
+                .is_some_and(|active| active.action.is_some())
+        })
+    }
+
     fn register_session(
         &self,
         identity: SessionIdentity,
@@ -297,6 +511,7 @@ impl QueryControlPort for QueryApplicationControl {
             cancellation.view(),
         );
         entry.active = Some(ActiveStatement {
+            action: None,
             generation: entry.next_statement_generation,
             began_at: Instant::now(),
             text: None,
@@ -335,6 +550,7 @@ impl QueryControlPort for QueryApplicationControl {
             cancellation.view().clone(),
         );
         entry.active = Some(ActiveStatement {
+            action: None,
             generation: entry.next_statement_generation,
             began_at: Instant::now(),
             text: statement_text,
@@ -420,6 +636,9 @@ impl QueryControlPort for QueryApplicationControl {
         if active.generation != statement.generation() {
             return GovernedStatementVisibilitySealOutcome::Stale;
         }
+        if active.action.is_some() {
+            return GovernedStatementVisibilitySealOutcome::Stale;
+        }
         let ActiveStatementCancellation::Governed(cancellation) = &active.cancellation else {
             return GovernedStatementVisibilitySealOutcome::Stale;
         };
@@ -453,6 +672,9 @@ impl QueryControlPort for QueryApplicationControl {
             return GovernedStatementFinishOutcome::Stale;
         };
         if active.generation != statement.generation() {
+            return GovernedStatementFinishOutcome::Stale;
+        }
+        if active.action.is_some() {
             return GovernedStatementFinishOutcome::Stale;
         }
         let ActiveStatementCancellation::Governed(cancellation) = &active.cancellation else {
@@ -492,6 +714,9 @@ impl QueryControlPort for QueryApplicationControl {
                 ActiveStatementCancellation::Governed(_)
             )
         {
+            return GovernedStatementFinishOutcome::Stale;
+        }
+        if active.action.is_some() {
             return GovernedStatementFinishOutcome::Stale;
         }
         let unregister_pending = entry.unregister_pending;
@@ -1804,5 +2029,416 @@ mod tests {
         );
         assert_eq!(workload.snapshot().businesses, 0);
         owner.complete();
+    }
+    struct OriginalStatementGate {
+        gate: futures::channel::oneshot::Receiver<()>,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl crate::session_control::GovernedStatementAction for OriginalStatementGate {
+        fn poll_action(
+            &mut self,
+            _owner: &mut crate::session_control::GovernedQueryStatementOwner,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<
+            Result<
+                crate::session_control::StatementActionValue,
+                crate::session_error::QueryServiceError,
+            >,
+        > {
+            use std::future::Future;
+            std::pin::Pin::new(&mut self.gate).poll(cx).map(|ready| {
+                ready.expect("original release sender");
+                Ok(crate::session_control::StatementActionValue::Ok)
+            })
+        }
+    }
+    impl Drop for OriginalStatementGate {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    fn drive_original_statement_actions(slot: &crate::session_control::StatementProgressSlot) {
+        let mut cursor = crate::session_control::StatementProgressCursor::default();
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        // The actual finite scanner is used; no mirror action state machine.
+        assert!(
+            slot.poll_turn(
+                &mut cursor,
+                std::num::NonZeroUsize::new(7).unwrap(),
+                &mut cx
+            )
+            .is_ready()
+        );
+    }
+    #[tokio::test]
+    async fn original_statement_source_keeps_owner_until_actual_action_drop_and_protocol_take() {
+        let (control, service, workload) = governed_control();
+        let session = register(&control, 7, 1, "root");
+        let slot = crate::session_control::StatementProgressSlot::empty();
+        slot.install(service.clone()).unwrap();
+        let mut owner = Some(
+            service
+                .begin_governed_query_statement(
+                    session,
+                    &workload.root_admission(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+        );
+        let token = owner.as_ref().unwrap().token();
+        let (release, gate) = futures::channel::oneshot::channel();
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut action: Option<Box<dyn crate::session_control::GovernedStatementAction>> =
+            Some(Box::new(OriginalStatementGate {
+                gate,
+                drops: Arc::clone(&drops),
+            }));
+        let mut receiver = None;
+        let publication = service
+            .publish_statement_action_in(&mut owner, &mut action, &mut receiver)
+            .unwrap();
+        assert!(owner.is_none() && action.is_none());
+        publication.finish().unwrap();
+        assert_eq!(
+            control.finish_governed_statement(token),
+            GovernedStatementFinishOutcome::Stale,
+            "the old numeric finish route cannot destroy the source"
+        );
+        let mut wait = Box::pin(receiver.take().unwrap());
+        use futures::FutureExt;
+        assert!(wait.as_mut().now_or_never().is_none());
+        drive_original_statement_actions(&slot);
+        assert_eq!(workload.snapshot().root_responsibilities, 1);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        release.send(()).unwrap();
+        drive_original_statement_actions(&slot);
+        assert_eq!(
+            drops.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "actual action Drop precedes the protocol handoff"
+        );
+        let receipt = wait.await.unwrap();
+        let mut stable_ready = None;
+        receipt
+            .take_ready_in(&mut stable_ready)
+            .unwrap_or_else(|_| panic!("same original stable receiver"))
+            .finish()
+            .unwrap();
+        let ready = stable_ready.take().unwrap();
+        assert!(ready.result.is_ok());
+        assert_eq!(ready.owner.token(), token);
+        assert_eq!(workload.snapshot().root_responsibilities, 1);
+        ready.owner.finish();
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
+    }
+    #[test]
+    fn abandoning_the_waiter_never_drops_the_original_inflight_statement() {
+        let (control, service, workload) = governed_control();
+        let session = register(&control, 7, 1, "root");
+        let slot = crate::session_control::StatementProgressSlot::empty();
+        slot.install(service.clone()).unwrap();
+        let mut owner = Some(
+            service
+                .begin_governed_query_statement(
+                    session,
+                    &workload.root_admission(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+        );
+        let (release, gate) = futures::channel::oneshot::channel();
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut action: Option<Box<dyn crate::session_control::GovernedStatementAction>> =
+            Some(Box::new(OriginalStatementGate {
+                gate,
+                drops: Arc::clone(&drops),
+            }));
+        let mut receiver = None;
+        service
+            .publish_statement_action_in(&mut owner, &mut action, &mut receiver)
+            .unwrap()
+            .finish()
+            .unwrap();
+        drop(receiver.take());
+        drive_original_statement_actions(&slot);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(workload.snapshot().root_responsibilities, 1);
+        assert!(matches!(
+            service.begin_governed_query_statement(
+                session,
+                &workload.root_admission(),
+                None,
+                None,
+                None
+            ),
+            Err(GovernedQueryStatementBeginError::QueryControl(
+                QueryControlError::StatementBusy
+            ))
+        ));
+        release.send(()).unwrap();
+        drive_original_statement_actions(&slot);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
+        assert!(!slot.has_sources());
+    }
+    #[test]
+    fn original_statement_poll_panic_retains_same_cause_and_owner_without_repoll() {
+        struct Cause(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Cause {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        struct PanicAction {
+            polls: Arc<std::sync::atomic::AtomicUsize>,
+            cause: Option<Cause>,
+        }
+        impl crate::session_control::GovernedStatementAction for PanicAction {
+            fn poll_action(
+                &mut self,
+                _: &mut crate::session_control::GovernedQueryStatementOwner,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<
+                Result<
+                    crate::session_control::StatementActionValue,
+                    crate::session_error::QueryServiceError,
+                >,
+            > {
+                self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::panic::panic_any(self.cause.take().unwrap())
+            }
+        }
+        let (control, service, workload) = governed_control();
+        let session = register(&control, 7, 1, "root");
+        let slot = crate::session_control::StatementProgressSlot::empty();
+        slot.install(service.clone()).unwrap();
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut owner = Some(
+            service
+                .begin_governed_query_statement(
+                    session,
+                    &workload.root_admission(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+        );
+        let mut action: Option<Box<dyn crate::session_control::GovernedStatementAction>> =
+            Some(Box::new(PanicAction {
+                polls: Arc::clone(&polls),
+                cause: Some(Cause(Arc::clone(&drops))),
+            }));
+        let mut receiver = None;
+        service
+            .publish_statement_action_in(&mut owner, &mut action, &mut receiver)
+            .unwrap()
+            .finish()
+            .unwrap();
+        drive_original_statement_actions(&slot);
+        let failure = slot.failure().expect("same original cause");
+        assert!(failure.payload().is::<Cause>());
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(workload.snapshot().root_responsibilities, 1);
+        drop(receiver.take());
+        drive_original_statement_actions(&slot);
+        assert_eq!(
+            polls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a poisoned source is never repolled"
+        );
+        let source = control.next_statement_action(None).unwrap().1.unwrap();
+        drop(failure);
+        source.dispose_poisoned_for_test(&service);
+        drop(source);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
+    }
+
+    #[test]
+    fn stopped_statement_publication_returns_the_same_two_original_sources() {
+        let (control, service, workload) = governed_control();
+        let session = register(&control, 7, 1, "root");
+        let slot = crate::session_control::StatementProgressSlot::empty();
+        slot.install(service.clone()).unwrap();
+        let mut owner = Some(
+            service
+                .begin_governed_query_statement(
+                    session,
+                    &workload.root_admission(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+        );
+        let token = owner.as_ref().unwrap().token();
+        let (_release, gate) = futures::channel::oneshot::channel();
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut action: Option<Box<dyn crate::session_control::GovernedStatementAction>> =
+            Some(Box::new(OriginalStatementGate {
+                gate,
+                drops: Arc::clone(&drops),
+            }));
+        let mut receiver = None;
+        slot.close();
+        let refusal = service
+            .publish_statement_action_in(&mut owner, &mut action, &mut receiver)
+            .unwrap();
+        assert_eq!(refusal.result(), &Err(QueryControlError::StatementBusy));
+        assert_eq!(owner.as_ref().unwrap().token(), token);
+        assert!(action.is_some() && receiver.is_none());
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(refusal.finish(), Err(QueryControlError::StatementBusy));
+        drop(action);
+        owner.take().unwrap().protocol_fail();
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
+    }
+    #[test]
+    fn abandoned_statement_cleanup_wake_panic_keeps_the_same_source_and_owner() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        type OriginalWait = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
+        struct CleanupCause(Arc<AtomicUsize>);
+        impl Drop for CleanupCause {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct PanicOnce {
+            cause: Mutex<Option<CleanupCause>>,
+        }
+        impl std::task::Wake for PanicOnce {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                let cause = self.cause.lock().unwrap().take();
+                if let Some(cause) = cause {
+                    std::panic::panic_any(cause);
+                }
+            }
+        }
+        struct ArmActualCleanupWake {
+            workload: Arc<WorkloadControl>,
+            wait: Arc<Mutex<Option<OriginalWait>>>,
+            wake: Arc<PanicOnce>,
+        }
+        impl crate::session_control::GovernedStatementAction for ArmActualCleanupWake {
+            fn poll_action(
+                &mut self,
+                _: &mut crate::session_control::GovernedQueryStatementOwner,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<
+                Result<
+                    crate::session_control::StatementActionValue,
+                    crate::session_error::QueryServiceError,
+                >,
+            > {
+                std::task::Poll::Ready(Ok(crate::session_control::StatementActionValue::Ok))
+            }
+        }
+        impl Drop for ArmActualCleanupWake {
+            fn drop(&mut self) {
+                // Arm the REAL authority waiter after action exit and before
+                // the original root/permit cleanup. No injected cleanup hook.
+                let workload = Arc::clone(&self.workload);
+                let marker = workload.progress_revision();
+                let mut waiting: OriginalWait = Box::pin(async move {
+                    workload.wait_progress(marker).await;
+                });
+                let waker = std::task::Waker::from(Arc::clone(&self.wake));
+                assert!(
+                    waiting
+                        .as_mut()
+                        .poll(&mut std::task::Context::from_waker(&waker))
+                        .is_pending()
+                );
+                *self.wait.lock().unwrap() = Some(waiting);
+            }
+        }
+        let (control, service, workload) = governed_control();
+        let workload = Arc::new(workload);
+        let session = register(&control, 7, 1, "root");
+        let slot = crate::session_control::StatementProgressSlot::empty();
+        slot.install(service.clone()).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let wake = Arc::new(PanicOnce {
+            cause: Mutex::new(Some(CleanupCause(Arc::clone(&drops)))),
+        });
+        let wait = Arc::new(Mutex::new(None));
+        let mut owner = Some(
+            service
+                .begin_governed_query_statement(
+                    session,
+                    &workload.root_admission(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+        );
+        let token = owner.as_ref().unwrap().token();
+        let mut action: Option<Box<dyn crate::session_control::GovernedStatementAction>> =
+            Some(Box::new(ArmActualCleanupWake {
+                workload: Arc::clone(&workload),
+                wait: Arc::clone(&wait),
+                wake,
+            }));
+        let mut receiver = None;
+        service
+            .publish_statement_action_in(&mut owner, &mut action, &mut receiver)
+            .unwrap()
+            .finish()
+            .unwrap();
+        drop(receiver.take());
+        // Settle the original cancellation delivery so the waiter below arms
+        // for the true completion callback rather than an older ready intent.
+        while let Some(permit) = workload.next_control() {
+            permit.acknowledge();
+        }
+        drive_original_statement_actions(&slot);
+        let failure = slot.failure().expect("actual cleanup wake preserved");
+        assert!(failure.payload().is::<CleanupCause>());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(
+            slot.has_sources(),
+            "callback panic cannot detach the sole stable receiver"
+        );
+        assert_eq!(
+            control.finish_governed_statement(token),
+            GovernedStatementFinishOutcome::Stale
+        );
+        let source = control.next_statement_action(None).unwrap().1.unwrap();
+        assert!(
+            !source.is_settled(),
+            "partial cleanup is not a terminal receipt"
+        );
+        assert!(matches!(
+            service.begin_governed_query_statement(
+                session,
+                &workload.root_admission(),
+                None,
+                None,
+                None
+            ),
+            Err(GovernedQueryStatementBeginError::QueryControl(
+                QueryControlError::StatementBusy
+            ))
+        ));
+        let waiting = wait.lock().unwrap().take();
+        drop(waiting);
+        drop(failure);
+        source.dispose_poisoned_for_test(&service);
+        drop(source);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(workload.snapshot().root_responsibilities, 0);
+        assert_eq!(workload.snapshot().businesses, 0);
     }
 }

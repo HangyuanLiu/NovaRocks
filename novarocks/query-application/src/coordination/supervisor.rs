@@ -201,6 +201,7 @@ pub struct LogicalExecutionSupervisor {
     original_root_failure: std::mem::ManuallyDrop<Option<Arc<tokio::task::JoinError>>>,
     original_root_panic: std::mem::ManuallyDrop<Option<OriginalRootPanic>>,
     registry: LogicalExecutionRuntimeRegistry,
+    statements: Arc<crate::session_control::StatementProgressSlot>,
     statement_native_residual_port: super::StatementNativeResidualPort,
     role_retirement: RoleBackingRetirementObserver,
     shutdown_complete: bool,
@@ -227,7 +228,7 @@ struct OriginalRootPanicCustody {
     // Cancellation is reported by the genuine original JoinError, not a
     // synthetic panic payload. A caught service panic remains unchanged here.
     primary: Option<Box<dyn std::any::Any + Send>>,
-    cleanup: [Option<Box<dyn std::any::Any + Send>>; 2],
+    cleanup: [Option<Box<dyn std::any::Any + Send>>; 3],
     cancelled: bool,
 }
 impl OriginalRootPanic {
@@ -339,6 +340,7 @@ where
         Option<RolePollBank<LogicalRoleInput, F, M, Arc<OriginalLogicalExit>>>,
     >,
     retirement: OriginalRootPanic,
+    statements: Arc<crate::session_control::StatementProgressSlot>,
 }
 impl<F, M> OriginalRootBank<F, M>
 where
@@ -363,14 +365,17 @@ where
         if let Some(bank) = self.bank.take() {
             // stop_ingress publishes the original State cut; the catch retains
             // any real exceptional tail without replacing the task JoinError.
-            let closing = catch_unwind(AssertUnwindSafe(|| bank.stop_ingress())).err();
+            let statement_closing =
+                catch_unwind(AssertUnwindSafe(|| self.statements.close())).err();
+            let bank_closing = catch_unwind(AssertUnwindSafe(|| bank.stop_ingress())).err();
             self.retirement.retain(OriginalRootPanicCustody {
-                _bank: Box::new(bank),
-                bank_layout: std::alloc::Layout::new::<
+                _bank: Box::new((bank, Arc::clone(&self.statements))),
+                bank_layout: std::alloc::Layout::new::<(
                     RolePollBank<LogicalRoleInput, F, M, Arc<OriginalLogicalExit>>,
-                >(),
+                    Arc<crate::session_control::StatementProgressSlot>,
+                )>(),
                 primary: None,
-                cleanup: [closing, None],
+                cleanup: [statement_closing, bank_closing, None],
                 cancelled: true,
             });
         }
@@ -399,9 +404,10 @@ where
         join_output: std::alloc::Layout::new::<OriginalRootOutcome>(),
         cancellation_guard: std::alloc::Layout::new::<OriginalRootBank<F, M>>(),
         shared_retirement_packet: std::alloc::Layout::new::<OriginalRootRetirement>(),
-        retained_bank: std::alloc::Layout::new::<
+        retained_bank: std::alloc::Layout::new::<(
             RolePollBank<LogicalRoleInput, F, M, Arc<OriginalLogicalExit>>,
-        >(),
+            Arc<crate::session_control::StatementProgressSlot>,
+        )>(),
     }
 }
 
@@ -434,6 +440,22 @@ impl Drop for LogicalExecutionSupervisor {
 }
 
 impl LogicalExecutionSupervisor {
+    /// Borrows the original source's same cause; no absence or root task
+    /// completion is projected as action exit.
+    pub fn statement_action_failure(
+        &self,
+    ) -> Option<Arc<crate::session_control::StatementActionFailure>> {
+        self.statements.failure()
+    }
+
+    /// Serial composition before statement publication/Ready. The same root
+    /// polls original statement actions without mounting their root twice.
+    pub fn install_statement_control(
+        &mut self,
+        service: crate::session_control::QueryControlService,
+    ) -> Result<(), crate::session_control::QueryControlError> {
+        self.statements.install(service)
+    }
     /// Pure layout facts from this owner's actual logical-role factory.
     /// No Work, input, task or bank is created. Composition must separately
     /// fund independent pointees and the real health wrapper overlap before
@@ -547,12 +569,14 @@ impl LogicalExecutionSupervisor {
             registry: registry_handle.clone(),
         };
         let original_root = OriginalRootPanic::empty();
+        let statements = crate::session_control::StatementProgressSlot::empty();
         let join = runtime.spawn(run_supervisor_owned(
             registry_handle,
             bank,
             turn_budget,
             shutdown_rx,
             original_root.clone(),
+            Arc::clone(&statements),
         ));
         Ok((
             Self {
@@ -562,6 +586,7 @@ impl LogicalExecutionSupervisor {
                 original_root_failure: std::mem::ManuallyDrop::new(None),
                 original_root_panic: std::mem::ManuallyDrop::new(Some(original_root)),
                 registry,
+                statements,
                 statement_native_residual_port,
                 role_retirement,
                 shutdown_complete: false,
@@ -1156,6 +1181,7 @@ fn run_supervisor_owned<F, M>(
     turn_budget: NonZeroUsize,
     shutdown: watch::Receiver<bool>,
     retirement: OriginalRootPanic,
+    statements: Arc<crate::session_control::StatementProgressSlot>,
 ) -> impl Future<Output = OriginalRootOutcome> + Send + 'static
 where
     F: Future<Output = Result<(), QueryExecutionError>> + Send + 'static,
@@ -1166,14 +1192,17 @@ where
     let mut original_bank = OriginalRootBank {
         bank: std::mem::ManuallyDrop::new(Some(bank)),
         retirement,
+        statements,
     };
     async move {
         let (outcome, cleanup) = {
+            let statements = Arc::clone(&original_bank.statements);
             let mut service = Box::pin(run_supervisor(
                 registry,
                 original_bank.bank_mut(),
                 turn_budget,
                 shutdown,
+                statements,
             ));
             let outcome = std::future::poll_fn(|cx| {
                 match catch_unwind(AssertUnwindSafe(|| service.as_mut().poll(cx))) {
@@ -1192,22 +1221,25 @@ where
             drop(original_bank.take());
             return OriginalRootOutcome::Completed(outcome.unwrap_or_else(|_| unreachable!()));
         }
-        let closing =
+        let statement_closing =
+            catch_unwind(AssertUnwindSafe(|| original_bank.statements.close())).err();
+        let bank_closing =
             catch_unwind(AssertUnwindSafe(|| original_bank.bank_mut().stop_ingress())).err();
         let (primary, cleanup) = match outcome {
-            Err(primary) => (primary, [cleanup, closing]),
+            Err(primary) => (primary, [cleanup, statement_closing, bank_closing]),
             Ok(_) => (
                 cleanup.expect("cleanup is the first failure"),
-                [closing, None],
+                [statement_closing, bank_closing, None],
             ),
         };
         let original = original_bank.retirement.clone();
         let bank = original_bank.take();
         original.retain(OriginalRootPanicCustody {
-            _bank: Box::new(bank),
-            bank_layout: std::alloc::Layout::new::<
+            _bank: Box::new((bank, Arc::clone(&original_bank.statements))),
+            bank_layout: std::alloc::Layout::new::<(
                 RolePollBank<LogicalRoleInput, F, M, Arc<OriginalLogicalExit>>,
-            >(),
+                Arc<crate::session_control::StatementProgressSlot>,
+            )>(),
             primary: Some(primary),
             cleanup,
             cancelled: false,
@@ -1221,6 +1253,7 @@ async fn run_supervisor<F, M>(
     bank: &mut RolePollBank<LogicalRoleInput, F, M, Arc<OriginalLogicalExit>>,
     turn_budget: NonZeroUsize,
     mut shutdown: watch::Receiver<bool>,
+    statements: Arc<crate::session_control::StatementProgressSlot>,
 ) -> Result<(), QueryExecutionError>
 where
     F: Future<Output = Result<(), QueryExecutionError>> + Send + 'static,
@@ -1230,15 +1263,22 @@ where
     let mut task_failure = None;
     let mut stopping = false;
     let mut original_exit_cursor = super::runtime_registry::OriginalExitCursor::default();
+    let mut statement_cursor = crate::session_control::StatementProgressCursor::default();
     loop {
         if !stopping && (*shutdown.borrow() || shutdown.has_changed().is_err()) {
             // The original State serializes this cut with publication. Every
             // already accepted input is visible; later attempts must refuse.
             bank.stop_ingress();
+            statements.close();
             registry.close_statement_native_admission();
             stopping = true;
         }
 
+        std::future::poll_fn(|cx| {
+            let _ = statements.poll_turn(&mut statement_cursor, turn_budget, cx);
+            Poll::Ready(())
+        })
+        .await;
         registry.progress_root_ack_tails();
         for task in registry.statement_native_ready_tasks() {
             residual_tasks.spawn(task);
@@ -1268,6 +1308,7 @@ where
             && registry.statement_native_count() == 0
             && registry.root_ack_tail_count() == 0
             && !registry.original_exit_pending()
+            && !statements.has_sources()
         {
             break;
         }
@@ -1287,6 +1328,7 @@ where
             }
             _ = registry.root_ack_tail_changed() => {}
             _ = registry.original_exit_changed() => {}
+            _ = std::future::poll_fn(|cx| statements.poll_turn(&mut statement_cursor, turn_budget, cx)) => {}
             _ = std::future::poll_fn(|cx| registry.poll_original_exit_turn(
                 &mut original_exit_cursor, turn_budget, cx)) => {}
             _ = std::future::poll_fn(|cx| bank.poll_ready(cx)) => {}

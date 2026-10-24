@@ -244,6 +244,7 @@ async fn rejected_late_health_completion_and_callback_panic_return_the_same_bank
             NonZeroUsize::new(7).unwrap(),
             shutdown.subscribe(),
             root_retirement.clone(),
+            crate::session_control::StatementProgressSlot::empty(),
         ));
         let outcome = tokio::time::timeout(Duration::from_secs(2), &mut original_join)
             .await
@@ -404,7 +405,10 @@ async fn original_root_joins_installed_actor_after_actual_reply_wake_panics_and_
             supervisor.registry.handle().statement_native_count(),
             supervisor.registry.handle().root_ack_tail_count(),
             supervisor.registry.handle().original_exit_pending(),
-            supervisor.join.as_ref().map(tokio::task::JoinHandle::is_finished),
+            supervisor
+                .join
+                .as_ref()
+                .map(tokio::task::JoinHandle::is_finished),
             supervisor.original_root_panic().is_some(),
         );
         // Dispose through the real process owner before asserting the health
@@ -969,4 +973,125 @@ async fn initial_and_replacement_completed_outputs_survive_original_dormant_drop
             "only explicit original-source disposition drops the active owner"
         );
     }
+}
+
+#[tokio::test]
+async fn actual_root_cancel_closes_bank_ingress_after_statement_wake_panics() {
+    struct StatementStopCause;
+    struct StopWake<T: Send + Sync + 'static> {
+        payload: std::sync::Mutex<Option<T>>,
+    }
+    impl<T: Send + Sync + 'static> std::task::Wake for StopWake<T> {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            let payload = self.payload.lock().unwrap().take();
+            if let Some(payload) = payload {
+                std::panic::panic_any(payload);
+            }
+        }
+    }
+    let control = governance_empty();
+    let mut control = {
+        let (mut bank, shutdown, mut registry, client) =
+            unpolled_test_driver(&control, Arc::new(PanickingOpenNativePort));
+        let statements = crate::session_control::StatementProgressSlot::empty();
+        statements
+            .install(crate::query_control::QueryApplicationControl::service())
+            .unwrap();
+        let statement_waker = std::task::Waker::from(Arc::new(StopWake {
+            payload: std::sync::Mutex::new(Some(StatementStopCause)),
+        }));
+        let mut cursor = crate::session_control::StatementProgressCursor::default();
+        let budget = NonZeroUsize::new(7).unwrap();
+        assert!(
+            statements
+                .poll_turn(
+                    &mut cursor,
+                    budget,
+                    &mut std::task::Context::from_waker(&statement_waker)
+                )
+                .is_ready()
+        );
+        assert!(
+            statements
+                .poll_turn(
+                    &mut cursor,
+                    budget,
+                    &mut std::task::Context::from_waker(&statement_waker)
+                )
+                .is_pending()
+        );
+        // Admit the real source before the ingress cut. stop_ingress closes
+        // the original WC too, so a new root after cancellation must refuse.
+        let root = control.begin_root().await;
+        let retirement = OriginalRootPanic::empty();
+        // Tokio spawn never synchronously polls; current-thread abort occurs
+        // before yielding, while the real pre-poll guard already exists.
+        let join = Handle::current().spawn(run_supervisor_owned(
+            registry.handle(),
+            bank,
+            budget,
+            shutdown.subscribe(),
+            retirement.clone(),
+            Arc::clone(&statements),
+        ));
+        join.abort();
+        let original = match join.await {
+            Err(original) => original,
+            Ok(_) => panic!("the real root was cancelled before first poll"),
+        };
+        assert!(original.is_cancelled());
+        retirement.retain_join_failure(Arc::new(original));
+        {
+            let packet = retirement.custody();
+            assert!(packet.cancelled);
+            assert!(
+                packet.cleanup[0]
+                    .as_ref()
+                    .unwrap()
+                    .is::<StatementStopCause>()
+            );
+            assert!(
+                packet.cleanup[1].is_none(),
+                "the actual bank stop is a silent State cut"
+            );
+        }
+        // The bank stop really happened after the statement notify panicked:
+        // its original ingress refuses and preserves the actual source tuple.
+        let mut input = Some(
+            client
+                .prepare_observed_start(completion_request(UnreachablePreparationPort), None)
+                .unwrap_or_else(|_| panic!("original source")),
+        );
+        let mut owner = Some(root.owner);
+        let mut ready = None;
+        let mut exit = None;
+        let refusal = client
+            .start_observed_in(&mut input, &mut owner, &mut ready, &mut exit)
+            .unwrap_or_else(|_| panic!("the original refusal packet is constructible"));
+        assert!(
+            refusal.result().is_err(),
+            "the actual original ingress is closed"
+        );
+        assert!(refusal.finish().is_err());
+        assert!(input.is_some() && owner.is_some() && ready.is_none() && exit.is_none());
+        drop(input);
+        owner
+            .take()
+            .unwrap()
+            .complete_after_terminal_cancel_settled();
+        root.business.release();
+        drop(client);
+        registry
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        drop(statements);
+        retirement.dispose_for_process_exit();
+        control
+    };
+    acknowledge_all_control(&control);
+    control.finish().await;
 }

@@ -17,7 +17,17 @@
 
 //! Query-application session cancellation control contract.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+
+mod statement_action;
+pub(crate) use statement_action::StatementProgressCursor;
+pub use statement_action::{
+    GovernedStatementAction, StatementActionAttempt, StatementActionFailure, StatementActionReady,
+    StatementActionReceipt, StatementActionValue, StatementActionWaitError, StatementActionWaiter,
+    StatementProgressGeometry,
+};
+#[doc(hidden)]
+pub use statement_action::{StatementActionSource, StatementProgressSlot};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -351,6 +361,52 @@ pub trait QueryControlPort: Send + Sync + 'static {
         target_connection_id: u32,
     ) -> ConnectionKillAuthorization;
     fn cancel_all(&self, reason: QueryCancellationReason);
+
+    /// Composition installs one original supervisor before publishing actions.
+    fn attach_statement_progress(
+        &self,
+        _slot: &Arc<StatementProgressSlot>,
+    ) -> Result<(), QueryControlError> {
+        Err(QueryControlError::UnknownSession)
+    }
+    fn statement_progress_slot(&self) -> Option<Arc<StatementProgressSlot>> {
+        None
+    }
+    fn publish_statement_action_in(
+        &self,
+        _owner: &mut Option<GovernedQueryStatementOwner>,
+        _action: &mut Option<Box<dyn GovernedStatementAction>>,
+        _source: &Arc<StatementActionSource>,
+    ) -> Result<(), QueryControlError> {
+        Err(QueryControlError::UnknownSession)
+    }
+    fn next_statement_action(
+        &self,
+        _after: Option<u32>,
+    ) -> Option<(u32, Option<Arc<StatementActionSource>>)> {
+        None
+    }
+    fn detach_statement_action(
+        &self,
+        _token: StatementToken,
+        _source: &Arc<StatementActionSource>,
+    ) -> bool {
+        false
+    }
+    fn settle_statement_action_silent(
+        &self,
+        _token: StatementToken,
+        _source: &Arc<StatementActionSource>,
+    ) -> bool {
+        false
+    }
+    fn close_statement_actions(&self) {}
+    fn has_statement_actions(&self) -> bool {
+        false
+    }
+    fn statement_action_failure(&self) -> Option<Arc<StatementActionFailure>> {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -532,7 +588,7 @@ impl QueryControlService {
             }
         };
         Ok(GovernedQueryStatementOwner {
-            service: self.clone(),
+            service: GovernedControlLink::Strong(self.clone()),
             registration,
             scope,
             execution_owner: Some(root.owner),
@@ -637,7 +693,7 @@ impl QueryControlService {
             }
         };
         Ok(GovernedQueryStatementOwner {
-            service: self.clone(),
+            service: GovernedControlLink::Strong(self.clone()),
             registration,
             scope: root.owner.scope(),
             execution_owner: Some(root.owner),
@@ -754,8 +810,23 @@ impl Drop for ActiveStatementLease {
 /// Move-only owner spanning query admission, async execution start, and the
 /// final protocol outcome. The business permit and statement generation remain
 /// live after the execution owner is handed to the query application.
+enum GovernedControlLink {
+    Strong(QueryControlService),
+    Stable(Weak<dyn QueryControlPort>),
+}
+impl GovernedControlLink {
+    fn port(&self) -> Arc<dyn QueryControlPort> {
+        match self {
+            Self::Strong(service) => Arc::clone(&service.port),
+            Self::Stable(port) => port
+                .upgrade()
+                .expect("original statement supervisor retains query control"),
+        }
+    }
+}
+
 pub struct GovernedQueryStatementOwner {
-    service: QueryControlService,
+    service: GovernedControlLink,
     registration: GovernedStatementRegistration,
     scope: WorkScope,
     execution_owner: Option<WorkOwner>,
@@ -771,6 +842,19 @@ pub struct GovernedQueryStatementOwner {
 }
 
 impl GovernedQueryStatementOwner {
+    fn park_control_link(&mut self) {
+        let port = self.service.port();
+        self.service = GovernedControlLink::Stable(Arc::downgrade(&port));
+    }
+    fn restore_control_link(&mut self, service: &QueryControlService) {
+        let original = self.service.port();
+        assert!(
+            Arc::ptr_eq(&original, &service.port),
+            "same statement control authority"
+        );
+        self.service = GovernedControlLink::Strong(service.clone());
+    }
+
     pub const fn token(&self) -> StatementToken {
         self.registration.token()
     }
@@ -892,7 +976,7 @@ impl GovernedQueryStatementOwner {
         }
         let outcome = self
             .service
-            .port
+            .port()
             .seal_governed_statement_visibility(self.registration.token());
         if outcome == GovernedStatementVisibilitySealOutcome::Sealed {
             self.success_visibility_sealed = true;
@@ -918,7 +1002,7 @@ impl GovernedQueryStatementOwner {
         } else {
             let _ = self
                 .service
-                .port
+                .port()
                 .cancel_governed_statement(self.registration.token(), reason);
         }
         self.finish_inner()
@@ -932,6 +1016,18 @@ impl GovernedQueryStatementOwner {
         self.protocol_fail_inner()
     }
 
+    /// Only the same stable Source uses this after its actual action/result
+    /// exit. Keep the original registry entry until every callback here returns.
+    fn cleanup_abandoned_action_in_place(&mut self) {
+        assert!(!self.finished, "one original statement cleanup attempt");
+        self.finished = true;
+        self.complete_local_owner_after_terminal();
+        self.release_terminal_concurrency();
+        // This grant may notify WC on actual last exit too. It is part of this
+        // borrowed cleanup, never an implicit owner Drop after Source removal.
+        self.result_window.take();
+    }
+
     fn protocol_fail_inner(&mut self) -> GovernedStatementFinishOutcome {
         if self.finished {
             return GovernedStatementFinishOutcome::Stale;
@@ -941,7 +1037,7 @@ impl GovernedQueryStatementOwner {
         self.release_terminal_concurrency();
 
         self.service
-            .port
+            .port()
             .fail_governed_statement(self.registration.token())
     }
 
@@ -957,7 +1053,7 @@ impl GovernedQueryStatementOwner {
         self.release_terminal_concurrency();
 
         self.service
-            .port
+            .port()
             .finish_governed_statement(self.registration.token())
     }
 
@@ -980,10 +1076,10 @@ impl Drop for GovernedQueryStatementOwner {
                 self.release_terminal_concurrency();
                 let _ = self
                     .service
-                    .port
+                    .port()
                     .fail_governed_statement(self.registration.token());
             } else {
-                let _ = self.service.port.cancel_governed_statement(
+                let _ = self.service.port().cancel_governed_statement(
                     self.registration.token(),
                     CancellationReason::OwnerDropped,
                 );
