@@ -258,7 +258,7 @@ impl NativeAttemptConvergenceOwner {
                     std::task::Poll::Ready(())
                 })
                 .await;
-                if profile.observation_deadline().is_none() {
+                if profile.final_info_closed() || profile.observation_deadline().is_none() {
                     round.execution_mut().release_profile_diagnostics();
                 }
             }
@@ -340,7 +340,7 @@ impl NativeAttemptConvergenceOwner {
                     std::task::Poll::Ready(())
                 })
                 .await;
-                if profile.observation_deadline().is_none() {
+                if profile.final_info_closed() || profile.observation_deadline().is_none() {
                     round.execution_mut().release_profile_diagnostics();
                 }
             }

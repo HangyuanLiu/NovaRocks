@@ -21,7 +21,8 @@ mod profile_snapshot_tests {
     use std::num::{NonZeroU64, NonZeroUsize};
 
     use crate::task_execution::profile_diagnostics::{
-        ProfileDiagnosticClosure, ProfileDiagnosticMissing, ProfileTaskDiagnostic,
+        ProfileDiagnosticClosure, ProfileDiagnosticMissing, ProfileSplitDiagnostic,
+        ProfileTaskDiagnostic,
     };
     use novarocks_coordination_contract::{ExecutionEffect, MonotonicClock, RecoveryMode};
     use novarocks_execution_contract::FinalTaskInfo;
@@ -127,8 +128,34 @@ mod profile_snapshot_tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn actual_ready_snapshot_deadline_is_independent_of_remote_wait_and_original_rpc_exit() {
+    struct OriginalAvailableFinalInfo {
+        info: Mutex<std::collections::BTreeMap<TaskIdentity, FinalTaskInfo>>,
+        started: Arc<Mutex<Vec<TaskIdentity>>>,
+    }
+
+    impl TaskResultTransport for OriginalAvailableFinalInfo {
+        fn final_task_info(
+            &self,
+            task: TaskIdentity,
+        ) -> futures::future::BoxFuture<'_, Result<FinalTaskInfoRead, String>> {
+            self.started.lock().unwrap().push(task);
+            let info = self.info.lock().unwrap().remove(&task);
+            Box::pin(async move {
+                info.map(|info| FinalTaskInfoRead::Available(Box::new(info)))
+                    .ok_or_else(|| "the original final-info fixture was read twice".to_owned())
+            })
+        }
+
+        fn dynamic_filters(
+            &self,
+            _: TaskIdentity,
+            _: Option<DomainVersion>,
+        ) -> Result<DynamicFilterRead, DynamicFilterReadError> {
+            panic!("profile diagnostics must not fetch dynamic filters")
+        }
+    }
+
+    async fn original_ready_profile_snapshot_fixture(final_info_before_release: bool) {
         let (mut round, acks, release, clock, establish_facts) =
             crate::task_execution::tests::manifest_normal_release_ack_with_actor_facts_fixture();
         let root_task = round.root_task();
@@ -230,6 +257,179 @@ mod profile_snapshot_tests {
         );
         // This is the logical recovery cut, not evidence of client delivery.
         assert!(actor_cut.output_visible);
+
+        if final_info_before_release {
+            // Each available value comes from this actual round's already
+            // accepted exact terminal, not from a hand-built Ready/snapshot.
+            let expected = round
+                .execution()
+                .graph()
+                .tasks()
+                .map(|task| task.identity())
+                .collect::<Vec<_>>();
+            let info = expected
+                .iter()
+                .map(|&identity| {
+                    let status = round
+                        .execution()
+                        .task(identity.task_id())
+                        .unwrap()
+                        .status()
+                        .unwrap()
+                        .clone();
+                    (
+                        identity,
+                        FinalTaskInfo::try_new(identity, status, Vec::new(), false).unwrap(),
+                    )
+                })
+                .collect();
+            let started = Arc::new(Mutex::new(Vec::new()));
+            let transport: Arc<dyn TaskResultTransport> = Arc::new(OriginalAvailableFinalInfo {
+                info: Mutex::new(info),
+                started: Arc::clone(&started),
+            });
+            let notify = Arc::new(tokio::sync::Notify::new());
+            let mut collector = TaskFinalInfoCollector::new(
+                transport,
+                true,
+                &round,
+                Arc::new(NotifyWake::new(Arc::clone(&notify))),
+            );
+            let observer = collector.enable_profile_observation().unwrap();
+            // There is genuinely no split source installed by this fixture.
+            // The no-scan Available(empty) fact must not hold up Release.
+            collector.set_split_profile_source(None);
+            collector.begin_profile_observation(ready).unwrap();
+            round
+                .execution_mut()
+                .retain_profile_diagnostics_until(ready.diagnostic_deadline());
+            for _ in 0..=expected.len() {
+                std::future::poll_fn(|cx| {
+                    collector.poll_profile_observation(&round, clock.now(), false, cx);
+                    Poll::Ready(())
+                })
+                .await;
+            }
+            let final_info_closed_before_release = collector.final_info_closed();
+            let no_early_snapshot = observer.current(ready).unwrap().is_none();
+            let original_deadline_before_release = collector.observation_deadline();
+            let original_reads = started.lock().unwrap().clone();
+            let before_release = round.execution().released_runtime_filter_contributions();
+            let split_delivery = SplitDeliveryBridge::for_graph(round.execution().graph());
+            let mut owner = original_convergence(&round);
+            let remote_deadline = std::time::Instant::now() + convergence_budget;
+            let mut wait = Box::pin(owner.drive(
+                &mut round,
+                &split_delivery,
+                NativeAttemptConvergenceMode::Normal,
+                NativeActiveConvergenceRequest::new(cancellation.clone(), remote_deadline),
+                &notify,
+                Some(&mut collector),
+            ));
+            let pending_before_release = futures::poll!(wait.as_mut()).is_pending();
+            drop(wait);
+            clock.advance(diagnostic_budget / 2);
+            collector.begin_profile_observation(ready).unwrap();
+            std::future::poll_fn(|cx| {
+                collector.poll_profile_observation(&round, clock.now(), false, cx);
+                Poll::Ready(())
+            })
+            .await;
+            let no_snapshot_after_rebegin = observer.current(ready).unwrap().is_none();
+            let original_deadline_after_rebegin = collector.observation_deadline();
+
+            let OperationIntent::ReleaseQueryContext(request) = &release else {
+                unreachable!()
+            };
+            let original_contribution =
+                crate::task_execution::tests::fixture_runtime_filter_contribution();
+            acks.publish(OperationAcknowledgement::new(
+                release.operation_id(),
+                OperationKind::ReleaseQueryContext,
+                OperationOutcome::Accepted,
+                AckPayload::Release {
+                    receipt: QueryContextReceipt::new(
+                        request.context(),
+                        QueryContextState::TerminalRetained,
+                    ),
+                    outcome: ReleaseOutcome::Released,
+                    runtime_filter: Some(original_contribution.clone()),
+                },
+            ));
+            round.turn().unwrap();
+            publish_exit(&mut round, context);
+            // A test-only watchdog drops only this borrowing wait on failure;
+            // the same collector/round/owner remain in this fixture's stack.
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                owner.drive(
+                    &mut round,
+                    &split_delivery,
+                    NativeAttemptConvergenceMode::Normal,
+                    NativeActiveConvergenceRequest::new(cancellation, remote_deadline),
+                    &notify,
+                    Some(&mut collector),
+                ),
+            )
+            .await;
+            let snapshot = observer.current(ready).unwrap();
+            // Finish the original actor before checking the captured cut facts.
+            logical.abandon_running_attempt();
+            logical
+                .observe_worker_stopped_and_context_fenced(context)
+                .await
+                .unwrap();
+            logical
+                .finish_until(std::time::Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert!(final_info_closed_before_release);
+            assert!(no_early_snapshot);
+            assert!(pending_before_release);
+            assert!(!before_release.is_complete());
+            assert!(before_release.contributions().is_empty());
+            assert!(no_snapshot_after_rebegin);
+            assert_eq!(
+                original_deadline_before_release,
+                Some(ready.diagnostic_deadline())
+            );
+            assert_eq!(
+                original_deadline_after_rebegin,
+                Some(ready.diagnostic_deadline())
+            );
+            assert_eq!(original_reads.len(), expected.len());
+            assert_eq!(
+                original_reads
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                expected.iter().copied().collect()
+            );
+            assert_eq!(*started.lock().unwrap(), original_reads);
+            assert!(matches!(
+                result
+                    .expect("test-only watchdog: original Release and local exit")
+                    .unwrap(),
+                NativeActiveConvergenceClosure::Evidence(_)
+            ));
+            let snapshot = snapshot.expect("the exact Release permits the final snapshot");
+            assert_eq!(snapshot.ready, ready);
+            assert_eq!(snapshot.closure, ProfileDiagnosticClosure::FrontierSettled);
+            assert!(snapshot.complete());
+            assert!(snapshot.runtime_filters.is_complete());
+            assert_eq!(
+                snapshot.runtime_filters.contributions(),
+                &[(context.backend_process_id(), original_contribution)]
+            );
+            assert!(matches!(
+                snapshot.split,
+                ProfileSplitDiagnostic::Available(_)
+            ));
+            assert_eq!(collector.observation_deadline(), None);
+            assert!(collector.final_info_closed());
+            assert!(collector.is_closed());
+            return;
+        }
 
         let first = round.execution().accepted_terminal_tasks()[0];
         let first_status = round
@@ -336,6 +536,13 @@ mod profile_snapshot_tests {
             ProfileDiagnosticClosure::ObservationDeadline
         );
         assert!(!snapshot.complete());
+        assert!(collector.final_info_closed());
+        assert!(!snapshot.runtime_filters.is_complete());
+        assert!(snapshot.runtime_filters.contributions().is_empty());
+        assert!(matches!(
+            snapshot.split,
+            ProfileSplitDiagnostic::Available(_)
+        ));
         let available = snapshot
             .tasks
             .iter()
@@ -471,6 +678,15 @@ mod profile_snapshot_tests {
         assert_eq!(collector.observation_deadline(), None);
         let late = observer.current(ready).unwrap().unwrap();
         assert!(Arc::ptr_eq(&late, &snapshot));
+        assert!(
+            round
+                .execution()
+                .released_runtime_filter_contributions()
+                .is_complete()
+        );
+        assert!(!late.runtime_filters.is_complete());
+        assert!(late.runtime_filters.contributions().is_empty());
+        assert!(matches!(late.split, ProfileSplitDiagnostic::Available(_)));
         assert!(late.tasks.iter().any(|(task, fact)| {
             *task == original_pending[0]
                 && matches!(
@@ -479,5 +695,15 @@ mod profile_snapshot_tests {
                 )
         }));
         assert_eq!(collector.collected.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn actual_ready_snapshot_deadline_is_independent_of_remote_wait_and_original_rpc_exit() {
+        original_ready_profile_snapshot_fixture(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn actual_final_info_cut_waits_for_original_release_without_renewing_ready_deadline() {
+        original_ready_profile_snapshot_fixture(true).await;
     }
 }

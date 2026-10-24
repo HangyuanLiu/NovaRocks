@@ -264,6 +264,13 @@ impl ManifestAssembledRound {
         self.split_failure = guard
             .as_ref()
             .map(SplitAssignmentRoundGuard::failure_source);
+        if let Some(diagnostics) = self.profile_diagnostics.as_mut() {
+            diagnostics.set_split_profile_source(
+                guard
+                    .as_ref()
+                    .map(SplitAssignmentRoundGuard::profile_source),
+            );
+        }
         guard
     }
 

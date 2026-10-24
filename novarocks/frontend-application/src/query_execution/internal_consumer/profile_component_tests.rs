@@ -272,6 +272,128 @@ async fn fixed_profile_reaches_real_ready_while_original_final_info_is_held() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn fixed_profile_deadline_freezes_pending_before_the_original_rpc_returns_on_that_poll() {
+    let probe = Arc::new(FinalInfoProbe::default());
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let transport: Arc<dyn TaskResultTransport> = Arc::new(HeldOriginalFinalInfo {
+        gate: Mutex::new(Some(gate)),
+        probe: Arc::clone(&probe),
+    });
+    let (mut attempt, resources, activation) = watchdog(
+        "build original actor for the deadline boundary",
+        OriginalAttempt::new_with_transport(1, transport),
+    )
+    .await;
+    let (description, plan) = internal_count_description();
+    let (consumer, offers, mut output) = profile_computation_consumer(&description, plan).unwrap();
+    let mut producer = offers.reserve(attempt.root.query_execution_id()).unwrap();
+    producer
+        .stage(
+            attempt.root.query_execution_id(),
+            attempt.root,
+            plan,
+            resources,
+        )
+        .unwrap();
+    attempt.bind_original_drive(&mut producer);
+    let pending_task = attempt.round.execution().accepted_terminal_tasks()[0];
+    std::future::poll_fn(|cx| {
+        attempt.diagnostics.poll_observe(&attempt.round, cx);
+        Poll::Ready(())
+    })
+    .await;
+    let initially_pending = probe.entered.load(Ordering::SeqCst)
+        && !probe.completed.load(Ordering::SeqCst)
+        && !probe.exited.load(Ordering::SeqCst)
+        && !attempt.diagnostics.is_closed();
+    let received =
+        run_fixed_consumer_to_real_cut(&attempt, consumer, activation, &mut output, None).await;
+    let token = received.ready_token();
+    attempt
+        .diagnostics
+        .begin_profile_observation(token)
+        .unwrap();
+    // Sending only readies this original F; no other task polls it. Its first
+    // return is deliberately the same poll that reaches the observation cut.
+    let released = release.send(()).is_ok();
+    let not_polled_after_release =
+        !probe.completed.load(Ordering::SeqCst) && !probe.exited.load(Ordering::SeqCst);
+    let remaining = token
+        .diagnostic_deadline()
+        .saturating_duration_since(attempt.clock.now());
+    attempt.clock.advance(remaining);
+    let at_exact_deadline = attempt.clock.now() == token.diagnostic_deadline();
+    std::future::poll_fn(|cx| {
+        attempt.diagnostics.poll_profile_observation(
+            &attempt.round,
+            attempt.clock.now(),
+            false,
+            cx,
+        );
+        Poll::Ready(())
+    })
+    .await;
+    let original = received.current_diagnostics().unwrap();
+    let original_read_exited = probe.completed.load(Ordering::SeqCst)
+        && probe.exited.load(Ordering::SeqCst)
+        && attempt.diagnostics.is_closed();
+    let cutoff_closed = attempt.diagnostics.final_info_closed();
+    let final_deadline = attempt.diagnostics.observation_deadline();
+    // A second actual poll cannot replace the same immutable cut with the
+    // original transport's now-received Unavailable(Gone) answer either.
+    std::future::poll_fn(|cx| {
+        attempt.diagnostics.poll_profile_observation(
+            &attempt.round,
+            attempt.clock.now(),
+            false,
+            cx,
+        );
+        Poll::Ready(())
+    })
+    .await;
+    let late = received.current_diagnostics().unwrap();
+    producer.retire_unclaimed();
+    drop((producer, received, output));
+    watchdog(
+        "boundary original TaskRound and actor drain",
+        attempt.finish(),
+    )
+    .await;
+
+    assert!(initially_pending);
+    assert!(released);
+    assert!(not_polled_after_release);
+    assert!(at_exact_deadline);
+    assert!(original_read_exited);
+    assert!(cutoff_closed);
+    assert_eq!(final_deadline, None);
+    let original = original.expect("the exact Ready deadline freezes the original snapshot");
+    let late = late.expect("the original immutable cut remains visible");
+    assert!(Arc::ptr_eq(&original, &late));
+    assert_eq!(original.ready, token);
+    assert_eq!(
+        original.closure,
+        ProfileDiagnosticClosure::ObservationDeadline
+    );
+    assert!(original.tasks.iter().any(|(task, fact)| {
+        *task == pending_task
+            && matches!(
+                fact,
+                ProfileTaskDiagnostic::Missing(ProfileDiagnosticMissing::ReadPending)
+            )
+    }));
+    assert!(!original.tasks.iter().any(|(task, fact)| {
+        *task == pending_task
+            && matches!(
+                fact,
+                ProfileTaskDiagnostic::Missing(ProfileDiagnosticMissing::Unavailable(
+                    OperationOutcome::Gone
+                ))
+            )
+    }));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn actual_foreign_old_claim_and_cut_cannot_consume_new_profile_custody() {
     // These are independent actual actors, as in the original handoff tests.
     // This protects capability/cut isolation, not the QA recovery algorithm.

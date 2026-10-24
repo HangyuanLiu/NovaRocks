@@ -878,6 +878,32 @@ pub(crate) struct SplitAssignmentRoundGuard {
     wake: Arc<dyn StatusIntakeWake>,
 }
 
+/// Read-only observation of the original close result. A weak view cannot
+/// keep a source alive or manufacture its actual-exit proof.
+#[derive(Clone)]
+pub(crate) struct SplitAssignmentProfileSource {
+    outcome: std::sync::Weak<Mutex<Option<Result<SplitSourceProfile, SplitAssignmentDriverError>>>>,
+}
+
+pub(crate) enum SplitAssignmentProfileRead {
+    Pending,
+    Available(SplitSourceProfile),
+    Failed,
+    SourceGone,
+}
+impl SplitAssignmentProfileSource {
+    pub(crate) fn current(&self) -> SplitAssignmentProfileRead {
+        let Some(outcome) = self.outcome.upgrade() else {
+            return SplitAssignmentProfileRead::SourceGone;
+        };
+        match outcome.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            None => SplitAssignmentProfileRead::Pending,
+            Some(Ok(profile)) => SplitAssignmentProfileRead::Available(*profile),
+            Some(Err(_)) => SplitAssignmentProfileRead::Failed,
+        }
+    }
+}
+
 /// Read-only projection of the original pump's selected failure. This grants
 /// no source, close, retry, or actual-exit authority.
 #[derive(Clone)]
@@ -895,6 +921,11 @@ impl SplitAssignmentFailureSource {
 }
 
 impl SplitAssignmentRoundGuard {
+    pub(crate) fn profile_source(&self) -> SplitAssignmentProfileSource {
+        SplitAssignmentProfileSource {
+            outcome: Arc::downgrade(&self.outcome),
+        }
+    }
     pub(crate) fn failure_source(&self) -> SplitAssignmentFailureSource {
         SplitAssignmentFailureSource {
             failure: Arc::clone(&self.failure),

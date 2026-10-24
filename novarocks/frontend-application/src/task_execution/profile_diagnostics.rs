@@ -22,6 +22,11 @@ use std::{
     sync::Arc,
 };
 
+use crate::query_execution::split_assignment_round::{
+    SplitAssignmentProfileRead, SplitAssignmentProfileSource,
+};
+use novarocks_spi::connector::read_stack::SplitSourceProfile;
+
 use super::{
     completion::accept_final_info, graph::TaskNode, round::TaskRound,
     status_intake::StatusIntakeWake,
@@ -55,10 +60,24 @@ pub(crate) enum ProfileTaskDiagnostic {
     Missing(ProfileDiagnosticMissing),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProfileSplitDiagnosticMissing {
+    Pending,
+    Failed,
+    SourceGone,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProfileSplitDiagnostic {
+    Available(SplitSourceProfile),
+    Missing(ProfileSplitDiagnosticMissing),
+}
+
 #[derive(Debug)]
 pub(crate) struct ProfileDiagnosticSnapshot {
     pub(crate) ready: ComputationReadyToken,
     pub(crate) closure: ProfileDiagnosticClosure,
+    pub(crate) runtime_filters: super::execution::ReleasedRuntimeFilterContributions,
+    pub(crate) split: ProfileSplitDiagnostic,
     pub(crate) tasks: Box<[(TaskIdentity, ProfileTaskDiagnostic)]>,
     /// Actual graph attribution, in the same original expected Task order.
     /// Stage IDs are not fragment IDs and must never be reinterpreted as one.
@@ -70,6 +89,11 @@ impl ProfileDiagnosticSnapshot {
         self.tasks
             .iter()
             .all(|(_, fact)| matches!(fact, ProfileTaskDiagnostic::Available(_)))
+            && self.runtime_filters.is_complete()
+            && self.runtime_filters.contributions().iter().all(|(_, telemetry)| {
+                matches!(telemetry.as_proto().telemetry, Some(novarocks_proto_models::novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(_)))
+            })
+            && matches!(self.split, ProfileSplitDiagnostic::Available(_))
     }
 }
 
@@ -121,6 +145,8 @@ pub(crate) struct TaskFinalInfoCollector {
     root: TaskIdentity,
     missing: BTreeMap<TaskIdentity, ProfileDiagnosticMissing>,
     publication: Option<ProfileDiagnosticPublication>,
+    final_info_closure: Option<ProfileDiagnosticClosure>,
+    split_source: Option<SplitAssignmentProfileSource>,
     pending: Option<FinalTaskInfoReadJob>,
     enabled: bool,
     accepting: bool,
@@ -158,6 +184,8 @@ impl TaskFinalInfoCollector {
             root: round.root_task(),
             missing: BTreeMap::new(),
             publication: None,
+            final_info_closure: None,
+            split_source: None,
             pending: None,
             enabled,
             accepting: true,
@@ -205,6 +233,39 @@ impl TaskFinalInfoCollector {
         Ok(())
     }
 
+    pub(crate) fn set_split_profile_source(
+        &mut self,
+        source: Option<SplitAssignmentProfileSource>,
+    ) {
+        assert!(
+            self.publication.as_ref().is_none_or(|p| p.ready.is_none()),
+            "split source is fixed before the computation cut"
+        );
+        self.split_source = source;
+    }
+
+    /// Final-info completion releases the remote hold independently of the
+    /// final user snapshot, whose RF facts arrive on that very Release ACK.
+    pub(crate) fn final_info_closed(&self) -> bool {
+        !self.accepting
+    }
+
+    fn split_diagnostic(&self) -> ProfileSplitDiagnostic {
+        use ProfileSplitDiagnostic as D;
+        use ProfileSplitDiagnosticMissing as M;
+        match self
+            .split_source
+            .as_ref()
+            .map(SplitAssignmentProfileSource::current)
+        {
+            None => D::Available(SplitSourceProfile::default()),
+            Some(SplitAssignmentProfileRead::Available(profile)) => D::Available(profile),
+            Some(SplitAssignmentProfileRead::Pending) => D::Missing(M::Pending),
+            Some(SplitAssignmentProfileRead::Failed) => D::Missing(M::Failed),
+            Some(SplitAssignmentProfileRead::SourceGone) => D::Missing(M::SourceGone),
+        }
+    }
+
     pub(crate) fn observation_deadline(&self) -> Option<MonotonicInstant> {
         self.publication.as_ref().and_then(|publication| {
             publication
@@ -226,16 +287,56 @@ impl TaskFinalInfoCollector {
         cancelled: bool,
         cx: &mut std::task::Context<'_>,
     ) {
-        if let Some(deadline) = self.observation_deadline() {
-            if cancelled {
-                self.publish_snapshot(round, ProfileDiagnosticClosure::Cancelled);
+        let deadline = self.observation_deadline();
+        if self.final_info_closure.is_none()
+            && let Some(deadline) = deadline
+        {
+            let closure = if cancelled {
+                Some(ProfileDiagnosticClosure::Cancelled)
             } else if now.has_reached(deadline) {
-                self.publish_snapshot(round, ProfileDiagnosticClosure::ObservationDeadline);
+                Some(ProfileDiagnosticClosure::ObservationDeadline)
+            } else {
+                None
+            };
+            if let Some(closure) = closure {
+                self.accepting = false;
+                self.final_info_closure = Some(closure);
+                // Freeze what was received before the cut, even when the
+                // original pending RPC becomes Ready in this very poll.
+                self.publish_snapshot(round, closure);
             }
         }
+        // A cut never detaches the original pending RPC.
         self.poll_observe(round, cx);
-        if self.all_terminal_observed() && self.observation_deadline().is_some() {
-            self.publish_snapshot(round, ProfileDiagnosticClosure::FrontierSettled);
+        if self.final_info_closure.is_none() && self.all_terminal_observed() && deadline.is_some() {
+            self.accepting = false;
+            self.final_info_closure = Some(ProfileDiagnosticClosure::FrontierSettled);
+        }
+        if let Some(deadline) = deadline {
+            let expired = now.has_reached(deadline);
+            let releases_complete = round.execution().graph().contexts().all(|context| {
+                round
+                    .execution()
+                    .owner(*context)
+                    .is_some_and(|owner| owner.is_released())
+            });
+            let split_finished = !matches!(
+                self.split_diagnostic(),
+                ProfileSplitDiagnostic::Missing(ProfileSplitDiagnosticMissing::Pending)
+            );
+            if cancelled
+                || expired
+                || (self.final_info_closed() && releases_complete && split_finished)
+            {
+                let closure = if cancelled {
+                    ProfileDiagnosticClosure::Cancelled
+                } else if expired {
+                    ProfileDiagnosticClosure::ObservationDeadline
+                } else {
+                    ProfileDiagnosticClosure::FrontierSettled
+                };
+                self.publish_snapshot(round, closure);
+            }
         }
     }
 
@@ -284,6 +385,8 @@ impl TaskFinalInfoCollector {
             .send_replace(Some(Arc::new(ProfileDiagnosticSnapshot {
                 ready,
                 closure,
+                runtime_filters: round.execution().released_runtime_filter_contributions(),
+                split: self.split_diagnostic(),
                 tasks,
                 fragments: round
                     .execution()

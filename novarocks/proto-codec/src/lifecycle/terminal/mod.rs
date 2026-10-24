@@ -113,6 +113,15 @@ impl QueryTerminalProfileContributionTelemetry {
         &self.raw
     }
 
+    /// Borrow validated canonical facts without cloning the generated graph.
+    pub fn available_ref(&self) -> Option<QueryTerminalProfileContributionRef<'_>> {
+        let novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(raw) =
+            self.as_proto().telemetry.as_ref()?
+        else {
+            return None;
+        };
+        Some(QueryTerminalProfileContributionRef { raw })
+    }
     pub fn available(&self) -> Option<QueryTerminalProfileContributionV1> {
         let novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
             contribution,
@@ -137,6 +146,28 @@ impl QueryTerminalProfileContributionTelemetry {
             TerminalTelemetryUnavailable::parse(reason.clone())
                 .expect("validated profile telemetry always has a valid reason"),
         )
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct QueryTerminalProfileContributionRef<'a> {
+    raw: &'a novarocks::QueryTerminalProfileContributionV1,
+}
+impl QueryTerminalProfileContributionRef<'_> {
+    pub fn as_proto(&self) -> &novarocks::QueryTerminalProfileContributionV1 {
+        self.raw
+    }
+    pub fn channels(&self) -> &[novarocks::QueryTerminalRuntimeFilterChannelV1] {
+        &self.raw.channels
+    }
+    pub fn producer_streams(&self) -> &[novarocks::QueryTerminalRuntimeFilterProducerStreamV1] {
+        &self.raw.producer_streams
+    }
+    pub fn transport_routes(&self) -> &[novarocks::QueryTerminalRuntimeFilterTransportRouteV1] {
+        &self.raw.transport_routes
+    }
+    pub fn consumers(&self) -> &[novarocks::QueryTerminalRuntimeFilterConsumerV1] {
+        &self.raw.consumers
     }
 }
 

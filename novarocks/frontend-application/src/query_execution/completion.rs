@@ -548,6 +548,9 @@ fn render_profile_result(
     // over the trees themselves and needs no attribution.
     let per_fragment =
         crate::query_execution::profile::collect_per_fragment_profile_summaries(&fragment_profiles);
+    let reported_runtime = fragment_profiles.iter().any(|profile| {
+        profile.fragment_root_plan_node_id().is_some() && profile.has_runtime_statistics()
+    });
     let fragment_profiles = fragment_profiles
         .into_iter()
         .map(crate::query_execution::profile::FragmentProfileTree::into_tree)
@@ -567,7 +570,7 @@ fn render_profile_result(
         format_explain_analyze_duration(formatter.execution_started_at.elapsed()),
         output_rows
     ));
-    if !fragment_profiles.is_empty() || diagnostics.is_empty() {
+    if reported_runtime || diagnostics.is_empty() {
         lines.push(format_distributed_profile_summary(&profile_summary));
     }
     lines.extend(diagnostics);
@@ -655,14 +658,17 @@ impl PreparedQueryCompletion {
                             .to_string(),
                     );
                 }
-                diagnostics.push(format!(
-                    "Diagnostics: {:?}; complete={}",
-                    snapshot.closure,
-                    snapshot.complete()
-                ));
+                if !snapshot.complete() {
+                    diagnostics.push(format!("Diagnostics: {:?}; complete=false", snapshot.closure));
+                }
                 for ((task, fact), (_, fragment)) in
                     snapshot.tasks.iter().zip(snapshot.fragments.iter())
                 {
+                    let fragment = plan
+                        .fragments()
+                        .get(&novarocks_physical_plan::FragmentId::new(*fragment))
+                        .ok_or_else(|| "EXPLAIN ANALYZE diagnostic Task names an absent plan fragment".to_string())?;
+                    let root = i32::try_from(fragment.root().get()).map_err(|_| "EXPLAIN ANALYZE fragment root exceeds native profile range".to_string())?;
                     match fact {
                         ProfileTaskDiagnostic::Available(info) => {
                             if info.final_status().identity() != *task {
@@ -671,27 +677,32 @@ impl PreparedQueryCompletion {
                                         .to_string(),
                                 );
                             }
-                            let fragment = plan
-                                .fragments()
-                                .get(&novarocks_physical_plan::FragmentId::new(*fragment))
-                                .ok_or_else(|| {
-                                    "EXPLAIN ANALYZE diagnostic Task names an absent plan fragment"
-                                        .to_string()
-                                })?;
-                            let root = i32::try_from(fragment.root().get()).map_err(|_| {
-                                "EXPLAIN ANALYZE fragment root exceeds native profile range"
-                                    .to_string()
-                            })?;
                             profiles
                                 .apply_task_operator_statistics(info, root)
                                 .map_err(|error| error.to_string())?;
                         }
-                        ProfileTaskDiagnostic::Missing(reason) => diagnostics.push(format!(
-                            "Diagnostics missing: stage={} task={}; reason={reason:?}",
-                            task.stage_id(),
-                            task.task_id()
-                        )),
+                        ProfileTaskDiagnostic::Missing(reason) => {
+                            profiles.apply_missing_task_information(*task, root);
+                            diagnostics.push(format!(
+                                "Diagnostics missing: stage={} task={}; reason={reason:?}",
+                                task.stage_id(), task.task_id()
+                            ));
+                        }
                     }
+                }
+                if !snapshot.runtime_filters.is_complete() {
+                    diagnostics.push("RuntimeFilter diagnostics unavailable: context release incomplete".to_string());
+                }
+                for (process, telemetry) in snapshot.runtime_filters.contributions() {
+                    if matches!(telemetry.as_proto().telemetry, Some(novarocks_proto_models::novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(_))) {
+                        diagnostics.push(format!("RuntimeFilter diagnostics unavailable: backend={process}"));
+                    }
+                    profiles.apply_runtime_filter_contribution(ready.ready_token().root().query_execution_id(), *process, telemetry)
+                        .map_err(|error| error.to_string())?;
+                }
+                match snapshot.split {
+                    crate::task_execution::profile_diagnostics::ProfileSplitDiagnostic::Available(profile) => profiles.apply_split_assignment_profile(profile),
+                    crate::task_execution::profile_diagnostics::ProfileSplitDiagnostic::Missing(reason) => diagnostics.push(format!("FrontendSplitAssignment diagnostics unavailable: {reason:?}")),
                 }
             }
             Err(crate::query_execution::internal_consumer::profile::ProfileSnapshotMissing::ForeignComputationCut) => {
