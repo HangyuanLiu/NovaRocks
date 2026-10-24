@@ -189,18 +189,19 @@ pub enum OptimizeDurableOutcome {
 
 /// The only automatic-maintenance effect boundary. Host adapters must invoke
 /// existing durable table-maintenance routes, never a provider shortcut.
-pub trait AutomaticMaintenanceRunner {
-    fn expire_snapshots_durably(
+#[async_trait::async_trait]
+pub trait AutomaticMaintenanceRunner: Send {
+    async fn expire_snapshots_durably(
         &mut self,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError>;
 
-    fn rewrite_position_deletes_durably(
+    async fn rewrite_position_deletes_durably(
         &mut self,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError>;
 
-    fn optimize_durably(
+    async fn optimize_durably(
         &mut self,
         target: MaintenanceTarget,
     ) -> Result<OptimizeDurableOutcome, MvBackgroundEngineError>;
@@ -510,7 +511,7 @@ impl MaintenanceCoordinator {
     /// Run product actions without holding a host coordinator lock. The host
     /// must settle the result with [`Self::finish_attempt`] exactly once.
     /// Later actions are never dispatched after a nonterminal or failed one.
-    pub fn execute_attempt(
+    pub async fn execute_attempt(
         attempt: &MaintenanceAttempt,
         runner: &mut dyn AutomaticMaintenanceRunner,
     ) -> MaintenanceExecutionReport {
@@ -527,24 +528,30 @@ impl MaintenanceCoordinator {
                 AutomaticMaintenanceAction::ExpireSnapshots {
                     older_than_ms,
                     retain_last,
-                } => runner.expire_snapshots_durably(MaintenanceActionRequest::ExpireSnapshots {
-                    target: attempt.target.clone(),
-                    older_than_ms: Some(*older_than_ms),
-                    retain_last: Some(*retain_last),
-                }),
+                } => {
+                    runner
+                        .expire_snapshots_durably(MaintenanceActionRequest::ExpireSnapshots {
+                            target: attempt.target.clone(),
+                            older_than_ms: Some(*older_than_ms),
+                            retain_last: Some(*retain_last),
+                        })
+                        .await
+                }
                 AutomaticMaintenanceAction::RewritePositionDeletes { min_input_files } => {
                     let mut options = BTreeMap::new();
                     options.insert("min-input-files".to_string(), min_input_files.to_string());
-                    runner.rewrite_position_deletes_durably(
-                        MaintenanceActionRequest::RewritePositionDeleteFiles {
-                            target: attempt.target.clone(),
-                            options,
-                            where_clause: None,
-                        },
-                    )
+                    runner
+                        .rewrite_position_deletes_durably(
+                            MaintenanceActionRequest::RewritePositionDeleteFiles {
+                                target: attempt.target.clone(),
+                                options,
+                                where_clause: None,
+                            },
+                        )
+                        .await
                 }
                 AutomaticMaintenanceAction::Optimize => {
-                    match runner.optimize_durably(attempt.target.clone()) {
+                    match runner.optimize_durably(attempt.target.clone()).await {
                         Ok(OptimizeDurableOutcome::Finished { handle }) => {
                             report.optimize_finished_handle = Some(handle);
                             report.completed.push(kind);
@@ -977,8 +984,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl AutomaticMaintenanceRunner for Runner {
-        fn expire_snapshots_durably(
+        async fn expire_snapshots_durably(
             &mut self,
             _request: MaintenanceActionRequest,
         ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError> {
@@ -1000,7 +1008,7 @@ mod tests {
             })
         }
 
-        fn rewrite_position_deletes_durably(
+        async fn rewrite_position_deletes_durably(
             &mut self,
             _request: MaintenanceActionRequest,
         ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError> {
@@ -1014,7 +1022,7 @@ mod tests {
             })
         }
 
-        fn optimize_durably(
+        async fn optimize_durably(
             &mut self,
             _target: MaintenanceTarget,
         ) -> Result<OptimizeDurableOutcome, MvBackgroundEngineError> {
@@ -1023,19 +1031,19 @@ mod tests {
         }
     }
 
-    fn run_attempt(
+    async fn run_attempt(
         coordinator: &mut MaintenanceCoordinator,
         attempt: super::MaintenanceAttempt,
         runner: &mut dyn AutomaticMaintenanceRunner,
         now_ms: i64,
     ) -> MaintenanceExecutionReport {
-        let report = MaintenanceCoordinator::execute_attempt(&attempt, runner);
+        let report = MaintenanceCoordinator::execute_attempt(&attempt, runner).await;
         coordinator.finish_attempt(attempt, &report, now_ms);
         report
     }
 
-    #[test]
-    fn policy_prefers_durable_optimize_and_suppresses_delete_rewrite() {
+    #[tokio::test]
+    async fn policy_prefers_durable_optimize_and_suppresses_delete_rewrite() {
         let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
         let attempt = coordinator
             .try_begin(1, target("mv"), &policy_facts(), NOW)
@@ -1050,7 +1058,7 @@ mod tests {
             MaintenanceActionKind::RewritePositionDeletes,
             MaintenanceSkipReason::SuppressedByOptimize,
         )));
-        let report = run_attempt(&mut coordinator, attempt, &mut Runner::default(), NOW);
+        let report = run_attempt(&mut coordinator, attempt, &mut Runner::default(), NOW).await;
         assert_eq!(
             report.completed,
             vec![
@@ -1080,8 +1088,8 @@ mod tests {
         coordinator.cancel_attempt(next);
     }
 
-    #[test]
-    fn failed_or_cancelled_action_stops_the_pass_without_consuming_snapshot() {
+    #[tokio::test]
+    async fn failed_or_cancelled_action_stops_the_pass_without_consuming_snapshot() {
         for error in [
             MvBackgroundEngineErrorKind::TransientUnavailable,
             MvBackgroundEngineErrorKind::ShutdownCancelled,
@@ -1096,7 +1104,7 @@ mod tests {
                 expire_error: Some(error),
                 ..Runner::default()
             };
-            let report = run_attempt(&mut coordinator, attempt, &mut runner, NOW);
+            let report = run_attempt(&mut coordinator, attempt, &mut runner, NOW).await;
             assert_eq!(runner.calls, vec![MaintenanceActionKind::Expire]);
             assert_eq!(
                 report.failures,
@@ -1121,8 +1129,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn already_active_optimize_does_not_start_cooldown_or_consume_snapshot() {
+    #[tokio::test]
+    async fn already_active_optimize_does_not_start_cooldown_or_consume_snapshot() {
         let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
         let attempt = coordinator
             .try_begin(1, target("mv"), &policy_facts(), NOW)
@@ -1131,7 +1139,7 @@ mod tests {
             optimize_outcome: OptimizeDurableOutcome::AlreadyActive,
             ..Runner::default()
         };
-        let report = run_attempt(&mut coordinator, attempt, &mut runner, NOW);
+        let report = run_attempt(&mut coordinator, attempt, &mut runner, NOW).await;
         assert_eq!(
             runner.calls,
             vec![
@@ -1153,8 +1161,8 @@ mod tests {
         coordinator.cancel_attempt(next);
     }
 
-    #[test]
-    fn transient_failure_sets_backoff_without_direct_retry() {
+    #[tokio::test]
+    async fn transient_failure_sets_backoff_without_direct_retry() {
         let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig {
             compaction_min_data_files: 1_000,
             ..MaintenanceCoordinatorConfig::default()
@@ -1170,7 +1178,8 @@ mod tests {
                 ..Runner::default()
             },
             NOW,
-        );
+        )
+        .await;
         assert_eq!(
             report.failures,
             vec![super::MaintenanceActionFailure {
@@ -1190,8 +1199,8 @@ mod tests {
         coordinator.cancel_attempt(second);
     }
 
-    #[test]
-    fn unchanged_snapshot_is_a_noop_after_first_completed_pass() {
+    #[tokio::test]
+    async fn unchanged_snapshot_is_a_noop_after_first_completed_pass() {
         let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig {
             compaction_min_data_files: 1_000,
             ..MaintenanceCoordinatorConfig::default()
@@ -1199,7 +1208,7 @@ mod tests {
         let first = coordinator
             .try_begin(1, target("mv"), &policy_facts(), NOW)
             .expect("admit first pass");
-        run_attempt(&mut coordinator, first, &mut Runner::default(), NOW);
+        run_attempt(&mut coordinator, first, &mut Runner::default(), NOW).await;
 
         let mut current = policy_facts();
         current.oldest_snapshot_timestamp_ms = Some(NOW);
@@ -1211,7 +1220,7 @@ mod tests {
             MaintenanceActionKind::Optimize,
             MaintenanceSkipReason::SnapshotUnchanged,
         )));
-        let report = run_attempt(&mut coordinator, second, &mut Runner::default(), NOW + 1);
+        let report = run_attempt(&mut coordinator, second, &mut Runner::default(), NOW + 1).await;
         assert!(report.is_noop());
     }
 
@@ -1340,8 +1349,8 @@ mod tests {
         coordinator.cancel_attempt(first);
         assert_eq!(coordinator.active_count(), 0);
     }
-    #[test]
-    fn actual_maintenance_report_keeps_compile_cause_without_changing_policy() {
+    #[tokio::test]
+    async fn actual_maintenance_report_keeps_compile_cause_without_changing_policy() {
         use novarocks_type_contract::CompileControlError as C;
         for control in [C::Cancelled, C::DeadlineExceeded, C::ResourceExhausted] {
             for kind in [
@@ -1367,13 +1376,14 @@ mod tests {
                         ..Runner::default()
                     },
                     NOW,
-                );
+                )
+                .await;
                 let mut runner = Runner {
                     expire_error: Some(kind),
                     compile_control: Some(control.clone()),
                     ..Runner::default()
                 };
-                let report = run_attempt(&mut typed, typed_attempt, &mut runner, NOW);
+                let report = run_attempt(&mut typed, typed_attempt, &mut runner, NOW).await;
                 assert_eq!(runner.calls, [MaintenanceActionKind::Expire]);
                 assert_eq!(report.failures.len(), 1);
                 assert_eq!(report.failures[0].kind, baseline_report.failures[0].kind);

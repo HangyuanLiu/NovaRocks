@@ -2188,6 +2188,10 @@ mod tests {
     }
     #[test]
     fn original_statement_poll_panic_retains_same_cause_and_owner_without_repoll() {
+        use novarocks_spi::connector::LakePublicationDisposition;
+        use std::future::Future;
+        type Observer =
+            Arc<std::sync::Mutex<Option<crate::session_control::StatementActionWaiter>>>;
         struct Cause(Arc<std::sync::atomic::AtomicUsize>);
         impl Drop for Cause {
             fn drop(&mut self) {
@@ -2197,8 +2201,20 @@ mod tests {
         struct PanicAction {
             polls: Arc<std::sync::atomic::AtomicUsize>,
             cause: Option<Cause>,
+            observer: Observer,
         }
         impl crate::session_control::GovernedStatementAction for PanicAction {
+            fn publication_disposition(&self) -> Option<LakePublicationDisposition> {
+                let mut observer = self.observer.lock().unwrap();
+                let observer = observer.as_mut().expect("same UI observer");
+                let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+                assert!(
+                    std::pin::Pin::new(observer).poll(&mut cx).is_pending(),
+                    "the first failure is not exposed before the original fact snapshot"
+                );
+                Some(LakePublicationDisposition::KnownCommitted)
+            }
+
             fn poll_action(
                 &mut self,
                 _: &mut crate::session_control::GovernedQueryStatementOwner,
@@ -2219,6 +2235,7 @@ mod tests {
         slot.install(service.clone()).unwrap();
         let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observer: Observer = Arc::new(std::sync::Mutex::new(None));
         let mut owner = Some(
             service
                 .begin_governed_query_statement(
@@ -2234,6 +2251,7 @@ mod tests {
             Some(Box::new(PanicAction {
                 polls: Arc::clone(&polls),
                 cause: Some(Cause(Arc::clone(&drops))),
+                observer: Arc::clone(&observer),
             }));
         let mut receiver = None;
         service
@@ -2241,12 +2259,31 @@ mod tests {
             .unwrap()
             .finish()
             .unwrap();
+        *observer.lock().unwrap() = receiver.take();
         drive_original_statement_actions(&slot);
         let failure = slot.failure().expect("same original cause");
         assert!(failure.payload().is::<Cause>());
+        assert_eq!(
+            failure.publication_disposition(),
+            Some(LakePublicationDisposition::KnownCommitted)
+        );
+        let mut waiter = observer.lock().unwrap().take().unwrap();
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        match std::pin::Pin::new(&mut waiter).poll(&mut cx) {
+            std::task::Poll::Ready(Err(
+                crate::session_control::StatementActionWaitError::Failed(packet),
+            )) => {
+                assert!(Arc::ptr_eq(&failure, &packet));
+                assert_eq!(
+                    packet.publication_disposition(),
+                    Some(LakePublicationDisposition::KnownCommitted)
+                );
+            }
+            _ => panic!("the original observer receives the complete stable failure"),
+        }
         assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(workload.snapshot().root_responsibilities, 1);
-        drop(receiver.take());
+        drop(waiter);
         drive_original_statement_actions(&slot);
         assert_eq!(
             polls.load(std::sync::atomic::Ordering::SeqCst),
@@ -2259,6 +2296,163 @@ mod tests {
         drop(source);
         assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(workload.snapshot().root_responsibilities, 0);
+    }
+
+    #[test]
+    fn original_statement_action_drop_panic_preserves_publication_and_raw_cause() {
+        use novarocks_spi::connector::LakePublicationDisposition;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Cause(Arc<AtomicUsize>);
+        impl Drop for Cause {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct DropPanicAction {
+            disposition: LakePublicationDisposition,
+            polls: Arc<AtomicUsize>,
+            cause: Option<Cause>,
+        }
+        impl crate::session_control::GovernedStatementAction for DropPanicAction {
+            fn publication_disposition(&self) -> Option<LakePublicationDisposition> {
+                Some(self.disposition)
+            }
+            fn poll_action(
+                &mut self,
+                _: &mut crate::session_control::GovernedQueryStatementOwner,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<
+                Result<
+                    crate::session_control::StatementActionValue,
+                    crate::session_error::QueryServiceError,
+                >,
+            > {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                std::task::Poll::Ready(Ok(crate::session_control::StatementActionValue::Ok))
+            }
+        }
+        impl Drop for DropPanicAction {
+            fn drop(&mut self) {
+                if let Some(cause) = self.cause.take() {
+                    std::panic::panic_any(cause);
+                }
+            }
+        }
+        for disposition in [
+            LakePublicationDisposition::KnownCommitted,
+            LakePublicationDisposition::CommitUnknown,
+            LakePublicationDisposition::KnownUncommitted,
+        ] {
+            let (control, service, workload) = governed_control();
+            let session = register(&control, 7, 1, "root");
+            let slot = crate::session_control::StatementProgressSlot::empty();
+            slot.install(service.clone()).unwrap();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut owner = Some(
+                service
+                    .begin_governed_query_statement(
+                        session,
+                        &workload.root_admission(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+            );
+            let mut action: Option<Box<dyn crate::session_control::GovernedStatementAction>> =
+                Some(Box::new(DropPanicAction {
+                    disposition,
+                    polls: Arc::clone(&polls),
+                    cause: Some(Cause(Arc::clone(&drops))),
+                }));
+            let mut observer = None;
+            service
+                .publish_statement_action_in(&mut owner, &mut action, &mut observer)
+                .unwrap()
+                .finish()
+                .unwrap();
+            drive_original_statement_actions(&slot);
+            let failure = slot.failure().expect("same original destructor cause");
+            assert!(failure.payload().is::<Cause>());
+            assert_eq!(failure.publication_disposition(), Some(disposition));
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            assert_eq!(workload.snapshot().root_responsibilities, 1);
+            drop(observer.take());
+            drive_original_statement_actions(&slot);
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            let source = control.next_statement_action(None).unwrap().1.unwrap();
+            drop(failure);
+            source.dispose_poisoned_for_test(&service);
+            drop(source);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(workload.snapshot().root_responsibilities, 0);
+        }
+    }
+
+    #[test]
+    fn original_statement_stopped_observer_keeps_publication_after_actual_settlement() {
+        use novarocks_spi::connector::LakePublicationDisposition;
+        use std::future::Future;
+        struct PublishedAction(LakePublicationDisposition);
+        impl crate::session_control::GovernedStatementAction for PublishedAction {
+            fn publication_disposition(&self) -> Option<LakePublicationDisposition> {
+                Some(self.0)
+            }
+            fn poll_action(
+                &mut self,
+                _: &mut crate::session_control::GovernedQueryStatementOwner,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<
+                Result<
+                    crate::session_control::StatementActionValue,
+                    crate::session_error::QueryServiceError,
+                >,
+            > {
+                std::task::Poll::Ready(Ok(crate::session_control::StatementActionValue::Ok))
+            }
+        }
+        for disposition in [
+            LakePublicationDisposition::KnownCommitted,
+            LakePublicationDisposition::CommitUnknown,
+            LakePublicationDisposition::KnownUncommitted,
+        ] {
+            let (control, service, workload) = governed_control();
+            let session = register(&control, 7, 1, "root");
+            let slot = crate::session_control::StatementProgressSlot::empty();
+            slot.install(service.clone()).unwrap();
+            let mut owner = Some(
+                service
+                    .begin_governed_query_statement(
+                        session,
+                        &workload.root_admission(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+            );
+            let mut action: Option<Box<dyn crate::session_control::GovernedStatementAction>> =
+                Some(Box::new(PublishedAction(disposition)));
+            let mut observer = None;
+            service
+                .publish_statement_action_in(&mut owner, &mut action, &mut observer)
+                .unwrap()
+                .finish()
+                .unwrap();
+            slot.close();
+            drive_original_statement_actions(&slot);
+            assert!(!slot.has_sources());
+            assert_eq!(workload.snapshot().root_responsibilities, 0);
+            let mut observer = observer.take().unwrap();
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            match std::pin::Pin::new(&mut observer).poll(&mut cx) {
+                std::task::Poll::Ready(Err(
+                    crate::session_control::StatementActionWaitError::Stopped { publication },
+                )) => assert_eq!(publication, Some(disposition)),
+                _ => panic!("actual source settlement keeps its original publication fact"),
+            }
+        }
     }
 
     #[test]

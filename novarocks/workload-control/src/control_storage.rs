@@ -83,6 +83,7 @@ pub struct ControlStorageConfig<'a> {
     pub(crate) children_per_slot: usize,
     pub(crate) proposals_per_slot: usize,
     pub(crate) poll_roles: &'a [crate::role_poll::PollRoleGeometry],
+    pub(crate) process_sources: crate::PollRoleSourceBacking,
 }
 
 impl<'a> ControlStorageConfig<'a> {
@@ -99,7 +100,15 @@ impl<'a> ControlStorageConfig<'a> {
             children_per_slot,
             proposals_per_slot,
             poll_roles,
+            process_sources: crate::PollRoleSourceBacking::default(),
         }
+    }
+
+    /// Independent process-owned source headers sharing this SAME prepaid
+    /// envelope. This is a storage fact, not a new role or admission authority.
+    pub fn with_process_source_backing(mut self, source: crate::PollRoleSourceBacking) -> Self {
+        self.process_sources = source;
+        self
     }
 
     /// Pure per-slot charge for these actual containers and the original

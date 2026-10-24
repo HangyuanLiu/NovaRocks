@@ -25,11 +25,12 @@ pub enum StatementActionValue {
 }
 use crate::session_error::QueryServiceError;
 use futures::task::AtomicWaker;
+use novarocks_spi::connector::LakePublicationDisposition;
 use std::any::Any;
 use std::num::NonZeroUsize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::task::{Context, Poll, Wake};
 
 /// FA implements the business state machine. Polling may only borrow its same
@@ -37,6 +38,12 @@ use std::task::{Context, Poll, Wake};
 /// observed and their remaining custody was installed in an original receiver.
 /// This interface grants neither execution nor a second root owner.
 pub trait GovernedStatementAction: Send + 'static {
+    /// Read only facts already retained by the original action. This must not
+    /// poll a future, perform I/O, dispatch an operation, or grant local exit.
+    fn publication_disposition(&self) -> Option<LakePublicationDisposition> {
+        None
+    }
+
     fn poll_action(
         &mut self,
         owner: &mut GovernedQueryStatementOwner,
@@ -46,8 +53,19 @@ pub trait GovernedStatementAction: Send + 'static {
 
 pub struct StatementActionFailure {
     primary: Mutex<Box<dyn Any + Send>>,
+    publication: AtomicU8,
 }
 impl StatementActionFailure {
+    pub fn publication_disposition(&self) -> Option<LakePublicationDisposition> {
+        match self.publication.load(Ordering::Acquire) {
+            0 => None,
+            1 => Some(LakePublicationDisposition::KnownUncommitted),
+            2 => Some(LakePublicationDisposition::CommitUnknown),
+            3 => Some(LakePublicationDisposition::KnownCommitted),
+            _ => unreachable!("closed publication disposition"),
+        }
+    }
+
     pub fn payload(&self) -> std::sync::MutexGuard<'_, Box<dyn Any + Send>> {
         self.primary.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -70,7 +88,9 @@ pub enum StatementActionWaitError {
     Failed(Arc<StatementActionFailure>),
     /// The original stopped source actually disposed its local action/result
     /// and settled its original protocol owner. This is not an absence test.
-    Stopped,
+    Stopped {
+        publication: Option<LakePublicationDisposition>,
+    },
 }
 pub struct StatementActionReady {
     pub result: Result<StatementActionValue, QueryServiceError>,
@@ -176,11 +196,18 @@ impl std::future::Future for StatementActionWaiter {
         source.waiter.register(cx.waker());
         {
             let state = source.state.lock().unwrap_or_else(|p| p.into_inner());
+            // The original poll loan must restore its retained facts before
+            // an observer can expose a failure caused by that same poll.
+            if state.polling {
+                return Poll::Pending;
+            }
             if let Some(failure) = &state.failure {
                 return Poll::Ready(Err(StatementActionWaitError::Failed(Arc::clone(failure))));
             }
             if state.settled {
-                return Poll::Ready(Err(StatementActionWaitError::Stopped));
+                return Poll::Ready(Err(StatementActionWaitError::Stopped {
+                    publication: state.publication,
+                }));
             }
             if !state.closed {
                 return Poll::Pending;
@@ -210,6 +237,7 @@ struct StatementActionState {
     result: Option<Result<StatementActionValue, QueryServiceError>>,
     failure: Option<Arc<StatementActionFailure>>,
     secondary: Option<Arc<StatementActionFailure>>,
+    publication: Option<LakePublicationDisposition>,
     settled: bool,
     polling: bool,
     closed: bool,
@@ -245,6 +273,7 @@ impl StatementActionSource {
                 result: None,
                 failure: None,
                 secondary: None,
+                publication: None,
                 settled: false,
                 polling: false,
                 closed: false,
@@ -311,9 +340,16 @@ impl StatementActionSource {
     fn record_failure(&self, primary: Box<dyn Any + Send>) {
         let packet = Arc::new(StatementActionFailure {
             primary: Mutex::new(primary),
+            publication: AtomicU8::new(0),
         });
+        // The actual packet's raw cause is already retained. Initialize its
+        // one quoted platform backing before sharing the packet with observers.
+        drop(packet.primary.lock().unwrap_or_else(|p| p.into_inner()));
         let overflow = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            packet
+                .publication
+                .store(publication_code(state.publication), Ordering::Release);
             if state.failure.is_none() {
                 state.failure = Some(packet);
                 None
@@ -324,12 +360,33 @@ impl StatementActionSource {
                 Some(packet)
             }
         };
-        // Two source-local sites exist: action poll/Drop and waiter cancellation.
-        // An internal violation goes to the SAME original root panic packet,
+        // A failure beyond the fixed source-local slots goes to the SAME
+        // original root panic packet,
         // never ordinary opaque-cause destruction under this metadata lock.
         if let Some(packet) = overflow {
             std::panic::panic_any(packet);
         }
+    }
+    fn retain_publication(&self, action: &dyn GovernedStatementAction) -> bool {
+        // Foreign code runs outside the metadata lock, while the original
+        // action/owner loan and its first raw failure remain retained.
+        let fact = match catch_unwind(AssertUnwindSafe(|| action.publication_disposition())) {
+            Ok(fact) => fact,
+            Err(primary) => {
+                self.record_failure(primary);
+                return false;
+            }
+        };
+        if let Some(fact) = fact {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.publication = Some(fact);
+            for packet in [&state.failure, &state.secondary].into_iter().flatten() {
+                packet
+                    .publication
+                    .store(publication_code(Some(fact)), Ordering::Release);
+            }
+        }
+        true
     }
     fn notify_root(&self) {
         self.wake.wake_by_ref();
@@ -381,15 +438,23 @@ impl StatementActionSource {
                 // The same original cause becomes stable BEFORE any action/F
                 // cleanup. The poisoned action is retained and never repolled.
                 self.record_failure(primary);
+                self.retain_publication(loan.action.as_deref().expect("same original action"));
                 drop(loan);
                 self.waiter.wake();
             }
             Ok(Poll::Ready(result)) => {
-                let action = loan.action.take();
                 {
                     let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     state.result = Some(result);
                 }
+                // The value is stable before reading the original effect fact,
+                // which must survive a subsequent action destructor panic.
+                if !self.retain_publication(loan.action.as_deref().expect("same original action")) {
+                    drop(loan);
+                    self.waiter.wake();
+                    return;
+                }
+                let action = loan.action.take();
                 // Restore owner to its stable source before arbitrary Drop.
                 drop(loan);
                 let cleanup = catch_unwind(AssertUnwindSafe(|| drop(action)));
@@ -462,6 +527,15 @@ impl StatementActionSource {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).settled
     }
 }
+fn publication_code(fact: Option<LakePublicationDisposition>) -> u8 {
+    match fact {
+        None => 0,
+        Some(LakePublicationDisposition::KnownUncommitted) => 1,
+        Some(LakePublicationDisposition::CommitUnknown) => 2,
+        Some(LakePublicationDisposition::KnownCommitted) => 3,
+    }
+}
+
 // Same-source synchronous loan, not a new owner or an async guard. It restores
 // the original owner on every unwind BEFORE the root can retain its packet.
 struct StatementCleanupLoan {

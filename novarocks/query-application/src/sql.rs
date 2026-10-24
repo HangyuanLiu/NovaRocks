@@ -171,6 +171,20 @@ impl ProductCommandRouter {
         }
     }
 
+    /// The same closed product dispatcher selects the injected maintenance
+    /// author. The admitted caller publishes its result into its original
+    /// statement source before polling the action.
+    pub fn prepare_maintenance_statement_action(
+        &self,
+        command: MaintenanceSqlCommand,
+        request_context: RequestContext,
+        command_context: CommandContext,
+    ) -> Result<Box<dyn crate::session_control::GovernedStatementAction>, crate::api::CommandError>
+    {
+        self.maintenance
+            .prepare_statement_action(command, request_context, command_context)
+    }
+
     pub fn execute(
         &self,
         command: ProductSqlCommand,

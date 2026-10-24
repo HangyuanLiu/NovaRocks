@@ -35,6 +35,7 @@ pub(crate) struct MvRefreshStep {
 
 /// Side-effect-free discovery and preparation capability consumed by
 /// frontend-owned MV background workers.
+#[async_trait::async_trait]
 pub(crate) trait MvBackgroundEngine: Send + Sync {
     fn resolve_refresh_steps(
         &self,
@@ -56,8 +57,9 @@ pub(crate) trait MvBackgroundEngine: Send + Sync {
         MvBackgroundEngineError,
     >;
 
-    fn maintenance_facts(
+    async fn maintenance_facts(
         &self,
+        pending: &mut Option<crate::mv::domain::maintenance::stats::MaintenanceFactsState>,
         target: &MaintenanceTarget,
     ) -> Result<MvMaintenanceFacts, MvBackgroundEngineError>;
 }

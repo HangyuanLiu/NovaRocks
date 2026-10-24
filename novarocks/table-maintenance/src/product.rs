@@ -130,9 +130,10 @@ pub trait CleanupSession: Send {
 /// Implementations may own provider leases, Native encoders, and query clients,
 /// but return only typed effect facts.  They do not own activity gates, GC
 /// maturity, worker lifecycle, or commit terminal interpretation.
-pub trait TableMaintenanceEffectPort {
-    fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String>;
-    fn execute_metadata(
+#[async_trait::async_trait]
+pub trait TableMaintenanceEffectPort: Sync {
+    async fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String>;
+    async fn execute_metadata(
         &self,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, String>;
@@ -142,7 +143,7 @@ pub trait TableMaintenanceEffectPort {
     /// an effect-free action is `NoOpWithoutCommit`.
     /// A failure before effect dispatch uses `PreDispatchFailed`; a possibly
     /// dispatched effect must never be represented by that state.
-    fn execute_metadata_with_id(
+    async fn execute_metadata_with_id(
         &self,
         _request: MaintenanceActionRequest,
         _effect_id: MaintenanceEffectId,
@@ -290,7 +291,7 @@ impl TableMaintenanceProduct {
         effects: &P,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, TerminalError> {
-        effects.reject_user_action_on_mv(request.target())?;
+        effects.reject_user_action_on_mv(request.target()).await?;
         self.execute_action(effects, request).await
     }
 
@@ -341,6 +342,7 @@ impl TableMaintenanceProduct {
                     .map_err(|error| error.to_string())?;
                 effects
                     .execute_metadata(request)
+                    .await
                     .map_err(TerminalError::from)
             }
         }
@@ -385,7 +387,7 @@ impl TableMaintenanceProduct {
                 let _permit = self
                     .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
                     .map_err(|error| TerminalError::pre_dispatch_failed(error.to_string()))?;
-                effects.execute_metadata_with_id(request, effect_id)
+                effects.execute_metadata_with_id(request, effect_id).await
             }
         }
     }
@@ -775,12 +777,16 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl TableMaintenanceEffectPort for FixedRewritePort {
-        fn reject_user_action_on_mv(&self, _target: &MaintenanceTarget) -> Result<(), String> {
+        async fn reject_user_action_on_mv(
+            &self,
+            _target: &MaintenanceTarget,
+        ) -> Result<(), String> {
             Ok(())
         }
 
-        fn execute_metadata(
+        async fn execute_metadata(
             &self,
             _request: MaintenanceActionRequest,
         ) -> Result<MaintenanceActionOutcome, String> {
@@ -881,19 +887,23 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl TableMaintenanceEffectPort for AutomaticPort {
-        fn reject_user_action_on_mv(&self, _target: &MaintenanceTarget) -> Result<(), String> {
+        async fn reject_user_action_on_mv(
+            &self,
+            _target: &MaintenanceTarget,
+        ) -> Result<(), String> {
             Ok(())
         }
 
-        fn execute_metadata(
+        async fn execute_metadata(
             &self,
             _request: MaintenanceActionRequest,
         ) -> Result<MaintenanceActionOutcome, String> {
             unreachable!("automatic action must not use the user metadata port")
         }
 
-        fn execute_metadata_with_id(
+        async fn execute_metadata_with_id(
             &self,
             _request: MaintenanceActionRequest,
             effect_id: MaintenanceEffectId,
@@ -1432,12 +1442,16 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl TableMaintenanceEffectPort for ReleaseRewritePort {
-        fn reject_user_action_on_mv(&self, _target: &MaintenanceTarget) -> Result<(), String> {
+        async fn reject_user_action_on_mv(
+            &self,
+            _target: &MaintenanceTarget,
+        ) -> Result<(), String> {
             Ok(())
         }
 
-        fn execute_metadata(
+        async fn execute_metadata(
             &self,
             _request: MaintenanceActionRequest,
         ) -> Result<MaintenanceActionOutcome, String> {
@@ -1611,12 +1625,16 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl TableMaintenanceEffectPort for ReleaseCleanupPort {
-        fn reject_user_action_on_mv(&self, _target: &MaintenanceTarget) -> Result<(), String> {
+        async fn reject_user_action_on_mv(
+            &self,
+            _target: &MaintenanceTarget,
+        ) -> Result<(), String> {
             Ok(())
         }
 
-        fn execute_metadata(
+        async fn execute_metadata(
             &self,
             _request: MaintenanceActionRequest,
         ) -> Result<MaintenanceActionOutcome, String> {
@@ -1716,5 +1734,91 @@ mod tests {
                 "terminal result and live port must release content"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod async_metadata_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct GatedMetadata {
+        entered: AtomicBool,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl TableMaintenanceEffectPort for GatedMetadata {
+        async fn reject_user_action_on_mv(&self, _: &MaintenanceTarget) -> Result<(), String> {
+            Ok(())
+        }
+        async fn execute_metadata(
+            &self,
+            _: MaintenanceActionRequest,
+        ) -> Result<MaintenanceActionOutcome, String> {
+            self.entered.store(true, Ordering::SeqCst);
+            self.release.notified().await;
+            Ok(MaintenanceActionOutcome::ExpireSnapshots {
+                deleted_data_files_count: None,
+                deleted_position_delete_files_count: None,
+                deleted_equality_delete_files_count: None,
+                deleted_manifest_files_count: None,
+                deleted_manifest_lists_count: None,
+                deleted_statistics_files_count: None,
+            })
+        }
+        fn begin_rewrite<'a>(
+            &'a self,
+            _: &MaintenanceTarget,
+            _: RewriteIntent,
+        ) -> Result<Box<dyn DistributedRewriteSession + 'a>, String> {
+            panic!("metadata cannot enter rewrite")
+        }
+        fn begin_cleanup<'a>(
+            &'a self,
+            _: &MaintenanceTarget,
+            _: i64,
+        ) -> Result<Box<dyn CleanupSession + 'a>, String> {
+            panic!("metadata cannot enter cleanup")
+        }
+    }
+    #[tokio::test]
+    async fn original_product_keeps_target_activity_across_actual_metadata_wait() {
+        let product = TableMaintenanceProduct::new(None);
+        let target = MaintenanceTarget {
+            catalog: "ice.main".into(),
+            namespace: "db".into(),
+            table: "orders".into(),
+        };
+        let port = Arc::new(GatedMetadata {
+            entered: AtomicBool::new(false),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut wait = Box::pin(product.execute_action(
+            port.as_ref(),
+            MaintenanceActionRequest::ExpireSnapshots {
+                target: target.clone(),
+                older_than_ms: Some(1),
+                retain_last: None,
+            },
+        ));
+        use std::future::Future;
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert!(port.entered.load(Ordering::SeqCst));
+        assert!(
+            product
+                .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
+                .is_err()
+        );
+        port.release.notify_one();
+        assert!(wait.await.is_ok());
+        assert!(
+            product
+                .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
+                .is_ok()
+        );
     }
 }

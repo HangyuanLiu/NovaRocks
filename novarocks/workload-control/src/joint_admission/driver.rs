@@ -203,6 +203,58 @@ pub(super) fn metadata_backing_bytes(
     ])
 }
 
+impl JointCapacityConfig {
+    /// Fill the original snapshot/graph arenas from their actual private
+    /// layout authors. This quotes storage, not feasibility or admission.
+    /// The total-work ceiling remains an independent cumulative finite policy.
+    pub fn fill_original_proof_geometry(&mut self) -> Result<(), WorkError> {
+        let n = self.max_claims;
+        let k = self.max_dependencies_per_claim;
+        let d = n
+            .checked_mul(k)
+            .ok_or(WorkError::ArithmeticOverflow)?
+            .min(self.max_registered_dependencies);
+        let arcs = n
+            .checked_mul(k.checked_add(1).ok_or(WorkError::ArithmeticOverflow)?)
+            .and_then(|n| n.checked_add(k))
+            .and_then(|n| n.checked_mul(2))
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        let per_profile = COORDINATE_COUNT
+            .checked_mul(16)
+            .and_then(|n| n.checked_add(std::mem::size_of::<ProfileRecord>().checked_mul(2)?))
+            .and_then(|n| n.checked_add(k.checked_mul(32)?))
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        self.max_snapshot_bytes = n
+            .checked_mul(per_profile)
+            .and_then(|n| n.checked_add(COORDINATE_COUNT.checked_mul(d.checked_mul(16)?)?))
+            .and_then(|n| n.checked_add(d.checked_mul(128)?))
+            .and_then(|n| n.checked_add(COORDINATE_COUNT.checked_mul(128)?))
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        use crate::control_storage::{array_bytes, sum_bytes};
+        let exact_snapshot = sum_bytes([
+            std::mem::size_of::<ProofInput>(),
+            array_bytes::<ExactProfile>(n)?,
+            array_bytes::<CoordinateLimit>(COORDINATE_COUNT)?,
+            array_bytes::<usize>(k)?,
+            array_bytes::<usize>(PROFILE_PROJECTION_COUNT * RESOURCE_COUNT)?,
+            n.checked_mul(sum_bytes([
+                array_bytes::<usize>(k)?,
+                array_bytes::<u128>(COORDINATE_COUNT)?,
+            ])?)
+            .ok_or(WorkError::ArithmeticOverflow)?,
+            COORDINATE_COUNT
+                .checked_mul(array_bytes::<u128>(d)?)
+                .ok_or(WorkError::ArithmeticOverflow)?,
+        ])?;
+        self.max_snapshot_bytes = self.max_snapshot_bytes.max(exact_snapshot);
+        self.max_residual_arcs = arcs;
+        self.max_scratch_bytes = std::mem::size_of::<ProtectionProof>()
+            .checked_add(protection::graph_backing_bytes(n, k, arcs)?)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        Ok(())
+    }
+}
+
 impl JointProgressDriver {
     pub(super) fn new(inner: Arc<Inner>, config: Arc<ValidatedJointCapacityConfig>) -> Self {
         Self {

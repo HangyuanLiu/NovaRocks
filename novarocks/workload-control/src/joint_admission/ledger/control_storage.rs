@@ -68,6 +68,9 @@ pub(crate) fn control_storage_base(
             .checked_add(role.bytes(count)?)
             .ok_or(WorkError::ArithmeticOverflow)?;
     }
+    bytes = bytes
+        .checked_add(config.process_sources.bytes(count)?)
+        .ok_or(WorkError::ArithmeticOverflow)?;
     // Fixed inventory reserves the original maps' retained roots and one
     // insertion path peak. These are whole-map amounts, counted exactly once.
     for map in [

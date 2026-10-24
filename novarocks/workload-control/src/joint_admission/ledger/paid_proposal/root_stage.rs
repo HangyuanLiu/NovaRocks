@@ -138,6 +138,37 @@ impl RootStageSource {
         ROOT_STAGE_BASE_CHANGES
     }
 
+    /// Exact original New record, shared by composition and end_stage. No
+    /// CPU, physical job or queue resource is implied by this computation pin.
+    pub fn computation_progress() -> JointResources {
+        computation_amounts()
+    }
+
+    /// Source support derived from finite per-D policy, not a declaration of
+    /// the Root's cumulative retained union. A complete profile includes the
+    /// returned quantum in Required; this pure fact itself grants nothing.
+    pub fn protected_payload_increment_for_policy(
+        per_dependency_bytes: u64,
+        fanout: std::num::NonZeroUsize,
+    ) -> Result<u64, WorkError> {
+        let k = u64::try_from(fanout.get()).map_err(|_| WorkError::ArithmeticOverflow)?;
+        per_dependency_bytes
+            .checked_div(k)
+            .filter(|n| *n != 0)
+            .ok_or(WorkError::Capacity(
+                "Root/stage protected payload increment",
+            ))
+    }
+
+    /// Read this same source's configured maximum before preparing any input
+    /// whose complete new backing would exceed the supported increment.
+    pub fn maximum_protected_payload_increment(&self) -> Result<u64, WorkError> {
+        let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
+        let state = inner.state.lock().unwrap();
+        validate_nodes(&state, self.root, self.fence.stage)?;
+        maximum_payload_increment(&state, self.root)
+    }
+
     /// Actual current originals in this closed action, including every
     /// production row of both exact works. This is a fact, not maxL policy.
     pub fn required_change_records(&self) -> Result<usize, WorkError> {
@@ -159,6 +190,11 @@ impl RootStageSource {
     ) -> Result<RootStageProposal, WorkError> {
         if !matches!(lane, JointLane::Foreground | JointLane::Settlement) {
             return Err(WorkError::Conflict);
+        }
+        if payload_delta_bytes > self.maximum_protected_payload_increment()? {
+            return Err(WorkError::Capacity(
+                "Root/stage protected payload increment",
+            ));
         }
         let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
         let root = WorkScope {
@@ -354,6 +390,33 @@ fn merge(proposal: &mut JointProposal, references: &[DependencyRef]) -> Result<(
     }
     Ok(())
 }
+fn maximum_payload_increment(state: &State, root: WorkId) -> Result<u64, WorkError> {
+    let node = state.nodes.get(&root).ok_or(WorkError::Released)?;
+    let config = &state
+        .joint
+        .as_ref()
+        .ok_or(WorkError::NotReady)?
+        .config
+        .config;
+    let class = crate::joint_admission::class_index(node.class);
+    let custody = JointLane::Custody as usize;
+    let cap = [
+        config.global,
+        config.classes[class],
+        config.lanes[custody],
+        config.class_lanes[class][custody],
+    ]
+    .into_iter()
+    .map(|l| l.per_dependency.get(JointResource::PayloadBytes))
+    .min()
+    .ok_or(WorkError::Conflict)?;
+    RootStageSource::protected_payload_increment_for_policy(
+        cap,
+        std::num::NonZeroUsize::new(config.max_dependencies_per_claim)
+            .ok_or(WorkError::Conflict)?,
+    )
+}
+
 fn computation_amounts() -> JointResources {
     JointResources::ZERO
         .with(JointResource::ClaimRecords, 1)
@@ -416,6 +479,11 @@ pub(in crate::joint_admission::ledger) fn validate_root_stage(
             .is_none_or(|f| !includes(&payload.claim.facts.dependencies, &f.dependencies))
     {
         return Err(WorkError::Conflict);
+    }
+    if delta.get(JointResource::PayloadBytes) > maximum_payload_increment(state, root)? {
+        return Err(WorkError::Capacity(
+            "Root/stage protected payload increment",
+        ));
     }
     let full = &changes[1].claim.facts.dependencies;
     if full.is_empty() || !includes(full, &payload.claim.facts.dependencies) {

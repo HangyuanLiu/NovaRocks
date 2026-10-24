@@ -469,12 +469,20 @@ impl LogicalExecutionSupervisor {
     pub fn logical_role_poll_geometry()
     -> Result<novarocks_workload_control::PollRoleGeometry, novarocks_workload_control::WorkError>
     {
-        novarocks_workload_control::PollRoleGeometry::for_factory_with_context::<
+        let geometry = novarocks_workload_control::PollRoleGeometry::for_factory_with_context::<
             _,
             _,
             _,
             Arc<OriginalLogicalExit>,
-        >(&make_logical_role)
+        >(&make_logical_role)?;
+        geometry.with_source_backing(Self::logical_role_source_backing()?)
+    }
+
+    fn logical_role_source_backing()
+    -> Result<novarocks_workload_control::PollRoleSourceBacking, WorkError> {
+        LogicalExecutionExitObserver::metadata_geometry()
+            .map_err(|_| WorkError::ArithmeticOverflow)?
+            .role_source_backing()
     }
 
     /// Actual factory types only; this does not construct an input or bank.
@@ -523,10 +531,11 @@ impl LogicalExecutionSupervisor {
     ) -> Result<(Self, QueryExecutionClient), WorkError> {
         // Finish fallible inventory registration before constructing any task
         // or Registry owner requiring asynchronous shutdown.
-        let bank = RolePollBank::<_, _, _, Arc<OriginalLogicalExit>>::install_with_context(
+        let bank = RolePollBank::<_, _, _, Arc<OriginalLogicalExit>>::install_with_context_and_source_backing(
             control,
             role,
             make_logical_role,
+            Self::logical_role_source_backing()?,
         )?;
         Self::start_installed_bank(
             bank,

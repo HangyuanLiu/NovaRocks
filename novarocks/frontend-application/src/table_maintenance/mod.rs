@@ -288,6 +288,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
     async fn handle_typed_statement(
         &self,
         engine: &dyn TableMaintenanceEngine,
+        state: &crate::query_execution::maintenance::MaintenanceActionState,
         statement: ParsedMaintenanceStatement,
         spark_procedure: bool,
         context: MaintenanceRequestContext<'_>,
@@ -298,7 +299,10 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                 let request = action.into_request(engine, target)?;
                 let outcome = self
                     .product
-                    .execute_user_action(&FrontendMaintenanceEffectPort::new(engine), request)
+                    .execute_user_action(
+                        &FrontendMaintenanceEffectPort::new(engine, state),
+                        request,
+                    )
                     .await?;
                 if spark_procedure {
                     action_result(outcome).map_err(TerminalError::from)
@@ -308,7 +312,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             }
             ParsedMaintenanceStatement::SubmitOptimize { name_parts } => {
                 let target = engine.resolve_target(&name_parts, context)?;
-                engine.reject_user_action_on_mv(&target)?;
+                engine.reject_user_action_on_mv(&target).await?;
                 let submission = self.submit_statement_optimize(engine, target)?;
                 if matches!(
                     submission,
@@ -367,6 +371,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
     async fn execute_automatic_action_with_effect_id(
         &self,
         engine: &dyn TableMaintenanceEngine,
+        state: &crate::query_execution::maintenance::MaintenanceActionState,
         request: MaintenanceActionRequest,
         effect_id: novarocks_table_maintenance::MaintenanceEffectId,
         context: &crate::query_execution::maintenance::AutomaticMaintenanceContext,
@@ -376,7 +381,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             .map_err(TerminalError::cancelled_before_dispatch)?;
         self.product
             .execute_automatic_action(
-                &FrontendMaintenanceEffectPort::new(engine),
+                &FrontendMaintenanceEffectPort::new(engine, state),
                 request,
                 effect_id,
             )

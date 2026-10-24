@@ -127,9 +127,56 @@ pub(crate) enum FrontendMaintenanceSkip {
 pub(crate) struct FrontendMaintenanceWorker {
     dependencies: FrontendMaintenanceWorkerDependencies,
     runtime: MvMaintenanceRuntime,
+    facts: std::sync::Mutex<FactsSlot>,
+    automatic: std::sync::Mutex<AutomaticPassSlot>,
+}
+#[path = "maintenance_worker/automatic_custody.rs"]
+mod automatic_custody;
+use automatic_custody::*;
+
+#[derive(Default)]
+struct FactsSlot {
+    pending: Option<crate::mv::domain::maintenance::stats::MaintenanceFactsState>,
+    borrowed: bool,
+}
+struct FactsLoan<'a> {
+    source: &'a std::sync::Mutex<FactsSlot>,
+    pending: Option<crate::mv::domain::maintenance::stats::MaintenanceFactsState>,
+}
+impl<'a> FactsLoan<'a> {
+    fn take(source: &'a std::sync::Mutex<FactsSlot>) -> Option<Self> {
+        let mut slot = source.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.borrowed {
+            return None;
+        }
+        slot.borrowed = true;
+        let pending = slot.pending.take();
+        Some(Self { source, pending })
+    }
+}
+impl Drop for FactsLoan<'_> {
+    fn drop(&mut self) {
+        let mut original = self.source.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            original.borrowed && original.pending.is_none(),
+            "same original maintenance pass loan"
+        );
+        original.pending = self.pending.take();
+        original.borrowed = false;
+    }
 }
 
 impl FrontendMaintenanceWorker {
+    /// Actual fixed source storage and its same-factory Product F pointee.
+    /// Variable plan/journal/retention increments remain separately admitted.
+    pub(crate) fn automatic_custody_geometry() -> AutomaticMaintenanceCustodyGeometry {
+        automatic_custody::geometry()
+    }
+
+    pub(crate) fn runtime_handle(&self) -> &tokio::runtime::Handle {
+        &self.dependencies.runtime
+    }
+
     pub(crate) fn new(dependencies: FrontendMaintenanceWorkerDependencies) -> Self {
         let mut coordinator_config = dependencies.coordinator_config.clone();
         if coordinator_config.enabled {
@@ -141,6 +188,8 @@ impl FrontendMaintenanceWorker {
         Self {
             runtime: MvMaintenanceRuntime::new(coordinator_config),
             dependencies,
+            facts: std::sync::Mutex::new(FactsSlot::default()),
+            automatic: std::sync::Mutex::new(AutomaticPassSlot::default()),
         }
     }
 
@@ -155,14 +204,27 @@ impl FrontendMaintenanceWorker {
     /// Evaluate every current frontend MV definition once. Every durable
     /// action enters the management FIFO independently, so a configuration
     /// write can take a turn between maintenance actions.
-    pub(crate) fn run_once(
+    pub(crate) async fn run_once_async(
         &self,
         now_ms: i64,
     ) -> Result<FrontendMaintenancePassReport, MvRepositoryError> {
+        // A borrowed pass wait can disappear; its original action cannot be
+        // replaced while its Product F or terminal cleanup is unproven.
+        if AutomaticPassLoan::take(&self.automatic)
+            .body()
+            .work
+            .is_some()
+        {
+            return Err(MvRepositoryError::new(
+                novarocks_mv_application::repository::MvRepositoryErrorKind::Conflict,
+                "the original automatic maintenance pass still owns responsibility",
+            ));
+        }
         let definitions = self
             .dependencies
             .readiness
-            .list_ready_projections()?
+            .list_ready_projections_async()
+            .await?
             .into_iter()
             .map(|loaded| loaded.projection)
             .collect::<Vec<_>>();
@@ -171,12 +233,12 @@ impl FrontendMaintenanceWorker {
         // terminal transition completes before the next event is admitted.
         let mut pass = FrontendMaintenancePassReport::default();
         for definition in definitions {
-            self.run_definition(definition, now_ms, &mut pass);
+            self.run_definition(definition, now_ms, &mut pass).await;
         }
         Ok(pass)
     }
 
-    fn run_definition(
+    async fn run_definition(
         &self,
         definition: StoredKeyedMvProjection,
         now_ms: i64,
@@ -192,11 +254,24 @@ impl FrontendMaintenanceWorker {
                 return;
             }
         };
-        let facts = match self
+        let Some(mut original) = FactsLoan::take(&self.facts) else {
+            pass.skipped.push(FrontendMaintenanceSkip::FactsFailed {
+                mv_id: definition.mv_id,
+                kind: MvBackgroundEngineErrorKind::InvariantViolation,
+            });
+            return;
+        };
+        let result = self
             .dependencies
             .background_engine
-            .maintenance_facts(&target)
-        {
+            .maintenance_facts(&mut original.pending, &target)
+            .await;
+        // Normal completed observation has actually exited its F. Dispose its
+        // original row outside the metadata mutex before considering next Work.
+        let retired = original.pending.take();
+        drop(original);
+        drop(retired);
+        let facts = match result {
             Ok(facts) => facts,
             Err(error) => {
                 pass.skipped.push(FrontendMaintenanceSkip::FactsFailed {
@@ -207,11 +282,7 @@ impl FrontendMaintenanceWorker {
             }
         };
 
-        let AdmittedAutomaticQuery {
-            owner,
-            query_concurrency,
-            result_capacity,
-        } = match admit_automatic_query(
+        let work = match admit_automatic_query(
             &self.dependencies.root_admission,
             &self.dependencies.runtime,
         ) {
@@ -223,12 +294,29 @@ impl FrontendMaintenanceWorker {
                 return;
             }
         };
-        let cancellation = match owner.scope().cancellation() {
+        {
+            let mut original = AutomaticPassLoan::take(&self.automatic);
+            assert!(
+                original.body().work.is_none(),
+                "one original automatic pass"
+            );
+            original.body_mut().work = Some(work);
+        }
+        let (scope, result_capacity) = {
+            let original = AutomaticPassLoan::take(&self.automatic);
+            let work = original
+                .body()
+                .work
+                .as_ref()
+                .expect("installed original work");
+            (work.owner.scope(), work.result_capacity.clone())
+        };
+        let cancellation = match scope.cancellation() {
             Ok(view) => novarocks_query_application::cancellation::QueryCancellationView::governed(
                 view, None,
             ),
             Err(_) => {
-                finish_automatic_root(owner, query_concurrency);
+                finish_automatic_pass(&self.automatic);
                 pass.skipped.push(FrontendMaintenanceSkip::Stopping {
                     mv_id: definition.mv_id,
                 });
@@ -236,7 +324,7 @@ impl FrontendMaintenanceWorker {
             }
         };
         if cancellation.is_cancelled() {
-            finish_automatic_root(owner, query_concurrency);
+            finish_automatic_pass(&self.automatic);
             pass.skipped.push(FrontendMaintenanceSkip::Stopping {
                 mv_id: definition.mv_id,
             });
@@ -250,7 +338,7 @@ impl FrontendMaintenanceWorker {
         {
             Ok(engine) => engine,
             Err(reason) => {
-                finish_automatic_root(owner, query_concurrency);
+                finish_automatic_pass(&self.automatic);
                 pass.skipped
                     .push(FrontendMaintenanceSkip::ExecutionBindingFailed {
                         mv_id: definition.mv_id,
@@ -265,7 +353,7 @@ impl FrontendMaintenanceWorker {
         {
             Ok(attempt) => attempt,
             Err(admission) => {
-                finish_automatic_root(owner, query_concurrency);
+                finish_automatic_pass(&self.automatic);
                 pass.skipped.push(FrontendMaintenanceSkip::Admission {
                     mv_id: definition.mv_id,
                     admission,
@@ -273,7 +361,18 @@ impl FrontendMaintenanceWorker {
                 return;
             }
         };
+        {
+            let mut original = AutomaticPassLoan::take(&self.automatic);
+            original.body_mut().attempt = Some(attempt);
+        }
+        let attempt = AutomaticPassLoan::take(&self.automatic)
+            .body()
+            .attempt
+            .as_ref()
+            .expect("original policy attempt installed")
+            .clone();
         let mut runner = TableMaintenanceAutomaticRunner {
+            original: &self.automatic,
             engine,
             service: Arc::clone(&self.dependencies.table_maintenance_service),
             connector_control: Arc::clone(&self.dependencies.connector_control),
@@ -285,11 +384,15 @@ impl FrontendMaintenanceWorker {
                 Instant::now() + self.dependencies.attempt_timeout,
                 self.dependencies.runtime.clone(),
             ),
-            handle: self.dependencies.runtime.clone(),
         };
-        let execution = MaintenanceCoordinator::execute_attempt(&attempt, &mut runner);
-        self.runtime.finish(attempt, &execution, now_ms);
-        finish_automatic_root(owner, query_concurrency);
+        let execution = MaintenanceCoordinator::execute_attempt(&attempt, &mut runner).await;
+        let original_attempt = AutomaticPassLoan::take(&self.automatic)
+            .body_mut()
+            .attempt
+            .take()
+            .expect("same original policy attempt");
+        self.runtime.finish(original_attempt, &execution, now_ms);
+        finish_automatic_pass(&self.automatic);
         pass.attempts.push(FrontendMaintenanceAttemptReport {
             mv_id: definition.mv_id,
             target,
@@ -336,7 +439,8 @@ fn finish_automatic_root(owner: WorkOwner, query_concurrency: QueryConcurrencyPe
 
 /// Narrow adapter from automatic policy actions to the frontend durable
 /// table-maintenance service and the shared MV management entrance.
-struct TableMaintenanceAutomaticRunner {
+struct TableMaintenanceAutomaticRunner<'a> {
+    original: &'a std::sync::Mutex<AutomaticPassSlot>,
     engine: Arc<dyn TableMaintenanceEngine>,
     service: Arc<dyn TableMaintenanceService>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -344,12 +448,10 @@ struct TableMaintenanceAutomaticRunner {
     product_service: Arc<MvKeyedProductService>,
     target: MaintenanceTarget,
     context: AutomaticMaintenanceContext,
-    /// Captured where the worker thread is spawned, because the thread itself
-    /// has no runtime of its own.
-    handle: tokio::runtime::Handle,
 }
 
 struct PreparedAutomaticAction {
+    metadata: crate::query_execution::maintenance::MaintenanceActionState,
     entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
     management: novarocks_mv_application::management::ManagementEntranceLease,
     managed_target: novarocks_mv_application::management::ManagedMvTarget,
@@ -360,7 +462,7 @@ struct PreparedAutomaticAction {
     context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
-impl TableMaintenanceAutomaticRunner {
+impl TableMaintenanceAutomaticRunner<'_> {
     /// Capture a fresh exact document set for one action, enter the shared MV
     /// FIFO, then validate the same physical object and Current documents a
     /// second time. The old policy observation never grants write authority.
@@ -522,6 +624,7 @@ impl TableMaintenanceAutomaticRunner {
             ));
         }
         Ok(PreparedAutomaticAction {
+            metadata: crate::query_execution::maintenance::MaintenanceActionState::default(),
             entrance,
             management,
             managed_target,
@@ -558,7 +661,7 @@ impl PreparedAutomaticAction {
     }
 
     fn record_terminal(
-        self,
+        &mut self,
         disposition: novarocks_mv_application::management::EffectDisposition,
         readiness: &MvReadinessPort,
         connector_control: &dyn ConnectorControlRegistry,
@@ -566,7 +669,7 @@ impl PreparedAutomaticAction {
         use novarocks_mv_application::management::EffectDisposition;
 
         self.management
-            .record_terminal(disposition)
+            .record_terminal_in_place(disposition)
             .map_err(|error| {
                 automatic_pre_dispatch_error(format!("record MV maintenance terminal: {error:?}"))
             })?;
@@ -575,10 +678,10 @@ impl PreparedAutomaticAction {
                 self.entrance.as_ref(),
                 readiness,
                 connector_control,
-                self.catalog_handle,
-                self.product_target,
+                self.catalog_handle.clone(),
+                self.product_target.clone(),
                 self.operation_uuid,
-                self.context.after_external_effect(),
+                self.context.clone().after_external_effect(),
             )
             .map_err(|error| {
                 automatic_pre_dispatch_error(format!(
@@ -598,44 +701,42 @@ fn automatic_stale_policy_error(message: impl Into<String>) -> MvBackgroundEngin
     MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::TransientUnavailable, message)
 }
 
-impl TableMaintenanceAutomaticRunner {
-    fn run_managed_action(
+impl TableMaintenanceAutomaticRunner<'_> {
+    async fn run_managed_action(
         &self,
         request: MaintenanceActionRequest,
         scope: novarocks_mv_application::management::EffectScope,
     ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError> {
-        use novarocks_mv_application::management::EffectDisposition;
-        use novarocks_table_maintenance::{AutomaticMaintenanceOutcome, MaintenanceEffectId};
-
-        let mut action = self.prepare_managed_action(scope)?;
-        action.mark_dispatched()?;
-        let effect_id = MaintenanceEffectId::from_bytes(*action.operation_uuid.as_bytes());
-        let future = self.service.execute_automatic_action_with_effect_id(
-            self.engine.as_ref(),
-            request,
-            effect_id,
-            &self.context,
+        let action = self.prepare_managed_action(scope)?;
+        let metadata = action.metadata.clone();
+        let effect_id = novarocks_table_maintenance::MaintenanceEffectId::from_bytes(
+            *action.operation_uuid.as_bytes(),
         );
-        let result = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
-            Err(_) => self.handle.block_on(future),
-        };
-        let disposition = match &result {
-            Ok(AutomaticMaintenanceOutcome::KnownCommitted(_)) => EffectDisposition::KnownCommitted,
-            Ok(AutomaticMaintenanceOutcome::NoOpWithoutCommit(_)) => {
-                EffectDisposition::KnownUncommitted
-            }
-            Err(error) => automatic_terminal_disposition(error.state),
-        };
-        finish_automatic_action(
-            result,
-            action.record_terminal(
-                disposition,
+        install_automatic_action(
+            self.original,
+            action,
+            AutomaticProductInput::Managed {
+                service: Arc::clone(&self.service),
+                engine: Arc::clone(&self.engine),
+                metadata,
+                request,
+                effect_id,
+                context: self.context.clone(),
+            },
+        );
+        match std::future::poll_fn(|cx| {
+            poll_automatic_action(
+                self.original,
                 self.readiness.as_ref(),
                 self.connector_control.as_ref(),
-            ),
-        )
-        .map(AutomaticMaintenanceOutcome::into_action_outcome)
+                cx,
+            )
+        })
+        .await?
+        {
+            AutomaticProductSuccess::Managed(outcome) => Ok(outcome.into_action_outcome()),
+            AutomaticProductSuccess::Optimize(_) => unreachable!("same original action kind"),
+        }
     }
 }
 
@@ -698,8 +799,9 @@ fn automatic_terminal_error(
     .with_compile_control(error.compile_control)
 }
 
-impl AutomaticMaintenanceRunner for TableMaintenanceAutomaticRunner {
-    fn expire_snapshots_durably(
+#[async_trait::async_trait]
+impl AutomaticMaintenanceRunner for TableMaintenanceAutomaticRunner<'_> {
+    async fn expire_snapshots_durably(
         &mut self,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError> {
@@ -707,9 +809,10 @@ impl AutomaticMaintenanceRunner for TableMaintenanceAutomaticRunner {
             request,
             novarocks_mv_application::management::EffectScope::CATALOG_AND_OBJECT_DELETION,
         )
+        .await
     }
 
-    fn rewrite_position_deletes_durably(
+    async fn rewrite_position_deletes_durably(
         &mut self,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError> {
@@ -717,50 +820,46 @@ impl AutomaticMaintenanceRunner for TableMaintenanceAutomaticRunner {
             request,
             novarocks_mv_application::management::EffectScope::CATALOG_COMMIT,
         )
+        .await
     }
 
-    fn optimize_durably(
+    async fn optimize_durably(
         &mut self,
         target: MaintenanceTarget,
     ) -> Result<OptimizeDurableOutcome, MvBackgroundEngineError> {
-        use novarocks_mv_application::management::{EffectDisposition, EffectScope};
-        use novarocks_table_maintenance::{AutomaticOptimizeOutcome, MaintenanceEffectId};
-
-        let mut action = self.prepare_managed_action(EffectScope::CATALOG_AND_OBJECT_DELETION)?;
-        action.mark_dispatched()?;
-        let effect_id = MaintenanceEffectId::from_bytes(*action.operation_uuid.as_bytes());
-        let result = self.service.execute_automatic_optimize_with_effect_id(
-            self.engine.as_ref(),
-            target,
-            effect_id,
-            &self.context,
+        use novarocks_mv_application::management::EffectScope;
+        let action = self.prepare_managed_action(EffectScope::CATALOG_AND_OBJECT_DELETION)?;
+        let effect_id = novarocks_table_maintenance::MaintenanceEffectId::from_bytes(
+            *action.operation_uuid.as_bytes(),
         );
-        let disposition = match &result {
-            Ok(AutomaticOptimizeOutcome::Finished {
-                commit_occurred: true,
-                ..
-            }) => EffectDisposition::KnownCommitted,
-            Ok(
-                AutomaticOptimizeOutcome::Finished {
-                    commit_occurred: false,
-                    ..
-                }
-                | AutomaticOptimizeOutcome::AlreadyActive,
-            ) => EffectDisposition::KnownUncommitted,
-            Err(error) => automatic_terminal_disposition(error.state),
-        };
-        match finish_automatic_action(
-            result,
-            action.record_terminal(
-                disposition,
+        install_automatic_action(
+            self.original,
+            action,
+            AutomaticProductInput::Optimize {
+                service: Arc::clone(&self.service),
+                engine: Arc::clone(&self.engine),
+                target,
+                effect_id,
+                context: self.context.clone(),
+            },
+        );
+        match std::future::poll_fn(|cx| {
+            poll_automatic_action(
+                self.original,
                 self.readiness.as_ref(),
                 self.connector_control.as_ref(),
-            ),
-        )? {
-            AutomaticOptimizeOutcome::Finished { handle, .. } => {
-                Ok(OptimizeDurableOutcome::Finished { handle })
-            }
-            AutomaticOptimizeOutcome::AlreadyActive => Ok(OptimizeDurableOutcome::AlreadyActive),
+                cx,
+            )
+        })
+        .await?
+        {
+            AutomaticProductSuccess::Optimize(
+                novarocks_table_maintenance::AutomaticOptimizeOutcome::Finished { handle, .. },
+            ) => Ok(OptimizeDurableOutcome::Finished { handle }),
+            AutomaticProductSuccess::Optimize(
+                novarocks_table_maintenance::AutomaticOptimizeOutcome::AlreadyActive,
+            ) => Ok(OptimizeDurableOutcome::AlreadyActive),
+            AutomaticProductSuccess::Managed(_) => unreachable!("same original action kind"),
         }
     }
 }

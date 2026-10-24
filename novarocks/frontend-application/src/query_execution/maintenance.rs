@@ -23,7 +23,9 @@
 
 use std::sync::Arc;
 
+mod action_state;
 pub mod command;
+pub use action_state::MaintenanceActionState;
 pub(crate) mod iceberg;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -317,6 +319,7 @@ pub enum MaintenanceStatementResult {
 /// the maintenance application; this stable Core domain port remains available
 /// to the Frontend MV background runtime until CLS-R3.
 // Design: ADR-0083 (docs/adr/ADR-0083-frontend-owns-table-maintenance-execution-port.md)
+#[async_trait::async_trait]
 pub trait TableMaintenanceEngine: Send + Sync {
     /// Bind the one already-admitted root before any distributed rewrite
     /// construction. This capability never enters durable job descriptions.
@@ -368,20 +371,22 @@ pub trait TableMaintenanceEngine: Send + Sync {
         expected_object_id: &ConnectorTableObjectId,
     ) -> Result<MaintenanceTargetRebind, String>;
 
-    fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String>;
+    async fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String>;
 
     fn current_snapshot_id(&self, target: &MaintenanceTarget) -> Result<i64, String>;
 
-    fn execute_action(
+    async fn execute_action(
         &self,
+        state: &MaintenanceActionState,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, String>;
 
     /// Automatic metadata effects retain the MV owner's exact identity and
     /// the provider's typed terminal state. A missing implementation closes
     /// management before a provider dispatch.
-    fn execute_automatic_metadata_action(
+    async fn execute_automatic_metadata_action(
         &self,
+        state: &MaintenanceActionState,
         _request: MaintenanceActionRequest,
         _effect_id: MaintenanceEffectId,
     ) -> Result<novarocks_table_maintenance::AutomaticMaintenanceOutcome, TerminalError> {
@@ -531,6 +536,7 @@ pub trait TableMaintenanceService: Send + Sync {
     async fn handle_typed_statement(
         &self,
         _engine: &dyn TableMaintenanceEngine,
+        _state: &MaintenanceActionState,
         _statement: crate::table_maintenance::ParsedMaintenanceStatement,
         _spark_procedure: bool,
         _context: MaintenanceRequestContext<'_>,
@@ -560,6 +566,7 @@ pub trait TableMaintenanceService: Send + Sync {
     async fn execute_automatic_action_with_effect_id(
         &self,
         _engine: &dyn TableMaintenanceEngine,
+        _state: &MaintenanceActionState,
         _request: MaintenanceActionRequest,
         _effect_id: MaintenanceEffectId,
         _context: &AutomaticMaintenanceContext,
@@ -882,6 +889,7 @@ impl crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer
     }
 }
 
+#[async_trait::async_trait]
 impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
     #[cfg(novarocks_dev_controls)]
     fn test_statement_nomination(
@@ -983,7 +991,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         self.rebind_target_object_with_context(target, expected_object_id)
     }
 
-    fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
+    async fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
         use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
         let instance_id = ConnectorInstanceId::parse(&target.catalog)
             .map_err(|error| format!("parse Iceberg catalog identity for MV guard: {error}"))?;
@@ -992,7 +1000,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
             &instance_id,
         )
         .map_err(|error| format!("acquire exact Iceberg generation for MV guard: {error}"))?;
-        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context(
+        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context_async(
             self.kernel.mv_storage_observation().as_ref(),
             &exact_lease,
             self.kernel.mv_readiness().as_ref(),
@@ -1005,7 +1013,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
             },
             crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Maintenance,
             self.connector_context.clone(),
-        )
+        ).await
     }
 
     fn current_snapshot_id(&self, target: &MaintenanceTarget) -> Result<i64, String> {
@@ -1016,36 +1024,25 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         )
     }
 
-    fn execute_action(
+    async fn execute_action(
         &self,
+        state: &MaintenanceActionState,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, String> {
-        if matches!(request, MaintenanceActionRequest::RemoveOrphanFiles { .. }) {
-            return Err(
-                "remove orphan files must be dispatched by the frontend durable cleanup owner"
-                    .to_string(),
-            );
-        }
-        self::iceberg::execute_action_with_ports(
-            self.kernel.connector_control().as_ref(),
-            &self.kernel,
-            request,
-            self.connector_context.clone(),
-        )
+        state.install_engine(self.clone())?;
+        state.execute(request).await
     }
 
-    fn execute_automatic_metadata_action(
+    async fn execute_automatic_metadata_action(
         &self,
+        state: &MaintenanceActionState,
         request: MaintenanceActionRequest,
         effect_id: MaintenanceEffectId,
     ) -> Result<novarocks_table_maintenance::AutomaticMaintenanceOutcome, TerminalError> {
-        self::iceberg::execute_automatic_metadata_action_with_ports(
-            self.kernel.connector_control().as_ref(),
-            &self.kernel,
-            request,
-            effect_id,
-            self.connector_context.clone(),
-        )
+        state
+            .install_engine(self.clone())
+            .map_err(TerminalError::pre_dispatch_failed)?;
+        state.execute_automatic(request, effect_id).await
     }
 
     fn plan_cleanup_maintenance(
@@ -1266,6 +1263,7 @@ impl RequestScopedMaintenanceEngine {
     }
 }
 
+#[async_trait::async_trait]
 impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
     fn for_admitted_execution(
         &self,
@@ -1320,29 +1318,45 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
             .rebind_target_object(target, expected_object_id)
     }
 
-    fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
-        self.request_engine()?.reject_user_action_on_mv(target)
+    async fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
+        self.request_engine()?
+            .reject_user_action_on_mv(target)
+            .await
     }
 
     fn current_snapshot_id(&self, target: &MaintenanceTarget) -> Result<i64, String> {
         self.request_engine()?.current_snapshot_id(target)
     }
 
-    fn execute_action(
+    async fn execute_action(
         &self,
+        state: &MaintenanceActionState,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, String> {
-        self.request_engine()?.execute_action(request)
+        if !state.has_engine()? {
+            state.install_engine(self.request_engine()?)?;
+        }
+        state.execute(request).await
     }
 
-    fn execute_automatic_metadata_action(
+    async fn execute_automatic_metadata_action(
         &self,
+        state: &MaintenanceActionState,
         request: MaintenanceActionRequest,
         effect_id: MaintenanceEffectId,
     ) -> Result<novarocks_table_maintenance::AutomaticMaintenanceOutcome, TerminalError> {
-        self.request_engine()
+        if !state
+            .has_engine()
             .map_err(TerminalError::pre_dispatch_failed)?
-            .execute_automatic_metadata_action(request, effect_id)
+        {
+            state
+                .install_engine(
+                    self.request_engine()
+                        .map_err(TerminalError::pre_dispatch_failed)?,
+                )
+                .map_err(TerminalError::pre_dispatch_failed)?;
+        }
+        state.execute_automatic(request, effect_id).await
     }
 
     fn plan_cleanup_maintenance(

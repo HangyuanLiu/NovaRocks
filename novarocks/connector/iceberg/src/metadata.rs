@@ -697,6 +697,27 @@ impl ConnectorMetadata for IcebergMetadata {
         self.current_table_object_binding(request.table, request.resolution, request.context)
     }
 
+    fn capture_table_object_binding_async(
+        &self,
+        request: ConnectorTableObjectCaptureRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorTableObjectBinding, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            self.require_current_table_object_selector(request.selector)?;
+            self.current_table_object_binding_async(
+                request.table,
+                request.resolution,
+                request.context,
+            )
+            .await
+        })
+    }
+
     fn rebind_table_object_binding(
         &self,
         request: ConnectorTableObjectRebindRequest,
@@ -2700,13 +2721,42 @@ mod plan_splits_pruning_tests {
                 context: context(),
             };
             let first = metadata
-                .current_table_object_binding_async(
-                    request.table.clone(),
-                    request.resolution,
-                    request.context.clone(),
-                )
+                .capture_table_object_binding_async(ConnectorTableObjectCaptureRequest {
+                    table: request.table.clone(),
+                    resolution: request.resolution,
+                    selector: ConnectorTableObjectSelector::Current,
+                    context: request.context.clone(),
+                })
                 .await
                 .unwrap();
+            let mut foreign = request.table.clone();
+            foreign.instance_id = ConnectorInstanceId::parse("foreign").unwrap();
+            let Err(error) = metadata
+                .capture_table_object_binding_async(ConnectorTableObjectCaptureRequest {
+                    table: foreign,
+                    resolution: request.resolution,
+                    selector: ConnectorTableObjectSelector::Current,
+                    context: request.context.clone(),
+                })
+                .await
+            else {
+                panic!("foreign instance must not capture a physical object");
+            };
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+            let mut missing = request.table.clone();
+            missing.table = Arc::from("missing");
+            let Err(error) = metadata
+                .capture_table_object_binding_async(ConnectorTableObjectCaptureRequest {
+                    table: missing,
+                    resolution: request.resolution,
+                    selector: ConnectorTableObjectSelector::Current,
+                    context: request.context.clone(),
+                })
+                .await
+            else {
+                panic!("missing table must not capture a physical object");
+            };
+            assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
             let retained = first.object_id.clone();
             let rebound = metadata
                 .rebind_table_object_binding_async(ConnectorTableObjectRebindRequest {

@@ -355,7 +355,12 @@ fn start_background_workers(
                 run_refresh_event(&refresh_task_dependencies, stop, maintenance_wakeup_tx);
             }),
             Box::new(move |_| {
-                if let Err(error) = maintenance.run_once(now_unix_millis()) {
+                // The original joined bare-thread event owns this whole pass F.
+                // Async physical leaves run here; none joins inside QB/facts.
+                if let Err(error) = maintenance
+                    .runtime_handle()
+                    .block_on(maintenance.run_once_async(now_unix_millis()))
+                {
                     tracing::warn!(error = %error, "frontend MV maintenance inventory failed");
                 }
                 if let Some((source, readiness, connector_control, product_service)) =

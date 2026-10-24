@@ -1956,6 +1956,7 @@ fn storage_fanout_is_finite_configurable_and_charged_from_actual_layout() {
         children_per_slot: 1,
         proposals_per_slot: 2,
         poll_roles: &[],
+        process_sources: crate::PollRoleSourceBacking::default(),
     };
     let wider = ControlStorageConfig {
         children_per_slot: 2,
@@ -2280,6 +2281,7 @@ fn metadata_reservation_tracks_actual_service_geometry_and_rejects_overflow_befo
         children_per_slot: 1,
         proposals_per_slot: 2,
         poll_roles: &[],
+        process_sources: crate::PollRoleSourceBacking::default(),
     };
     let quote = |geometry: &JointCapacityConfig| {
         crate::joint_admission::ledger::control_storage_base(storage, geometry)
@@ -2331,4 +2333,35 @@ fn metadata_reservation_tracks_actual_service_geometry_and_rejects_overflow_befo
             Err(WorkError::ArithmeticOverflow)
         ));
     }
+}
+
+#[test]
+fn independent_process_source_layout_is_prepaid_once_by_the_original_base() {
+    let (control, _, _driver) = prototype_profile(4, 1, 1, 1);
+    let geometry = {
+        let state = control.inner.state.lock().unwrap();
+        state.joint.as_ref().unwrap().config_for_test()
+    };
+    let plain = ControlStorageConfig::new([4, 0, 0, 0, 0], 1, 2, &[]);
+    let source = crate::PollRoleSourceBacking::from_layouts(
+        &[std::alloc::Layout::new::<[u64; 4]>()],
+        &[std::alloc::Layout::new::<[u64; 2]>()],
+    )
+    .unwrap();
+    let with = plain.with_process_source_backing(source);
+    let old = plain.base_charge(&geometry).unwrap();
+    let new = with.base_charge(&geometry).unwrap();
+    // (4 * 32 + 16) / 4 is exact, including the one shared header.
+    assert_eq!(
+        new.get(JointResource::MetadataBytes) - old.get(JointResource::MetadataBytes),
+        36
+    );
+    assert_eq!(
+        new.get(JointResource::ScopeRecords),
+        old.get(JointResource::ScopeRecords)
+    );
+    assert_eq!(
+        new.get(JointResource::ClaimRecords),
+        old.get(JointResource::ClaimRecords)
+    );
 }

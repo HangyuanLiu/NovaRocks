@@ -17,14 +17,14 @@
 
 //! EXPLAIN runs in the original registered statement, not a second Work role.
 
+use super::statement_action::StatementReadyReceiver;
 use super::*;
 use crate::query::compiler::{PreparedAsyncExplain, PreparedAsyncProfile};
 use crate::query_execution::logical_execution::OriginalComputationStart;
 use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_query_application::api::{ExecutionHandle, LocalResultProducer, OwnedLocalResult};
 use novarocks_query_application::session_control::{
-    GovernedQueryStatementOwner, GovernedStatementAction, StatementActionReady,
-    StatementActionReceipt, StatementActionValue, StatementActionWaitError,
+    GovernedQueryStatementOwner, GovernedStatementAction, StatementActionValue,
 };
 use std::task::{Context, Poll};
 
@@ -136,34 +136,6 @@ async fn make_profile_diagnostics(
         .completion
         .complete_profile_observation(&input.ready, snapshot.as_deref().map_err(|e| *e))
         .map_err(internal_error)
-}
-
-/// Exactly one receiving field in the existing session. The tail cannot erase
-/// the installed owner/result if its callback panics.
-#[derive(Default)]
-pub(super) struct ExplainReadyReceiver {
-    ready: Mutex<Option<StatementActionReady>>,
-}
-impl ExplainReadyReceiver {
-    fn install(&self, receipt: StatementActionReceipt) -> Result<(), QueryServiceError> {
-        let installed = {
-            let mut ready = self.ready.lock().unwrap_or_else(|p| p.into_inner());
-            receipt.take_ready_in(&mut ready)
-        };
-        let tail =
-            installed.map_err(|_receipt| internal_error("EXPLAIN receiving slot is occupied"))?;
-        tail.finish()
-            .map_err(|e| internal_error(format!("EXPLAIN progress notification refused: {e:?}")))
-    }
-    fn take_protocol(&self) -> Result<StatementResult, QueryServiceError> {
-        let mut output = None;
-        {
-            let mut ready = self.ready.lock().unwrap_or_else(|p| p.into_inner());
-            StatementActionReady::transfer_protocol_in(&mut ready, &mut output)
-                .map_err(internal_error)?;
-        }
-        Ok(output.expect("silent transfer installed original output"))
-    }
 }
 
 struct ExplainStatementAction {
@@ -383,60 +355,23 @@ impl FrontendQuerySession {
             #[cfg(novarocks_dev_controls)]
             observation: observation.clone(),
         };
-        let cancellation = input.cancellation.clone();
-        let mut owner = Some(statement);
-        let mut action: Option<Box<dyn GovernedStatementAction>> =
-            Some(Box::new(ExplainStatementAction {
-                preparation: Some(Box::pin(make_explain_preparation(input))),
-                preparation_started: false,
-                prepared: None,
-                profile: None,
-                capacity: None,
-                original: OriginalComputationStart::default(),
-                execution: None,
-                diagnostics: None,
-                raw_result: None,
-                local: None,
-                launcher: Arc::clone(&self.service.logical_execution_launcher),
-                #[cfg(novarocks_dev_controls)]
-                observation,
-            }));
-        let mut waiter = None;
-        let tail = match self.service.query_control.publish_statement_action_in(
-            &mut owner,
-            &mut action,
-            &mut waiter,
-        ) {
-            Ok(tail) => tail,
-            Err(e) => {
-                return Ok(self.governed_typed_error(
-                    internal_error(format!("EXPLAIN source publication refused: {e:?}")),
-                    owner.take().expect("refusal preserves owner"),
-                ));
-            }
-        };
-        if let Err(e) = tail.finish() {
-            return Ok(self.governed_typed_error(
-                internal_error(format!("EXPLAIN source publication refused: {e:?}")),
-                owner.take().expect("refusal preserves owner"),
-            ));
-        }
-        let receipt = match waiter.as_mut().expect("published original observer").await {
-            Ok(receipt) => receipt,
-            Err(StatementActionWaitError::Stopped) => {
-                return Err(match cancellation.reason() {
-                    Some(reason) => cancellation_error(reason),
-                    None => internal_error("EXPLAIN statement stopped before delivery"),
-                });
-            }
-            Err(StatementActionWaitError::Failed(_)) => {
-                return Err(internal_error(
-                    "EXPLAIN statement action failed; original cause retained by supervisor",
-                ));
-            }
-        };
-        self.explain_ready.install(receipt)?;
-        self.explain_ready.take_protocol()
+        let action = Box::new(ExplainStatementAction {
+            preparation: Some(Box::pin(make_explain_preparation(input))),
+            preparation_started: false,
+            prepared: None,
+            profile: None,
+            capacity: None,
+            original: OriginalComputationStart::default(),
+            execution: None,
+            diagnostics: None,
+            raw_result: None,
+            local: None,
+            launcher: Arc::clone(&self.service.logical_execution_launcher),
+            #[cfg(novarocks_dev_controls)]
+            observation,
+        });
+        self.execute_observed_statement_action(statement, action)
+            .await
     }
 }
 
@@ -456,7 +391,7 @@ pub(crate) fn statement_action_geometry() -> ExplainStatementGeometry {
         action: std::alloc::Layout::new::<ExplainStatementAction>(),
         preparation: future_layout(make_explain_preparation),
         diagnostics: future_layout(make_profile_diagnostics),
-        receiver: std::alloc::Layout::new::<ExplainReadyReceiver>(),
+        receiver: std::alloc::Layout::new::<StatementReadyReceiver>(),
     }
 }
 
@@ -467,6 +402,7 @@ mod tests {
         api::{QueryExecutionFuture, ReservedExecutionIdentity},
         client_connection::ClientConnectionToken,
         query_control::QueryApplicationControl,
+        session_control::StatementActionReady,
     };
     use novarocks_workload_control::{
         ResourceConfig, ResultCapacityConfig, ResultCapacityHandle, WorkloadConfig, WorkloadControl,
@@ -623,8 +559,20 @@ mod tests {
             .unwrap()
             .cancel(novarocks_workload_control::CancellationReason::Requested);
         let result = futures::future::poll_fn(|cx| action.poll_action(&mut owner, cx)).await;
-        assert!(
-            matches!(result,Err(error) if error.message()=="Query execution cancellation was requested")
+        let Err(error) = result else {
+            panic!("cancelled preparation cannot deliver a result");
+        };
+        assert_eq!(error.kind(), QueryServiceErrorKind::Interrupted);
+        assert_eq!(
+            error.user_error().expect("typed cancellation").message(),
+            "Query execution cancellation was requested"
+        );
+        assert_eq!(
+            error
+                .execution_failure()
+                .expect("original cancellation fact")
+                .site(),
+            novarocks_query_application::execution_error::ExecutionFailureSite::Coordinator
         );
         assert_eq!(polls.load(Ordering::SeqCst), 0);
         assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);

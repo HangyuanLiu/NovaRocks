@@ -116,6 +116,8 @@ use novarocks_workload_control::{WorkError, WorkOwner};
 
 pub(crate) mod compiler;
 mod explain_action;
+mod maintenance_action;
+mod statement_action;
 pub(crate) use explain_action::{
     ExplainStatementGeometry, statement_action_geometry as explain_statement_geometry,
 };
@@ -377,12 +379,43 @@ struct FrontendMaintenanceCommandConsumer {
 }
 
 impl MaintenanceCommandConsumer for FrontendMaintenanceCommandConsumer {
+    fn prepare_statement_action(
+        &self,
+        command: novarocks_sql::semantic::MaintenanceSqlCommand,
+        request_context: RequestContext,
+        command_context: CommandContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        CommandError,
+    > {
+        maintenance_action::prepare(
+            &self.maintenance,
+            &command,
+            &request_context,
+            &command_context,
+        )
+    }
+
     fn execute(
         &self,
         command: novarocks_sql::semantic::MaintenanceSqlCommand,
         request_context: RequestContext,
         command_context: CommandContext,
     ) -> CommandFuture {
+        if crate::query_execution::maintenance::command::is_async_metadata_command(
+            &command,
+            request_context.session().current_catalog(),
+            request_context.session().current_database(),
+        )
+        .unwrap_or(false)
+        {
+            return Box::pin(async {
+                Err(CommandError::new(
+                    CommandErrorKind::Conflict,
+                    "metadata maintenance requires the original registered statement source",
+                ))
+            });
+        }
         let maintenance = self.maintenance.clone();
         let maintenance_read = self.maintenance_read.clone();
         execute_product_command_edge(
@@ -400,7 +433,7 @@ impl MaintenanceCommandConsumer for FrontendMaintenanceCommandConsumer {
                         .map_err(CommandError::from)
                 }
                 command => maintenance
-                    .execute_command(
+                    .execute_non_metadata_command(
                         &command,
                         context.session().current_catalog(),
                         context.session().current_database(),
@@ -1247,7 +1280,7 @@ impl QuerySessionFactory for FrontendQueryService {
             service: self.clone(),
             lease: Mutex::new(Some(lease)),
             state: Mutex::new(SessionSqlState::default()),
-            explain_ready: explain_action::ExplainReadyReceiver::default(),
+            statement_ready: statement_action::StatementReadyReceiver::default(),
             principal: Arc::from(request.principal()),
         }))
     }
@@ -1273,7 +1306,7 @@ struct FrontendQuerySession {
     service: FrontendQueryService,
     lease: Mutex<Option<QuerySessionLease>>,
     state: Mutex<SessionSqlState>,
-    explain_ready: explain_action::ExplainReadyReceiver,
+    statement_ready: statement_action::StatementReadyReceiver,
     /// Who the server authenticated on this connection. A command that records
     /// what someone did takes this, never an argument that claims an identity.
     principal: Arc<str>,
@@ -2307,6 +2340,34 @@ impl FrontendQuerySession {
             },
             None => command_context,
         };
+        if let Ok(Some(ProductSqlCommand::Maintenance(command))) =
+            lower_product_sql_command(&parsed_statement)
+        {
+            if crate::query_execution::maintenance::command::is_async_metadata_command(
+                &command,
+                context.session().current_catalog(),
+                context.session().current_database(),
+            )
+            .unwrap_or(false)
+            {
+                let action = match self
+                    .service
+                    .product_command_router
+                    .prepare_maintenance_statement_action(command, context, command_context)
+                {
+                    Ok(action) => action,
+                    Err(error) => {
+                        return Ok(self.governed_typed_error(
+                            routed_execution_service_error(product_command_error(error)),
+                            statement,
+                        ));
+                    }
+                };
+                return self
+                    .execute_observed_statement_action(statement, action)
+                    .await;
+            }
+        }
         let producer_window = command_context.result_window_alias();
         let execution_owner = statement
             .take_execution_owner()

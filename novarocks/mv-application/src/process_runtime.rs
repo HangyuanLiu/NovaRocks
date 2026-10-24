@@ -63,6 +63,29 @@ impl MvBackgroundStop {
     }
 }
 
+type OriginalMaintenanceTask = Arc<Mutex<Option<MvMaintenanceBackgroundTask>>>;
+struct MaintenanceTaskLoan {
+    source: OriginalMaintenanceTask,
+    task: Option<MvMaintenanceBackgroundTask>,
+}
+impl MaintenanceTaskLoan {
+    fn take(source: &OriginalMaintenanceTask) -> Self {
+        let task = source.lock().unwrap_or_else(|p| p.into_inner()).take();
+        assert!(task.is_some(), "one original maintenance event callback");
+        Self {
+            source: Arc::clone(source),
+            task,
+        }
+    }
+}
+impl Drop for MaintenanceTaskLoan {
+    fn drop(&mut self) {
+        let mut target = self.source.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(target.is_none(), "same callback loan returns once");
+        *target = self.task.take();
+    }
+}
+
 /// Product-owned lifecycle and event runtime for the two process-local MV
 /// workers.  It owns worker creation, timer/wakeup waits, stop signals and
 /// joins. Frontend supplies only repository/provider/native adapters.
@@ -77,6 +100,10 @@ pub struct MvBackgroundRuntime {
     maintenance_wakeup_tx: mpsc::SyncSender<()>,
     maintenance_worker: Option<JoinHandle<()>>,
     stop: MvBackgroundStop,
+    // Host keeps the original callback/source beyond a worker unwind.
+    maintenance_task: Option<OriginalMaintenanceTask>,
+    refresh_failure: Mutex<Option<Box<dyn std::any::Any + Send>>>,
+    maintenance_failure: Mutex<Option<Box<dyn std::any::Any + Send>>>,
 }
 
 impl MvBackgroundRuntime {
@@ -96,6 +123,9 @@ impl MvBackgroundRuntime {
             stop: MvBackgroundStop {
                 requested: Arc::new(AtomicBool::new(false)),
             },
+            maintenance_task: None,
+            refresh_failure: Mutex::new(None),
+            maintenance_failure: Mutex::new(None),
         }
     }
 
@@ -131,12 +161,17 @@ impl MvBackgroundRuntime {
                 }
             })
             .map_err(|error| format!("start MV refresh product worker: {error}"))?;
-        let mut maintenance = tasks.maintenance;
+        let maintenance_task = Arc::new(Mutex::new(Some(tasks.maintenance)));
+        let original_task = Arc::clone(&maintenance_task);
         let maintenance_worker = match thread::Builder::new()
             .name("novarocks-mv-maintenance".to_string())
             .spawn(move || {
                 while !maintenance_stop.is_requested() {
-                    maintenance(&maintenance_stop);
+                    // No lock is held across callback, physical poll or Drop.
+                    // Unwind returns the SAME callback and its fixed source.
+                    let mut original = MaintenanceTaskLoan::take(&original_task);
+                    original.task.as_mut().unwrap()(&maintenance_stop);
+                    drop(original);
                     match maintenance_wakeup_rx
                         .recv_timeout(maintenance_interval.max(Duration::from_millis(1)))
                     {
@@ -162,6 +197,9 @@ impl MvBackgroundRuntime {
             maintenance_wakeup_tx,
             maintenance_worker: Some(maintenance_worker),
             stop,
+            maintenance_task: Some(maintenance_task),
+            refresh_failure: Mutex::new(None),
+            maintenance_failure: Mutex::new(None),
         })
     }
 
@@ -178,20 +216,38 @@ impl MvBackgroundRuntime {
 
     pub async fn stop_and_join_until(&mut self, deadline: Instant) -> Result<(), String> {
         self.request_stop();
-        wait_and_join(
+        let refresh = wait_and_join(
             &mut self.refresh_worker,
+            &self.refresh_failure,
             deadline,
             "MV refresh worker did not stop before the shared shutdown deadline",
             "MV refresh worker panicked during shutdown",
         )
-        .await?;
-        wait_and_join(
+        .await;
+        let maintenance = wait_and_join(
             &mut self.maintenance_worker,
+            &self.maintenance_failure,
             deadline,
             "MV maintenance worker did not stop before the shared shutdown deadline",
             "MV maintenance worker panicked during shutdown",
         )
-        .await
+        .await;
+        // A sticky first worker failure never prevents observation of the
+        // second original JH. Both use the SAME absolute deadline. The actual
+        // opaque causes remain in their original two fixed fields.
+        match (refresh, maintenance) {
+            (Err(primary), _) => return Err(primary),
+            (Ok(()), Err(secondary)) => return Err(secondary),
+            (Ok(()), Ok(())) => {}
+        }
+        // Both joins succeeding is required to release the callback. A joined
+        // failed worker can still own a poisoned action, so Err retains it.
+        let retired = self
+            .maintenance_task
+            .as_ref()
+            .and_then(|source| source.lock().unwrap_or_else(|p| p.into_inner()).take());
+        drop(retired);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -207,12 +263,21 @@ impl MvBackgroundRuntime {
 
 async fn wait_and_join(
     worker: &mut Option<JoinHandle<()>>,
+    original_failure: &Mutex<Option<Box<dyn std::any::Any + Send>>>,
     deadline: Instant,
     deadline_error: &'static str,
     panic_error: &'static str,
 ) -> Result<(), String> {
     let Some(handle) = worker.as_ref() else {
-        return Ok(());
+        return if original_failure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+        {
+            Err(panic_error.to_string())
+        } else {
+            Ok(())
+        };
     };
     while !handle.is_finished() {
         if Instant::now() >= deadline {
@@ -223,11 +288,20 @@ async fn wait_and_join(
         )
         .await;
     }
-    worker
+    match worker
         .take()
         .expect("finished MV worker is retained")
         .join()
-        .map_err(|_| panic_error.to_string())
+    {
+        Ok(()) => Ok(()),
+        Err(primary) => {
+            let mut original = original_failure.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(original.is_none(), "same original worker is joined once");
+            *original = Some(primary);
+            drop(original);
+            Err(panic_error.to_string())
+        }
+    }
 }
 
 #[derive(Default)]
@@ -240,6 +314,9 @@ enum BackgroundLifecycle {
     #[default]
     Idle,
     Starting,
+    // The same runtime is temporarily loaned outside the mutex for actual
+    // joins. Cancellation restores it; nobody may install a second runtime.
+    Stopping,
     Running(MvBackgroundRuntime),
 }
 
@@ -276,7 +353,7 @@ impl MvBackgroundRuntimeOwner {
             BackgroundLifecycle::Starting => {
                 return Err(MvBackgroundRuntimeLifecycleError::AlreadyStarting);
             }
-            BackgroundLifecycle::Running(_) => {
+            BackgroundLifecycle::Running(_) | BackgroundLifecycle::Stopping => {
                 return Err(MvBackgroundRuntimeLifecycleError::AlreadyRunning);
             }
         }
@@ -292,28 +369,37 @@ impl MvBackgroundRuntimeOwner {
                 .lifecycle
                 .lock()
                 .map_err(|error| format!("lock MV background runtime lifecycle: {error}"))?;
-            match std::mem::replace(&mut *lifecycle, BackgroundLifecycle::Idle) {
-                BackgroundLifecycle::Idle => return Ok(()),
+            match std::mem::replace(&mut *lifecycle, BackgroundLifecycle::Stopping) {
+                BackgroundLifecycle::Idle => {
+                    *lifecycle = BackgroundLifecycle::Idle;
+                    return Ok(());
+                }
                 BackgroundLifecycle::Starting => {
                     *lifecycle = BackgroundLifecycle::Starting;
                     return Err(MvBackgroundRuntimeLifecycleError::StartupInterrupted.to_string());
                 }
+                BackgroundLifecycle::Stopping => {
+                    return Err(
+                        MvBackgroundRuntimeLifecycleError::OwnerChangedDuringShutdown.to_string(),
+                    );
+                }
                 BackgroundLifecycle::Running(runtime) => runtime,
             }
         };
-        let mut runtime = runtime;
-        let result = runtime.stop_and_join_until(deadline).await;
-        if result.is_err() {
-            let mut lifecycle = self
-                .lifecycle
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if !matches!(*lifecycle, BackgroundLifecycle::Idle) {
-                return Err(
-                    MvBackgroundRuntimeLifecycleError::OwnerChangedDuringShutdown.to_string(),
-                );
-            }
-            *lifecycle = BackgroundLifecycle::Running(runtime);
+        // Constructed before the first join await; its Drop is a pure move
+        // back to this owner, never a detached-worker cleanup approximation.
+        let mut original = BackgroundRuntimeLoan {
+            owner: self,
+            runtime: Some(runtime),
+        };
+        let result = original
+            .runtime
+            .as_mut()
+            .unwrap()
+            .stop_and_join_until(deadline)
+            .await;
+        if result.is_ok() {
+            original.finish();
         }
         result
     }
@@ -323,6 +409,46 @@ impl MvBackgroundRuntimeOwner {
             && let BackgroundLifecycle::Running(runtime) = &*lifecycle
         {
             runtime.request_stop();
+        }
+    }
+}
+
+struct BackgroundRuntimeLoan<'a> {
+    owner: &'a MvBackgroundRuntimeOwner,
+    runtime: Option<MvBackgroundRuntime>,
+}
+impl BackgroundRuntimeLoan<'_> {
+    fn finish(&mut self) {
+        {
+            let mut lifecycle = self
+                .owner
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert!(
+                matches!(*lifecycle, BackgroundLifecycle::Stopping),
+                "same original runtime shutdown"
+            );
+            *lifecycle = BackgroundLifecycle::Idle;
+        }
+        // Actual joins and callback/source destruction have completed. All
+        // remaining owner fields are destroyed outside the lifecycle mutex.
+        drop(self.runtime.take());
+    }
+}
+impl Drop for BackgroundRuntimeLoan<'_> {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            let mut lifecycle = self
+                .owner
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert!(
+                matches!(*lifecycle, BackgroundLifecycle::Stopping),
+                "same original runtime loan"
+            );
+            *lifecycle = BackgroundLifecycle::Running(runtime);
         }
     }
 }
@@ -703,5 +829,209 @@ mod tests {
             .stop_and_join_until(Instant::now() + Duration::from_secs(1))
             .await
             .expect("woken workers observe the product stop signal");
+    }
+    #[tokio::test]
+    async fn failed_original_worker_keeps_callback_and_raw_cause_after_actual_join() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct DropProbe(Arc<AtomicUsize>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let source_drops = Arc::new(AtomicUsize::new(0));
+        let cause_drops = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(DropProbe(Arc::clone(&source_drops)));
+        let source_view = Arc::downgrade(&source);
+        let mut cause = Some(DropProbe(Arc::clone(&cause_drops)));
+        let (entered, receive) = mpsc::channel();
+        let mut runtime = MvBackgroundRuntime::start(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            super::MvBackgroundTasks::new(
+                Box::new(|_, _| {}),
+                Box::new(move |_| {
+                    let _same_original = &source;
+                    entered.send(()).unwrap();
+                    std::panic::panic_any(cause.take().expect("same worker only runs once"));
+                }),
+            ),
+        )
+        .unwrap();
+        let entered = receive.recv_timeout(Duration::from_secs(1)).is_ok();
+        let exit = runtime
+            .stop_and_join_until(Instant::now() + Duration::from_secs(1))
+            .await;
+        let first_cause = runtime
+            .maintenance_failure
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|p| p.is::<DropProbe>());
+        let repeat = runtime
+            .stop_and_join_until(Instant::now() + Duration::from_secs(1))
+            .await;
+        let success = entered
+            && exit.is_err()
+            && repeat.is_err()
+            && first_cause
+            && !runtime.has_maintenance_worker()
+            && source_view.upgrade().is_some()
+            && source_drops.load(Ordering::SeqCst) == 0
+            && cause_drops.load(Ordering::SeqCst) == 0;
+        if !success {
+            std::panic::panic_any(runtime)
+        }
+        drop(runtime); // Explicit original process-owner disposition after real join.
+        assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(cause_drops.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn refresh_panic_does_not_skip_the_finished_maintenance_join() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Cause(Arc<AtomicUsize>);
+        impl Drop for Cause {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let cause_drops = Arc::new(AtomicUsize::new(0));
+        let callback_drops = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(Cause(Arc::clone(&callback_drops)));
+        let source_view = Arc::downgrade(&source);
+        let mut primary = Some(Cause(Arc::clone(&cause_drops)));
+        let (finished, receive) = mpsc::channel();
+        let mut runtime = MvBackgroundRuntime::start(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            super::MvBackgroundTasks::new(
+                Box::new(move |_, _| std::panic::panic_any(primary.take().unwrap())),
+                Box::new(move |_| {
+                    let _original_callback = &source;
+                    let _ = finished.send(());
+                }),
+            ),
+        )
+        .unwrap();
+        let entered = receive.recv_timeout(Duration::from_secs(1));
+        let exit = runtime
+            .stop_and_join_until(Instant::now() + Duration::from_secs(1))
+            .await;
+        let both_joined = !runtime.has_refresh_worker() && !runtime.has_maintenance_worker();
+        let cause_retained = runtime
+            .refresh_failure
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|cause| cause.is::<Cause>());
+        let repeat = runtime
+            .stop_and_join_until(Instant::now() + Duration::from_secs(1))
+            .await;
+        if !(entered.is_ok()
+            && exit.is_err()
+            && repeat.is_err()
+            && both_joined
+            && cause_retained
+            && source_view.upgrade().is_some()
+            && cause_drops.load(Ordering::SeqCst) == 0
+            && callback_drops.load(Ordering::SeqCst) == 0)
+        {
+            // Both original causes and callback remain in the whole packet.
+            std::panic::panic_any(runtime)
+        }
+        drop(runtime); // Explicit original owner disposition, not a Source exit receipt.
+        assert_eq!(cause_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(callback_drops.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn cancelled_shutdown_restores_the_same_two_joins_and_callback() {
+        use std::future::Future;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Source(Arc<AtomicUsize>);
+        impl Drop for Source {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(Source(Arc::clone(&drops)));
+        let source_view = Arc::downgrade(&source);
+        let (refresh_entered, refresh_seen) = mpsc::channel();
+        let (maintenance_entered, maintenance_seen) = mpsc::channel();
+        let (release_refresh, refresh_release) = mpsc::channel();
+        let (release_maintenance, maintenance_release) = mpsc::channel();
+        let runtime = MvBackgroundRuntime::start(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            super::MvBackgroundTasks::new(
+                Box::new(move |_, _| {
+                    let _ = refresh_entered.send(());
+                    let _ = refresh_release.recv();
+                }),
+                Box::new(move |_| {
+                    let _original = &source;
+                    let _ = maintenance_entered.send(());
+                    let _ = maintenance_release.recv();
+                }),
+            ),
+        )
+        .unwrap();
+        let identities = (
+            runtime.refresh_worker.as_ref().unwrap().thread().id(),
+            runtime.maintenance_worker.as_ref().unwrap().thread().id(),
+        );
+        let owner = MvBackgroundRuntimeOwner::default();
+        owner.begin_start().unwrap().install(runtime).unwrap();
+        let entered = refresh_seen.recv_timeout(Duration::from_secs(1)).is_ok()
+            && maintenance_seen
+                .recv_timeout(Duration::from_secs(1))
+                .is_ok();
+        let mut wait = Box::pin(owner.shutdown_until(Instant::now() + Duration::from_secs(1)));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let pending = wait.as_mut().poll(&mut cx).is_pending();
+        drop(wait); // Borrowed cancellation is not an actual worker exit.
+        let restored = {
+            let lifecycle = owner.lifecycle.lock().unwrap();
+            match &*lifecycle {
+                super::BackgroundLifecycle::Running(runtime) => {
+                    runtime.refresh_worker.as_ref().map(|h| h.thread().id()) == Some(identities.0)
+                        && runtime.maintenance_worker.as_ref().map(|h| h.thread().id())
+                            == Some(identities.1)
+                        && runtime.maintenance_task.is_some()
+                }
+                _ => false,
+            }
+        };
+        let retained = source_view.upgrade().is_some() && drops.load(Ordering::SeqCst) == 0;
+        let refresh_released = release_refresh.send(()).is_ok();
+        let maintenance_released = release_maintenance.send(()).is_ok();
+        let joined = owner
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await;
+        let closed = matches!(
+            *owner.lifecycle.lock().unwrap(),
+            super::BackgroundLifecycle::Idle
+        );
+        if !(entered
+            && pending
+            && restored
+            && retained
+            && refresh_released
+            && maintenance_released
+            && joined.is_ok()
+            && closed
+            && drops.load(Ordering::SeqCst) == 1)
+        {
+            std::panic::panic_any(owner)
+        }
     }
 }

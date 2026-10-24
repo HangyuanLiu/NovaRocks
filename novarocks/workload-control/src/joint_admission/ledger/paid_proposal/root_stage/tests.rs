@@ -692,3 +692,55 @@ fn root_stage_original_batch_also_installs_its_roots_unknown_production_domains(
     drive(&mut driver);
     assert_eq!(capacity(&control, JointResource::Computations), 0);
 }
+
+#[test]
+fn complete_payload_increment_refuses_before_paid_body_and_preserves_same_source_for_retry() {
+    let (control, _, mut driver, work, stage, payload) = setup(false);
+    let payload = payload.unwrap();
+    let alias = payload.retain_alias().unwrap();
+    let source = payload
+        .root_stage_source(&work.owner.scope(), &stage)
+        .unwrap();
+    let id = source.fence.payload;
+    let bound = source.maximum_protected_payload_increment().unwrap();
+    assert_eq!(bound, 16);
+    let before = payload_state(&control, id).unwrap();
+    let before_claims = {
+        let state = control.inner.state.lock().unwrap();
+        state.joint.as_ref().unwrap().claims.len()
+    };
+    assert!(matches!(
+        source.begin(bound + 1, JointLane::Foreground),
+        Err(WorkError::Capacity(
+            "Root/stage protected payload increment"
+        ))
+    ));
+    assert_eq!(payload_state(&control, id).unwrap(), before);
+    assert_eq!(capacity(&control, JointResource::Computations), 0);
+    {
+        let state = control.inner.state.lock().unwrap();
+        assert_eq!(state.joint.as_ref().unwrap().claims.len(), before_claims);
+        assert_eq!(state.nodes[&work.owner.scope().id].resource_waiters, 0);
+    }
+    let mut admission = batch(&payload, &work, &stage, 4);
+    drive(&mut driver);
+    let mut reply = ready(&mut admission);
+    let mut compute = None;
+    let notification = reply
+        .install_in(&work.owner.scope(), &payload, &stage, &mut compute)
+        .unwrap();
+    let after = payload_state(&control, id).unwrap();
+    assert_eq!((after.0, after.1), (before.0, before.1));
+    assert_eq!(alias.capacity_bytes().unwrap(), 12);
+    notification.notify();
+    drop(reply);
+    drop(compute);
+    assert_eq!(capacity(&control, JointResource::Computations), 0);
+    drop(alias);
+    drop(payload);
+    stage.complete();
+    work.business.release();
+    work.owner.complete();
+    drive(&mut driver);
+    assert_eq!(capacity(&control, JointResource::PayloadBytes), 0);
+}

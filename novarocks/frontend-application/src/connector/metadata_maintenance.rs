@@ -21,13 +21,16 @@
 //! generic cache finalization. Provider-specific maintenance planning, durable
 //! artifacts, markers and external mutation all remain behind the SPI.
 
-use crate::connector::schema_creation::FrontendSchemaLoad;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorMaxCompactableDataFilesRequest, ConnectorMetadataMaintenanceExecuteRequest,
-    ConnectorMetadataMaintenanceLease, ConnectorMetadataMaintenanceOperation,
+    ConnectorMetadataMaintenanceExecution, ConnectorMetadataMaintenanceLease,
+    ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenanceOutcome,
     ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenanceReceipt,
     ConnectorMetadataMaintenanceResolver, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorMutationOperationId, ConnectorRequestContext, ConnectorTableHandle,
@@ -88,7 +91,7 @@ impl MetadataMaintenanceIntent {
 /// Provider cache invalidation is represented by the provider's returned
 /// finalization. This port is deliberately invoked only afterwards, preserving
 /// provider-before-generic invalidation without importing provider state here.
-pub trait MetadataMaintenanceCacheFinalizer {
+pub trait MetadataMaintenanceCacheFinalizer: Send + Sync {
     fn invalidate_generic_table(
         &self,
         table: &ConnectorTableIdentity,
@@ -145,155 +148,32 @@ pub enum ResolvedMetadataMaintenance {
     },
 }
 
-/// Compatibility projection for a synchronous statement caller.
-pub fn execute_metadata_maintenance(
-    resolver: &dyn ConnectorMetadataMaintenanceResolver,
-    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
-    instance_id: &ConnectorInstanceId,
-    operation_id: ConnectorMutationOperationId,
-    table: ConnectorTableIdentity,
-    intent: MetadataMaintenanceIntent,
-    context: ConnectorRequestContext,
-) -> Result<CompletedMetadataMaintenance, String> {
-    match resolve_metadata_maintenance(
-        resolver,
-        cache_finalizer,
-        instance_id,
-        operation_id,
-        table,
-        intent,
-        context,
-    ) {
-        ResolvedMetadataMaintenance::KnownCommitted(completed) => {
-            if let ExternalMutationFinalization::Failed(failure) = &completed.finalization {
-                Err(
-                    EngineError::commit_known_committed_finalize_failed(failure.to_string())
-                        .to_string(),
-                )
-            } else {
-                Ok(completed)
-            }
-        }
-        ResolvedMetadataMaintenance::KnownUncommitted { failure, cleanup } => Err(
-            EngineError::commit_known_uncommitted(super::mutation::known_uncommitted_message(
-                failure, &cleanup,
-            ))
-            .to_string(),
-        ),
-        ResolvedMetadataMaintenance::CommitUnknown { failure } => {
-            Err(EngineError::commit_unknown(failure.to_string()).to_bracketed_user_message())
-        }
-        ResolvedMetadataMaintenance::ContractFailure { error, .. } => Err(error.to_string()),
-    }
-}
-
-/// Execute a plan that a frontend durable-operation owner has already made
-/// visible as RUNNING.  The session owns the exact-generation lease until the
-/// provider returns a terminal outcome.
-#[cfg(test)]
-pub fn execute_planned_metadata_maintenance(
-    session: MetadataMaintenanceSession,
-    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
-) -> Result<CompletedMetadataMaintenance, String> {
-    match session.execute(cache_finalizer) {
-        ResolvedMetadataMaintenance::KnownCommitted(completed) => {
-            if let ExternalMutationFinalization::Failed(failure) = &completed.finalization {
-                Err(
-                    EngineError::commit_known_committed_finalize_failed(failure.to_string())
-                        .to_string(),
-                )
-            } else {
-                Ok(completed)
-            }
-        }
-        ResolvedMetadataMaintenance::KnownUncommitted { failure, cleanup } => Err(
-            EngineError::commit_known_uncommitted(super::mutation::known_uncommitted_message(
-                failure, &cleanup,
-            ))
-            .to_string(),
-        ),
-        ResolvedMetadataMaintenance::CommitUnknown { failure } => {
-            Err(EngineError::commit_unknown(failure.to_string()).to_bracketed_user_message())
-        }
-        ResolvedMetadataMaintenance::ContractFailure { error, .. } => Err(error.to_string()),
-    }
-}
-
-/// Read one provider-owned maintenance observation on a current lease.
-///
-/// This deliberately does not reuse [`MetadataMaintenanceSession`]: an
-/// observation has no operation id, no plan, no receipt and no cache
-/// finalization, so it must not travel the durable operation path. The lease is
-/// held only long enough to resolve the table handle and ask the provider.
-///
-/// The call is expensive by contract — the provider enumerates live table
-/// state to answer it — so it belongs to background maintenance policy only,
-/// never to SQL planning.
-pub fn read_max_compactable_data_files(
-    resolver: &dyn ConnectorMetadataMaintenanceResolver,
-    instance_id: &ConnectorInstanceId,
-    table: ConnectorTableIdentity,
-    context: ConnectorRequestContext,
-) -> Result<Option<u64>, ConnectorError> {
-    if &table.instance_id != instance_id {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "connector maintenance observation table does not belong to requested instance",
-        ));
-    }
-    let lease = resolver.acquire_current_metadata_maintenance(instance_id)?;
-    let metadata = lease
-        .metadata()
-        .load_frontend_table(ConnectorTableRequest {
-            table: table.clone(),
-            resolution: ConnectorTableResolution::StrictBaseTable,
-            context: context.clone(),
-        })?;
-    if metadata.identity != table || metadata.table.owner() != &lease.descriptor().instance_id {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "connector metadata returned a table handle for a different exact owner",
-        ));
-    }
-    let request = ConnectorMaxCompactableDataFilesRequest::try_new(metadata.table, context)?;
-    Ok(lease.read_max_compactable_data_files(request)?.value())
-}
-
-/// Plan and execute one operation using a newly acquired current lease.
-pub fn resolve_metadata_maintenance(
-    resolver: &dyn ConnectorMetadataMaintenanceResolver,
-    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
-    instance_id: &ConnectorInstanceId,
-    operation_id: ConnectorMutationOperationId,
-    table: ConnectorTableIdentity,
-    intent: MetadataMaintenanceIntent,
-    context: ConnectorRequestContext,
-) -> ResolvedMetadataMaintenance {
-    let session = match MetadataMaintenanceSession::plan(
-        resolver,
-        instance_id,
-        operation_id,
-        table,
-        intent,
-        context,
-    ) {
-        Ok(session) => session,
-        Err(failure) => return failure,
-    };
-    session.execute(cache_finalizer)
-}
-
-pub struct MetadataMaintenanceSession {
+/// The original durable-operation owner stores this call before polling it.
+/// Cancelling a borrowed wait leaves preparation, the exact lease and execution
+/// handle in this same field; it is not permission to create another call.
+pub struct MetadataMaintenanceCall {
     lease: ConnectorMetadataMaintenanceLease,
     table: ConnectorTableIdentity,
-    plan: ConnectorMetadataMaintenancePlan,
+    operation_id: ConnectorMutationOperationId,
+    intent: MetadataMaintenanceIntent,
     context: ConnectorRequestContext,
+    preparation: Option<
+        Pin<
+            Box<
+                dyn Future<Output = Result<MetadataMaintenanceSession, ResolvedMetadataMaintenance>>
+                    + Send,
+            >,
+        >,
+    >,
+    preparation_poll_unproven: bool,
+    session: Option<MetadataMaintenanceSession>,
+    failure: Option<ResolvedMetadataMaintenance>,
 }
 
-impl MetadataMaintenanceSession {
-    /// Acquire the current exact lease, strictly load the base table, and make
-    /// one immutable provider plan. This is the only entry point that plans.
-    pub(crate) fn plan(
+impl MetadataMaintenanceCall {
+    /// Pure lease/identity validation and stable future construction. No I/O is
+    /// polled until this value has been installed in the caller's original row.
+    pub fn try_new(
         resolver: &dyn ConnectorMetadataMaintenanceResolver,
         instance_id: &ConnectorInstanceId,
         operation_id: ConnectorMutationOperationId,
@@ -318,17 +198,363 @@ impl MetadataMaintenanceSession {
                     MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
                 )
             })?;
-        let metadata = lease
-            .metadata()
-            .load_frontend_table(ConnectorTableRequest {
+        let preparation = Box::pin(MetadataMaintenanceSession::plan_on_lease(
+            lease.clone(),
+            operation_id,
+            table.clone(),
+            intent.clone(),
+            context.clone(),
+        ));
+        Ok(Self {
+            lease,
+            table,
+            operation_id,
+            intent,
+            context,
+            preparation: Some(preparation),
+            preparation_poll_unproven: false,
+            session: None,
+            failure: None,
+        })
+    }
+
+    pub fn original_context(&self) -> &ConnectorRequestContext {
+        &self.context
+    }
+
+    pub fn operation_id(&self) -> ConnectorMutationOperationId {
+        self.operation_id
+    }
+
+    pub fn matches(
+        &self,
+        instance: &ConnectorInstanceId,
+        operation_id: ConnectorMutationOperationId,
+        table: &ConnectorTableIdentity,
+        intent: &MetadataMaintenanceIntent,
+    ) -> bool {
+        self.lease.descriptor().instance_id == *instance
+            && self.operation_id == operation_id
+            && self.table == *table
+            && self.intent == *intent
+    }
+
+    fn poll_prepared(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ResolvedMetadataMaintenance>> {
+        if self.preparation_poll_unproven {
+            return Poll::Ready(Err(contract_failure(
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "metadata maintenance preparation did not prove actual exit",
+                ),
+                MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
+            )));
+        }
+        if let Some(failure) = &self.failure {
+            return Poll::Ready(Err(failure.clone()));
+        }
+        if self.session.is_some() {
+            return Poll::Ready(Ok(()));
+        }
+        // If foreign poll or Drop unwinds, the future/session remains in this
+        // original call, and subsequent callers cannot repoll an unwound F.
+        self.preparation_poll_unproven = true;
+        let result = self
+            .preparation
+            .as_mut()
+            .expect("preparation is installed")
+            .as_mut()
+            .poll(cx);
+        match result {
+            Poll::Pending => {
+                self.preparation_poll_unproven = false;
+                Poll::Pending
+            }
+            Poll::Ready(result) => {
+                match result {
+                    Ok(session) => self.session = Some(session),
+                    Err(failure) => self.failure = Some(failure),
+                }
+                let retired = self.preparation.take();
+                drop(retired);
+                self.preparation_poll_unproven = false;
+                Poll::Ready(self.failure.clone().map_or(Ok(()), Err))
+            }
+        }
+    }
+
+    pub async fn resolve(
+        &mut self,
+        cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+    ) -> ResolvedMetadataMaintenance {
+        if let Err(failure) = std::future::poll_fn(|cx| self.poll_prepared(cx)).await {
+            return failure;
+        }
+        self.session
+            .as_mut()
+            .expect("prepared session is stable")
+            .execute(cache_finalizer)
+            .await
+    }
+
+    /// Original provider facts remain inspectable after a notification or
+    /// finalizer panic. They never authorize another physical dispatch.
+    pub fn retained_outcome(
+        &self,
+    ) -> Option<Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>> {
+        self.session
+            .as_ref()
+            .and_then(MetadataMaintenanceSession::retained_outcome)
+    }
+    /// Publication classification from the original retained provider fact.
+    /// It grants no cleanup/exit proof and never dispatches another operation.
+    pub fn publication_disposition(
+        &self,
+    ) -> Option<novarocks_spi::connector::LakePublicationDisposition> {
+        use novarocks_spi::connector::LakePublicationDisposition as D;
+        if let Some(Ok(outcome)) = self.retained_outcome() {
+            return Some(match outcome {
+                ExternalMutationOutcome::KnownCommitted { .. } => D::KnownCommitted,
+                ExternalMutationOutcome::KnownUncommitted { .. } => D::KnownUncommitted,
+                ExternalMutationOutcome::CommitUnknown { .. } => D::CommitUnknown,
+            });
+        }
+        // Retained provider terminal above wins even after frame/Drop failure.
+        // Installed execution or an interrupted begin is possibly dispatched.
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.execution.is_some() || session.execution_begin_unproven)
+        {
+            return Some(D::CommitUnknown);
+        }
+        let resolved = self
+            .failure
+            .as_ref()
+            .or_else(|| self.session.as_ref().and_then(|s| s.resolved.as_ref()))?;
+        match resolved {
+            ResolvedMetadataMaintenance::KnownCommitted(_) => Some(D::KnownCommitted),
+            ResolvedMetadataMaintenance::KnownUncommitted { .. } => Some(D::KnownUncommitted),
+            ResolvedMetadataMaintenance::CommitUnknown { .. } => Some(D::CommitUnknown),
+            ResolvedMetadataMaintenance::ContractFailure {
+                dispatch: MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
+                ..
+            } => Some(D::KnownUncommitted),
+            ResolvedMetadataMaintenance::ContractFailure { .. } => Some(D::CommitUnknown),
+        }
+    }
+
+    pub fn execution_failure(&self) -> Option<&ConnectorError> {
+        self.session
+            .as_ref()
+            .and_then(MetadataMaintenanceSession::execution_failure)
+    }
+}
+
+pub async fn resolve_metadata_maintenance(
+    call: &mut MetadataMaintenanceCall,
+    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+) -> ResolvedMetadataMaintenance {
+    call.resolve(cache_finalizer).await
+}
+
+pub async fn execute_metadata_maintenance(
+    call: &mut MetadataMaintenanceCall,
+    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+) -> Result<CompletedMetadataMaintenance, String> {
+    completed_projection(call.resolve(cache_finalizer).await)
+}
+
+fn completed_projection(
+    result: ResolvedMetadataMaintenance,
+) -> Result<CompletedMetadataMaintenance, String> {
+    match result {
+        ResolvedMetadataMaintenance::KnownCommitted(completed) => {
+            if let ExternalMutationFinalization::Failed(failure) = &completed.finalization {
+                Err(
+                    EngineError::commit_known_committed_finalize_failed(failure.to_string())
+                        .to_string(),
+                )
+            } else {
+                Ok(completed)
+            }
+        }
+        ResolvedMetadataMaintenance::KnownUncommitted { failure, cleanup } => Err(
+            EngineError::commit_known_uncommitted(super::mutation::known_uncommitted_message(
+                failure, &cleanup,
+            ))
+            .to_string(),
+        ),
+        ResolvedMetadataMaintenance::CommitUnknown { failure } => {
+            Err(EngineError::commit_unknown(failure.to_string()).to_bracketed_user_message())
+        }
+        ResolvedMetadataMaintenance::ContractFailure { error, .. } => Err(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+pub async fn execute_planned_metadata_maintenance(
+    session: &mut MetadataMaintenanceSession,
+    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+) -> Result<CompletedMetadataMaintenance, String> {
+    completed_projection(session.execute(cache_finalizer).await)
+}
+
+/// A read-only observation has no mutation identity or publication journal.
+/// Its original owner must still retain this value while borrowing its wait.
+pub struct MetadataMaintenanceObservation {
+    _lease: ConnectorMetadataMaintenanceLease,
+    future: Option<Pin<Box<dyn Future<Output = Result<Option<u64>, ConnectorError>> + Send>>>,
+    result: Option<Result<Option<u64>, ConnectorError>>,
+    poll_unproven: bool,
+}
+impl MetadataMaintenanceObservation {
+    pub fn try_new(
+        resolver: &dyn ConnectorMetadataMaintenanceResolver,
+        instance_id: &ConnectorInstanceId,
+        table: ConnectorTableIdentity,
+        context: ConnectorRequestContext,
+    ) -> Result<Self, ConnectorError> {
+        if &table.instance_id != instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector maintenance observation table does not belong to requested instance",
+            ));
+        }
+        let lease = resolver.acquire_current_metadata_maintenance(instance_id)?;
+        let owner = lease.clone();
+        let future = Box::pin(async move {
+            let metadata = crate::connector::schema_creation::load_frontend_table_async(
+                owner.metadata().as_ref(),
+                ConnectorTableRequest {
+                    table: table.clone(),
+                    resolution: ConnectorTableResolution::StrictBaseTable,
+                    context: context.clone(),
+                },
+            )
+            .await?;
+            if metadata.identity != table
+                || metadata.table.owner() != &owner.descriptor().instance_id
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "connector metadata returned a table handle for a different exact owner",
+                ));
+            }
+            let request =
+                ConnectorMaxCompactableDataFilesRequest::try_new(metadata.table, context)?;
+            Ok(owner
+                .read_max_compactable_data_files(request)
+                .await?
+                .value())
+        });
+        Ok(Self {
+            _lease: lease,
+            future: Some(future),
+            result: None,
+            poll_unproven: false,
+        })
+    }
+    pub(crate) fn poll_result(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<u64>, ConnectorError>> {
+        if self.poll_unproven {
+            return Poll::Ready(Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "metadata maintenance observation did not prove actual exit",
+            )));
+        }
+        if let Some(result) = &self.result {
+            return Poll::Ready(result.clone());
+        }
+        self.poll_unproven = true;
+        match self
+            .future
+            .as_mut()
+            .expect("observation future is installed")
+            .as_mut()
+            .poll(cx)
+        {
+            Poll::Pending => {
+                self.poll_unproven = false;
+                Poll::Pending
+            }
+            Poll::Ready(result) => {
+                self.result = Some(result.clone());
+                let retired = self.future.take();
+                drop(retired);
+                self.poll_unproven = false;
+                Poll::Ready(result)
+            }
+        }
+    }
+    pub async fn wait(&mut self) -> Result<Option<u64>, ConnectorError> {
+        std::future::poll_fn(|cx| self.poll_result(cx)).await
+    }
+}
+
+pub async fn read_max_compactable_data_files(
+    observation: &mut MetadataMaintenanceObservation,
+) -> Result<Option<u64>, ConnectorError> {
+    observation.wait().await
+}
+
+pub struct MetadataMaintenanceSession {
+    lease: ConnectorMetadataMaintenanceLease,
+    table: ConnectorTableIdentity,
+    plan: ConnectorMetadataMaintenancePlan,
+    context: ConnectorRequestContext,
+    execution: Option<ConnectorMetadataMaintenanceExecution>,
+    execution_begin_unproven: bool,
+    provider_outcome: Option<Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>>,
+    resolved: Option<ResolvedMetadataMaintenance>,
+    finalization_unproven: bool,
+}
+
+impl MetadataMaintenanceSession {
+    #[cfg(test)]
+    pub(crate) async fn plan(
+        resolver: &dyn ConnectorMetadataMaintenanceResolver,
+        instance_id: &ConnectorInstanceId,
+        operation_id: ConnectorMutationOperationId,
+        table: ConnectorTableIdentity,
+        intent: MetadataMaintenanceIntent,
+        context: ConnectorRequestContext,
+    ) -> Result<Self, ResolvedMetadataMaintenance> {
+        let mut call = MetadataMaintenanceCall::try_new(
+            resolver,
+            instance_id,
+            operation_id,
+            table,
+            intent,
+            context,
+        )?;
+        std::future::poll_fn(|cx| call.poll_prepared(cx)).await?;
+        Ok(call.session.take().expect("prepared test session"))
+    }
+    async fn plan_on_lease(
+        lease: ConnectorMetadataMaintenanceLease,
+        operation_id: ConnectorMutationOperationId,
+        table: ConnectorTableIdentity,
+        intent: MetadataMaintenanceIntent,
+        context: ConnectorRequestContext,
+    ) -> Result<Self, ResolvedMetadataMaintenance> {
+        let metadata = crate::connector::schema_creation::load_frontend_table_async(
+            lease.metadata().as_ref(),
+            ConnectorTableRequest {
                 table: table.clone(),
                 resolution: ConnectorTableResolution::StrictBaseTable,
                 context: context.clone(),
-            })
-            .map_err(|error| ResolvedMetadataMaintenance::KnownUncommitted {
-                failure: KnownUncommittedMetadataMaintenance::Planning(error),
-                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
-            })?;
+            },
+        )
+        .await
+        .map_err(|error| ResolvedMetadataMaintenance::KnownUncommitted {
+            failure: KnownUncommittedMetadataMaintenance::Planning(error),
+            cleanup: ExternalMutationFinalization::Complete,
+        })?;
         if metadata.identity != table || metadata.table.owner() != &lease.descriptor().instance_id {
             return Err(contract_failure(
                 ConnectorError::new(
@@ -341,76 +567,211 @@ impl MetadataMaintenanceSession {
         let operation = intent.into_operation(metadata.table).map_err(|error| {
             ResolvedMetadataMaintenance::KnownUncommitted {
                 failure: KnownUncommittedMetadataMaintenance::Planning(error),
-                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+                cleanup: ExternalMutationFinalization::Complete,
             }
         })?;
         let plan = lease
             .plan_operation(operation_id, operation, context.clone())
+            .await
             .map_err(|error| ResolvedMetadataMaintenance::KnownUncommitted {
                 failure: KnownUncommittedMetadataMaintenance::Planning(error),
-                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+                cleanup: ExternalMutationFinalization::Complete,
             })?;
         Ok(Self {
             lease,
             table,
             plan,
             context,
+            execution: None,
+            execution_begin_unproven: false,
+            provider_outcome: None,
+            resolved: None,
+            finalization_unproven: false,
         })
     }
-
     #[cfg(test)]
     pub fn plan_ref(&self) -> &ConnectorMetadataMaintenancePlan {
         &self.plan
     }
-
-    /// Consume the session, so callers cannot execute its immutable plan twice.
-    pub(crate) fn execute(
-        self,
+    pub fn retained_outcome(
+        &self,
+    ) -> Option<Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>> {
+        self.execution
+            .as_ref()
+            .and_then(|execution| execution.retained_result())
+            .or_else(|| self.provider_outcome.clone())
+    }
+    /// Actual frame/notification failure is independent of publication facts.
+    /// The original session retains this cause while its source is unproven.
+    pub fn execution_failure(&self) -> Option<&ConnectorError> {
+        self.provider_outcome
+            .as_ref()
+            .and_then(|result| result.as_ref().err())
+    }
+    /// Installs the original provider execution handle before the first wait.
+    /// Re-entry resumes this exact handle; it never constructs another request.
+    pub(crate) async fn execute(
+        &mut self,
         cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
     ) -> ResolvedMetadataMaintenance {
-        let request = match ConnectorMetadataMaintenanceExecuteRequest::try_new(
-            self.plan.clone(),
-            self.context.clone(),
-        ) {
-            Ok(request) => request,
-            Err(error) => {
-                return contract_failure(
-                    error,
-                    MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
-                );
+        if let Some(resolved) = &self.resolved {
+            return resolved.clone();
+        }
+        if self.execution_begin_unproven {
+            return contract_failure(
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "metadata maintenance begin did not prove non-dispatch",
+                ),
+                MetadataMaintenanceDispatchState::PossiblyDispatched,
+            );
+        }
+        if self.execution.is_none() {
+            let request = match ConnectorMetadataMaintenanceExecuteRequest::try_new(
+                self.plan.clone(),
+                self.context.clone(),
+            ) {
+                Ok(request) => request,
+                Err(error) => {
+                    let failure = contract_failure(
+                        error,
+                        MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
+                    );
+                    self.resolved = Some(failure.clone());
+                    return failure;
+                }
+            };
+            // A panic after this call entered cannot prove non-dispatch.
+            // The same session retains that fact before any foreign callback.
+            self.execution_begin_unproven = true;
+            match self.lease.begin_execute(request) {
+                Ok(execution) => {
+                    self.execution = Some(execution);
+                    self.execution_begin_unproven = false;
+                }
+                Err(error) => {
+                    let failure = contract_failure(
+                        error,
+                        MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
+                    );
+                    self.resolved = Some(failure.clone());
+                    self.execution_begin_unproven = false;
+                    return failure;
+                }
             }
-        };
-        let outcome = match self.lease.execute(request) {
+        }
+        if self.provider_outcome.is_none() {
+            let result = self
+                .execution
+                .as_mut()
+                .expect("execution is stable")
+                .wait()
+                .await;
+            self.provider_outcome = Some(result);
+        }
+        let outcome = match self
+            .provider_outcome
+            .as_ref()
+            .expect("outcome is stable")
+            .clone()
+        {
             Ok(outcome) => outcome,
-            Err(error) => {
-                return contract_failure(
-                    error,
-                    MetadataMaintenanceDispatchState::PossiblyDispatched,
-                );
-            }
+            Err(error) => match self
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.retained_result())
+            {
+                Some(Ok(outcome)) => outcome_after_frame_failure(outcome, &error),
+                _ => {
+                    return contract_failure(
+                        error,
+                        MetadataMaintenanceDispatchState::PossiblyDispatched,
+                    );
+                }
+            },
         };
-        resolve_terminal_outcome(outcome, &self.table, cache_finalizer)
+        if self.finalization_unproven {
+            // A cache callback panic cannot erase a known publication or call
+            // that callback again. The original outer owner retains its panic.
+            let outcome = outcome_after_frame_failure(
+                outcome,
+                &ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "generic cache finalization did not prove actual exit",
+                ),
+            );
+            return project_terminal_without_cache(outcome);
+        }
+        self.finalization_unproven = true;
+        let resolved = resolve_terminal_outcome(outcome, &self.table, cache_finalizer);
+        self.resolved = Some(resolved.clone());
+        self.finalization_unproven = false;
+        resolved
     }
 }
 
-fn resolve_terminal_outcome(
-    outcome: ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>,
-    table: &ConnectorTableIdentity,
-    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
-) -> ResolvedMetadataMaintenance {
+fn outcome_after_frame_failure(
+    outcome: ConnectorMetadataMaintenanceOutcome,
+    error: &ConnectorError,
+) -> ConnectorMetadataMaintenanceOutcome {
+    let frame_failure = ConnectorMutationFailure::new(
+        ConnectorMutationFailureKind::Internal,
+        format!("metadata maintenance execution frame failed: {error}"),
+    );
     match outcome {
         ExternalMutationOutcome::KnownCommitted {
             effect,
             receipt,
             finalization,
         } => {
-            let generic_finalization = cache_finalizer.invalidate_generic_table(table);
-            ResolvedMetadataMaintenance::KnownCommitted(CompletedMetadataMaintenance {
+            let finalization = match finalization {
+                ExternalMutationFinalization::Complete => {
+                    ExternalMutationFinalization::Failed(frame_failure)
+                }
+                ExternalMutationFinalization::Failed(failure) => {
+                    ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                        failure.kind(),
+                        format!("{}; {}", failure.message(), frame_failure.message()),
+                    ))
+                }
+            };
+            ExternalMutationOutcome::KnownCommitted {
                 effect,
                 receipt,
-                finalization: merge_finalization(finalization, generic_finalization),
-            })
+                finalization,
+            }
         }
+        other => other,
+    }
+}
+
+fn resolve_terminal_outcome(
+    mut outcome: ConnectorMetadataMaintenanceOutcome,
+    table: &ConnectorTableIdentity,
+    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+) -> ResolvedMetadataMaintenance {
+    if let ExternalMutationOutcome::KnownCommitted { finalization, .. } = &mut outcome {
+        *finalization = merge_finalization(
+            finalization.clone(),
+            cache_finalizer.invalidate_generic_table(table),
+        );
+    }
+    project_terminal_without_cache(outcome)
+}
+
+fn project_terminal_without_cache(
+    outcome: ConnectorMetadataMaintenanceOutcome,
+) -> ResolvedMetadataMaintenance {
+    match outcome {
+        ExternalMutationOutcome::KnownCommitted {
+            effect,
+            receipt,
+            finalization,
+        } => ResolvedMetadataMaintenance::KnownCommitted(CompletedMetadataMaintenance {
+            effect,
+            receipt,
+            finalization,
+        }),
         ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
             ResolvedMetadataMaintenance::KnownUncommitted {
                 failure: KnownUncommittedMetadataMaintenance::Provider(failure),
@@ -510,6 +871,8 @@ mod tests {
         Committed,
         UnknownStaysUnknown,
         PlanningFailure,
+        Pending,
+        BeginPanic,
     }
 
     struct FakeProvider {
@@ -520,6 +883,7 @@ mod tests {
         plan_calls: AtomicUsize,
         execute_calls: AtomicUsize,
         events: Arc<Mutex<Vec<&'static str>>>,
+        execution_ready: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl FakeProvider {
@@ -539,6 +903,10 @@ mod tests {
                 plan_calls: AtomicUsize::new(0),
                 execute_calls: AtomicUsize::new(0),
                 events: Arc::new(Mutex::new(Vec::new())),
+                execution_ready: Arc::new(std::sync::atomic::AtomicBool::new(!matches!(
+                    mode,
+                    Mode::Pending
+                ))),
             })
         }
 
@@ -573,31 +941,15 @@ mod tests {
         }
     }
 
-    impl ConnectorMetadata for FakeProvider {
-        fn instance_id(&self) -> &ConnectorInstanceId {
-            &self.descriptor.instance_id
-        }
-        fn namespace_exists(&self, _: ConnectorNamespaceRequest) -> Result<bool, ConnectorError> {
-            unreachable!()
-        }
-        fn table_exists(&self, _: ConnectorTableRequest) -> Result<bool, ConnectorError> {
-            unreachable!()
-        }
-        fn list_tables(
-            &self,
-            _: ConnectorListTablesRequest,
-        ) -> Result<Vec<ConnectorTableIdentity>, ConnectorError> {
-            unreachable!()
-        }
-        fn load_table(
+    impl FakeProvider {
+        fn create_test_table(
             &self,
             request: ConnectorTableRequest,
             creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
         ) -> Result<
-            novarocks_spi::connector::ConnectorTableMetadata,
+            ConnectorTableMetadata,
             novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
         > {
-            self.metadata_calls.fetch_add(1, Ordering::SeqCst);
             empty_table_metadata(
                 novarocks_spi::connector::ConnectorTableMetadataHeader {
                     identity: request.table,
@@ -616,36 +968,64 @@ mod tests {
         }
     }
 
-    impl ConnectorMetadataMaintenance for FakeProvider {
-        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
-            &self.descriptor
+    impl ConnectorMetadata for FakeProvider {
+        fn instance_id(&self) -> &ConnectorInstanceId {
+            &self.descriptor.instance_id
         }
-        fn binding_key(&self) -> &ConnectorProviderBindingKey {
-            &self.key
+        fn namespace_exists(&self, _: ConnectorNamespaceRequest) -> Result<bool, ConnectorError> {
+            unreachable!()
         }
-        fn plan_maintenance(
+        fn table_exists(&self, _: ConnectorTableRequest) -> Result<bool, ConnectorError> {
+            unreachable!()
+        }
+        fn list_tables(
             &self,
-            request: ConnectorMetadataMaintenancePlanningRequest,
-        ) -> Result<ConnectorMetadataMaintenancePlan, ConnectorError> {
-            self.plan_calls.fetch_add(1, Ordering::SeqCst);
-            if matches!(self.mode, Mode::PlanningFailure) {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "planning rejected",
-                ));
-            }
-            ConnectorMetadataMaintenancePlan::try_new(
-                &request,
-                [3; 32],
-                ConnectorMetadataMaintenancePlanSummary::new(1, 2, 3, 4, 5),
-                Bytes::from_static(b"plan"),
-            )
+            _: ConnectorListTablesRequest,
+        ) -> Result<Vec<ConnectorTableIdentity>, ConnectorError> {
+            unreachable!()
         }
-        fn execute(
+        fn prepare_table(
+            &self,
+            request: ConnectorTableRequest,
+        ) -> novarocks_spi::connector::ConnectorTablePreparationFuture<'_> {
+            Box::pin(async move {
+                self.metadata_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(novarocks_spi::connector::ConnectorTablePreparation::new(
+                    self.descriptor.instance_id.clone(),
+                    request,
+                ))
+            })
+        }
+        fn create_prepared_table(
+            &self,
+            prepared: novarocks_spi::connector::ConnectorTablePreparation,
+            creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            ConnectorTableMetadata,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
+            let request: ConnectorTableRequest =
+                prepared.into_facts(&self.descriptor.instance_id)?;
+            self.create_test_table(request, creation)
+        }
+        fn load_table(
+            &self,
+            request: ConnectorTableRequest,
+            creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorTableMetadata,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
+            self.metadata_calls.fetch_add(1, Ordering::SeqCst);
+            self.create_test_table(request, creation)
+        }
+    }
+
+    impl FakeProvider {
+        fn test_outcome(
             &self,
             request: ConnectorMetadataMaintenanceExecuteRequest,
-        ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError>
-        {
+        ) -> Result<ConnectorMetadataMaintenanceOutcome, ConnectorError> {
             self.execute_calls.fetch_add(1, Ordering::SeqCst);
             if matches!(self.mode, Mode::UnknownStaysUnknown) {
                 return Ok(ExternalMutationOutcome::CommitUnknown {
@@ -664,7 +1044,119 @@ mod tests {
             })
         }
     }
+    impl ConnectorMetadataMaintenance for FakeProvider {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
+            &self.key
+        }
+        fn plan_maintenance(
+            &self,
+            request: ConnectorMetadataMaintenancePlanningRequest,
+        ) -> novarocks_spi::connector::ConnectorMetadataMaintenanceFuture<
+            '_,
+            ConnectorMetadataMaintenancePlan,
+        > {
+            Box::pin(async move {
+                self.plan_calls.fetch_add(1, Ordering::SeqCst);
+                if matches!(self.mode, Mode::PlanningFailure) {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "planning rejected",
+                    ));
+                }
+                ConnectorMetadataMaintenancePlan::try_new(
+                    &request,
+                    [3; 32],
+                    ConnectorMetadataMaintenancePlanSummary::new(1, 2, 3, 4, 5),
+                    Bytes::from_static(b"plan"),
+                )
+            })
+        }
+        fn begin_execute(
+            &self,
+            request: ConnectorMetadataMaintenanceExecuteRequest,
+        ) -> Result<ConnectorMetadataMaintenanceExecution, ConnectorError> {
+            if matches!(self.mode, Mode::BeginPanic) {
+                self.execute_calls.fetch_add(1, Ordering::SeqCst);
+                std::panic::panic_any(71_u32);
+            }
+            Ok(ConnectorMetadataMaintenanceExecution::from_source(
+                Arc::new(GatedExecution {
+                    ready: self.execution_ready.clone(),
+                    result: self.test_outcome(request),
+                }),
+            ))
+        }
+    }
 
+    struct GatedExecution {
+        ready: Arc<std::sync::atomic::AtomicBool>,
+        result: Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>,
+    }
+    impl novarocks_spi::connector::ConnectorMetadataMaintenanceExecutionSource for GatedExecution {
+        fn poll_result(
+            &self,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>> {
+            if self.ready.load(Ordering::SeqCst) {
+                Poll::Ready(self.result.clone())
+            } else {
+                Poll::Pending
+            }
+        }
+        fn retained_result(
+            &self,
+        ) -> Option<Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>> {
+            self.ready
+                .load(Ordering::SeqCst)
+                .then(|| self.result.clone())
+        }
+    }
+    // Test-stack wrappers preserve the original behavior oracles. Production
+    // callers must supply their stable named Call/Observation fields instead.
+    async fn execute_metadata_maintenance(
+        resolver: &dyn ConnectorMetadataMaintenanceResolver,
+        finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+        instance: &ConnectorInstanceId,
+        operation: ConnectorMutationOperationId,
+        table: ConnectorTableIdentity,
+        intent: MetadataMaintenanceIntent,
+        context: ConnectorRequestContext,
+    ) -> Result<CompletedMetadataMaintenance, String> {
+        let mut call =
+            MetadataMaintenanceCall::try_new(resolver, instance, operation, table, intent, context)
+                .map_err(|failure| format!("{failure:?}"))?;
+        super::execute_metadata_maintenance(&mut call, finalizer).await
+    }
+    async fn resolve_metadata_maintenance(
+        resolver: &dyn ConnectorMetadataMaintenanceResolver,
+        finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+        instance: &ConnectorInstanceId,
+        operation: ConnectorMutationOperationId,
+        table: ConnectorTableIdentity,
+        intent: MetadataMaintenanceIntent,
+        context: ConnectorRequestContext,
+    ) -> ResolvedMetadataMaintenance {
+        let mut call = match MetadataMaintenanceCall::try_new(
+            resolver, instance, operation, table, intent, context,
+        ) {
+            Ok(call) => call,
+            Err(failure) => return failure,
+        };
+        super::resolve_metadata_maintenance(&mut call, finalizer).await
+    }
+    async fn read_max_compactable_data_files(
+        resolver: &dyn ConnectorMetadataMaintenanceResolver,
+        instance: &ConnectorInstanceId,
+        table: ConnectorTableIdentity,
+        context: ConnectorRequestContext,
+    ) -> Result<Option<u64>, ConnectorError> {
+        let mut observation =
+            MetadataMaintenanceObservation::try_new(resolver, instance, table, context)?;
+        super::read_max_compactable_data_files(&mut observation).await
+    }
     struct Resolver {
         provider: Arc<FakeProvider>,
         releases: Arc<AtomicUsize>,
@@ -741,14 +1233,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn exact_lease_plans_executes_once_and_finalizes_provider_before_generic() {
+    #[tokio::test]
+    async fn exact_lease_plans_executes_once_and_finalizes_provider_before_generic() {
         let provider = FakeProvider::new(Mode::Committed);
         let resolver = Resolver::new(provider.clone());
         let finalizer = Finalizer {
             events: provider.events.clone(),
         };
-        let session = MetadataMaintenanceSession::plan(
+        let mut session = MetadataMaintenanceSession::plan(
             &resolver,
             &provider.descriptor.instance_id,
             ConnectorMutationOperationId::from_bytes([9; 16]),
@@ -756,6 +1248,7 @@ mod tests {
             MetadataMaintenanceIntent::rewrite_metadata_layout(),
             context(),
         )
+        .await
         .unwrap();
         assert_eq!(
             session.plan_ref().operation_kind(),
@@ -763,12 +1256,13 @@ mod tests {
         );
         assert_eq!(resolver.releases.load(Ordering::SeqCst), 0);
         assert!(matches!(
-            session.execute(&finalizer),
+            session.execute(&finalizer).await,
             ResolvedMetadataMaintenance::KnownCommitted(_)
         ));
         assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.plan_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+        drop(session);
         assert_eq!(resolver.releases.load(Ordering::SeqCst), 1);
         assert_eq!(
             provider.events.lock().unwrap().as_slice(),
@@ -776,14 +1270,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unknown_execute_is_not_reexecuted() {
+    #[tokio::test]
+    async fn unknown_execute_is_not_reexecuted() {
         let provider = FakeProvider::new(Mode::UnknownStaysUnknown);
         let resolver = Resolver::new(provider.clone());
         let finalizer = Finalizer {
             events: provider.events.clone(),
         };
-        let session = MetadataMaintenanceSession::plan(
+        let mut session = MetadataMaintenanceSession::plan(
             &resolver,
             &provider.descriptor.instance_id,
             ConnectorMutationOperationId::from_bytes([7; 16]),
@@ -791,9 +1285,10 @@ mod tests {
             MetadataMaintenanceIntent::rewrite_metadata_layout(),
             context(),
         )
+        .await
         .unwrap();
         assert!(matches!(
-            session.execute(&finalizer),
+            session.execute(&finalizer).await,
             ResolvedMetadataMaintenance::CommitUnknown { .. }
         ));
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
@@ -802,8 +1297,8 @@ mod tests {
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn unknown_maintenance_strings_preserve_the_canonical_outcome_without_reexecution() {
+    #[tokio::test]
+    async fn unknown_maintenance_strings_preserve_the_canonical_outcome_without_reexecution() {
         for planned in [false, true] {
             let provider = FakeProvider::new(Mode::UnknownStaysUnknown);
             let resolver = Resolver::new(provider.clone());
@@ -812,7 +1307,7 @@ mod tests {
             };
             let operation = ConnectorMutationOperationId::new();
             let outcome = if planned {
-                let session = MetadataMaintenanceSession::plan(
+                let mut session = MetadataMaintenanceSession::plan(
                     &resolver,
                     &provider.descriptor.instance_id,
                     operation,
@@ -820,8 +1315,9 @@ mod tests {
                     MetadataMaintenanceIntent::rewrite_metadata_layout(),
                     context(),
                 )
+                .await
                 .unwrap();
-                execute_planned_metadata_maintenance(session, &finalizer)
+                execute_planned_metadata_maintenance(&mut session, &finalizer).await
             } else {
                 execute_metadata_maintenance(
                     &resolver,
@@ -832,6 +1328,7 @@ mod tests {
                     MetadataMaintenanceIntent::rewrite_metadata_layout(),
                     context(),
                 )
+                .await
             };
             assert_eq!(
                 outcome.unwrap_err(),
@@ -869,6 +1366,26 @@ mod tests {
         ) -> Result<Vec<ConnectorTableIdentity>, ConnectorError> {
             unreachable!()
         }
+        fn prepare_table(
+            &self,
+            request: ConnectorTableRequest,
+        ) -> novarocks_spi::connector::ConnectorTablePreparationFuture<'_> {
+            assert_eq!(
+                request.resolution,
+                ConnectorTableResolution::StrictBaseTable
+            );
+            self.inner.prepare_table(request)
+        }
+        fn create_prepared_table(
+            &self,
+            prepared: novarocks_spi::connector::ConnectorTablePreparation,
+            creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            ConnectorTableMetadata,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
+            self.inner.create_prepared_table(prepared, creation)
+        }
         fn load_table(
             &self,
             request: ConnectorTableRequest,
@@ -895,22 +1412,29 @@ mod tests {
         fn plan_maintenance(
             &self,
             _: ConnectorMetadataMaintenancePlanningRequest,
-        ) -> Result<ConnectorMetadataMaintenancePlan, ConnectorError> {
-            unreachable!("observation must not plan")
+        ) -> novarocks_spi::connector::ConnectorMetadataMaintenanceFuture<
+            '_,
+            ConnectorMetadataMaintenancePlan,
+        > {
+            Box::pin(async move { unreachable!("observation must not plan") })
         }
-        fn execute(
+        fn begin_execute(
             &self,
             _: ConnectorMetadataMaintenanceExecuteRequest,
-        ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError>
-        {
+        ) -> Result<ConnectorMetadataMaintenanceExecution, ConnectorError> {
             unreachable!("observation must not execute")
         }
         fn read_max_compactable_data_files(
             &self,
             request: novarocks_spi::connector::ConnectorMaxCompactableDataFilesRequest,
-        ) -> Result<ConnectorMaxCompactableDataFiles, ConnectorError> {
-            assert_eq!(request.table.owner(), &self.inner.descriptor.instance_id);
-            Ok(ConnectorMaxCompactableDataFiles::new(self.observation))
+        ) -> novarocks_spi::connector::ConnectorMetadataMaintenanceFuture<
+            '_,
+            ConnectorMaxCompactableDataFiles,
+        > {
+            Box::pin(async move {
+                assert_eq!(request.table.owner(), &self.inner.descriptor.instance_id);
+                Ok(ConnectorMaxCompactableDataFiles::new(self.observation))
+            })
         }
     }
 
@@ -939,8 +1463,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn observation_reads_the_provider_scalar_without_planning() {
+    #[tokio::test]
+    async fn observation_reads_the_provider_scalar_without_planning() {
         let inner = FakeProvider::new(Mode::Committed);
         let instance_id = inner.descriptor.instance_id.clone();
         let resolver = ObservingResolver {
@@ -956,6 +1480,7 @@ mod tests {
             table(&instance_id),
             context(),
         )
+        .await
         .expect("observation");
 
         assert_eq!(observed, Some(7));
@@ -964,8 +1489,8 @@ mod tests {
         assert_eq!(inner.execute_calls.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn observation_is_unsupported_when_the_provider_does_not_implement_it() {
+    #[tokio::test]
+    async fn observation_is_unsupported_when_the_provider_does_not_implement_it() {
         let provider = FakeProvider::new(Mode::Committed);
         let resolver = Resolver::new(provider.clone());
 
@@ -975,6 +1500,7 @@ mod tests {
             table(&provider.descriptor.instance_id),
             context(),
         )
+        .await
         .expect_err("default observation must fail closed");
 
         assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
@@ -982,8 +1508,8 @@ mod tests {
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn observation_rejects_a_table_from_another_instance() {
+    #[tokio::test]
+    async fn observation_rejects_a_table_from_another_instance() {
         let provider = FakeProvider::new(Mode::Committed);
         let resolver = Resolver::new(provider.clone());
         let foreign = ConnectorInstanceId::parse("catalog.other").unwrap();
@@ -994,14 +1520,15 @@ mod tests {
             table(&foreign),
             context(),
         )
+        .await
         .expect_err("foreign instance must fail closed");
 
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn planning_failure_is_known_uncommitted_without_dispatch() {
+    #[tokio::test]
+    async fn planning_failure_is_known_uncommitted_without_dispatch() {
         let provider = FakeProvider::new(Mode::PlanningFailure);
         let resolver = Resolver::new(provider.clone());
         let finalizer = Finalizer {
@@ -1016,12 +1543,175 @@ mod tests {
                 table(&provider.descriptor.instance_id),
                 MetadataMaintenanceIntent::expire_table_versions(None, Some(1)),
                 context()
-            ),
+            )
+            .await,
             ResolvedMetadataMaintenance::KnownUncommitted {
                 failure: KnownUncommittedMetadataMaintenance::Planning(_),
                 cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete
             }
         ));
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn cancelled_execution_wait_resumes_same_installed_session_without_redispatch() {
+        let provider = FakeProvider::new(Mode::Pending);
+        let resolver = Resolver::new(provider.clone());
+        let finalizer = Finalizer {
+            events: provider.events.clone(),
+        };
+        let mut session = MetadataMaintenanceSession::plan(
+            &resolver,
+            &provider.descriptor.instance_id,
+            ConnectorMutationOperationId::new(),
+            table(&provider.descriptor.instance_id),
+            MetadataMaintenanceIntent::rewrite_metadata_layout(),
+            context(),
+        )
+        .await
+        .unwrap();
+        let mut wait = Box::pin(session.execute(&finalizer));
+        assert!(futures::poll!(&mut wait).is_pending());
+        drop(wait);
+        assert!(session.execution.is_some());
+        assert!(session.provider_outcome.is_none());
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resolver.releases.load(Ordering::SeqCst), 0);
+        provider.execution_ready.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            session.execute(&finalizer).await,
+            ResolvedMetadataMaintenance::KnownCommitted(_)
+        ));
+        assert!(matches!(
+            session.execute(&finalizer).await,
+            ResolvedMetadataMaintenance::KnownCommitted(_)
+        ));
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider.events.lock().unwrap().as_slice(),
+            ["provider", "generic"]
+        );
+        drop(session);
+        assert_eq!(resolver.releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn generic_finalizer_panic_keeps_original_provider_outcome_and_never_redispatches() {
+        struct PanickingFinalizer(AtomicUsize);
+        impl MetadataMaintenanceCacheFinalizer for PanickingFinalizer {
+            fn invalidate_generic_table(
+                &self,
+                _: &ConnectorTableIdentity,
+            ) -> Result<(), ConnectorError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                panic!("original generic finalizer panic");
+            }
+        }
+        let provider = FakeProvider::new(Mode::Committed);
+        let resolver = Resolver::new(provider.clone());
+        let finalizer = PanickingFinalizer(AtomicUsize::new(0));
+        let mut call = MetadataMaintenanceCall::try_new(
+            &resolver,
+            &provider.descriptor.instance_id,
+            ConnectorMutationOperationId::new(),
+            table(&provider.descriptor.instance_id),
+            MetadataMaintenanceIntent::rewrite_metadata_layout(),
+            context(),
+        )
+        .unwrap();
+        let mut wait = Box::pin(call.resolve(&finalizer));
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            wait.as_mut().poll(&mut cx)
+        }))
+        .expect_err("actual generic callback must unwind");
+        drop(wait);
+        assert!(matches!(
+            call.retained_outcome().unwrap().unwrap(),
+            ExternalMutationOutcome::KnownCommitted { .. }
+        ));
+        assert!(matches!(
+            call.resolve(&finalizer).await,
+            ResolvedMetadataMaintenance::KnownCommitted(CompletedMetadataMaintenance {
+                finalization: ExternalMutationFinalization::Failed(_),
+                ..
+            })
+        ));
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(finalizer.0.load(Ordering::SeqCst), 1);
+        drop(failure);
+    }
+    #[tokio::test]
+    async fn interrupted_begin_keeps_unknown_fact_and_never_begins_again() {
+        use futures::FutureExt;
+        let provider = FakeProvider::new(Mode::BeginPanic);
+        let resolver = Resolver::new(provider.clone());
+        let finalizer = Finalizer {
+            events: provider.events.clone(),
+        };
+        let mut call = MetadataMaintenanceCall::try_new(
+            &resolver,
+            &provider.descriptor.instance_id,
+            ConnectorMutationOperationId::new(),
+            table(&provider.descriptor.instance_id),
+            MetadataMaintenanceIntent::rewrite_metadata_layout(),
+            context(),
+        )
+        .unwrap();
+        let Err(cause) = std::panic::AssertUnwindSafe(call.resolve(&finalizer))
+            .catch_unwind()
+            .await
+        else {
+            panic!("actual begin callback must panic")
+        };
+        assert_eq!(cause.downcast_ref::<u32>(), Some(&71));
+        assert_eq!(
+            call.publication_disposition(),
+            Some(novarocks_spi::connector::LakePublicationDisposition::CommitUnknown)
+        );
+        assert!(matches!(
+            call.resolve(&finalizer).await,
+            ResolvedMetadataMaintenance::ContractFailure {
+                dispatch: MetadataMaintenanceDispatchState::PossiblyDispatched,
+                ..
+            }
+        ));
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resolver.releases.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_execution_publication_fact_becomes_actual_terminal_without_redispatch() {
+        let provider = FakeProvider::new(Mode::Pending);
+        let resolver = Resolver::new(provider.clone());
+        let finalizer = Finalizer {
+            events: provider.events.clone(),
+        };
+        let mut call = MetadataMaintenanceCall::try_new(
+            &resolver,
+            &provider.descriptor.instance_id,
+            ConnectorMutationOperationId::new(),
+            table(&provider.descriptor.instance_id),
+            MetadataMaintenanceIntent::rewrite_metadata_layout(),
+            context(),
+        )
+        .unwrap();
+        let mut wait = Box::pin(call.resolve(&finalizer));
+        assert!(futures::poll!(&mut wait).is_pending());
+        drop(wait);
+        assert_eq!(
+            call.publication_disposition(),
+            Some(novarocks_spi::connector::LakePublicationDisposition::CommitUnknown)
+        );
+        provider.execution_ready.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            call.resolve(&finalizer).await,
+            ResolvedMetadataMaintenance::KnownCommitted(_)
+        ));
+        assert_eq!(
+            call.publication_disposition(),
+            Some(novarocks_spi::connector::LakePublicationDisposition::KnownCommitted)
+        );
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
     }
 }

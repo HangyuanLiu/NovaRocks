@@ -101,6 +101,7 @@ impl FrontendMvBackgroundEngine {
     }
 }
 
+#[async_trait::async_trait]
 impl MvBackgroundEngine for FrontendMvBackgroundEngine {
     fn resolve_refresh_steps(
         &self,
@@ -236,28 +237,55 @@ impl MvBackgroundEngine for FrontendMvBackgroundEngine {
             .collect()
     }
 
-    fn maintenance_facts(
+    async fn maintenance_facts(
         &self,
+        pending: &mut Option<crate::mv::domain::maintenance::stats::MaintenanceFactsState>,
         target: &MaintenanceTarget,
     ) -> Result<MvMaintenanceFacts, MvBackgroundEngineError> {
-        let projections = self
-            .readiness
-            .list_ready_projections()
-            .map_err(repository_error)?
-            .into_iter()
-            .map(|loaded| loaded.projection)
-            .collect::<Vec<_>>();
-        let stats = crate::mv::domain::maintenance::stats::collect_table_stats_with_ports(
-            self.connector_control.as_ref(),
-            self.storage_observation.as_ref(),
-            &target.catalog,
-            &target.namespace,
-            &target.table,
-            &projections,
-        )
-        .map_err(|error| {
-            MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::TransientUnavailable, error)
-        })?;
+        if let Some(original) = pending.as_ref() {
+            if !original.matches(target) {
+                return Err(MvBackgroundEngineError::new(
+                    MvBackgroundEngineErrorKind::InvariantViolation,
+                    "maintenance facts wait changes its original target",
+                ));
+            }
+        } else {
+            let projections = self
+                .readiness
+                .list_ready_projections_async()
+                .await
+                .map_err(repository_error)?
+                .into_iter()
+                .map(|loaded| loaded.projection)
+                .collect();
+            *pending = Some(
+                crate::mv::domain::maintenance::stats::MaintenanceFactsState::try_new(
+                    Arc::clone(&self.connector_control),
+                    Arc::clone(&self.storage_observation),
+                    &target.catalog,
+                    &target.namespace,
+                    &target.table,
+                    projections,
+                )
+                .map_err(|error| {
+                    MvBackgroundEngineError::new(
+                        MvBackgroundEngineErrorKind::TransientUnavailable,
+                        error,
+                    )
+                })?,
+            );
+        }
+        let stats = pending
+            .as_mut()
+            .expect("original facts installed before poll")
+            .wait()
+            .await
+            .map_err(|error| {
+                MvBackgroundEngineError::new(
+                    MvBackgroundEngineErrorKind::TransientUnavailable,
+                    error,
+                )
+            })?;
         Ok(MvMaintenanceFacts {
             current_snapshot_id: stats.current_snapshot_id,
             total_data_files: stats.total_data_files.map(|value| value as i64),

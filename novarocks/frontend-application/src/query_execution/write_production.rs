@@ -34,6 +34,22 @@ pub(crate) struct WriteProductionQuote {
     quote: UnreceivedProductionQuote,
 }
 impl WriteProductionQuote {
+    /// The original cohort author derives its exact bounded metadata. No
+    /// remote object bytes, credentials or unknown payload are inferred here.
+    pub(crate) fn for_composition(count: NonZeroUsize) -> Result<Self, WorkError> {
+        let records = u64::try_from(count.get())
+            .ok()
+            .and_then(NonZeroU64::new)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        let bytes = count
+            .get()
+            .checked_mul(COHORT_BYTES)
+            .and_then(NonZeroUsize::new)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        Ok(Self {
+            quote: UnreceivedProductionQuote::new(records, bytes)?,
+        })
+    }
     /// Derived from the actual immutable manifest, never scope/cache capacity.
     pub(crate) fn from_manifest(
         manifest: &TaskManifestBinding,
@@ -106,6 +122,16 @@ impl ConnectorWriteSession {
         let Some(quote) = WriteProductionQuote::from_manifest(manifest)? else {
             return Ok(());
         };
+        // Count the complete immutable cohort before building a paid request
+        // or allowing the first Native writer effect. Never truncate it.
+        let limit = scope
+            .unreceived_production_occurrence_limit()
+            .map_err(production_work_error)?;
+        if quote.occurrences() > limit {
+            return Err(production_work_error(WorkError::Capacity(
+                "writer cohort exceeds protected profile support",
+            )));
+        }
         for cohort in manifest.writer_cohorts() {
             if !self
                 .targets()

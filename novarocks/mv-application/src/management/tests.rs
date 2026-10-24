@@ -4275,3 +4275,45 @@ fn shared_current_reader_foreign_scope_does_not_revoke_another_target() {
             .unwrap(),
     );
 }
+
+#[test]
+fn borrowed_terminal_releases_real_activity_before_the_stable_lease_is_destroyed() {
+    let (entrance, target, request) =
+        publication_terminal_fixture(ConnectorDocumentManagementOperation::Publication);
+    let mut first = entrance
+        .request(
+            request.clone(),
+            crate::activity::MvActivityOwner::ScheduledRefresh,
+        )
+        .unwrap();
+    let mut first = first.try_acquire().unwrap().unwrap();
+    first
+        .mark_dispatched(EffectResponsibility::new(
+            EffectIdentity::from_bytes([91; 16]),
+            target.clone(),
+            incarnation("inc-a"),
+            EffectScope::CATALOG_COMMIT,
+            ManagementTimestamp::from_unix_millis(1_000),
+        ))
+        .unwrap();
+    let mut next = entrance
+        .request(request, crate::activity::MvActivityOwner::ManualRefresh)
+        .unwrap();
+    assert!(next.try_acquire().unwrap().is_none());
+    first
+        .record_terminal_in_place(EffectDisposition::KnownUncommitted)
+        .unwrap();
+    let next = next
+        .try_acquire()
+        .unwrap()
+        .expect("actual terminal releases the original FIFO turn");
+    // Keep the old stable lease alive through the proof. Its later Drop must
+    // neither pin the turn nor invent an Unknown effect after real settlement.
+    drop(first);
+    assert!(entrance.unsettled_effects(target.table()).is_empty());
+    drop(next);
+    assert_eq!(
+        entrance.management_phase(target.table()),
+        MvManagementPhase::Manageable
+    );
+}

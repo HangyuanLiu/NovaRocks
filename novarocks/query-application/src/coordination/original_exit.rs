@@ -92,7 +92,7 @@ impl std::error::Error for OriginalLogicalExit {}
 
 impl OriginalLogicalExit {
     pub(super) fn new() -> Arc<Self> {
-        Arc::new(Self {
+        let source = Arc::new(Self {
             state: Mutex::new(State {
                 phase: LogicalActorExitPhase::Unreserved,
                 association: None,
@@ -115,7 +115,11 @@ impl OriginalLogicalExit {
             }),
             native: Arc::new(tokio::sync::Mutex::new(OriginalNativePreparation::default())),
             changed: futures::task::AtomicWaker::new(),
-        })
+        });
+        // Initialize the one quoted platform backing before any alias can
+        // race its lazy initialization through a newly published Source.
+        drop(source.state.lock().unwrap_or_else(|p| p.into_inner()));
+        source
     }
     pub(super) fn with_native(
         request: crate::api::QueryExecutionRequest,
@@ -598,6 +602,41 @@ pub struct LogicalExecutionExitGeometry {
     pub input_header: Layout,
     pub publication_tail: Layout,
     pub health_wrapper: Layout,
+}
+impl LogicalExecutionExitGeometry {
+    /// These independent original allocations coexist for one mounted role.
+    /// The whole Ready/Panicked packet is inline in Source.State.role; its
+    /// footer is already inside self.source. The raw geometry separately
+    /// covers Position, the constructed F frame and retained outer completion.
+    /// Do not charge another fictional Box for either inline packet.
+    pub(super) fn role_source_backing(
+        self,
+    ) -> Result<
+        novarocks_workload_control::PollRoleSourceBacking,
+        novarocks_workload_control::WorkError,
+    > {
+        // Same pinned std 1.98.1 model as the existing original platform
+        // authors: Darwin pthread_mutex_t is (c_long, [u8; 56]); Linux's
+        // futex storage is inline. Unknown targets cannot silently quote zero.
+        let mutex_backing = if cfg!(all(target_os = "macos", target_pointer_width = "64")) {
+            Layout::new::<(isize, [u8; 56])>()
+        } else if cfg!(target_os = "linux") {
+            Layout::new::<()>()
+        } else {
+            return Err(novarocks_workload_control::WorkError::InvalidConfig(
+                "unsupported logical Source Mutex backing",
+            ));
+        };
+        novarocks_workload_control::PollRoleSourceBacking::from_layouts(
+            &[
+                self.source,
+                self.native_body,
+                self.health_wrapper,
+                mutex_backing,
+            ],
+            &[],
+        )
+    }
 }
 impl LogicalExecutionExitObserver {
     /// Source header includes the whole original packet inline. Task/opaque

@@ -1662,6 +1662,15 @@ impl ManagementEntranceLease {
         mut self,
         disposition: EffectDisposition,
     ) -> Result<(), ManagementAdmissionError> {
+        self.record_terminal_in_place(disposition)
+    }
+
+    /// Settle through the original stable owner without moving its only lease
+    /// into a callback frame. The caller must never replay an unproven call.
+    pub fn record_terminal_in_place(
+        &mut self,
+        disposition: EffectDisposition,
+    ) -> Result<(), ManagementAdmissionError> {
         if self.request.operation == ConnectorDocumentManagementOperation::Drop {
             return Err(ManagementAdmissionError::InvalidEffect);
         }

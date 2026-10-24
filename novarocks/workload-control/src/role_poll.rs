@@ -46,6 +46,35 @@ use std::{
 };
 use tokio::sync::{Notify, futures::OwnedNotified};
 
+/// Requested backing owned by the application's SAME role source. This
+/// storage-only fact grants no Work, dispatch, payload or Native qualification.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PollRoleSourceBacking {
+    per_slot: usize,
+    shared: usize,
+}
+impl PollRoleSourceBacking {
+    /// Original layout authors provide independent allocations only. A handle
+    /// already inside an inline source is not charged a second time here.
+    pub fn from_layouts(per_slot: &[Layout], shared: &[Layout]) -> Result<Self, WorkError> {
+        let sum = |layouts: &[Layout]| {
+            layouts.iter().try_fold(0usize, |n, l| {
+                n.checked_add(l.size()).ok_or(WorkError::ArithmeticOverflow)
+            })
+        };
+        Ok(Self {
+            per_slot: sum(per_slot)?,
+            shared: sum(shared)?,
+        })
+    }
+    pub(crate) fn bytes(self, slots: usize) -> Result<usize, WorkError> {
+        self.per_slot
+            .checked_mul(slots)
+            .and_then(|n| n.checked_add(self.shared))
+            .ok_or(WorkError::ArithmeticOverflow)
+    }
+}
+
 /// Pure layout facts for the actual factory's fixed frames and containers.
 ///
 /// This is neither a capacity reservation nor installation authority. Independent
@@ -94,8 +123,23 @@ impl PollRoleGeometry {
             completion_custody: Layout::new::<PollTurnCompletion<C, F::Output>>(),
         })
     }
-    /// Fixed bank backing for the actual number of original inventory slots.
-    /// This excludes the separate health wrapper and independent pointees.
+    /// Include original application source allocations in the SAME fixed
+    /// role base. The bank installer must consume this identical fact.
+    pub fn with_source_backing(mut self, source: PollRoleSourceBacking) -> Result<Self, WorkError> {
+        self.per_slot = self
+            .per_slot
+            .checked_add(source.per_slot)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        self.shared = self
+            .shared
+            .checked_add(source.shared)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        Ok(self)
+    }
+
+    /// Fixed bank backing for the actual number of original inventory slots,
+    /// including only the independent sources explicitly added by their author.
+    /// Unquoted pointees and variable payload still require original funding.
     pub fn bytes(self, slots: usize) -> Result<usize, WorkError> {
         self.per_slot
             .checked_mul(slots)
@@ -345,10 +389,27 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F, C> RolePollBank<I, F, M, C> {
         role: usize,
         make: M,
     ) -> Result<Self, WorkError> {
+        Self::install_with_context_and_source_backing(
+            control,
+            role,
+            make,
+            PollRoleSourceBacking::default(),
+        )
+    }
+
+    /// Install the actual factory and the same original source backing fact
+    /// used by fixed storage. Any mismatch refuses before allocation/mutation.
+    pub fn install_with_context_and_source_backing(
+        control: &mut WorkloadControl,
+        role: usize,
+        make: M,
+        source: PollRoleSourceBacking,
+    ) -> Result<Self, WorkError> {
         // Only the original unique startup owner can install. No shared Inner
         // entry point can allocate competing banks against the same paid base.
         let inner = &control.inner;
-        let geometry = PollRoleGeometry::for_factory_with_context::<I, F, M, C>(&make)?;
+        let geometry = PollRoleGeometry::for_factory_with_context::<I, F, M, C>(&make)?
+            .with_source_backing(source)?;
         let validate = |state: &mut crate::scope::State| -> Result<(usize, u64), WorkError> {
             if state.ready || state.closed || !state.cancellations.fixed || !state.nodes.is_empty()
             {
@@ -800,3 +861,50 @@ impl RoleBackingRetirementObserver {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod source_backing_tests {
+    use super::*;
+    #[test]
+    fn same_source_fact_is_required_at_original_bank_install() {
+        let make = |_: WorkOwner, (): ()| async {};
+        let raw = PollRoleGeometry::for_factory(&make).unwrap();
+        let backing =
+            PollRoleSourceBacking::from_layouts(&[Layout::new::<[u64; 4]>()], &[]).unwrap();
+        let actual = raw.with_source_backing(backing).unwrap();
+        assert_eq!(
+            actual.bytes(4).unwrap() - raw.bytes(4).unwrap(),
+            4 * Layout::new::<[u64; 4]>().size()
+        );
+        let (mut control, _handle, mut driver) =
+            crate::scope::fixed_control_storage_tests::prototype_profile_with_roles(
+                4,
+                1,
+                1,
+                1,
+                &[actual],
+            );
+        assert!(matches!(
+            RolePollBank::install(&mut control, 0, make),
+            Err(WorkError::Conflict)
+        ));
+        let bank = RolePollBank::<_, _, _, ()>::install_with_context_and_source_backing(
+            &mut control,
+            0,
+            make,
+            backing,
+        )
+        .unwrap();
+        drop(bank);
+        control.close_admission();
+        for _ in 0..1000 {
+            if matches!(
+                driver.step(),
+                crate::joint_admission::JointProgress::Idle(_)
+            ) {
+                break;
+            }
+        }
+        assert!(control.shutdown().is_ok());
+    }
+}

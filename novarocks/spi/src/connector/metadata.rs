@@ -1741,6 +1741,26 @@ pub trait ConnectorMetadata: Send + Sync {
         ))
     }
 
+    /// Capture the same physical object after real asynchronous observation.
+    /// An implementation must not call its synchronous joining capture here.
+    fn capture_table_object_binding_async(
+        &self,
+        _request: ConnectorTableObjectCaptureRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorTableObjectBinding, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata does not support asynchronous physical table object binding",
+            ))
+        })
+    }
+
     /// Rebind a logical table to its current metadata only when it still denotes
     /// the expected physical object. A replacement or missing target must use
     /// `ConnectorTableObjectBindingFailure`, never an untyped message match.

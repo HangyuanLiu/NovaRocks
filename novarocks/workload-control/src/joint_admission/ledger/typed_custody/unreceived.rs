@@ -80,6 +80,41 @@ pub struct UnreceivedProductionAdmission {
     quote: UnreceivedProductionQuote,
 }
 impl WorkScope {
+    /// Pure configured support fact. It neither binds D nor grants a record.
+    /// The same original configuration protects a complete indivisible cohort
+    /// under its cumulative per-dependency responsibility limit.
+    pub fn unreceived_production_occurrence_limit(&self) -> Result<u64, WorkError> {
+        let state = self.inner.state.lock().unwrap();
+        control_facts(&state, self)?;
+        let config = &state
+            .joint
+            .as_ref()
+            .ok_or(WorkError::NotReady)?
+            .config
+            .config;
+        let k = u64::try_from(config.max_dependencies_per_claim)
+            .map_err(|_| WorkError::ArithmeticOverflow)?;
+        let class = crate::joint_admission::class_index(state.nodes[&self.id].class);
+        let custody = JointLane::Custody as usize;
+        [
+            config.global,
+            config.classes[class],
+            config.lanes[custody],
+            config.class_lanes[class][custody],
+        ]
+        .into_iter()
+        .map(|limits| {
+            limits
+                .per_dependency
+                .get(JointResource::UnreceivedProductions)
+        })
+        .min()
+        .ok_or(WorkError::Conflict)?
+        .checked_div(k)
+        .filter(|n| *n != 0)
+        .ok_or(WorkError::Capacity("protected writer cohort support"))
+    }
+
     /// A closed delegated constructor: only these responsibility coordinates,
     /// the original active Node's complete class/D, and original paid Q.
     pub fn begin_unreceived_productions(

@@ -273,6 +273,12 @@ impl MvReadinessPort {
     /// consumption.  A catalog/package observation failure therefore removes
     /// exactly that target from SHOW, rewrite, scheduler and maintenance
     /// candidates instead of reviving a retained StateStore projection.
+    pub(crate) async fn list_ready_projections_async(
+        &self,
+    ) -> Result<Vec<LoadedKeyedMvProjection>, MvRepositoryError> {
+        self.service.list_ready_projections().await
+    }
+
     pub(crate) fn list_ready_projections(
         &self,
     ) -> Result<Vec<LoadedKeyedMvProjection>, MvRepositoryError> {

@@ -54,33 +54,56 @@ use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
 /// product crate owns all target-gate, cohort and terminal business decisions.
 pub(crate) struct FrontendMaintenanceEffectPort<'a> {
     engine: &'a dyn TableMaintenanceEngine,
+    state: Option<&'a crate::query_execution::maintenance::MaintenanceActionState>,
 }
 
 impl<'a> FrontendMaintenanceEffectPort<'a> {
-    pub(crate) fn new(engine: &'a dyn TableMaintenanceEngine) -> Self {
-        Self { engine }
+    pub(crate) fn new(
+        engine: &'a dyn TableMaintenanceEngine,
+        state: &'a crate::query_execution::maintenance::MaintenanceActionState,
+    ) -> Self {
+        Self {
+            engine,
+            state: Some(state),
+        }
+    }
+    // Synchronous rewrite has no metadata action row and cannot acquire one
+    // implicitly through an unrelated effect capability.
+    pub(crate) fn for_rewrite(engine: &'a dyn TableMaintenanceEngine) -> Self {
+        Self {
+            engine,
+            state: None,
+        }
     }
 }
 
+#[async_trait::async_trait]
 impl TableMaintenanceEffectPort for FrontendMaintenanceEffectPort<'_> {
-    fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
-        self.engine.reject_user_action_on_mv(target)
+    async fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
+        self.engine.reject_user_action_on_mv(target).await
     }
 
-    fn execute_metadata(
+    async fn execute_metadata(
         &self,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, String> {
-        self.engine.execute_action(request)
+        let state = self
+            .state
+            .ok_or("rewrite effect cannot dispatch metadata")?;
+        self.engine.execute_action(state, request).await
     }
 
-    fn execute_metadata_with_id(
+    async fn execute_metadata_with_id(
         &self,
         request: MaintenanceActionRequest,
         effect_id: MaintenanceEffectId,
     ) -> Result<AutomaticMaintenanceOutcome, OptimizeTerminalError> {
+        let state = self.state.ok_or_else(|| {
+            OptimizeTerminalError::pre_dispatch_failed("rewrite effect cannot dispatch metadata")
+        })?;
         self.engine
-            .execute_automatic_metadata_action(request, effect_id)
+            .execute_automatic_metadata_action(state, request, effect_id)
+            .await
     }
 
     fn begin_rewrite<'a>(
@@ -750,7 +773,7 @@ impl OptimizeJobExecution for FrontendOptimizeJobExecution {
         self.record_test_dispatch(job, capacity)
             .map_err(OptimizeTerminalError::failed)?;
         self.product.execute_rewrite_terminal(
-            &FrontendMaintenanceEffectPort::new(engine.as_ref()),
+            &FrontendMaintenanceEffectPort::for_rewrite(engine.as_ref()),
             &job.target,
             RewriteIntent::DataFiles { rewrite_all: true },
         )
@@ -770,7 +793,7 @@ impl OptimizeJobExecution for FrontendOptimizeJobExecution {
         self.record_test_dispatch(job, capacity)
             .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
         self.product.execute_automatic_rewrite_terminal(
-            &FrontendMaintenanceEffectPort::new(engine.as_ref()),
+            &FrontendMaintenanceEffectPort::for_rewrite(engine.as_ref()),
             &job.target,
             effect_id,
         )
