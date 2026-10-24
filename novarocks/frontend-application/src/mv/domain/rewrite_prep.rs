@@ -48,13 +48,14 @@ use novarocks_types::naming::TableIdentity;
 ///
 /// MV discovery and each candidate are optional accelerators. Their failures
 /// therefore produce a missing or empty observed fact, never a query failure.
-pub(crate) fn freeze_materialized_view_fact_with_ports(
+pub(crate) async fn freeze_materialized_view_fact_with_ports_async(
     need: &MaterializedViewNeed,
     candidate_reader: &MvCandidateReader,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     _storage_observation: &dyn MvStorageObservationPort,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> MaterializedViewFact {
-    let definitions = match candidate_reader.list_candidate_definitions() {
+    let definitions = match candidate_reader.list_candidate_definitions_async().await {
         Ok(definitions) => definitions,
         Err(error) => {
             tracing::debug!(error = %error, "skip MV rewrite discovery because the inventory is unavailable");
@@ -76,19 +77,30 @@ pub(crate) fn freeze_materialized_view_fact_with_ports(
             &requested_relations,
         )
     });
-    let report = novarocks_mv_application::candidate::inspect_candidates(
-        relevant,
-        |definition| definition.mv_id.to_string(),
-        |definition| freeze_mv_rewrite_definition(candidate_reader, connector_control, definition),
-    );
-    for diagnostic in report.diagnostics() {
-        tracing::debug!(
-            candidate = diagnostic.identity(),
-            error = diagnostic.message(),
-            "skip unavailable MV rewrite candidate"
-        );
+    let mut accepted = Vec::new();
+    for definition in relevant {
+        let identity = definition.mv_id.to_string();
+        match freeze_mv_rewrite_definition_async(
+            candidate_reader,
+            connector_control,
+            definition,
+            context,
+        )
+        .await
+        {
+            Ok(facts) => accepted.push(facts),
+            Err(error) => {
+                let diagnostic =
+                    novarocks_mv_application::candidate::CandidateDiagnostic::new(identity, error);
+                tracing::debug!(
+                    candidate = diagnostic.identity(),
+                    error = diagnostic.message(),
+                    "skip unavailable MV rewrite candidate"
+                );
+            }
+        }
     }
-    MaterializedViewFact::observed(need, report.into_accepted())
+    MaterializedViewFact::observed(need, accepted)
 }
 
 fn candidate_base_tables_are_requested(
@@ -278,6 +290,123 @@ fn freeze_mv_rewrite_definition(
     .with_selection_facts(selection)
 }
 
+async fn freeze_mv_rewrite_definition_async(
+    candidate_reader: &MvCandidateReader,
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    projection: StoredKeyedMvProjection,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<SqlMvRewriteDefinitionFacts, String> {
+    use novarocks_spi::connector::{
+        ConnectorReadSelector, ConnectorTableIdentity, ConnectorTableObjectRebindRequest,
+        ConnectorTableObjectSelector, ConnectorTableResolution,
+    };
+    let target = projection.facts.target();
+    let target_catalog = target.catalog().ok_or("MV rewrite target has no catalog")?;
+    let planning =
+        crate::connector::acquire_metadata_planning_lease(connector_control, target_catalog)?;
+    let context = crate::connector::context_for_planning_lease(&planning, context.clone())?;
+    let documents = planning
+        .derive_document_storage_lease()
+        .map_err(|error| error.to_string())?;
+    let request = crate::mv::domain::staged_create::keyed_request(
+        &documents,
+        ConnectorTableIdentity {
+            instance_id: documents.owner().instance_id.clone(),
+            namespace: Arc::from(target.namespace()),
+            table: Arc::from(target.name()),
+        },
+        projection.facts.source_revision().target_object_id.clone(),
+        context.clone(),
+    );
+    let frozen = candidate_reader
+        .observe_current_async(&documents, request)
+        .await?;
+    let publication = frozen
+        .publication
+        .as_ref()
+        .ok_or("MV rewrite target has no current publication")?;
+    if frozen.versions.definition_revision()
+        != projection.facts.source_revision().definition_revision
+    {
+        return Err(
+            "MV rewrite discovery definition changed before its frozen publication read".into(),
+        );
+    }
+    let target_binding = planning
+        .binding()
+        .metadata()
+        .rebind_table_object_binding_async(ConnectorTableObjectRebindRequest {
+            table: frozen.view.table.clone(),
+            expected_object_id: frozen.view.object_id.clone(),
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            selector: ConnectorTableObjectSelector::Current,
+            context: context.clone(),
+        })
+        .await
+        .map_err(|error| format!("bind frozen MV rewrite output object: {error}"))?;
+    let snapshot = frozen
+        .publication_snapshot
+        .ok_or("MV rewrite output provider did not expose an exact snapshot selector")?;
+    // The provider interprets its own typed output selector against the retained
+    // object handle. Never decode output-version payloads or manufacture a fact.
+    let target_revision = planning
+        .binding()
+        .metadata()
+        .exact_semantic_revision(
+            &target_binding.metadata.table,
+            ConnectorReadSelector::SnapshotId(snapshot),
+        )
+        .map_err(|error| format!("resolve exact MV rewrite output revision: {error}"))?;
+    let definition = &frozen.definition;
+    let mut sources = Vec::with_capacity(definition.relation_occurrences.len());
+    for (occurrence, input) in definition
+        .relation_occurrences
+        .iter()
+        .zip(&publication.inputs)
+    {
+        if occurrence.occurrence_id != input.relation_occurrence_id {
+            return Err("MV rewrite D/P occurrence order differs".into());
+        }
+        let table = occurrence_table(occurrence);
+        let state = freeze_base_table_state_async(connector_control, &table, &context)
+            .await
+            .unwrap_or_else(SqlMvRewriteBaseTableFacts::unavailable);
+        sources.push(SqlMvRewriteSourceOccurrenceFacts::try_new(
+            SqlMvRelationOccurrenceId::new(occurrence.occurrence_id),
+            table,
+            occurrence.qualifier_at_binding.clone(),
+            Some(
+                restore_exact_query_revision(&input.object_id, &input.native_data_version)
+                    .map_err(|error| format!("restore MV rewrite publication input: {error}"))?,
+            ),
+            state,
+        )?);
+    }
+    let selection = freeze_mv_rewrite_selection(&frozen, target_revision)?;
+    SqlMvRewriteDefinitionFacts::try_new(
+        projection.mv_id,
+        *frozen.versions.definition_revision().as_bytes(),
+        parse_mv_select_query(&definition.query.effective_sql)?,
+        SqlMvDefinitionResolutionContext::try_new(
+            definition.query.resolution.default_catalog.clone(),
+            definition.query.resolution.default_namespace.clone(),
+        )?,
+        planning
+            .binding()
+            .descriptor()
+            .provider_id
+            .as_str()
+            .to_string(),
+        Some(TableIdentity {
+            catalog: target_catalog.to_string(),
+            namespace: target.namespace().to_string(),
+            table: target.name().to_string(),
+        }),
+        sources,
+    )?
+    .with_selection_facts(selection)
+}
+
 fn freeze_mv_rewrite_selection(
     frozen: &MvKeyedObservedCurrentDocuments,
     target_revision: novarocks_spi::connector::ConnectorExactSemanticRevision,
@@ -357,6 +486,39 @@ fn freeze_base_table_state(
         &table.table,
         novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
     )?;
+    lease
+        .binding()
+        .metadata()
+        .exact_semantic_revision(
+            &metadata.table,
+            novarocks_spi::connector::ConnectorReadSelector::Current,
+        )
+        .map(SqlMvRewriteBaseTableFacts::resolved)
+        .map_err(|error| format!("observe MV rewrite exact source {}: {error}", table.fqn()))
+}
+
+async fn freeze_base_table_state_async(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    table: &TableIdentity,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<SqlMvRewriteBaseTableFacts, String> {
+    let lease =
+        crate::connector::acquire_metadata_planning_lease(connector_control, &table.catalog)?;
+    let context = crate::connector::context_for_planning_lease(&lease, context.clone())?;
+    let metadata = crate::connector::schema_creation::load_frontend_table_async(
+        lease.binding().metadata().as_ref(),
+        novarocks_spi::connector::ConnectorTableRequest {
+            table: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: lease.binding().descriptor().instance_id.clone(),
+                namespace: Arc::from(table.namespace.as_str()),
+                table: Arc::from(table.table.as_str()),
+            },
+            resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+            context,
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     lease
         .binding()
         .metadata()

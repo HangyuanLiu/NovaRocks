@@ -392,6 +392,30 @@ pub fn metadata_namespace_exists(
         .map_err(|error| error.to_string())
 }
 
+/// Await namespace existence using the same exact planning generation.
+pub(crate) async fn metadata_namespace_exists_async(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    context: ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+) -> Result<bool, String> {
+    validate_request_context(&context)?;
+    let binding = metadata_binding(controls, catalog)?;
+    let instance_id = binding.binding().descriptor().instance_id.clone();
+    binding
+        .binding()
+        .metadata()
+        .namespace_exists_async(novarocks_spi::connector::ConnectorNamespaceRequest {
+            namespace: novarocks_spi::connector::ConnectorNamespaceIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+            },
+            context,
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Attach a query-attempt vended-credential collector to one exact catalog
 /// generation. Every provider metadata entry point that can transitively load
 /// a table must use this adapter; callers may not recreate an unbound context

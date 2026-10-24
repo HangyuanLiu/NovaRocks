@@ -392,6 +392,12 @@ impl MvCandidateReader {
     ) -> Result<Vec<StoredKeyedMvProjection>, MvRepositoryError> {
         self.block_on(self.reader.list_candidate_definitions())
     }
+
+    pub(crate) async fn list_candidate_definitions_async(
+        &self,
+    ) -> Result<Vec<StoredKeyedMvProjection>, MvRepositoryError> {
+        self.reader.list_candidate_definitions().await
+    }
     pub(crate) fn observe_current(
         &self,
         lease: &novarocks_spi::connector::document_storage::ConnectorDocumentStorageLease,
@@ -473,6 +479,97 @@ impl MvCandidateReader {
                 },
             ))
             .map_err(|e| e.to_string())?;
+        }
+        Ok(observed)
+    }
+
+    pub(crate) async fn observe_current_async(
+        &self,
+        lease: &novarocks_spi::connector::document_storage::ConnectorDocumentStorageLease,
+        request: novarocks_spi::connector::document_storage::KeyedDocumentObservationRequest,
+    ) -> Result<
+        novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+        String,
+    > {
+        let Self {
+            service,
+            management,
+            ..
+        } = self;
+        let (mut observed,convergence)=novarocks_mv_application::persistence::keyed_documents::observe_current_keyed_documents_with_management_async(lease,request.clone(),Default::default(),management).await.map_err(|e|e.to_string())?;
+        if observed.deployment_owner != *management.owner()
+            || observed.process_incarnation != *management.incarnation()
+        {
+            management
+                .close_on_keyed_current_management_mismatch_async(lease, request.clone())
+                .await
+                .map_err(|e| e.to_string())?;
+            struct ReadOnly(novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments);
+            #[async_trait::async_trait]
+            impl MvKeyedReadOnlyCurrentProjectionSource for ReadOnly {
+                async fn observe_current_keyed_read_only(&self,_:MvCurrentProjectionRequest)->Result<novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,MvProjectionError>{
+                    Ok(self.0.clone())
+                }
+            }
+            let target = CanonicalMvTarget::from_parts(
+                Some(request.target.instance_id.as_str()),
+                &request.target.namespace,
+                &request.target.table,
+            );
+            let projection_request = MvCurrentProjectionRequest::try_new(
+                request.catalog_handle,
+                target,
+                request.context,
+                Default::default(),
+            )
+            .map_err(|e| e.to_string())?;
+            service
+                .observe_current_read_only_and_install(
+                    Uuid::now_v7(),
+                    projection_request,
+                    &ReadOnly(observed.clone()),
+                    "fresh MV management slot names another writer".into(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(observed);
+        }
+        if convergence.reinstall_current_projection {
+            let (fresh, admission, _) = management
+                .observe_keyed_admission_async(lease, request.clone(), Default::default())
+                .await
+                .map_err(|e| e.to_string())?;
+            observed = fresh;
+            struct Source{observed:novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,admission:std::sync::Mutex<Option<novarocks_mv_application::management::MvCurrentManagementAdmission>>}
+            #[async_trait::async_trait]
+            impl MvKeyedCurrentProjectionSource for Source {
+                async fn observe_current_keyed(&self,_:MvCurrentProjectionRequest)->Result<(novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,novarocks_mv_application::management::MvCurrentManagementAdmission),MvProjectionError>{
+                    Ok((self.observed.clone(), self.admission.lock().map_err(|_|MvProjectionError::new(novarocks_mv_application::readiness::MvProjectionErrorKind::SourceConflict,"slot projection admission lock poisoned"))?.take().ok_or_else(||MvProjectionError::new(novarocks_mv_application::readiness::MvProjectionErrorKind::SourceConflict,"slot projection admission already consumed"))?))
+                }
+            }
+            let target = CanonicalMvTarget::from_parts(
+                Some(request.target.instance_id.as_str()),
+                &request.target.namespace,
+                &request.target.table,
+            );
+            let projection_request = MvCurrentProjectionRequest::try_new(
+                request.catalog_handle,
+                target,
+                request.context,
+                Default::default(),
+            )
+            .map_err(|e| e.to_string())?;
+            service
+                .observe_and_install(
+                    Uuid::now_v7(),
+                    projection_request,
+                    &Source {
+                        observed: observed.clone(),
+                        admission: std::sync::Mutex::new(Some(admission)),
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
         }
         Ok(observed)
     }

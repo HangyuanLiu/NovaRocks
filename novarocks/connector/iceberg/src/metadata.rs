@@ -221,6 +221,13 @@ impl IcebergMetadata {
                 &mut creation,
             )
             .map_err(metadata_creation_error)?;
+        self.table_object_binding_from_metadata(metadata)
+    }
+
+    fn table_object_binding_from_metadata(
+        &self,
+        metadata: ConnectorTableMetadata,
+    ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
         // Design: ADR-0085 (docs/adr/ADR-0085-connector-physical-table-object-bindings.md)
         // Reuse the UUID frozen into this exact metadata observation instead of
         // issuing a second catalog lookup or deriving identity from a name.
@@ -236,6 +243,32 @@ impl IcebergMetadata {
             metadata,
             object_id,
         })
+    }
+
+    async fn current_table_object_binding_async(
+        &self,
+        table: ConnectorTableIdentity,
+        resolution: ConnectorTableResolution,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
+        let preparation = self
+            .prepare_table(ConnectorTableRequest {
+                table,
+                resolution,
+                context: context.clone(),
+            })
+            .await?;
+        let mut request_observer = |_: std::alloc::Layout| pure_catalog_control(&context);
+        let mut work_observer = |_: usize| pure_catalog_control(&context);
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request_observer,
+            &mut work_observer,
+        );
+        let metadata = self
+            .create_prepared_table(preparation, &mut creation)
+            .map_err(metadata_creation_error)?;
+        self.table_object_binding_from_metadata(metadata)
     }
 
     pub(crate) fn table_payload(
@@ -504,6 +537,24 @@ impl ConnectorMetadata for IcebergMetadata {
         result.map_err(unavailable)
     }
 
+    fn namespace_exists_async(
+        &self,
+        request: ConnectorNamespaceRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<bool, ConnectorError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            self.validate_context(&request.context)?;
+            self.ensure_owner(&request.namespace.instance_id)?;
+            let result = self
+                .runtime
+                .namespace_exists_for_request_async(&request.namespace.namespace, &request.context)
+                .await;
+            self.validate_context(&request.context)?;
+            result.map_err(unavailable)
+        })
+    }
+
     fn table_exists(&self, request: ConnectorTableRequest) -> Result<bool, ConnectorError> {
         self.validate_context(&request.context)?;
         self.ensure_owner(&request.table.instance_id)?;
@@ -671,6 +722,46 @@ impl ConnectorMetadata for IcebergMetadata {
             ));
         }
         Ok(binding)
+    }
+
+    fn rebind_table_object_binding_async(
+        &self,
+        request: ConnectorTableObjectRebindRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorTableObjectBinding, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            self.require_current_table_object_selector(request.selector)?;
+            let expected_object_id = request.expected_object_id;
+            let binding = self
+                .current_table_object_binding_async(
+                    request.table,
+                    request.resolution,
+                    request.context,
+                )
+                .await
+                .map_err(|error| {
+                    if error.kind() == ConnectorErrorKind::NotFound {
+                        ConnectorError::table_object_binding(
+                            ConnectorTableObjectBindingFailure::Missing,
+                            "Iceberg table no longer resolves for its durable object binding",
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+            if binding.object_id != expected_object_id {
+                return Err(ConnectorError::table_object_binding(
+                    ConnectorTableObjectBindingFailure::Replaced,
+                    "Iceberg table no longer matches its durable object binding",
+                ));
+            }
+            Ok(binding)
+        })
     }
 
     fn prepare_table(
@@ -2502,6 +2593,153 @@ mod plan_splits_pruning_tests {
             runtime,
         );
         (executor, warehouse, provider)
+    }
+
+    #[test]
+    fn async_namespace_exists_preserves_real_catalog_observation_and_owner_fence() {
+        use crate::catalog::{
+            CatalogNamespaceName, catalog_request::CatalogPublicationRequest, error::CatalogOutcome,
+        };
+        let (executor, _warehouse, metadata) = provider();
+        executor.block_on(async {
+            let request = ConnectorNamespaceRequest {
+                namespace: ConnectorNamespaceIdentity {
+                    instance_id: metadata.descriptor.instance_id.clone(),
+                    namespace: Arc::from("prepared_test"),
+                },
+                context: context(),
+            };
+            assert!(
+                !metadata
+                    .namespace_exists_async(request.clone())
+                    .await
+                    .unwrap()
+            );
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                &metadata.runtime,
+                metadata.incarnation,
+                CatalogPublicationRequest::CreateNamespace {
+                    namespace: CatalogNamespaceName::new("prepared_test"),
+                    properties: HashMap::new(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
+            assert!(
+                metadata
+                    .namespace_exists_async(request.clone())
+                    .await
+                    .unwrap()
+            );
+            let mut foreign = request;
+            foreign.namespace.instance_id = ConnectorInstanceId::parse("foreign").unwrap();
+            let error = metadata.namespace_exists_async(foreign).await.unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        });
+    }
+
+    #[test]
+    fn async_object_rebind_keeps_the_real_frozen_uuid_and_typed_replacement() {
+        use crate::catalog::CatalogNamespaceName;
+        use crate::catalog::catalog_request::CatalogPublicationRequest;
+        use crate::catalog::error::CatalogOutcome;
+        use crate::iceberg::TableCreation;
+        let (executor, _warehouse, metadata) = provider();
+        executor.block_on(async {
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                &metadata.runtime,
+                metadata.incarnation,
+                CatalogPublicationRequest::CreateNamespace {
+                    namespace: CatalogNamespaceName::new("prepared_test"),
+                    properties: HashMap::new(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
+            let schema = Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .unwrap();
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                &metadata.runtime,
+                metadata.incarnation,
+                CatalogPublicationRequest::CreateTable {
+                    namespace: CatalogNamespaceName::new("prepared_test"),
+                    creation: TableCreation::builder()
+                        .name("t".into())
+                        .schema(schema)
+                        .format_version(FormatVersion::V2)
+                        .build(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
+            let request = ConnectorTableRequest {
+                table: ConnectorTableIdentity {
+                    instance_id: metadata.descriptor.instance_id.clone(),
+                    namespace: "prepared_test".into(),
+                    table: "t".into(),
+                },
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context: context(),
+            };
+            let first = metadata
+                .current_table_object_binding_async(
+                    request.table.clone(),
+                    request.resolution,
+                    request.context.clone(),
+                )
+                .await
+                .unwrap();
+            let retained = first.object_id.clone();
+            let rebound = metadata
+                .rebind_table_object_binding_async(ConnectorTableObjectRebindRequest {
+                    table: request.table.clone(),
+                    expected_object_id: retained.clone(),
+                    resolution: request.resolution,
+                    selector: ConnectorTableObjectSelector::Current,
+                    context: request.context.clone(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(rebound.object_id, retained);
+            assert_eq!(rebound.metadata.identity, first.metadata.identity);
+            let refused = metadata
+                .rebind_table_object_binding_async(ConnectorTableObjectRebindRequest {
+                    table: request.table,
+                    expected_object_id: ConnectorTableObjectId::try_new(Bytes::from_static(
+                        b"replaced",
+                    ))
+                    .unwrap(),
+                    resolution: request.resolution,
+                    selector: ConnectorTableObjectSelector::Current,
+                    context: request.context,
+                })
+                .await;
+            let Err(error) = refused else {
+                panic!("foreign physical UUID must be rejected");
+            };
+            assert_eq!(
+                error.table_object_binding_failure(),
+                Some(novarocks_spi::connector::ConnectorTableObjectBindingFailure::Replaced)
+            );
+        });
     }
 
     #[test]

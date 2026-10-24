@@ -855,6 +855,23 @@ impl ConnectorMetadata for PaimonGenericControl {
         })?
     }
 
+    fn namespace_exists_async(
+        &self,
+        request: ConnectorNamespaceRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<bool, ConnectorError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            self.ensure_instance(&request.namespace.instance_id)?;
+            let resources = PaimonRequestControl::from_request(&request.context);
+            let catalog = self.catalog(&request.context)?;
+            let namespace = request.namespace.namespace;
+            resources
+                .until(async move { catalog.namespace_exists(&namespace).await })
+                .await?
+        })
+    }
+
     fn table_exists(&self, request: ConnectorTableRequest) -> Result<bool, ConnectorError> {
         self.ensure_instance(&request.table.instance_id)?;
         let resources = PaimonRequestControl::from_request(&request.context);

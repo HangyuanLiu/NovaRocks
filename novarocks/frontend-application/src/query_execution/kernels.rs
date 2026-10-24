@@ -586,35 +586,18 @@ impl SessionCatalogPort for SessionCatalogResolver {
     async fn external_namespace_exists(
         &self,
         request: novarocks_spi::connector::ConnectorRequestContext,
-        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+        _capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
         catalog_name: &str,
         namespace_name: &str,
     ) -> Result<bool, QueryServiceError> {
-        let connector_control = Arc::clone(&self.connector_control);
-        let catalog_name = catalog_name.to_owned();
-        let namespace_name = namespace_name.to_owned();
-        self.connector_blocking_io
-            .spawn_admitted(capacity.scope(), &capacity.window_alias(), move || {
-                crate::connector::validate_request_context(&request)?;
-                crate::connector::metadata_namespace_exists(
-                    connector_control.as_ref(),
-                    request,
-                    &catalog_name,
-                    &namespace_name,
-                )
-            })
-            .map_err(|error| {
-                QueryServiceError::new(QueryServiceErrorKind::Unavailable, error.to_string())
-            })?
-            .finish()
-            .await
-            .map_err(|error| {
-                QueryServiceError::new(
-                    QueryServiceErrorKind::Internal,
-                    self.connector_blocking_io.present_and_retire_failure(error),
-                )
-            })?
-            .map_err(|error| QueryServiceError::new(QueryServiceErrorKind::Internal, error))
+        crate::connector::metadata_namespace_exists_async(
+            self.connector_control.as_ref(),
+            request,
+            catalog_name,
+            namespace_name,
+        )
+        .await
+        .map_err(|error| QueryServiceError::new(QueryServiceErrorKind::Internal, error))
     }
 }
 

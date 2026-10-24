@@ -1675,6 +1675,25 @@ impl IcebergMetadataContext {
             .map_err(|error| format!("check Iceberg namespace {namespace_label}: {error}"))
     }
 
+    pub(crate) async fn namespace_exists_for_request_async(
+        &self,
+        namespace: &str,
+        request: &ConnectorRequestContext,
+    ) -> Result<bool, String> {
+        let namespace = NamespaceIdent::new(normalize_identifier(namespace)?);
+        let namespace_label = namespace.to_string();
+        let owner = Arc::clone(self.novarocks_catalog());
+        let target = crate::catalog::CatalogNamespaceName::new(namespace.to_url_string());
+        let binding = self
+            .resources
+            .planning_binding()
+            .for_request(request.clone());
+        owner
+            .namespace_exists_for_read(target, binding)
+            .await
+            .map_err(|error| format!("check Iceberg namespace {namespace_label}: {error}"))
+    }
+
     /// Enumerate one namespace's tables for one request, refused as a whole
     /// when the listing would exceed `bound`. The catalog's classification
     /// survives, so a bound refusal stays `ResourceExhausted`.

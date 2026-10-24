@@ -24,11 +24,9 @@
 //! how the compiler stays pure while its answers come from a catalog, a
 //! statistics resolver and a materialized-view inventory that are anything but.
 //!
-//! All three owners answer synchronously and may reach a remote catalog to do
-//! it. They therefore run on the frontend's bounded connector lane rather than
-//! on the async runtime: a slow REST catalog must not be able to stall the
-//! scheduler, and an unbounded number of statements must not be able to queue
-//! against it.
+//! Physical observations await their original async owners directly. Schema,
+//! revision and selection interpretation then consume those completed facts;
+//! the shared connector worker remains only for explicitly authored leaf work.
 
 use std::sync::Arc;
 
@@ -56,7 +54,7 @@ use crate::catalog_application::query_materializer::{
 };
 use crate::connector::UnifiedStatisticsResolver;
 use crate::mv::domain::readiness::MvCandidateReader;
-use crate::mv::domain::rewrite_prep::freeze_materialized_view_fact_with_ports;
+use crate::mv::domain::rewrite_prep::freeze_materialized_view_fact_with_ports_async;
 use crate::query_execution::planning::statistics::resolve_statistics_need_async;
 use crate::query_execution::provider_read_facts::{FrontendProviderReadFacts, FrozenProviderRead};
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
@@ -298,50 +296,21 @@ impl MaterializedViewFactPort for FrontendMaterializedViewFacts {
         &self,
         needs: &[MaterializedViewNeed],
     ) -> Result<Vec<MaterializedViewFact>, String> {
-        let needs = needs.to_vec();
-        let owners = self.owners.clone();
-        admitted(&self.owners, &self.scope.capacity, move || {
-            Ok(needs
-                .iter()
-                .map(|need| {
-                    freeze_materialized_view_fact_with_ports(
-                        need,
-                        &owners.materialized_views,
-                        owners.connector_control.as_ref(),
-                        owners.mv_storage_observation.as_ref(),
-                    )
-                })
-                .collect())
-        })
-        .await
+        let mut facts = Vec::with_capacity(needs.len());
+        for need in needs {
+            facts.push(
+                freeze_materialized_view_fact_with_ports_async(
+                    need,
+                    &self.owners.materialized_views,
+                    self.owners.connector_control.as_ref(),
+                    self.owners.mv_storage_observation.as_ref(),
+                    &self.scope.connector_context,
+                )
+                .await,
+            );
+        }
+        Ok(facts)
     }
-}
-
-/// Run one owner's synchronous answer on the bounded connector lane.
-///
-/// Losing the lane is not the owner's answer and must not be reported as one:
-/// a query that was refused admission never asked its question.
-async fn admitted<T, F>(
-    owners: &CompletionFactOwners,
-    capacity: &QueryResultCapacityBinding,
-    call: F,
-) -> Result<T, String>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T, String> + Send + 'static,
-{
-    owners
-        .blocking
-        .spawn_admitted(capacity.scope(), &capacity.window_alias(), call)
-        .map_err(|error| format!("frontend completion fact admission: {error}"))?
-        .finish()
-        .await
-        .map_err(|error| {
-            format!(
-                "frontend completion fact lane: {}",
-                owners.blocking.present_and_retire_failure(error)
-            )
-        })?
 }
 
 /// The fact source one statement's completion is driven with, with all four

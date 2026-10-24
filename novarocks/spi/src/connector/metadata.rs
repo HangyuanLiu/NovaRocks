@@ -1659,6 +1659,21 @@ pub trait ConnectorMetadata: Send + Sync {
 
     fn namespace_exists(&self, request: ConnectorNamespaceRequest) -> Result<bool, ConnectorError>;
 
+    /// Probe the provider's original namespace observation without joining it.
+    fn namespace_exists_async(
+        &self,
+        _request: ConnectorNamespaceRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<bool, ConnectorError>> + Send + '_>,
+    > {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata does not support asynchronous namespace existence",
+            ))
+        })
+    }
+
     fn table_exists(&self, request: ConnectorTableRequest) -> Result<bool, ConnectorError>;
 
     /// Await the provider's original existence probe without a joining bridge.
@@ -1737,6 +1752,26 @@ pub trait ConnectorMetadata: Send + Sync {
             super::ConnectorErrorKind::Unsupported,
             "connector metadata does not support physical table object rebinding",
         ))
+    }
+
+    /// Rebind the same physical object after real asynchronous observation.
+    /// An implementation must not call its synchronous joining rebind here.
+    fn rebind_table_object_binding_async(
+        &self,
+        _request: ConnectorTableObjectRebindRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ConnectorTableObjectBinding, ConnectorError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                super::ConnectorErrorKind::Unsupported,
+                "connector metadata does not support asynchronous physical table object rebinding",
+            ))
+        })
     }
 
     fn load_table(
