@@ -62,6 +62,7 @@ struct AttemptMetadataTableKey {
 struct AttemptMetadataTableEntry {
     result: Mutex<Option<Result<IcebergAttemptTableAccess, (ConnectorErrorKind, String)>>>,
     ready: Condvar,
+    async_ready: tokio::sync::Notify,
 }
 
 impl AttemptMetadataTableEntry {
@@ -69,6 +70,7 @@ impl AttemptMetadataTableEntry {
         Self {
             result: Mutex::new(None),
             ready: Condvar::new(),
+            async_ready: tokio::sync::Notify::new(),
         }
     }
 }
@@ -108,7 +110,9 @@ impl AttemptMetadataTableCache {
             let mut stored = entry.result.lock().expect("attempt metadata entry lock");
             debug_assert!(stored.is_none(), "attempt metadata entry completes once");
             *stored = Some(result.clone());
+            drop(stored);
             entry.ready.notify_all();
+            entry.async_ready.notify_waiters();
             return result;
         }
 
@@ -123,6 +127,107 @@ impl AttemptMetadataTableCache {
             .as_ref()
             .expect("attempt metadata entry completed")
             .clone()
+    }
+    async fn get_or_load_async<F>(
+        &self,
+        key: AttemptMetadataTableKey,
+        load: F,
+    ) -> Result<IcebergAttemptTableAccess, (ConnectorErrorKind, String)>
+    where
+        F: std::future::Future<
+                Output = Result<IcebergAttemptTableAccess, (ConnectorErrorKind, String)>,
+            >,
+    {
+        let (entry, loader) = {
+            let mut entries = self.entries.lock().expect("attempt metadata cache lock");
+            match entries.get(&key) {
+                Some(entry) => (Arc::clone(entry), false),
+                None => {
+                    let entry = Arc::new(AttemptMetadataTableEntry::loading());
+                    entries.insert(key.clone(), Arc::clone(&entry));
+                    (entry, true)
+                }
+            }
+        };
+        if !loader {
+            loop {
+                let ready = entry.async_ready.notified();
+                tokio::pin!(ready);
+                ready.as_mut().enable();
+                let observed = {
+                    entry
+                        .result
+                        .lock()
+                        .expect("attempt metadata entry lock")
+                        .clone()
+                };
+                if let Some(result) = observed {
+                    return result;
+                }
+                ready.await;
+            }
+        }
+        let mut publication = AttemptMetadataLoad {
+            cache: self,
+            key,
+            entry,
+            complete: false,
+        };
+        let result = load.await;
+        if result.is_err() {
+            publication.remove_failed_entry();
+        }
+        *publication
+            .entry
+            .result
+            .lock()
+            .expect("attempt metadata entry lock") = Some(result.clone());
+        publication.complete = true;
+        publication.entry.ready.notify_all();
+        publication.entry.async_ready.notify_waiters();
+        result
+    }
+}
+
+// An async loader can be cancelled before publishing. Existing sync and async
+// waiters receive its real cancellation; a later attempt may load a new entry.
+struct AttemptMetadataLoad<'a> {
+    cache: &'a AttemptMetadataTableCache,
+    key: AttemptMetadataTableKey,
+    entry: Arc<AttemptMetadataTableEntry>,
+    complete: bool,
+}
+impl AttemptMetadataLoad<'_> {
+    fn remove_failed_entry(&self) {
+        let mut entries = self
+            .cache
+            .entries
+            .lock()
+            .expect("attempt metadata cache lock");
+        if entries
+            .get(&self.key)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.entry))
+        {
+            entries.remove(&self.key);
+        }
+    }
+}
+impl Drop for AttemptMetadataLoad<'_> {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        self.remove_failed_entry();
+        *self
+            .entry
+            .result
+            .lock()
+            .expect("attempt metadata entry lock") = Some(Err((
+            ConnectorErrorKind::Cancelled,
+            "Iceberg metadata loader exited before publishing its observation".into(),
+        )));
+        self.entry.ready.notify_all();
+        self.entry.async_ready.notify_waiters();
     }
 }
 
@@ -339,6 +444,82 @@ impl IcebergMetadataContext {
         .map_err(|(_, message)| message)
     }
 
+    /// Async counterpart of the same request-local cache author. It shares the
+    /// exact entry with synchronous consumers and preserves failed-load eviction.
+    pub(crate) async fn load_table_for_request_async(
+        &self,
+        namespace: &str,
+        table: &str,
+        request: &ConnectorRequestContext,
+    ) -> Result<IcebergPhysicalTable, String> {
+        let load = async {
+            ConnectorOperationControl::check_active(request)
+                .map_err(|e| (e.kind(), e.to_string()))?;
+            let namespace = normalize_identifier(namespace).map_err(invalid_request)?;
+            let table = normalize_identifier(table).map_err(invalid_request)?;
+            let collection = request.vended_credential_lease_collection();
+            if request.fresh_catalog_observation_required()
+                || (request.vended_credential_lease_sink().is_none()
+                    && request.storage_resolver().is_some())
+            {
+                return self
+                    .observe_table_classified_for_request_with_snapshots_async(
+                        &namespace,
+                        &table,
+                        request,
+                        crate::catalog::SnapshotLoading::All,
+                    )
+                    .await;
+            }
+            let cache =
+                request.request_scope_extension_or_insert_with(AttemptMetadataTableCache::default);
+            let frozen = cache
+                .get_or_load_async(
+                    AttemptMetadataTableKey {
+                        owner: self.attempt_metadata_cache_owner,
+                        namespace: namespace.clone(),
+                        table: table.clone(),
+                    },
+                    async {
+                        let loaded = if collection.is_none() {
+                            self.control_state
+                                .physical_table_cache()
+                                .get(&namespace, &table)
+                                .map_err(unavailable)?
+                        } else {
+                            None
+                        };
+                        let loaded = match loaded {
+                            Some(loaded) => loaded,
+                            None => {
+                                self.observe_table_classified_with_snapshots_async(
+                                    &namespace,
+                                    &table,
+                                    collection,
+                                    Some(request),
+                                    crate::catalog::SnapshotLoading::All,
+                                )
+                                .await?
+                            }
+                        };
+                        Ok(IcebergAttemptTableAccess::freeze(loaded))
+                    },
+                )
+                .await?;
+            ConnectorOperationControl::check_active(request)
+                .map_err(|e| (e.kind(), e.to_string()))?;
+            frozen
+                .reacquired_request_scoped(
+                    self.resources
+                        .planning_binding()
+                        .for_request(request.clone()),
+                    self.resources.catalog_runtime().iceberg_runtime().clone(),
+                )
+                .map_err(|e| (e.kind(), e.to_string()))
+        };
+        load.await.map_err(|(_, message)| message)
+    }
+
     /// Load an explicit REST snapshot scope without allowing a partial
     /// observation into the complete-metadata caches.
     pub(crate) fn load_table_for_request_with_snapshots(
@@ -421,6 +602,62 @@ impl IcebergMetadataContext {
             .observe_table_classified_for_request_with_snapshots(
                 namespace, table, request, snapshots,
             )
+            .map_err(|(kind, message)| {
+                if kind == ConnectorErrorKind::NotFound {
+                    ConnectorError::table_object_binding(
+                        novarocks_spi::connector::ConnectorTableObjectBindingFailure::Missing,
+                        message,
+                    )
+                } else {
+                    ConnectorError::new(kind, message)
+                }
+            })?;
+        if fresh.table.metadata().uuid() != uuid {
+            return Err(ConnectorError::table_object_binding(
+                novarocks_spi::connector::ConnectorTableObjectBindingFailure::Replaced,
+                "Iceberg table UUID changed while waiting for catalog coordination",
+            ));
+        }
+        Ok((guard, fresh))
+    }
+
+    pub(crate) async fn coordinate_table_for_request_async(
+        &self,
+        namespace: &str,
+        table: &str,
+        request: &ConnectorRequestContext,
+    ) -> Result<
+        (
+            crate::catalog::table_coordination::IcebergTableCoordinationGuard,
+            IcebergPhysicalTable,
+        ),
+        novarocks_spi::connector::ConnectorError,
+    > {
+        use novarocks_spi::connector::ConnectorError;
+        let observed = self
+            .observe_table_classified_for_request_with_snapshots_async(
+                namespace,
+                table,
+                request,
+                crate::catalog::SnapshotLoading::All,
+            )
+            .await
+            .map_err(|(kind, message)| ConnectorError::new(kind, message))?;
+        let uuid = observed.table.metadata().uuid();
+        let guard = {
+            let _waiting = self.resources.catalog_runtime().activity().map(|owner| {
+                owner.enter(novarocks_spi::connector::CatalogActivityPhase::TableCoordination)
+            });
+            self.table_coordination.acquire(uuid, request).await?
+        };
+        let fresh = self
+            .observe_table_classified_for_request_with_snapshots_async(
+                namespace,
+                table,
+                request,
+                crate::catalog::SnapshotLoading::All,
+            )
+            .await
             .map_err(|(kind, message)| {
                 if kind == ConnectorErrorKind::NotFound {
                     ConnectorError::table_object_binding(
@@ -1711,5 +1948,39 @@ mod tests {
             drop(other);
         });
         drop(guard);
+    }
+    #[tokio::test]
+    async fn cancelled_async_cache_loader_wakes_existing_waiter_and_does_not_cache_absence() {
+        let cache = AttemptMetadataTableCache::default();
+        let key = AttemptMetadataTableKey {
+            owner: 1,
+            namespace: "analytics".into(),
+            table: "created_later".into(),
+        };
+        let mut loader = Box::pin(cache.get_or_load_async(key.clone(), std::future::pending()));
+        assert!(futures::poll!(&mut loader).is_pending());
+        let mut waiter = Box::pin(cache.get_or_load_async(key.clone(), async {
+            panic!("the original active entry already owns the physical observation")
+        }));
+        assert!(futures::poll!(&mut waiter).is_pending());
+        drop(loader);
+        assert!(matches!(
+            waiter.await,
+            Err((ConnectorErrorKind::Cancelled, _))
+        ));
+        let calls = AtomicUsize::new(0);
+        let first = cache
+            .get_or_load_async(key.clone(), async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err((ConnectorErrorKind::NotFound, "target is absent".into()))
+            })
+            .await;
+        assert!(matches!(first, Err((ConnectorErrorKind::NotFound, _))));
+        let second = cache.get_or_load(key, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err((ConnectorErrorKind::NotFound, "target is absent".into()))
+        });
+        assert!(matches!(second, Err((ConnectorErrorKind::NotFound, _))));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

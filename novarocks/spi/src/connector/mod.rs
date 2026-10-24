@@ -204,8 +204,10 @@ pub use metadata::{
 pub use metadata_maintenance::{
     CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION, ConnectorMaxCompactableDataFiles,
     ConnectorMaxCompactableDataFilesRequest, ConnectorMetadataMaintenance,
-    ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenanceLease,
-    ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenancePlan,
+    ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenanceExecution,
+    ConnectorMetadataMaintenanceExecutionSource, ConnectorMetadataMaintenanceFuture,
+    ConnectorMetadataMaintenanceLease, ConnectorMetadataMaintenanceOperation,
+    ConnectorMetadataMaintenanceOutcome, ConnectorMetadataMaintenancePlan,
     ConnectorMetadataMaintenancePlanSummary, ConnectorMetadataMaintenancePlanningRequest,
     ConnectorMetadataMaintenanceReceipt, ConnectorMetadataMaintenanceReceiptSummary,
     ConnectorMetadataMaintenanceResolver, EXPIRE_TABLE_VERSIONS_KIND,

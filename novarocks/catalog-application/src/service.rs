@@ -3074,13 +3074,16 @@ mod tests {
                     .unwrap(),
                     planning.clone(),
                 )
+                .await
                 .unwrap();
             let first_id = first.control_runtime_id();
-            let expiry = tokio::task::spawn_blocking(move || {
-                first.execute(
+            let mut execution = first
+                .begin_execute(
                     ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, planning).unwrap(),
                 )
-            });
+                .unwrap();
+            drop(first);
+            let expiry = tokio::spawn(async move { execution.wait().await });
             until(|| server.state.lock().unwrap().expiry_entered).await;
             assert_eq!(server.posts("t").len(), 1);
             port.unpublish_all();

@@ -547,17 +547,84 @@ impl ConnectorMaxCompactableDataFiles {
     }
 }
 
+pub type ConnectorMetadataMaintenanceOutcome =
+    ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>;
+pub type ConnectorMetadataMaintenanceFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, ConnectorError>> + Send + 'a>>;
+
+/// Read/poll view of the provider's ORIGINAL active execution row. Creating a
+/// view grants no admission, and dropping a waiter never destroys that row.
+pub trait ConnectorMetadataMaintenanceExecutionSource: Send + Sync {
+    fn poll_result(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>>;
+    fn retained_result(
+        &self,
+    ) -> Option<Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>>;
+}
+
+/// Move-only view installed in the original application session before wait.
+/// The source stays in the provider's active row through actual future exit.
+pub struct ConnectorMetadataMaintenanceExecution {
+    source: Arc<dyn ConnectorMetadataMaintenanceExecutionSource>,
+    validation: Option<(
+        ConnectorMetadataMaintenanceLease,
+        ConnectorMetadataMaintenancePlan,
+    )>,
+}
+impl ConnectorMetadataMaintenanceExecution {
+    pub fn from_source(source: Arc<dyn ConnectorMetadataMaintenanceExecutionSource>) -> Self {
+        Self {
+            source,
+            validation: None,
+        }
+    }
+    fn validate_result(
+        &self,
+        result: Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>,
+    ) -> Result<ConnectorMetadataMaintenanceOutcome, ConnectorError> {
+        let outcome = result?;
+        if let Some((lease, plan)) = &self.validation {
+            lease.validate_outcome(plan, &outcome)?;
+        }
+        Ok(outcome)
+    }
+    pub fn poll_result(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>> {
+        use std::task::Poll;
+        match self.source.poll_result(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => Poll::Ready(self.validate_result(result)),
+        }
+    }
+    pub async fn wait(&mut self) -> Result<ConnectorMetadataMaintenanceOutcome, ConnectorError> {
+        std::future::poll_fn(|cx| self.poll_result(cx)).await
+    }
+    /// Observed publication facts survive even an execution-frame Drop panic.
+    /// This observer does not prove actual exit or permit another dispatch.
+    pub fn retained_result(
+        &self,
+    ) -> Option<Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>> {
+        self.source
+            .retained_result()
+            .map(|result| self.validate_result(result))
+    }
+}
+
 pub trait ConnectorMetadataMaintenance: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn binding_key(&self) -> &ConnectorProviderBindingKey;
     fn plan_maintenance(
         &self,
         request: ConnectorMetadataMaintenancePlanningRequest,
-    ) -> Result<ConnectorMetadataMaintenancePlan, ConnectorError>;
-    fn execute(
+    ) -> ConnectorMetadataMaintenanceFuture<'_, ConnectorMetadataMaintenancePlan>;
+    fn begin_execute(
         &self,
         request: ConnectorMetadataMaintenanceExecuteRequest,
-    ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError>;
+    ) -> Result<ConnectorMetadataMaintenanceExecution, ConnectorError>;
     /// Reads the largest number of data files the provider would place into one
     /// of its own rewrite groups for this table. The grouping rule stays
     /// provider-private; only the resulting scalar crosses this boundary.
@@ -568,12 +635,14 @@ pub trait ConnectorMetadataMaintenance: Send + Sync {
     fn read_max_compactable_data_files(
         &self,
         request: ConnectorMaxCompactableDataFilesRequest,
-    ) -> Result<ConnectorMaxCompactableDataFiles, ConnectorError> {
-        let _ = request;
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "connector does not observe compactable data file groups",
-        ))
+    ) -> ConnectorMetadataMaintenanceFuture<'_, ConnectorMaxCompactableDataFiles> {
+        Box::pin(async move {
+            let _ = request;
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector does not observe compactable data file groups",
+            ))
+        })
     }
 }
 
@@ -645,7 +714,7 @@ impl ConnectorMetadataMaintenanceLease {
     /// Builds and validates a provider planning request behind the FE-owned
     /// runtime lease. The provider's legacy binding fence stays internal to
     /// this capability boundary.
-    pub fn plan_operation(
+    pub async fn plan_operation(
         &self,
         operation_id: ConnectorMutationOperationId,
         operation: ConnectorMetadataMaintenanceOperation,
@@ -657,9 +726,9 @@ impl ConnectorMetadataMaintenanceLease {
             operation,
             context,
         )?;
-        self.plan_maintenance(request)
+        self.plan_maintenance(request).await
     }
-    pub fn plan_maintenance(
+    pub async fn plan_maintenance(
         &self,
         request: ConnectorMetadataMaintenancePlanningRequest,
     ) -> Result<ConnectorMetadataMaintenancePlan, ConnectorError> {
@@ -670,7 +739,7 @@ impl ConnectorMetadataMaintenanceLease {
                 "metadata maintenance request does not match lease",
             ));
         }
-        let plan = self.maintenance.plan_maintenance(request.clone())?;
+        let plan = self.maintenance.plan_maintenance(request.clone()).await?;
         plan.validate()?;
         if plan.owner != self.provider_binding_key
             || plan.operation_id != request.operation_id
@@ -684,21 +753,22 @@ impl ConnectorMetadataMaintenanceLease {
         }
         Ok(plan)
     }
-    pub fn execute(
+    /// Install a provider-owned execution before any borrowed wait can poll I/O.
+    pub fn begin_execute(
         &self,
         request: ConnectorMetadataMaintenanceExecuteRequest,
-    ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError> {
+    ) -> Result<ConnectorMetadataMaintenanceExecution, ConnectorError> {
         self.validate_plan(&request.plan)?;
         let plan = request.plan.clone();
-        let outcome = self.maintenance.execute(request)?;
-        self.validate_outcome(&plan, &outcome)?;
-        Ok(outcome)
+        let mut execution = self.maintenance.begin_execute(request)?;
+        execution.validation = Some((self.clone(), plan));
+        Ok(execution)
     }
     /// Read-only passthrough. It shares the maintenance lease because the
     /// observation needs the provider's own runtime and file access, but it
     /// deliberately validates nothing beyond exact handle ownership: there is
     /// no plan, no operation id and no outcome to reconcile.
-    pub fn read_max_compactable_data_files(
+    pub async fn read_max_compactable_data_files(
         &self,
         request: ConnectorMaxCompactableDataFilesRequest,
     ) -> Result<ConnectorMaxCompactableDataFiles, ConnectorError> {
@@ -708,7 +778,9 @@ impl ConnectorMetadataMaintenanceLease {
                 "metadata maintenance observation table does not match lease",
             ));
         }
-        self.maintenance.read_max_compactable_data_files(request)
+        self.maintenance
+            .read_max_compactable_data_files(request)
+            .await
     }
     fn validate_plan(&self, plan: &ConnectorMetadataMaintenancePlan) -> Result<(), ConnectorError> {
         plan.validate()?;
@@ -866,6 +938,7 @@ mod tests {
         ExternalMutationEffect, ExternalMutationFinalization,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
 
     // Native SPI boundary coverage: provider attempt facts remain opaque, but
     // the lease must bind the fixed intent and all plan identities exactly.
@@ -912,19 +985,20 @@ mod tests {
         fn plan_maintenance(
             &self,
             request: ConnectorMetadataMaintenancePlanningRequest,
-        ) -> Result<ConnectorMetadataMaintenancePlan, ConnectorError> {
-            ConnectorMetadataMaintenancePlan::try_new(
-                &request,
-                [3; 32],
-                ConnectorMetadataMaintenancePlanSummary::default(),
-                Bytes::from_static(b"fixed intent"),
-            )
+        ) -> ConnectorMetadataMaintenanceFuture<'_, ConnectorMetadataMaintenancePlan> {
+            Box::pin(async move {
+                ConnectorMetadataMaintenancePlan::try_new(
+                    &request,
+                    [3; 32],
+                    ConnectorMetadataMaintenancePlanSummary::default(),
+                    Bytes::from_static(b"fixed intent"),
+                )
+            })
         }
-        fn execute(
+        fn begin_execute(
             &self,
             request: ConnectorMetadataMaintenanceExecuteRequest,
-        ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError>
-        {
+        ) -> Result<ConnectorMetadataMaintenanceExecution, ConnectorError> {
             let mode = self.foreign.load(Ordering::SeqCst);
             let plan = request.plan;
             let receipt = ConnectorMetadataMaintenanceReceipt::try_new(
@@ -950,11 +1024,29 @@ mod tests {
                 ConnectorMetadataMaintenanceReceiptSummary::default(),
                 Bytes::from_static(b"attempt=2;base=new;request=new"),
             )?;
-            Ok(ExternalMutationOutcome::KnownCommitted {
-                effect: ExternalMutationEffect::Applied,
-                receipt,
-                finalization: ExternalMutationFinalization::Complete,
-            })
+            Ok(ConnectorMetadataMaintenanceExecution::from_source(
+                Arc::new(ReadyExecution(Ok(
+                    ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::Applied,
+                        receipt,
+                        finalization: ExternalMutationFinalization::Complete,
+                    },
+                ))),
+            ))
+        }
+    }
+    struct ReadyExecution(Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>);
+    impl ConnectorMetadataMaintenanceExecutionSource for ReadyExecution {
+        fn poll_result(
+            &self,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>> {
+            Poll::Ready(self.0.clone())
+        }
+        fn retained_result(
+            &self,
+        ) -> Option<Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>> {
+            Some(self.0.clone())
         }
     }
     fn context() -> ConnectorRequestContext {
@@ -966,8 +1058,8 @@ mod tests {
         )
         .unwrap()
     }
-    #[test]
-    fn fixed_intent_accepts_new_attempt_receipt_and_rejects_foreign_identity() {
+    #[tokio::test]
+    async fn fixed_intent_accepts_new_attempt_receipt_and_rejects_foreign_identity() {
         let instance = ConnectorInstanceId::parse("metadata-lease-test").unwrap();
         let descriptor = ConnectorInstanceDescriptor {
             provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
@@ -1001,13 +1093,17 @@ mod tests {
                 operation,
                 context(),
             )
+            .await
             .unwrap();
         let original_digest = plan.plan_digest();
         let outcome = lease
-            .execute(
+            .begin_execute(
                 ConnectorMetadataMaintenanceExecuteRequest::try_new(plan.clone(), context())
                     .unwrap(),
             )
+            .unwrap()
+            .wait()
+            .await
             .unwrap();
         let ExternalMutationOutcome::KnownCommitted { receipt, .. } = outcome else {
             panic!("valid reprepare receipt rejected")
@@ -1023,13 +1119,16 @@ mod tests {
             provider.foreign.store(mode, Ordering::SeqCst);
             assert!(
                 lease
-                    .execute(
+                    .begin_execute(
                         ConnectorMetadataMaintenanceExecuteRequest::try_new(
                             plan.clone(),
                             context()
                         )
                         .unwrap()
                     )
+                    .unwrap()
+                    .wait()
+                    .await
                     .is_err()
             );
         }
