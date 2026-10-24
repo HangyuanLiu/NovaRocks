@@ -363,6 +363,22 @@ impl WorkloadControl {
             if state.ready || state.closed || !state.nodes.is_empty() || state.joint.is_some() {
                 return Err(WorkError::Conflict);
             }
+            if config
+                .source_authority
+                .as_ref()
+                .is_some_and(|authority| !Weak::ptr_eq(authority, &Arc::downgrade(&self.inner)))
+            {
+                return Err(WorkError::ForeignAuthority);
+            }
+            if let Some(source) = config.internal_cpu_factory.as_ref() {
+                let installed = state
+                    .internal_cpu_factory
+                    .as_ref()
+                    .ok_or(WorkError::NotReady)?;
+                if !installed.matches(source) || !source.is_live() {
+                    return Err(WorkError::ForeignAuthority);
+                }
+            }
             state.joint = Some(JointLedger {
                 config: Arc::clone(&config),
                 dependencies: None,

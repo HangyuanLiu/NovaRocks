@@ -39,7 +39,7 @@ pub use ledger::{
 pub use ledger::{JointClaimChange, JointDependency};
 
 use crate::{WorkClass, WorkError};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 
 /// Independently constrained resource coordinates. Byte values describe owned
 /// backing or an explicit reserved envelope, never allocator metadata or RSS.
@@ -201,9 +201,11 @@ pub struct JointCapacityConfig {
 
 /// Validated once at composition and passed unchanged to the original ledger
 /// and real execution owners. This is still a profile, never an admission.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ValidatedJointCapacityConfig {
     config: JointCapacityConfig,
+    internal_cpu_factory: Option<InternalResultClosedFactoryDescriptor>,
+    source_authority: Option<std::sync::Weak<crate::scope::Inner>>,
 }
 
 impl JointCapacityConfig {
@@ -211,6 +213,27 @@ impl JointCapacityConfig {
         self,
         required: &RequiredJointProgress,
     ) -> Result<ValidatedJointCapacityConfig, WorkError> {
+        self.validate_inner(required, None, None)
+    }
+
+    fn validate_registered_internal_cpu(
+        self,
+        required: &RequiredJointProgress,
+        factory: InternalResultClosedFactoryDescriptor,
+        authority: std::sync::Weak<crate::scope::Inner>,
+    ) -> Result<ValidatedJointCapacityConfig, WorkError> {
+        self.validate_inner(required, Some(factory), Some(authority))
+    }
+
+    fn validate_inner(
+        self,
+        required: &RequiredJointProgress,
+        internal_cpu_factory: Option<InternalResultClosedFactoryDescriptor>,
+        source_authority: Option<std::sync::Weak<crate::scope::Inner>>,
+    ) -> Result<ValidatedJointCapacityConfig, WorkError> {
+        let finite_queue_bytes = internal_cpu_factory
+            .as_ref()
+            .map(|source| source.queue_bytes());
         if self.max_dependencies_per_claim == 0
             || self.max_dependencies_per_claim > self.max_registered_dependencies
             || self.max_registered_dependencies > u32::MAX as usize
@@ -230,9 +253,9 @@ impl JointCapacityConfig {
         {
             return Err(WorkError::InvalidConfig("joint admission finite geometry"));
         }
-        self.validate_projection(self.global, required.global)?;
+        self.validate_projection(self.global, required.global, finite_queue_bytes)?;
         for (limits, minimum) in self.classes.iter().zip(required.classes) {
-            self.validate_projection(*limits, minimum)?;
+            self.validate_projection(*limits, minimum, finite_queue_bytes)?;
             if !self.global.global.covers(limits.global)
                 || !self
                     .global
@@ -246,7 +269,7 @@ impl JointCapacityConfig {
         let mut lane_capacities = JointResources::ZERO;
         let mut lane_dependencies = JointResources::ZERO;
         for (limits, minimum) in self.lanes.iter().zip(required.lanes) {
-            self.validate_projection(*limits, minimum)?;
+            self.validate_projection(*limits, minimum, finite_queue_bytes)?;
             if !self.global.global.covers(limits.global) {
                 return Err(WorkError::InvalidConfig("joint lane projection"));
             }
@@ -269,7 +292,11 @@ impl JointCapacityConfig {
             let mut progress = JointResources::ZERO;
             for lane in 0..LANE_COUNT {
                 let limits = self.class_lanes[class][lane];
-                self.validate_projection(limits, required.class_lanes[class][lane])?;
+                self.validate_projection(
+                    limits,
+                    required.class_lanes[class][lane],
+                    finite_queue_bytes,
+                )?;
                 global = global.checked_add(limits.global)?;
                 dependency = dependency.checked_add(limits.per_dependency)?;
                 progress = progress.checked_add(limits.protected_progress)?;
@@ -300,13 +327,18 @@ impl JointCapacityConfig {
                 return Err(WorkError::InvalidConfig("joint lane class reservation"));
             }
         }
-        Ok(ValidatedJointCapacityConfig { config: self })
+        Ok(ValidatedJointCapacityConfig {
+            config: self,
+            internal_cpu_factory,
+            source_authority,
+        })
     }
 
     fn validate_projection(
         &self,
         limits: JointResourceLimits,
         minimum: JointResources,
+        finite_queue_bytes: Option<NonZeroU64>,
     ) -> Result<(), WorkError> {
         if !limits.protected_progress.covers(minimum)
             || !limits.global.covers(limits.per_dependency)
@@ -315,24 +347,86 @@ impl JointCapacityConfig {
                 "joint protected progress geometry",
             ));
         }
-        let fanout = self.max_dependencies_per_claim as u128;
-        for index in 0..RESOURCE_COUNT {
-            let progress = u128::from(limits.protected_progress.0[index]);
-            // Admit one complete supported increment even at the maximum
-            // declared fanout, while retaining the protected intersections.
-            let global = (fanout + 1)
-                .checked_mul(progress)
-                .ok_or(WorkError::ArithmeticOverflow)?;
-            let domain = fanout
-                .checked_mul(progress)
-                .ok_or(WorkError::ArithmeticOverflow)?;
-            if global > u128::from(limits.global.0[index])
-                || domain > u128::from(limits.per_dependency.0[index])
-            {
-                return Err(WorkError::InvalidConfig("joint dependency protection"));
-            }
+        let floor = source_progress_floor(
+            self.max_dependencies_per_claim,
+            minimum,
+            limits.protected_progress,
+            finite_queue_bytes,
+        )?;
+        if !limits.global.covers(floor.global)
+            || !limits.per_dependency.covers(floor.per_dependency)
+        {
+            return Err(WorkError::InvalidConfig("joint dependency protection"));
         }
         Ok(())
+    }
+}
+
+// This is a floor fact only, never a capacity grant or a Native qualification.
+fn source_progress_floor(
+    fanout: usize,
+    minimum: JointResources,
+    protected: JointResources,
+    finite_queue_bytes: Option<NonZeroU64>,
+) -> Result<JointResourceLimits, WorkError> {
+    if fanout == 0 || !protected.covers(minimum) {
+        return Err(WorkError::InvalidConfig(
+            "joint protected progress geometry",
+        ));
+    }
+    // Only the exact registered source's complete CPU contribution is finite.
+    // Shared queue bytes belonging to other sources keep the original floor.
+    let finite = if let Some(queue_bytes) = finite_queue_bytes {
+        let jobs = minimum.get(JointResource::InternalCpuJobs);
+        JointResources::ZERO
+            .with(JointResource::InternalCpuJobs, jobs)
+            .with(JointResource::PhysicalQueueRecords, jobs)
+            .with(
+                JointResource::PhysicalQueueBytes,
+                jobs.checked_mul(queue_bytes.get())
+                    .ok_or(WorkError::ArithmeticOverflow)?,
+            )
+    } else {
+        JointResources::ZERO
+    };
+    if !minimum.covers(finite) {
+        return Err(WorkError::InvalidConfig(
+            "joint closed CPU progress source shape",
+        ));
+    }
+    let fanout = fanout as u128;
+    let mut global = JointResources::ZERO;
+    let mut per_dependency = JointResources::ZERO;
+    for index in 0..RESOURCE_COUNT {
+        let finite = u128::from(finite.0[index]);
+        let external = u128::from(protected.0[index]) - finite;
+        let amount = |multiplier: u128| {
+            external
+                .checked_mul(multiplier)
+                .and_then(|value| value.checked_add(finite))
+                .and_then(|value| u64::try_from(value).ok())
+                .ok_or(WorkError::InvalidConfig("joint dependency protection"))
+        };
+        global.0[index] = amount(fanout + 1)?;
+        per_dependency.0[index] = amount(fanout)?;
+    }
+    Ok(JointResourceLimits {
+        global,
+        per_dependency,
+        protected_progress: protected,
+    })
+}
+
+impl Clone for ValidatedJointCapacityConfig {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            internal_cpu_factory: self
+                .internal_cpu_factory
+                .as_ref()
+                .map(|source| source.duplicate()),
+            source_authority: self.source_authority.clone(),
+        }
     }
 }
 

@@ -140,6 +140,36 @@ impl FrontendNativeCapacityInputs {
         self.query_blocking
     }
 
+    /// Source-derived floor used for every projection in the private composer.
+    /// The full original action minimum remains the caller author's duty.
+    pub(crate) fn progress_floor(
+        &self,
+        workload: &mut novarocks_workload_control::WorkloadControl,
+        minimum: novarocks_workload_control::joint_admission::JointResources,
+        fanout: NonZeroUsize,
+    ) -> Result<novarocks_workload_control::joint_admission::JointResourceLimits, WorkError> {
+        workload.joint_capacity_floor_for_registered_sources(minimum, fanout)
+    }
+
+    /// The original RuntimeOwner's private composer supplies complete action
+    /// minima. This step validates only original WC/source capacity; it does
+    /// not establish Native readiness or replace payload/physical admission.
+    pub(crate) fn validate_joint_sources(
+        &self,
+        workload: &mut novarocks_workload_control::WorkloadControl,
+        sources: &FrontendNativeCapacitySources,
+        declared: novarocks_workload_control::joint_admission::JointCapacityConfig,
+        required: &novarocks_workload_control::joint_admission::RequiredJointProgress,
+    ) -> Result<novarocks_workload_control::joint_admission::ValidatedJointCapacityConfig, WorkError>
+    {
+        if sources.query_blocking != self.query_blocking {
+            return Err(WorkError::InvalidConfig(
+                "frontend actual blocking source geometry",
+            ));
+        }
+        workload.validate_joint_capacity_for_registered_sources(declared, required)
+    }
+
     /// Read the same Native owners before any logical-role service is started.
     pub(crate) fn with_native_sources(
         mut self,
@@ -270,5 +300,181 @@ mod tests {
             FrontendNativeCapacityInputs::try_new(policy([4, 1, 1, 1, 1]).unwrap(), overflow),
             Err(WorkError::ArithmeticOverflow)
         ));
+    }
+
+    // This isolates the real closed factory's capacity coordinates. It is not
+    // a complete Native profile or a proof that other source backing is paid.
+    fn cpu_floor_probe(
+        action: InternalCpuActionQuote,
+        fanout: usize,
+        physical_positions: usize,
+    ) -> (
+        novarocks_workload_control::joint_admission::JointCapacityConfig,
+        novarocks_workload_control::joint_admission::RequiredJointProgress,
+    ) {
+        use novarocks_workload_control::joint_admission::{
+            JointCapacityConfig, JointResource as R, JointResourceLimits as L, JointResources as V,
+            RequiredJointProgress,
+        };
+        let minimum = V::ZERO
+            .with(R::ClaimRecords, 1)
+            .with(R::MetadataBytes, action.metadata_bytes().get())
+            .with(R::InternalCpuJobs, 1)
+            .with(R::PhysicalQueueRecords, 1)
+            .with(R::PhysicalQueueBytes, action.physical_queue_bytes().get());
+        let global = V::ZERO
+            .with(R::ClaimRecords, (fanout + 1) as u64)
+            .with(
+                R::MetadataBytes,
+                (fanout + 1) as u64 * action.metadata_bytes().get(),
+            )
+            .with(R::InternalCpuJobs, physical_positions as u64)
+            .with(R::PhysicalQueueRecords, physical_positions as u64)
+            .with(
+                R::PhysicalQueueBytes,
+                physical_positions as u64 * action.physical_queue_bytes().get(),
+            );
+        let dependency = global;
+        let limits = L {
+            global,
+            per_dependency: dependency,
+            protected_progress: minimum,
+        };
+        let lanes = [L::default(), limits, L::default()];
+        (
+            JointCapacityConfig {
+                global: limits,
+                classes: [limits; 5],
+                lanes,
+                class_lanes: [lanes; 5],
+                max_dependencies_per_claim: fanout,
+                max_registered_dependencies: 256,
+                max_claims: 32,
+                max_requests: 16,
+                max_changes_per_request: 4,
+                max_snapshot_bytes: 4 * 1024 * 1024,
+                max_scratch_bytes: 4 * 1024 * 1024,
+                max_residual_arcs: 10000,
+                max_total_proof_work: 10_000_000,
+                work_per_turn: NonZeroUsize::new(17).unwrap(),
+            },
+            RequiredJointProgress {
+                global: minimum,
+                classes: [minimum; 5],
+                lanes: [V::ZERO, minimum, V::ZERO],
+                class_lanes: [[V::ZERO, minimum, V::ZERO]; 5],
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn original_three_position_closed_factory_uses_its_source_floor_not_network_fanout() {
+        use crate::query_execution::internal_result_cpu::InternalResultCpuOwner;
+        use novarocks_native_trust::{NativeEndpointConnector, NativeTransportMode};
+        use novarocks_types::NativeEndpoint;
+        use novarocks_workload_control::joint_admission::JointResource as R;
+        use novarocks_workload_control::{ResultCapacityConfig, WorkloadControl};
+        let mut domains = std::collections::BTreeSet::new();
+        for host in ["be-one.example", "be-two.example", "be-three.example"] {
+            for port in [19040, 19041] {
+                let endpoint = NativeEndpoint::from_host_port(host, port).unwrap();
+                domains.insert(
+                    NativeEndpointConnector::selected_origin_for(
+                        &endpoint,
+                        NativeTransportMode::Disabled,
+                    )
+                    .unwrap()
+                    .into_owned(),
+                );
+            }
+        }
+        let mut result = ResultCapacityConfig::V1;
+        result.positions[2] = 3;
+        let profile = FrontendResultCapacityProfile::try_new(result).unwrap();
+        let mut control = WorkloadControl::try_new_counted(WorkloadConfig::default())
+            .unwrap()
+            .owner;
+        let mut cpu = InternalResultCpuOwner::try_new(profile, &mut control).unwrap();
+        let runtime = cpu.runtime();
+        let actual = runtime.configured_capacity();
+        let quote = runtime.operation_action_quote().unwrap();
+        let (config, required) =
+            cpu_floor_probe(quote, domains.len(), actual.worker_threads().get());
+        let old_refuses = matches!(
+            config.clone().validate(&required),
+            Err(WorkError::InvalidConfig("joint dependency protection"))
+        );
+        let floor = control.joint_capacity_floor_for_registered_sources(
+            required.global,
+            NonZeroUsize::new(domains.len()).unwrap(),
+        );
+        let qualified =
+            control.validate_joint_capacity_for_registered_sources(config.clone(), &required);
+        let mut foreign = WorkloadControl::try_new_counted(WorkloadConfig::default())
+            .unwrap()
+            .owner;
+        let missing_refuses = matches!(
+            foreign.validate_joint_capacity_for_registered_sources(config.clone(), &required),
+            Err(WorkError::NotReady)
+        );
+        let source_bound = qualified.as_ref().ok().map(|validated| {
+            matches!(
+                foreign.configure_joint_capacity(validated.clone()),
+                Err(WorkError::ForeignAuthority)
+            )
+        });
+        // Keep one unqualified queue increment beside the exact CPU increment.
+        // It must retain the K/K+1 floor although both use these same columns.
+        let mut mixed = config;
+        let mixed_minimum = required.global.with(R::PhysicalQueueRecords, 2).with(
+            R::PhysicalQueueBytes,
+            2 * quote.physical_queue_bytes().get(),
+        );
+        let mut mixed_required = required;
+        mixed_required.global = mixed_minimum;
+        mixed_required.classes = [mixed_minimum; 5];
+        mixed_required.lanes[1] = mixed_minimum;
+        for class in 0..5 {
+            mixed_required.class_lanes[class][1] = mixed_minimum;
+        }
+        mixed.global.protected_progress = mixed_minimum;
+        mixed.classes = [mixed.global; 5];
+        mixed.lanes[1] = mixed.global;
+        mixed.class_lanes = [mixed.lanes; 5];
+        let mixed_refuses = matches!(
+            control.validate_joint_capacity_for_registered_sources(mixed, &mixed_required),
+            Err(WorkError::InvalidConfig("joint dependency protection"))
+        );
+        let installed = qualified.and_then(|validated| control.configure_joint_capacity(validated));
+        let installation_ok = installed.is_ok();
+        drop(installed);
+        drop(runtime);
+        let shutdown = cpu
+            .shutdown_until(std::time::Instant::now() + Duration::from_secs(5))
+            .await;
+        // All real physical worker handles have been joined before assertions.
+        assert_eq!(domains.len(), 6);
+        assert_eq!(actual.worker_threads().get(), 3);
+        assert_eq!(actual.queue_capacity().get(), 3);
+        let floor = floor.unwrap();
+        assert_eq!(floor.global.get(R::InternalCpuJobs), 1);
+        assert_eq!(floor.per_dependency.get(R::InternalCpuJobs), 1);
+        assert_eq!(floor.global.get(R::PhysicalQueueRecords), 1);
+        assert_eq!(
+            floor.global.get(R::PhysicalQueueBytes),
+            quote.physical_queue_bytes().get()
+        );
+        assert_eq!(floor.global.get(R::ClaimRecords), 7);
+        assert!(old_refuses);
+        assert!(missing_refuses);
+        assert_eq!(source_bound, Some(true));
+        assert!(mixed_refuses);
+        assert!(installation_ok);
+        assert!(
+            shutdown.is_ok(),
+            "original CPU owner did not exit: {shutdown:?}"
+        );
+        // No charged dependencies were narrowed by capacity validation.
+        assert_eq!(mixed_required.global.get(R::InternalCpuJobs), 1);
     }
 }

@@ -23,31 +23,51 @@ use std::{any::TypeId, num::NonZeroU64};
 /// Identity of the existing physical pool allocation and its one closed call
 /// factory. Only trusted first-party composition may describe this kind.
 /// A descriptor is not a source-finiteness proof or a workload grant.
+#[derive(Debug)]
 pub struct InternalResultClosedFactoryDescriptor {
     pool: Weak<dyn Send + Sync>,
     call: TypeId,
+    physical_queue_bytes: NonZeroU64,
 }
 impl InternalResultClosedFactoryDescriptor {
-    fn duplicate(&self) -> Self {
+    pub(in crate::joint_admission) fn duplicate(&self) -> Self {
         Self {
             pool: self.pool.clone(),
             call: self.call,
+            physical_queue_bytes: self.physical_queue_bytes,
         }
     }
     /// Composition-only seam used by the original QA physical owner after it
     /// installs the exact first-party factory in that same pool. Arbitrary
     /// generic blocking work is not authorized by choosing this descriptor.
-    pub fn for_composition(pool: Weak<dyn Send + Sync>, call: TypeId) -> Self {
-        Self { pool, call }
+    pub fn for_composition(
+        pool: Weak<dyn Send + Sync>,
+        call: TypeId,
+        physical_queue_bytes: NonZeroU64,
+    ) -> Self {
+        Self {
+            pool,
+            call,
+            physical_queue_bytes,
+        }
     }
     pub fn matches(&self, other: &Self) -> bool {
-        self.call == other.call && Weak::ptr_eq(&self.pool, &other.pool)
+        self.call == other.call
+            && self.physical_queue_bytes == other.physical_queue_bytes
+            && Weak::ptr_eq(&self.pool, &other.pool)
+    }
+    pub(in crate::joint_admission) fn queue_bytes(&self) -> NonZeroU64 {
+        self.physical_queue_bytes
+    }
+    pub(in crate::joint_admission) fn is_live(&self) -> bool {
+        self.pool.strong_count() != 0
     }
     fn stamp(&self) -> CpuFactoryStamp {
         CpuFactoryStamp {
             // The original State keeps this Weak allocation identity alive.
             pool: self.pool.as_ptr() as *const () as usize,
             call: self.call,
+            physical_queue_bytes: self.physical_queue_bytes,
         }
     }
 }
@@ -55,6 +75,7 @@ impl InternalResultClosedFactoryDescriptor {
 struct CpuFactoryStamp {
     pool: usize,
     call: TypeId,
+    physical_queue_bytes: NonZeroU64,
 }
 /// Narrow view of the original WC owner's before-Ready composition decision.
 /// Weak identities retain neither a Work nor a physical pool or new budget.
@@ -96,6 +117,58 @@ impl InternalCpuFactoryBinding {
     }
 }
 impl WorkloadControl {
+    /// Minimum global/domain limits for complete progress on this original
+    /// registered source. Other sources' shared coordinates retain their
+    /// original causal floor. Reading these facts grants no capacity.
+    pub fn joint_capacity_floor_for_registered_sources(
+        &mut self,
+        minimum: JointResources,
+        max_dependencies_per_claim: std::num::NonZeroUsize,
+    ) -> Result<JointResourceLimits, WorkError> {
+        let state = self.inner.state.lock().unwrap();
+        if state.ready || state.closed || !state.nodes.is_empty() || state.joint.is_some() {
+            return Err(WorkError::Conflict);
+        }
+        let descriptor = state
+            .internal_cpu_factory
+            .as_ref()
+            .ok_or(WorkError::NotReady)?;
+        if !descriptor.is_live() {
+            return Err(WorkError::Released);
+        }
+        source_progress_floor(
+            max_dependencies_per_claim.get(),
+            minimum,
+            minimum,
+            Some(descriptor.queue_bytes()),
+        )
+    }
+
+    /// Validate source-aware floors from this original authority's registered
+    /// closed factory. Full charged dependencies and every hard cap remain.
+    /// No caller-selected causal mask or arbitrary finite contribution enters.
+    pub fn validate_joint_capacity_for_registered_sources(
+        &mut self,
+        config: JointCapacityConfig,
+        required: &RequiredJointProgress,
+    ) -> Result<ValidatedJointCapacityConfig, WorkError> {
+        let state = self.inner.state.lock().unwrap();
+        if state.ready || state.closed || !state.nodes.is_empty() || state.joint.is_some() {
+            return Err(WorkError::Conflict);
+        }
+        let descriptor = state
+            .internal_cpu_factory
+            .as_ref()
+            .ok_or(WorkError::NotReady)?;
+        if descriptor.pool.strong_count() == 0 {
+            return Err(WorkError::Released);
+        }
+        config.validate_registered_internal_cpu(
+            required,
+            descriptor.duplicate(),
+            Arc::downgrade(&self.inner),
+        )
+    }
     /// Installs the one InternalResultClosedFactory on this original authority.
     /// Only first-party role composition owns both this unique owner and the
     /// physical CPU owner. The reviewed closed implementation, not its TypeId,
@@ -223,6 +296,25 @@ fn require_registered_factory(state: &State, fence: CpuActionFence) -> Result<()
     Ok(())
 }
 
+fn validate_queue_quote(
+    state: &State,
+    fence: CpuActionFence,
+    physical_queue_bytes: u64,
+) -> Result<(), WorkError> {
+    if fence.has_closed_factory()
+        && physical_queue_bytes
+            < state
+                .internal_cpu_factory
+                .as_ref()
+                .ok_or(WorkError::Conflict)?
+                .queue_bytes()
+                .get()
+    {
+        return Err(WorkError::Conflict);
+    }
+    Ok(())
+}
+
 pub(in crate::joint_admission::ledger) fn validate_cpu_action(
     state: &State,
     owner: WorkId,
@@ -235,6 +327,7 @@ pub(in crate::joint_admission::ledger) fn validate_cpu_action(
         return Err(WorkError::Conflict);
     };
     let amounts = change.claim.amounts;
+    validate_queue_quote(state, fence, amounts.get(JointResource::PhysicalQueueBytes))?;
     let expected = JointResources::ZERO
         .with(JointResource::ClaimRecords, 1)
         .with(
@@ -330,6 +423,8 @@ impl InternalCpuActionSource {
             // Refuse an unauthorized request before reserving the original Q
             // cell or retaining any additional profile graph backing.
             require_registered_factory(&state, self.fence)?;
+            computation_facts(&state, self.owner, self.fence)?;
+            validate_queue_quote(&state, self.fence, physical_queue_bytes.get())?;
         }
         let scope = WorkScope {
             inner: Arc::clone(&inner),

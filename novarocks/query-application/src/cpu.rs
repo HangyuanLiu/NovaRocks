@@ -882,9 +882,18 @@ impl QueryBlockingExecutorOwner {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
+        let physical_queue_bytes = bounded_worker::queue_record_layout::<CpuResult>()
+            .size()
+            .checked_add(QueryBlockingExecutor::preserving_call_layout::<T, F>().size())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .and_then(std::num::NonZeroU64::new)
+            .ok_or(novarocks_workload_control::WorkError::ArithmeticOverflow)?;
         self.executor
             .handle
-            .bind_internal_result_closed_factory_for_composition(preserving_call_type::<T, F>())
+            .bind_internal_result_closed_factory_for_composition(
+                preserving_call_type::<T, F>(),
+                physical_queue_bytes,
+            )
     }
 
     pub fn executor(&self) -> QueryBlockingExecutor {
@@ -2595,6 +2604,19 @@ mod joint_queue_tests {
             .size()
             .checked_add(call_layout(fixture_closed_work).size())
             .unwrap() as u64;
+        let underquoted = binding
+            .bind_source(computation.cpu_action_source(&root.owner.scope()).unwrap())
+            .unwrap()
+            .begin(
+                std::num::NonZeroU64::new(1).unwrap(),
+                std::num::NonZeroU64::new(1).unwrap(),
+            );
+        assert!(matches!(
+            underquoted,
+            Err(JointAdmissionFailure {
+                error: WorkError::Conflict
+            })
+        ));
         let source = binding
             .bind_source(computation.cpu_action_source(&root.owner.scope()).unwrap())
             .unwrap();

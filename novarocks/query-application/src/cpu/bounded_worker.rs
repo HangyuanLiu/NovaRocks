@@ -398,6 +398,7 @@ pub(crate) fn worker_entry_layout() -> std::alloc::Layout {
 
 struct QueueState<R> {
     closed_factory: Option<TypeId>,
+    closed_factory_queue_bytes: Option<std::num::NonZeroU64>,
     closed: bool,
     jobs: VecDeque<QueuedJob<R>>,
     running: usize,
@@ -456,6 +457,7 @@ impl<R: Send + 'static> BoundedWorkerOwner<R> {
         let shared = Arc::new(Shared {
             state: Mutex::new(QueueState {
                 closed_factory: None,
+                closed_factory_queue_bytes: None,
                 closed: false,
                 jobs: VecDeque::with_capacity(queue_capacity),
                 running: 0,
@@ -659,6 +661,7 @@ impl<R: Send + 'static> BoundedWorkerHandle<R> {
     pub(crate) fn bind_internal_result_closed_factory_for_composition(
         &self,
         call: TypeId,
+        physical_queue_bytes: std::num::NonZeroU64,
     ) -> Result<
         novarocks_workload_control::joint_admission::InternalResultClosedFactoryDescriptor,
         novarocks_workload_control::WorkError,
@@ -673,19 +676,17 @@ impl<R: Send + 'static> BoundedWorkerHandle<R> {
             return Err(novarocks_workload_control::WorkError::Conflict);
         }
         state.closed_factory = Some(call);
-        Ok(novarocks_workload_control::joint_admission::InternalResultClosedFactoryDescriptor::for_composition(self.source(), call))
+        state.closed_factory_queue_bytes = Some(physical_queue_bytes);
+        Ok(novarocks_workload_control::joint_admission::InternalResultClosedFactoryDescriptor::for_composition(self.source(), call, physical_queue_bytes))
     }
     pub(crate) fn closed_factory_descriptor(
         &self,
     ) -> Option<novarocks_workload_control::joint_admission::InternalResultClosedFactoryDescriptor>
     {
-        let call = self
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .closed_factory?;
-        Some(novarocks_workload_control::joint_admission::InternalResultClosedFactoryDescriptor::for_composition(self.source(), call))
+        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let call = state.closed_factory?;
+        let physical_queue_bytes = state.closed_factory_queue_bytes?;
+        Some(novarocks_workload_control::joint_admission::InternalResultClosedFactoryDescriptor::for_composition(self.source(), call, physical_queue_bytes))
     }
     pub(crate) fn accepts_call_type(&self, call: TypeId) -> bool {
         self.shared
