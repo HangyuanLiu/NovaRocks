@@ -19,14 +19,14 @@ under the License.
 
 # 维护 / 治理
 
-> Iceberg 的运维操作包括压缩小文件、清理历史 snapshot、回收孤儿文件、重写 manifest 与重写 deletion vector。NovaRocks 支持 whole-table OPTIMIZE、EXPIRE SNAPSHOTS、REMOVE ORPHAN FILES、REWRITE MANIFESTS 与 V3 Puffin deletion-vector repack；增量压缩、sort-order rewrite 和通用定时调度仍待补。
+> Iceberg 的运维操作包括压缩小文件、清理历史 snapshot、回收孤儿文件、重写 manifest 与重写 deletion vector。NovaRocks 支持 whole-table OPTIMIZE、EXPIRE SNAPSHOTS、REWRITE MANIFESTS 与 V3 Puffin deletion-vector repack；扫描型回收按 Provider 安全证明准入，REMOVE ORPHAN FILES 的现有 REST/Hadoop 组合缺证受限。增量压缩、sort-order rewrite 和通用定时调度仍待补。
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
 | `ALTER TABLE ... OPTIMIZE`（whole-table 文件压缩） | ✅ | 异步 job |
 | `OPTIMIZE` 增量（仅小文件 / 仅 partition） | ❌ | |
 | `EXPIRE SNAPSHOTS` | ✅ | 同步 action |
-| `REMOVE ORPHAN FILES` | ✅ | 同步 action |
+| `REMOVE ORPHAN FILES` | 受限 | REST/Hadoop 安全证明为 UNPROVEN；缺证应明确拒绝 |
 | `REWRITE MANIFESTS` | ✅ | 同步 action |
 | `rewrite_position_delete_files`（V3 Puffin DV repack） | ✅ | 同步 Spark-style `CALL` |
 | V2 Parquet position delete → V3 DV 升级 | ❌ | |
@@ -46,20 +46,11 @@ maintenance 的三层职责是固定的：
 - Iceberg connector 仍是 catalog、snapshot/file、rewrite/expire/orphan、commit、cache
   invalidation 与 MV target snapshot adopt 的唯一执行 truth。
 
-异步 optimize job 只持久化到 frontend StateStore。单 FE 部署的最小配置如下：
-
-```toml
-[state_store]
-provider = "sqlite"
-path = "/absolute/path/frontend-state.sqlite"
-cluster_id = "cluster-a"
-```
-
-重启 FE 时复用同一绝对 `path` 与 `cluster_id`，已完成的
-`SHOW ALTER TABLE OPTIMIZE` 历史仍可见，新 job 也可继续提交。未配置 StateStore 时，
-`ALTER TABLE ... OPTIMIZE`、`SHOW ALTER TABLE OPTIMIZE` 与 automatic optimize 会返回明确的
-unavailable error；`REWRITE MANIFESTS`、`EXPIRE SNAPSHOTS`、`REMOVE ORPHAN FILES` 和
-Spark-style maintenance `CALL` 等同步 action 仍可直接执行。
+Optimize job、操作、lease、checkpoint 与历史仅属于当前 FE 进程；重启后不会恢复旧 job 或
+`SHOW ALTER TABLE OPTIMIZE` 历史。它们不以 StateStore 为执行前提。
+StateStore 在本领域仅可保存 GC first-observation Accelerator；该记录可重建，不是 job repository，
+也不授予 catalog mutation、跨重启接管或删除权。所有手动与自动维护仍须通过实际 Provider 能力准入；
+是否配置 StateStore 都不能解除扫描 GC 的缺证限制。
 
 当前 lifecycle 只支持单 FE owner。关闭 FE 时会先停止并 join maintenance worker，再释放
 StateStore；它不提供多 FE lease、takeover 或 fencing。多 FE active/standby 的 claim 与
@@ -76,7 +67,7 @@ SHOW ALTER TABLE OPTIMIZE
   LIMIT 10;
 ```
 
-`ALTER TABLE ... OPTIMIZE` 在 job 成功写入 StateStore 后返回，rewrite 由 Frontend
+`ALTER TABLE ... OPTIMIZE` 在当前进程的 job runtime 接受后返回，rewrite 由 Frontend
 Application 的 maintenance worker 异步执行。调用方必须轮询 `SHOW ALTER TABLE OPTIMIZE`，并以 `FINISHED` 或 `FAILED`
 作为终态。Spark-style `CALL ...rewrite_data_files(...)` 则保持同步，并直接返回 action
 结果。
@@ -131,29 +122,65 @@ ALTER TABLE orders EXPIRE SNAPSHOTS OLDER THAN '2026-04-01 00:00:00' RETAIN LAST
 `novarocks/connector/iceberg/src/catalog_control/metadata_maintenance.rs` 与
 `novarocks/connector/iceberg/src/commit/snapshot_lifecycle_helpers/expire_snapshots.rs`
 
-## ✅ REMOVE ORPHAN FILES
+## 受限：REMOVE ORPHAN FILES 与其它扫描回收
 
-### 行为
+本节记录 [ADR-0198](../../adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 已接受的准入契约。
+限制的代码接线与原生验证尚待完成；不能据本文推断某个二进制已经实施该限制。
 
-扫描 warehouse 下 `data/` + `metadata/` 路径，找到不被 `metadata.json` 中任何 snapshot 引用的文件，按 OLDER THAN 阈值过滤后物理删除。不提交新 snapshot，不更新 metadata.json。
+### 安全准入与缺证拒绝
 
-### 示例
+REMOVE ORPHAN FILES 扫描表路径的 data/metadata 候选，并按引用和 OLDER THAN 过滤。
+但“当前 metadata 不引用”和“文件足够老”都不能证明迟到的合法 publication 不会引用它。
+SQL 手动调用与自动入口使用同一判据，用户指定删除阈值不替代 Provider 安全证明。
+
+| Catalog / 回收路径 | 安全状态与支持边界 |
+|---|---|
+| Iceberg REST，静态或 vended 凭据，表内 orphan 扫描 | UNPROVEN；按缺证能力明确拒绝，凭据来源不改变证明 |
+| Iceberg Hadoop，file 或 object store，表内 orphan 扫描 | UNPROVEN；前台同样受限，原有 Background 拒绝继续成立 |
+| NovaRocks owned-ref 成熟回收 | UNPROVEN；provenance、first-observation 与 exact CAS 不单独排除仍合法的旧业务 |
+| 无表锚 CTAS 根扫描 | UNPROVEN；年龄与 fresh NotFound 不能排除迟到的 staged publication |
+| Iceberg Hive / Paimon | Hive mutation 不支持；Paimon 只读，无写入或 GC 能力 |
+
+缺证入口应返回明确的 unsupported 能力结果，说明缺失的安全前提，不能静默执行删除或返回
+清理成功。增大 OLDER THAN、只部署一个 FE 或换成静态凭据都不能解除 UNPROVEN。
+此处 UNPROVEN 表示契约和证据不足，不代表已复现误删，也不代表这些外部系统永远无法支持安全回收。
+
+恢复某个扫描能力前，Provider 必须证明真实 writer/潜在外部效果的截止或有效 fencing，
+说明时钟与列举假设、并发提交和 Unknown 保护，并覆盖宣称支持的重启范围。
+`safe_gc_age > max_attempt_duration + ...` 只有后者真正约束外部效果才有效；本地语句
+超时、请求幂等键、进程内 Unknown 记录或 GC first-observation 表都不能独自提供这一保证。
+
+### SQL 形状与候选保护
 
 ```sql
+-- SQL 形状仍保留；未取得安全能力的 catalog 应明确拒绝。
 ALTER TABLE orders REMOVE ORPHAN FILES OLDER THAN '2026-04-01 00:00:00';
 ```
 
-### 支持的子集
+OLDER THAN 是必需的候选过滤条件，不能据“至少三天”推断安全。现有实现还保护当前和
+metadata-log 中的 metadata，以及仍有 live data file 引用的整个 DV Puffin 对象；
+这些保护应保留，但不替代无未来引用证明。file/s3/oss 的列举实现不等于安全准入；
+hdfs 列举仍未支持，`t.branch_<x>` 后缀仍在 parse-time 拒绝。
 
-- OLDER THAN **强制**（建议 ≥ 3 天，防御 in-flight 写入误删）
-- 保护当前 `metadata.json` + metadata-log 中所有历史 `metadata.json`
-- DV puffin 半引用保护：任一 blob 关联 live data file → 整个 puffin 文件保留
-- 支持 `file://`、`s3://`、`oss://` scheme；`hdfs://` **暂未实现**
-- 不支持 `t.branch_<x>` 后缀（parse-time reject）
+### 与提交、必要 finalize 和精确清理的关系
+
+精确 operation-owned cleanup 处理本操作 ledger 内、已证明归属且不再使用的对象，
+不与扫描候选共用删除判据。Unknown 对象保持受保护；BE 已 seal 但 FE 未收齐清单时，
+即使确定尚未提交，也只能报告回收未决，不能把 session 释放当作 cleanup Complete。
+
+撤销旧删除权、保护提交引用和必要领域 finalize 是业务成功的前提；已证明安全的 GC
+可交给监督者延后执行，携带原对象、访问能力、删除授权、容量及实际退出观察。
+仅延后 GC 失败不翻转已完成业务；必要步骤失败则必须同时报告已有提交效果和业务未完成。
+
+无表锚 CTAS 的旧根扫描是可选维护。禁用缺证扫描不阻止新 CTAS 走已安全准入的 staged
+publication，也不能把该扫描的 unsupported 错误投成新 CTAS 的 AppliedButUnusable。
+目前不承诺跨 FE/BE 崩溃可重建全部产物清单、自动回收或无孤儿；恢复这类能力需要独立协议与证明。
 
 ### 入口
 
-`novarocks/connector/iceberg/src/catalog_control/cleanup_maintenance.rs`
+`novarocks/connector/iceberg/src/catalog_control/{cleanup_maintenance,cleanup_candidates,unanchored_ctas_cleanup}.rs`，
+owned-ref 选择位于同目录的 `owned_ref_cleanup.rs`，first-observation 位于
+`novarocks/table-maintenance/src/gc_observation.rs`。这些是迁移入口，安全准入与拒绝接线仍须实际验收。
 
 ## ✅ REWRITE MANIFESTS
 

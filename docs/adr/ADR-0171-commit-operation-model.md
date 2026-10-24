@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0198
+    scope: "Synchronous control waiting, the undifferentiated finalize/cleanup completion boundary and unconditional age-gated GC continuation; immutable intent, dependencies, field inheritance, the physical artifact ledger, actual-exit observation and protection of Unknown objects remain active"
+    link: "ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md"
   - id: ADR-0180
     scope: "Request-shape table for document storage: marker-only MetadataOnly, zero-file SnapshotProducing slot changes and all-observed-ref expiry; immutable operations, dependency validation and artifact ownership remain unchanged"
   - id: ADR-0179

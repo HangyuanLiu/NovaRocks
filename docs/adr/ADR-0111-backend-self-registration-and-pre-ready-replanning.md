@@ -5,6 +5,10 @@ domain: [cluster-membership, distributed-query-lifecycle]
 status: active
 supersedes: [ADR-0013]
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0198
+    scope: "Whole semantic replanning before ControlReady and pre-ready retries for mutating execution; external desired membership, authenticated registration, exact heartbeat and process identity remain active"
+    link: "ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md"
 date: 2026-08-25
 provenance:
   - "discussion: 2026-08-25 serverless backend self-registration, drain, and pre-ready admission"

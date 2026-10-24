@@ -66,7 +66,7 @@ SQL client
   `- MySQL protocol -----------> NovaRocks role=fe
                                       |
                                       v
-                            Frontend SQL/coordinator application
+                            Frontend SQL / logical execution
                                       |
                                       v
                             Native gRPC fragment submission
@@ -139,8 +139,10 @@ SQL client
 
 - `novarocks/frontend-application/src/**`
   FE application composition, SQL admission, catalog projection, native query
-  execution adapter and distributed task coordination. Query-local semantic
-  policy remains in `novarocks/query-application/src/**`; long-lived Catalog
+  adapter, supervised statement orchestration and domain publication.
+  `task_execution/**` owns Native attempt protocol facts; the common logical
+  execution owner and recovery policy remain in `novarocks/query-application/src/**`.
+  Long-lived Catalog
   generation ownership remains in `novarocks/catalog-application/src/**`.
   `state_family/**` is the closed manifest of every frontend-local state
   family: it owns each family's classification (`ExternalProjection` /
@@ -160,6 +162,12 @@ SQL client
   kernels shared by FE and BE application owners. `execution-contract` owns the
   identities and contracts both roles must agree on; `execution` owns the
   runtime that runs under them.
+
+- `novarocks/coordination-contract/src/**`（已接受的目标边界，接线与验收待完成）
+  仅共享 FE owner 之间实际使用的身份、时间、消息与中立事实；无 Tokio、领域载荷、
+  session、closure、资源 owner 或恢复算法。恢复属于 Query Application，writer/统计
+  完成证明属于 Frontend 领域。见 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md)；
+  本索引不证明迁移已完成，最终模块与承重代码锚点由集成时核对。
 
 ### 4.2 SQL Frontend: Parse, Plan, Admit
 
@@ -188,6 +196,11 @@ SQL client
   DML flows — `insert.rs`, `delete/**`, `mutation.rs` / `mutation_flow.rs`,
   `truncate.rs`, `add_files.rs`, `ctas.rs` / `iceberg_ctas.rs`,
   `iceberg_writer.rs` (INSERT INTO / INSERT OVERWRITE).
+
+- `novarocks/frontend-application/src/dml/runner.rs`
+  语句级写入编排的迁移入口；受监督任务覆盖 prepare、计算、publication 和必要 finalize。
+  计算就绪后即可推进领域提交，诊断与安全清理独立；成功和失败路径均保留累计外部效果。
+  seal/NoOp 不冒充真实提交，取消不得覆盖已取得的提交事实。契约见 ADR-0198。
 
 - `novarocks/frontend-application/src/catalog_application/statement.rs`
   Catalog, database and table DDL against the projected catalog.
@@ -418,7 +431,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 1. A MySQL client connects to a `role=fe` process through the native SQL
    entrypoint.
 2. The frontend owns session admission, catalog resolution, planning, and
-   coordinator lifecycle assembly.
+   supervised statement orchestration and common logical execution assembly.
 3. Persistent tables belong to external providers. Iceberg owns its catalog and
    mutation truth; Paimon owns its external snapshots and exposes only its
    supported read capability.
@@ -457,7 +470,10 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    per participating backend. A context exists only where the scheduler placed
    a task, so the number of participants is a property of the plan and the
    splits, never of the cluster size.
-2. `execute_round_on_task_protocol` establishes every context and creates every
+2. 各分布式意图由 Query Application 的统一逻辑执行 owner 管理恢复、结果与就绪；
+   Frontend 领域提供完整结果的 typed proof，Task 驱动只提供协议事实。
+   ADR-0198 将内部计算就绪、publication、诊断和收敛分开；就绪不等于语句成功。
+   `execute_round_on_task_protocol` establishes every context and creates every
    task through a bounded, fair dispatcher
    (`novarocks/frontend-application/src/task_execution/{round,dispatch,context_owner}.rs`).
    Each operation gets one verdict per domain -- Apply / Idempotent / Older /
@@ -497,8 +513,10 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    task's terminal *is* its own status.
 6. Client cancellation is `KILL QUERY` through the Query Application query-control
    owner, delivered as `AbortQueryContext`. The Frontend Application withholds the
-   interrupt until its coordinator worker unwinds, so the next statement on
-   that connection cannot race the statement generation.
+   interrupt until this statement's local supervised orchestration exits, so the
+   next statement cannot race its generation. This does not require remote
+   Unknown publication or residual cleanup to disappear; its stable owner retains
+   the actual responsibility and capacity. See ADR-0198.
 
 ## 6. Core Data Structures (Current Implementation)
 
@@ -912,7 +930,7 @@ unless you edited them.
 | `novarocks/worker/**`, `novarocks/native-adapter/**` | `-p novarocks-worker -p novarocks-native-adapter` |
 | `novarocks/connector/<name>/**` | that connector crate, plus `-p novarocks-fs` when authorized object-store access changes |
 | `novarocks/state-store/**` | the touched backend crate plus `-p novarocks-state-store-api` |
-| `novarocks/types/**`, `novarocks/spi/**`, `novarocks/execution-contract/**`, `novarocks/*-codec/**`, `novarocks/proto-models/**` | the whole workspace: a shared vocabulary or wire format has no bounded blast radius |
+| `novarocks/types/**`, `novarocks/spi/**`, `novarocks/execution-contract/**`, `novarocks/coordination-contract/**`, `novarocks/*-codec/**`, `novarocks/proto-models/**` | the whole workspace: a shared vocabulary or wire format has no bounded blast radius |
 
 **SQL: choose suites from native declarations** and their generated map in
 `tests/sql/correctness/README.md`. Direct `--only <case>` is useful for diagnosis;
@@ -966,11 +984,17 @@ suspected case against a clean server before attributing it to the change.
   `delete/**`, `mutation_flow.rs`, `truncate.rs`, `add_files.rs`,
   `iceberg_writer.rs`); catalog/table DDL is in
   `novarocks/frontend-application/src/catalog_application/statement.rs`.
+  Statement supervision/publication starts at `novarocks/frontend-application/src/dml/runner.rs`;
+  common execution is in `novarocks/query-application/src/coordination/**`.
+  Preserve cumulative effects through `novarocks/query-application/src/api/result.rs`
+  and MySQL success/error projection; consult ADR-0198 before changing these boundaries.
 - **Iceberg 提交、冲突与清理**：从 `novarocks/connector/iceberg/src/commit/{model,dependency,staging}/**`、
   `commit/attempt.rs`、`commit/operation.rs` 和 `commit/write_stack/control/publication.rs` 开始。
   单次派发结论由 `commit/attempt/observation.rs` 的 journal 拥有，prepared owner 在 `catalog/publication_dispatch.rs`；冻结恢复载荷与桥接证据在 `commit/recovery.rs`、
   `commit/attempt/observation.rs`；CTAS 完整 CREATE 请求在 `catalog_control/staged_create/publication.rs`。
-  读 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md) 与 [ADR-0179](docs/adr/ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 后再改身份、字段继承、派发生命周期或清理授权。
+  读 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)、[ADR-0179](docs/adr/ADR-0179-iceberg-publication-lifecycle-and-evidence.md) 与 [ADR-0198](docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 后再改身份、字段继承、派发或清理授权。
+  BE seal 先不可回退撤销 writer 删除权；FE 收齐后做本地交接。缺产物清单不能报 cleanup Complete。
+  精确 operation-owned cleanup 与扫描 GC 分开；REST/Hadoop 扫描安全仍为 UNPROVEN，手动/自动入口共用缺证限制，不能以本地 deadline 或年龄授予删除权。
 - **Execution semantics/operator behavior**：先核对 `novarocks/local-compiler/src/**` 和
   `novarocks/local-program/src/**`，再看 Execution `exec/pipeline/builder/compiled.rs`、
   `exec/operators/**`；`exec/node/**` 仍有共享值类型和运行能力，不能当旧树整片删除。
@@ -982,7 +1006,9 @@ suspected case against a clean server before attributing it to the change.
 - **Materialized views**: inspect `novarocks/mv-application/src/**` and
   `novarocks/frontend-application/src/mv/**`; MV query rewrite is an optimizer
   concern under `novarocks/sql/src/optimizer/**`.
-- **Native distributed task execution**: inspect
+- **Native distributed task execution**: start with the common execution owner in
+  `novarocks/query-application/src/coordination/**` and the minimal boundary in
+  `novarocks/coordination-contract/**` (integration pending; ADR-0198), then inspect
   `novarocks/frontend-application/src/query_execution/native_execution_adapter.rs`,
   `novarocks/frontend-application/src/task_execution/**`,
   `novarocks/worker/src/{task_registry,ingress,convergence}.rs`,
