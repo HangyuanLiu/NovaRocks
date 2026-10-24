@@ -155,6 +155,8 @@ struct WriterShared<O> {
     result: Mutex<Option<O>>,
     error: Mutex<Option<ExecutionFailure>>,
     cleanup_diagnostics: Mutex<Vec<SafeDetail>>,
+    // One returned typed abort failure; separate from the execution origin.
+    abort_failure: Mutex<Option<ExecutionFailure>>,
     queue_tracker: Mutex<Option<Arc<MemTracker>>>,
     queue_peak_batches: AtomicUsize,
     queue_peak_rows: AtomicUsize,
@@ -196,6 +198,7 @@ impl<O> WriterShared<O> {
             result: Mutex::new(None),
             error: Mutex::new(None),
             cleanup_diagnostics: Mutex::new(Vec::new()),
+            abort_failure: Mutex::new(None),
             queue_tracker: Mutex::new(None),
             queue_peak_batches: AtomicUsize::new(0),
             queue_peak_rows: AtomicUsize::new(0),
@@ -1287,6 +1290,16 @@ async fn await_supervised<
         if phase.required() {
             shared.set_error(original.clone(), signal);
         } else {
+            // Stabilize the exact typed result before any callback or actual
+            // lifecycle future Drop. After this one returned error the same
+            // actor is held unresolved, so it cannot issue another abort.
+            let mut saved = shared
+                .abort_failure
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            debug_assert!(saved.is_none());
+            *saved = Some(original.clone());
+            drop(saved);
             shared.cleanup(original, signal);
         }
     }
@@ -1405,7 +1418,13 @@ async fn abort_writer<O: Send>(
     };
     let result = match result {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(error),
+        Ok(Err(error)) => {
+            // The actual call and its future destructor exited, but did not
+            // dispose the journal's objects. Preserve that original writer in
+            // this same frame; its cause was installed before the first wake.
+            shared.unknown(&error, runtime_error);
+            Err(error)
+        }
         Err(error) => Err(error),
     };
     if shared.unresolved.load(Ordering::Acquire) {
@@ -3876,7 +3895,9 @@ pub(crate) mod tests {
                 "failure publication is not actual owner exit"
             );
             gate.add_permits(1);
-            failure.await;
+            assert!(futures::poll!(failure.as_mut()).is_pending());
+            assert!(shared.unresolved.load(Ordering::Acquire));
+            assert!(shared.abort_failure.lock().unwrap().is_some());
             assert_eq!(runtime_error.error(), Some(primary.clone()));
             assert_eq!(*shared.error.lock().unwrap(), Some(primary));
             let diagnostics = shared.cleanup_diagnostics.lock().unwrap();
@@ -3922,18 +3943,36 @@ pub(crate) mod tests {
             owner(Arc::clone(&calls), None, false, true, config);
         wait_until(|| calls.opened.load(Ordering::Relaxed) == 1);
         owner.request_abort();
-        wait_until(|| owner.is_done());
+        wait_until(|| owner.shared.unresolved.load(Ordering::Acquire));
+        assert!(!owner.is_done());
         assert_eq!(calls.aborted.load(Ordering::Relaxed), 1);
         assert_eq!(calls.finished.load(Ordering::Relaxed), 0);
         assert!(
             error.error().is_none(),
             "abort returned error is secondary cleanup"
         );
-        wait_until(|| owner.actor_exited());
+        assert!(!owner.actor_exited());
+        assert!(!owner.shared.frame_exited.load(Ordering::Acquire));
+        let original = owner.shared.abort_failure.lock().unwrap().clone().unwrap();
+        assert!(
+            matches!(original.cause(), crate::runtime::fragment::ExecutionFailureCause::Connector(source)
+            if source.operation() == ConnectorOperation::AbortWriter)
+        );
         assert!(matches!(
             owner.observe_actor_exit().progress,
-            ExitProgress::Exited
+            ExitProgress::Unresolved(_)
         ));
+        for _ in 0..3 {
+            assert!(matches!(
+                owner.observe_actor_exit().progress,
+                ExitProgress::Unresolved(_)
+            ));
+        }
+        assert_eq!(
+            calls.aborted.load(Ordering::Relaxed),
+            1,
+            "failed call is never repolled/reissued"
+        );
         assert_eq!(owner.shared.cleanup_diagnostics.lock().unwrap().len(), 1);
     }
 
@@ -4129,9 +4168,13 @@ pub(crate) mod tests {
             } else {
                 owner.request_abort();
             }
-            wait_until(|| owner.actor_exited());
+            wait_until(|| owner.shared.unresolved.load(Ordering::Acquire));
+            assert!(!owner.is_done());
+            assert!(!owner.actor_exited());
+            assert!(!owner.shared.frame_exited.load(Ordering::Acquire));
+            assert!(owner.shared.abort_failure.lock().unwrap().is_some());
             let observation = owner.observe_actor_exit();
-            assert!(matches!(observation.progress, ExitProgress::Exited));
+            assert!(matches!(observation.progress, ExitProgress::Unresolved(_)));
             assert!(
                 observation.failure.is_none(),
                 "actor already reported original events exactly once"

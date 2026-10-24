@@ -44,11 +44,13 @@ use novarocks_spi::connector::{
 };
 
 use crate::access_binding::IcebergReadBinding;
+use crate::commit::PositionDeleteGroup;
 use crate::commit::data_writer::{
-    StagedDataFile, StagedWriteContext, cleanup_staged_files, staged_data_file_to_writer_report,
-    write_record_batches,
+    StagedDataFile, StagedPathJournal, StagedWriteContext, cleanup_staged_files,
+    staged_data_file_to_writer_report, write_record_batches_journaled,
 };
 use crate::commit::frozen_write::{FrozenDataWriteFacts, staged_write_context_from_frozen_facts};
+use crate::commit::position_delete_writer::write_position_delete_files_journaled;
 use crate::commit::report::{IcebergPartitionReport, partition_path_from_struct};
 use crate::commit::write_io::build_staged_file_io;
 use crate::commit::write_stack::domain::{
@@ -60,7 +62,6 @@ use crate::commit::write_stack::equality_schema::equality_delete_target_from_rec
 use crate::commit::write_stack::old_delete::read_and_merge_old_deletes;
 use crate::commit::write_stack::runtime::IcebergWriteAdapter;
 use crate::commit::{DeletionVector, write_single_deletion_vector_puffin};
-use crate::commit::{PositionDeleteGroup, write_position_delete_files};
 use crate::delete_file::IcebergFileFormat;
 use crate::write_descriptor::encode_partition_descriptor;
 
@@ -249,7 +250,7 @@ struct IcebergDataStackWriter {
     context: StagedWriteContext,
     request_context: ConnectorRequestContext,
     fragments: Vec<ConnectorCommitFragment>,
-    staged_paths: Vec<String>,
+    staged_paths: StagedPathJournal,
     lifecycle: WriterLifecycle,
 }
 
@@ -295,7 +296,7 @@ impl IcebergDataStackWriter {
             context,
             request_context: request.context,
             fragments: Vec::new(),
-            staged_paths: Vec::new(),
+            staged_paths: StagedPathJournal::default(),
             lifecycle: WriterLifecycle::Live,
         })
     }
@@ -362,7 +363,6 @@ impl IcebergDataStackWriter {
                 report.file.split_offsets.clone().unwrap_or_default(),
                 report.file.column_stats.clone(),
             )?;
-            self.staged_paths.push(report.file.path.clone());
             let artifact = IcebergDataFileArtifact::try_new(
                 report.file.path.clone(),
                 IcebergFileFormat::Parquet,
@@ -386,7 +386,7 @@ impl ConnectorBatchWriter for IcebergDataStackWriter {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        let staged = write_record_batches(&self.context, [batch])
+        let staged = write_record_batches_journaled(&self.context, [batch], &self.staged_paths)
             .await
             .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
         self.record(staged)
@@ -407,11 +407,13 @@ impl ConnectorBatchWriter for IcebergDataStackWriter {
         self.lifecycle = WriterLifecycle::Aborting;
         // Keep each original path until its own deletion is observed. Failed
         // cleanup or a dropped wait never erases the remaining responsibility.
-        while let Some(path) = self.staged_paths.last().cloned() {
+        while let Some(path) = self.staged_paths.last() {
             cleanup_staged_files(&self.context, std::slice::from_ref(&path))
                 .await
                 .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
-            self.staged_paths.pop();
+            self.staged_paths
+                .confirm_deleted(&path)
+                .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
         }
         self.fragments.clear();
         self.lifecycle = WriterLifecycle::Aborted;
@@ -432,7 +434,7 @@ struct IcebergDeleteStackWriter {
     request_context: ConnectorRequestContext,
     file_io: crate::iceberg::io::FileIO,
     pending: BTreeMap<String, roaring::RoaringTreemap>,
-    staged_paths: Vec<String>,
+    staged_paths: StagedPathJournal,
     next_sequence: u64,
     lifecycle: WriterLifecycle,
 }
@@ -454,7 +456,7 @@ impl IcebergDeleteStackWriter {
             request_context: request.context,
             file_io,
             pending: BTreeMap::new(),
-            staged_paths: Vec::new(),
+            staged_paths: StagedPathJournal::default(),
             next_sequence: 0,
             lifecycle: WriterLifecycle::Live,
         })
@@ -500,7 +502,7 @@ impl IcebergDeleteStackWriter {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let written = write_position_delete_files(
+        let written = write_position_delete_files_journaled(
             &self.file_io,
             &staging_dir,
             vec![PositionDeleteGroup {
@@ -512,6 +514,7 @@ impl IcebergDeleteStackWriter {
                 partition_values: crate::iceberg::spec::Struct::empty(),
                 positions: ordered,
             }],
+            &self.staged_paths,
         )
         .await
         .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
@@ -521,7 +524,6 @@ impl IcebergDeleteStackWriter {
                 "Iceberg position-delete writer staged an unexpected file count",
             ));
         };
-        self.staged_paths.push(file.path.clone());
         let metrics = IcebergArtifactMetrics::try_new(
             file.record_count,
             file.file_size_in_bytes,
@@ -569,6 +571,7 @@ impl IcebergDeleteStackWriter {
             sequence,
             "puffin",
         );
+        self.staged_paths.record(&path);
         let written = write_single_deletion_vector_puffin(&self.file_io, &path, data_file, &vector)
             .await
             .map_err(|write_error| {
@@ -577,7 +580,6 @@ impl IcebergDeleteStackWriter {
                     format!("stage Iceberg deletion vector failed: {write_error}"),
                 )
             })?;
-        self.staged_paths.push(written.path.clone());
         let metrics = IcebergArtifactMetrics::try_new(
             written.cardinality,
             written.file_size_in_bytes,
@@ -597,18 +599,17 @@ impl IcebergDeleteStackWriter {
     }
 
     async fn cleanup(&mut self) -> Result<(), ConnectorError> {
-        if self.staged_paths.is_empty() {
-            return Ok(());
-        }
         let file_io = self.file_io.clone();
-        while let Some(path) = self.staged_paths.last().cloned() {
+        while let Some(path) = self.staged_paths.last() {
             file_io.delete(&path).await.map_err(|delete_error| {
                 error(
                     ConnectorErrorKind::Internal,
                     format!("cleanup staged Iceberg delete artifact {path}: {delete_error}"),
                 )
             })?;
-            self.staged_paths.pop();
+            self.staged_paths
+                .confirm_deleted(&path)
+                .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
         }
         Ok(())
     }
@@ -774,7 +775,7 @@ struct IcebergEqualityDeleteStackWriter {
     equality_field_ids: Vec<i32>,
     partition: IcebergArtifactPartition,
     fragments: Vec<ConnectorCommitFragment>,
-    staged_paths: Vec<String>,
+    staged_paths: StagedPathJournal,
     lifecycle: WriterLifecycle,
 }
 
@@ -822,24 +823,23 @@ impl IcebergEqualityDeleteStackWriter {
             equality_field_ids,
             partition,
             fragments: Vec::new(),
-            staged_paths: Vec::new(),
+            staged_paths: StagedPathJournal::default(),
             lifecycle: WriterLifecycle::Live,
         })
     }
 
     async fn cleanup(&mut self) -> Result<(), ConnectorError> {
-        if self.staged_paths.is_empty() {
-            return Ok(());
-        }
         let file_io = self.file_io.clone();
-        while let Some(path) = self.staged_paths.last().cloned() {
+        while let Some(path) = self.staged_paths.last() {
             file_io.delete(&path).await.map_err(|delete_error| {
                 error(
                     ConnectorErrorKind::Internal,
                     format!("cleanup staged Iceberg equality-delete file {path}: {delete_error}"),
                 )
             })?;
-            self.staged_paths.pop();
+            self.staged_paths
+                .confirm_deleted(&path)
+                .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
         }
         Ok(())
     }
@@ -852,19 +852,19 @@ impl ConnectorBatchWriter for IcebergEqualityDeleteStackWriter {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        let written = crate::commit::write_equality_delete_file(
+        let written = crate::commit::equality_delete_writer::write_equality_delete_file_journaled(
             &self.file_io,
             &self.staging_dir,
             self.handle.table().default_partition_spec_id(),
             self.target.clone(),
             batch,
+            &self.staged_paths,
         )
         .await
         .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
         let Some(written) = written else {
             return Ok(());
         };
-        self.staged_paths.push(written.path.clone());
         let metrics = IcebergArtifactMetrics::try_new(
             written.record_count,
             written.file_size_in_bytes,
