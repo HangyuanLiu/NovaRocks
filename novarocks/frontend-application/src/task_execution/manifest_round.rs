@@ -901,6 +901,10 @@ mod tests {
         assert!(round.execution().context_never_established(context));
         let mut assembled = unstarted_close_round(round);
         let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let mut executors =
+            crate::task_execution::blocking_io::tests::OriginalExecutorsFixture::install(
+                data_runtime.connector_blocking_io(),
+            );
         let (release, released) = std::sync::mpsc::channel();
         let (plan, enumerations, closes) = failure_observation_plan(
             context.query_execution_id(),
@@ -961,6 +965,7 @@ mod tests {
         drop(assembled);
         root.owner.complete();
         root.business.release();
+        executors.shutdown().await;
     }
 
     #[tokio::test]
@@ -2010,6 +2015,10 @@ mod tests {
         };
         let original_input = original.input().clone();
         let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let mut executors =
+            crate::task_execution::blocking_io::tests::OriginalExecutorsFixture::install(
+                data_runtime.connector_blocking_io(),
+            );
         let (release, released) = std::sync::mpsc::channel();
         let (plan, enumerations, closes) = failure_observation_plan(
             context.query_execution_id(),
@@ -2093,6 +2102,7 @@ mod tests {
         drop(assembled);
         drop(drive);
         finish_pending_actor(logical, context).await;
+        executors.shutdown().await;
     }
 
     #[tokio::test]
@@ -2112,6 +2122,10 @@ mod tests {
         assembled.pending_terminal = None;
         assembled.pending_pre_ready_unknown = None;
         let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let mut executors =
+            crate::task_execution::blocking_io::tests::OriginalExecutorsFixture::install(
+                data_runtime.connector_blocking_io(),
+            );
         let (plan, enumerations, closes) = failure_observation_plan(
             context.query_execution_id(),
             data_runtime.connector_blocking_io().clone(),
@@ -2168,6 +2182,9 @@ mod tests {
         assert_eq!(enumerations.load(Ordering::SeqCst), 1);
         // Selecting the original failure is earlier than its cleanup. Retain
         // the same pump and guard until the original close job actually exits.
+        // The selected attempt terminal is separate from local convergence.
+        // Request the same original input close before observing its real exit.
+        assembled.round.begin_input_close();
         tokio::time::timeout(Duration::from_secs(2), async {
             while !guard.is_finished() || !assembled.round.pumps_closed() {
                 assembled.round.receive_without_dispatch().unwrap();
@@ -2181,6 +2198,7 @@ mod tests {
         drop(assembled);
         drop(drive);
         finish_pending_actor(logical, context).await;
+        executors.shutdown().await;
     }
 
     #[tokio::test]

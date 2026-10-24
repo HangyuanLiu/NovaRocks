@@ -637,6 +637,11 @@ impl SplitAssignmentPump {
                     drop(unresolved);
                     if first {
                         let result = match completed {
+                            Some(Ok(_)) if job.source_drop_unproven() => {
+                                Err(self.closing_reason.clone().unwrap_or(
+                                    SplitAssignmentDriverError::SplitSource { scan: None, detail },
+                                ))
+                            }
                             Some(closed) => self.closing_reason.clone().map_or(closed, Err),
                             None => Err(self.closing_reason.clone().unwrap_or(
                                 SplitAssignmentDriverError::SplitSource { scan: None, detail },
@@ -835,8 +840,12 @@ impl TurnPump for SplitAssignmentPump {
                 .unwrap_or_else(|lock| lock.into_inner());
             if let Some(cause) = fault.enumeration.as_ref().or(fault.close.as_ref()) {
                 cause.clone()
-            } else {
+            } else if !self.close_joined {
                 fault.provider_close.as_ref()?.clone()
+            } else {
+                // A typed Provider close error with a genuinely joined job
+                // remains cleanup data. It is not missing actual-exit proof.
+                return None;
             }
         };
         self.unresolved_reported = true;

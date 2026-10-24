@@ -1406,7 +1406,13 @@ mod root_action_tests {
                     let (entered, entry) = tokio::sync::oneshot::channel();
                     let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
                     let completed = Arc::new(tokio::sync::Notify::new());
-                    let job: Job = cpu_owner.runtime().submit(
+                    // Deliberately blocked arbitrary callbacks are not the
+                    // registered closed finite factory. Keep this lifecycle
+                    // injection on its original unbound physical test owner;
+                    // the same Root's real computation alias still stays in
+                    // the original job and is observed by this same custody.
+                    let mut injection_owner = InternalResultCpuOwner::try_new_for_test().unwrap();
+                    let job: Job = injection_owner.runtime().submit(
                         input,
                         cancellation.view(),
                         &runtime,
@@ -1531,6 +1537,10 @@ mod root_action_tests {
                         .unwrap();
                     }
                     tokio::time::timeout(Duration::from_secs(5), input_exit)
+                        .await
+                        .unwrap();
+                    injection_owner
+                        .shutdown_until(Instant::now() + Duration::from_secs(5))
                         .await
                         .unwrap();
                 }

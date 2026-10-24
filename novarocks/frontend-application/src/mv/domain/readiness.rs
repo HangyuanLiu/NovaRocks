@@ -742,10 +742,11 @@ mod controlled_wipe_tests {
             .install(runtime)
             .unwrap();
         let result = port.wipe_accelerator_for_test(&product, Uuid::now_v7(), &mut claim);
-        product
+        let repeated = product
             .shutdown_background_workers_until(Instant::now() + Duration::from_secs(1))
             .await
-            .unwrap();
+            .expect_err("an observed original panic remains a shutdown failure");
+        assert!(repeated.contains("panicked"));
         assert!(result.unwrap_err().contains("panicked"));
         assert_eq!(repository.list_keyed_projections().await.unwrap(), before);
     }
