@@ -65,12 +65,18 @@ type ExecutionFactoryBuilder = fn(
 type PureProgramBuilder =
     fn(ConnectorProviderId) -> PureProviderProgramDefinition<ConnectorCodecError>;
 
+type MetadataIoGeometryBuilder = fn() -> Result<
+    novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
+    novarocks_spi::connector::ConnectorError,
+>;
+
 #[derive(Clone, Copy)]
 struct ProviderBuilderDefinition {
     contract: ContractBuilder,
     control: Option<ControlFactoryBuilder>,
     execution: Option<ExecutionFactoryBuilder>,
     pure: PureProgramBuilder,
+    metadata_io_geometry: Option<MetadataIoGeometryBuilder>,
 }
 
 struct SealedProviderBuilder {
@@ -78,6 +84,7 @@ struct SealedProviderBuilder {
     control: ControlFactoryBuilder,
     execution: ExecutionFactoryBuilder,
     pure: PureProgramBuilder,
+    metadata_io_geometry: Option<MetadataIoGeometryBuilder>,
 }
 
 // Design: ADR-0139 (docs/adr/ADR-0139-sealed-active-provider-manifest.md)
@@ -87,12 +94,14 @@ const PROVIDER_BUILDERS: &[ProviderBuilderDefinition] = &[
         control: Some(build_iceberg_control_factory),
         execution: Some(build_iceberg_execution_factory),
         pure: iceberg_pure_program,
+        metadata_io_geometry: Some(novarocks_connector_iceberg::metadata_maintenance_io_geometry),
     },
     ProviderBuilderDefinition {
         contract: novarocks_connector_paimon::definition::paimon_contract_definition,
         control: Some(build_paimon_control_factory),
         execution: Some(build_paimon_execution_factory),
         pure: paimon_pure_program,
+        metadata_io_geometry: None,
     },
 ];
 
@@ -136,6 +145,7 @@ impl ServerProviderManifest {
                 control,
                 execution,
                 pure: definition.pure,
+                metadata_io_geometry: definition.metadata_io_geometry,
             });
         }
 
@@ -160,6 +170,26 @@ impl ServerProviderManifest {
 
     pub const fn contracts(&self) -> &SealedProviderRegistry {
         &self.contracts
+    }
+
+    /// Pure fixed backing of the original active metadata action factory.
+    /// This does not bind a catalog generation, route, or runtime capability.
+    pub fn metadata_maintenance_io_geometry(
+        &self,
+    ) -> anyhow::Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry> {
+        let mut authors = self.builders.iter().filter_map(|builder| {
+            builder
+                .metadata_io_geometry
+                .map(|quote| (&builder.provider_id, quote))
+        });
+        let (provider, quote) = authors.next().ok_or_else(|| {
+            anyhow::anyhow!("server manifest has no metadata I/O geometry author")
+        })?;
+        anyhow::ensure!(
+            authors.next().is_none(),
+            "multiple metadata I/O factories require explicit composition"
+        );
+        quote().with_context(|| format!("quote `{}` metadata I/O factory", provider.as_str()))
     }
 
     pub fn compose_control_factories(
@@ -468,6 +498,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sealed_metadata_geometry_is_the_same_iceberg_factory_without_a_role_session() {
+        let manifest = ServerProviderManifest::seal().unwrap();
+        assert_eq!(
+            manifest.metadata_maintenance_io_geometry().unwrap(),
+            novarocks_connector_iceberg::metadata_maintenance_io_geometry().unwrap()
+        );
+    }
+
     fn drifted_control_factory(
         _input: &ProviderFactoryInput<'_>,
     ) -> anyhow::Result<Arc<dyn ConnectorControlRoleBindingFactory>> {
@@ -522,6 +561,7 @@ mod tests {
             control: Some(fixture_control_factory),
             execution: None,
             pure: fixture_pure_program,
+            metadata_io_geometry: None,
         }])
         .err()
         .expect("missing BE factory must fail")
@@ -537,12 +577,14 @@ mod tests {
                 control: Some(fixture_control_factory),
                 execution: Some(fixture_execution_factory),
                 pure: fixture_pure_program,
+                metadata_io_geometry: None,
             },
             ProviderBuilderDefinition {
                 contract: duplicate_fixture_contract,
                 control: Some(fixture_control_factory),
                 execution: Some(fixture_execution_factory),
                 pure: fixture_pure_program,
+                metadata_io_geometry: None,
             },
         ])
         .err()
@@ -558,6 +600,7 @@ mod tests {
             control: Some(drifted_control_factory),
             execution: Some(fixture_execution_factory),
             pure: fixture_pure_program,
+            metadata_io_geometry: None,
         }])
         .expect("contract-only sealing must not invoke factories");
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
@@ -591,6 +634,7 @@ mod tests {
             control: Some(counted_control_factory),
             execution: Some(counted_execution_factory),
             pure: fixture_pure_program,
+            metadata_io_geometry: None,
         }])
         .expect("manifest");
         assert_eq!(CONTROL_BUILDS.load(Ordering::Acquire), 0);
@@ -735,6 +779,7 @@ mod tests {
             control: Some(fixture_control_factory),
             execution: Some(fixture_execution_factory),
             pure: fixture_pure_program,
+            metadata_io_geometry: None,
         }])
         .expect("manifest");
         let error = manifest

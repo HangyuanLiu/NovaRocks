@@ -100,6 +100,56 @@ pub(crate) fn original_input_layouts<F: Future<Output = ()>>()
     })
 }
 
+/// The actual fixed Apply inventory, including canonical reply headers which
+/// can outlive action/IO. Dynamic reply cells and payload remain per action.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ApplySourceGeometry {
+    pub(crate) records: usize,
+    pub(crate) record_array: std::alloc::Layout,
+    pub(crate) core: std::alloc::Layout,
+    pub(crate) canonical_header: std::alloc::Layout,
+    pub(crate) canonical_headers: usize,
+    pub(crate) owner: std::alloc::Layout,
+}
+impl ApplySourceGeometry {
+    pub(crate) fn resident_bytes(self) -> Result<usize, novarocks_workload_control::WorkError> {
+        use novarocks_workload_control::WorkError;
+        self.canonical_headers
+            .checked_mul(self.canonical_header.size())
+            .and_then(|bytes| bytes.checked_add(self.record_array.size()))
+            .and_then(|bytes| bytes.checked_add(self.core.size()))
+            .and_then(|bytes| bytes.checked_add(self.owner.size()))
+            .ok_or(WorkError::ArithmeticOverflow)
+    }
+}
+/// Shared by installation inventory observation and frontend composition.
+/// These are requested Rust backing layouts, not a Tokio task or platform
+/// synchronization implementation estimate. No source is constructed here.
+pub(crate) fn apply_source_geometry(
+    records: usize,
+) -> Result<ApplySourceGeometry, novarocks_workload_control::WorkError> {
+    use novarocks_type_contract::owned_resources::layout::arc_layout;
+    use novarocks_workload_control::WorkError;
+    use std::alloc::Layout;
+    if records == 0 {
+        return Err(WorkError::Capacity("Native Apply records"));
+    }
+    Ok(ApplySourceGeometry {
+        records,
+        record_array: Layout::array::<Option<OriginalRecord>>(records)
+            .map_err(|_| WorkError::ArithmeticOverflow)?,
+        core: arc_layout(Layout::new::<Core>()).map_err(|_| WorkError::ArithmeticOverflow)?,
+        canonical_header: arc_layout(Layout::new::<ReservationBacking>())
+            .map_err(|_| WorkError::ArithmeticOverflow)?,
+        // One retiring header can still be leaving the serial reaper after
+        // its original row has become available to its successor.
+        canonical_headers: records
+            .checked_add(1)
+            .ok_or(WorkError::ArithmeticOverflow)?,
+        owner: Layout::new::<ApplySendOwner>(),
+    })
+}
+
 // The one original future stays in the record even if Handle::spawn unwinds.
 // This is the ORIGINAL send task, not a second observer or retry task.
 struct OriginalInput {
@@ -497,8 +547,6 @@ impl ApplySendPort {
     pub(crate) fn capacity_sources(
         &self,
     ) -> Result<(usize, usize), novarocks_workload_control::WorkError> {
-        use novarocks_workload_control::WorkError;
-        use std::alloc::Layout;
         let records = self
             .core
             .state
@@ -506,30 +554,8 @@ impl ApplySendPort {
             .unwrap_or_else(|e| e.into_inner())
             .records
             .len();
-        let array = Layout::array::<Option<OriginalRecord>>(records)
-            .map_err(|_| WorkError::ArithmeticOverflow)?;
-        let core =
-            novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<Core>())
-                .map_err(|_| WorkError::ArithmeticOverflow)?;
-        // Same fixed process inventory owns canonical backing headers until
-        // their actual final Arc exit. One old header can be leaving the
-        // serial reaper while its freed row admits its successor.
-        let reply_headers =
-            novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<
-                ReservationBacking,
-            >())
-            .map_err(|_| WorkError::ArithmeticOverflow)?;
-        let reply_headers = records
-            .checked_add(1)
-            .and_then(|n| n.checked_mul(reply_headers.size()))
-            .ok_or(WorkError::ArithmeticOverflow)?;
-        let bytes = array
-            .size()
-            .checked_add(reply_headers)
-            .and_then(|n| n.checked_add(core.size()))
-            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<ApplySendOwner>()))
-            .ok_or(WorkError::ArithmeticOverflow)?;
-        Ok((records, bytes))
+        let geometry = apply_source_geometry(records)?;
+        Ok((geometry.records, geometry.resident_bytes()?))
     }
 
     /// Refuse a closed role before starting a paid proposal. This does not

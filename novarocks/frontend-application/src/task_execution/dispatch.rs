@@ -68,6 +68,7 @@ struct QueuedOperation {
     queue_permit: Box<dyn super::intent::TaskOperationQueuePermit>,
     queued_at: MonotonicInstant,
     queued_bytes: usize,
+    packing: super::intent::OriginalOperationPacking,
 }
 
 pub(crate) fn queued_operation_layout() -> std::alloc::Layout {
@@ -250,6 +251,9 @@ impl OperationDispatcher {
         queue_permit: Box<dyn super::intent::TaskOperationQueuePermit>,
     ) -> Result<(), TaskExecutionError> {
         self.validate_operation_carrier(&intent)?;
+        let packing = queue_permit
+            .packing_support(&intent)
+            .map_err(TaskExecutionError::Workload)?;
         let queued_bytes = intent.queued_bytes();
         let backend = intent.backend_process_id();
         let lane = lane_index(intent.lane());
@@ -284,6 +288,7 @@ impl OperationDispatcher {
             queue_permit,
             queued_at: now,
             queued_bytes,
+            packing,
         };
         if front {
             queues.lanes[lane].push_front(entry);
@@ -676,11 +681,27 @@ impl OperationDispatcher {
             if retained_items.is_some_and(|items| items > allowance) {
                 return None;
             }
+            if let Some(items) = retained_items {
+                let mut owned = 0_u64;
+                let mut limit = u64::MAX;
+                for entry in queues.lanes[lane].iter().take(items) {
+                    limit = limit.min(entry.packing.maximum_owned_increment());
+                    let Some(next) = owned.checked_add(entry.packing.owned_bytes()) else {
+                        return None;
+                    };
+                    if next > limit {
+                        return None;
+                    }
+                    owned = next;
+                }
+            }
             let allowance = retained_items.unwrap_or(allowance);
             let mut native_pending = None;
             let mut operations = Vec::new();
             let mut queue_permits = Vec::new();
             let mut queued_bytes = 0_usize;
+            let mut owned_bytes = 0_u64;
+            let mut owned_limit = u64::MAX;
             let mut queued_at = None;
             let original_run = queues.lanes[lane]
                 .front()
@@ -709,6 +730,21 @@ impl OperationDispatcher {
                 if queued_bytes.saturating_add(entry.queued_bytes) > max_bytes {
                     break;
                 }
+                let next_limit = owned_limit.min(entry.packing.maximum_owned_increment());
+                let Some(next_owned) = owned_bytes.checked_add(entry.packing.owned_bytes()) else {
+                    break;
+                };
+                if next_owned > next_limit {
+                    // Leave this exact input/permit/timestamp at the head.
+                    // Only a fresh unquoted run may select a shorter prefix.
+                    debug_assert!(
+                        retained_items.is_none(),
+                        "paid Native span was already invoiced"
+                    );
+                    break;
+                }
+                owned_bytes = next_owned;
+                owned_limit = next_limit;
                 let mut entry = queues.lanes[lane]
                     .pop_front()
                     .expect("the front entry was just observed");
@@ -817,6 +853,9 @@ impl OperationDispatcher {
                 operations.into_iter().zip(queue_permits).enumerate().rev()
             {
                 let queued_bytes = intent.queued_bytes();
+                let packing = queue_permit
+                    .packing_support(&intent)
+                    .expect("unchanged original refused input retains its packing invoice");
                 let entry = QueuedOperation {
                     native_pending: if index == 0 {
                         native_pending.take()
@@ -827,6 +866,7 @@ impl OperationDispatcher {
                     queue_permit,
                     queued_at,
                     queued_bytes,
+                    packing,
                 };
                 queues.lanes[lane].push_front(entry);
                 queues.queued_items += 1;
@@ -924,4 +964,11 @@ struct UntrackedTestQueuePermit;
 #[cfg(test)]
 impl super::intent::TaskOperationQueuePermit for UntrackedTestQueuePermit {
     fn mark_in_flight(&mut self) {}
+    fn packing_support(
+        &self,
+        _: &OperationIntent,
+    ) -> Result<super::intent::OriginalOperationPacking, novarocks_workload_control::WorkError>
+    {
+        Ok(super::intent::test_operation_packing())
+    }
 }

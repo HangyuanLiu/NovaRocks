@@ -167,7 +167,41 @@ impl RootPayloadSource<'_> {
                 return Err(WorkError::Capacity("Root protected payload increment"));
             }
         }
-        let mut proposal = JointAdmissionHandle { inner }.begin_paid_proposal_for_scope(scope)?;
+        let proposal = JointAdmissionHandle { inner }.begin_paid_proposal_for_scope(scope)?;
+        self.finish_begin(proposal, delta_bytes)
+    }
+
+    /// Full owns no paid constructor. The caller keeps the same stable Root,
+    /// payload grant and frozen active-grant set while awaiting reobservation.
+    pub fn try_begin(
+        self,
+        delta_bytes: u64,
+    ) -> Result<JointTryBegin<RootPayloadProposal>, WorkError> {
+        let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
+        let scope = WorkScope {
+            inner: Arc::clone(&inner),
+            id: self.root,
+        };
+        {
+            let state = inner.state.lock().unwrap();
+            node(&state, self.root, self.fence.lane)?;
+            if delta_bytes > super::root_stage::maximum_payload_increment(&state, self.root)? {
+                return Err(WorkError::Capacity("Root protected payload increment"));
+            }
+        }
+        match (JointAdmissionHandle { inner }).try_begin_paid_proposal_for_scope(scope)? {
+            JointTryBegin::Full(wait) => Ok(JointTryBegin::Full(wait)),
+            JointTryBegin::Started(proposal) => self
+                .finish_begin(proposal, delta_bytes)
+                .map(JointTryBegin::Started),
+        }
+    }
+
+    fn finish_begin(
+        self,
+        mut proposal: JointProposal,
+        delta_bytes: u64,
+    ) -> Result<RootPayloadProposal, WorkError> {
         proposal.root_payload = Some(self.fence);
         let mut physical = Vec::new();
         physical

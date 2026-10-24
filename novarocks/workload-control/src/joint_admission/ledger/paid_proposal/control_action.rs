@@ -207,7 +207,7 @@ impl ControlActionSource {
             .map_err(|error| JointAdmissionFailure { error })
     }
     fn begin_inner(
-        self,
+        &self,
         metadata_bytes: NonZeroU64,
         position_or_queue_bytes: NonZeroU64,
     ) -> Result<ControlActionAdmission, WorkError> {
@@ -215,13 +215,50 @@ impl ControlActionSource {
         {
             source_facts(&inner.state.lock().unwrap(), self.owner, self.fence)?;
         }
-        let mut proposal = JointAdmissionHandle {
+        let proposal = JointAdmissionHandle {
             inner: Arc::clone(&inner),
         }
         .begin_paid_proposal_for_scope(WorkScope {
             inner: Arc::clone(&inner),
             id: self.owner,
         })?;
+        self.finish_begin(proposal, metadata_bytes, position_or_queue_bytes)
+    }
+
+    pub(super) fn try_begin(
+        &self,
+        metadata_bytes: NonZeroU64,
+        position_or_queue_bytes: NonZeroU64,
+    ) -> Result<JointTryBegin<ControlActionAdmission>, JointAdmissionFailure> {
+        let result = (|| {
+            let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
+            source_facts(&inner.state.lock().unwrap(), self.owner, self.fence)?;
+            let attempt = JointAdmissionHandle {
+                inner: Arc::clone(&inner),
+            }
+            .try_begin_paid_proposal_for_scope(WorkScope {
+                inner: Arc::clone(&inner),
+                id: self.owner,
+            })?;
+            // Full is not permission to refresh this original source fence.
+            source_facts(&inner.state.lock().unwrap(), self.owner, self.fence)?;
+            match attempt {
+                JointTryBegin::Full(wait) => Ok(JointTryBegin::Full(wait)),
+                JointTryBegin::Started(proposal) => self
+                    .finish_begin(proposal, metadata_bytes, position_or_queue_bytes)
+                    .map(JointTryBegin::Started),
+            }
+        })();
+        result.map_err(|error| JointAdmissionFailure { error })
+    }
+
+    fn finish_begin(
+        &self,
+        mut proposal: JointProposal,
+        metadata_bytes: NonZeroU64,
+        position_or_queue_bytes: NonZeroU64,
+    ) -> Result<ControlActionAdmission, WorkError> {
+        let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
         // Recheck after original Q reservation; no caller-built D or mask enters.
         let facts = {
             Arc::clone(source_facts(

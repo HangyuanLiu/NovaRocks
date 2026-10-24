@@ -37,7 +37,8 @@ use novarocks_frontend_application::{
     ClusterBackendOpenConfig, FrontendApplicationOpenConfig, FrontendDependencyCustodyLimits,
     FrontendExecutionConfig, FrontendLogicalExecutionRuntimeConfig, FrontendManagementConfig,
     FrontendNativeCapacityInputs, FrontendQueryControlTimeouts, FrontendResultCapacityProfile,
-    FrontendServingConfig, FrontendWorkloadCapacityConfig,
+    FrontendServingConfig, FrontendStatementIngress, FrontendWorkloadCapacityConfig,
+    FrontendWorkloadCapacityProfile,
 };
 use novarocks_fs::{
     FsAccessResolver, FsAccessResources, ObjectStoreProviderPool, ObjectStoreProviderPoolOptions,
@@ -593,14 +594,26 @@ pub fn compose_frontend_role_config(
     let task_execution_budgets = compose_task_execution_budgets(config)?;
     let (logical_supervisor, workload, abort_capacity, result_profile, capacity_inputs) =
         compose_frontend_workload_runtime(runtime_config)?;
+    // Pure facts come from the same sealed Provider and Native budget used
+    // below. No lease, selected dependency, or physical source is fabricated.
+    let ingress = compose_frontend_statement_ingress()?;
+    let capacity_profile = FrontendWorkloadCapacityProfile::try_for_native(
+        capacity_inputs,
+        &workload,
+        result_profile,
+        task_execution_budgets.transport,
+        ingress,
+        provider_manifest.metadata_maintenance_io_geometry()?,
+    )
+    .context("compose frontend original-source workload capacity profile")?;
     // The fifth input and the actual pool consume one frozen configuration.
-    let query_blocking_config = capacity_inputs.query_blocking_capacity();
+    let query_blocking_config = capacity_profile.inputs().query_blocking_capacity();
     let logical_runtime = FrontendLogicalExecutionRuntimeConfig::new(
         logical_supervisor,
         workload,
         abort_capacity,
         result_profile,
-        capacity_inputs,
+        capacity_profile,
     );
     let mut execution = FrontendExecutionConfig::new(
         runtime_filter_worker_count,
@@ -864,6 +877,21 @@ pub(crate) fn validate_frontend_joint_startup(
     let workload = compose_frontend_workload_policy(runtime)?;
     let profile = compose_frontend_result_profile(runtime)?;
     crate::joint_startup_report::validate_profile(&workload, profile.declared())
+}
+
+fn compose_frontend_statement_ingress() -> anyhow::Result<FrontendStatementIngress> {
+    let mysql = novarocks_mysql_adapter::frozen_mysql_startup_parameters()
+        .context("read original frontend MySQL ingress bounds")?;
+    Ok(FrontendStatementIngress {
+        ordinary_connections: NonZeroUsize::new(mysql.ordinary_positions)
+            .ok_or_else(|| anyhow!("ordinary MySQL positions must be nonzero"))?,
+        control_connections: NonZeroUsize::new(mysql.control_positions)
+            .ok_or_else(|| anyhow!("control MySQL positions must be nonzero"))?,
+        ordinary_command_bytes: NonZeroUsize::new(mysql.ordinary.limits.command_bytes)
+            .ok_or_else(|| anyhow!("ordinary MySQL command bound must be nonzero"))?,
+        control_command_bytes: NonZeroUsize::new(mysql.control.limits.command_bytes)
+            .ok_or_else(|| anyhow!("control MySQL command bound must be nonzero"))?,
+    })
 }
 
 fn compose_frontend_workload_runtime(
@@ -1213,7 +1241,11 @@ pub fn state_store_provider_registry(
 
 #[cfg(test)]
 mod tests {
-    use super::{compose_frontend_workload_runtime, compose_task_execution_budgets};
+    use super::{
+        FrontendWorkloadCapacityProfile, compose_frontend_statement_ingress,
+        compose_frontend_workload_runtime, compose_task_execution_budgets,
+    };
+    use crate::provider_manifest::ServerProviderManifest;
     use novarocks_execution_contract::{MaxWait, OperationKind};
     use novarocks_frontend_application::task_protocol_config::DispatchBudget;
     use novarocks_native_adapter::FrontendTaskTransportBudget;
@@ -1398,6 +1430,31 @@ mod tests {
             MaxWait::DEFAULT_UPDATE
         );
         assert!(budgets.coordination.status_subscription_error_budget > 0);
+    }
+
+    #[test]
+    fn frontend_profile_consumes_sealed_metadata_and_native_source_facts() {
+        let config = crate::app_config::NovaRocksConfig::default();
+        let (_, workload, _, result, inputs) =
+            compose_frontend_workload_runtime(&config.runtime).unwrap();
+        let transport = compose_task_execution_budgets(&config).unwrap().transport;
+        let providers = ServerProviderManifest::seal().unwrap();
+        let profile = FrontendWorkloadCapacityProfile::try_for_native(
+            inputs,
+            &workload,
+            result,
+            transport,
+            compose_frontend_statement_ingress().unwrap(),
+            providers.metadata_maintenance_io_geometry().unwrap(),
+        )
+        .expect("original configured action bounds compose without a role or lease");
+        let facts = profile.composition_facts().unwrap();
+        assert!(facts.maximum_dependencies > 0);
+        assert!(facts.maximum_native_owned_increment > 0);
+        assert!(facts.maximum_protected_payload_increment > 0);
+        assert!(facts.metadata_source_bytes > 0);
+        assert_eq!(facts.proposals_per_slot, 6);
+        assert_eq!(profile.policy().scope_limit(), workload.scope_records_limit);
     }
 
     #[test]

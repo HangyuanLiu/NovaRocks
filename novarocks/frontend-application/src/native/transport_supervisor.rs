@@ -620,6 +620,23 @@ impl NativeTransportQueuePermit {
 }
 
 impl crate::task_execution::intent::TaskOperationQueuePermit for NativeTransportQueuePermit {
+    fn packing_support(
+        &self,
+        _: &crate::task_execution::intent::OperationIntent,
+    ) -> Result<
+        crate::task_execution::intent::OriginalOperationPacking,
+        novarocks_workload_control::WorkError,
+    > {
+        // Raw process transport is not a paid Native input source.
+        #[cfg(not(test))]
+        {
+            Err(novarocks_workload_control::WorkError::NotReady)
+        }
+        #[cfg(test)]
+        {
+            Ok(crate::task_execution::intent::test_operation_packing())
+        }
+    }
     fn mark_in_flight(&mut self) {
         NativeTransportQueuePermit::mark_in_flight(self);
     }

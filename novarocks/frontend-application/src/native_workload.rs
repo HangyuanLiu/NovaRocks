@@ -487,3 +487,6 @@ mod installation;
 pub use installation::FrontendWorkloadCapacityProfile;
 #[cfg(test)]
 pub(crate) use installation::{original_owner_test_profile, original_owner_test_workload};
+
+mod composition;
+pub use composition::{FrontendCompositionFacts, FrontendStatementIngress};

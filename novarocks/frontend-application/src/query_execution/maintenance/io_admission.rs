@@ -26,8 +26,9 @@ use novarocks_spi::connector::{
     ConnectorMetadataMaintenanceIoProfile, ConnectorPayloadRetentionGuard,
 };
 use novarocks_workload_control::joint_admission::{
-    AsyncActionAdmission, AsyncActionGrant, JointAdjustmentReceipt, JointAdmission, JointLane,
-    RetainedPayloadGrant, RootPayloadAdmission, RootPayloadInitialAdmission, RootPayloadReady,
+    AsyncActionAdmission, AsyncActionGrant, AsyncActionSource, JointAdjustmentReceipt,
+    JointAdmission, JointLane, JointProposalSlotWait, JointTryBegin, RetainedPayloadGrant,
+    RootPayloadAdmission, RootPayloadInitialAdmission, RootPayloadInitialSource, RootPayloadReady,
 };
 use novarocks_workload_control::{WorkError, WorkOwner, WorkScope};
 use std::{
@@ -125,6 +126,8 @@ struct Body {
     bootstrap_receipt: Option<JointAdjustmentReceipt>,
     bound: Vec<SharedDependency>,
     full: Option<Arc<[SharedDependency]>>,
+    initial_source: Option<RootPayloadInitialSource>,
+    payload_slot_wait: Option<JointProposalSlotWait>,
     initial: Option<RootPayloadInitialAdmission>,
     payload: Option<RetainedPayloadGrant>,
     growth: Option<RootPayloadAdmission>,
@@ -157,6 +160,8 @@ struct CellBody {
     claimed: bool,
     full: Option<Arc<[SharedDependency]>>,
     extension: Option<SharedDependency>,
+    source: Option<AsyncActionSource>,
+    slot_wait: Option<JointProposalSlotWait>,
     admission: Option<AsyncActionAdmission>,
     grant: Option<AsyncActionGrant>,
     failure: Option<WorkError>,
@@ -507,6 +512,8 @@ impl MetadataIoAdmission {
                 bootstrap_receipt: None,
                 bound,
                 full: None,
+                initial_source: None,
+                payload_slot_wait: None,
                 initial: None,
                 payload: None,
                 growth: None,
@@ -534,8 +541,12 @@ impl MetadataIoAdmission {
         } else {
             0
         };
+        // Inline wait/source fields are already in the actual CellBody. Only
+        // the one possible original wait factory F pointee is additional.
+        let (_, wait_future) = JointProposalSlotWait::metadata_layouts();
         let per = std::mem::size_of::<RequestCell>()
-            .checked_add(arc)
+            .checked_add(wait_future.size())
+            .and_then(|v| v.checked_add(arc))
             .and_then(|v| v.checked_add(4 * mutex_external))
             .and_then(|v| v.checked_add(std::mem::size_of::<Arc<RequestCell>>()))
             .and_then(|v| v.checked_add(std::mem::size_of::<Loan<'_, CellBody>>()))
@@ -547,6 +558,9 @@ impl MetadataIoAdmission {
             .ok_or(WorkError::ArithmeticOverflow)?;
         let bytes = per
             .checked_mul(n)
+            // Initial and growth are mutually exclusive original Root phases;
+            // they share one fixed wait slot and at most one actual wait F.
+            .and_then(|v| v.checked_add(wait_future.size()))
             .and_then(|v| {
                 v.checked_add(
                     std::mem::size_of::<Self>()
@@ -712,15 +726,37 @@ impl MetadataIoAdmission {
                 notice.notify();
             }
             if body.initial.is_none() {
+                if let Some(wait) = body.payload_slot_wait.as_mut() {
+                    match Pin::new(wait).poll(cx) {
+                        Poll::Pending => return Ok(false),
+                        Poll::Ready(Ok(())) => drop(body.payload_slot_wait.take()),
+                        Poll::Ready(Err(error)) => return Err(error),
+                    }
+                }
+                if body.initial_source.is_none() {
+                    body.initial_source = Some(owner.root_payload_initial_source()?);
+                }
                 let bytes = body.source_metadata_bytes;
-                body.initial = Some(
-                    owner
-                        .begin_root_payload(
-                            NonZeroU64::new(bytes).ok_or(WorkError::ArithmeticOverflow)?,
-                            body.profile.initial_owned_bytes(),
-                        )
-                        .map_err(|e| e.error)?,
-                );
+                match body
+                    .initial_source
+                    .as_ref()
+                    .unwrap()
+                    .try_begin(
+                        NonZeroU64::new(bytes).ok_or(WorkError::ArithmeticOverflow)?,
+                        body.profile.initial_owned_bytes(),
+                    )
+                    .map_err(|failure| failure.error)?
+                {
+                    JointTryBegin::Started(admission) => body.initial = Some(admission),
+                    JointTryBegin::Full(mut wait) => {
+                        match Pin::new(&mut wait).poll(cx) {
+                            Poll::Pending => body.payload_slot_wait = Some(wait),
+                            Poll::Ready(Ok(())) => body.reobserve = true,
+                            Poll::Ready(Err(error)) => return Err(error),
+                        }
+                        return Ok(false);
+                    }
+                }
             }
             let notice = match body.initial.as_mut().unwrap().poll_install_in(
                 cx,
@@ -730,6 +766,9 @@ impl MetadataIoAdmission {
                 Poll::Pending => return Ok(false),
                 Poll::Ready(r) => r.map_err(|e| e.error)?,
             };
+            // The positive payload is already stable in the original field.
+            // Retire the completed admission's empty batch, not that payload.
+            drop(body.initial.take());
             body.bound
                 .extend_from_slice(body.profile.initial_dependencies());
             body.full = Some(body.bound.clone().into());
@@ -743,7 +782,7 @@ impl MetadataIoAdmission {
             body.changed = true;
             notice.notify();
         }
-        if body.growth.is_none() && body.growth_ready.is_none() {
+        if body.growth.is_none() && body.growth_ready.is_none() && body.growth_cell.is_none() {
             for original in &mut body.cells {
                 if !original.stream_clear() || Arc::get_mut(original).is_none() {
                     continue;
@@ -758,6 +797,27 @@ impl MetadataIoAdmission {
         let mut cells = Vec::with_capacity(body.cells.len());
         for cell in &body.cells {
             cells.push(loan(&cell.original).ok_or(WorkError::Conflict)?);
+        }
+        if let Some(wait) = body.payload_slot_wait.as_mut() {
+            match Pin::new(wait).poll(cx) {
+                Poll::Pending => return Ok(body.first_ready),
+                Poll::Ready(Ok(())) => {
+                    drop(body.payload_slot_wait.take());
+                    // The same pending route/peak and actual holder set were
+                    // frozen while no paid constructor had a Q cell.
+                    body.cursor = body.growth_cell.ok_or(WorkError::Conflict)?;
+                }
+                Poll::Ready(Err(error)) => {
+                    let i = body.growth_cell.take().ok_or(WorkError::Conflict)?;
+                    cells[i].body.as_mut().unwrap().failure = Some(error.clone());
+                    body.failure.get_or_insert(error);
+                    body.changed = true;
+                    drop(body.payload_slot_wait.take());
+                    body.growth_route.take();
+                    body.growth_bytes = 0;
+                    return Ok(body.first_ready);
+                }
+            }
         }
         // First finish the ONE original atomic replacement. Its active grant set
         // cannot change or be reclaimed while this exact receipt is outstanding.
@@ -824,6 +884,11 @@ impl MetadataIoAdmission {
         if body.growth.is_some() {
             return Ok(body.first_ready);
         }
+        if let Some(i) = body.growth_cell {
+            // A wait may have observed Free during its very first poll. Keep
+            // that exact original pending intent first on the next turn too.
+            body.cursor = i;
+        }
         for offset in 0..cells.len() {
             let i = (body.cursor + offset) % cells.len();
             let cell = cells[i].body.as_ref().unwrap();
@@ -860,6 +925,8 @@ impl MetadataIoAdmission {
                     let source = source.body.as_mut().unwrap();
                     if source.grant.is_none() {
                         drop(source.admission.take());
+                        drop(source.slot_wait.take());
+                        drop(source.source.take());
                     }
                 }
                 let active: Vec<_> = cells
@@ -872,30 +939,59 @@ impl MetadataIoAdmission {
                     JointLane::Foreground
                 };
                 let construction = (|| {
-                    let mut p = body
+                    let source = body
                         .payload
                         .as_ref()
                         .unwrap()
-                        .root_payload_source(&body.root, lane, &active)?
-                        .begin(bytes)?;
-                    if let Some(route) = route.as_ref() {
-                        p.push_dependency(route)?;
+                        .root_payload_source(&body.root, lane, &active)?;
+                    match source.try_begin(bytes)? {
+                        JointTryBegin::Started(mut proposal) => {
+                            if let Some(route) = route.as_ref() {
+                                proposal.push_dependency(route)?;
+                            }
+                            proposal.end_change()?;
+                            proposal
+                                .submit()
+                                .map(JointTryBegin::Started)
+                                .map_err(|failure| failure.error)
+                        }
+                        JointTryBegin::Full(wait) => Ok(JointTryBegin::Full(wait)),
                     }
-                    p.end_change()?;
-                    p.submit().map_err(|e| e.error)
                 })();
                 match construction {
-                    Ok(p) => {
-                        body.growth = Some(p);
+                    Ok(JointTryBegin::Started(proposal)) => {
+                        body.growth = Some(proposal);
                         body.growth_cell = Some(i);
                         body.growth_route = route;
                         body.growth_bytes = bytes;
                         body.reobserve = true;
                     }
+                    Ok(JointTryBegin::Full(mut wait)) => {
+                        // Full has no paid Q intent. Keep the same original
+                        // positive holders and route/peak until real reobserve.
+                        body.growth_cell = Some(i);
+                        body.growth_route = route;
+                        body.growth_bytes = bytes;
+                        match Pin::new(&mut wait).poll(cx) {
+                            Poll::Pending => body.payload_slot_wait = Some(wait),
+                            Poll::Ready(Ok(())) => body.reobserve = true,
+                            Poll::Ready(Err(error)) => {
+                                cells[i].body.as_mut().unwrap().failure = Some(error.clone());
+                                body.failure.get_or_insert(error);
+                                body.changed = true;
+                                body.growth_cell.take();
+                                body.growth_route.take();
+                                body.growth_bytes = 0;
+                            }
+                        }
+                    }
                     Err(error) => {
                         cells[i].body.as_mut().unwrap().failure = Some(error.clone());
                         body.failure.get_or_insert(error);
                         body.changed = true;
+                        body.growth_cell.take();
+                        body.growth_route.take();
+                        body.growth_bytes = 0;
                     }
                 }
                 break;
@@ -915,17 +1011,61 @@ impl MetadataIoAdmission {
                 } else {
                     JointLane::Foreground
                 };
-                match owner.async_action_source(lane).and_then(|s| {
-                    s.begin(
-                        NonZeroU64::new(Self::request_metadata_bytes()).unwrap(),
-                        NonZeroU64::new(1).unwrap(),
-                    )
-                    .map_err(|e| e.error)
-                }) {
-                    Ok(a) => cell.admission = Some(a),
-                    Err(error) => {
-                        cell.failure = Some(error.clone());
-                        body.failure.get_or_insert(error);
+                if let Some(wait) = cell.slot_wait.as_mut() {
+                    match Pin::new(wait).poll(cx) {
+                        Poll::Pending => continue,
+                        Poll::Ready(Ok(())) => {
+                            drop(cell.slot_wait.take());
+                        }
+                        Poll::Ready(Err(error)) => {
+                            cell.failure = Some(error.clone());
+                            body.failure.get_or_insert(error);
+                            body.changed = true;
+                            drop(cell.slot_wait.take());
+                            continue;
+                        }
+                    }
+                }
+                if cell.source.is_none() {
+                    match owner.async_action_source(lane) {
+                        Ok(source) => cell.source = Some(source),
+                        Err(error) => {
+                            cell.failure = Some(error.clone());
+                            body.failure.get_or_insert(error);
+                            body.changed = true;
+                            continue;
+                        }
+                    }
+                }
+                // Full means only the original fixed proposal inventory is
+                // temporarily occupied. Keep this exact captured source and
+                // request, and keep receiving other cells' original replies.
+                match cell.source.as_ref().unwrap().try_begin(
+                    NonZeroU64::new(Self::request_metadata_bytes()).unwrap(),
+                    NonZeroU64::new(1).unwrap(),
+                ) {
+                    Ok(JointTryBegin::Started(admission)) => cell.admission = Some(admission),
+                    Ok(JointTryBegin::Full(mut wait)) => {
+                        // Register the actual release observer before leaving
+                        // this turn; an unpolled wait would have no wake source.
+                        match Pin::new(&mut wait).poll(cx) {
+                            Poll::Pending => cell.slot_wait = Some(wait),
+                            Poll::Ready(Ok(())) => {
+                                // A real Free cut raced the initial Full fact.
+                                // Reobserve once, never repoll a completed wait.
+                                body.reobserve = true;
+                            }
+                            Poll::Ready(Err(error)) => {
+                                cell.failure = Some(error.clone());
+                                body.failure.get_or_insert(error);
+                                body.changed = true;
+                            }
+                        }
+                        continue;
+                    }
+                    Err(failure) => {
+                        cell.failure = Some(failure.error.clone());
+                        body.failure.get_or_insert(failure.error);
                         body.changed = true;
                         continue;
                     }
@@ -970,7 +1110,11 @@ impl MetadataIoAdmission {
             return Poll::Ready(Err(WorkError::Conflict));
         };
         let body = original.body.as_mut().unwrap();
-        if body.growth.is_some() || body.growth_ready.is_some() {
+        if body.growth.is_some()
+            || body.growth_ready.is_some()
+            || body.growth_cell.is_some()
+            || body.payload_slot_wait.is_some()
+        {
             return Poll::Pending;
         }
         for original in &mut body.cells {
@@ -1009,7 +1153,12 @@ impl MetadataIoAdmission {
                 return Err(error(failure));
             }
         }
-        for cell in &mut body.cells {
+        for (index, cell) in body.cells.iter_mut().enumerate() {
+            // The original route/peak request cannot be overwritten while its
+            // constructor awaits Q, even if its borrowing caller has exited.
+            if body.growth_cell == Some(index) {
+                continue;
+            }
             if !cell.stream_clear() || Arc::get_mut(cell).is_none() {
                 continue;
             }
@@ -1022,7 +1171,9 @@ impl MetadataIoAdmission {
             // Their completed request cell becomes reusable after that batch.
             if state.claimed
                 && state.grant.is_some()
-                && (body.growth.is_some() || body.growth_ready.is_some())
+                && (body.growth.is_some()
+                    || body.growth_ready.is_some()
+                    || body.growth_cell.is_some())
             {
                 continue;
             }
@@ -1103,3 +1254,317 @@ impl std::error::Error for MetadataIoAdmission {}
 #[cfg(test)]
 #[path = "io_admission/cleanup_tests.rs"]
 pub(super) mod cleanup_tests;
+
+#[cfg(test)]
+mod original_governor_tests {
+    use super::*;
+    use novarocks_spi::connector::ConnectorIoPermit;
+    use novarocks_workload_control::{
+        ControlStorageConfig, RootWork, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+        joint_admission::{
+            JointCapacityConfig, JointProgress, JointProgressDriver, JointResource as R,
+            JointResourceLimits, JointResources, RequiredJointProgress,
+        },
+    };
+    use std::{
+        num::NonZeroUsize,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Wake, Waker},
+    };
+
+    #[derive(Default)]
+    struct OriginalWake(AtomicUsize);
+    impl Wake for OriginalWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // Finite single-class/single-LocalHost component policy only. This creates
+    // the actual WC substrate, not a Native or external-fault protection token.
+    fn original_governor() -> (WorkloadControl, JointProgressDriver, RootWork) {
+        let count = 8;
+        let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], count - 1, 2, &[]);
+        let mut config = JointCapacityConfig {
+            global: JointResourceLimits::default(),
+            classes: [JointResourceLimits::default(); 5],
+            lanes: [JointResourceLimits::default(); 3],
+            class_lanes: [[JointResourceLimits::default(); 3]; 5],
+            max_dependencies_per_claim: 1,
+            max_registered_dependencies: 1,
+            max_claims: 64,
+            max_requests: 32,
+            max_changes_per_request: 10,
+            max_snapshot_bytes: 64 * 1024 * 1024,
+            max_scratch_bytes: 64 * 1024 * 1024,
+            max_residual_arcs: 100000,
+            max_total_proof_work: 10000000,
+            work_per_turn: NonZeroUsize::new(7).unwrap(),
+        };
+        config.max_registered_dependencies = storage.minimum_dependency_records(&config).unwrap();
+        let base = storage.base_charge(&config).unwrap();
+        let m = base.get(R::MetadataBytes);
+        let custody = JointResourceLimits {
+            global: JointResources::ZERO
+                .with(R::ScopeRecords, count as u64)
+                .with(R::ClaimRecords, 32)
+                .with(R::MetadataBytes, m.checked_mul(128).unwrap())
+                .with(R::PayloadBytes, 4096),
+            per_dependency: JointResources::ZERO
+                .with(R::ScopeRecords, count as u64)
+                .with(R::ClaimRecords, 32)
+                .with(R::MetadataBytes, m.checked_mul(128).unwrap())
+                .with(R::PayloadBytes, 4096),
+            protected_progress: base,
+        };
+        let action = JointResourceLimits {
+            global: JointResources::ZERO
+                .with(R::ClaimRecords, 8)
+                .with(R::MetadataBytes, m.checked_mul(64).unwrap())
+                .with(R::AsyncIo, 8),
+            per_dependency: JointResources::ZERO
+                .with(R::ClaimRecords, 8)
+                .with(R::MetadataBytes, m.checked_mul(64).unwrap())
+                .with(R::AsyncIo, 8),
+            protected_progress: JointResources::ZERO,
+        };
+        // Explicit sum of both original runtime lanes and the custody lane;
+        // no private WC resource arithmetic or hidden extra physical pool.
+        let global = JointResourceLimits {
+            global: JointResources::ZERO
+                .with(R::ScopeRecords, count as u64)
+                .with(R::ClaimRecords, 48)
+                .with(R::MetadataBytes, m.checked_mul(256).unwrap())
+                .with(R::PayloadBytes, 4096)
+                .with(R::AsyncIo, 16),
+            per_dependency: JointResources::ZERO
+                .with(R::ScopeRecords, count as u64)
+                .with(R::ClaimRecords, 48)
+                .with(R::MetadataBytes, m.checked_mul(256).unwrap())
+                .with(R::PayloadBytes, 4096)
+                .with(R::AsyncIo, 16),
+            protected_progress: base,
+        };
+        config.global = global;
+        config.classes[0] = global;
+        config.lanes = [custody, action, action];
+        config.class_lanes[0] = config.lanes;
+        // This component promises the actual fixed substrate. It exercises
+        // real AsyncIo hard caps, without declaring a production bad-domain
+        // or complete five-class Native progress minimum.
+        let mut required = RequiredJointProgress {
+            global: base,
+            classes: [JointResources::ZERO; 5],
+            lanes: [JointResources::ZERO; 3],
+            class_lanes: [[JointResources::ZERO; 3]; 5],
+        };
+        required.classes[0] = base;
+        required.lanes[0] = base;
+        required.class_lanes[0][0] = base;
+        let control = WorkloadControl::try_new_counted(WorkloadConfig {
+            root_limit: count,
+            business_limit: count,
+            query_concurrency_limit: count,
+            scope_records_limit: count,
+            ..WorkloadConfig::default()
+        })
+        .unwrap()
+        .owner;
+        let (_, driver) = control
+            .configure_joint_capacity(config.validate(&required).unwrap())
+            .unwrap();
+        control.configure_control_storage(storage).unwrap();
+        control.mark_ready().unwrap();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        (control, driver, root)
+    }
+
+    fn drive_original(driver: &mut JointProgressDriver) {
+        for _ in 0..100000 {
+            if matches!(driver.step(), JointProgress::Idle(_)) {
+                return;
+            }
+        }
+        panic!("same finite metadata component driver failed to become idle");
+    }
+
+    fn assert_original_healthy(source: &MetadataIoAdmission) {
+        let original = source.original.lock().unwrap();
+        let body = original.as_ref().unwrap();
+        assert!(body.failure.is_none());
+        for cell in &body.cells {
+            assert!(
+                cell.original
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .failure
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn eight_original_requests_share_two_proposal_cells_and_all_exit() {
+        let (control, mut driver, root) = original_governor();
+        let source_bytes = MetadataIoAdmission::fixed_backing_bytes(8, 1).unwrap();
+        let profile = ConnectorMetadataMaintenanceIoProfile::try_new(
+            NonZeroUsize::new(8).unwrap(),
+            NonZeroU64::new(source_bytes).unwrap(),
+            NonZeroU64::new(128).unwrap(),
+            vec![SharedDependency::LocalHost],
+        )
+        .unwrap();
+        let source = MetadataIoAdmission::new(root.owner.scope(), profile, source_bytes).unwrap();
+        let wake = Arc::new(OriginalWake::default());
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut cx = Context::from_waker(&waker);
+        let mut first_ready = false;
+        // No prebound control or injected payload/grant: progress drives the
+        // same Source's actual bootstrap, initial payload and first action.
+        for _ in 0..256 {
+            first_ready = source.poll_progress(&root.owner, &mut cx).unwrap();
+            assert_original_healthy(&source);
+            if first_ready {
+                break;
+            }
+            drive_original(&mut driver);
+        }
+        assert!(
+            first_ready,
+            "real bootstrap and initial admission must complete"
+        );
+        drive_original(&mut driver);
+
+        let mut waiting: Vec<_> = (0..8)
+            .map(|_| {
+                Some(Box::pin(
+                    source
+                        .request(SharedDependency::LocalHost)
+                        .unwrap()
+                        .admitted(),
+                ))
+            })
+            .collect();
+        let mut permits: Vec<Option<ConnectorIoPermit>> = (0..8).map(|_| None).collect();
+        source.poll_progress(&root.owner, &mut cx).unwrap();
+        assert_original_healthy(&source);
+        {
+            let original = source.original.lock().unwrap();
+            let body = original.as_ref().unwrap();
+            assert_eq!(body.cells.len(), 8);
+            assert!(
+                body.cells.iter().any(|cell| cell
+                    .original
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .slot_wait
+                    .is_some()),
+                "real Q2 exhaustion must reach the Source's typed Full wait"
+            );
+        }
+
+        // No driver step or external event occurs here. After registration
+        // settles, observing old Waiting replies/Full slots must not wake the
+        // same Source forever. In particular Waiting reply polls are pure.
+        source.poll_progress(&root.owner, &mut cx).unwrap();
+        source.poll_progress(&root.owner, &mut cx).unwrap();
+        let quiet = wake.0.load(Ordering::SeqCst);
+        source.poll_progress(&root.owner, &mut cx).unwrap();
+        assert_eq!(
+            wake.0.load(Ordering::SeqCst),
+            quiet,
+            "temporary Full alone cannot create an endless self-wake"
+        );
+        assert_original_healthy(&source);
+
+        for _ in 0..256 {
+            // Only this one original driver proves/grants/reaps. The Source
+            // keeps receiving every cell while Q waiters remain Pending.
+            drive_original(&mut driver);
+            source.poll_progress(&root.owner, &mut cx).unwrap();
+            assert_original_healthy(&source);
+            for index in 0..waiting.len() {
+                let Some(future) = waiting[index].as_mut() else {
+                    continue;
+                };
+                match future.as_mut().poll(&mut cx) {
+                    Poll::Pending => {}
+                    Poll::Ready(Ok(permit)) => {
+                        permits[index] = Some(permit);
+                        // The original receipt is stable before its completed
+                        // borrowing request future actually drops.
+                        drop(waiting[index].take());
+                    }
+                    Poll::Ready(Err(error)) => panic!("real request refused: {error}"),
+                }
+            }
+            if permits.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        assert!(
+            permits.iter().all(Option::is_some),
+            "all eight real Async grants must be simultaneously held with Q2"
+        );
+        {
+            let original = source.original.lock().unwrap();
+            let body = original.as_ref().unwrap();
+            assert_eq!(
+                body.cells
+                    .iter()
+                    .filter(|cell| cell
+                        .original
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .grant
+                        .is_some())
+                    .count(),
+                8
+            );
+        }
+        assert!(matches!(
+            source.poll_quiescent(&root.owner, &mut cx),
+            Poll::Pending
+        ));
+        let retained = permits[0].as_ref().unwrap().retain();
+        drop(permits);
+        drop(waiting);
+        assert!(
+            matches!(source.poll_quiescent(&root.owner, &mut cx), Poll::Pending),
+            "the original retained request alias still prevents true exit"
+        );
+        drop(retained);
+        let mut exited = false;
+        for _ in 0..256 {
+            match source.poll_quiescent(&root.owner, &mut cx) {
+                Poll::Ready(result) => {
+                    result.unwrap();
+                    exited = true;
+                    break;
+                }
+                Poll::Pending => drive_original(&mut driver),
+            }
+        }
+        assert!(exited, "actual original request aliases must all exit");
+        drop(source);
+        root.owner.complete_after_terminal_cancel_settled();
+        root.business.release();
+        control.close_admission();
+        drive_original(&mut driver);
+        assert!(
+            control.shutdown().is_ok(),
+            "same unique WC owner must really drain; no ledger reset or fake exit"
+        );
+    }
+}

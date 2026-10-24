@@ -31,13 +31,42 @@ use super::{
     ExternalMutationEvidence, ExternalMutationOutcome, ProviderBindingEpoch,
 };
 
-/// Pure owned-source geometry and initial selected dependencies of the SAME
-/// exact provider generation. This is input to admission, never a grant.
-#[derive(Clone)]
-pub struct ConnectorMetadataMaintenanceIoProfile {
+/// Pure fixed backing of the original Provider metadata action factory.
+/// It contains no selected dependency, runtime lease, or admission authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorMetadataMaintenanceIoGeometry {
     max_concurrent_io: std::num::NonZeroUsize,
     metadata_bytes: std::num::NonZeroU64,
     initial_owned_bytes: std::num::NonZeroU64,
+}
+impl ConnectorMetadataMaintenanceIoGeometry {
+    pub const fn new(
+        max_concurrent_io: std::num::NonZeroUsize,
+        metadata_bytes: std::num::NonZeroU64,
+        initial_owned_bytes: std::num::NonZeroU64,
+    ) -> Self {
+        Self {
+            max_concurrent_io,
+            metadata_bytes,
+            initial_owned_bytes,
+        }
+    }
+    pub fn max_concurrent_io(&self) -> std::num::NonZeroUsize {
+        self.max_concurrent_io
+    }
+    pub fn metadata_bytes(&self) -> std::num::NonZeroU64 {
+        self.metadata_bytes
+    }
+    pub fn initial_owned_bytes(&self) -> std::num::NonZeroU64 {
+        self.initial_owned_bytes
+    }
+}
+
+/// The same factory geometry with the exact running generation's original
+/// selected dependencies. This is admission input, never a grant.
+#[derive(Clone)]
+pub struct ConnectorMetadataMaintenanceIoProfile {
+    geometry: ConnectorMetadataMaintenanceIoGeometry,
     initial_dependencies: std::sync::Arc<[super::SharedDependency]>,
 }
 impl ConnectorMetadataMaintenanceIoProfile {
@@ -45,6 +74,19 @@ impl ConnectorMetadataMaintenanceIoProfile {
         max_concurrent_io: std::num::NonZeroUsize,
         metadata_bytes: std::num::NonZeroU64,
         initial_owned_bytes: std::num::NonZeroU64,
+        initial_dependencies: Vec<super::SharedDependency>,
+    ) -> Result<Self, ConnectorError> {
+        Self::from_geometry(
+            ConnectorMetadataMaintenanceIoGeometry::new(
+                max_concurrent_io,
+                metadata_bytes,
+                initial_owned_bytes,
+            ),
+            initial_dependencies,
+        )
+    }
+    pub fn from_geometry(
+        geometry: ConnectorMetadataMaintenanceIoGeometry,
         initial_dependencies: Vec<super::SharedDependency>,
     ) -> Result<Self, ConnectorError> {
         if initial_dependencies.is_empty()
@@ -59,20 +101,21 @@ impl ConnectorMetadataMaintenanceIoProfile {
             ));
         }
         Ok(Self {
-            max_concurrent_io,
-            metadata_bytes,
-            initial_owned_bytes,
+            geometry,
             initial_dependencies: initial_dependencies.into(),
         })
     }
+    pub fn geometry(&self) -> &ConnectorMetadataMaintenanceIoGeometry {
+        &self.geometry
+    }
     pub fn max_concurrent_io(&self) -> std::num::NonZeroUsize {
-        self.max_concurrent_io
+        self.geometry.max_concurrent_io()
     }
     pub fn metadata_bytes(&self) -> std::num::NonZeroU64 {
-        self.metadata_bytes
+        self.geometry.metadata_bytes()
     }
     pub fn initial_owned_bytes(&self) -> std::num::NonZeroU64 {
-        self.initial_owned_bytes
+        self.geometry.initial_owned_bytes()
     }
     pub fn initial_dependencies(&self) -> &[super::SharedDependency] {
         &self.initial_dependencies
@@ -1000,6 +1043,39 @@ mod tests {
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
+
+    #[test]
+    fn fixed_geometry_requires_no_route_but_runtime_profile_requires_real_facts() {
+        let geometry = ConnectorMetadataMaintenanceIoGeometry::new(
+            std::num::NonZeroUsize::new(8).unwrap(),
+            std::num::NonZeroU64::new(11).unwrap(),
+            std::num::NonZeroU64::new(13).unwrap(),
+        );
+        assert!(ConnectorMetadataMaintenanceIoProfile::from_geometry(geometry, vec![]).is_err());
+        let profile = ConnectorMetadataMaintenanceIoProfile::from_geometry(
+            geometry,
+            vec![super::super::SharedDependency::LocalHost],
+        )
+        .unwrap();
+        assert_eq!(*profile.geometry(), geometry);
+        assert_eq!(profile.max_concurrent_io().get(), 8);
+        assert_eq!(profile.metadata_bytes().get(), 11);
+        assert_eq!(profile.initial_owned_bytes().get(), 13);
+        assert_eq!(
+            profile.initial_dependencies(),
+            &[super::super::SharedDependency::LocalHost]
+        );
+        assert!(
+            ConnectorMetadataMaintenanceIoProfile::from_geometry(
+                geometry,
+                vec![
+                    super::super::SharedDependency::LocalHost,
+                    super::super::SharedDependency::LocalHost
+                ],
+            )
+            .is_err()
+        );
+    }
 
     // Native SPI boundary coverage: provider attempt facts remain opaque, but
     // the lease must bind the fixed intent and all plan identities exactly.

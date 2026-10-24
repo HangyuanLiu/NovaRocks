@@ -653,6 +653,15 @@ impl MaintenanceCommandExecutor {
         profile: &novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile,
         complete_dependency_limit: usize,
     ) -> Result<MetadataStatementIoRequirements, novarocks_workload_control::WorkError> {
+        Self::metadata_io_requirements_for_geometry(profile.geometry(), complete_dependency_limit)
+    }
+
+    /// Pure fixed quote; selected dependencies are supplied only by the actual
+    /// running Provider profile before admission, never invented by composition.
+    pub fn metadata_io_requirements_for_geometry(
+        geometry: &novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry,
+        complete_dependency_limit: usize,
+    ) -> Result<MetadataStatementIoRequirements, novarocks_workload_control::WorkError> {
         use novarocks_workload_control::{
             WorkError,
             joint_admission::{JointResource, JointResources},
@@ -664,11 +673,11 @@ impl MaintenanceCommandExecutor {
             .ok_or(WorkError::ArithmeticOverflow)?;
         let source_metadata_bytes = u64::try_from(bytes)
             .map_err(|_| WorkError::ArithmeticOverflow)?
-            .checked_add(profile.metadata_bytes().get())
+            .checked_add(geometry.metadata_bytes().get())
             .and_then(|n| {
                 n.checked_add(
                     super::io_admission::MetadataIoAdmission::fixed_backing_bytes(
-                        profile.max_concurrent_io().get(),
+                        geometry.max_concurrent_io().get(),
                         complete_dependency_limit,
                     )
                     .ok()?,
@@ -688,8 +697,8 @@ impl MaintenanceCommandExecutor {
             foreground: step,
             settlement: step,
             source_metadata_bytes,
-            initial_payload_bytes: profile.initial_owned_bytes().get(),
-            max_concurrent_io: profile.max_concurrent_io(),
+            initial_payload_bytes: geometry.initial_owned_bytes().get(),
+            max_concurrent_io: geometry.max_concurrent_io(),
         })
     }
 }
@@ -697,3 +706,35 @@ impl MaintenanceCommandExecutor {
 #[cfg(test)]
 #[path = "command/cleanup_reception_tests.rs"]
 mod cleanup_reception_tests;
+
+#[cfg(test)]
+mod fixed_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn pure_and_running_quotes_share_the_same_original_factory_formula() {
+        use novarocks_spi::connector::{
+            ConnectorMetadataMaintenanceIoGeometry, ConnectorMetadataMaintenanceIoProfile,
+            SharedDependency,
+        };
+        let geometry = ConnectorMetadataMaintenanceIoGeometry::new(
+            std::num::NonZeroUsize::new(8).unwrap(),
+            std::num::NonZeroU64::new(11).unwrap(),
+            std::num::NonZeroU64::new(13).unwrap(),
+        );
+        let runtime = ConnectorMetadataMaintenanceIoProfile::from_geometry(
+            geometry,
+            vec![SharedDependency::LocalHost],
+        )
+        .unwrap();
+        let pure = MaintenanceCommandExecutor::metadata_io_requirements_for_geometry(&geometry, 2)
+            .unwrap();
+        let running = MaintenanceCommandExecutor::metadata_io_requirements(&runtime, 2).unwrap();
+        assert_eq!(pure.foreground, running.foreground);
+        assert_eq!(pure.settlement, running.settlement);
+        assert_eq!(pure.source_metadata_bytes, running.source_metadata_bytes);
+        assert_eq!(pure.initial_payload_bytes, running.initial_payload_bytes);
+        assert_eq!(pure.max_concurrent_io, running.max_concurrent_io);
+        assert!(pure.source_metadata_bytes > geometry.metadata_bytes().get());
+    }
+}

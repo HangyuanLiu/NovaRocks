@@ -127,6 +127,57 @@ impl std::fmt::Debug for NativeAsyncActionAuthority {
     }
 }
 impl NativeAsyncActionAuthority {
+    /// Read the installed original Native source support. Encoding coexistence
+    /// is a fact from the actual Native builder, not a delegated capacity.
+    /// The production profile keeps FG/Settlement payload support equal to
+    /// this source's encoding backing plus its next owned increment.
+    pub fn maximum_owned_increment(
+        &self,
+        encoding_coexistence_bytes: NonZeroU64,
+    ) -> Result<NonZeroU64, WorkError> {
+        let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
+        let root = WorkScope {
+            inner: Arc::clone(&inner),
+            id: self.owner,
+        };
+        let execution = WorkScope {
+            inner: Arc::clone(&inner),
+            id: self.execution,
+        };
+        // Capture the actual original control slots, not an ID-only route.
+        let root_fence = capture_node(&root)?;
+        let execution_fence = capture_node(&execution)?;
+        let state = inner.state.lock().unwrap();
+        validate_execution(&state, self.owner, self.execution)?;
+        self.capacity.validate(&state, self.owner)?;
+        node_facts(&state, &root_fence, false)?;
+        node_facts(&state, &execution_fence, false)?;
+        let node = state.nodes.get(&self.owner).ok_or(WorkError::Released)?;
+        let class = crate::joint_admission::class_index(node.class);
+        let config = &state
+            .joint
+            .as_ref()
+            .ok_or(WorkError::NotReady)?
+            .config
+            .config;
+        let mut support = u64::MAX;
+        for lane in [JointLane::Foreground, JointLane::Settlement] {
+            let lane = lane as usize;
+            for limits in [
+                config.global,
+                config.classes[class],
+                config.lanes[lane],
+                config.class_lanes[class][lane],
+            ] {
+                support = support.min(limits.protected_progress.get(JointResource::PayloadBytes));
+            }
+        }
+        support
+            .checked_sub(encoding_coexistence_bytes.get())
+            .and_then(NonZeroU64::new)
+            .ok_or(WorkError::Capacity("Native next owned increment support"))
+    }
+
     pub fn action_source(
         &self,
         lane: JointLane,
@@ -180,11 +231,61 @@ pub struct NativeAsyncActionSource {
 }
 #[must_use = "Retain this same original paid ticket in the pending batch"]
 pub struct NativeAsyncActionAdmission {
-    admission: JointAdmission,
+    admission: Option<JointAdmission>,
     scope: WorkScope,
     fence: NativeActionFence,
+    slot_wait: Option<JointProposalSlotWait>,
 }
 impl NativeAsyncActionAdmission {
+    pub fn is_waiting_for_proposal_slot(&self) -> bool {
+        self.admission.is_none()
+    }
+
+    fn poll_constructor(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), JointAdmissionFailure>> {
+        if self.admission.is_some() {
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(wait) = self.slot_wait.as_mut() {
+            match Pin::new(wait).poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => {
+                    return Poll::Ready(Err(JointAdmissionFailure { error }));
+                }
+                Poll::Ready(Ok(())) => {
+                    self.slot_wait = None;
+                }
+            }
+        }
+        let source = NativeAsyncActionSource {
+            inner: Arc::downgrade(&self.scope.inner),
+            owner: self.scope.id,
+            fence: self.fence.clone(),
+        };
+        match source.try_begin()? {
+            JointTryBegin::Started(mut original) => {
+                self.admission = original.admission.take();
+                Poll::Ready(Ok(()))
+            }
+            JointTryBegin::Full(wait) => {
+                self.slot_wait = Some(wait);
+                match Pin::new(self.slot_wait.as_mut().unwrap()).poll(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Err(error)) => Poll::Ready(Err(JointAdmissionFailure { error })),
+                    Poll::Ready(Ok(())) => {
+                        // A genuine event raced the failed reservation. Keep
+                        // the same source, make only one attempt this turn.
+                        self.slot_wait = None;
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                }
+            }
+        }
+    }
+
     pub fn adopt_action_in(
         &self,
         source: &mut Option<JointClaim>,
@@ -211,7 +312,15 @@ impl NativeAsyncActionAdmission {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<JointLocalOffer<'_>, JointAdmissionFailure>> {
-        self.admission.poll_local_offer(cx)
+        match self.poll_constructor(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) => {}
+        }
+        self.admission
+            .as_mut()
+            .expect("original Native constructor started")
+            .poll_local_offer(cx)
     }
 }
 fn validate_execution(state: &State, root: WorkId, execution: WorkId) -> Result<(), WorkError> {
@@ -408,17 +517,66 @@ impl NativeAsyncActionSource {
         self.begin_inner()
             .map_err(|error| JointAdmissionFailure { error })
     }
-    fn begin_inner(self) -> Result<NativeAsyncActionAdmission, WorkError> {
+    pub fn try_begin(
+        &self,
+    ) -> Result<JointTryBegin<NativeAsyncActionAdmission>, JointAdmissionFailure> {
+        let result = (|| {
+            let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
+            source_facts(&inner.state.lock().unwrap(), self.owner, &self.fence)?;
+            let scope = WorkScope {
+                inner: Arc::clone(&inner),
+                id: self.owner,
+            };
+            let attempt = JointAdmissionHandle {
+                inner: Arc::clone(&inner),
+            }
+            .try_begin_paid_proposal_for_scope(scope.clone())?;
+            source_facts(&inner.state.lock().unwrap(), self.owner, &self.fence)?;
+            match attempt {
+                JointTryBegin::Full(wait) => Ok(JointTryBegin::Full(wait)),
+                JointTryBegin::Started(proposal) => self
+                    .finish_begin(proposal, scope)
+                    .map(JointTryBegin::Started),
+            }
+        })();
+        result.map_err(|error| JointAdmissionFailure { error })
+    }
+    /// Keep the same source/fence before a ticket exists; only Q Full defers.
+    pub fn begin_when_available(self) -> Result<NativeAsyncActionAdmission, JointAdmissionFailure> {
+        match self.try_begin()? {
+            JointTryBegin::Started(admission) => Ok(admission),
+            JointTryBegin::Full(wait) => Ok(NativeAsyncActionAdmission {
+                admission: None,
+                scope: WorkScope {
+                    inner: self.inner.upgrade().ok_or(JointAdmissionFailure {
+                        error: WorkError::Released,
+                    })?,
+                    id: self.owner,
+                },
+                fence: self.fence,
+                slot_wait: Some(wait),
+            }),
+        }
+    }
+    fn begin_inner(&self) -> Result<NativeAsyncActionAdmission, WorkError> {
         let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
         source_facts(&inner.state.lock().unwrap(), self.owner, &self.fence)?;
         let scope = WorkScope {
             inner: Arc::clone(&inner),
             id: self.owner,
         };
-        let mut proposal = JointAdmissionHandle {
+        let proposal = JointAdmissionHandle {
             inner: Arc::clone(&inner),
         }
         .begin_paid_proposal_for_scope(scope.clone())?;
+        self.finish_begin(proposal, scope)
+    }
+    fn finish_begin(
+        &self,
+        mut proposal: JointProposal,
+        scope: WorkScope,
+    ) -> Result<NativeAsyncActionAdmission, WorkError> {
+        let inner = Arc::clone(&scope.inner);
         let (facts, execution) = {
             let state = inner.state.lock().unwrap();
             let (root, stage) = source_facts(&state, self.owner, &self.fence)?;
@@ -453,9 +611,10 @@ impl NativeAsyncActionSource {
             proposal.end_change()?;
         }
         Ok(NativeAsyncActionAdmission {
-            admission: proposal.submit().map_err(|e| e.error)?,
+            admission: Some(proposal.submit().map_err(|e| e.error)?),
             scope,
-            fence: self.fence,
+            fence: self.fence.clone(),
+            slot_wait: None,
         })
     }
 }
@@ -475,53 +634,72 @@ pub(in crate::joint_admission::ledger) fn validate_native_fence(
     })
 }
 impl NativeAsyncActionAuthority {
+    fn queued_source(
+        &self,
+        lane: JointLane,
+        quote: NativeQueuedInputQuote,
+    ) -> Result<NativeAsyncActionSource, WorkError> {
+        let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
+        let scope = WorkScope {
+            inner,
+            id: self.owner,
+        };
+        capture_native_source(
+            &scope,
+            &WorkScope {
+                inner: Arc::clone(&scope.inner),
+                id: self.execution,
+            },
+            self.capacity.clone(),
+            lane,
+            NativeSourceQuote::Queued(quote),
+        )
+    }
     pub fn begin_queued_input(
         &self,
         lane: JointLane,
         quote: NativeQueuedInputQuote,
     ) -> Result<NativeQueuedInputAdmission, JointAdmissionFailure> {
-        let result = (|| {
-            let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
-            let scope = WorkScope {
-                inner,
-                id: self.owner,
-            };
-            let source = capture_native_source(
-                &scope,
-                &WorkScope {
-                    inner: Arc::clone(&scope.inner),
-                    id: self.execution,
-                },
-                self.capacity.clone(),
-                lane,
-                NativeSourceQuote::Queued(quote),
-            )?;
-            let fence = source.fence.clone();
-            let admission = source.begin_inner()?.admission;
-            Ok(NativeQueuedInputAdmission {
-                admission,
-                scope,
-                fence,
-            })
-        })();
-        result.map_err(|error| JointAdmissionFailure { error })
+        self.queued_source(lane, quote)
+            .map_err(|error| JointAdmissionFailure { error })?
+            .begin()
+            .map(|original| NativeQueuedInputAdmission { original })
+    }
+    pub fn begin_queued_input_when_available(
+        &self,
+        lane: JointLane,
+        quote: NativeQueuedInputQuote,
+    ) -> Result<NativeQueuedInputAdmission, JointAdmissionFailure> {
+        self.queued_source(lane, quote)
+            .map_err(|error| JointAdmissionFailure { error })?
+            .begin_when_available()
+            .map(|original| NativeQueuedInputAdmission { original })
     }
 }
 #[must_use]
 pub struct NativeQueuedInputAdmission {
-    admission: JointAdmission,
-    scope: WorkScope,
-    fence: NativeActionFence,
+    original: NativeAsyncActionAdmission,
+}
+impl NativeQueuedInputAdmission {
+    pub fn is_waiting_for_proposal_slot(&self) -> bool {
+        self.original.is_waiting_for_proposal_slot()
+    }
 }
 impl Future for NativeQueuedInputAdmission {
     type Output = Result<NativeQueuedInputReady, JointAdmissionFailure>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.admission).poll(cx).map(|result| {
+        match self.original.poll_constructor(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) => {}
+        }
+        let result = Pin::new(self.original.admission.as_mut().unwrap()).poll(cx);
+        result.map(|result| {
             result.map(|batch| NativeQueuedInputReady {
                 original: None,
                 batch,
-                scope: self.scope.clone(),
-                fence: self.fence.clone(),
+                scope: self.original.scope.clone(),
+                fence: self.original.fence.clone(),
             })
         })
     }

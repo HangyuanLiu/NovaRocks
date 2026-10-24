@@ -25,7 +25,10 @@ use novarocks_native_adapter::native_lane::ReservedNativeCall;
 use novarocks_proto_models::resource_layout::{CloneBackingVisitor, GeneratedCloneBacking};
 use novarocks_workload_control::{
     WorkError,
-    joint_admission::{JointLane, NativeAsyncActionAdmission, NativeAsyncActionQuote},
+    joint_admission::{
+        JointLane, JointResource, JointResources, NativeAsyncActionAdmission,
+        NativeAsyncActionQuote,
+    },
 };
 use std::{
     alloc::Layout,
@@ -185,6 +188,14 @@ fn clone_input_backing(operations: &[OperationIntent]) -> Result<usize, WorkErro
     }
     Ok(invoice.owned)
 }
+/// Same clone author used by the runtime invoice and dispatcher packing.
+/// Projection aliases retain their original queue input; no DTO is cloned.
+pub(crate) fn original_operation_clone_bytes(
+    operation: &OperationIntent,
+) -> Result<u64, WorkError> {
+    u64::try_from(clone_input_backing(std::slice::from_ref(operation))?)
+        .map_err(|_| WorkError::ArithmeticOverflow)
+}
 fn nonzero(value: usize) -> Result<std::num::NonZeroU64, WorkError> {
     std::num::NonZeroU64::new(u64::try_from(value).map_err(|_| WorkError::ArithmeticOverflow)?)
         .ok_or(WorkError::Conflict)
@@ -242,27 +253,196 @@ fn make_quote(
         nonzero(reply_bytes)?,
     ))
 }
+/// Complete requested backing of one actual original RPC method run. This is
+/// not a budget-only promise for every possible input or a capacity grant.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeMethodRunProgress {
+    original: NativeAsyncActionQuote,
+}
+impl NativeMethodRunProgress {
+    pub(crate) fn foreground(self) -> Result<JointResources, WorkError> {
+        self.original.action(JointLane::Foreground)
+    }
+    pub(crate) fn settlement(self) -> Result<JointResources, WorkError> {
+        self.original.action(JointLane::Settlement)
+    }
+    /// Canonical reply only. Previously admitted queued-input custody remains
+    /// with its original producer; it must not be charged a second time here.
+    pub(crate) fn custody(self) -> JointResources {
+        self.original.custody()
+    }
+}
+/// Whole supported next-run envelope derived from an explicit owned-increment
+/// policy. The caller must install the same policy at the original prefreeze
+/// and preclone boundaries before treating this as a supported source.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeTaskActionMinimum {
+    foreground: JointResources,
+    settlement: JointResources,
+    custody: JointResources,
+}
+impl NativeTaskActionMinimum {
+    pub(crate) fn foreground(self) -> JointResources {
+        self.foreground
+    }
+    pub(crate) fn settlement(self) -> JointResources {
+        self.settlement
+    }
+    pub(crate) fn custody(self) -> JointResources {
+        self.custody
+    }
+}
+
 impl NativeTaskOperationSink {
-    pub(super) fn quote_original_batch(
-        &self,
-        batch: &DispatchBatch,
-    ) -> Result<NativeAsyncActionQuote, WorkError> {
-        let clone = clone_input_backing(batch.operations())?;
-        // The original Encoder may retain its previous request buffer while
-        // growing the next output. Two full configured requests cover this
-        // original source phase; original immutable input is charged separately.
-        let wire = self
+    /// Allocation-free invoice for the actual next run, before DTO clones or
+    /// encoding. Keep the whole method run: no sampled message or truncated D.
+    pub(crate) fn progress_for_original_method_run(
+        operations: &[OperationIntent],
+        budget: TransportBudget,
+    ) -> Result<NativeMethodRunProgress, WorkError> {
+        let plan = action_input::NativeApplyInputPlan::from_operations(operations, budget)
+            .map_err(|_| WorkError::Capacity("Native original method run"))?;
+        let first = operations
+            .first()
+            .ok_or(WorkError::Conflict)?
+            .native_run_key();
+        if operations
+            .iter()
+            .any(|operation| operation.native_run_key() != first)
+        {
+            return Err(WorkError::Conflict);
+        }
+        let cloned = clone_input_backing(operations)?;
+        // Encoder old/new backing may coexist. This is wire backing only;
+        // actual owned DTO clones were independently visited above.
+        let wire = budget
+            .max_batch_encoded_bytes()
+            .checked_mul(2)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        Ok(NativeMethodRunProgress {
+            original: make_quote(
+                plan.items(),
+                cloned
+                    .checked_add(wire)
+                    .ok_or(WorkError::ArithmeticOverflow)?,
+                budget,
+            )?,
+        })
+    }
+
+    /// Necessary header support for one full configured method run. This is
+    /// not an upper bound for its variable graph: that is the explicit policy.
+    pub(crate) fn minimum_owned_support_for_composition(
+        budget: TransportBudget,
+    ) -> Result<std::num::NonZeroU64, WorkError> {
+        let creation =
+            crate::task_execution::creation::creation_owner_header_bytes().map_err(|error| {
+                match error {
+                    crate::task_execution::error::TaskExecutionError::Workload(error) => error,
+                    _ => WorkError::Conflict,
+                }
+            })?;
+        let bytes = creation
+            .max(4 * 16 + 32)
+            .checked_mul(budget.max_batch_items())
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        nonzero(bytes)
+    }
+
+    /// Pure source invoice. E covers the new owned backing of the entire
+    /// configured method run, including original creation owner headers.
+    /// It is not inferred from encoded wire size or a cumulative Root window.
+    pub(crate) fn minimum_progress_for_composition(
+        budget: TransportBudget,
+        maximum_owned_increment: std::num::NonZeroU64,
+    ) -> Result<NativeTaskActionMinimum, WorkError> {
+        if maximum_owned_increment < Self::minimum_owned_support_for_composition(budget)? {
+            return Err(WorkError::Capacity("Native full-run owned headers"));
+        }
+        let owned = usize::try_from(maximum_owned_increment.get())
+            .map_err(|_| WorkError::ArithmeticOverflow)?;
+        let wire = budget
+            .max_batch_encoded_bytes()
+            .checked_mul(2)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        let original = make_quote(
+            budget.max_batch_items(),
+            owned
+                .checked_add(wire)
+                .ok_or(WorkError::ArithmeticOverflow)?,
+            budget,
+        )?;
+        let reply = original.custody();
+        let queued = queue_input::queued_header_quote(0)?.custody();
+        let items =
+            u64::try_from(budget.max_batch_items()).map_err(|_| WorkError::ArithmeticOverflow)?;
+        let queued_metadata = queued
+            .get(JointResource::MetadataBytes)
+            .checked_mul(items)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        let custody = reply
+            .with(
+                JointResource::ClaimRecords,
+                items.checked_add(1).ok_or(WorkError::ArithmeticOverflow)?,
+            )
+            .with(JointResource::QueueRecords, items)
+            .with(
+                JointResource::MetadataBytes,
+                reply
+                    .get(JointResource::MetadataBytes)
+                    .checked_add(queued_metadata)
+                    .ok_or(WorkError::ArithmeticOverflow)?,
+            )
+            .with(
+                JointResource::PayloadBytes,
+                reply
+                    .get(JointResource::PayloadBytes)
+                    .checked_add(maximum_owned_increment.get())
+                    .ok_or(WorkError::ArithmeticOverflow)?,
+            );
+        Ok(NativeTaskActionMinimum {
+            foreground: original.action(JointLane::Foreground)?,
+            settlement: original.action(JointLane::Settlement)?,
+            custody,
+        })
+    }
+
+    pub(super) fn maximum_owned_increment(&self) -> Result<std::num::NonZeroU64, WorkError> {
+        let encoding = self
             .transport
             .max_batch_encoded_bytes()
             .checked_mul(2)
             .ok_or(WorkError::ArithmeticOverflow)?;
-        make_quote(
-            batch.operations().len(),
-            clone
-                .checked_add(wire)
-                .ok_or(WorkError::ArithmeticOverflow)?,
-            self.transport,
+        self.authority.maximum_owned_increment(nonzero(encoding)?)
+    }
+
+    pub(crate) fn source_geometry_for_composition(
+        budget: TransportBudget,
+    ) -> Result<super::super::apply_send_owner::ApplySourceGeometry, WorkError> {
+        super::super::apply_send_owner::apply_source_geometry(
+            budget.max_backend_queued_operations(),
         )
+    }
+
+    pub(super) fn quote_original_batch(
+        &self,
+        batch: &DispatchBatch,
+    ) -> Result<NativeAsyncActionQuote, WorkError> {
+        let maximum = self.maximum_owned_increment()?;
+        let progress = Self::progress_for_original_method_run(batch.operations(), self.transport)?;
+        let encoding = self
+            .transport
+            .max_batch_encoded_bytes()
+            .checked_mul(2)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        let complete = u64::try_from(encoding)
+            .map_err(|_| WorkError::ArithmeticOverflow)?
+            .checked_add(maximum.get())
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        if progress.foreground()?.get(JointResource::PayloadBytes) > complete {
+            return Err(WorkError::Capacity("Native method run owned backing"));
+        }
+        Ok(progress.original)
     }
 }
 
@@ -304,7 +484,7 @@ impl NativeTaskOperationSink {
             let admission = self
                 .authority
                 .action_source(lane, quote)?
-                .begin()
+                .begin_when_available()
                 .map_err(|error| error.error)?;
             batch.native_pending = Some(NativeBatchAdmission {
                 remaining: batch.operations().len(),

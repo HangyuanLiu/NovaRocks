@@ -32,7 +32,7 @@ pub struct AsyncActionAdmission {
 /// There is no second pool, unit physical receipt, or finite CPU privilege.
 #[must_use = "Retain through the same actual I/O phase and its real Drop"]
 pub struct AsyncActionGrant {
-    pub(super) claims: JointGrantedClaims,
+    pub(super) claims: [JointClaim; 1],
 }
 impl WorkOwner {
     pub fn async_action_source(&self, lane: JointLane) -> Result<AsyncActionSource, WorkError> {
@@ -42,6 +42,18 @@ impl WorkOwner {
     }
 }
 impl AsyncActionSource {
+    pub fn try_begin(
+        &self,
+        metadata_bytes: NonZeroU64,
+        positions: NonZeroU64,
+    ) -> Result<JointTryBegin<AsyncActionAdmission>, JointAdmissionFailure> {
+        match self.original.try_begin(metadata_bytes, positions)? {
+            JointTryBegin::Started(original) => {
+                Ok(JointTryBegin::Started(AsyncActionAdmission { original }))
+            }
+            JointTryBegin::Full(wait) => Ok(JointTryBegin::Full(wait)),
+        }
+    }
     pub fn begin(
         self,
         metadata_bytes: NonZeroU64,
@@ -65,7 +77,7 @@ impl AsyncActionAdmission {
                 error: WorkError::Conflict,
             }));
         }
-        let batch = match Pin::new(&mut self.original.admission).poll(cx) {
+        let mut batch = match Pin::new(&mut self.original.admission).poll(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Ready(Ok(batch)) => batch,
@@ -77,9 +89,14 @@ impl AsyncActionAdmission {
                 error: WorkError::Conflict,
             }));
         }
-        *destination = Some(AsyncActionGrant {
-            claims: batch.new_claims,
-        });
+        let claim = batch
+            .new_claims
+            .pop()
+            .expect("checked single original async claim");
+        *destination = Some(AsyncActionGrant { claims: [claim] });
+        // The stable original physical grant now owns its claim. Only the
+        // empty reply container/body exits; no live AsyncIo amount is retired.
+        drop(batch);
         Poll::Ready(Ok(()))
     }
 }
@@ -93,7 +110,37 @@ pub struct RootPayloadInitialAdmission {
     batch: Option<JointGrantedBatch>,
     raw: Option<JointClaim>,
 }
+#[must_use]
+pub struct RootPayloadInitialSource {
+    original: control_action::ControlActionSource,
+}
+impl RootPayloadInitialSource {
+    pub fn try_begin(
+        &self,
+        metadata_bytes: NonZeroU64,
+        payload_bytes: NonZeroU64,
+    ) -> Result<JointTryBegin<RootPayloadInitialAdmission>, JointAdmissionFailure> {
+        match self.original.try_begin(metadata_bytes, payload_bytes)? {
+            JointTryBegin::Started(original) => {
+                Ok(JointTryBegin::Started(RootPayloadInitialAdmission {
+                    original,
+                    batch: None,
+                    raw: None,
+                }))
+            }
+            JointTryBegin::Full(wait) => Ok(JointTryBegin::Full(wait)),
+        }
+    }
+}
 impl WorkOwner {
+    pub fn root_payload_initial_source(&self) -> Result<RootPayloadInitialSource, WorkError> {
+        Ok(RootPayloadInitialSource {
+            original: self.control_action_source(
+                JointLane::Foreground,
+                control_action::ControlActionKind::Payload,
+            )?,
+        })
+    }
     pub fn begin_root_payload(
         &self,
         metadata_bytes: NonZeroU64,

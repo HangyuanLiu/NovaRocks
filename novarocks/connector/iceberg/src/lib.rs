@@ -51,6 +51,7 @@ pub mod catalog_cache;
 pub mod catalog_config;
 pub mod catalog_control;
 mod catalog_metadata_root;
+pub use catalog_control::metadata_maintenance::metadata_maintenance_io_geometry;
 pub mod catalog_runtime;
 pub mod change_planning;
 pub mod commit;

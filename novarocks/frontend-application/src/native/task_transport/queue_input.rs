@@ -44,6 +44,7 @@ impl Wake for TaskAckIntakeInner {
 pub(super) struct NativeInputQueuePermit {
     physical: Option<super::super::transport_supervisor::NativeTransportQueuePermit>,
     input: Option<NativeQueuedInputGrant>,
+    maximum_owned_increment: std::num::NonZeroU64,
 }
 impl std::fmt::Debug for NativeInputQueuePermit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -56,6 +57,15 @@ impl TaskOperationQueuePermit for NativeInputQueuePermit {
             .as_mut()
             .expect("original process queue holder")
             .mark_in_flight()
+    }
+    fn packing_support(
+        &self,
+        input: &OperationIntent,
+    ) -> Result<crate::task_execution::intent::OriginalOperationPacking, WorkError> {
+        crate::task_execution::intent::OriginalOperationPacking::new(
+            super::joint_action::original_operation_clone_bytes(input)?,
+            self.maximum_owned_increment,
+        )
     }
     fn native_input_retention(&self) -> Result<Option<ExistingOwnerRetentionLease>, WorkError> {
         self.input
@@ -118,6 +128,7 @@ pub(crate) fn queued_header_quote(payload: usize) -> Result<NativeQueuedInputQuo
     let bytes = Layout::new::<NativeInputQueuePermit>()
         .size()
         .checked_add(crate::task_execution::dispatch::queued_operation_layout().size())
+        .and_then(|bytes| bytes.checked_add(novarocks_workload_control::joint_admission::JointProposalSlotWait::metadata_layouts().1.size()))
         .ok_or(WorkError::ArithmeticOverflow)?;
     Ok(NativeQueuedInputQuote::for_original_native_input(
         metadata(bytes)?,
@@ -162,6 +173,13 @@ impl NativeTaskOperationSink {
         if let Some(error) = preparation.failure.as_ref() {
             return TaskOperationQueueAdmission::Rejected(error.clone());
         }
+        let maximum_owned_increment = match self.maximum_owned_increment() {
+            Ok(maximum) => maximum,
+            Err(error) => {
+                preparation.failure = Some(error.clone());
+                return TaskOperationQueueAdmission::Rejected(error);
+            }
+        };
         if preparation
             .request
             .is_some_and(|original| original != request)
@@ -178,12 +196,26 @@ impl NativeTaskOperationSink {
             let Some(quote) = request.native_input else {
                 return TaskOperationQueueAdmission::Rejected(WorkError::Conflict);
             };
+            // This exact quote includes Creation's new backing and owner
+            // headers. Check before paid grant and before the caller freezes.
+            if quote
+                .custody()
+                .get(novarocks_workload_control::joint_admission::JointResource::PayloadBytes)
+                > maximum_owned_increment.get()
+            {
+                let error = WorkError::Capacity("Native queued input owned backing");
+                preparation.failure = Some(error.clone());
+                return TaskOperationQueueAdmission::Rejected(error);
+            }
             let lane = if request.requires_control_progress() {
                 JointLane::Settlement
             } else {
                 JointLane::Foreground
             };
-            match self.authority.begin_queued_input(lane, quote) {
+            match self
+                .authority
+                .begin_queued_input_when_available(lane, quote)
+            {
                 Ok(admission) => preparation.admission = Some(admission),
                 Err(error) => {
                     preparation.failure = Some(error.error.clone());
@@ -194,8 +226,16 @@ impl NativeTaskOperationSink {
         let waker = Waker::from(Arc::clone(&self.acks.inner));
         let mut cx = Context::from_waker(&waker);
         if let Some(admission) = preparation.admission.as_mut() {
-            match std::pin::Pin::new(admission).poll(&mut cx) {
-                Poll::Pending => return TaskOperationQueueAdmission::TargetFull,
+            match std::pin::Pin::new(&mut *admission).poll(&mut cx) {
+                Poll::Pending => {
+                    return if admission.is_waiting_for_proposal_slot() {
+                        // Original Root-wide Q exhaustion stops this producer pass
+                        // before any other unpublished input allocates a waiter.
+                        TaskOperationQueueAdmission::ProcessFull
+                    } else {
+                        TaskOperationQueueAdmission::TargetFull
+                    };
+                }
                 Poll::Ready(Err(error)) => {
                     preparation.failure = Some(error.error.clone());
                     return TaskOperationQueueAdmission::Rejected(error.error);
@@ -242,6 +282,7 @@ impl NativeTaskOperationSink {
                 TaskOperationQueueAdmission::Admitted(Box::new(NativeInputQueuePermit {
                     physical: Some(physical),
                     input: Some(input),
+                    maximum_owned_increment,
                 }))
             }
             Err(NativeTransportBackpressure::Target) => TaskOperationQueueAdmission::TargetFull,

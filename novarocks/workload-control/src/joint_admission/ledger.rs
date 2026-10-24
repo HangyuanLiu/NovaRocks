@@ -56,6 +56,7 @@ pub use paid_proposal::{
     BlockingActionSource, NativeAsyncActionAdmission, NativeAsyncActionAuthority,
     NativeAsyncActionQuote, NativeAsyncActionSource, NativeQueuedInputAdmission,
     NativeQueuedInputQuote, NativeQueuedInputReady, RootPayloadInitialAdmission,
+    RootPayloadInitialSource,
 };
 use paid_proposal::{
     ControlActionFence, CpuActionFence, NativeActionFence, RootPayloadFence,
@@ -73,10 +74,11 @@ pub use paid_proposal::{
 pub(crate) mod proposal_storage;
 pub(crate) use control_storage::{control_storage_base, control_storage_dependency_records};
 use dependency_storage::{DependencyRef, DependencyRegistry};
-pub use proposal_storage::JointGrantedClaims;
 use proposal_storage::{
-    ChangeBody, ProposalConstruction, ProposalKey, queue_proposal, retire_proposal,
+    ChangeBody, ProposalConstruction, ProposalKey, ProposalReservation, queue_proposal,
+    retire_proposal,
 };
+pub use proposal_storage::{JointGrantedClaims, JointProposalSlotWait, JointTryBegin};
 
 pub(super) struct DependencyRecord {
     pub(super) ordinal: u64,
@@ -1746,100 +1748,119 @@ impl Future for JointAdmission {
             body: None,
             _exit: None,
         };
-        let result = inner.update(|state| {
-            let closed = state.joint.as_ref().unwrap().driver_closed;
-            let request = state
-                .joint
-                .as_mut()
-                .unwrap()
-                .requests
-                .get_mut(&id)
-                .expect("live reply");
-            match &request.phase {
-                RequestPhase::Waiting => {
-                    if request
-                        .waker
-                        .as_ref()
-                        .is_none_or(|w| !w.will_wake(cx.waker()))
-                    {
-                        request.waker = Some(cx.waker().clone());
+        // A pending reply only registers the original consumer. It does not
+        // publish capacity progress or wake the same root's Q-slot waits.
+        let mut incoming = Some(cx.waker().clone());
+        let mut outgoing = None;
+        let result = {
+            let mut state = inner.state.lock().unwrap();
+            let result = (|state: &mut State| {
+                let closed = state.joint.as_ref().unwrap().driver_closed;
+                let request = state
+                    .joint
+                    .as_mut()
+                    .unwrap()
+                    .requests
+                    .get_mut(&id)
+                    .expect("live reply");
+                match &request.phase {
+                    RequestPhase::Waiting => {
+                        if request
+                            .waker
+                            .as_ref()
+                            .is_none_or(|w| !w.will_wake(incoming.as_ref().unwrap()))
+                        {
+                            outgoing = request.waker.replace(incoming.take().unwrap());
+                        }
+                        return None;
                     }
-                    return None;
+                    RequestPhase::Failed(error) => {
+                        let error = error.clone();
+                        self.id = None;
+                        remove_request(state, id);
+                        return Some(Err(error));
+                    }
+                    RequestPhase::LocalOffered { .. } => {
+                        // The original offer may still own physical resources.
+                        // Do not convert its claims through the ordinary reply API.
+                        return Some(Err(WorkError::Conflict));
+                    }
+                    RequestPhase::Delivered => unreachable!("one reply consumer"),
+                    RequestPhase::Granted { .. } => {}
                 }
-                RequestPhase::Failed(error) => {
-                    let error = error.clone();
+                if closed {
+                    fail_request(state, id, WorkError::Closed);
                     self.id = None;
                     remove_request(state, id);
-                    return Some(Err(error));
+                    return Some(Err(WorkError::Closed));
                 }
-                RequestPhase::LocalOffered { .. } => {
-                    // The original offer may still own physical resources.
-                    // Do not convert its claims through the ordinary reply API.
-                    return Some(Err(WorkError::Conflict));
-                }
-                RequestPhase::Delivered => unreachable!("one reply consumer"),
-                RequestPhase::Granted { .. } => {}
-            }
-            if closed {
-                fail_request(state, id, WorkError::Closed);
-                self.id = None;
-                remove_request(state, id);
-                return Some(Err(WorkError::Closed));
-            }
-            let control_action = request.control_action;
-            let root_payload = request.root_payload;
-            let changes = request.changes.clone();
-            let owner = request.owner;
-            let requires_business_active = request.requires_business_active();
-            let source_valid = control_action
-                .map_or(Ok(()), |fence| {
-                    validate_control_action(state, owner, fence, &changes)
-                })
-                .and_then(|()| {
-                    root_payload.map_or(Ok(()), |fence| {
-                        validate_root_payload(state, owner, fence, &changes)
+                let control_action = request.control_action;
+                let root_payload = request.root_payload;
+                let changes = request.changes.clone();
+                let owner = request.owner;
+                let requires_business_active = request.requires_business_active();
+                let source_valid = control_action
+                    .map_or(Ok(()), |fence| {
+                        validate_control_action(state, owner, fence, &changes)
                     })
-                });
-            if let Err(error) = source_valid {
-                fail_request(state, id, error.clone());
-                self.id = None;
-                remove_request(state, id);
-                return Some(Err(error));
-            }
-            if requires_business_active {
-                if let Err(error) = state
-                    .nodes
-                    .get(&owner)
-                    .ok_or(WorkError::Released)
-                    .and_then(|n| n.check(&state.cancellations))
-                {
+                    .and_then(|()| {
+                        root_payload.map_or(Ok(()), |fence| {
+                            validate_root_payload(state, owner, fence, &changes)
+                        })
+                    });
+                if let Err(error) = source_valid {
                     fail_request(state, id, error.clone());
                     self.id = None;
                     remove_request(state, id);
                     return Some(Err(error));
                 }
+                if requires_business_active {
+                    if let Err(error) = state
+                        .nodes
+                        .get(&owner)
+                        .ok_or(WorkError::Released)
+                        .and_then(|n| n.check(&state.cancellations))
+                    {
+                        fail_request(state, id, error.clone());
+                        self.id = None;
+                        remove_request(state, id);
+                        return Some(Err(error));
+                    }
+                }
+                let request = state.joint.as_mut().unwrap().requests.get_mut(&id).unwrap();
+                let RequestPhase::Granted { new_ids } =
+                    std::mem::replace(&mut request.phase, RequestPhase::Delivered)
+                else {
+                    unreachable!()
+                };
+                let has_adjustment = changes.iter().any(|change| change.old.is_some());
+                // IDs are checked, monotonic and never reused in this exact
+                // authority. Only this unique reply constructs physical guards.
+                delivery.new_ids = new_ids;
+                delivery.ticket = has_adjustment.then_some(id);
+                delivery.body = Some(changes);
+                delivery._exit = Some(crate::scope::ReclaimWakeOnExit::observe(&Arc::downgrade(
+                    &inner,
+                )));
+                self.id = None;
+                if !has_adjustment {
+                    remove_request(state, id);
+                }
+                Some(Ok(()))
+            })(&mut state);
+            if result.is_some() {
+                crate::admission::dispatch(&mut state, &inner.config);
+                crate::observation::fill_control(&mut state, &inner.config);
+                state.advance_progress_revision();
             }
-            let request = state.joint.as_mut().unwrap().requests.get_mut(&id).unwrap();
-            let RequestPhase::Granted { new_ids } =
-                std::mem::replace(&mut request.phase, RequestPhase::Delivered)
-            else {
-                unreachable!()
-            };
-            let has_adjustment = changes.iter().any(|change| change.old.is_some());
-            // IDs are checked, monotonic and never reused in this exact
-            // authority. Only this unique reply constructs physical guards.
-            delivery.new_ids = new_ids;
-            delivery.ticket = has_adjustment.then_some(id);
-            delivery.body = Some(changes);
-            delivery._exit = Some(crate::scope::ReclaimWakeOnExit::observe(&Arc::downgrade(
-                &inner,
-            )));
-            self.id = None;
-            if !has_adjustment {
-                remove_request(state, id);
-            }
-            Some(Ok(()))
-        });
+            result
+        };
+        drop(outgoing);
+        drop(incoming);
+        if result.is_some() {
+            crate::admission::drain_wakes(&inner);
+            inner.changed.notify_waiters();
+        }
         let Some(result) = result else {
             return Poll::Pending;
         };
@@ -1974,75 +1995,82 @@ impl JointAdmission {
         // Both clone and destruction of a foreign Waker are outside State.
         let mut incoming = Some(cx.waker().clone());
         let mut outgoing = None;
-        let result = inner.update_facts_silent(|state| {
-            let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
-            let request = ledger.requests.get(&id).ok_or(WorkError::Released)?;
-            if !request.budget.is_finite()
-                || request.changes.iter().any(|change| change.old.is_some())
-            {
-                return Err(WorkError::Conflict);
-            }
-            match &request.phase {
-                RequestPhase::Waiting => {
-                    let request = state.joint.as_mut().unwrap().requests.get_mut(&id).unwrap();
-                    if request
-                        .waker
-                        .as_ref()
-                        .is_none_or(|waker| !waker.will_wake(incoming.as_ref().unwrap()))
-                    {
-                        outgoing = request.waker.replace(incoming.take().unwrap());
-                    }
-                    return Ok(false);
-                }
-                RequestPhase::Failed(error) => {
-                    let error = error.clone();
-                    // Keep the original typed refusal and Q in the caller's
-                    // stable admission until its ordinary Drop/withdraw path.
-                    return Err(error);
-                }
-                RequestPhase::Granted { .. } => {}
-                RequestPhase::LocalOffered { .. } | RequestPhase::Delivered => {
+        let result = {
+            let mut state = inner.state.lock().unwrap();
+            let result = (|state: &mut State| {
+                let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
+                let request = ledger.requests.get(&id).ok_or(WorkError::Released)?;
+                if !request.budget.is_finite()
+                    || request.changes.iter().any(|change| change.old.is_some())
+                {
                     return Err(WorkError::Conflict);
                 }
-            }
-            if let Some(fence) = request.native_action.as_ref() {
-                validate_native_action(state, request.owner, fence, &request.changes)?;
-            }
-            if request.root_payload.is_some() {
-                return Err(WorkError::Conflict);
-            }
-            if let Some(fence) = request.control_action {
-                validate_control_action(state, request.owner, fence, &request.changes)?;
-            }
-            if let Some(fence) = request.cpu_action {
-                validate_cpu_action(state, request.owner, fence, &request.changes)?;
-            }
-            if ledger.driver_closed {
-                return Err(WorkError::Closed);
-            }
-            if request.requires_business_active() {
-                state
-                    .nodes
-                    .get(&request.owner)
-                    .ok_or(WorkError::Released)?
-                    .check(&state.cancellations)?;
-                if state.closed {
+                match &request.phase {
+                    RequestPhase::Waiting => {
+                        let request = state.joint.as_mut().unwrap().requests.get_mut(&id).unwrap();
+                        if request
+                            .waker
+                            .as_ref()
+                            .is_none_or(|waker| !waker.will_wake(incoming.as_ref().unwrap()))
+                        {
+                            outgoing = request.waker.replace(incoming.take().unwrap());
+                        }
+                        return Ok(false);
+                    }
+                    RequestPhase::Failed(error) => {
+                        let error = error.clone();
+                        // Keep the original typed refusal and Q in the caller's
+                        // stable admission until its ordinary Drop/withdraw path.
+                        return Err(error);
+                    }
+                    RequestPhase::Granted { .. } => {}
+                    RequestPhase::LocalOffered { .. } | RequestPhase::Delivered => {
+                        return Err(WorkError::Conflict);
+                    }
+                }
+                if let Some(fence) = request.native_action.as_ref() {
+                    validate_native_action(state, request.owner, fence, &request.changes)?;
+                }
+                if request.root_payload.is_some() {
+                    return Err(WorkError::Conflict);
+                }
+                if let Some(fence) = request.control_action {
+                    validate_control_action(state, request.owner, fence, &request.changes)?;
+                }
+                if let Some(fence) = request.cpu_action {
+                    validate_cpu_action(state, request.owner, fence, &request.changes)?;
+                }
+                if ledger.driver_closed {
                     return Err(WorkError::Closed);
                 }
+                if request.requires_business_active() {
+                    state
+                        .nodes
+                        .get(&request.owner)
+                        .ok_or(WorkError::Released)?
+                        .check(&state.cancellations)?;
+                    if state.closed {
+                        return Err(WorkError::Closed);
+                    }
+                }
+                let request = state.joint.as_mut().unwrap().requests.get_mut(&id).unwrap();
+                let RequestPhase::Granted { new_ids } =
+                    std::mem::replace(&mut request.phase, RequestPhase::Delivered)
+                else {
+                    unreachable!("validated original grant")
+                };
+                request.phase = RequestPhase::LocalOffered {
+                    new_ids,
+                    failure: None,
+                    exiting: false,
+                };
+                Ok(true)
+            })(&mut state);
+            if matches!(result, Ok(true)) {
+                state.advance_progress_revision();
             }
-            let request = state.joint.as_mut().unwrap().requests.get_mut(&id).unwrap();
-            let RequestPhase::Granted { new_ids } =
-                std::mem::replace(&mut request.phase, RequestPhase::Delivered)
-            else {
-                unreachable!("validated original grant")
-            };
-            request.phase = RequestPhase::LocalOffered {
-                new_ids,
-                failure: None,
-                exiting: false,
-            };
-            Ok(true)
-        });
+            result
+        };
         drop(outgoing);
         drop(incoming);
         match result {

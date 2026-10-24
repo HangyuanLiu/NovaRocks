@@ -24,6 +24,11 @@ use std::{
 };
 
 fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
+    fixture_with_positions(4)
+}
+fn fixture_with_positions(
+    positions: u64,
+) -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     let count = 8;
     let storage = ControlStorageConfig::new([count, 0, 0, 0, 0], 2, 2, &[]);
     let mut config = JointCapacityConfig {
@@ -66,16 +71,16 @@ fn fixture() -> (WorkloadControl, JointAdmissionHandle, JointProgressDriver) {
     };
     let foreground = JointResourceLimits {
         global: JointResources::ZERO
-            .with(JointResource::ClaimRecords, 4)
+            .with(JointResource::ClaimRecords, positions)
             .with(JointResource::MetadataBytes, m * 16)
-            .with(JointResource::AsyncIo, 4)
-            .with(JointResource::PhysicalQueueRecords, 4)
+            .with(JointResource::AsyncIo, positions)
+            .with(JointResource::PhysicalQueueRecords, positions)
             .with(JointResource::PhysicalQueueBytes, 4096),
         per_dependency: JointResources::ZERO
-            .with(JointResource::ClaimRecords, 4)
+            .with(JointResource::ClaimRecords, positions)
             .with(JointResource::MetadataBytes, m * 8)
-            .with(JointResource::AsyncIo, 4)
-            .with(JointResource::PhysicalQueueRecords, 4)
+            .with(JointResource::AsyncIo, positions)
+            .with(JointResource::PhysicalQueueRecords, positions)
             .with(JointResource::PhysicalQueueBytes, 4096),
         protected_progress: JointResources::ZERO,
     };
@@ -336,6 +341,222 @@ fn root_payload_rekeys_live_async_rows_without_child_or_payload_pin_replacement(
     drop(ready);
     drop(pending);
     drop(grant);
+    drop(alias);
+    drop(payload);
+    drive(&mut driver);
+}
+
+#[test]
+fn two_original_proposal_cells_install_eight_simultaneous_async_grants() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct WakeCount(AtomicUsize);
+    impl std::task::Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let (control, _, mut driver) = fixture_with_positions(8);
+    let work = root(&control);
+    let scope = work.owner.scope();
+    bind(&scope, &[fact("catalog")], &mut driver);
+    let source = work
+        .owner
+        .async_action_source(JointLane::Foreground)
+        .unwrap();
+    let mut admissions = Vec::new();
+    for _ in 0..2 {
+        admissions.push(
+            match source
+                .try_begin(NonZeroU64::new(1).unwrap(), NonZeroU64::new(1).unwrap())
+                .unwrap()
+            {
+                JointTryBegin::Started(value) => value,
+                JointTryBegin::Full(_) => panic!("two original construction positions"),
+            },
+        );
+    }
+    let marker = control.progress_revision();
+    let mut wait = match source
+        .try_begin(NonZeroU64::new(1).unwrap(), NonZeroU64::new(1).unwrap())
+        .unwrap()
+    {
+        JointTryBegin::Full(wait) => wait,
+        JointTryBegin::Started(_) => panic!("original Q must be full"),
+    };
+    assert_eq!(control.progress_revision(), marker);
+    let wake = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&wake));
+    let mut cx = Context::from_waker(&waker);
+    assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
+    // Polling the same pending replies must not notify this root's Q wait.
+    for _ in 0..2 {
+        for admission in &mut admissions {
+            let mut target = None;
+            assert!(admission.poll_install_in(&mut cx, &mut target).is_pending());
+        }
+        assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
+    }
+    assert_eq!(control.progress_revision(), marker);
+    assert_eq!(wake.0.load(Ordering::SeqCst), 0);
+    let mut grants = Vec::new();
+    for admission in &mut admissions {
+        grants.push(install(admission, &mut driver));
+    }
+    drive(&mut driver);
+    assert!(wake.0.load(Ordering::SeqCst) > 0);
+    assert!(matches!(
+        Pin::new(&mut wait).poll(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    // Keep even the completed admission objects alive: their empty replies no
+    // longer retain the paid proposal-body container or either original Q cell.
+    for _ in 2..8 {
+        let mut admission = match source
+            .try_begin(NonZeroU64::new(1).unwrap(), NonZeroU64::new(1).unwrap())
+            .unwrap()
+        {
+            JointTryBegin::Started(value) => value,
+            JointTryBegin::Full(_) => panic!("received empty container must release Q"),
+        };
+        grants.push(install(&mut admission, &mut driver));
+        admissions.push(admission);
+        drive(&mut driver);
+    }
+    let async_count = || {
+        control
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .joint
+            .as_ref()
+            .unwrap()
+            .claims
+            .values()
+            .map(|row| row.active_amounts.get(JointResource::AsyncIo))
+            .sum::<u64>()
+    };
+    assert_eq!(grants.len(), 8);
+    assert_eq!(async_count(), 8);
+    drop(grants);
+    drive(&mut driver);
+    assert_eq!(async_count(), 0);
+    drop(admissions);
+}
+
+#[test]
+fn root_initial_and_growth_retry_only_after_original_q_progress() {
+    let (control, handle, mut driver) = fixture();
+    let work = root(&control);
+    let scope = work.owner.scope();
+    bind(&scope, &[fact("catalog")], &mut driver);
+    let first = handle.begin_paid_proposal(&work.owner).unwrap();
+    let second = handle.begin_paid_proposal(&work.owner).unwrap();
+    let source = work.owner.root_payload_initial_source().unwrap();
+    let marker = control.progress_revision();
+    let mut wait = match source
+        .try_begin(NonZeroU64::new(1).unwrap(), NonZeroU64::new(8).unwrap())
+        .unwrap()
+    {
+        JointTryBegin::Full(wait) => wait,
+        JointTryBegin::Started(_) => panic!("initial construction needs the same Q"),
+    };
+    assert_eq!(marker, control.progress_revision());
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
+    drop(first);
+    drive(&mut driver);
+    assert!(matches!(
+        Pin::new(&mut wait).poll(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    let mut initial = match source
+        .try_begin(NonZeroU64::new(1).unwrap(), NonZeroU64::new(8).unwrap())
+        .unwrap()
+    {
+        JointTryBegin::Started(value) => value,
+        JointTryBegin::Full(_) => panic!("same initial source after real reap"),
+    };
+    drive(&mut driver);
+    let mut payload = None;
+    match initial.poll_install_in(&mut cx, &scope, &mut payload) {
+        Poll::Ready(Ok(notification)) => notification.notify(),
+        _ => panic!("real initial receipt"),
+    }
+    drop(initial);
+    drive(&mut driver);
+    let payload = payload.unwrap();
+    let alias = payload.retain_alias().unwrap();
+    let before = {
+        let state = control.inner.state.lock().unwrap();
+        state
+            .joint
+            .as_ref()
+            .unwrap()
+            .claims
+            .iter()
+            .find_map(|(id, row)| match row.custody {
+                ClaimCustody::Payload { epoch, pins } => Some((*id, epoch, pins)),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let third = handle.begin_paid_proposal(&work.owner).unwrap();
+    let mut wait = match payload
+        .root_payload_source(&scope, JointLane::Foreground, &[])
+        .unwrap()
+        .try_begin(4)
+        .unwrap()
+    {
+        JointTryBegin::Full(wait) => wait,
+        JointTryBegin::Started(_) => panic!("growth construction needs the same Q"),
+    };
+    assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
+    // A shape/policy refusal is never converted into temporary Full.
+    assert!(matches!(
+        payload
+            .root_payload_source(&scope, JointLane::Foreground, &[])
+            .unwrap()
+            .try_begin(u64::MAX),
+        Err(WorkError::Capacity(_))
+    ));
+    drop(third);
+    drive(&mut driver);
+    assert!(matches!(
+        Pin::new(&mut wait).poll(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    let mut proposal = match payload
+        .root_payload_source(&scope, JointLane::Foreground, &[])
+        .unwrap()
+        .try_begin(4)
+        .unwrap()
+    {
+        JointTryBegin::Started(value) => value,
+        JointTryBegin::Full(_) => panic!("same stable payload after real reap"),
+    };
+    proposal.push_dependency(&fact("new-storage")).unwrap();
+    proposal.end_change().unwrap();
+    let mut pending = proposal.submit().unwrap();
+    drive(&mut driver);
+    let mut ready = match Pin::new(&mut pending).poll(&mut cx) {
+        Poll::Ready(Ok(ready)) => ready,
+        _ => panic!("real growth receipt"),
+    };
+    ready.install_in(&scope, &payload, &[]).unwrap().notify();
+    assert_eq!(alias.capacity_bytes().unwrap(), 12);
+    let state = control.inner.state.lock().unwrap();
+    assert!(
+        matches!(state.joint.as_ref().unwrap().claims[&before.0].custody,
+        ClaimCustody::Payload {epoch,pins} if epoch == before.1 && pins == before.2)
+    );
+    drop(state);
+    drop(ready);
+    drop(pending);
+    drop(second);
     drop(alias);
     drop(payload);
     drive(&mut driver);

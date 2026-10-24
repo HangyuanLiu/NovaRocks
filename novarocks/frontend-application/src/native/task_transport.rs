@@ -126,6 +126,9 @@ fn covered_reconnect_backoff(failures: u32, jitter_sample: u64) -> Duration {
 mod joint_action;
 use joint_action::NativeCallSource;
 pub(crate) use joint_action::{NativeBatchAdmission, NativePhysicalOffer};
+pub(crate) use joint_action::{
+    NativeMethodRunProgress, NativeTaskActionMinimum, original_operation_clone_bytes,
+};
 mod queue_input;
 pub(crate) use queue_input::{queued_creation_quote, queued_intent_quote, queued_update_quote};
 
@@ -3321,6 +3324,119 @@ mod tests {
     //! from the frontend's own generated stub, so batch framing, receipt
     //! attribution, status streaming, and the deployment JWT interceptor are
     //! exercised rather than mocked.
+
+    #[test]
+    fn original_method_run_progress_quotes_the_full_supported_count_and_rejects_mixed_runs() {
+        use novarocks_workload_control::joint_admission::JointResource;
+        let budget = TransportBudget::DEFAULT;
+        let backend = BackendProcessId::new_v7();
+        let operations: Vec<_> = (0..budget.max_batch_items())
+            .map(|task| cancel_intent(task as u32 + 1, backend))
+            .collect();
+        let quote =
+            NativeTaskOperationSink::progress_for_original_method_run(&operations, budget).unwrap();
+        let foreground = quote.foreground().unwrap();
+        let settlement = quote.settlement().unwrap();
+        assert_eq!(foreground, settlement);
+        assert_eq!(foreground.get(JointResource::AsyncIo), 1);
+        assert_eq!(foreground.get(JointResource::PhysicalQueueRecords), 1);
+        assert_eq!(
+            foreground.get(JointResource::PhysicalQueueBytes),
+            budget.max_batch_encoded_bytes() as u64
+        );
+        assert_eq!(
+            quote.custody().get(JointResource::ReplyRecords),
+            operations.len() as u64
+        );
+        assert_eq!(quote.custody().get(JointResource::QueueRecords), 0);
+        assert_eq!(quote.custody().get(JointResource::PayloadBytes),
+            (novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES
+            + novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_transport(budget)
+                .peak_bytes()) as u64);
+        let mut over = operations.clone();
+        over.push(cancel_intent(99, backend));
+        assert!(NativeTaskOperationSink::progress_for_original_method_run(&over, budget).is_err());
+        assert!(NativeTaskOperationSink::progress_for_original_method_run(&[], budget).is_err());
+        let same_control_method = [cancel_intent(1, backend), abort_intent(context(backend))];
+        assert_eq!(
+            same_control_method[0].native_run_key(),
+            same_control_method[1].native_run_key()
+        );
+        assert!(
+            NativeTaskOperationSink::progress_for_original_method_run(&same_control_method, budget)
+                .is_ok()
+        );
+        let mixed = [cancel_intent(1, backend), update_intent(2, backend, 1)];
+        assert_ne!(mixed[0].native_run_key(), mixed[1].native_run_key());
+        assert!(NativeTaskOperationSink::progress_for_original_method_run(&mixed, budget).is_err());
+    }
+
+    #[test]
+    fn composition_run_envelope_charges_queued_input_and_reply_independently() {
+        use novarocks_workload_control::joint_admission::JointResource;
+        let budget = TransportBudget::DEFAULT;
+        let owned = NativeTaskOperationSink::minimum_owned_support_for_composition(budget).unwrap();
+        let quote =
+            NativeTaskOperationSink::minimum_progress_for_composition(budget, owned).unwrap();
+        assert_eq!(quote.foreground(), quote.settlement());
+        assert_eq!(
+            quote.foreground().get(JointResource::PayloadBytes),
+            owned.get() + 2 * budget.max_batch_encoded_bytes() as u64
+        );
+        assert_eq!(
+            quote.custody().get(JointResource::QueueRecords),
+            budget.max_batch_items() as u64
+        );
+        assert_eq!(
+            quote.custody().get(JointResource::ReplyRecords),
+            budget.max_batch_items() as u64
+        );
+        assert_eq!(
+            quote.custody().get(JointResource::ClaimRecords),
+            budget.max_batch_items() as u64 + 1
+        );
+        assert_eq!(
+            quote.custody().get(JointResource::PayloadBytes),
+            owned.get()
+                + novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64
+                + novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_transport(
+                    budget
+                )
+                .peak_bytes() as u64
+        );
+        let too_small = std::num::NonZeroU64::new(owned.get() - 1).unwrap();
+        assert!(
+            NativeTaskOperationSink::minimum_progress_for_composition(budget, too_small).is_err()
+        );
+        assert!(
+            NativeTaskOperationSink::minimum_progress_for_composition(
+                budget,
+                std::num::NonZeroU64::new(u64::MAX).unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn original_apply_source_geometry_keeps_last_alias_headers_separate_from_reply_cells() {
+        let geometry =
+            NativeTaskOperationSink::source_geometry_for_composition(TransportBudget::DEFAULT)
+                .unwrap();
+        assert_eq!(
+            geometry.records,
+            TransportBudget::DEFAULT.max_backend_queued_operations()
+        );
+        assert_eq!(geometry.canonical_headers, geometry.records + 1);
+        assert_eq!(
+            geometry.resident_bytes().unwrap(),
+            geometry.record_array.size()
+                + geometry.core.size()
+                + geometry.owner.size()
+                + geometry.canonical_headers * geometry.canonical_header.size()
+        );
+        assert!(super::super::apply_send_owner::apply_source_geometry(0).is_err());
+        assert!(super::super::apply_send_owner::apply_source_geometry(usize::MAX).is_err());
+    }
 
     #[test]
     fn original_dispatch_batch_drives_the_input_gate_before_dto_construction() {

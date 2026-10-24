@@ -26,6 +26,7 @@ mod async_action;
 mod control_action;
 pub use async_action::{
     AsyncActionAdmission, AsyncActionGrant, AsyncActionSource, RootPayloadInitialAdmission,
+    RootPayloadInitialSource,
 };
 pub(super) mod native_action;
 pub(super) use native_action::{NativeActionFence, validate_native_action};
@@ -158,6 +159,29 @@ impl JointAdmissionHandle {
         let Some(custody) = custody else {
             return Err(WorkError::NotReady);
         };
+        self.paid_proposal_with_custody(scope, custody)
+    }
+
+    pub(super) fn try_begin_paid_proposal_for_scope(
+        &self,
+        scope: WorkScope,
+    ) -> Result<JointTryBegin<JointProposal>, WorkError> {
+        match self.try_reserve_proposal(&scope)? {
+            ProposalReservation::Reserved(Some(custody)) => self
+                .paid_proposal_with_custody(scope, custody)
+                .map(JointTryBegin::Started),
+            ProposalReservation::Reserved(None) => Err(WorkError::NotReady),
+            ProposalReservation::Full(target) => Ok(JointTryBegin::Full(
+                JointProposalSlotWait::new(Arc::downgrade(&self.inner), target),
+            )),
+        }
+    }
+
+    fn paid_proposal_with_custody(
+        &self,
+        scope: WorkScope,
+        custody: ProposalConstruction,
+    ) -> Result<JointProposal, WorkError> {
         let (config, class) = {
             let state = self.inner.state.lock().unwrap();
             let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;

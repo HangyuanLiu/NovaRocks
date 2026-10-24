@@ -752,6 +752,56 @@ impl MaintenanceEngine {
     }
 }
 
+/// Pure first-party fixed geometry from the same metadata execution factory.
+/// No catalog instance, route, credential, lease, Work, or network is created.
+pub fn metadata_maintenance_io_geometry()
+-> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry, ConnectorError> {
+    // Exact original io_requests, not the cleanup object bound or a new
+    // semaphore. Header/F costs exclude borrowed SDK/cache/private graphs.
+    let io = std::num::NonZeroUsize::new(OperationLimits::default().io_requests as usize)
+        .ok_or_else(|| internal("metadata operation I/O inventory is empty"))?;
+    let fixed = std::mem::size_of::<MaintenanceEngine>()
+        .checked_add(std::mem::size_of::<MetadataExecutionInput>())
+        .and_then(|n| n.checked_add(metadata_execution_future_bytes(make_metadata_execution)))
+        .and_then(|n| n.checked_add(execution::fixed_backing_bytes()))
+        .and_then(|n| n.checked_add(IcebergCommitOperation::fixed_backing_bytes().ok()?))
+        .and_then(|n| {
+            n.checked_add(
+                crate::fs_io::governed_writer_backing_bytes()
+                    .ok()?
+                    .checked_mul(io.get())?,
+            )
+        })
+        .ok_or_else(|| internal("metadata source geometry overflow"))?;
+    // Canonical plan/evidence String+Bytes and old/new conversion coexist.
+    // Variable retention/journal plans are reserved from observed metadata
+    // at their actual formation points, not hidden in this initial bound.
+    let initial = 2usize
+        .checked_mul(
+            novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES,
+        )
+        .and_then(|n| {
+            n.checked_add(
+                2 * novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES,
+            )
+        })
+        .ok_or_else(|| internal("metadata initial payload geometry overflow"))?;
+    Ok(
+        novarocks_spi::connector::ConnectorMetadataMaintenanceIoGeometry::new(
+            io,
+            std::num::NonZeroU64::new(
+                u64::try_from(fixed).map_err(|_| internal("metadata source geometry overflow"))?,
+            )
+            .unwrap(),
+            std::num::NonZeroU64::new(
+                u64::try_from(initial)
+                    .map_err(|_| internal("metadata initial payload overflow"))?,
+            )
+            .unwrap(),
+        ),
+    )
+}
+
 impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
@@ -801,48 +851,10 @@ impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
         &self,
     ) -> Result<novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile, ConnectorError>
     {
+        let geometry = metadata_maintenance_io_geometry()?;
         let dependencies = self.runtime.metadata_action_initial_dependencies()?;
-        // Exact original io_requests, not the cleanup object bound or a new
-        // semaphore. Header/F costs exclude borrowed SDK/cache/private graphs.
-        let io = std::num::NonZeroUsize::new(OperationLimits::default().io_requests as usize)
-            .ok_or_else(|| internal("metadata operation I/O inventory is empty"))?;
-        let fixed = std::mem::size_of::<MaintenanceEngine>()
-            .checked_add(std::mem::size_of::<MetadataExecutionInput>())
-            .and_then(|n| n.checked_add(metadata_execution_future_bytes(make_metadata_execution)))
-            .and_then(|n| n.checked_add(execution::fixed_backing_bytes()))
-            .and_then(|n| n.checked_add(IcebergCommitOperation::fixed_backing_bytes().ok()?))
-            .and_then(|n| {
-                n.checked_add(
-                    crate::fs_io::governed_writer_backing_bytes()
-                        .ok()?
-                        .checked_mul(io.get())?,
-                )
-            })
-            .ok_or_else(|| internal("metadata source geometry overflow"))?;
-        // Canonical plan/evidence String+Bytes and old/new conversion coexist.
-        // Variable retention/journal plans are reserved from observed metadata
-        // at their actual formation points, not hidden in this initial bound.
-        let initial = 2usize
-            .checked_mul(
-                novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES,
-            )
-            .and_then(|n| {
-                n.checked_add(
-                    2 * novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES,
-                )
-            })
-            .ok_or_else(|| internal("metadata initial payload geometry overflow"))?;
-        novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile::try_new(
-            io,
-            std::num::NonZeroU64::new(
-                u64::try_from(fixed).map_err(|_| internal("metadata source geometry overflow"))?,
-            )
-            .unwrap(),
-            std::num::NonZeroU64::new(
-                u64::try_from(initial)
-                    .map_err(|_| internal("metadata initial payload overflow"))?,
-            )
-            .unwrap(),
+        novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile::from_geometry(
+            geometry,
             dependencies,
         )
     }

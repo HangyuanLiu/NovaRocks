@@ -30,18 +30,25 @@ use novarocks_workload_control::{ControlStorageConfig, PollRoleGeometry, Workloa
 /// Native qualification API. Installation revalidates the original sources.
 #[derive(Clone, Debug)]
 pub struct FrontendWorkloadCapacityProfile {
-    inputs: FrontendNativeCapacityInputs,
-    workload: WorkloadConfig,
-    capacity: JointCapacityConfig,
+    pub(super) inputs: FrontendNativeCapacityInputs,
+    pub(super) workload: WorkloadConfig,
+    pub(super) capacity: JointCapacityConfig,
     required: RequiredJointProgress,
     children_per_slot: usize,
     proposals_per_slot: NonZeroUsize,
     poll_roles: [PollRoleGeometry; 1],
+    process_sources: novarocks_workload_control::PollRoleSourceBacking,
+    pub(super) composition_facts: Option<super::composition::FrontendCompositionFacts>,
+    pub(super) transport_budget: Option<novarocks_native_adapter::FrontendTaskTransportBudget>,
+    pub(super) statement_ingress: Option<super::composition::FrontendStatementIngress>,
+    pub(super) recipe: Option<super::composition::NativeCompositionRecipe>,
 }
 impl FrontendWorkloadCapacityProfile {
     /// Private to this original frontend composer. Call only after deriving
     /// complete supported action vectors, inputs and retained-source envelopes.
-    /// This is not the still-missing production action recipe itself.
+    /// The raw vector convenience remains only in original unit fixtures;
+    /// production enters through the concrete composition recipe.
+    #[cfg(test)]
     pub(super) fn from_complete_actions(
         inputs: FrontendNativeCapacityInputs,
         workload: &WorkloadConfig,
@@ -49,6 +56,26 @@ impl FrontendWorkloadCapacityProfile {
         required: RequiredJointProgress,
         children_per_slot: usize,
         proposals_per_slot: NonZeroUsize,
+    ) -> Result<Self, WorkError> {
+        Self::from_complete_actions_with_sources(
+            inputs,
+            workload,
+            capacity,
+            required,
+            children_per_slot,
+            proposals_per_slot,
+            novarocks_workload_control::PollRoleSourceBacking::default(),
+        )
+    }
+
+    pub(super) fn from_complete_actions_with_sources(
+        inputs: FrontendNativeCapacityInputs,
+        workload: &WorkloadConfig,
+        capacity: JointCapacityConfig,
+        required: RequiredJointProgress,
+        children_per_slot: usize,
+        proposals_per_slot: NonZeroUsize,
+        process_sources: novarocks_workload_control::PollRoleSourceBacking,
     ) -> Result<Self, WorkError> {
         workload.validate()?;
         let policy = inputs.policy();
@@ -68,7 +95,8 @@ impl FrontendWorkloadCapacityProfile {
             children_per_slot,
             proposals_per_slot.get(),
             &poll_roles,
-        );
+        )
+        .with_process_source_backing(process_sources);
         // Keep the formula with the original WC metadata author. In particular,
         // changing C for all canonical productions changes the actual Q/M fee.
         if capacity.max_registered_dependencies < storage.minimum_dependency_records(&capacity)? {
@@ -150,6 +178,11 @@ impl FrontendWorkloadCapacityProfile {
             children_per_slot,
             proposals_per_slot,
             poll_roles,
+            process_sources,
+            composition_facts: None,
+            transport_budget: None,
+            statement_ingress: None,
+            recipe: None,
         })
     }
 
@@ -164,7 +197,21 @@ impl FrontendWorkloadCapacityProfile {
         native: &FrontendDataRuntime,
     ) -> Result<Self, WorkError> {
         self.inputs = self.inputs.with_native_sources(native)?;
-        Ok(self)
+        if let Some(budget) = self.transport_budget {
+            let source = self.inputs.native.as_ref().ok_or(WorkError::NotReady)?;
+            if source.apply_records != budget.max_backend_queued_operations()
+                || source.transport.process_items != budget.max_backend_queued_operations()
+                || source.transport.process_retained_bytes != budget.max_backend_queued_bytes()
+                || source.transport.target_items != budget.max_query_backend_queued_operations()
+                || source.transport.control_reserved_items != budget.max_batch_items()
+                || source.transport.maximum_batch_encoded_bytes != budget.max_batch_encoded_bytes()
+            {
+                return Err(WorkError::InvalidConfig(
+                    "frontend actual Native source capacity",
+                ));
+            }
+        }
+        self.rebind_process_sources()
     }
     pub(crate) fn validate_pool_declarations(
         &self,
@@ -220,12 +267,15 @@ impl FrontendWorkloadCapacityProfile {
             &self.required,
         )?;
         let pair = workload.configure_joint_capacity(capacity)?;
-        workload.configure_control_storage(ControlStorageConfig::new(
-            self.policy().slots_per_class(),
-            self.children_per_slot,
-            self.proposals_per_slot.get(),
-            &self.poll_roles,
-        ))?;
+        workload.configure_control_storage(
+            ControlStorageConfig::new(
+                self.policy().slots_per_class(),
+                self.children_per_slot,
+                self.proposals_per_slot.get(),
+                &self.poll_roles,
+            )
+            .with_process_source_backing(self.process_sources),
+        )?;
         Ok(pair)
     }
 

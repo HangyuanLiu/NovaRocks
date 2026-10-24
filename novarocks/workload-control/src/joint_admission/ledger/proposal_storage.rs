@@ -96,52 +96,181 @@ impl Drop for ProposalConstruction {
     }
 }
 
+/// A temporary unacquired constructor slot is distinct from every capacity
+/// proof/configuration/backing error. Full owns no request ticket or body.
+pub enum JointTryBegin<T> {
+    Started(T),
+    Full(JointProposalSlotWait),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ProposalSlotWaitTarget {
+    owner: WorkId,
+    slot: SlotId,
+    generation: u64,
+    marker: crate::WorkloadProgressRevision,
+}
+pub(crate) enum ProposalReservation {
+    Reserved(Option<ProposalConstruction>),
+    Full(ProposalSlotWaitTarget),
+}
+
+/// An event subscription in the original producer's existing fixed field.
+/// Ready asks that SAME source to reobserve; it never reserves a Q cell.
+pub struct JointProposalSlotWait {
+    future: Pin<Box<dyn Future<Output = Result<(), WorkError>> + Send>>,
+}
+impl JointProposalSlotWait {
+    pub(super) fn new(inner: Weak<Inner>, target: ProposalSlotWaitTarget) -> Self {
+        Self {
+            future: Box::pin(wait_proposal_slot(inner, target)),
+        }
+    }
+    /// Inline layout is already included by the containing original row.
+    /// Charge the second, actual named F pointee once per fixed wait position.
+    pub fn metadata_layouts() -> (std::alloc::Layout, std::alloc::Layout) {
+        fn layout<F: Future<Output = Result<(), WorkError>>>(
+            _: fn(Weak<Inner>, ProposalSlotWaitTarget) -> F,
+        ) -> std::alloc::Layout {
+            std::alloc::Layout::new::<F>()
+        }
+        (
+            std::alloc::Layout::new::<Self>(),
+            layout(wait_proposal_slot),
+        )
+    }
+}
+impl Future for JointProposalSlotWait {
+    type Output = Result<(), WorkError>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.future.as_mut().poll(cx)
+    }
+}
+async fn wait_proposal_slot(
+    inner: Weak<Inner>,
+    target: ProposalSlotWaitTarget,
+) -> Result<(), WorkError> {
+    let inner = inner.upgrade().ok_or(WorkError::Released)?;
+    loop {
+        let changed = inner.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let reobserve = {
+            let state = inner.state.lock().unwrap();
+            let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
+            if ledger.driver_closed {
+                return Err(WorkError::Closed);
+            }
+            let node = state.nodes.get(&target.owner).ok_or(WorkError::Released)?;
+            let slot = state
+                .cancellations
+                .slots
+                .get(target.slot.0)
+                .ok_or(WorkError::Released)?;
+            if node.owner != crate::OwnerState::Active
+                || node.cancellation != target.slot
+                || slot.phase != SlotPhase::Node(target.owner)
+                || slot.generation != target.generation
+            {
+                return Err(WorkError::Released);
+            }
+            slot.proposals
+                .iter()
+                .any(|cell| cell.phase == ProposalPhase::Free)
+                || inner.capture_progress(&state) != target.marker
+        };
+        if reobserve {
+            return Ok(());
+        }
+        changed.await;
+    }
+}
+
 impl JointAdmissionHandle {
     pub(crate) fn reserve_proposal(
         &self,
         scope: &WorkScope,
     ) -> Result<Option<ProposalConstruction>, WorkError> {
+        match self.try_reserve_proposal(scope)? {
+            ProposalReservation::Reserved(custody) => Ok(custody),
+            ProposalReservation::Full(_) => {
+                Err(WorkError::Capacity("fixed proposal and reply cells"))
+            }
+        }
+    }
+
+    pub(crate) fn try_reserve_proposal(
+        &self,
+        scope: &WorkScope,
+    ) -> Result<ProposalReservation, WorkError> {
         if !Arc::ptr_eq(&self.inner, &scope.inner) {
             return Err(WorkError::ForeignAuthority);
         }
-        self.inner.update(|state| {
-            let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
-            if ledger.driver_closed {
-                return Err(WorkError::Closed);
+        let (result, changed) = {
+            let mut state = self.inner.state.lock().unwrap();
+            let result = (|| {
+                let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
+                if ledger.driver_closed {
+                    return Err(WorkError::Closed);
+                }
+                let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
+                if !state.cancellations.fixed {
+                    return Ok(ProposalReservation::Reserved(None));
+                }
+                let slot = node.cancellation;
+                if state.cancellations.slots[slot.0].proposals.is_empty() {
+                    return Err(WorkError::Capacity("fixed proposal cell geometry"));
+                }
+                let Some(index) = state.cancellations.slots[slot.0]
+                    .proposals
+                    .iter()
+                    .position(|cell| cell.phase == ProposalPhase::Free)
+                else {
+                    // A failed reservation is read-only. Advancing/notifying
+                    // here would wake this constructor on its own Full result.
+                    return Ok(ProposalReservation::Full(ProposalSlotWaitTarget {
+                        owner: scope.id,
+                        slot,
+                        generation: state.cancellations.slots[slot.0].generation,
+                        marker: self.inner.capture_progress(&state),
+                    }));
+                };
+                let waiters = node
+                    .resource_waiters
+                    .checked_add(1)
+                    .ok_or(WorkError::ArithmeticOverflow)?;
+                let cell = &mut state.cancellations.slots[slot.0].proposals[index];
+                assert!(Arc::get_mut(&mut cell.body).is_some());
+                let generation = cell
+                    .generation
+                    .checked_add(1)
+                    .ok_or(WorkError::ArithmeticOverflow)?;
+                cell.generation = generation;
+                cell.phase = ProposalPhase::Building;
+                state.nodes.get_mut(&scope.id).unwrap().resource_waiters = waiters;
+                Ok(ProposalReservation::Reserved(Some(ProposalConstruction {
+                    inner: Arc::downgrade(&self.inner),
+                    owner: scope.id,
+                    key: Some(ProposalKey {
+                        slot,
+                        index,
+                        generation,
+                    }),
+                })))
+            })();
+            let changed = matches!(&result, Ok(ProposalReservation::Reserved(Some(_))));
+            if changed {
+                crate::admission::dispatch(&mut state, &self.inner.config);
+                crate::observation::fill_control(&mut state, &self.inner.config);
+                state.advance_progress_revision();
             }
-            let node = state.nodes.get(&scope.id).ok_or(WorkError::Released)?;
-            if !state.cancellations.fixed {
-                return Ok(None);
-            }
-            let slot = node.cancellation;
-            let waiters = node
-                .resource_waiters
-                .checked_add(1)
-                .ok_or(WorkError::ArithmeticOverflow)?;
-            let (index, cell) = state.cancellations.slots[slot.0]
-                .proposals
-                .iter_mut()
-                .enumerate()
-                .find(|(_, cell)| cell.phase == ProposalPhase::Free)
-                .ok_or(WorkError::Capacity("fixed proposal and reply cells"))?;
-            assert!(Arc::get_mut(&mut cell.body).is_some());
-            let generation = cell
-                .generation
-                .checked_add(1)
-                .ok_or(WorkError::ArithmeticOverflow)?;
-            cell.generation = generation;
-            cell.phase = ProposalPhase::Building;
-            state.nodes.get_mut(&scope.id).unwrap().resource_waiters = waiters;
-            Ok(Some(ProposalConstruction {
-                inner: Arc::downgrade(&self.inner),
-                owner: scope.id,
-                key: Some(ProposalKey {
-                    slot,
-                    index,
-                    generation,
-                }),
-            }))
-        })
+            (result, changed)
+        };
+        if changed {
+            crate::admission::drain_wakes(&self.inner);
+            self.inner.changed.notify_waiters();
+        }
+        result
     }
 
     pub(super) fn store_proposal(
