@@ -515,6 +515,61 @@ impl LogicalExecutionTestHarness {
         Self::install(runtime, config, initial_execution, contexts)
     }
 
+    /// Exposes the original effect-free recovery configuration only to the
+    /// existing integration harness. install_internal still validates the
+    /// actual description's effect, recovery policy, and internal carrier.
+    #[allow(clippy::too_many_arguments)]
+    pub fn internal_pre_visibility_recovery_config(
+        initial_execution: QueryExecutionId,
+        mailbox_capacity: std::num::NonZeroUsize,
+        contexts: Vec<QueryContextRef>,
+        max_admission_issues: std::num::NonZeroUsize,
+        max_establish_authorizations: std::num::NonZeroUsize,
+        max_attempts: std::num::NonZeroU32,
+        qualification: std::sync::Arc<dyn crate::coordination::ReplacementQualificationEffectPort>,
+        owner: novarocks_workload_control::WorkOwner,
+        stage: novarocks_workload_control::StagePermit,
+        reservation_valid_for: std::time::Duration,
+    ) -> Result<LogicalExecutionActorConfig, LogicalExecutionActorError> {
+        LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
+            initial_execution,
+            mailbox_capacity,
+            contexts,
+            max_admission_issues,
+            max_establish_authorizations,
+            max_attempts,
+            qualification,
+            owner,
+            stage,
+            reservation_valid_for,
+        )
+    }
+
+    /// Consume the same original running authority through the actor's real
+    /// failure/visibility/attempt-budget gate, qualification and activation.
+    /// Failure/cancellation leaves the original actor/registry owned by self;
+    /// this helper never reconstructs a consumed permit or a Ready token.
+    pub async fn replace_original_running_attempt(
+        &mut self,
+        failure: novarocks_coordination_contract::AttemptFailureClass,
+        successor: QueryExecutionId,
+        contexts: Vec<QueryContextRef>,
+    ) -> Result<AttemptActivationIdentity, LogicalExecutionActorError> {
+        let running = self
+            .running
+            .take()
+            .ok_or(LogicalExecutionActorError::WrongPhase)?;
+        let qualification = self
+            .actor()
+            .begin_replacement(running, failure, successor, contexts)
+            .await?;
+        let initial = self.actor().activate_replacement(qualification).await?;
+        let running = self.actor().activate(initial.ready()).await?;
+        let identity = running.identity();
+        self.running = Some(running);
+        Ok(identity)
+    }
+
     /// Replays the fixture's original accepted admission and Establish facts
     /// through the real actor-owned permit/transport/Worker-settlement path.
     /// The caller supplies the already-observed operation identities and ACKs;
@@ -523,6 +578,43 @@ impl LogicalExecutionTestHarness {
         &self,
         admission_request: novarocks_execution_contract::AcquireQueryContextAdmissionTicket,
         admission_settlement: crate::coordination::AdmissionIssueSettlement,
+        establish_request: std::sync::Arc<novarocks_execution_contract::EstablishQueryContext>,
+        establish_ack_operation: novarocks_execution_contract::TaskOperationId,
+        establish_outcome: novarocks_execution_contract::OperationOutcome,
+    ) -> Result<(), LogicalExecutionActorError> {
+        self.settle_original_establish(
+            admission_request,
+            Some(admission_settlement),
+            establish_request,
+            establish_ack_operation,
+            establish_outcome,
+        )
+        .await
+    }
+
+    /// A replacement's admission was already installed by its actual qualified
+    /// reservation. Reuse that exact grant without issuing admission twice.
+    pub async fn settle_original_qualified_establish(
+        &self,
+        admission_request: novarocks_execution_contract::AcquireQueryContextAdmissionTicket,
+        establish_request: std::sync::Arc<novarocks_execution_contract::EstablishQueryContext>,
+        establish_ack_operation: novarocks_execution_contract::TaskOperationId,
+        establish_outcome: novarocks_execution_contract::OperationOutcome,
+    ) -> Result<(), LogicalExecutionActorError> {
+        self.settle_original_establish(
+            admission_request,
+            None,
+            establish_request,
+            establish_ack_operation,
+            establish_outcome,
+        )
+        .await
+    }
+
+    async fn settle_original_establish(
+        &self,
+        admission_request: novarocks_execution_contract::AcquireQueryContextAdmissionTicket,
+        admission_settlement: Option<crate::coordination::AdmissionIssueSettlement>,
         establish_request: std::sync::Arc<novarocks_execution_contract::EstablishQueryContext>,
         establish_ack_operation: novarocks_execution_contract::TaskOperationId,
         establish_outcome: novarocks_execution_contract::OperationOutcome,
@@ -559,10 +651,12 @@ impl LogicalExecutionTestHarness {
             return Err(LogicalExecutionActorError::InvariantViolation);
         }
         let running = self.running.as_ref().expect("fixture attempt is active");
-        let receipt = running.begin_admission_issue(admission_request).await?;
-        running
-            .settle_admission_issue(receipt, admission_settlement)
-            .await?;
+        if let Some(admission_settlement) = admission_settlement {
+            let receipt = running.begin_admission_issue(admission_request).await?;
+            running
+                .settle_admission_issue(receipt, admission_settlement)
+                .await?;
+        }
         let permit = running
             .authorize_establish(
                 establish_request,

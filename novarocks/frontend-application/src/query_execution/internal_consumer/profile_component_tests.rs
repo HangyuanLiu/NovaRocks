@@ -451,3 +451,569 @@ async fn actual_foreign_old_claim_and_cut_cannot_consume_new_profile_custody() {
     watchdog("stale actual actor drain", stale.finish()).await;
     watchdog("next actual actor drain", next.finish()).await;
 }
+
+// The qualification fixture owns the successor's actual admission ACKs from
+// its original TaskRound. It supplies neither an actor nor a Ready token.
+#[derive(Debug)]
+struct ProfileRecoveryFacts {
+    failed: QueryContextRef,
+    successor: QueryContextRef,
+    admissions:
+        Mutex<Option<Box<[novarocks_query_application::coordination::QualifiedWorkerAdmission]>>>,
+    submitted: std::sync::atomic::AtomicUsize,
+    isolation_exits: Arc<std::sync::atomic::AtomicUsize>,
+}
+#[derive(Debug)]
+struct ProfileRecoveryPort {
+    capacity: tokio::sync::watch::Sender<u64>,
+    facts: Arc<ProfileRecoveryFacts>,
+}
+#[derive(Debug)]
+struct ProfileRecoveryEffect(Arc<ProfileRecoveryFacts>);
+impl novarocks_query_application::coordination::ReplacementQualificationEffectPort
+    for ProfileRecoveryPort
+{
+    fn subscribe_capacity(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.capacity.subscribe()
+    }
+    fn try_reserve(
+        &self,
+        _: &novarocks_query_application::coordination::ReplacementQualificationRequest,
+    ) -> novarocks_query_application::coordination::ReplacementQualificationEffectAdmission {
+        novarocks_query_application::coordination::ReplacementQualificationEffectAdmission::Admitted(
+            Box::new(ProfileRecoveryEffect(Arc::clone(&self.facts))),
+        )
+    }
+}
+impl novarocks_query_application::coordination::ReplacementQualificationEffectReservation
+    for ProfileRecoveryEffect
+{
+    fn submit(
+        self: Box<Self>,
+        submission: novarocks_query_application::coordination::ReplacementQualificationEffectSubmission,
+    ) {
+        use novarocks_query_application::coordination as qa;
+        let request = submission.request();
+        if request.failed_contexts() != [self.0.failed]
+            || request.replacement_contexts() != [self.0.successor]
+        {
+            submission.refused(qa::ReplacementQualificationFailure::InvalidReservation);
+            return;
+        }
+        let admissions = self.0.admissions.lock().unwrap().take();
+        let Some(admissions) = admissions else {
+            submission.refused(qa::ReplacementQualificationFailure::InvalidReservation);
+            return;
+        };
+        self.0.submitted.fetch_add(1, Ordering::SeqCst);
+        let reservation = ProfileRecoveryIsolation {
+            identity: request.identity(),
+            failed: self.0.failed,
+            admissions,
+            exits: Arc::clone(&self.0.isolation_exits),
+        };
+        match qa::QualifiedReplacementReservation::try_new(request, Box::new(reservation)) {
+            Ok(qualified) => submission.qualified(qualified).unwrap(),
+            Err(error) => submission.refused(error),
+        }
+    }
+}
+#[derive(Debug)]
+struct ProfileRecoveryIsolation {
+    identity: novarocks_query_application::coordination::ReplacementQualificationIdentity,
+    failed: QueryContextRef,
+    admissions: Box<[novarocks_query_application::coordination::QualifiedWorkerAdmission]>,
+    exits: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl novarocks_query_application::coordination::AttemptIsolationReservation
+    for ProfileRecoveryIsolation
+{
+    fn identity(
+        &self,
+    ) -> novarocks_query_application::coordination::ReplacementQualificationIdentity {
+        self.identity
+    }
+    fn topology_revision(&self) -> u64 {
+        1
+    }
+    fn admissions(&self) -> &[novarocks_query_application::coordination::QualifiedWorkerAdmission] {
+        &self.admissions
+    }
+    fn validate_binding(
+        &self,
+        failed: &[QueryContextRef],
+    ) -> Result<(), novarocks_query_application::coordination::ReplacementQualificationFailure>
+    {
+        (failed == [self.failed]).then_some(()).ok_or(novarocks_query_application::coordination::ReplacementQualificationFailure::InvalidReservation)
+    }
+    fn activate(
+        self: Box<Self>,
+    ) -> Result<
+        Box<dyn novarocks_query_application::coordination::ActiveAttemptIsolationOwner>,
+        novarocks_query_application::coordination::AttemptIsolationActivationFailure,
+    > {
+        Ok(Box::new(ProfileRecoveryActiveIsolation {
+            execution: self.identity.replacement(),
+            exits: Arc::clone(&self.exits),
+        }))
+    }
+    fn abandon(self: Box<Self>) {
+        self.exits.fetch_add(1, Ordering::SeqCst);
+    }
+}
+#[derive(Debug)]
+struct ProfileRecoveryActiveIsolation {
+    execution: QueryExecutionId,
+    exits: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl novarocks_query_application::coordination::ActiveAttemptIsolationOwner
+    for ProfileRecoveryActiveIsolation
+{
+    fn execution(&self) -> QueryExecutionId {
+        self.execution
+    }
+    fn finish(self: Box<Self>) {
+        self.exits.fetch_add(1, Ordering::SeqCst);
+    }
+    fn abandon(self: Box<Self>) {
+        self.exits.fetch_add(1, Ordering::SeqCst);
+    }
+}
+struct ProfileRecoveryFinalInfo(
+    Mutex<std::collections::BTreeMap<TaskIdentity, novarocks_execution_contract::FinalTaskInfo>>,
+);
+impl TaskResultTransport for ProfileRecoveryFinalInfo {
+    fn final_task_info(
+        &self,
+        task: TaskIdentity,
+    ) -> futures::future::BoxFuture<'_, Result<FinalTaskInfoRead, String>> {
+        let info = self.0.lock().unwrap().remove(&task);
+        Box::pin(async move {
+            info.map(|info| FinalTaskInfoRead::Available(Box::new(info)))
+                .ok_or_else(|| "the original successor final info was read twice".to_owned())
+        })
+    }
+    fn dynamic_filters(
+        &self,
+        _: TaskIdentity,
+        _: Option<DomainVersion>,
+    ) -> Result<DynamicFilterRead, DynamicFilterReadError> {
+        panic!("Profile recovery diagnostics must not fetch dynamic filters")
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_logical_profile_owner_replaces_before_visibility_and_receives_only_successor_diagnostics()
+ {
+    use crate::query_execution::internal_consumer::test_fixture::internal_profile_recovery_description;
+    use novarocks_query_application::coordination as qa;
+    use std::num::NonZeroU32;
+    let control = WorkloadControl::try_new(
+        WorkloadConfig::default(),
+        ResourceConfig {
+            total_bytes: 1 << 20,
+            control_bytes: 1 << 10,
+            per_scope_bytes: 1 << 18,
+        },
+    )
+    .unwrap();
+    let result_capacity = control
+        .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+        .unwrap();
+    control.mark_ready().unwrap();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let scope = root.owner.scope();
+    let (description, plan) = watchdog(
+        "complete the original SQL Profile declaration and CountOnly carrier",
+        internal_profile_recovery_description(&scope),
+    )
+    .await;
+    assert_eq!(
+        description.kind(),
+        novarocks_query_application::api::QueryExecutionKind::Read
+    );
+    assert_eq!(
+        description.effect(),
+        novarocks_coordination_contract::ExecutionEffect::None
+    );
+    assert_eq!(
+        description.recovery(),
+        novarocks_coordination_contract::RecoveryMode::RestartAttemptBeforeVisibility
+    );
+    let first_execution =
+        QueryExecutionId::new(QueryId::new(0x92, 0x37), AttemptId::new(1).unwrap()).unwrap();
+    let next_execution =
+        QueryExecutionId::new(first_execution.query_id(), AttemptId::new(2).unwrap()).unwrap();
+    let (mut first_round, first_acks, first_release, actor_clock, first_protocol, first_establish) =
+        crate::task_execution::tests::manifest_normal_release_ack_with_protocol_fixture(
+            first_execution,
+            plan,
+        );
+    let (next_round, next_acks, next_release, next_clock, next_protocol, next_facts) =
+        crate::task_execution::tests::manifest_normal_release_ack_with_protocol_fixture(
+            next_execution,
+            plan,
+        );
+    let first_root = first_round.root_task();
+    let next_root = next_round.root_task();
+    let first_context = *first_round.execution().graph().contexts().next().unwrap();
+    let next_context = *next_round.execution().graph().contexts().next().unwrap();
+    let mut admission = None;
+    let mut establish = None;
+    let mut qualified = Vec::new();
+    for (intent, ack) in next_facts {
+        assert_eq!(intent.operation_id(), ack.operation_id());
+        match intent {
+            OperationIntent::AcquireQueryContextAdmissionTicket(request) => {
+                let AckPayload::AdmissionTicket(ticket) = ack.payload() else {
+                    panic!("original replacement admission ACK")
+                };
+                qualified.push(
+                    qa::QualifiedWorkerAdmission::try_new(next_execution, request, *ticket)
+                        .unwrap(),
+                );
+                assert!(admission.replace(request).is_none());
+            }
+            OperationIntent::EstablishQueryContext(request) => {
+                assert!(
+                    establish
+                        .replace((request, ack.operation_id(), ack.worker_outcome().unwrap()))
+                        .is_none()
+                );
+            }
+            _ => panic!("unrelated original successor fixture fact"),
+        }
+    }
+    let isolation_exits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let facts = Arc::new(ProfileRecoveryFacts {
+        failed: first_context,
+        successor: next_context,
+        admissions: Mutex::new(Some(qualified.into_boxed_slice())),
+        submitted: std::sync::atomic::AtomicUsize::new(0),
+        isolation_exits: Arc::clone(&isolation_exits),
+    });
+    let (capacity, _) = tokio::sync::watch::channel(1);
+    let qualification = Arc::new(ProfileRecoveryPort {
+        capacity,
+        facts: Arc::clone(&facts),
+    });
+    let stage = scope
+        .try_acquire(novarocks_workload_control::Stage::Execution)
+        .unwrap();
+    let (abort, abort_intake) =
+        crate::task_execution::abort_effect::NativeAbortEffectAdapter::bounded(
+            NonZeroUsize::new(2).unwrap(),
+            Arc::new(CountingWake::default()),
+        );
+    first_round.install_abort_effect_intake(abort_intake);
+    let config = LogicalExecutionTestHarness::internal_pre_visibility_recovery_config(
+        first_execution,
+        NonZeroUsize::new(8).unwrap(),
+        vec![first_context],
+        NonZeroUsize::new(2).unwrap(),
+        NonZeroUsize::new(2).unwrap(),
+        NonZeroU32::new(2).unwrap(),
+        qualification,
+        root.owner,
+        stage,
+        Duration::from_secs(30),
+    )
+    .unwrap()
+    .with_abort_query_context_effect_port(
+        abort as Arc<dyn AbortQueryContextEffectPort>,
+        NonZeroUsize::new(2).unwrap(),
+    );
+    let mut logical = LogicalExecutionTestHarness::install_internal(
+        tokio::runtime::Handle::current(),
+        config,
+        &description,
+        NonZeroUsize::MIN,
+        Arc::clone(&actor_clock) as Arc<dyn MonotonicClock>,
+        ComputationObservationBudgets::new(Duration::from_secs(1), Duration::from_secs(5)),
+        first_execution,
+        vec![first_context],
+    )
+    .unwrap();
+    let first_activation = watchdog(
+        "activate original Profile attempt",
+        logical.activate_initial(),
+    )
+    .await
+    .unwrap();
+    watchdog(
+        "settle first original Establish",
+        crate::task_execution::tests::settle_original_actor_establish_facts(
+            &logical,
+            first_establish,
+        ),
+    )
+    .await;
+    let old_probe = Arc::new(FinalInfoProbe::default());
+    let (release_old_read, old_gate) = tokio::sync::oneshot::channel();
+    let transport: Arc<dyn TaskResultTransport> = Arc::new(HeldOriginalFinalInfo {
+        gate: Mutex::new(Some(old_gate)),
+        probe: Arc::clone(&old_probe),
+    });
+    let mut diagnostics = TaskFinalInfoCollector::new(
+        transport,
+        true,
+        &first_round,
+        Arc::new(CountingWake::default()),
+    );
+    let first_observer = diagnostics.enable_profile_observation().unwrap();
+    let credentials = original_credentials(first_execution);
+    let resources = AttemptHandoffResources::new(
+        first_protocol,
+        Some(Arc::clone(&credentials)),
+        Some(first_observer),
+    );
+    let mut attempt = OriginalAttempt {
+        round: first_round,
+        acks: first_acks,
+        release: Some(first_release),
+        pending_upstream: None,
+        scope,
+        capacity: result_capacity,
+        clock: actor_clock,
+        plan,
+        root: first_root,
+        context: first_context,
+        logical,
+        native_credentials: credentials,
+        diagnostics,
+        _control: control,
+        business: Some(root.business),
+    };
+    let (consumer, offers, mut output) = profile_computation_consumer(&description, plan).unwrap();
+    let mut first_producer = offers.reserve(first_execution).unwrap();
+    first_producer
+        .stage(first_execution, first_root, plan, resources)
+        .unwrap();
+    attempt.bind_original_drive(&mut first_producer);
+    std::future::poll_fn(|cx| {
+        attempt.diagnostics.poll_observe(&attempt.round, cx);
+        Poll::Ready(())
+    })
+    .await;
+    let before = attempt.logical.actor_snapshot().await.unwrap();
+    let old_read_pending =
+        old_probe.entered.load(Ordering::SeqCst) && !old_probe.exited.load(Ordering::SeqCst);
+    let next_activation = watchdog(
+        "real same-owner pre-visibility replacement",
+        attempt.logical.replace_original_running_attempt(
+            novarocks_coordination_contract::AttemptFailureClass::RecoverableInfrastructure,
+            next_execution,
+            vec![next_context],
+        ),
+    )
+    .await
+    .unwrap();
+    let (establish, operation, verdict) = establish.unwrap();
+    watchdog(
+        "settle qualified original successor Establish",
+        attempt.logical.settle_original_qualified_establish(
+            admission.unwrap(),
+            establish,
+            operation,
+            verdict,
+        ),
+    )
+    .await
+    .unwrap();
+
+    // Only the original per-attempt carrier fields change. The logical harness,
+    // registry, WorkOwner, result capacity and receiving holder are the same.
+    let mut old_round = std::mem::replace(&mut attempt.round, next_round);
+    let old_acks = std::mem::replace(&mut attempt.acks, next_acks);
+    let old_release = attempt.release.replace(next_release).unwrap();
+    let old_context = std::mem::replace(&mut attempt.context, next_context);
+    attempt.root = next_root;
+    attempt.clock = next_clock;
+    let next_credentials = original_credentials(next_execution);
+    let old_credentials = std::mem::replace(
+        &mut attempt.native_credentials,
+        Arc::clone(&next_credentials),
+    );
+    let expected = attempt
+        .round
+        .execution()
+        .graph()
+        .tasks()
+        .map(|task| task.identity())
+        .collect::<Vec<_>>();
+    let info = expected
+        .iter()
+        .map(|&identity| {
+            let status = attempt
+                .round
+                .execution()
+                .task(identity.task_id())
+                .unwrap()
+                .status()
+                .unwrap()
+                .clone();
+            (
+                identity,
+                novarocks_execution_contract::FinalTaskInfo::try_new(
+                    identity,
+                    status,
+                    Vec::new(),
+                    false,
+                )
+                .unwrap(),
+            )
+        })
+        .collect();
+    let mut next_diagnostics = TaskFinalInfoCollector::new(
+        Arc::new(ProfileRecoveryFinalInfo(Mutex::new(info))),
+        true,
+        &attempt.round,
+        Arc::new(CountingWake::default()),
+    );
+    let next_observer = next_diagnostics.enable_profile_observation().unwrap();
+    let mut old_diagnostics = std::mem::replace(&mut attempt.diagnostics, next_diagnostics);
+    let resources = AttemptHandoffResources::new(
+        next_protocol,
+        Some(Arc::clone(&next_credentials)),
+        Some(next_observer),
+    );
+    let mut next_producer = offers.reserve(next_execution).unwrap();
+    next_producer
+        .stage(next_execution, next_root, plan, resources)
+        .unwrap();
+    attempt.bind_original_drive(&mut next_producer);
+    let activation = attempt
+        .logical
+        .internal_consumer_activation(next_root)
+        .await
+        .unwrap();
+    let mut received =
+        run_fixed_consumer_to_real_cut(&attempt, consumer, activation, &mut output, None).await;
+    let ready = received.ready_token();
+    let has_only_next_provenance = received.expected_tasks() == expected.as_slice();
+    let has_original_next_credentials =
+        Arc::ptr_eq(received.original_credentials().unwrap(), &next_credentials)
+            && !Arc::ptr_eq(received.original_credentials().unwrap(), &old_credentials);
+    let OperationIntent::ReleaseQueryContext(request) = attempt.release.as_ref().unwrap() else {
+        unreachable!()
+    };
+    attempt.acks.publish(OperationAcknowledgement::new(
+        request.envelope().operation_id(),
+        OperationKind::ReleaseQueryContext,
+        OperationOutcome::Accepted,
+        AckPayload::Release {
+            receipt: QueryContextReceipt::new(next_context, QueryContextState::TerminalRetained),
+            outcome: ReleaseOutcome::Released,
+            runtime_filter: None,
+        },
+    ));
+    attempt.round.turn().unwrap();
+    attempt.publish_original_snapshot(ready).await;
+    let snapshot = watchdog(
+        "same successful Profile diagnostic snapshot",
+        received.wait_diagnostics(),
+    )
+    .await
+    .unwrap();
+    let released_old = release_old_read.send(()).is_ok();
+    std::future::poll_fn(|cx| {
+        old_diagnostics.poll_observe(&old_round, cx);
+        Poll::Ready(())
+    })
+    .await;
+    let old_read_exited = old_probe.completed.load(Ordering::SeqCst)
+        && old_probe.exited.load(Ordering::SeqCst)
+        && old_diagnostics.is_closed();
+    let after_old_read = received.current_diagnostics().unwrap().unwrap();
+
+    // Drive the original failed round and its exact context to real fixture
+    // closure before retiring the one logical registry/actor.
+    let OperationIntent::ReleaseQueryContext(request) = old_release else {
+        unreachable!()
+    };
+    old_acks.publish(OperationAcknowledgement::new(
+        request.envelope().operation_id(),
+        OperationKind::ReleaseQueryContext,
+        OperationOutcome::Accepted,
+        AckPayload::Release {
+            receipt: QueryContextReceipt::new(old_context, QueryContextState::TerminalRetained),
+            outcome: ReleaseOutcome::Released,
+            runtime_filter: None,
+        },
+    ));
+    old_round.turn().unwrap();
+    old_round
+        .execution_mut()
+        .apply_covered_entries(vec![ObservationIntakeEntry::Frame(Box::new(
+            ObservationFrame::Covered {
+                context: old_context,
+                generation: 1,
+                event: CoveredStatusStreamEvent {
+                    fact: CoveredStatusStreamFact::ContextConvergence(
+                        QueryContextConvergenceReceipt::new(
+                            old_context,
+                            QueryContextConvergenceVersion::FIRST,
+                            QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+                        ),
+                    ),
+                    source_revision: None,
+                },
+            },
+        ))])
+        .unwrap();
+    let old_round_closed = old_round.attempt_drained()
+        && old_round.pumps_closed()
+        && old_round.execution().worker_contexts_stopped();
+    attempt
+        .logical
+        .observe_worker_stopped_and_context_fenced(old_context)
+        .await
+        .unwrap();
+    first_producer.retire_unclaimed();
+    next_producer.retire_unclaimed();
+    drop((
+        first_producer,
+        next_producer,
+        received,
+        output,
+        old_diagnostics,
+        old_round,
+        old_credentials,
+        next_credentials,
+    ));
+    watchdog(
+        "both original attempts and one actor actual retirement",
+        attempt.finish(),
+    )
+    .await;
+
+    assert!(before.conclusion.is_none());
+    assert!(!before.output_visible);
+    assert!(old_read_pending);
+    assert_eq!(first_activation.actor(), next_activation.actor());
+    assert_eq!(
+        first_activation.execution().query_id(),
+        next_activation.execution().query_id()
+    );
+    assert!(first_activation.generation() < next_activation.generation());
+    assert_eq!(ready.activation(), next_activation);
+    assert_eq!(ready.root(), next_root);
+    assert!(has_only_next_provenance);
+    assert!(has_original_next_credentials);
+    assert_eq!(facts.submitted.load(Ordering::SeqCst), 1);
+    assert_eq!(isolation_exits.load(Ordering::SeqCst), 1);
+    assert!(released_old && old_read_exited && old_round_closed);
+    assert!(Arc::ptr_eq(&snapshot, &after_old_read));
+    assert!(snapshot.complete());
+    assert_eq!(
+        snapshot
+            .tasks
+            .iter()
+            .map(|(task, _)| *task)
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(snapshot.tasks.iter().all(|(task, fact)| task.query_execution_id() == next_execution && matches!(fact, ProfileTaskDiagnostic::Available(info) if info.final_status().identity() == *task)));
+}

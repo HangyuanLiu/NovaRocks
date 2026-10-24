@@ -322,30 +322,45 @@ impl OriginalAttempt {
         }
         assert!(self.diagnostics.is_closed());
         assert!(self.diagnostics.all_terminal_observed());
+        // Final info closes the existing Release hold; the final immutable
+        // Profile also needs that original acknowledgement's RF contribution.
+        self.settle_original_release();
+        self.round.turn().unwrap();
+        std::future::poll_fn(|cx| {
+            self.diagnostics
+                .poll_profile_observation(&self.round, self.clock.now(), false, cx);
+            Poll::Ready(())
+        })
+        .await;
     }
-    pub(crate) async fn finish(self) {
-        // Existing fixtures own their process only through this attempt.
-        drop(self.finish_retaining_process().await);
-    }
-
-    pub(crate) async fn finish_retaining_process(mut self) -> WorkloadControl {
+    fn settle_original_release(&mut self) {
         if let Some(release) = self.release.as_ref() {
             let OperationIntent::ReleaseQueryContext(request) = release else {
                 unreachable!("the fixture returns its original Release")
             };
-            self.acks.publish(OperationAcknowledgement::new(
-                release.operation_id(),
-                OperationKind::ReleaseQueryContext,
-                OperationOutcome::Accepted,
-                AckPayload::Release {
-                    receipt: QueryContextReceipt::new(
-                        request.context(),
-                        QueryContextState::TerminalRetained,
-                    ),
-                    outcome: ReleaseOutcome::Released,
-                    runtime_filter: None,
-                },
-            ));
+            // A diagnostic consumer can already have settled this exact
+            // Release. Never deliver its original acknowledgement twice.
+            if !self
+                .round
+                .execution()
+                .owner(self.context)
+                .unwrap()
+                .is_released()
+            {
+                self.acks.publish(OperationAcknowledgement::new(
+                    release.operation_id(),
+                    OperationKind::ReleaseQueryContext,
+                    OperationOutcome::Accepted,
+                    AckPayload::Release {
+                        receipt: QueryContextReceipt::new(
+                            request.context(),
+                            QueryContextState::TerminalRetained,
+                        ),
+                        outcome: ReleaseOutcome::Released,
+                        runtime_filter: None,
+                    },
+                ));
+            }
         } else {
             assert!(self.pending_upstream.is_none());
             assert!(self.round.execution().selected_task_failure().is_some());
@@ -358,6 +373,15 @@ impl OriginalAttempt {
             );
             assert!(self.round.attempt_drained());
         }
+    }
+
+    pub(crate) async fn finish(self) {
+        // Existing fixtures own their process only through this attempt.
+        drop(self.finish_retaining_process().await);
+    }
+
+    pub(crate) async fn finish_retaining_process(mut self) -> WorkloadControl {
+        self.settle_original_release();
         self.round.turn().unwrap();
         self.round
             .execution_mut()

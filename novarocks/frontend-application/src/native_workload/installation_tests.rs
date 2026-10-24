@@ -62,7 +62,9 @@ fn additional_production_changes_increase_the_original_paid_metadata_envelope() 
     next.global.global = next.global.global.with(JointResource::Publications, 3);
     next.max_changes_per_request = production_batch_records(&next).unwrap();
     let next_m = storage.minimum_dependency_records(&next).unwrap();
-    assert!(next_m > old_m);
+    // One paid request retains its complete distinct union once, irrespective
+    // of the number of changes; additional C still enlarges the paid body.
+    assert_eq!(next_m, old_m);
     next.max_registered_dependencies = next_m;
     let next_base = storage.base_charge(&next).unwrap();
     assert!(
