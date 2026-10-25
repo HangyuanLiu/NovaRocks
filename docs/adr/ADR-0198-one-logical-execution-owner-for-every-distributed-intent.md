@@ -21,10 +21,11 @@ partially-supersedes:
   - id: ADR-0171
     scope: "Synchronous control waiting, the undifferentiated finalize/cleanup completion boundary and unconditional age-gated GC continuation; immutable intent, dependencies, field inheritance, the physical artifact ledger, actual-exit observation and protection of Unknown objects remain active"
     link: "ADR-0171-commit-operation-model.md"
-date: 2026-10-23
+date: 2026-10-25
 implementation-status: pending
 provenance:
   - "discussion: 2026-10-22 and 2026-10-23 unified logical execution, publication custody and bounded settlement"
+  - "discussion: 2026-10-25 actual resource owners, cancellable backpressure and payload lifetime"
 code-anchors:
   - "novarocks/query-application/src/coordination/ (logical execution owner and supervisor; migration anchor)"
   - "novarocks/frontend-application/src/task_execution/ (native attempt facts and convergence; migration anchor)"
@@ -50,7 +51,16 @@ code-anchors:
   - "novarocks/spi/src/connector/write_stack/writer.rs (writer seal and deletion authority; migration anchor)"
   - "novarocks/connector/iceberg/src/commit/operation.rs (operation-owned artifacts and actual I/O exit; migration anchor)"
   - "novarocks/connector/iceberg/src/catalog_control/cleanup_maintenance.rs (scan reclamation admission; migration anchor)"
-  - "novarocks/workload-control/src/ (capacity and actual holders; migration anchor)"
+  - "novarocks/query-application/src/session_control/statement_action.rs (stable SQL Action custody, borrowed context and actual exit)"
+  - "novarocks/query-application/src/session_control/background_source.rs (original background Root and residual custody)"
+  - "novarocks/query-application/src/cpu/bounded_worker.rs (original physical executor, queue reservation and actual worker exit)"
+  - "novarocks/frontend-application/src/native/task_transport.rs (original process/target transport budgets and backpressure)"
+  - "novarocks/workload-control/src/joint_admission/ledger/proposal_storage.rs (temporary proposal backing separated from installed claims)"
+  - "novarocks/workload-control/src/result_window.rs (original Client computation window and Internal result retention)"
+  - "novarocks/workload-control/src/result_window/retained_bytes.rs (same Root actual payload byte receipts)"
+  - "novarocks/spi/src/connector/payload_retention.rs (original byte author distinct from additional lifetime retention)"
+  - "novarocks/spi/src/connector/row_mutation/source_owner.rs (copy authorization and last Arrow buffer alias)"
+  - "novarocks/native-adapter/src/root_record_assembly.rs (borrowed record fast path and budgeted partial-buffer replacement)"
 ---
 
 ## 问题
@@ -89,6 +99,8 @@ code-anchors:
 
 **统一执行 owner，受监督语句编排，计算就绪后交给领域 owner，诊断与安全收尾独立推进。采纳。** 它保留单一决策者，同时让外部提交、资源退出与本地响应各有可验证的事实和真实 holder。
 
+**为全部动作叠加工作类别、每依赖域和所有权图的通用配额。成本否决。** 缺少独立资源依据的配额会复制真实资源 owner 的预算，带来组合公式、对象布局预测和合法业务的额外拒绝。默认复用原执行器、传输与结果预算，完整依赖事实用于身份、来源和责任追踪。若产品以后要求更强故障隔离，按具体资源和故障模型重新评估，不保留一套隐含严格模式。
+
 **跨进程可靠产物清单、封存 ACK/撤销、持久 publication 恢复与外部 fencing。待评估。** 它们可能扩大故障后的可回收范围，但需要独立协议与安全证明。本条不通过新增 Native wire 或隐含删除权恢复实现它们。
 
 ## 裁决
@@ -107,7 +119,9 @@ code-anchors:
 
 统计另要求全部任务成功、统计域 finished 和收尾解码完成；COW 匹配要求根封口接受、选择集 End 和无挂起解码。领域证明绑定 execution、activation、冻结输入/输出与真实结果，只能交接一次。
 
-普通 Read 与 Internal 计算共用原 Root/Stage 的准入与真实退出边界，但 Read 保留 Client 结果窗口和原流式 handle；不能用 Internal 窗口替换客户端结果容量，也不能把内部计算就绪投成客户端成功 EOF。计算位置按实际本地 CPU/交接证明归还，原 Native 退出观察和残余责任继续由同 owner 保管；不能为了继续下一段而丢弃观察者。
+普通 Read 与 Internal 计算共用原 Root/Stage 的准入与真实退出边界，但 Read 保留 Client 结果窗口和原流式 handle；不能用 Internal 窗口替换客户端结果容量，也不能把内部计算就绪投成客户端成功 EOF。同一 Client window 的后继计算借原位置，须等待前一计算的实际最后 alias 退出。成功读取的 EOF/空活动事实只建立切点，原本地 producer Future 正常返回和实际活动退出后才能归还计算位置；失败、取消和 attempt replacement 不借成功切点提前退休。
+
+Internal 计算在 typed 就绪交接且本地计算实际不再使用后归还该段位置；仍需的数据转交同 Root 的结果保留与字节 receipt。两者均不要求无关 Native 清理先结束，原退出观察和残余责任继续由同 owner 保管；不能为了继续下一段而丢弃观察者。
 
 写入、COW 匹配、统计当前使用 NoRecovery；这是支持范围，不是这些语句族永久不能恢复。Profile 在计算就绪前可按冻结语义恢复可恢复的基础设施故障，替换时丢弃旧消费者和诊断；就绪后不再恢复。普通读保留可见性与成功 EOS 的既有顺序，不能提前向客户端发成功 EOF。
 
@@ -154,7 +168,7 @@ FE 的未接收责任记录不能虚构完整清单的内存占用，各中间�
 
 CTAS 的 staged seal 与最终 catalog CREATE 是两个实际阶段。后续绑定借用同一份 seal receipt，只有必要 finalization 为 Complete 才能据此继续最终 publication；seal 的 KnownCommitted/NoOp 不制造 catalog 已发布事实。必要 finalization 失败时保留已观察事实并拒绝下一步，不能靠复制或重造 receipt 绕过该屏障。
 
-seal 后零输出、只到前缀或缺 End 都不能 Ready。若 publication 没有派发，可以同时成立 KnownUncommitted 与产物回收未决/清单不完整；不能改成 CommitUnknown，也不能因 session 内存释放而报 cleanup Complete。缺清单时不猜路径删除，保留有界责任并在该故障域额度耗尽时拒绝新工作。跨 FE/BE 崩溃可能失去进程内清单，本条不承诺确定回收或无孤儿。
+seal 后零输出、只到前缀或缺 End 都不能 Ready。若 publication 没有派发，可以同时成立 KnownUncommitted 与产物回收未决/清单不完整；不能改成 CommitUnknown，也不能因 session 内存释放而报 cleanup Complete。缺清单时不猜路径删除，原稳定 owner 继续保管责任与实际记录；真实内存、存储或执行资源承压时沿其原预算/背压处理新工作，不另加每域责任配额。跨 FE/BE 崩溃可能失去进程内清单，本条不承诺确定回收或无孤儿。
 
 ### 6. 必要 finalize 与可延后维护
 
@@ -174,27 +188,38 @@ operation-owned cleanup 仅删除 ledger 内精确归属且已证明不再使用
 
 进程内 Unknown 记录、持久 first-observation、幂等键和 exact CAS 各有用途，都不能独自证明跨重启无未来引用。恢复缺证扫描需要另行接受的安全机制，不能在异步迁移中暗加持久清单或分布式 ACK 协议。
 
-### 7. 有界运行、真实保管与公平推进
+### 7. 实际资源预算、真实保管与可取消背压
 
-受影响的网络控制 I/O 沿异步 SPI/Provider future 推进，字段读取和纯验证仍同步；规划 CPU 留在 CPU owner；Statistics 的 schema、计划与产物处理使用经原 lease/session 认证的封闭 scoped CPU source，不能从纯创建 context 或空 ownership pin 取得运行资格。真正只能阻塞的 SDK/JVM/本地调用进入有界执行器，分别记录排队、真实开始和退出。取消等待不释放已开始动作的名额，不用无界线程掩盖永久卡住。
+每项真实资源只有一个授权、排队和释放 owner。Workload Control 保管同 Root/阶段的责任、完整依赖事实和结果授权；物理执行器、Native transport 与领域结果 owner 分别管理自身的实际资源。身份、scope、完整 D、TypeId、catalog generation 和原 factory 来源检查继续成立，均不单独授予资源。依赖按实际共享服务规范化；catalog 别名不制造新来源，发现新实际路由后先续接同 Root 的依赖事实再派发，不为合法拓扑设置依赖域数量上限。
 
-全局、工作类别、真实外部故障域与物理执行位置作为完整资源向量联合准入，不先拿一部分运行许可等另一部分。域键按共享依赖规范化，catalog 别名不能增加额度；多依赖动作同时约束相关域，全局物理占用只计一次。调度跳过暂不可运行项，对持续可运行项提供有限轮数推进；严格全局 FIFO 不能让坏域队首阻断健康域。
+| 实际资源 | 原 owner 与释放事实 | 满时行为 |
+|---|---|---|
+| CPU/Blocking 线程与队列 | 原执行器；队列位置在真实出队后归还，运行与输入/输出析构保留到实际退出 | 原输入在同队列可取消等待；未发布 reservation 取消后不执行，已经开始者不因 timeout 提前退款 |
+| Native 排队 bytes/items、在途调用与每 BE 部署窗口 | 原 transport 与 attempt owner；W 不超过该准确 BE descriptor 公布的准备位置 P | 沿已有公平 waiter/唤醒背压；控制回报与完成回收保持可推进，不另收通用逻辑配额 |
+| Client/Internal 计算位置及结果数据 | 原 window/阶段与真实数据 holder；位置交接和数据字节分开 | 独立工作可释放的资源可等待；本语句自持不足不能等待自己 |
+| publication、未接收产物与 residual | 副作用前已登记的稳定 Source、原 journal、精确对象和访问能力 | 责任不因状态变化消失；实际资源承压交原 owner，不把 Unknown 自动计成一个活动执行槽 |
 
-启动不可逆动作前先预留保管、回报位与队列记录，运行许可按阶段取得。故障域限制同时覆盖长期 Unknown/未接收产物、payload 字节和运行位置；转为 residual 或移交 supervisor 不能洗掉归属。至少单个坏域隔离的保留份额不得被该域不可撤回地借走，既有结算另有保管和运行保护；不满足此约束的配置必须拒绝。
+网络控制 I/O 直接沿 SPI/Provider async Future 推进；纯字段与验证保持纯作者，规划 CPU 和实际形成/解码交给已认证的封闭 CPU source。真正阻塞的 SDK/JVM/本地操作使用原有界执行器，不在外层包整段同步 block_on，不新建并行池。执行器普通 Full 是可取消背压，不伪装成业务 Resource failure。排队、物理 reservation 与来源验证前后接同原输入，不能重复派发或丢失被拒接输入。检查锁跨 await、同池工作自等及控制回报重入业务队列等实际循环；不靠增加默认线程数规避错误。
 
-内部结果 positions/bytes 可配置，按实际 holder 转移；多段业务释放上段计算位置后，以业务预算保有仍需的 payload，再启动下段。整句 union 共用累计字节上界，还需容纳下一段最低运行/接收空间；不足且释放依赖自己后续完成时明确报资源不足，不等待自己、不丢 union、不隐式 spill。失败保留已有外部效果与已封存产物责任。
+临时 proposal/reply 的构造 backing 与已安装 claims/物理许可分开：原件被取走且不再借用构造 body 后可回收临时记录，不能让长 I/O 仅因空 owning iterator 仍保 body 而占住提案位置。仍被真实 active borrower 使用的来源和已开始工作则保持到其实际退出。单轮工作预算用于让出与公平，不成为累计 proof-work 或业务并发上限。
 
-普通业务拒绝与实际退出是两项事实：原 I/O/CPU 已退出时可以观察实际 quiescence，同时保留原 Resource/Control/领域失败；不能把所有普通 Err 包成 process health，也不能因没有 health 就推断已退出。poll/Drop panic、原 source loan 冲突或退出证据不足仍由原健康与保管路径处理。
+真实 payload 在复制或扩容前沿原 byte author 取得 receipt，支付旧数据与新 backing 的实际并存峰。fragment/统计 body、分片组装与 Arrow buffer 复用同 Root 的配置预算；完整 record 的借用不重复收费。拥有的 envelope 尽量转移原 Vec/Bytes，不能为了验证再连做 clone→encode→decode。receipt 随实际 buffer 移交，合并原件不重新收费；销毁旧 backing 后才归还其字节，最后 Bytes/Arrow slice alias 退出才释放对应 receipt。额外 schema/lifetime 保管不能替代 primary byte author，也不必让一个 raw buffer 钉住其它已退出数据。
 
-形成期的临时展开额度、仍活 Provider/backing 的保管和 Unknown/未接收责任分别计费。原形成 backing 及其别名实际退出、且原接收方未持有该形成产物后，只能由原 holder 报告不再使用的增量；不能因此退掉仍活 Provider 的已准入峰值、累计 payload 或未收记录的 metadata/完整故障域归属。失败、取消、Stage 终态与回收未决都不是自动退款或删除证明。
+多段 COW/rewrite 交接上段计算位置后再启动下段，仍需 payload 继续保管。整句 union 的累计预算不逐段清零，另计下一段接收/解码与旧数据的真实并存空间。若所需空间超过真实配置预算且只能等本语句后续完成才释放，明确 typed Resource 拒绝；不等待自己、不丢 union、不暗加 spill。默认结果窗口数量不是物理 worker 数或全查询规模上限，小型业务不预付无关 COW 最大峰值。
 
-公平性覆盖 actor 输入、supervisor 的启动/完成回收及结算调度；持续 starts 不能饿死 completed joins。活性以依赖可返回/可退出且调度持续为前提；永久不退出仍占额，多坏域或共享宿主耗尽时明确不可用，不承诺无限故障隔离。
+启动有外部责任的动作前，稳定 custody 和接收能力必须已存在；不能产生责任后再赌一个 residual 登记。原输入、session、回报位、原 journal 与未决对象原子移交；不预付所有未来动作、每种 Arc/SDK 私有图或全依赖域最坏库存。归因与布局事实不能冒充实际字节授权或 RSS 上界。新增硬限制须有真实资源、协议或当前支持边界的依据，并说明为何已有排队/分批不能解决。
+
+普通业务拒绝、typed Source、实际 quiescence 与 process health 分别保留。预算错误不能被压成 malformed data 或无来源的模型拒绝；poll/Drop panic、原 source loan 冲突或缺少退出证据也不能因结果终态而清账。CPU/I/O 已证实退出时归还其实际运行资源，Unknown、未接收产物及仍需数据继续由原 owner 保管；状态改名、timeout、响应和 holder 转移都不是删除或实际退出证明。
+
+公平性覆盖 actor 输入、supervisor 的启动/完成回收及结算；持续 starts 不能饿死 completed joins。有资源、依赖可返回且调度持续时保证可运行工作公平推进。共享执行器的全部 worker 永久阻塞时，健康业务与结算也可能等待至原预算结束；本条接受这一实际可用性边界，不承诺单坏域永久阻塞隔离，不按域数或保护公式推导线程下限。更强隔离需要以后对具体资源另行论证。
 
 ### 8. 关闭与承重验证
 
 关闭先停止新准入，再通知既有 owner，按阶段取消新业务、结算和安全收尾。shutdown 期限只停止等待，未退出责任保留到真实退出或明确进程退出。KILL QUERY 与会话 generation fencing 等待本语句的本地编排退出，不等待远端 Unknown 消失。
 
-验证分别覆盖就绪早于清理、取消/授权/派发顺序、累计效果与响应结果、BE seal/FE 完整接收切点、缺清单不虚报 Complete、GC 缺证拒绝，以及坏域先到时健康域和已登记结算仍能推进。contract/组件测试证明局部性质，原生 1FE+3BE 才证明端到端接线；本文不提供性能或跨崩溃恢复结论。
+验证分别覆盖就绪早于清理、取消/授权/派发顺序、累计效果与响应结果、BE seal/FE 完整接收切点、缺清单不虚报 Complete 与 GC 缺证拒绝。资源组件覆盖真实队列 Full/取消/恢复、出队与运行退出的不同寿命、原输入只执行一次、真实 buffer 的 old+new 授权与最后 alias、同 Root 多段足额推进及自持不足拒绝、Client 原 window 与 Internal 位置分离，以及有资源且依赖可返回时启动/完成的公平性。共享池全部永久阻塞时保留实际等待或不可用结果，不用隔离公式的自洽测试代替行为。
+
+contract/组件测试只证明局部性质；原生 1FE+3BE 才证明端到端接线。本文保持 implementation pending，完整调用面、原生场景与最终全工作区验证仍未完成；局部通过、离树包、类型检查和源码存在都不能提升这些状态。本文不新增测量、吞吐、RSS 或跨崩溃恢复结论。
 
 本条只按 frontmatter 指定范围部分替代旧 ADR；Native 的准确身份、接管/安装/覆盖观察、dataflow writer、Provider 不可变提交意图与字段继承等有效规则继续成立。Native wire、Task 协议和单次派发 journal 不因统一 FE owner 而重造。
 
@@ -203,14 +228,14 @@ operation-owned cleanup 仅删除 ledger 内精确归属且已证明不再使用
 - 更早交付计算就绪降低了与清理的串行耦合，却需要额外且有限的保管、诊断和收敛记录；不据此宣称已经测得吞吐或延迟改善。
 - 结果类型和协议投影必须保留累计效果，调用面较简单 Result 更复杂；这是避免提交事实丢失的成本，不能靠一个新错误码替代。
 - 不增加可靠产物运输与持久恢复协议，意味着丢失输出或进程崩溃后可能保留孤儿；缺证扫描受限，存储残留需要显式可观察，而非承诺自动清空。
-- 未退出的动作和长期未知责任继续占额，故障域可能拒绝新工作；保护健康域与已有结算需要真实预留容量，存在利用率代价。
-- 内部多段 union 采用明确上界，不能容纳下一段时失败；本条不以 spill 或改变业务并行度扩大能力。
+- 长期责任继续保管实际记录和仍需数据；已退出运行资源可以归还。复用共享执行器意味着全部 worker 永久阻塞时其它业务和结算也可能不可用，本条不付出全域预留容量来承诺隔离。
+- 内部多段 union 共用真实配置预算，不能容纳下一段时失败；本条不以 spill 或改变业务并行度扩大能力。
 - 保留现有异步 actor 外壳，未在本条抽取纯状态机核心；边界词汇只冻结已消费的部分，不能把接口整理当作已完成可模拟内核。
 
 ## 何时重新评估
 
 - 产品要求 seal 后丢失输出仍可无孤儿回收，或要求跨 FE/BE 崩溃继续自动回收时，评估持久产物清单、确认/撤销与外部 fencing，并先给出故障模型和安全证明。
 - Provider 提供可验证的外部效果截止/围栏、时钟与列举保证、并发与 Unknown 保护时，逐能力重审扫描准入；不能仅靠更长保留期恢复支持。
-- 多段 payload 在真实业务中稳定超出已批准上界时，评估明确的 spill/分层聚合协议及其容量与删除 owner，不放宽现有计费。
-- 负载和故障分布证明现有保留份额、域归一或公平调度不能满足已接受活性界时，重审配置与调度；需要无限卡住调用的可回收性时，评估进程隔离，不提前退账。
+- 多段 payload 在真实业务中稳定超出实际配置预算时，评估原资源配置、明确的 spill/分层聚合协议及其容量与删除 owner；不把旧模型公式当成支持边界。
+- 产品明确要求永久阻塞下更强的跨依赖隔离，或实际负载证明原资源背压/公平调度不足时，按具体执行器、传输或存储资源重新论证配置与隔离，比较利用率和维护成本；若要求回收无限卡住调用，再评估进程隔离，不提前退账。
 - 共享边界经过真实消费者验证、需要独立模拟时再抽取逻辑执行/attempt 纯核心；publication 与 GC 仍由其领域负责。

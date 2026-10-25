@@ -17,7 +17,7 @@
 
 //! The original SQL statistics read, outside its borrowed I/O and CPU waiters.
 use super::*;
-use crate::read_snapshot::cow_capture::{CaptureBudget, ReadFailure};
+use crate::read_snapshot::cow_capture::{CaptureScope, ReadFailure};
 use novarocks_spi::connector::{
     ConnectorMetadata, ConnectorOriginalResultScope, ConnectorTableMetadata, ConnectorTableRequest,
     OriginalResultCheckClass, StatisticsMetricRequest, StatisticsReadOriginal,
@@ -33,8 +33,6 @@ pub(super) struct ReadBody {
     result: Option<Result<StatisticsEvidence, ConnectorError>>,
     pub(super) phase: u8,
     snapshot: Option<Arc<IcebergMetadataCpuOriginal>>,
-    upper: u64,
-    required: u64,
     payload: Option<IcebergTablePayload>,
     snapshot_id: Option<i64>,
     retiring: bool,
@@ -89,10 +87,9 @@ pub(super) fn checked_read(error: ReadFailure) -> ConnectorError {
 }
 impl ReadBody {
     pub(super) fn run(&mut self) {
-        // This cumulative prospective bound is checked against the same paid
-        // original payload. It is never a second allowance or a window size.
+        // CPU work retains the same original operation and stable receiver.
         let original_scope = self.original.clone();
-        let budget = match CaptureBudget::new(&original_scope, self.upper) {
+        let capture = match CaptureScope::new(&original_scope) {
             Ok(value) => value,
             Err(error) => {
                 self.result = Some(Err(checked_read(error)));
@@ -100,61 +97,18 @@ impl ReadBody {
             }
         };
         let result = match self.phase {
-            0 => self.preflight(&budget),
-            1 => self.prepare_request(&budget),
-            2 => self.preflight_evidence(&budget),
-            3 => self.project(&budget),
+            1 => self.prepare_request(&capture),
+            3 => self.project(&capture),
             _ => Err(invalid("statistics read CPU phase was dispatched twice")),
         };
-        self.upper = budget.upper();
         if let Err(error) = result {
-            tracing::debug!(
-                phase = self.phase,
-                retained_upper = self.upper,
-                prospective_total = self.required,
-                "statistics read CPU phase refused"
-            );
+            tracing::debug!(phase = self.phase, "statistics read CPU phase refused");
             self.result = Some(Err(error));
         }
     }
-    fn preflight(&mut self, budget: &CaptureBudget<'_>) -> Result<(), ConnectorError> {
-        let table = IcebergMetadata::statistics_read_physical(self.facts.as_ref().unwrap());
-        let schema = table.metadata().current_schema();
-        let schema_bytes = budget.json_size(schema.as_ref()).map_err(checked_read)?;
-        let metadata_bytes = budget.json_size(table.metadata()).map_err(checked_read)?;
-        let mut amount = CaptureBudget::json_working_upper(schema_bytes).map_err(checked_read)?;
-        // create_table_from_observation serializes the full metadata into the
-        // original handle; table_payload decodes that handle into our receiver.
-        // The pinned JSON recipe covers these first-party escaped buffers and
-        // parsed nodes, not the already-borrowed SDK Table backing.
-        amount = plus(
-            amount,
-            CaptureBudget::json_working_upper(metadata_bytes).map_err(checked_read)?,
-        )?;
-        amount = plus(
-            amount,
-            budget.schema_indexes_upper(schema).map_err(checked_read)?,
-        )?;
-        // The exact physical top-level fields bound the visible selection.
-        // Hidden pseudo-columns do not enter SHOW's metric request.
-        amount = plus(
-            amount,
-            metric_request_upper(schema.as_struct().fields().iter().map(|f| f.name.as_str()))?,
-        )?;
-        self.required = plus(budget.upper(), amount)?;
-        Ok(())
-    }
-    fn prepare_request(&mut self, budget: &CaptureBudget<'_>) -> Result<(), ConnectorError> {
+    fn prepare_request(&mut self, scope: &CaptureScope<'_>) -> Result<(), ConnectorError> {
+        scope.active().map_err(checked_read)?;
         let facts = self.facts.as_ref().expect("original prepared read facts");
-        // Consume the complete original phase receipt before schema, handle,
-        // request Vec, name Arc or duplicate-check trees are constructed.
-        budget
-            .charge(
-                self.required
-                    .checked_sub(budget.upper())
-                    .ok_or_else(|| invalid("statistics request receipt regressed"))?,
-            )
-            .map_err(checked_read)?;
         self.metadata = Some(
             self.provider
                 .as_ref()
@@ -223,23 +177,8 @@ impl ReadBody {
         });
         Ok(())
     }
-    fn preflight_evidence(&mut self, budget: &CaptureBudget<'_>) -> Result<(), ConnectorError> {
-        let table = IcebergMetadata::statistics_read_physical(self.facts.as_ref().unwrap());
-        let request = self.read_request.as_ref().unwrap();
-        let info = base_table_info(self.payload.as_ref().unwrap(), "statistics read")?;
-        let amount = evidence_formation_upper(
-            budget,
-            table.metadata(),
-            self.metadata.as_ref().unwrap().schema(),
-            request,
-            info.table_uuid
-                .as_deref()
-                .ok_or_else(|| invalid("statistics table UUID is absent"))?,
-        )?;
-        self.required = plus(budget.upper(), amount)?;
-        Ok(())
-    }
-    fn project(&mut self, budget: &CaptureBudget<'_>) -> Result<(), ConnectorError> {
+    fn project(&mut self, scope: &CaptureScope<'_>) -> Result<(), ConnectorError> {
+        scope.active().map_err(checked_read)?;
         let request = self.read_request.as_ref().expect("original read request");
         let facts = self.facts.as_ref().expect("original physical table");
         let table = IcebergMetadata::statistics_read_physical(facts);
@@ -250,16 +189,6 @@ impl ReadBody {
                 "Iceberg table has no current snapshot for statistics",
             )
         })?;
-        // Schema indexes, selected metric BTree nodes, name maps, ancestry
-        // entries and escaped diagnostics are first-party new backing. The
-        // pinned schema recipe is shared with the original checked reader.
-        budget
-            .charge(
-                self.required
-                    .checked_sub(budget.upper())
-                    .ok_or_else(|| invalid("statistics evidence receipt regressed"))?,
-            )
-            .map_err(checked_read)?;
         let files = self
             .files
             .as_ref()
@@ -274,216 +203,6 @@ impl ReadBody {
         ));
         Ok(())
     }
-}
-// These are prospective layout facts, not a capacity source. The caller must
-// await the original MIO receipt before the corresponding formation phase.
-fn plus(a: u64, b: u64) -> Result<u64, ConnectorError> {
-    a.checked_add(b)
-        .ok_or_else(|| invalid("statistics read geometry overflow"))
-}
-fn geometry<T>(
-    value: Result<
-        T,
-        crate::read_snapshot::cow_capture::geometry::Failure<
-            novarocks_spi::connector::ConnectorCowBeginCause,
-        >,
-    >,
-) -> Result<T, ConnectorError> {
-    crate::read_snapshot::cow_capture::recipe(value).map_err(checked_read)
-}
-fn metric_request_upper<'a>(names: impl Iterator<Item = &'a str>) -> Result<u64, ConnectorError> {
-    use crate::read_snapshot::cow_capture::geometry as g;
-    use novarocks_spi::connector::ConnectorCowBeginCause as Cause;
-    let mut columns = 0usize;
-    let mut amount = 0;
-    for name in names {
-        columns = columns
-            .checked_add(1)
-            .ok_or_else(|| invalid("statistics column count overflow"))?;
-        amount = plus(amount, geometry(g::arc_bytes::<Cause>(name.len()))?)?;
-    }
-    let count = columns
-        .checked_mul(5)
-        .and_then(|n| n.checked_add(1))
-        .ok_or_else(|| invalid("statistics metric count overflow"))?;
-    amount = plus(
-        amount,
-        geometry(g::slots::<Cause, StatisticsMetric>(count))?,
-    )?;
-    // StatisticsMetricRequest::try_new's two real BTreeSet collections. They
-    // are temporary; include both in the cumulative constructor envelope.
-    amount = plus(
-        amount,
-        geometry(g::btree_construct::<Cause, &StatisticsMetric, ()>(count))?,
-    )?;
-    plus(
-        amount,
-        geometry(g::btree_construct::<Cause, &str, ()>(count - 1))?,
-    )
-}
-fn evidence_formation_upper(
-    budget: &CaptureBudget<'_>,
-    metadata: &crate::iceberg::spec::TableMetadata,
-    schema: &arrow::datatypes::Schema,
-    request: &StatisticsReadRequest,
-    uuid: &str,
-) -> Result<u64, ConnectorError> {
-    use crate::read_snapshot::cow_capture::geometry as g;
-    use novarocks_spi::connector::ConnectorCowBeginCause as Cause;
-    let bytes = budget
-        .json_size(metadata.current_schema().as_ref())
-        .map_err(checked_read)?;
-    let mut amount = CaptureBudget::json_working_upper(bytes).map_err(checked_read)?;
-    // Nominal type declarations are metadata properties, not schema JSON.
-    for (key, value) in metadata.properties() {
-        amount = plus(
-            amount,
-            CaptureBudget::json_working_upper(plus(key.len() as u64, value.len() as u64)?)
-                .map_err(checked_read)?,
-        )?;
-    }
-    let fields = metadata.current_schema().as_struct();
-    amount = plus(
-        amount,
-        geometry(g::hash_max::<Cause, (String, i32)>(fields.fields().len()))?,
-    )?;
-    amount = plus(
-        amount,
-        geometry(g::hash_max::<Cause, (String, DataType)>(
-            schema.fields().len(),
-        ))?,
-    )?;
-    for field in fields.fields() {
-        amount = plus(amount, field.name.len() as u64)?;
-    }
-    for field in schema.fields() {
-        amount = plus(amount, field.name().len() as u64)?;
-        // Arrow's other recursive variants clone their existing Arc fields.
-        // Dictionary owns two Boxes and recursively clones their DataTypes.
-        fn boxes(ty: &DataType) -> Result<u64, ConnectorError> {
-            if let DataType::Dictionary(key, value) = ty {
-                plus(
-                    (2 * std::mem::size_of::<DataType>()) as u64,
-                    plus(boxes(key)?, boxes(value)?)?,
-                )
-            } else {
-                Ok(0)
-            }
-        }
-        amount = plus(amount, boxes(field.data_type())?)?;
-    }
-    // String -> Bytes reuses the character buffer but may create bytes' own
-    // Shared allocation. Use the pinned original layout author; this is not
-    // another copy of the String payload or an SDK graph estimate.
-    let bytes_shared = u64::try_from(
-        novarocks_type_contract::owned_resources::layout::bytes_shared_upper()
-            .map_err(|_| invalid("statistics Bytes shared layout is unsupported"))?,
-    )
-    .map_err(|_| invalid("statistics Bytes shared layout overflow"))?;
-    let count = request.metrics.metrics().len();
-    let ndv = request
-        .metrics
-        .metrics()
-        .iter()
-        .filter(|m| matches!(m, StatisticsMetric::ThetaNdv { .. }))
-        .count();
-    for part in [
-        g::btree_construct::<Cause, StatisticsMetric, StatisticsMetricState>(count),
-        g::btree_construct::<Cause, i32, StatisticsMetric>(ndv),
-        g::btree_construct::<Cause, i32, ()>(ndv), // wanted field set
-        g::btree_construct::<Cause, i32, ()>(ndv), // outstanding clone
-        g::slots::<Cause, (i32, i64)>(ndv),        // evidence_revision bases
-    ] {
-        amount = plus(amount, geometry(part)?)?;
-    }
-    amount = plus(
-        amount,
-        geometry(g::mul::<Cause>(
-            geometry(g::hash_max::<Cause, (i32, AncestorNdv)>(ndv))?,
-            2,
-        ))?,
-    )?;
-    // Each ancestor's temporary blob map is dropped before the next ancestor.
-    // Bound that one real map's geometric old/new backing by the largest actual
-    // registered file; do not clone any StatisticsFile or Puffin/SDK graph.
-    let blobs = metadata
-        .statistics_iter()
-        .map(|file| file.blob_metadata.len())
-        .max()
-        .unwrap_or(0);
-    amount = plus(
-        amount,
-        geometry(g::mul::<Cause>(
-            geometry(g::hash_max::<Cause, (i32, f64)>(blobs))?,
-            2,
-        ))?,
-    )?;
-    // StatsLoader's original corrupt-metadata branch renders one i32 field id
-    // and, for parse failure, std's fixed ParseFloatError text. It stops the
-    // walk immediately; no SDK error tree is copied or recursively estimated.
-    let loader_error = [
-        "Theta blob metadata must name exactly one field".len(),
-        "Theta blob metadata for field  is missing ndv".len() + 11,
-        "Theta ndv for field  is not numeric: ".len()
-            + 11
-            + "cannot parse float from empty string".len(),
-        "Theta ndv for field  must be finite and non-negative".len() + 11,
-        "statistics metadata contains duplicate Theta blobs for field ".len() + 11,
-    ]
-    .into_iter()
-    .max()
-    .unwrap();
-    amount = plus(
-        amount,
-        geometry(g::format_capacity::<Cause>(loader_error as u64))?,
-    )?;
-    for metric in request.metrics.metrics() {
-        budget.active().map_err(checked_read)?;
-        let column = statistics_metric_column(metric).unwrap_or("");
-        amount = plus(amount, column.len() as u64)?; // lowercase lookup scratch
-        let message = match metric {
-            StatisticsMetric::RowCount => "Iceberg manifest does not report every row count".len(),
-            StatisticsMetric::NullCount { .. } => {
-                "Iceberg manifest does not report a null count for ``".len()
-            }
-            StatisticsMetric::ThetaNdv { .. } => {
-                "no ancestor snapshot published a sketch for this column".len()
-            }
-            _ => "statistics for column `` are not collected".len(),
-        };
-        let length = message
-            .checked_add(column.len())
-            .ok_or_else(|| invalid("statistics diagnostic upper overflow"))?;
-        amount = plus(
-            amount,
-            geometry(g::format_capacity::<Cause>(length as u64))?,
-        )?;
-        amount = plus(amount, geometry(g::arc_bytes::<Cause>(length))?)?;
-        if matches!(metric, StatisticsMetric::ThetaNdv { .. }) {
-            amount = plus(amount, bytes_shared)?;
-            // statistics_data_version: signed-i64 temporary, then its exact
-            // fixed prefix + original UUID + snapshot rendering.
-            amount = plus(amount, geometry(g::format_capacity::<Cause>(20))?)?;
-            amount = plus(
-                amount,
-                geometry(g::format_capacity::<Cause>(plus(
-                    uuid.len() as u64,
-                    ("iceberg/v1//".len() + 20) as u64,
-                )?))?,
-            )?;
-        }
-    }
-    amount = plus(amount, 32)?; // evidence_revision's digest String
-    amount = plus(amount, geometry(g::format_capacity::<Cause>(2))?)?; // one byte formatting scratch
-    amount = plus(
-        amount,
-        geometry(g::format_capacity::<Cause>(plus(
-            uuid.len() as u64,
-            ("iceberg/v2///".len() + 20 + 32) as u64,
-        )?))?,
-    )?;
-    // The evidence revision owns one independent Bytes carrier.
-    plus(amount, bytes_shared)
 }
 impl IcebergMetadataCpuOriginal {
     pub(crate) fn read_source(
@@ -503,10 +222,8 @@ impl IcebergMetadataCpuOriginal {
                 read_request: None,
                 files: None,
                 result: None,
-                phase: 0,
+                phase: 1,
                 snapshot: None,
-                upper: 0,
-                required: 0,
                 payload: None,
                 snapshot_id: None,
                 retiring: false,
@@ -543,8 +260,8 @@ impl IcebergMetadataCpuOriginal {
             let CpuBody::Read(body) = &mut loan.body.as_mut().unwrap().body else {
                 unreachable!()
             };
-            let budget = CaptureBudget::new(&body.original, body.upper).map_err(checked_read)?;
-            budget.active().map_err(checked_read)?;
+            let capture = CaptureScope::new(&body.original).map_err(checked_read)?;
+            capture.active().map_err(checked_read)?;
             let preparation = body
                 .provider
                 .as_ref()
@@ -562,36 +279,6 @@ impl IcebergMetadataCpuOriginal {
         ));
         metadata.submit_metadata_in(&mut input)?;
         std::future::poll_fn(|cx| metadata.poll_finished(cx)).await?;
-        let (context, required) = {
-            let mut loan = BodyLoan::take(self);
-            let CpuBody::Read(body) = &mut loan.body.as_mut().unwrap().body else {
-                unreachable!()
-            };
-            if body.result.is_some() {
-                return Ok(());
-            }
-            (
-                body.request.as_ref().unwrap().context.clone(),
-                body.required,
-            )
-        };
-        let required = std::num::NonZeroU64::new(required)
-            .ok_or_else(|| invalid("statistics schema quote is empty"))?;
-        context.reserve_owned_metadata(required).await?;
-        {
-            let mut loan = BodyLoan::take(self);
-            let original = loan.body.as_mut().unwrap();
-            let CpuBody::Read(body) = &mut original.body else {
-                unreachable!()
-            };
-            body.phase = 1;
-            original.started = false;
-        }
-        let mut input = Some(novarocks_spi::connector::ProviderMetadataCpuInput(
-            self.clone(),
-        ));
-        metadata.submit_metadata_in(&mut input)?;
-        std::future::poll_fn(|cx| metadata.poll_finished(cx)).await?;
         {
             let mut loan = BodyLoan::take(self);
             let original = loan.body.as_mut().unwrap();
@@ -601,10 +288,6 @@ impl IcebergMetadataCpuOriginal {
             if body.result.is_some() {
                 return Ok(());
             }
-            let request = body
-                .read_request
-                .as_ref()
-                .expect("CPU prepared read request");
             let snapshot = body.snapshot_id.ok_or_else(|| {
                 ConnectorError::new(
                     ConnectorErrorKind::NotFound,
@@ -618,7 +301,6 @@ impl IcebergMetadataCpuOriginal {
                 snapshot,
                 body.request.as_ref().unwrap().context.clone(),
                 body.original.clone(),
-                body.upper,
                 super::scoped_snapshot::SnapshotReadKind::Statistics,
             ));
         }
@@ -640,36 +322,6 @@ impl IcebergMetadataCpuOriginal {
             snapshot.take_read_snapshot_in(&mut received)?;
             let received = received.expect("original snapshot receiver")?;
             body.files = Some(received.files);
-            body.upper = received.simultaneous_upper;
-            body.phase = 2;
-            original.started = false;
-        }
-        run_read(cpu, self).await?;
-        let (context, required) = {
-            let mut loan = BodyLoan::take(self);
-            let CpuBody::Read(body) = &mut loan.body.as_mut().unwrap().body else {
-                unreachable!()
-            };
-            if body.result.is_some() {
-                return Ok(());
-            }
-            (
-                body.request.as_ref().unwrap().context.clone(),
-                body.required,
-            )
-        };
-        context
-            .reserve_owned_metadata(
-                std::num::NonZeroU64::new(required)
-                    .ok_or_else(|| invalid("statistics evidence quote is empty"))?,
-            )
-            .await?;
-        {
-            let mut loan = BodyLoan::take(self);
-            let original = loan.body.as_mut().unwrap();
-            let CpuBody::Read(body) = &mut original.body else {
-                unreachable!()
-            };
             body.phase = 3;
             original.started = false;
         }

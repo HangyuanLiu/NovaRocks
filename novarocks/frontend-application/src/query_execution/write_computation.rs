@@ -69,13 +69,28 @@ impl WriteComputationDecode {
         &self,
         prepared: DecodedPreparedWriteSet,
     ) -> Result<SessionDecodedWriteSegment, RootWriteDecodeFailure> {
-        let (row_count, fragments, statistics, retention, production_execution) =
+        let canonical_bytes = prepared
+            .fragments()
+            .iter()
+            .try_fold(0usize, |sum, (_, bytes)| {
+                sum.checked_add(bytes.len()).ok_or_else(|| {
+                    RootWriteDecodeFailure::source(
+                        novarocks_workload_control::WorkError::ArithmeticOverflow,
+                    )
+                })
+            })?;
+        // Decoding borrows the same original byte author while every canonical
+        // input remains live; each new outer buffer pays its coexistence first.
+        let decoded = self.interpret_borrowed(&prepared)?;
+        let (_row_count, fragments, statistics, retention, production_execution) =
             prepared.into_parts();
         let fragment_sizes = fragments.iter().map(|(_, bytes)| bytes.len()).collect();
-        // The original buffers remain governed until all decoded Provider
-        // objects have been admitted; no independent byte clone is made.
-        let decoded = self.interpret_borrowed(row_count, &fragments)?;
         drop(fragments);
+        if let Some(retention) = &retention {
+            retention
+                .release_bytes_destroyed(canonical_bytes)
+                .map_err(RootWriteDecodeFailure::source)?;
+        }
         Ok(SessionDecodedWriteSegment {
             origin: Arc::clone(&self.origin),
             production_execution,
@@ -88,13 +103,21 @@ impl WriteComputationDecode {
 
     pub(super) fn interpret_borrowed(
         &self,
-        row_count: u64,
-        fragments: &[(WriteTargetOrdinal, Vec<u8>)],
+        prepared: &DecodedPreparedWriteSet,
     ) -> Result<ConnectorPreparedWriteSet, RootWriteDecodeFailure> {
         use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
         use prost::Message;
-        let mut decoded = Vec::with_capacity(fragments.len());
-        for (index, (target, bytes)) in fragments.iter().enumerate() {
+        let author = prepared.fragment_decode_author()?;
+        let mut decoded = Vec::with_capacity(prepared.fragments().len());
+        for (index, (target, bytes)) in prepared.fragments().iter().enumerate() {
+            // prost copies byte/string fields within the original encoded
+            // carrier. Its encoded length bounds those actual byte copies;
+            // this is not an invoice for the Provider's decoded SDK graph.
+            let receipt = author
+                .as_ref()
+                .map(|author| author.reserve_owned_bytes(bytes.len()))
+                .transpose()
+                .map_err(RootWriteDecodeFailure::source)?;
             let raw =
                 write_dto::ConnectorCommitFragment::decode(bytes.as_slice()).map_err(|error| {
                     RootWriteDecodeFailure::source(ProtocolError::new(
@@ -108,6 +131,10 @@ impl WriteComputationDecode {
                 FieldPath::root("prepared_write_set").index(index),
             )
             .map_err(RootWriteDecodeFailure::source)?;
+            let validated = match receipt {
+                Some(receipt) => validated.retain_provider_payload(receipt),
+                None => validated, // explicit local test constructor only
+            };
             let fragment = self
                 .decoder
                 .decode_commit_fragment(&validated)
@@ -116,7 +143,7 @@ impl WriteComputationDecode {
                 })?;
             decoded.push((*target, fragment));
         }
-        ConnectorPreparedWriteSet::try_new(row_count, decoded, &self.query_targets)
+        ConnectorPreparedWriteSet::try_new(prepared.row_count(), decoded, &self.query_targets)
             .map_err(RootWriteDecodeFailure::source)
     }
 }
@@ -410,5 +437,121 @@ impl ConnectorWriteSession {
             },
             notification,
         ))
+    }
+}
+
+#[cfg(test)]
+mod outer_byte_budget_tests {
+    use super::*;
+    use novarocks_spi::connector::{
+        ConnectorCodecError, ConnectorCodecErrorKind, ConnectorEncodedPayload, ConnectorFieldPath,
+    };
+
+    struct ObservedDecoder {
+        calls: Arc<AtomicUsize>,
+        alias: Arc<Mutex<Option<bytes::Bytes>>>,
+    }
+    impl ConnectorWriteFragmentWireDecoder for ObservedDecoder {
+        fn owner(&self) -> &str {
+            "outer_byte_budget_test"
+        }
+        fn decode_commit_fragment_payload(
+            &self,
+            payload: &ConnectorEncodedPayload,
+        ) -> Result<
+            novarocks_spi::connector::write_stack::ConnectorCommitFragment,
+            ConnectorCodecError,
+        > {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            *self.alias.lock().unwrap() = Some(payload.payload().clone());
+            Err(ConnectorCodecError::new(
+                ConnectorFieldPath::root("provider_payload"),
+                ConnectorCodecErrorKind::InvalidValue,
+                "original Provider rejected its fragment",
+            ))
+        }
+    }
+    fn observed_decoder(
+        target: WriteTargetOrdinal,
+    ) -> (
+        WriteComputationDecode,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Option<bytes::Bytes>>>,
+    ) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let alias = Arc::new(Mutex::new(None));
+        (
+            WriteComputationDecode {
+                origin: Arc::new(()),
+                decoder: Arc::new(ObservedDecoder {
+                    calls: calls.clone(),
+                    alias: alias.clone(),
+                }),
+                query_targets: vec![target].into(),
+            },
+            calls,
+            alias,
+        )
+    }
+
+    #[test]
+    fn full_original_budget_refuses_outer_copy_before_provider_and_keeps_canonical_input() {
+        let (_control, root, binding, _) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let window = binding.window_alias();
+        let target = WriteTargetOrdinal::try_new(0).unwrap();
+        let bytes = super::super::tests::commit_fragment_bytes();
+        let count = bytes.len() as u64;
+        let prepared = DecodedPreparedWriteSet::for_test(1, vec![(target, bytes)])
+            .with_test_capacity(&binding);
+        assert_eq!(window.retained_payload_bytes(), count);
+        let limit = novarocks_workload_control::ResultCapacityConfig::V1.all_objects_bytes[2];
+        let other_reserved_backing = window.reserve_payload_bytes(limit - 2 * count + 1).unwrap();
+        let before = window.retained_payload_bytes();
+        let (decoder, calls, alias) = observed_decoder(target);
+        let error = decoder.interpret_borrowed(&prepared).unwrap_err();
+        assert!(error.to_string().contains("retained result bytes"));
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        assert!(alias.lock().unwrap().is_none());
+        assert_eq!(window.retained_payload_bytes(), before);
+        assert_eq!(prepared.fragments()[0].1.len() as u64, count);
+        drop(other_reserved_backing);
+        assert_eq!(window.retained_payload_bytes(), count);
+        drop(prepared);
+        assert_eq!(window.retained_payload_bytes(), 0);
+        drop((binding, window));
+        root.owner.complete();
+        root.business.release();
+    }
+
+    #[test]
+    fn provider_bytes_alias_keeps_only_its_outer_receipt_after_borrowed_failure() {
+        let (_control, root, binding, _) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let window = binding.window_alias();
+        let target = WriteTargetOrdinal::try_new(0).unwrap();
+        let bytes = super::super::tests::commit_fragment_bytes();
+        let count = bytes.len() as u64;
+        let prepared = DecodedPreparedWriteSet::for_test(1, vec![(target, bytes)])
+            .with_test_capacity(&binding);
+        let (decoder, calls, alias) = observed_decoder(target);
+        let error = decoder.interpret_borrowed(&prepared).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("original Provider rejected its fragment")
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(window.retained_payload_bytes(), 2 * count);
+        // Borrowed logical-row inspection cannot retire the canonical input.
+        drop(prepared);
+        assert_eq!(window.retained_payload_bytes(), count);
+        let last = alias.lock().unwrap().take().unwrap();
+        assert!(!last.is_empty());
+        drop(last);
+        assert_eq!(window.retained_payload_bytes(), 0);
+        drop((binding, window));
+        root.owner.complete();
+        root.business.release();
     }
 }

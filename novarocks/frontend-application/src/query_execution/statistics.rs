@@ -25,7 +25,9 @@
 pub(crate) mod completion;
 pub(crate) mod preparation;
 
-use novarocks_native_adapter::root_record_assembly::{RootRecordAssembly, RootRecordDomain};
+use novarocks_native_adapter::root_record_assembly::{
+    RootRecordAssembly, RootRecordAssemblyError, RootRecordDomain,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -483,6 +485,8 @@ pub struct StatisticsRootResultDecoder {
     body_bytes: usize,
     root_eof: bool,
     execution_succeeded: bool,
+    #[cfg(test)]
+    local_assembly: bool,
     retention: Option<crate::query_execution::internal_result_cpu::InternalResultRetention>,
 }
 
@@ -499,6 +503,13 @@ impl StatisticsRootResultDecoder {
         decoder.retention = Some(retention);
         decoder
     }
+    #[cfg(test)]
+    fn for_test_local(expected: impl IntoIterator<Item = StatisticsArtifactIdentity>) -> Self {
+        let mut decoder = Self::new(expected);
+        decoder.local_assembly = true;
+        decoder
+    }
+
     fn new(expected: impl IntoIterator<Item = StatisticsArtifactIdentity>) -> Self {
         Self {
             relayed_record_count: 0,
@@ -509,6 +520,8 @@ impl StatisticsRootResultDecoder {
             root_eof: false,
             execution_succeeded: false,
             retention: None,
+            #[cfg(test)]
+            local_assembly: false,
         }
     }
 
@@ -615,24 +628,64 @@ impl StatisticsRootResultDecoder {
         Ok(())
     }
 
-    /// Accept a relayed body into the prepaid 32 MiB assembly share. A complete
-    /// record is validated before this call returns and its receipt may finish.
+    /// Reserve partial record backing against the original result byte budget.
+    /// A complete borrowed record needs no assembly copy.
     pub(crate) fn apply_relay_body(&mut self, body: &[u8]) -> Result<(), StatisticsDecodeFailure> {
         if self.root_eof {
             return Err("statistics Root emitted a trailing body after EOF".into());
         }
+        #[cfg(test)]
+        let explicit_local = self.local_assembly;
+        #[cfg(not(test))]
+        let explicit_local = false;
+        let author = self
+            .retention
+            .as_ref()
+            .map(
+                crate::query_execution::internal_result_cpu::InternalResultRetention::try_spi_guard,
+            )
+            .transpose()
+            .map_err(|error| {
+                StatisticsDecodeFailure::Connector(
+                    novarocks_spi::connector::ConnectorError::from_domain(
+                        novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                        error,
+                    ),
+                )
+            })?;
         let mut assembly = std::mem::replace(
             &mut self.relay_assembly,
             RootRecordAssembly::new(RootRecordDomain::Statistics, 32 * 1024 * 1024),
         );
-        let result = assembly.push(body, |record| -> Result<(), StatisticsDecodeFailure> {
+        let consume = |record: &[u8]| -> Result<(), StatisticsDecodeFailure> {
             self.apply_record(record)?;
             self.relayed_record_count = self
                 .relayed_record_count
                 .checked_add(1)
                 .ok_or("internal root record count overflow")?;
             Ok(())
-        });
+        };
+        let result = match author {
+            Some(author) => assembly.push_budgeted(
+                body,
+                |bytes| {
+                    author
+                        .reserve_owned_bytes(bytes)
+                        .map_err(StatisticsDecodeFailure::Connector)
+                },
+                consume,
+            ),
+            None if explicit_local => assembly.push(body, consume),
+            None => {
+                let error = novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                    "statistics Root assembly requires its original byte-budget author",
+                );
+                Err(RootRecordAssemblyError::Sink(
+                    StatisticsDecodeFailure::Connector(error),
+                ))
+            }
+        };
         self.relay_assembly = assembly;
         result.map_err(StatisticsDecodeFailure::from)
     }
@@ -750,7 +803,9 @@ mod tests {
     use novarocks_spi::connector::StatisticsArtifactIdentity;
     use novarocks_types::SlotId;
 
-    use super::{StatisticsRootResultDecoder, charge_statistics_body_bytes};
+    use super::{
+        StatisticsDecodeFailure, StatisticsRootResultDecoder, charge_statistics_body_bytes,
+    };
 
     fn identity(field_id: i32, blob_type: &str) -> StatisticsArtifactIdentity {
         StatisticsArtifactIdentity::try_new(vec![field_id], Arc::<str>::from(blob_type))
@@ -985,10 +1040,26 @@ mod tests {
     }
 
     #[test]
+    fn production_statistics_decoder_without_author_is_refused_even_in_tests() {
+        let mut decoder = StatisticsRootResultDecoder::new([identity(1, "theta-v1")]);
+        let record = statistics_records(&chunk(&[(&[1], "theta-v1", b"one", &[])])).remove(0);
+        let error = decoder.apply_relay_body(&record).unwrap_err();
+        let StatisticsDecodeFailure::Connector(error) = error else {
+            panic!("missing original author must be a typed connector rejection");
+        };
+        assert_eq!(
+            error.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::InvalidRequest
+        );
+        assert_eq!(decoder.relay_assembly.retained_bytes(), 0);
+        assert!(decoder.observed.is_empty());
+    }
+
+    #[test]
     fn last_artifact_body_clone_retains_window_after_decoder_and_artifacts_exit() {
         let (_control, root, binding, capacity) =
             crate::query_execution::internal_result_cpu::admitted_internal_fixture();
-        let mut decoder = StatisticsRootResultDecoder::new([identity(1, "theta-v1")]);
+        let mut decoder = StatisticsRootResultDecoder::for_test_local([identity(1, "theta-v1")]);
         decoder.retention = Some(
             crate::query_execution::internal_result_cpu::InternalResultRetention::try_new(&binding)
                 .unwrap(),
@@ -1014,7 +1085,7 @@ mod tests {
     fn relayed_body_end_refuses_partial_record_and_preserves_all_success_gate() {
         let record = statistics_records(&chunk(&[(&[1], "theta-v1", b"one", &[])])).remove(0);
         let expected = StatisticsArtifactIdentity::try_new(vec![1], "theta-v1").unwrap();
-        let mut decoder = StatisticsRootResultDecoder::new([expected.clone()]);
+        let mut decoder = StatisticsRootResultDecoder::for_test_local([expected.clone()]);
         decoder.apply_relay_body(&record[..7]).unwrap();
         assert!(
             decoder
@@ -1036,7 +1107,7 @@ mod tests {
                 .to_string()
                 .contains("all-success")
         );
-        let mut decoder = StatisticsRootResultDecoder::new([expected]);
+        let mut decoder = StatisticsRootResultDecoder::for_test_local([expected]);
         decoder.apply_relay_body(&record).unwrap();
         decoder.observe_root_eof().unwrap();
         decoder.observe_execution_success().unwrap();
@@ -1050,7 +1121,7 @@ mod tests {
             (&[2, 3], "apache-datasketches-theta-v1", b"two", &[]),
         ]);
         let expected = || {
-            StatisticsRootResultDecoder::new([
+            StatisticsRootResultDecoder::for_test_local([
                 StatisticsArtifactIdentity::try_new(vec![1], "apache-datasketches-theta-v1")
                     .unwrap(),
                 StatisticsArtifactIdentity::try_new(vec![2, 3], "apache-datasketches-theta-v1")
@@ -1075,13 +1146,13 @@ mod tests {
         let records = statistics_records(&rows);
         duplicate.apply_record(&records[0]).unwrap();
         assert!(duplicate.apply_record(&records[0]).is_err());
-        let mut unexpected = StatisticsRootResultDecoder::new([identity(9, "x")]);
+        let mut unexpected = StatisticsRootResultDecoder::for_test_local([identity(9, "x")]);
         assert!(unexpected.apply_record(&records[0]).is_err());
     }
 
     #[test]
     fn statistics_root_decoder_requires_eof_success_and_exact_membership() {
-        let mut decoder = StatisticsRootResultDecoder::new([
+        let mut decoder = StatisticsRootResultDecoder::for_test_local([
             identity(1, "apache-datasketches-theta-v1"),
             identity(2, "apache-datasketches-theta-v1"),
         ]);
@@ -1103,7 +1174,7 @@ mod tests {
             .expect("second batch");
         assert!(decoder.finish().unwrap_err().to_string().contains("EOF"));
 
-        let mut decoder = StatisticsRootResultDecoder::new([
+        let mut decoder = StatisticsRootResultDecoder::for_test_local([
             identity(1, "apache-datasketches-theta-v1"),
             identity(2, "apache-datasketches-theta-v1"),
         ]);
@@ -1122,7 +1193,7 @@ mod tests {
                 .contains("all-success")
         );
 
-        let mut decoder = StatisticsRootResultDecoder::new([
+        let mut decoder = StatisticsRootResultDecoder::for_test_local([
             identity(1, "apache-datasketches-theta-v1"),
             identity(2, "apache-datasketches-theta-v1"),
         ]);
@@ -1141,7 +1212,7 @@ mod tests {
     fn statistics_root_decoder_rejects_unknown_duplicate_missing_and_trailing() {
         let expected = identity(1, "apache-datasketches-theta-v1");
 
-        let mut unknown = StatisticsRootResultDecoder::new([expected.clone()]);
+        let mut unknown = StatisticsRootResultDecoder::for_test_local([expected.clone()]);
         assert!(
             unknown
                 .apply_chunk(&chunk(&[(
@@ -1155,7 +1226,7 @@ mod tests {
                 .contains("unexpected")
         );
 
-        let mut duplicate = StatisticsRootResultDecoder::new([expected.clone()]);
+        let mut duplicate = StatisticsRootResultDecoder::for_test_local([expected.clone()]);
         duplicate
             .apply_chunk(&chunk(&[(
                 &[1],
@@ -1177,7 +1248,7 @@ mod tests {
                 .contains("duplicate")
         );
 
-        let mut missing = StatisticsRootResultDecoder::new([expected.clone()]);
+        let mut missing = StatisticsRootResultDecoder::for_test_local([expected.clone()]);
         missing.observe_root_eof().expect("EOF");
         missing.observe_execution_success().expect("all-success");
         assert!(
@@ -1188,7 +1259,7 @@ mod tests {
                 .contains("incomplete")
         );
 
-        let mut trailing = StatisticsRootResultDecoder::new([expected]);
+        let mut trailing = StatisticsRootResultDecoder::for_test_local([expected]);
         trailing.observe_root_eof().expect("EOF");
         assert!(
             trailing
@@ -1206,7 +1277,7 @@ mod tests {
             Arc::<str>::from("future-composite-v1"),
         )
         .expect("composite identity");
-        let mut decoder = StatisticsRootResultDecoder::new([composite]);
+        let mut decoder = StatisticsRootResultDecoder::for_test_local([composite]);
         decoder
             .apply_chunk(&chunk(&[(&[7, 9], "future-composite-v1", b"body", &[])]))
             .expect("composite artifact");
@@ -1215,8 +1286,10 @@ mod tests {
         let drafts = decoder.finish().expect("complete");
         assert_eq!(drafts[0].identity().input_fields(), &[7, 9]);
 
-        let mut decoder =
-            StatisticsRootResultDecoder::new([identity(1, "apache-datasketches-theta-v1")]);
+        let mut decoder = StatisticsRootResultDecoder::for_test_local([identity(
+            1,
+            "apache-datasketches-theta-v1",
+        )]);
         assert!(
             decoder
                 .apply_chunk(&chunk(&[(
@@ -1260,7 +1333,7 @@ mod tests {
         use novarocks_failure_contract::{FailureClass, FailureProjection};
         use novarocks_spi::connector::ConnectorError;
         let expected = StatisticsArtifactIdentity::try_new(vec![-1], "theta-v1").unwrap_err();
-        let mut decoder = StatisticsRootResultDecoder::new([identity(1, "theta-v1")]);
+        let mut decoder = StatisticsRootResultDecoder::for_test_local([identity(1, "theta-v1")]);
         let source = original_statistics_source(
             decoder
                 .apply_chunk(&chunk(&[(&[-1], "theta-v1", b"body", &[])]))
@@ -1281,7 +1354,7 @@ mod tests {
         for word in [(24 + 4 + 1 + body_bytes) as u32, 1, 1, body_bytes as u32, 0] {
             header.extend_from_slice(&word.to_le_bytes());
         }
-        let mut decoder = StatisticsRootResultDecoder::new([identity(1, "x")]);
+        let mut decoder = StatisticsRootResultDecoder::for_test_local([identity(1, "x")]);
         let source = original_statistics_source(decoder.apply_relay_body(&header).unwrap_err());
         assert_eq!(
             source.downcast_ref::<StatisticsCodecError>(),
@@ -1306,7 +1379,7 @@ mod tests {
         }
         record.extend_from_slice(&0i32.to_le_bytes());
         record.push(b'x');
-        let mut decoder = StatisticsRootResultDecoder::new([identity(1, "x")]);
+        let mut decoder = StatisticsRootResultDecoder::for_test_local([identity(1, "x")]);
         let source = original_statistics_source(decoder.apply_relay_body(&record).unwrap_err());
         assert_eq!(
             source.downcast_ref::<StatisticsCodecError>(),
@@ -1353,8 +1426,9 @@ mod tests {
         };
         use novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_ARTIFACTS;
         let limit = MAX_CONNECTOR_STATISTICS_ARTIFACTS;
-        let mut decoder =
-            StatisticsRootResultDecoder::new((1..=limit).map(|field| identity(field as i32, "x")));
+        let mut decoder = StatisticsRootResultDecoder::for_test_local(
+            (1..=limit).map(|field| identity(field as i32, "x")),
+        );
         let record = |field: i32| {
             let mut record = Vec::from(*b"STA1");
             for word in [29u32, 1, 1, 0, 0] {

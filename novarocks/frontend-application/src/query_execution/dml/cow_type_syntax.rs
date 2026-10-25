@@ -15,16 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// One borrowed spelling projection supplies both the actual TypeName builder
-// and its original exact heap calculation. It owns no semantic type or query.
-use super::borrowed_value_footprint::Failure;
+//! Borrowed spelling for the actual signed COW TypeName builder.
+//! This owns no semantic type, resource allowance or heap invoice.
 use arrow::datatypes::{DataType, Fields, TimeUnit};
-use novarocks_parser::ast::{Ident, TypeNameArgument};
 use novarocks_type_contract::{
     FunctionValueType, ValueField, ValueKind, ValueLogicalType, ValueTypeRef,
 };
-use std::mem::size_of;
 
+#[derive(Debug)]
+pub(super) enum Failure {
+    InvalidSource(&'static str),
+    OriginalSemantic(&'static str),
+}
 type Result<T> = std::result::Result<T, Failure>;
 #[derive(Clone, Copy)]
 pub(in crate::query_execution::dml) struct Node<'a> {
@@ -152,61 +154,4 @@ impl<'a> Node<'a> {
         };
         Ok(Spelling::Leaf(leaf.expect("leaf branch")))
     }
-}
-fn add(a: u64, b: u64) -> Result<u64> {
-    a.checked_add(b).ok_or(Failure::ResourceExhausted)
-}
-fn mul(a: u64, b: u64) -> Result<u64> {
-    a.checked_mul(b).ok_or(Failure::ResourceExhausted)
-}
-fn name(s: &str) -> Result<u64> {
-    add(size_of::<Ident>() as u64, s.len() as u64)
-}
-fn arguments(count: usize) -> Result<u64> {
-    add(
-        mul(count as u64, size_of::<TypeNameArgument>() as u64)?,
-        count.saturating_sub(1) as u64,
-    )
-}
-fn decimal_digits(mut n: u8) -> u64 {
-    let mut digits = 1;
-    while n >= 10 {
-        n /= 10;
-        digits += 1;
-    }
-    digits
-}
-// TypeName inline remains part of Expr::Cast; only actual owned heap is returned.
-pub fn exact_type_heap(value: &FunctionValueType) -> Result<u64> {
-    exact_node_heap(Node::root(value))
-}
-pub(in crate::query_execution::dml) fn effect_type_heap() -> Result<u64> {
-    name("TINYINT")
-}
-fn exact_node_heap(node: Node<'_>) -> Result<u64> {
-    Ok(match node.spelling()? {
-        Spelling::Leaf(word) => name(word)?,
-        Spelling::Decimal { precision, scale } => add(
-            add(name("DECIMAL")?, arguments(2)?)?,
-            add(decimal_digits(precision), decimal_digits(scale))?,
-        )?,
-        Spelling::Array(item) => add(add(name("ARRAY")?, arguments(1)?)?, exact_node_heap(item)?)?,
-        Spelling::Map(key, value) => add(
-            add(add(name("MAP")?, arguments(2)?)?, exact_node_heap(key)?)?,
-            exact_node_heap(value)?,
-        )?,
-        Spelling::Struct(fields, layout) => {
-            let mut total = add(name("STRUCT")?, arguments(fields.len())?)?;
-            for (field, layout) in fields.iter().zip(layout) {
-                total = add(
-                    add(total, field.name().len() as u64)?,
-                    exact_node_heap(Node {
-                        value: field.value_type(),
-                        layout: layout.data_type(),
-                    })?,
-                )?;
-            }
-            total
-        }
-    })
 }

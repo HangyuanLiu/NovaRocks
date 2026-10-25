@@ -1478,7 +1478,6 @@ pub trait ConnectorWriteControl: Send + Sync {
         &self,
         request: ConnectorWriteBeginRequest,
         original: crate::connector::ConnectorOriginalResultScope,
-        existing_caller_upper: u64,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -1565,14 +1564,11 @@ pub trait ConnectorWriteControl: Send + Sync {
 
     /// First-party COW admission under the caller's original Internal window.
     /// Required: no default delegation to ordinary, unchecked begin_write.
-    /// existing_caller_upper is a truthful prospective caller receipt including
-    /// the neutral carrier, request and final FE session header coexistence.
-    /// Provider-owned allocations require their own borrowed phase recipes.
+    /// Provider capability checks and original request control remain required.
     fn begin_cow_write_checked(
         &self,
         request: ConnectorWriteBeginRequest,
         original: crate::connector::ConnectorOriginalResultScope,
-        existing_caller_upper: u64,
     ) -> Result<crate::connector::ConnectorCowBeginPlan, crate::connector::ConnectorCowBeginFailure>;
 
     /// Interpret every commit fragment and perform exactly one external commit.

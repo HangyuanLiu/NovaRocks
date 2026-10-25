@@ -54,7 +54,7 @@ CPU/Provider 后，把原 query permit 移交给同 job 稳定槽，再通知原
 | Query Application | `novarocks-query-application` | request-local 观察/准备，各分布式意图的逻辑执行、attempt 恢复、可见性与计算就绪 | 产品业务结果、publication/GC 策略、角色实现、wire codec 或 Server 配置 |
 | Frontend Application | `novarocks-frontend-application` | FE 装配、prepare 前语句监督、Native attempt 驱动、领域就绪证明与 SQL/MySQL 结果接线 | BE Task registry、第二套逻辑执行 policy 或第二份 Provider 提交真相 |
 | Worker | `novarocks-worker` | BE 本地 Task/context 准入、租约、入站围栏、实际停止与收敛 | FE 观察、编译、逻辑恢复政策或产品状态 |
-| Workload Control | `novarocks-workload-control` | 进程内 scope、阶段准入、受治理资源与结果信用 | MV/Statistics/Maintenance 的业务锁、外部提交或 durable truth |
+| Workload Control | `novarocks-workload-control` | 进程内 scope、责任/完整依赖事实及原结果预算授权 | MV/Statistics/Maintenance 的业务锁、外部提交或 durable truth |
 | Catalog Application | `novarocks-catalog-application` | 长期 Catalog generation 与退休 | 查询局部 compiler 映射或 Connector execution instance |
 | 产品应用 | MV、Statistics、Maintenance application crates | 业务状态、外部效果、发布与业务恢复决定 | Query Application 的通用协调 policy |
 | Native/MySQL adapter | `novarocks-native-adapter`、`novarocks-mysql-adapter` | wire/协议 decode、encode、连接与 transport 事实 | 领域业务 policy 或全局 service locator |
@@ -134,9 +134,12 @@ ComputationReady。随后领域业务可立即推进；Native 诊断和收敛继
 普通读取仍保留客户端成功 EOF 的边界。Profile 在就绪前按冻结语义恢复，就绪后不恢复；
 诊断缺失必须显式标注，不能阻挡已完成计算或被当作零。
 
-普通 Read 保留同 Root 的 Client 结果窗口，把原执行 handle 交给流式结果 receipt；共享
-Root/Stage 准入不把它转换为 Internal 容量。Internal 计算就绪后，实际本地 CPU 退出与
-Native 的远端收尾分别观察；下一段可以归还计算位置后推进，原 Native tail 仍由同 owner 保管。
+普通 Read 保留同 Root 的原 Client 结果窗口，同窗口只允许一个活计算，下一计算等待原
+计算最后实际 alias 退出。成功 EOF 与空 activity 是计算退位证据的一部分，仍须原本地
+producer Future 正常退出；失败、取消或 attempt 替换不能伪造成功退位。共享 Root/Stage
+不把 Client 转换为 Internal。Internal 的计算位置在就绪并满足实际本地退出后归还，
+仍活结果数据继续占同 Root 原预算；Native 远端收尾另由原 owner 保管。结果窗口与 worker
+并非同一资源。
 
 外层语句/job 同时保存业务是否完成、实际 publication 的累计效果、剩余必要/维护义务和本地
 响应交付事实。seal/NoOp 不产生虚构提交；最后一步未提交不能覆盖前一步已提交或 Unknown。
@@ -169,23 +172,28 @@ session。进程崩溃可能丢失清单，不承诺确定回收。扫描 GC（�
 进程内 Unknown 记录或持久 first-observation 替代保护。精确 operation-owned cleanup
 与扫描能力分开，具体支持限制见 [维护指南](../iceberg-v3/maintenance.md)。
 
-容量跟随真实 holder；内部位置/字节、后续保管和运行许可分别治理。全局、工作类别、真实
-外部依赖域和物理运行位置联合准入，任一不足不先占其它运行份额。域约束也覆盖长期
-Unknown/未接收产物记录和字节，坏域不能占完健康域与既有结算的保护额度。
-持续准入不能饿死 supervisor 的完成回收；暂不可运行的队首不能阻挡其它可运行域。
+资源只有实际 owner：CPU pool 拥有 worker 和队列，Transport 拥有 process/target 的
+queued bytes/items，Workload/result owner 拥有计算位置与仍活结果字节。完整 D 与原 factory
+身份保留，但不再叠加工作类别或依赖域配额，也不要求逐个 SDK 对象图预付 invoice。
 
-多段业务先交接上段保留 payload 并归还计算位置，再启动下一段。整句累计字节不逐段清零，
-还须容纳下一段最低运行/接收空间；不足且需要自己未来释放时明确失败，不等待自己。
-metadata 结算沿同 Root 已取得的保管能力继续推进；scope 身份、alias 或 context getter
-不自行授予新容量，也不证明前一个阶段已退出。网络控制 I/O 异步，真正阻塞调用使用隔离的
-有界执行器；超时或取消等待不证明动作实际退出。
-永久卡住者仍占额，多个坏域或共享宿主耗尽时保留明确不可用边界。
+普通 Full 沿原队列可取消等待，同输入保持稳定且只处理一次。出队可以归还 queue 位置；
+运行、结果及析构仍按原实际退出归还对应资源，超时或取消等待不证明它们退出。临时 proposal
+构造 backing 与已安装资源许可分开，真实仍借用的来源保管不能提前释放。不在占满全部 worker
+后等待必须由同一批 worker 执行的后继任务，也不为控制流程另起 pool 或整段 block_on。
+公平推进以资源可用和依赖能够返回为条件；全部共享 worker 永久阻塞时，健康请求与结算也
+可能不可用，不承诺单坏域隔离或据此推出 worker 最低数。
 
-普通资源或领域拒绝不等于 process health。原 `MetadataIoAdmission` 的 actual quiescence 观察
-只有在 growth、真实 I/O 与最后 cell alias 均已退出后才成立，并单独携带原普通失败；panic、
-loan 冲突或退出不足仍保原健康原因与 source。业务结果与实际退出不能互相覆盖。
-形成期临时展开、仍活 Provider backing、累计产物与 Unknown/未接收责任分别保管：即使原形成
-增量已可归还，也不能退掉仍被持有的 Provider 峰值、metadata 或完整故障域账。
+实际 buffer 复制前取得 old+new 并存峰的原预算回执。move、合并和最后 alias 退出按真实
+backing 续接或退款，不能把同一 buffer 重复收费，也不能因交接退掉仍活 backing。额外
+schema lifetime 只保来源，不产生 byte author。多段业务的仍活数据共用同一预算，不逐段清零；
+自持结果使下一次形成不足时明确 typed 拒绝，不等待自己，也不隐式 spill。不设置通用
+Internal 峰值 floor 或把窗口数绑定到 worker 数。
+
+metadata 结算沿同 Root 原能力继续；scope、alias 或 context getter 不自行授予新资源。
+Unknown 保留原 journal、未决对象和仍活数据，已实际退出的物理动作则归还原运行资源。
+原 `MetadataIoAdmission` 的 actual quiescence 只有在 growth、真实 I/O 与最后 cell alias
+均已退出后成立，并保原 typed Source；普通资源拒绝、process health 与真实退出分别报告。
+实现迁移、原生调用面和最终全工作区验证仍待完成，源码存在与局部测试不代替这些证据。
 
 客户端取消经 query-control owner 进入，会话 generation fencing 等本语句的本地受监督编排
 退出；不等远端 Unknown 责任消失。后者继续由原 owner 持有真实义务与容量。

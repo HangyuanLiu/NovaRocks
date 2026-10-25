@@ -44,8 +44,8 @@ use novarocks_execution::runtime::query_options::QueryOptions;
 #[cfg(test)]
 use novarocks_native_adapter::root_cow_selection_codec::CowSelectionCodecError;
 use novarocks_native_adapter::root_cow_selection_codec::{
-    COW_SELECTION_MAX_RECORD_BYTES, CowSelectionRecordHeader, CowSelectionRecordKind,
-    CowSelectionStreamDecoder,
+    COW_SELECTION_MAX_RECORD_BYTES, CowOwnedDecodeError, CowSelectionRecordHeader,
+    CowSelectionRecordKind, CowSelectionStreamDecoder,
 };
 use novarocks_native_adapter::root_record_assembly::{
     RootRecordAssembly, RootRecordAssemblyError, RootRecordDomain, RootRecordFramingError,
@@ -533,6 +533,8 @@ pub struct RelayedCowSelectionCollector {
     collector: BoundedRowMutationMatchCollector,
     declarations: Vec<novarocks_type_contract::FunctionValueType>,
     conversions: novarocks_value_arrays::decode::ValueConversionContext,
+    #[cfg(test)]
+    local_assembly: bool,
     retention: Option<ConnectorPayloadRetentionGuard>,
 }
 
@@ -544,7 +546,9 @@ impl RelayedCowSelectionCollector {
         schema: SchemaRef,
     ) -> Result<Self, ConnectorError> {
         let declarations = signed_layout::fixture_declarations(&schema);
-        Self::try_new_declared(context, exec_mem_limit, schema, declarations)
+        let mut collector = Self::try_new_declared(context, exec_mem_limit, schema, declarations)?;
+        collector.local_assembly = true;
+        Ok(collector)
     }
 
     pub fn try_new_declared(
@@ -572,6 +576,8 @@ impl RelayedCowSelectionCollector {
             schema,
             collector,
             retention: None,
+            #[cfg(test)]
+            local_assembly: false,
             declarations,
             conversions: novarocks_value_arrays::decode::ValueConversionContext::new(0),
         })
@@ -601,6 +607,10 @@ impl RelayedCowSelectionCollector {
 
     /// Feed one relayed body.
     pub fn push_body(&mut self, body: &[u8]) -> Result<(), ConnectorError> {
+        #[cfg(test)]
+        let explicit_local = self.local_assembly;
+        #[cfg(not(test))]
+        let explicit_local = false;
         let Self {
             assembly,
             decoder,
@@ -609,8 +619,9 @@ impl RelayedCowSelectionCollector {
             retention,
             declarations,
             conversions,
+            ..
         } = self;
-        let pushed = assembly.push(body, |record| {
+        let consume = |record: &[u8]| {
             let header = CowSelectionRecordHeader::parse(record).map_err(cow_codec_error)?;
             if header.kind() == CowSelectionRecordKind::Batch {
                 // Refuse the declaration before the private codec creates Arrow buffers.
@@ -620,7 +631,7 @@ impl RelayedCowSelectionCollector {
                 Some(guard) => decoder.apply_owned_record_with_guard(record, guard.clone()),
                 None => decoder.apply_owned_record(record),
             };
-            let Some(batch) = decoded.map_err(cow_codec_error)? else {
+            let Some(batch) = decoded.map_err(cow_owned_decode_error)? else {
                 let width = decoder.schema().map_or(0, |relayed| relayed.fields().len());
                 if width != schema.fields().len() {
                     return Err(invalid_match(
@@ -640,7 +651,16 @@ impl RelayedCowSelectionCollector {
                 &mut |_| collector.check_control(),
             )?;
             collector.push_owned(batch)
-        });
+        };
+        let pushed = match retention.as_ref() {
+            Some(author) => {
+                assembly.push_budgeted(body, |bytes| author.reserve_owned_bytes(bytes), consume)
+            }
+            None if explicit_local => assembly.push(body, consume),
+            None => Err(RootRecordAssemblyError::Sink(invalid_match(
+                "COW Root assembly requires its original byte-budget author",
+            ))),
+        };
         if pushed.is_err() {
             conversions.clear();
         }
@@ -677,7 +697,9 @@ impl CowMatchRootConsumer {
         intent: ConnectorRowMutationIntent,
     ) -> Result<Self, ConnectorError> {
         let declarations = signed_layout::fixture_declarations(&schema);
-        Self::try_new_declared(context, schema, declarations, contract, intent)
+        let mut consumer = Self::try_new_declared(context, schema, declarations, contract, intent)?;
+        consumer.collector.local_assembly = true;
+        Ok(consumer)
     }
     #[cfg(test)]
     pub(crate) fn try_new_with_capacity(
@@ -1014,6 +1036,13 @@ fn decode_effect(value: i8) -> Result<ConnectorRowMutationEffect, ConnectorError
         REPLACE_EFFECT_TAG => Ok(ConnectorRowMutationEffect::Replace),
         INSERT_EFFECT_TAG => Ok(ConnectorRowMutationEffect::Insert),
         _ => Err(invalid_match("row-mutation effect tag is unknown")),
+    }
+}
+
+fn cow_owned_decode_error(error: CowOwnedDecodeError) -> ConnectorError {
+    match error {
+        CowOwnedDecodeError::Codec(error) => cow_codec_error(error),
+        CowOwnedDecodeError::Source(error) => error,
     }
 }
 
@@ -1585,6 +1614,82 @@ mod tests {
             ConnectorErrorKind::ResourceExhausted
         );
         assert_eq!(relayed.byte_count(), retained_before_refusal);
+    }
+
+    #[test]
+    fn production_cow_collector_without_author_is_refused_even_in_tests() {
+        let mut collector = RelayedCowSelectionCollector::try_new_declared(
+            context(
+                Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+                COW_SELECTION_BYTES as usize,
+            ),
+            None,
+            selection_schema(),
+            signed_layout::fixture_declarations(&selection_schema()),
+        )
+        .unwrap();
+        let stream = relayed_stream(&[batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)])]);
+        let error = collector.push_body(&stream).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(collector.assembly_bytes(), 0);
+        assert_eq!(collector.collector.row_count(), 0);
+    }
+
+    #[test]
+    fn actual_root_budget_refusal_reaches_cow_consumer_as_original_work_source() {
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_workload_control::{ResultCapacityConfig, WorkError};
+        use std::error::Error;
+        let (_control, root, binding, _) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let window = binding.window_alias();
+        let mut consumer = CowMatchRootConsumer::try_new_with_capacity(
+            context(
+                Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+                COW_SELECTION_BYTES as usize,
+            ),
+            selection_schema(),
+            contract(),
+            ConnectorRowMutationIntent::Merge {
+                effects: vec![ConnectorRowMutationEffect::Replace],
+            },
+            &binding,
+        )
+        .unwrap();
+        let original_reservation = window
+            .reserve_payload_bytes(ResultCapacityConfig::V1.all_objects_bytes[2])
+            .unwrap();
+        let held = window.retained_payload_bytes();
+        let stream = relayed_stream(&[batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)])]);
+        let error = consumer.push_body(&stream).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+        let source = error
+            .source()
+            .unwrap()
+            .downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+            .unwrap();
+        assert_eq!(
+            source.downcast_ref::<WorkError>(),
+            Some(&WorkError::Capacity("retained result bytes"))
+        );
+        assert_eq!(
+            error.failure_fact(),
+            WorkError::Capacity("retained result bytes").failure_fact()
+        );
+        assert_eq!(consumer.collector.collector.row_count(), 0);
+        assert_eq!(
+            consumer.collector.assembly_bytes(),
+            0,
+            "complete borrowed records create no partial copy"
+        );
+        assert_eq!(window.retained_payload_bytes(), held);
+        drop(consumer);
+        assert_eq!(window.retained_payload_bytes(), held);
+        drop(original_reservation);
+        assert_eq!(window.retained_payload_bytes(), 0);
+        drop((binding, window));
+        root.owner.complete();
+        root.business.release();
     }
 
     #[test]

@@ -2289,8 +2289,6 @@ impl std::ops::Deref for IcebergAdmissionStatisticsMetadata {
 pub(crate) mod cow_begin;
 #[path = "control/cow_begin_own.rs"]
 mod cow_begin_own;
-#[path = "control/cow_json.rs"]
-pub(crate) mod cow_json;
 
 impl IcebergWriteSessionControl {
     fn frozen_references_of(
@@ -3632,7 +3630,6 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         &self,
         request: ConnectorWriteBeginRequest,
         original: novarocks_spi::connector::ConnectorOriginalResultScope,
-        existing_caller_upper: u64,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -3644,7 +3641,7 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
                 + '_,
         >,
     > {
-        Box::pin(self.begin_cow_original_async(request, original, existing_caller_upper))
+        Box::pin(self.begin_cow_original_async(request, original))
     }
 
     fn finish_write_async<'a>(
@@ -3740,12 +3737,11 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         &self,
         request: ConnectorWriteBeginRequest,
         original: novarocks_spi::connector::ConnectorOriginalResultScope,
-        existing_caller_upper: u64,
     ) -> Result<
         novarocks_spi::connector::ConnectorCowBeginPlan,
         novarocks_spi::connector::ConnectorCowBeginFailure,
     > {
-        self.begin_cow_original(request, original, existing_caller_upper)
+        self.begin_cow_original(request, original)
     }
 
     fn prepared_logical_row_change(
@@ -5415,7 +5411,7 @@ mod variant_statistics_tests {
 // The measured F is the exact factory above; no request or dummy Future is
 // constructed, polled or dropped to quote backing. Variable graphs remain on
 // their original formation-point receipts rather than guessed fixed minima.
-fn write_control_cow_future_bytes<A, B, C, D, F>(_: fn(A, B, C, D) -> F) -> usize {
+fn write_control_cow_future_bytes<A, B, C, F>(_: fn(A, B, C) -> F) -> usize {
     std::mem::size_of::<F>()
 }
 

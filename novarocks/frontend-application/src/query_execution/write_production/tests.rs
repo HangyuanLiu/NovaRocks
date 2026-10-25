@@ -129,7 +129,7 @@ fn decoder(
     plan: PlanSeal,
 ) -> RootWriteResultDecoder {
     let targets = [WriteTargetOrdinal::try_new(0).unwrap()];
-    let mut decoder = RootWriteResultDecoder::new(
+    let mut decoder = RootWriteResultDecoder::for_test_local(
         RootWriteDecodeContract::try_new(&targets, session.targets()).unwrap(),
     );
     decoder.bind_production_execution(execution, plan);

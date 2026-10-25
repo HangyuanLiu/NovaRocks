@@ -27,7 +27,6 @@ pub trait ConnectorOriginalResultScopeCheck: Send + Sync + 'static {
     fn original_deadline(&self) -> Instant;
     /// Original control and Work checks only. Never authorizes allocation.
     fn check_active(&self) -> Result<(), OriginalResultCheckError>;
-    fn check_before_growth(&self, simultaneous_upper: u64) -> Result<(), OriginalResultCheckError>;
 }
 
 /// Preserve the original cause; presentation never formats an arbitrary source.
@@ -95,12 +94,7 @@ impl ConnectorOriginalResultScope {
     pub fn check_active(&self) -> Result<(), OriginalResultCheckError> {
         self.checks.check_active()
     }
-    pub fn check_before_growth(
-        &self,
-        simultaneous_upper: u64,
-    ) -> Result<(), OriginalResultCheckError> {
-        self.checks.check_before_growth(simultaneous_upper)
-    }
+
     pub fn retention_guard(&self) -> ConnectorPayloadRetentionGuard {
         self.guard.clone()
     }

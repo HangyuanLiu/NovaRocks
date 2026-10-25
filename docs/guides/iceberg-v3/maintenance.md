@@ -186,6 +186,21 @@ operation/journal 与访问能力仍由同一稳定 Call/残留保管；GC 的 P
 publication，也不能把该扫描的 unsupported 错误投成新 CTAS 的 AppliedButUnusable。
 目前不承诺跨 FE/BE 崩溃可重建全部产物清单、自动回收或无孤儿；恢复这类能力需要独立协议与证明。
 
+### 实际资源与等待边界
+
+Provider 异步 I/O 由原稳定 Source 与同 Root 的 metadata 能力推进，真正阻塞调用使用原
+executor。普通 Full 可取消等待，不另起 pool 或把整个维护流程包进 block_on。取消或超时
+不能代替实际退出；Unknown 继续保管 journal、对象与仍活数据，但已经退出的动作不再占原
+运行位置。必要 finalize 与安全 GC 的完成分别取证，不能因空槽、NeededReady 或业务成功
+宣布 cleanup Complete。
+
+实际 buffer 复制按同预算的 old+new 并存峰授权，最后实际 alias 退出才退款。same operation
+自持数据造成不足时 typed 拒绝，不等待自己；完整 D 与来源检查不变，不新增依赖域 cleanup
+配额、SDK 对象图 invoice 或 worker 最低数。共享 executor 全部阻塞时，清理也可能等待到期限。
+这些规则不改变扫描的 UNPROVEN 拒绝：仍须在 list/delete 前拒绝，精确 owned-ref 与
+operation-owned cleanup 不因扫描不受支持而被禁用。实现迁移及手动/自动的原生与最终
+全工作区验证仍待完成。
+
 ### 入口
 
 `novarocks/connector/iceberg/src/catalog_control/{cleanup_maintenance,cleanup_candidates,unanchored_ctas_cleanup}.rs`，

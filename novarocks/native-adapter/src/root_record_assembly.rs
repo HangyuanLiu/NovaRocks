@@ -21,8 +21,9 @@
 //! wholly inside one body is handed to its decoder without a copy. A record
 //! that crosses bodies is assembled only after its fixed header has been
 //! parsed and its declared length checked against the caller's bound; the
-//! assembly buffer is then reserved once at exactly that length. End inside
-//! an unfinished record is refused. Taking a body into assembly is what lets
+//! budgeted entry reserves the actual header and record backing before each
+//! allocation, including their old/new coexistence. End inside an unfinished
+//! record is refused. Taking a body into assembly is what lets
 //! its stream item be acknowledged before the whole record arrives; the
 //! assembled bytes are still not published facts until the decoder accepts
 //! the complete record.
@@ -30,6 +31,7 @@
 use crate::root_cow_selection_codec::{COW_SELECTION_HEADER_BYTES, CowSelectionRecordHeader};
 use crate::root_statistics_codec::{STATISTICS_HEADER_BYTES, StatisticsArtifactHeader};
 use crate::root_write_commit_codec::{WRITE_COMMIT_HEADER_BYTES, WriteCommitRecordHeader};
+use novarocks_spi::connector::ConnectorPayloadRetentionGuard;
 
 /// The record framing of one internal-facts domain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,17 +155,20 @@ pub struct RootRecordAssembly {
     domain: RootRecordDomain,
     max_record_bytes: usize,
     partial: Vec<u8>,
+    // Field order destroys actual partial backing before its receipt.
+    partial_receipt: Option<ConnectorPayloadRetentionGuard>,
     needed: Option<usize>,
 }
 
 impl RootRecordAssembly {
-    /// `max_record_bytes` bounds every assembled record; it is the share of
-    /// the caller's window that assembly may hold.
+    /// `max_record_bytes` validates the domain's declared record size only.
+    /// Actual Root bytes are authorized separately by `push_budgeted`.
     pub fn new(domain: RootRecordDomain, max_record_bytes: usize) -> Self {
         Self {
             domain,
             max_record_bytes,
             partial: Vec::new(),
+            partial_receipt: None,
             needed: None,
         }
     }
@@ -173,11 +178,55 @@ impl RootRecordAssembly {
         self.partial.capacity()
     }
 
-    /// Feed one relayed body. Each complete record is passed to `sink` in
-    /// order; a record still incomplete at the end of `body` is kept.
+    /// Explicit local assembly, without claiming a Root byte authorization.
+    /// Governed consumers must call `push_budgeted` instead.
     pub fn push<E>(
         &mut self,
+        body: &[u8],
+        sink: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), RootRecordAssemblyError<E>> {
+        assert!(
+            self.partial_receipt.is_none(),
+            "budgeted partial requires its byte author"
+        );
+        self.push_inner(body, |_| Ok(None), sink)
+    }
+
+    /// Reserve each actual partial buffer before allocating it. Replacement
+    /// holds both old and new receipts until copying destroys the old backing.
+    /// Complete borrowed records allocate no partial buffer or byte receipt.
+    pub fn push_budgeted<E>(
+        &mut self,
+        body: &[u8],
+        mut reserve: impl FnMut(usize) -> Result<ConnectorPayloadRetentionGuard, E>,
+        sink: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), RootRecordAssemblyError<E>> {
+        assert!(
+            self.partial.is_empty() || self.partial_receipt.is_some(),
+            "local partial cannot acquire byte authority after allocation"
+        );
+        self.push_inner(body, |bytes| reserve(bytes).map(Some), sink)
+    }
+
+    fn replace_partial<E>(
+        &mut self,
+        capacity: usize,
+        reserve: &mut impl FnMut(usize) -> Result<Option<ConnectorPayloadRetentionGuard>, E>,
+    ) -> Result<(), RootRecordAssemblyError<E>> {
+        let receipt = reserve(capacity).map_err(RootRecordAssemblyError::Sink)?;
+        let mut next = Vec::with_capacity(capacity);
+        next.extend_from_slice(&self.partial);
+        let old = std::mem::replace(&mut self.partial, next);
+        drop(old);
+        // Releasing the old receipt cannot precede destroying its backing.
+        drop(std::mem::replace(&mut self.partial_receipt, receipt));
+        Ok(())
+    }
+
+    fn push_inner<E>(
+        &mut self,
         mut body: &[u8],
+        mut reserve: impl FnMut(usize) -> Result<Option<ConnectorPayloadRetentionGuard>, E>,
         mut sink: impl FnMut(&[u8]) -> Result<(), E>,
     ) -> Result<(), RootRecordAssemblyError<E>> {
         let header = self.domain.header_bytes();
@@ -196,26 +245,36 @@ impl RootRecordAssembly {
             if self.partial.len() < header {
                 let take = (header - self.partial.len()).min(body.len());
                 if self.partial.capacity() == 0 {
-                    self.partial.reserve_exact(header);
+                    self.replace_partial(header, &mut reserve)?;
                 }
                 self.partial.extend_from_slice(&body[..take]);
                 body = &body[take..];
                 if self.partial.len() < header {
                     continue;
                 }
-                let length = self
-                    .checked_length(&self.partial[..header])
-                    .map_err(RootRecordAssemblyError::Framing)?;
-                self.partial.reserve_exact(length - self.partial.len());
-                self.needed = Some(length);
             }
-            let needed = self.needed.expect("a parsed header declares its length");
+            // A refused growth keeps the already-owned header and its receipt.
+            // A later observation never implicitly grows this original Vec.
+            let needed = match self.needed {
+                Some(needed) => needed,
+                None => {
+                    let length = self
+                        .checked_length(&self.partial[..header])
+                        .map_err(RootRecordAssemblyError::Framing)?;
+                    self.needed = Some(length);
+                    length
+                }
+            };
+            if self.partial.capacity() < needed {
+                self.replace_partial(needed, &mut reserve)?;
+            }
             let take = (needed - self.partial.len()).min(body.len());
             self.partial.extend_from_slice(&body[..take]);
             body = &body[take..];
             if self.partial.len() == needed {
                 sink(&self.partial).map_err(RootRecordAssemblyError::Sink)?;
-                self.partial = Vec::new();
+                drop(std::mem::take(&mut self.partial));
+                drop(self.partial_receipt.take());
                 self.needed = None;
             }
         }

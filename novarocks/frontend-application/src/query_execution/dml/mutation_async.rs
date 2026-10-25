@@ -342,7 +342,6 @@ impl PreparedMutationFacts {
                 self.write_lease(),
                 input.request,
                 input.original,
-                input.existing_caller_upper,
                 receiving.as_ref(),
             )
             .await?;

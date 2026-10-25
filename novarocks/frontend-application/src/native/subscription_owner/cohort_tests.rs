@@ -83,7 +83,7 @@ impl Drop for ActualFuture {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn scan_and_original_subscription_consume_same_cohort_even_when_q_is_full() {
+async fn scan_and_original_subscription_consume_same_cohort_with_other_control_builders_live() {
     let (control, mut driver, capacity) = fixture();
     let root = control
         .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -100,14 +100,15 @@ async fn scan_and_original_subscription_consume_same_cohort_even_when_q_is_full(
             .unwrap();
     let scan = scan_admission.ready().await.unwrap();
     assert_eq!(cohort.remaining(), 1);
-    // No individual request may acquire these occupied original Q cells.
-    // The partially consumed positive cohort still holds one original Q cell.
-    // Occupy the sole remaining cell, then observe Full without another ticket.
-    let blockers = [scope.begin_control_binding().unwrap()];
-    assert!(matches!(
-        scope.try_begin_control_binding().unwrap(),
-        novarocks_workload_control::joint_admission::JointTryBegin::Full(_)
-    ));
+    // Other unsubmitted control builders grant no Source authority. The
+    // subscription must still consume the SAME cohort's remaining position.
+    let second_builder = match scope.try_begin_control_binding().unwrap() {
+        novarocks_workload_control::joint_admission::JointTryBegin::Started(builder) => builder,
+        novarocks_workload_control::joint_admission::JointTryBegin::Full(_) => {
+            panic!("control responsibility has no separate proposal quota")
+        }
+    };
+    let blockers = [scope.begin_control_binding().unwrap(), second_builder];
     let (mut owner, port) = NativeSubscriptionOwner::new(Handle::current(), 8).unwrap();
     // Run the exact original service turn synchronously to observe the lock cut.
     owner.core.state.lock().unwrap().started = true;

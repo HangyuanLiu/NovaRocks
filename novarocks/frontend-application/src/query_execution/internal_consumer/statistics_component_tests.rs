@@ -378,7 +378,16 @@ async fn run_case(case: Case) {
             }
         })
         .await;
-    assert_eq!(attempt.capacity.snapshot().held_positions, [0; 4]);
+    if let Some(typed) = &typed {
+        assert!(typed.computation.is_some());
+        assert_eq!(
+            attempt.capacity.snapshot().held_positions,
+            [0, 0, 1, 0],
+            "the original typed RootStage already owns its real Internal computation position"
+        );
+    } else {
+        assert_eq!(attempt.capacity.snapshot().held_positions, [0; 4]);
+    }
     let binding = if let Some(typed) = &typed {
         // Actor, stage compute, cancellation and binding all name this exact
         // direct child; the positive payload stays with the outer Root owner.
@@ -417,6 +426,14 @@ async fn run_case(case: Case) {
     )
     .unwrap();
     let custody = output.cpu_custody();
+    if let Some(typed) = &typed {
+        assert!(typed.computation.is_none());
+        assert_eq!(
+            attempt.capacity.snapshot().held_positions,
+            [0, 0, 1, 0],
+            "moving the SAME computation into stable CPU custody neither frees nor mints a position"
+        );
+    }
     let mut producer = offers.reserve(attempt.root.query_execution_id()).unwrap();
     producer
         .stage(
@@ -498,6 +515,13 @@ async fn run_case(case: Case) {
             logical.original_internal_outcome().borrow().is_none(),
             "End is not the Ready proof"
         );
+        if typed.is_some() {
+            assert_eq!(
+                attempt.capacity.snapshot().held_positions,
+                [0, 0, 1, 0],
+                "End completion keeps the SAME computation for the second original proof receipt"
+            );
+        }
         std::future::poll_fn(|cx| {
             assert!(
                 consume.as_mut().poll(cx).is_pending(),
@@ -637,6 +661,21 @@ async fn run_case(case: Case) {
     )
     .await
     .unwrap();
+    if let Some(typed) = &mut typed {
+        drive_typed(&mut typed.driver);
+        assert_eq!(
+            attempt.capacity.snapshot().held_positions,
+            [0; 4],
+            "actual CPU custody closure releases compute while original payload, binding and output remain live"
+        );
+        assert_eq!(
+            artifact_body.as_ref().unwrap().as_ref(),
+            b"original artifact"
+        );
+        if matches!(case, Case::TypedRootSuccess) {
+            assert!(retained_ready.is_some());
+        }
+    }
     drop(custody);
     drop(output);
     drop(consumer);
@@ -644,7 +683,8 @@ async fn run_case(case: Case) {
     drop(producer);
     drop(offers);
     if let Some(mut typed) = typed {
-        assert_eq!(attempt.capacity.snapshot().held_positions, [0; 4]);
+        let capacity = attempt.capacity.clone();
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
         // Join the original actor that owns the actual stage WorkOwner. Root
         // and Ready payload remain stable outside this consuming future.
         let process = watchdog_joint(
@@ -692,7 +732,14 @@ async fn run_case(case: Case) {
             let next_retired = next.retirement_observer().unwrap();
             let computation =
                 typed_statistics_batch(&typed.root, &typed.payload, &next, &mut typed.driver);
+            assert_eq!(
+                capacity.snapshot().held_positions,
+                [0, 0, 1, 0],
+                "the next actual stage acquires the sole compute position while original Ready payload remains live"
+            );
             drop(computation);
+            drive_typed(&mut typed.driver);
+            assert_eq!(capacity.snapshot().held_positions, [0; 4]);
             next.complete();
             drive_typed(&mut typed.driver);
             assert!(next_retired.is_reclaimed().unwrap());
@@ -708,6 +755,7 @@ async fn run_case(case: Case) {
         typed.root.owner.complete();
         typed.root.business.release();
         drive_typed(&mut typed.driver);
+        drop(capacity);
         drop(process);
     } else {
         if artifact_body.is_some() {

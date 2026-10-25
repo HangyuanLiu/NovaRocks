@@ -120,7 +120,7 @@ async fn unbound_ordinary_read_parent_is_bound_by_its_original_provider_before_c
 }
 
 #[test]
-fn original_provider_binding_q_full_keeps_one_wait_and_does_not_select_routes_or_children() {
+fn original_provider_binding_keeps_same_admission_with_other_builders_live() {
     let (control, mut driver, capacity) = fixture();
     let root = control
         .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -132,20 +132,32 @@ fn original_provider_binding_q_full_keeps_one_wait_and_does_not_select_routes_or
     ];
     let factory = selected_factory();
     let mut original = ProviderCreatorControlBinding::default();
-    let mut cx = Context::from_waker(Waker::noop());
+    let wake = std::sync::Arc::new(ChildWake::default());
+    let waker = Waker::from(wake.clone());
+    let mut cx = Context::from_waker(&waker);
     assert!(original.poll(&scope, &factory, &mut cx).is_pending());
-    assert!(original.wait.is_some() && original.proposal.is_none() && original.admission.is_none());
-    assert_eq!(factory.visits.load(Ordering::SeqCst), 0);
+    assert!(original.wait.is_none() && original.proposal.is_none() && original.admission.is_some());
+    assert_eq!(factory.visits.load(Ordering::SeqCst), 1);
+    wake.0.store(0, Ordering::SeqCst);
+    for _ in 0..16 {
+        assert!(original.poll(&scope, &factory, &mut cx).is_pending());
+    }
+    assert_eq!(
+        wake.0.load(Ordering::SeqCst),
+        0,
+        "a waiting reply is not a self event"
+    );
+    assert_eq!(factory.visits.load(Ordering::SeqCst), 1);
+    assert_eq!(control.snapshot().scopes.len(), 1);
     let mut borrowed = Box::pin(std::future::poll_fn(|cx| {
         original.poll(&scope, &factory, cx)
     }));
     assert!(borrowed.as_mut().poll(&mut cx).is_pending());
     drop(borrowed);
     assert!(
-        original.wait.is_some(),
-        "same source owns the original wait after borrowed F drop"
+        original.admission.is_some(),
+        "same source owns the original request after borrowed F drop"
     );
-    drop(blockers);
     drive(&mut driver);
     loop {
         match original.poll(&scope, &factory, &mut cx) {
@@ -159,7 +171,7 @@ fn original_provider_binding_q_full_keeps_one_wait_and_does_not_select_routes_or
     assert_eq!(factory.visits.load(Ordering::SeqCst), 1);
     assert_eq!(control.snapshot().scopes.len(), 1);
     original.after_source_exit();
-    drop((original, capacity, scope));
+    drop((original, blockers, capacity, scope));
     finish(control, root, driver);
 }
 
@@ -175,7 +187,7 @@ impl std::task::Wake for ChildWake {
 }
 
 #[test]
-fn original_provider_child_q_full_waits_for_actual_reap_without_reopening_source() {
+fn original_provider_child_waits_for_original_driver_without_reopening_source() {
     let (control, mut driver, capacity) = fixture();
     let root = control
         .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -201,8 +213,8 @@ fn original_provider_child_q_full_waits_for_actual_reap_without_reopening_source
     }
     assert!(binding.bound);
     drive(&mut driver);
-    // Keep the fixture's original Q=2. Neither of these original constructors
-    // has exited, so a child must not invent another cell or report failure.
+    // These other original builders remain live throughout child admission.
+    // They grant no child authority and impose no separate proposal quota.
     let blockers = [
         scope.begin_control_binding().unwrap(),
         scope.begin_control_binding().unwrap(),
@@ -212,15 +224,18 @@ fn original_provider_child_q_full_waits_for_actual_reap_without_reopening_source
     for _ in 0..16 {
         assert!(child.poll_ready(&mut cx).is_pending());
     }
-    assert_eq!(wake.0.load(Ordering::SeqCst), 0, "Full is not a self event");
+    assert_eq!(
+        wake.0.load(Ordering::SeqCst),
+        0,
+        "a waiting reply is not a self event"
+    );
     assert_eq!(factory.visits.load(Ordering::SeqCst), 1);
     assert_eq!(control.snapshot().scopes.len(), 1);
     let mut borrowed = Box::pin(child.ready());
     assert!(borrowed.as_mut().poll(&mut cx).is_pending());
     drop(borrowed);
-    drop(blockers);
-    // Drop retires the original body; it does not publish Free before the
-    // driver's lock-free backing destruction. The SAME child still waits.
+    // Dropping a borrowed observer does not drive or replace the original
+    // request. Only the SAME driver can publish its admission result.
     assert!(child.poll_ready(&mut cx).is_pending());
     assert_eq!(control.snapshot().scopes.len(), 1);
     drive(&mut driver);
@@ -272,12 +287,20 @@ fn original_provider_child_q_full_waits_for_actual_reap_without_reopening_source
             .any(|s| s.id == actual_scope.id())
     );
     binding.after_source_exit();
-    drop((binding, actual_scope, alias, window, capacity, scope));
+    drop((
+        binding,
+        blockers,
+        actual_scope,
+        alias,
+        window,
+        capacity,
+        scope,
+    ));
     finish(control, root, driver);
 }
 
 #[test]
-fn original_provider_child_q_wait_keeps_exact_parent_cancellation() {
+fn original_provider_child_waiting_reply_keeps_exact_parent_cancellation() {
     let (control, mut driver, capacity) = fixture();
     let root = control
         .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -301,6 +324,16 @@ fn original_provider_child_q_wait_keeps_exact_parent_cancellation() {
     assert!(child.poll_ready(&mut cx).is_pending());
     root.owner
         .cancel(novarocks_workload_control::CancellationReason::Requested);
+    assert!(matches!(
+        scope.check(),
+        Err(WorkError::Cancelled(
+            novarocks_workload_control::CancellationReason::Requested
+        ))
+    ));
+    // The existing request is Waiting, not an old proposal-slot wait. Drive
+    // its original owner to deliver the exact parent cancellation; no child
+    // may be installed even while the other original builders remain live.
+    drive(&mut driver);
     assert!(matches!(
         child.poll_ready(&mut cx),
         Poll::Ready(Err(WorkError::Cancelled(

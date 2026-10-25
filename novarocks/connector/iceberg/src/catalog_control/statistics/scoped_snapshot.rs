@@ -20,7 +20,7 @@
 //! publish a named raw read; only the original async driver polls FileIO.
 use super::*;
 use crate::iceberg::{io::FileIO, table::Table};
-use crate::read_snapshot::cow_capture::{CaptureBudget, ReadFailure};
+use crate::read_snapshot::cow_capture::ReadFailure;
 use novarocks_spi::connector::{
     ConnectorOriginalResultScope, ConnectorPayloadRetentionGuard, ConnectorRequestContext,
     ProviderMetadataCpuInput, ProviderMetadataCpuPort,
@@ -39,7 +39,6 @@ pub(crate) enum SnapshotReadKind {
 pub(crate) struct ScopedReadSnapshot {
     pub(crate) files: Vec<crate::read_model::IcebergReadFile>,
     pub(crate) all_deletes: Vec<Arc<crate::delete_semantics::DeleteFact>>,
-    pub(crate) simultaneous_upper: u64,
     pub(crate) retention_guard: ConnectorPayloadRetentionGuard,
 }
 const SNAPSHOT_RAW_DETAIL: &str = "original snapshot metadata I/O failed";
@@ -89,14 +88,11 @@ enum IoState {
     Idle,
     Requested {
         path: String,
-        retained: u64,
     },
     Reading {
         input: Option<crate::iceberg::io::InputFile>,
         result: Option<Result<Bytes, ConnectorError>>,
     },
-    Owned(u64),
-    OwnedReady(u64),
     Returned(Result<Bytes, ConnectorError>),
 }
 pub(crate) struct SnapshotIoGate {
@@ -126,28 +122,13 @@ impl SnapshotIoGate {
             state: Mutex::new(Some(IoState::Idle)),
         })
     }
-    pub(crate) async fn read(
-        &self,
-        path: &str,
-        budget: Option<&CaptureBudget<'_>>,
-    ) -> Result<Bytes, ReadFailure> {
-        if let Some(budget) = budget {
-            // The previous raw read may have used its exact paid total. Even
-            // the next path copy must obtain the same original Root's growth
-            // before it can be formed; a borrowed path is not a reservation.
-            let required = crate::read_snapshot::cow_capture::recipe(
-                crate::read_snapshot::cow_capture::geometry::add(budget.upper(), path.len() as u64),
-            )?;
-            self.reserve(required).await?;
-            budget.charge(path.len() as u64)?;
-        }
+    pub(crate) async fn read(&self, path: &str) -> Result<Bytes, ReadFailure> {
         std::future::poll_fn(|_| {
             let mut loan = IoLoan::take(self);
             match loan.state.as_mut().unwrap() {
                 IoState::Idle => {
                     loan.state = Some(IoState::Requested {
                         path: path.to_owned(),
-                        retained: budget.map_or(0, CaptureBudget::upper),
                     });
                     Poll::Pending
                 }
@@ -155,46 +136,15 @@ impl SnapshotIoGate {
                     assert_eq!(original, path, "same original snapshot raw read");
                     Poll::Pending
                 }
-                IoState::Owned(_) | IoState::OwnedReady(_) | IoState::Reading { .. } => {
-                    panic!("snapshot read collided with original quota intent")
+                IoState::Reading { .. } => {
+                    panic!("snapshot read collided with an active original read")
                 }
                 IoState::Returned(_) => {
                     let Some(IoState::Returned(result)) = loan.state.replace(IoState::Idle) else {
                         unreachable!()
                     };
-                    Poll::Ready(
-                        result
-                            .map_err(|error| ReadFailure::Original(error.into()))
-                            .and_then(|bytes| {
-                                if let Some(budget) = budget {
-                                    budget.charge(bytes.len() as u64)?;
-                                }
-                                Ok(bytes)
-                            }),
-                    )
+                    Poll::Ready(result.map_err(|error| ReadFailure::Original(error.into())))
                 }
-            }
-        })
-        .await
-    }
-    pub(crate) async fn reserve(&self, total: u64) -> Result<(), ReadFailure> {
-        std::future::poll_fn(|_| {
-            let mut loan = IoLoan::take(self);
-            match loan.state.as_ref().unwrap() {
-                IoState::Idle => {
-                    loan.state = Some(IoState::Owned(total));
-                    Poll::Pending
-                }
-                IoState::Owned(original) => {
-                    assert_eq!(*original, total);
-                    Poll::Pending
-                }
-                IoState::OwnedReady(original) => {
-                    assert_eq!(*original, total);
-                    loan.state = Some(IoState::Idle);
-                    Poll::Ready(Ok(()))
-                }
-                _ => panic!("snapshot quota collided with original read intent"),
             }
         })
         .await
@@ -207,27 +157,11 @@ impl SnapshotIoGate {
         // The same requested path remains in this loan across the foreign F.
         // Neither poll, wake nor SDK Drop runs under the mutex.
         let mut loan = IoLoan::take(self);
-        if let IoState::Owned(total) = loan.state.as_ref().unwrap() {
-            let total = *total;
-            if context
-                .io_admission()
-                .and_then(std::sync::Weak::upgrade)
-                .is_none()
-            {
-                return Err(invalid("scoped snapshot requires its original MIO port"));
-            }
-            let total = std::num::NonZeroU64::new(total)
-                .ok_or_else(|| invalid("snapshot quota is empty"))?;
-            context.reserve_owned_metadata(total).await?;
-            loan.state = Some(IoState::OwnedReady(total.get()));
-            return Ok(());
-        }
-        let IoState::Requested { path, retained } = loan.state.as_ref().unwrap() else {
+        let IoState::Requested { path } = loan.state.as_ref().unwrap() else {
             return Err(invalid(
                 "snapshot CPU suspended without an original I/O request",
             ));
         };
-        let retained = *retained;
         let input = match io.new_input(path) {
             Ok(input) => input,
             Err(error) => {
@@ -248,9 +182,7 @@ impl SnapshotIoGate {
         let observed = input.as_ref().unwrap().metadata().await;
         match observed {
             Ok(metadata) => {
-                let total = retained
-                    .checked_add(metadata.size)
-                    .ok_or_else(|| invalid("snapshot raw-byte upper overflow"))?;
+                let total = metadata.size;
                 if let Some(total) = std::num::NonZeroU64::new(total) {
                     if context
                         .io_admission()
@@ -327,7 +259,6 @@ impl IcebergMetadataCpuOriginal {
         snapshot: i64,
         context: ConnectorRequestContext,
         original: ConnectorOriginalResultScope,
-        base_upper: u64,
         kind: SnapshotReadKind,
     ) -> Arc<Self> {
         Self::read_snapshot_source_for_generation(
@@ -337,7 +268,6 @@ impl IcebergMetadataCpuOriginal {
             snapshot,
             context,
             original,
-            base_upper,
             kind,
         )
     }
@@ -348,7 +278,6 @@ impl IcebergMetadataCpuOriginal {
         snapshot: i64,
         context: ConnectorRequestContext,
         original: ConnectorOriginalResultScope,
-        base_upper: u64,
         kind: SnapshotReadKind,
     ) -> Arc<Self> {
         let gate = SnapshotIoGate::new();
@@ -358,7 +287,6 @@ impl IcebergMetadataCpuOriginal {
             snapshot,
             context.clone(),
             original.clone(),
-            base_upper,
             kind,
             gate.clone(),
         ));
@@ -417,8 +345,8 @@ pub(crate) async fn drive_read_snapshot(
 }
 pub(super) fn reader_backing_bytes() -> Result<usize, ConnectorError> {
     use novarocks_type_contract::owned_resources::layout::arc_layout;
-    fn bytes<A, B, C, D, E, F, G, H>(_: fn(A, B, C, D, E, F, G) -> H) -> usize {
-        std::mem::size_of::<H>()
+    fn bytes<A, B, C, D, E, F, G>(_: fn(A, B, C, D, E, F) -> G) -> usize {
+        std::mem::size_of::<G>()
     }
     let gate = arc_layout(std::alloc::Layout::new::<SnapshotIoGate>())
         .map_err(|_| internal("snapshot gate layout overflow"))?
@@ -447,40 +375,21 @@ mod tests {
         }
     }
     #[test]
-    fn original_quota_intent_survives_borrowed_waiter_and_does_not_self_wake() {
+    fn original_raw_read_survives_borrowed_waiter_without_self_wake() {
         let gate = SnapshotIoGate::new();
         let wake = Arc::new(CountWake(AtomicUsize::new(0)));
         let waker = std::task::Waker::from(wake.clone());
         let mut cx = Context::from_waker(&waker);
-        let mut borrowed = Box::pin(gate.reserve(8192));
+        let path = "memory:///original-manifest.avro";
+        let mut borrowed = Box::pin(gate.read(path));
         assert!(borrowed.as_mut().poll(&mut cx).is_pending());
         assert!(borrowed.as_mut().poll(&mut cx).is_pending());
         assert_eq!(wake.0.load(Ordering::SeqCst), 0);
         drop(borrowed);
         let loan = IoLoan::take(&gate);
-        assert!(matches!(loan.state.as_ref(), Some(IoState::Owned(8192))));
-        // No positive quota or actual I/O receipt is manufactured by this test.
-    }
-    #[tokio::test]
-    async fn original_quota_driver_refuses_absent_mio_without_consuming_intent() {
-        let gate = SnapshotIoGate::new();
-        let mut borrowed = Box::pin(gate.reserve(8192));
-        assert!(futures::poll!(borrowed.as_mut()).is_pending());
-        drop(borrowed);
-        let context = ConnectorRequestContext::try_new(
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-            novarocks_spi::connector::ConnectorStopOwner::new().view(),
-            1024 * 1024,
-            1024 * 1024,
-        )
-        .expect("original context");
-        let io = FileIO::new_with_memory();
-        let refused = gate.fulfill(&io, &context).await;
-        assert!(refused.is_err());
-        let loan = IoLoan::take(&gate);
-        assert!(matches!(loan.state.as_ref(), Some(IoState::Owned(8192))));
-        // The same Source keeps the unmet intent. This is a refusal/borrowing
-        // component, not a positive Joint grant or Native profile assertion.
+        assert!(
+            matches!(loan.state.as_ref(), Some(IoState::Requested { path: original }) if original == path)
+        );
     }
     #[test]
     fn raw_snapshot_error_retains_sdk_source_and_original_public_fact() {
@@ -513,61 +422,6 @@ mod tests {
                     SNAPSHOT_RAW_DETAIL
                 )
                 .unwrap()
-        );
-    }
-}
-
-#[cfg(test)]
-mod invoice_tests {
-    use super::*;
-    use novarocks_spi::connector::{
-        ConnectorOriginalResultScopeCheck, OriginalResultCheckClass, OriginalResultCheckError,
-    };
-
-    struct ExactOriginalEnvelope(u64);
-    impl ConnectorOriginalResultScopeCheck for ExactOriginalEnvelope {
-        fn original_deadline(&self) -> std::time::Instant {
-            std::time::Instant::now() + std::time::Duration::from_secs(30)
-        }
-        fn check_active(&self) -> Result<(), OriginalResultCheckError> {
-            Ok(())
-        }
-        fn check_before_growth(&self, upper: u64) -> Result<(), OriginalResultCheckError> {
-            if upper <= self.0 {
-                Ok(())
-            } else {
-                Err(OriginalResultCheckError::new(
-                    OriginalResultCheckClass::Coverage,
-                    std::io::Error::other("original exact envelope"),
-                ))
-            }
-        }
-    }
-    #[test]
-    fn next_raw_path_waits_for_its_invoice_before_copy_or_charge() {
-        let original =
-            ConnectorOriginalResultScope::from_original(Arc::new(ExactOriginalEnvelope(40)));
-        let budget = CaptureBudget::new(&original, 40).unwrap();
-        let gate = SnapshotIoGate::new();
-        let path = "memory:///next-original-manifest.avro";
-        let mut read = Box::pin(gate.read(path, Some(&budget)));
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        // The old ordering returned Coverage here, before it could expose the
-        // new prospective amount to the original MIO. No test grant is minted.
-        assert!(read.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(budget.upper(), 40);
-        {
-            let state = gate.state.lock().unwrap();
-            assert!(
-                matches!(state.as_ref(), Some(IoState::Owned(total)) if *total == 40 + path.len() as u64)
-            );
-        }
-        assert!(read.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(budget.upper(), 40, "re-poll cannot repeat the increment");
-        drop(read);
-        assert!(
-            matches!(gate.state.lock().unwrap().as_ref(), Some(IoState::Owned(_))),
-            "borrowed waiter Drop does not erase the original pending intent"
         );
     }
 }

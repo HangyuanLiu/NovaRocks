@@ -91,26 +91,15 @@ impl Error for ConnectorCowBeginFailure {
 
 pub struct ConnectorCowBeginPlan {
     plan: ConnectorWriteSessionPlan,
-    simultaneous_upper: u64,
     original: ConnectorOriginalResultScope,
 }
 impl ConnectorCowBeginPlan {
-    /// First-party constructors must have completed their prospective recipe
-    /// and the late-publication check before constructing this envelope.
-    pub fn new(
-        plan: ConnectorWriteSessionPlan,
-        original: ConnectorOriginalResultScope,
-        simultaneous_upper: u64,
-    ) -> Self {
-        Self {
-            plan,
-            original,
-            simultaneous_upper,
-        }
+    /// First-party constructors preserve their original control and complete
+    /// typed plan before handing both to the original receiving owner.
+    pub fn new(plan: ConnectorWriteSessionPlan, original: ConnectorOriginalResultScope) -> Self {
+        Self { plan, original }
     }
-    pub fn simultaneous_upper(&self) -> u64 {
-        self.simultaneous_upper
-    }
+
     pub fn plan(&self) -> &ConnectorWriteSessionPlan {
         &self.plan
     }

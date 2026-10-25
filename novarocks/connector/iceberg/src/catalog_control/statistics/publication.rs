@@ -1073,15 +1073,26 @@ mod tests {
             submitted: AtomicUsize::new(0),
         });
         let cpu: Arc<dyn novarocks_spi::connector::StatisticsCpuPort> = refusal.clone();
-        let preparer = Arc::new(StatisticsDraftPreparer {
-            snapshot_id: 7,
-            sequence_number: 1,
-            drafts: drafts().into(),
-            cpu: Some(Arc::downgrade(&cpu)),
-            cpu_owner: Some((
-                rig.projection.descriptor.clone(),
-                rig.projection.incarnation,
-            )),
+        let path = Arc::new(Mutex::new(None));
+        let atomic = Arc::new(
+            crate::fs_io::manifest_stream_tests::AtomicManifestWriterBoundary::new(
+                rig.directory.path(),
+            ),
+        );
+        let preparer = Arc::new(AbortableCpuRefusalPreparer {
+            inner: StatisticsDraftPreparer {
+                snapshot_id: 7,
+                sequence_number: 1,
+                drafts: drafts().into(),
+                cpu: Some(Arc::downgrade(&cpu)),
+                cpu_owner: Some((
+                    rig.projection.descriptor.clone(),
+                    rig.projection.incarnation,
+                )),
+            },
+            operation: rig.operation.clone(),
+            atomic,
+            path: path.clone(),
         });
         let outcome = rig.run(publisher.clone(), preparer);
         let ExternalMutationOutcome::KnownUncommitted {
@@ -1099,6 +1110,43 @@ mod tests {
         assert_eq!(refusal.submitted.load(Ordering::SeqCst), 1);
         assert_eq!(publisher.dispatches.load(Ordering::SeqCst), 0);
         assert!(rig.operation.artifacts().unwrap().is_empty());
+        assert!(!exists(path.lock().unwrap().as_ref().unwrap()));
+        assert!(
+            std::fs::read_dir(rig.directory.path().join(".atomic"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "actual abort must remove its atomic temporary file"
+        );
+    }
+
+    struct AbortableCpuRefusalPreparer {
+        inner: StatisticsDraftPreparer,
+        operation: IcebergCommitOperation,
+        atomic: Arc<crate::fs_io::manifest_stream_tests::AtomicManifestWriterBoundary>,
+        path: Arc<Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl Preparer for AbortableCpuRefusalPreparer {
+        async fn prepare(
+            &self,
+            view: &StagedView<'_>,
+            _: &OperationIntent,
+        ) -> crate::iceberg::Result<PreparedChange> {
+            let file_io = crate::iceberg::io::FileIOBuilder::new(Arc::new(MetadataFaultStorage {
+                inner: Some(view.artifacts().file_io().clone()),
+                stop: None,
+                atomic: Some((self.operation.clone(), self.atomic.clone())),
+            }))
+            .build();
+            let writer = MetadataFaultWriter {
+                inner: view.artifacts(),
+                file_io,
+                path: self.path.clone(),
+            };
+            self.inner.prepare_artifacts(&writer).await
+        }
     }
 
     struct FailAfterClose {
@@ -1122,6 +1170,11 @@ mod tests {
         inner: Option<crate::iceberg::io::FileIO>,
         #[serde(skip)]
         stop: Option<StopAtMetadata>,
+        #[serde(skip)]
+        atomic: Option<(
+            IcebergCommitOperation,
+            Arc<crate::fs_io::manifest_stream_tests::AtomicManifestWriterBoundary>,
+        )>,
     }
 
     impl MetadataFaultStorage {
@@ -1150,6 +1203,9 @@ mod tests {
                 "metadata fault must follow actual Puffin close"
             );
             let metadata = self.inner()?.new_input(path)?.metadata().await?;
+            if self.atomic.is_some() {
+                return Ok(metadata);
+            }
             if let Some(stop) = &self.stop {
                 stop.0.request_stop();
                 Ok(metadata)
@@ -1175,6 +1231,9 @@ mod tests {
             &self,
             path: &str,
         ) -> crate::iceberg::Result<Box<dyn crate::iceberg::io::FileWrite>> {
+            if let Some((operation, atomic)) = &self.atomic {
+                return atomic.writer(operation, path).await;
+            }
             self.inner()?.new_output(path)?.writer().await
         }
         async fn delete(&self, path: &str) -> crate::iceberg::Result<()> {
@@ -1260,6 +1319,7 @@ mod tests {
             let file_io = crate::iceberg::io::FileIOBuilder::new(Arc::new(MetadataFaultStorage {
                 inner: Some(view.artifacts().file_io().clone()),
                 stop: self.stop.clone().map(StopAtMetadata),
+                atomic: None,
             }))
             .build();
             let writer = MetadataFaultWriter {

@@ -629,108 +629,76 @@ fn seed_delay_source_files(
     Ok(())
 }
 
-// Deliberate scenario policy, not a physical-layout quote. The normal Server
-// creator must still validate the complete original action/source projections.
-// Keep the three Internal positions explicit rather than relying on V1's four.
+// Three normal DMLs share one real Blocking worker. Internal positions and
+// retained payload use the existing Result budget; transport values below are
+// the original Native defaults, not another admission model or a heap quote.
 const CONCURRENT_CAPACITY_OVERLAY: &str = r#"
 query_blocking_worker_threads = 1
 query_blocking_queue_capacity = 64
+task_dispatch_create_permits = 16
+task_dispatch_update_permits = 12
+task_dispatch_lifecycle_permits = 4
+task_dispatch_control_permits = 4
+task_operation_max_batch_items = 32
+task_operation_max_batch_encoded_bytes = 50331648
+task_descriptor_max_encoded_bytes = 16777216
+task_query_backend_max_queued_operations = 4096
+task_query_backend_max_queued_bytes = 268435456
+task_backend_max_queued_operations = 16384
+task_backend_max_queued_bytes = 536870912
 [runtime.frontend_workload]
 concurrency_limit = 3
 internal_result_positions = 3
-internal_result_all_objects_bytes = 1056964608
-[runtime.frontend_workload.scope_slots]
-query = 4096
-materialized_view = 1024
-statistics = 1024
-table_maintenance = 1024
-management = 1024
-[runtime.frontend_workload.dependency_custody]
-unreceived_productions = 256
-publications = 256
-residuals = 256
-retained_payload_bytes = 4294967296
+internal_result_all_objects_bytes = 1073741824
+scope_records_limit = 8192
+"#;
+// Keep the original BE root/process byte budgets explicit in the actual launch
+// config. They retain Arrow input plus encoded output until their real exit.
+const CONCURRENT_BACKEND_RESULT_OVERLAY: &str = r#"
+result_retained_bytes_per_root = 16777216
+result_retained_bytes_per_process = 4294967296
 "#;
 const CONCURRENT_CAPACITY_EXPECTED: &[(&[&str], i64)] = &[
     (&["runtime", "query_blocking_worker_threads"], 1),
     (&["runtime", "query_blocking_queue_capacity"], 64),
-    (&["runtime", "frontend_workload", "concurrency_limit"], 3),
+    (&["runtime", "task_dispatch_create_permits"], 16),
+    (&["runtime", "task_dispatch_update_permits"], 12),
+    (&["runtime", "task_dispatch_lifecycle_permits"], 4),
+    (&["runtime", "task_dispatch_control_permits"], 4),
+    (&["runtime", "task_operation_max_batch_items"], 32),
     (
-        &["runtime", "frontend_workload", "internal_result_positions"],
-        3,
+        &["runtime", "task_operation_max_batch_encoded_bytes"],
+        50331648,
     ),
+    (&["runtime", "task_descriptor_max_encoded_bytes"], 16777216),
+    (
+        &["runtime", "task_query_backend_max_queued_operations"],
+        4096,
+    ),
+    (
+        &["runtime", "task_query_backend_max_queued_bytes"],
+        268435456,
+    ),
+    (&["runtime", "task_backend_max_queued_operations"], 16384),
+    (&["runtime", "task_backend_max_queued_bytes"], 536870912),
+    (&["runtime", "frontend_workload", "concurrency_limit"], 3),
     (
         &[
             "runtime",
             "frontend_workload",
             "internal_result_all_objects_bytes",
         ],
-        1056964608,
+        1073741824,
     ),
     (
-        &["runtime", "frontend_workload", "scope_slots", "query"],
-        4096,
+        &["runtime", "frontend_workload", "scope_records_limit"],
+        8192,
     ),
+];
+const CONCURRENT_BACKEND_RESULT_EXPECTED: &[(&[&str], i64)] = &[
+    (&["runtime", "result_retained_bytes_per_root"], 16777216),
     (
-        &[
-            "runtime",
-            "frontend_workload",
-            "scope_slots",
-            "materialized_view",
-        ],
-        1024,
-    ),
-    (
-        &["runtime", "frontend_workload", "scope_slots", "statistics"],
-        1024,
-    ),
-    (
-        &[
-            "runtime",
-            "frontend_workload",
-            "scope_slots",
-            "table_maintenance",
-        ],
-        1024,
-    ),
-    (
-        &["runtime", "frontend_workload", "scope_slots", "management"],
-        1024,
-    ),
-    (
-        &[
-            "runtime",
-            "frontend_workload",
-            "dependency_custody",
-            "unreceived_productions",
-        ],
-        256,
-    ),
-    (
-        &[
-            "runtime",
-            "frontend_workload",
-            "dependency_custody",
-            "publications",
-        ],
-        256,
-    ),
-    (
-        &[
-            "runtime",
-            "frontend_workload",
-            "dependency_custody",
-            "residuals",
-        ],
-        256,
-    ),
-    (
-        &[
-            "runtime",
-            "frontend_workload",
-            "dependency_custody",
-            "retained_payload_bytes",
-        ],
+        &["runtime", "result_retained_bytes_per_process"],
         4294967296,
     ),
 ];
@@ -777,23 +745,40 @@ fn require_concurrent_effective_config(context: &ScenarioContext) -> Result<usiz
         frontend.len() == 1,
         "concurrent writer scenario requires one effective FE config"
     );
-    let config = &frontend[0]["effective_config"];
-    for &(path, expected_value) in CONCURRENT_CAPACITY_EXPECTED {
-        let mut value = config;
-        for key in path {
+    let require_values = |role: &serde_json::Value, expected: &[(&[&str], i64)]| -> Result<()> {
+        for &(path, expected_value) in expected {
+            let mut value = &role["effective_config"];
+            for key in path {
+                anyhow::ensure!(
+                    value["type"] == "table",
+                    "effective {} config has no table before {}",
+                    role["role"],
+                    path.join(".")
+                );
+                value = &value["value"][*key];
+            }
             anyhow::ensure!(
-                value["type"] == "table",
-                "effective config has no table before {}",
+                value["type"] == "integer" && value["value"].as_i64() == Some(expected_value),
+                "concurrent writer effective {} {} must be exactly {expected_value}",
+                role["role"],
                 path.join(".")
             );
-            value = &value["value"][*key];
         }
-        anyhow::ensure!(
-            value["type"] == "integer" && value["value"].as_i64() == Some(expected_value),
-            "concurrent writer effective {} must be exactly {expected_value}",
-            path.join(".")
-        );
+        Ok(())
+    };
+    require_values(frontend[0], CONCURRENT_CAPACITY_EXPECTED)?;
+    let backends = roles
+        .iter()
+        .filter(|role| role["role"] == "be")
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        backends.len() == CONCURRENT_WRITERS,
+        "concurrent writer scenario requires three effective BE configs"
+    );
+    for backend in backends {
+        require_values(backend, CONCURRENT_BACKEND_RESULT_EXPECTED)?;
     }
+    let config = &frontend[0]["effective_config"];
     let integer = |path: &[&str]| -> Result<usize> {
         let mut value = config;
         for key in path {
@@ -807,20 +792,20 @@ fn require_concurrent_effective_config(context: &ScenarioContext) -> Result<usiz
         .with_context(|| format!("effective {} is not nonnegative", path.join(".")))
     };
     // The immutable prelaunch test-session plan nominates N=3 exact SQLs.
-    // Consume the real FE window here; a mismatch must fail, not silently
-    // nominate new statements or assume a historical default window.
+    // Require enough real positions without deriving an execution limit from
+    // the Blocking worker count or changing the frozen three nominations.
     let workers = integer(&["runtime", "query_blocking_worker_threads"])?;
     let writers = integer(&["runtime", "frontend_workload", "internal_result_positions"])?;
     anyhow::ensure!(
-        writers == CONCURRENT_WRITERS && writers > workers,
-        "concurrent progress needs its exact admitted {CONCURRENT_WRITERS} statements to exceed the actual blocking worker count: window={writers}, workers={workers}"
+        workers == 1 && writers >= CONCURRENT_WRITERS,
+        "concurrent progress requires one actual Blocking worker and at least {CONCURRENT_WRITERS} Internal positions: positions={writers}, workers={workers}"
     );
-    Ok(writers)
+    Ok(CONCURRENT_WRITERS)
 }
 
 /// Read external data only before admission or after EVERY original writer
-/// actually exits. A SQL read while all Internal positions are held would wait
-/// for those same positions and contaminate the progress proof.
+/// actually exits. Readback can need the same warehouse query admission;
+/// adding it while the three writers are held would contaminate this proof.
 fn require_concurrent_source_data(control: &mut mysql::Conn) -> Result<()> {
     let source = format!("{CONCURRENT_CATALOG}.{CONCURRENT_DATABASE}.{CONCURRENT_SOURCE}");
     let rows = row_count(control, &source)?;
@@ -881,6 +866,23 @@ impl Scenario for DistributedWriterConcurrentProgress {
         launch.config_overlay.fe = Some(format!(
             "{}\n[runtime]\n{capacity}\n",
             launch.config_overlay.fe.take().unwrap_or_default()
+        ));
+        // connector_launch_config owns this existing runtime table and its
+        // reader-cache settings. Insert within it instead of repeating a TOML
+        // table or replacing the original backend configuration.
+        let backend = launch
+            .config_overlay
+            .be
+            .take()
+            .context("original connector BE overlay")?;
+        anyhow::ensure!(
+            backend.matches("[runtime]\n").count() == 1,
+            "original connector BE overlay must have one runtime table"
+        );
+        launch.config_overlay.be = Some(backend.replacen(
+            "[runtime]\n",
+            &format!("[runtime]\n{CONCURRENT_BACKEND_RESULT_OVERLAY}\n"),
+            1,
         ));
         Ok(launch)
     }
@@ -958,6 +960,10 @@ impl Scenario for DistributedWriterConcurrentProgress {
         let progress_deadline = Instant::now() + progress_budget;
         let mut writers = Vec::with_capacity(concurrent_writers);
         let progress = (|| -> Result<()> {
+            // No required FE Blocking action is held here. A permanently
+            // stuck shared worker would legitimately prevent this progress;
+            // this scenario promises normal async concurrency, not isolation
+            // from an operation that never actually exits.
             context.action("submit three independent INSERTs with one FE blocking worker");
             for ordinal in 0..concurrent_writers {
                 let selected = self.intent.take(ordinal)?;

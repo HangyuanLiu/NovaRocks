@@ -163,10 +163,7 @@ impl CowFailure {
                 out.push("connector write lease has no immutable catalog runtime identity")
             }
             Cause::BeforeBegin(error) => match error {
-                cow_necessary_before_begin::Error::Control(error)
-                | cow_necessary_before_begin::Error::ResourceExhausted(error) => {
-                    out.connector(error)
-                }
+                cow_necessary_before_begin::Error::Control(error) => out.connector(error),
                 cow_necessary_before_begin::Error::Scope(error) => {
                     // Concrete WorkError is a closed first-party enum. Its
                     // implementation reads only finite enums/static labels.
@@ -214,10 +211,7 @@ impl CowFailure {
     fn original_connector(&self) -> Option<&ConnectorError> {
         match &self.cause {
             Cause::Lease(e) | Cause::Provider(e) => Some(e),
-            Cause::BeforeBegin(
-                cow_necessary_before_begin::Error::Control(e)
-                | cow_necessary_before_begin::Error::ResourceExhausted(e),
-            ) => Some(e),
+            Cause::BeforeBegin(cow_necessary_before_begin::Error::Control(e)) => Some(e),
             _ => None,
         }
     }

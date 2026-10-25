@@ -211,6 +211,19 @@ SQL client
   `query_execution/statistics/preparation.rs`。普通业务拒绝、actual quiescence 与 raw health 分别保留，
   不能用其中一项代替另一项；这些源码入口不证明整族或原生验收完成。
 
+- `novarocks/workload-control/src/result_window.rs` 与
+  `novarocks/workload-control/src/result_window/retained_bytes.rs`、
+  `novarocks/query-application/src/cpu.rs` 与
+  `novarocks/query-application/src/cpu/bounded_worker.rs`、
+  `novarocks/frontend-application/src/native/task_transport.rs`
+  分别拥有结果数据预算、实际 worker/队列和 Transport bytes/items。scope、完整 D 与
+  factory 身份不能自行授予资源；普通 Full 沿原队列可取消等待，不当作资源失败。
+  出队归还队列位置，已开始工作及结果析构仍按实际退出归还原运行资源。
+  Client 复用原结果窗口，Internal 计算位置与保留数据分开，不与 worker 数绑定。
+  复制前按实际 buffer 的 old+new 并存峰取得同一预算回执，最后实际 alias 退出才退款；
+  额外 schema lifetime 不授予 byte author。same Root 自持数据导致预算不足时 typed 拒绝，
+  不等待自己、不建立递归 SDK invoice。完整迁移与原生/最终全工作区验证仍待完成。
+
 - `novarocks/frontend-application/src/dml/runner.rs` 与 `novarocks/frontend-application/src/coordinator/**`
   旧同步 runner 和协调路径仍在，调用面迁移与删旧尚未完成；不能把新 Action 文件存在或局部检查
   当作全路径实现、退役或原生验收通过。ADR-0198 保持 implementation pending。
@@ -1005,6 +1018,8 @@ suspected case against a clean server before attributing it to the change.
   Common logical execution policy is in `novarocks/query-application/src/coordination/**`.
   Preserve cumulative effects through `novarocks/query-application/src/api/result.rs`
   and MySQL success/error projection; consult ADR-0198 before changing these boundaries.
+  资源修改沿原 worker、Transport 与结果预算 owner；保留 typed Source、完整 D 和实际退出证据。
+  局部组件通过不证明原生调用面或最终全工作区验证完成。
 - **Iceberg 提交、冲突与清理**：从 `novarocks/connector/iceberg/src/commit/{model,dependency,staging}/**`、
   `commit/attempt.rs`、`commit/operation.rs` 和 `commit/write_stack/control/publication.rs` 开始。
   单次派发结论由 `commit/attempt/observation.rs` 的 journal 拥有，prepared owner 在 `catalog/publication_dispatch.rs`；冻结恢复载荷与桥接证据在 `commit/recovery.rs`、

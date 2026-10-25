@@ -40,7 +40,9 @@
 //! Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 
 use crate::query_execution::internal_result_cpu::InternalResultRetention;
-use novarocks_native_adapter::root_record_assembly::{RootRecordAssembly, RootRecordDomain};
+use novarocks_native_adapter::root_record_assembly::{
+    RootRecordAssembly, RootRecordAssemblyError, RootRecordDomain,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
@@ -201,6 +203,8 @@ pub(crate) struct DecodedPreparedWriteSet {
     row_count: u64,
     fragments: Vec<(WriteTargetOrdinal, Vec<u8>)>,
     statistics: Vec<WriteStatisticsArtifact>,
+    #[cfg(test)]
+    local_decode: bool,
     retention: Option<InternalResultRetention>,
     production_execution: Option<(
         novarocks_types::QueryExecutionId,
@@ -222,6 +226,7 @@ impl DecodedPreparedWriteSet {
             fragments,
             statistics: Vec::new(),
             retention: None,
+            local_decode: true,
             production_execution: None,
         }
     }
@@ -237,6 +242,7 @@ impl DecodedPreparedWriteSet {
             fragments,
             statistics,
             retention: None,
+            local_decode: true,
             production_execution: None,
         }
     }
@@ -246,7 +252,10 @@ impl DecodedPreparedWriteSet {
         mut self,
         binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
     ) -> Self {
-        self.retention = Some(InternalResultRetention::try_new(binding).unwrap());
+        let retention = InternalResultRetention::try_new(binding).unwrap();
+        let bytes = self.fragments.iter().map(|(_, bytes)| bytes.len()).sum();
+        retention.reserve_bytes(bytes).unwrap();
+        self.retention = Some(retention);
         self
     }
 
@@ -256,6 +265,32 @@ impl DecodedPreparedWriteSet {
 
     pub(crate) fn fragments(&self) -> &[(WriteTargetOrdinal, Vec<u8>)] {
         &self.fragments
+    }
+
+    /// Borrow only this prepared result's actual byte author. A missing
+    /// production author is never converted into a local decode permission.
+    pub(crate) fn fragment_decode_author(
+        &self,
+    ) -> Result<
+        Option<novarocks_spi::connector::ConnectorPayloadRetentionGuard>,
+        RootWriteDecodeFailure,
+    > {
+        if let Some(retention) = &self.retention {
+            return retention
+                .try_spi_guard()
+                .map(Some)
+                .map_err(RootWriteDecodeFailure::source);
+        }
+        #[cfg(test)]
+        if self.local_decode {
+            return Ok(None);
+        }
+        Err(RootWriteDecodeFailure::source(
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "prepared write decoding requires its original byte-budget author",
+            ),
+        ))
     }
 
     pub(crate) fn into_parts(self) -> RootWriteResultParts {
@@ -362,6 +397,8 @@ pub(crate) struct RootWriteResultDecoder {
     property_bytes: usize,
     root_eof: bool,
     retention: Option<InternalResultRetention>,
+    #[cfg(test)]
+    local_assembly: bool,
     production_execution: Option<(
         novarocks_types::QueryExecutionId,
         novarocks_query_application::api::PlanSeal,
@@ -386,8 +423,17 @@ impl RootWriteResultDecoder {
             property_bytes: 0,
             root_eof: false,
             retention: None,
+            #[cfg(test)]
+            local_assembly: false,
             production_execution: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_local(contract: RootWriteDecodeContract) -> Self {
+        let mut decoder = Self::new(contract);
+        decoder.local_assembly = true;
+        decoder
     }
 
     pub(crate) fn new_with_capacity(
@@ -524,24 +570,55 @@ impl RootWriteResultDecoder {
         Ok(())
     }
 
-    /// Accept a relayed body into the prepaid 32 MiB assembly share. A complete
-    /// record is validated before this call returns and its receipt may finish.
+    /// Reserve partial record backing against the original result byte budget.
+    /// A complete borrowed record needs no assembly copy.
     pub(crate) fn apply_relay_body(&mut self, body: &[u8]) -> Result<(), RootWriteDecodeFailure> {
         if self.root_eof {
             return Err("write Root emitted a trailing body after EOF".into());
         }
+        #[cfg(test)]
+        let explicit_local = self.local_assembly;
+        #[cfg(not(test))]
+        let explicit_local = false;
+        let author = self
+            .retention
+            .as_ref()
+            .map(InternalResultRetention::try_spi_guard)
+            .transpose()
+            .map_err(RootWriteDecodeFailure::source)?;
         let mut assembly = std::mem::replace(
             &mut self.relay_assembly,
             RootRecordAssembly::new(RootRecordDomain::WriteCommit, 32 * 1024 * 1024),
         );
-        let result = assembly.push(body, |record| {
+        let consume = |record: &[u8]| {
             self.apply_record(record)?;
             self.relayed_record_count = self
                 .relayed_record_count
                 .checked_add(1)
                 .ok_or("internal root record count overflow")?;
             Ok::<(), RootWriteDecodeFailure>(())
-        });
+        };
+        let result = match author {
+            Some(author) => assembly.push_budgeted(
+                body,
+                |bytes| {
+                    author
+                        .reserve_owned_bytes(bytes)
+                        .map_err(RootWriteDecodeFailure::source)
+                },
+                consume,
+            ),
+            None if explicit_local => assembly.push(body, consume),
+            None => {
+                let error = novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                    "write Root assembly requires its original byte-budget author",
+                );
+                Err(RootRecordAssemblyError::Sink(
+                    RootWriteDecodeFailure::source(error),
+                ))
+            }
+        };
         self.relay_assembly = assembly;
         result.map_err(Into::into)
     }
@@ -793,6 +870,8 @@ impl RootWriteResultDecoder {
             fragments: self.fragments,
             statistics: self.statistics.into_values().collect(),
             retention: self.retention,
+            #[cfg(test)]
+            local_decode: self.local_assembly,
             production_execution: self.production_execution,
         })
     }
@@ -1021,7 +1100,7 @@ pub(crate) mod tests {
     }
 
     fn new_decoder(count: u32) -> RootWriteResultDecoder {
-        RootWriteResultDecoder::new(RootWriteDecodeContract::for_test(
+        RootWriteResultDecoder::for_test_local(RootWriteDecodeContract::for_test(
             targets(count),
             std::iter::empty(),
         ))
@@ -1037,7 +1116,7 @@ pub(crate) mod tests {
     fn exact_decoder() -> RootWriteResultDecoder {
         let target = WriteTargetOrdinal::try_new(0).expect("target");
         let identity = StatisticsArtifactIdentity::try_new(vec![11], "theta-v1").expect("identity");
-        RootWriteResultDecoder::new(RootWriteDecodeContract::for_test(
+        RootWriteResultDecoder::for_test_local(RootWriteDecodeContract::for_test(
             [target],
             [(target, identity)],
         ))
@@ -1112,6 +1191,210 @@ pub(crate) mod tests {
             source.downcast_ref::<novarocks_spi::connector::ConnectorError>(),
             Some(&original)
         );
+    }
+
+    #[test]
+    fn production_write_decoder_without_author_is_refused_even_in_tests() {
+        let mut decoder = RootWriteResultDecoder::new(RootWriteDecodeContract::for_test(
+            targets(1),
+            std::iter::empty(),
+        ));
+        let record = records(vec![fragment(0, 16)]).remove(0);
+        let error = decoder.apply_relay_body(&record).unwrap_err();
+        assert_eq!(
+            error
+                .source
+                .unwrap()
+                .downcast_ref::<novarocks_spi::connector::ConnectorError>()
+                .unwrap()
+                .kind(),
+            novarocks_spi::connector::ConnectorErrorKind::InvalidRequest
+        );
+        assert_eq!(decoder.relay_assembly.retained_bytes(), 0);
+        assert!(decoder.fragments.is_empty());
+    }
+
+    fn original_assembly_budget(
+        bytes: usize,
+    ) -> (
+        novarocks_workload_control::WorkloadControl,
+        novarocks_workload_control::RootWork,
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) {
+        use novarocks_workload_control::{
+            ResourceConfig, ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest,
+            WorkloadConfig, WorkloadControl,
+        };
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
+            },
+        )
+        .unwrap();
+        let mut result = ResultCapacityConfig::V1;
+        result.all_objects_bytes[2] = bytes as u64;
+        control.configure_result_capacity(result).unwrap();
+        control.mark_ready().unwrap();
+        let (root, window) = control
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let binding = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(
+            &root.owner.scope(), window.retain_alias(),
+        ).unwrap();
+        (control, root, binding)
+    }
+
+    #[test]
+    fn original_result_budget_refuses_partial_header_before_backing_and_preserves_source() {
+        let record = records(vec![fragment(0, 16)]).remove(0);
+        let header = novarocks_native_adapter::root_write_commit_codec::WRITE_COMMIT_HEADER_BYTES;
+        assert!(record.len() > header);
+        let (_control, root, binding) = original_assembly_budget(header - 1);
+        let window = binding.window_alias();
+        let mut decoder = RootWriteResultDecoder::new_with_capacity(
+            RootWriteDecodeContract::for_test(targets(1), std::iter::empty()),
+            &binding,
+        )
+        .unwrap();
+        let error = decoder.apply_relay_body(&record[..header]).unwrap_err();
+        let original = error.source.unwrap();
+        assert_eq!(
+            original
+                .downcast_ref::<novarocks_spi::connector::ConnectorError>()
+                .unwrap()
+                .kind(),
+            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted
+        );
+        assert_eq!(decoder.relay_assembly.retained_bytes(), 0);
+        assert_eq!(window.retained_payload_bytes(), 0);
+        assert!(decoder.fragments.is_empty());
+        drop((decoder, binding, window));
+        root.owner.complete();
+        root.business.release();
+    }
+
+    #[test]
+    fn partial_replacement_needs_old_and_new_bytes_and_last_partial_exit_refunds() {
+        let record = records(vec![fragment(0, 16)]).remove(0);
+        let header = novarocks_native_adapter::root_write_commit_codec::WRITE_COMMIT_HEADER_BYTES;
+        let (_control, root, binding) = original_assembly_budget(record.len());
+        let window = binding.window_alias();
+        let mut decoder = RootWriteResultDecoder::new_with_capacity(
+            RootWriteDecodeContract::for_test(targets(1), std::iter::empty()),
+            &binding,
+        )
+        .unwrap();
+        decoder.apply_relay_body(&record[..1]).unwrap();
+        assert_eq!(decoder.relay_assembly.retained_bytes(), header);
+        assert_eq!(window.retained_payload_bytes(), header as u64);
+        // New full record alone fits; old header plus new record does not.
+        let error = decoder.apply_relay_body(&record[1..header]).unwrap_err();
+        assert_eq!(
+            error
+                .source
+                .unwrap()
+                .downcast_ref::<novarocks_spi::connector::ConnectorError>()
+                .unwrap()
+                .kind(),
+            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted
+        );
+        assert_eq!(decoder.relay_assembly.retained_bytes(), header);
+        assert_eq!(window.retained_payload_bytes(), header as u64);
+        assert!(decoder.fragments.is_empty());
+        drop(decoder);
+        assert_eq!(window.retained_payload_bytes(), 0);
+        drop((binding, window));
+        root.owner.complete();
+        root.business.release();
+    }
+
+    #[test]
+    fn replaced_partial_keeps_exact_receipt_through_original_sink_failure_and_drop() {
+        let record = records(vec![fragment(0, 16)]).remove(0);
+        let header = novarocks_native_adapter::root_write_commit_codec::WRITE_COMMIT_HEADER_BYTES;
+        let (_control, root, binding) = original_assembly_budget(header + record.len());
+        let window = binding.window_alias();
+        let mut assembly = RootRecordAssembly::new(RootRecordDomain::WriteCommit, record.len());
+        let mut observations = Vec::new();
+        let reserve = |bytes| {
+            observations.push((bytes, window.retained_payload_bytes()));
+            window
+                .reserve_payload_bytes(bytes as u64)
+                .map(novarocks_spi::connector::ConnectorPayloadRetentionGuard::new)
+                .map_err(RootWriteDecodeFailure::source)
+        };
+        assembly
+            .push_budgeted(&record[..header], reserve, |_| Ok(()))
+            .unwrap();
+        assert_eq!(observations, [(header, 0), (record.len(), header as u64)]);
+        assert_eq!(assembly.retained_bytes(), record.len());
+        assert_eq!(window.retained_payload_bytes(), record.len() as u64);
+        let original = PreparedWriteSetLedger::new()
+            .reserve_fragment(
+                novarocks_spi::connector::write_stack::MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1,
+            )
+            .unwrap_err();
+        let error = assembly
+            .push_budgeted(
+                &record[header..],
+                |bytes| {
+                    window
+                        .reserve_payload_bytes(bytes as u64)
+                        .map(novarocks_spi::connector::ConnectorPayloadRetentionGuard::new)
+                        .map_err(RootWriteDecodeFailure::source)
+                },
+                |received| {
+                    assert_eq!(received, record.as_slice());
+                    Err(RootWriteDecodeFailure::source(original.clone()))
+                },
+            )
+            .unwrap_err();
+        let error = RootWriteDecodeFailure::from(error);
+        assert_eq!(
+            error
+                .source
+                .unwrap()
+                .downcast_ref::<novarocks_spi::connector::ConnectorError>(),
+            Some(&original)
+        );
+        assert_eq!(window.retained_payload_bytes(), record.len() as u64);
+        drop(assembly);
+        assert_eq!(window.retained_payload_bytes(), 0);
+        drop((binding, window));
+        root.owner.complete();
+        root.business.release();
+    }
+
+    #[test]
+    fn complete_borrowed_record_charges_only_its_retained_fragment_and_hands_receipt_off() {
+        let record = records(vec![fragment(0, 16)]).remove(0);
+        let (_control, root, binding) = original_assembly_budget(16);
+        let window = binding.window_alias();
+        let mut decoder = RootWriteResultDecoder::new_with_capacity(
+            RootWriteDecodeContract::for_test(targets(1), std::iter::empty()),
+            &binding,
+        )
+        .unwrap();
+        decoder.apply_relay_body(&record).unwrap();
+        decoder
+            .apply_relay_body(&records(vec![summary(1)]).remove(0))
+            .unwrap();
+        assert_eq!(decoder.relay_assembly.retained_bytes(), 0);
+        assert_eq!(window.retained_payload_bytes(), 16);
+        let prepared = finish(decoder).unwrap();
+        assert_eq!(window.retained_payload_bytes(), 16);
+        drop(prepared);
+        assert_eq!(window.retained_payload_bytes(), 0);
+        drop((binding, window));
+        root.owner.complete();
+        root.business.release();
     }
 
     #[test]
@@ -1474,10 +1757,9 @@ pub(crate) mod tests {
     #[test]
     fn query_local_membership_is_exact_not_max_ordinal_based() {
         let target_five = WriteTargetOrdinal::try_new(5).expect("target");
-        let mut decoder = RootWriteResultDecoder::new(RootWriteDecodeContract::for_test(
-            [target_five],
-            std::iter::empty(),
-        ));
+        let mut decoder = RootWriteResultDecoder::for_test_local(
+            RootWriteDecodeContract::for_test([target_five], std::iter::empty()),
+        );
         let error = decoder
             .apply_chunk(&chunk(vec![fragment(4, 4)]))
             .expect_err("target below the maximum is still foreign");
@@ -1490,13 +1772,14 @@ pub(crate) mod tests {
         let target_one = WriteTargetOrdinal::try_new(1).expect("target");
         let identity =
             StatisticsArtifactIdentity::try_new(vec![11], "theta-v1").expect("artifact identity");
-        let mut decoder = RootWriteResultDecoder::new(RootWriteDecodeContract::for_test(
-            [target_zero, target_one],
-            [
-                (target_zero, identity.clone()),
-                (target_one, identity.clone()),
-            ],
-        ));
+        let mut decoder =
+            RootWriteResultDecoder::for_test_local(RootWriteDecodeContract::for_test(
+                [target_zero, target_one],
+                [
+                    (target_zero, identity.clone()),
+                    (target_one, identity.clone()),
+                ],
+            ));
         decoder
             .apply_chunk(&chunk(vec![
                 summary(2),

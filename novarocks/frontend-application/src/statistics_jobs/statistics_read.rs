@@ -56,12 +56,6 @@ impl ConnectorOriginalResultScopeCheck for ReadOriginalCheck {
             .check()
             .map_err(|e| ScopeFailure::new(Class::Admission, e))
     }
-    fn check_before_growth(&self, _upper: u64) -> Result<(), ScopeFailure> {
-        // This Provider callback carries SDK/schema construction declarations,
-        // not actual retained Result bytes. Preserve the exact original scope,
-        // deadline and cancellation; actual collectors own payload admission.
-        self.check_active()
-    }
 }
 struct StatisticsReadAction {
     io: Arc<MetadataIoAdmission>,

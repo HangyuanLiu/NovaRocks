@@ -127,6 +127,15 @@ impl InternalResultRetention {
             .unwrap_or_else(|e| e.into_inner())
             .try_grow(additional)
     }
+    /// Return only this decoder's aggregate bytes after their actual backing
+    /// has been destroyed. Other merged segment receipts remain unchanged.
+    pub(crate) fn release_bytes_destroyed(&self, bytes: usize) -> Result<(), WorkError> {
+        let bytes = u64::try_from(bytes).map_err(|_| WorkError::ArithmeticOverflow)?;
+        self.bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release_destroyed(bytes)
+    }
     /// Keep the same receipts when moving another completed segment into the
     /// statement union. No allocation is charged again by this handoff.
     pub(crate) fn merge_retention(&mut self, incoming: &Self) {

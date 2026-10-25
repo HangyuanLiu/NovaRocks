@@ -2243,7 +2243,6 @@ fn begin_cow_write_session(
         write_lease,
         input.request,
         input.original,
-        input.existing_caller_upper,
     )
 }
 
@@ -2251,7 +2250,6 @@ struct CowBeginInput {
     lease: novarocks_catalog_application::ConnectorWriteStackLease,
     request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
     original: novarocks_spi::connector::ConnectorOriginalResultScope,
-    existing_caller_upper: u64,
 }
 
 fn prepare_cow_begin_input(
@@ -2269,16 +2267,14 @@ fn prepare_cow_begin_input(
     use novarocks_spi::connector::{ConnectorWriteFieldRequest, ConnectorWriteInputRequest};
 
     cow_necessary_before_begin::before_request_owned(
-        preparation, selection, execution.result_capacity(), connector_context,
+        selection, execution.result_capacity(), connector_context,
         |selection| {
         let binding = execution.result_capacity().ok_or_else(|| CowFailure::before_begin(
             cow_necessary_before_begin::Error::MissingAdmission))?;
-        let request_receipt = cow_fe_begin_receipt::before_request(
-            preparation, &selection, &target.namespace, &target.table, binding, connector_context,
-        ).map_err(CowFailure::before_begin)?;
-        let caller_peak = request_receipt.through_request_peak_upper().map_err(CowFailure::provider)?;
-        let (original_scope, caller_with_scope_upper) = crate::query_execution::original_cow_result_scope::from_original_binding(
-            binding, connector_context, caller_peak,
+        cow_fe_begin_receipt::before_request(&selection, binding, connector_context)
+            .map_err(CowFailure::before_begin)?;
+        let original_scope = crate::query_execution::original_cow_result_scope::from_original_binding(
+            binding, connector_context,
         ).map_err(CowFailure::original_scope)?;
         let name_bytes = target.namespace.len().checked_add(1)
             .and_then(|n| n.checked_add(target.table.len())).ok_or_else(|| CowFailure::provider(
@@ -2335,7 +2331,6 @@ fn prepare_cow_begin_input(
                 .map_err(CowFailure::lease)?,
             request,
             original: original_scope,
-            existing_caller_upper: caller_with_scope_upper,
         })
         },
     ).map_err(CowFailure::before_begin)?
@@ -2366,7 +2361,6 @@ struct CowTargetWritePlan {
     materialized_rows: super::cow_materialized_values::Rows,
     materialized_site: novarocks_sql::compiler::SqlMaterializedValuesSite,
     frozen_read: Option<CowFrozenRead>,
-    simultaneous_upper: u64,
     // Final field: generated graph and frozen read exit before its original
     // admitted window. This carries no activity lease or fresh admission.
     original: novarocks_spi::connector::ConnectorOriginalResultScope,
@@ -2403,6 +2397,42 @@ impl novarocks_type_contract::PureCompileControl for CowMaterializedCompileContr
     }
 }
 
+fn closed_cow_identity(
+    namespace: &str,
+) -> super::cow_closed_ast::Result<FrozenConnectorScanIdentity> {
+    fn copy(value: &str) -> super::cow_closed_ast::Result<String> {
+        let mut output = String::new();
+        output
+            .try_reserve_exact(value.len())
+            .map_err(super::cow_closed_ast::BuildError::Allocation)?;
+        if output.capacity() != value.len() {
+            return Err(super::cow_closed_ast::BuildError::ResourceExhausted);
+        }
+        output.push_str(value);
+        Ok(output)
+    }
+    let uuid = uuid::Uuid::new_v4();
+    let mut encoded = [0; uuid::fmt::Simple::LENGTH];
+    let suffix = uuid.simple().encode_lower(&mut encoded);
+    let mut name = String::new();
+    let length = "__nr_cow_"
+        .len()
+        .checked_add(suffix.len())
+        .ok_or(super::cow_closed_ast::BuildError::ResourceExhausted)?;
+    name.try_reserve_exact(length)
+        .map_err(super::cow_closed_ast::BuildError::Allocation)?;
+    if name.capacity() != length {
+        return Err(super::cow_closed_ast::BuildError::ResourceExhausted);
+    }
+    name.push_str("__nr_cow_");
+    name.push_str(suffix);
+    Ok(FrozenConnectorScanIdentity::new(
+        copy("default_catalog")?,
+        copy(namespace)?,
+        name,
+    ))
+}
+
 fn build_cow_update_distributed_write(
     constant_policy: novarocks_functions::ConstantPolicy,
     compile_control: &dyn novarocks_type_contract::PureCompileControl,
@@ -2411,7 +2441,6 @@ fn build_cow_update_distributed_write(
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
     write_session: Arc<ConnectorWriteSession>,
 ) -> Result<CowUpdateDistributedWrite, crate::dml::error::DmlExecutionError> {
-    use super::cow_compile_receipt::{self as footprint, recipe};
     use super::{cow_closed_ast as closed, cow_closed_route as route_builder};
     let original = write_session
         .cow_original()
@@ -2439,74 +2468,7 @@ fn build_cow_update_distributed_write(
     }
     let selection = routing.selection();
     let contract = routing.match_contract();
-    let checked_add = |a: u64, b: u64| {
-        a.checked_add(b)
-            .ok_or(closed::BuildError::ResourceExhausted)
-    };
     let count = write_session.targets().len();
-    let borrowed_slots = count
-        .checked_mul(std::mem::size_of::<
-            &novarocks_spi::connector::write_stack::ConnectorWriteTargetPlan,
-        >())
-        .ok_or(closed::BuildError::ResourceExhausted)
-        .map_err(&fail)? as u64;
-    let identity_slots = count
-        .checked_mul(std::mem::size_of::<Option<FrozenConnectorScanIdentity>>())
-        .ok_or(closed::BuildError::ResourceExhausted)
-        .map_err(&fail)? as u64;
-    let scalars = (std::mem::size_of::<recipe::Recipe>()
-        + std::mem::size_of::<recipe::CheckedRecipe>()
-        + std::mem::size_of::<recipe::TargetAccumulator>()) as u64;
-    let mut all_metadata = 0;
-    let mut first_pass_scratch = 0;
-    let mut compiler_handoff = 0;
-    for sealed in write_session.targets() {
-        check().map_err(&fail)?;
-        let metadata = footprint::target_metadata_upper::<CowTargetWritePlan>(
-            sealed.input(),
-            &target.namespace,
-            sealed.rewrite_source(),
-        )
-        .map_err(&fail)?;
-        all_metadata = checked_add(all_metadata, metadata).map_err(&fail)?;
-        if let Some(source) = sealed.rewrite_source() {
-            compiler_handoff = compiler_handoff.max(
-                crate::query_execution::pinned_connector_read::cow_overlay_conversion_upper(
-                    &target.namespace,
-                    source.scan_schema(),
-                    source.pinned_source(),
-                )
-                .map_err(closed::BuildError::Control)
-                .map_err(&fail)?,
-            );
-        }
-        first_pass_scratch = first_pass_scratch.max(
-            route_builder::prospective_views_upper(sealed.input(), sealed.rewrite_source())
-                .map_err(&fail)?,
-        );
-    }
-    let scalar_and_identity = checked_add(scalars, identity_slots).map_err(&fail)?;
-    let baseline = checked_add(
-        checked_add(write_session.cow_simultaneous_upper(), borrowed_slots).map_err(&fail)?,
-        scalar_and_identity,
-    )
-    .map_err(&fail)?;
-    let before_views = checked_add(
-        checked_add(baseline, all_metadata).map_err(&fail)?,
-        checked_add(first_pass_scratch, compiler_handoff).map_err(&fail)?,
-    )
-    .map_err(&fail)?;
-    original
-        .check_before_growth(before_views)
-        .map_err(closed::BuildError::Original)
-        .map_err(&fail)?;
-    let mut recipe = recipe::Recipe::start(Some(recipe::ExistingBackingEvidence {
-        session_simultaneous_upper: write_session.cow_simultaneous_upper(),
-        sorted_borrowed_target_vector_upper: borrowed_slots,
-        recipe_and_small_scalars_upper: scalar_and_identity,
-    }))
-    .map_err(route_builder::map_footprint)
-    .map_err(&fail)?;
     let mut sealed = closed::exact_vec(count).map_err(&fail)?;
     sealed.extend(write_session.targets().iter());
     // The sealed ordinals are unique. Unstable sort preserves their ordinal
@@ -2543,7 +2505,7 @@ fn build_cow_update_distributed_write(
                 if source.pinned_source().files().len() != 1 {
                     return Err("COW rewrite branch must replace exactly one data file".into());
                 }
-                Some(footprint::closed_identity(&target.namespace).map_err(&fail)?)
+                Some(closed_cow_identity(&target.namespace).map_err(&fail)?)
             }
             (
                 novarocks_spi::connector::write_stack::ConnectorWriteCohortRoutingBody::Append,
@@ -2555,54 +2517,9 @@ fn build_cow_update_distributed_write(
                 );
             }
         };
-        let metadata = footprint::target_metadata_upper::<CowTargetWritePlan>(
-            write_target.input(),
-            &target.namespace,
-            write_target.rewrite_source(),
-        )
-        .map_err(&fail)?;
-        route_builder::preflight_materialized_target(
-            selection,
-            proof.selection_ordinals(),
-            write_target.input(),
-            route,
-            contract,
-            write_target.rewrite_source().zip(identity.as_ref()),
-            metadata,
-            if let Some(source) = write_target.rewrite_source() {
-                crate::query_execution::pinned_connector_read::cow_overlay_conversion_upper(
-                    &target.namespace,
-                    source.scan_schema(),
-                    source.pinned_source(),
-                )
-                .map_err(closed::BuildError::Control)
-                .map_err(&fail)?
-            } else {
-                0
-            }, // Append has no frozen-read overlay.
-            &mut recipe,
-            &check,
-        )
-        .map_err(&fail)?;
         identities.push(identity);
     }
-    // Every target's compact payload/owner is created on the original receipt
-    // before ANY target AST. Whole unselected columns never enter wire pools.
-    let staged_layout = std::alloc::Layout::array::<super::cow_materialized_values::Rows>(count)
-        .map_err(|_| fail(closed::BuildError::ResourceExhausted))?;
-    recipe
-        .add_materialized_owned(staged_layout.size() as u64)
-        .map_err(route_builder::map_footprint)
-        .map_err(&fail)?;
-    original
-        .check_before_growth(
-            recipe
-                .peak()
-                .map_err(route_builder::map_footprint)
-                .map_err(&fail)?,
-        )
-        .map_err(closed::BuildError::Original)
-        .map_err(&fail)?;
+    // Preserve each original target and its complete signed compact constants.
     let mut materialized = closed::exact_vec(count).map_err(&fail)?;
     for write_target in &sealed {
         check().map_err(&fail)?;
@@ -2615,14 +2532,6 @@ fn build_cow_update_distributed_write(
             route,
             contract,
             write_target.rewrite_source(),
-            &mut |layout| {
-                recipe
-                    .add_materialized_owned(layout.size() as u64)
-                    .map_err(route_builder::map_footprint)?;
-                original
-                    .check_before_growth(recipe.peak().map_err(route_builder::map_footprint)?)
-                    .map_err(closed::BuildError::Original)
-            },
             &check,
         )
         .map_err(&fail)?;
@@ -2635,7 +2544,6 @@ fn build_cow_update_distributed_write(
                 write_target
                     .rewrite_source()
                     .map(|_| contract.effect_field().target_ordinal()),
-                &mut recipe,
                 &original,
                 constant_policy,
                 compile_control,
@@ -2643,19 +2551,6 @@ fn build_cow_update_distributed_write(
             .map_err(&fail)?,
         );
     }
-    let receipt = recipe
-        .finish_all(count as u64)
-        .map_err(route_builder::map_footprint)
-        .map_err(&fail)?;
-    let peak = receipt
-        .peak_upper()
-        .map_err(route_builder::map_footprint)
-        .map_err(&fail)?;
-    original
-        .check_before_growth(peak)
-        .map_err(closed::BuildError::Original)
-        .map_err(&fail)?;
-    let maximum_query = receipt.maximum_current_target_clone();
     let mut targets = closed::exact_vec(count).map_err(&fail)?;
     for ((write_target, identity), materialized_rows) in
         sealed.into_iter().zip(identities).zip(materialized)
@@ -2709,16 +2604,8 @@ fn build_cow_update_distributed_write(
                 .map_err(&fail)?,
                 None,
             ),
-            _ => return Err("COW sealed rewrite identity changed after its preflight".into()),
+            _ => return Err("COW sealed rewrite identity changed after validation".into()),
         };
-        let actual = footprint::deep_closed_query::query_owned(&query)
-            .map_err(route_builder::map_footprint)
-            .map_err(&fail)?;
-        if actual > maximum_query {
-            return Err(fail(closed::BuildError::InvalidSource(
-                "COW constructed query exceeded its prospective recipe",
-            )));
-        }
         check().map_err(&fail)?;
         targets.push(CowTargetWritePlan {
             ordinal: write_target.ordinal(),
@@ -2734,7 +2621,6 @@ fn build_cow_update_distributed_write(
                 novarocks_sql::compiler::SqlMaterializedValuesSite::SelectFromDerived { from: 0 }
             },
             frozen_read,
-            simultaneous_upper: peak,
             original: original.clone(),
         });
     }
@@ -3285,14 +3171,12 @@ fn prepare_cow_target_binding(
     ),
     crate::dml::error::DmlExecutionError,
 > {
-    plan.original
-        .check_before_growth(plan.simultaneous_upper)
-        .map_err(|error| {
-            CowFailure::construction(
-                super::cow_closed_ast::BuildError::Original(error),
-                plan.original.clone(),
-            )
-        })?;
+    plan.original.check_active().map_err(|error| {
+        CowFailure::construction(
+            super::cow_closed_ast::BuildError::Original(error),
+            plan.original.clone(),
+        )
+    })?;
     if write_session
         .cow_original()
         .is_none_or(|session| !session.is_same_original(&plan.original))
@@ -6503,7 +6387,6 @@ mod tests {
             &fixture.rewrite_source,
             fixture.preparation.match_contract(),
             &fixture.identity,
-            &|_, _| Ok(()),
             &|| Ok(()),
         )
         .expect("closed variant query");
@@ -6896,7 +6779,6 @@ mod tests {
                 &self,
                 request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
                 original: novarocks_spi::connector::ConnectorOriginalResultScope,
-                existing_caller_upper: u64,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<
@@ -6909,22 +6791,19 @@ mod tests {
                 >,
             > {
                 // This original test control's checked author is pure and performs no I/O.
-                Box::pin(async move {
-                    self.begin_cow_write_checked(request, original, existing_caller_upper)
-                })
+                Box::pin(async move { self.begin_cow_write_checked(request, original) })
             }
 
             fn begin_cow_write_checked(
                 &self,
                 request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
                 original: novarocks_spi::connector::ConnectorOriginalResultScope,
-                existing_caller_upper: u64,
             ) -> Result<
                 novarocks_spi::connector::ConnectorCowBeginPlan,
                 novarocks_spi::connector::ConnectorCowBeginFailure,
             > {
                 // Test-only scripted provider: the fixture owns its finite graph.
-                if let Err(cause) = original.check_before_growth(existing_caller_upper) {
+                if let Err(cause) = original.check_active() {
                     return Err(novarocks_spi::connector::ConnectorCowBeginFailure::new(
                         cause.into(),
                         original,
@@ -6932,9 +6811,7 @@ mod tests {
                 }
                 match self.begin_write(request) {
                     Ok(plan) => Ok(novarocks_spi::connector::ConnectorCowBeginPlan::new(
-                        plan,
-                        original,
-                        existing_caller_upper,
+                        plan, original,
                     )),
                     Err(cause) => Err(novarocks_spi::connector::ConnectorCowBeginFailure::new(
                         cause.into(),
@@ -7465,20 +7342,11 @@ mod tests {
             else {
                 panic!("fixture must carry signed lineage input");
             };
-            let request_receipt = cow_fe_begin_receipt::before_request(
-                &fixture.preparation,
-                &selection,
-                "db",
-                "t",
-                &binding,
-                &context,
-            )
-            .expect("original COW request receipt");
-            let (original, caller_upper) =
+            cow_fe_begin_receipt::before_request(&selection, &binding, &context)
+                .expect("original COW source provenance");
+            let original =
                 crate::query_execution::original_cow_result_scope::from_original_binding(
-                    &binding,
-                    &context,
-                    request_receipt.through_request_peak_upper().unwrap(),
+                    &binding, &context,
                 )
                 .expect("original admitted Internal result scope");
             let begin_request = ws::ConnectorWriteBeginRequest {
@@ -7502,7 +7370,6 @@ mod tests {
                 &planning.derive_write_lease().unwrap(),
                 begin_request,
                 original,
-                caller_upper,
             )
             .unwrap();
             // The checked session obtains the same immutable properties from its actual lease.
@@ -8024,7 +7891,6 @@ mod tests {
             &self,
             request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
             original: novarocks_spi::connector::ConnectorOriginalResultScope,
-            existing_caller_upper: u64,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<
@@ -8037,22 +7903,19 @@ mod tests {
             >,
         > {
             // This original test control's checked author is pure and performs no I/O.
-            Box::pin(async move {
-                self.begin_cow_write_checked(request, original, existing_caller_upper)
-            })
+            Box::pin(async move { self.begin_cow_write_checked(request, original) })
         }
 
         fn begin_cow_write_checked(
             &self,
             request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
             original: novarocks_spi::connector::ConnectorOriginalResultScope,
-            existing_caller_upper: u64,
         ) -> Result<
             novarocks_spi::connector::ConnectorCowBeginPlan,
             novarocks_spi::connector::ConnectorCowBeginFailure,
         > {
             // Test-only scripted provider: the fixture owns its finite graph.
-            if let Err(cause) = original.check_before_growth(existing_caller_upper) {
+            if let Err(cause) = original.check_active() {
                 return Err(novarocks_spi::connector::ConnectorCowBeginFailure::new(
                     cause.into(),
                     original,
@@ -8060,9 +7923,7 @@ mod tests {
             }
             match self.begin_write(request) {
                 Ok(plan) => Ok(novarocks_spi::connector::ConnectorCowBeginPlan::new(
-                    plan,
-                    original,
-                    existing_caller_upper,
+                    plan, original,
                 )),
                 Err(cause) => Err(novarocks_spi::connector::ConnectorCowBeginFailure::new(
                     cause.into(),

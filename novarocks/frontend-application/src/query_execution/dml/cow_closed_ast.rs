@@ -16,7 +16,7 @@
 // under the License.
 
 //! Private closed COW syntax construction. No parser or SQL text growth.
-//! Original all-target footprint preflight is required before this module.
+//! Signed schema/type declarations and original caller control are required.
 use arrow::array::*;
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_parser::{Span, ast::*};
@@ -104,7 +104,7 @@ impl From<novarocks_type_contract::ExecutionValueTypeError> for BuildError {
 pub(super) type Result<T> = std::result::Result<T, BuildError>;
 
 // These are allocation requests, not new credits or a second capacity budget.
-// The paired preflight charges these prospective exact slots before this call.
+// The actual constructor validates and reserves its exact slot count.
 pub(super) fn exact_vec<T>(length: usize) -> Result<Vec<T>> {
     let mut out = Vec::new();
     out.try_reserve_exact(length)
@@ -301,16 +301,16 @@ fn function(name_value: &str, arguments: Vec<Expr>) -> Result<Expr> {
     }))
 }
 
-// Root invokes this after its complete all-target pass. The callback rechecks
-// this same original borrowed cell before ANY child Expr allocation; it must
-// come from the checked original recipe, never an arbitrary constant fallback.
+// Validate the actual borrowed row and preserve its original caller control
+// through nested construction. This creates no object-graph resource allowance.
 pub(super) fn checked_value(
     array: &dyn Array,
     row: usize,
-    preflight: &impl Fn(&dyn Array, usize) -> Result<()>,
     original_check: &impl Fn() -> Result<()>,
 ) -> Result<Expr> {
-    preflight(array, row)?;
+    if row >= array.len() {
+        return Err(BuildError::InvalidSource("COW value row is out of bounds"));
+    }
     original_check()?;
     let mut control = ConstructionControl {
         visits: 0,
@@ -476,13 +476,9 @@ fn finite_float(value: f64) -> Result<Expr> {
     number(value)
 }
 
-fn type_failure(
-    error: super::cow_compile_receipt::borrowed_value_footprint::Failure,
-) -> BuildError {
-    use super::cow_compile_receipt::borrowed_value_footprint::Failure as F;
+fn type_failure(error: super::cow_type_syntax::Failure) -> BuildError {
+    use super::cow_type_syntax::Failure as F;
     match error {
-        F::ResourceExhausted => BuildError::ResourceExhausted,
-        F::Stopped => BuildError::InvalidSource("COW type construction stopped"),
         F::InvalidSource(reason) => BuildError::InvalidSource(reason),
         F::OriginalSemantic(reason) => BuildError::OriginalSemantic(reason.into()),
     }
@@ -491,16 +487,13 @@ pub(super) fn type_name(
     value: &novarocks_type_contract::FunctionValueType,
     check: &impl Fn() -> Result<()>,
 ) -> Result<TypeName> {
-    type_name_node(
-        super::cow_compile_receipt::type_footprint::Node::root(value),
-        check,
-    )
+    type_name_node(super::cow_type_syntax::Node::root(value), check)
 }
 fn type_name_node(
-    node: super::cow_compile_receipt::type_footprint::Node<'_>,
+    node: super::cow_type_syntax::Node<'_>,
     check: &impl Fn() -> Result<()>,
 ) -> Result<TypeName> {
-    use super::cow_compile_receipt::type_footprint::{Node, Spelling};
+    use super::cow_type_syntax::{Node, Spelling};
     check()?;
     let spelling = node.spelling().map_err(type_failure)?;
     let (word, count) = match &spelling {

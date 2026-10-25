@@ -2328,7 +2328,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod manifest_stream_tests {
+pub(crate) mod manifest_stream_tests {
     //! Protect the SDK manifest/list streaming boundary and real operation ownership.
     //! Expected allocation/admission/cleanup ordering comes from the 0.9 behavior
     //! and ADR-0171, not from a replacement ledger. The only injected behavior is
@@ -2372,10 +2372,70 @@ mod manifest_stream_tests {
     }
 
     #[derive(Debug)]
-    struct AtomicManifestWriterBoundary {
+    pub(crate) struct AtomicManifestWriterBoundary {
         operator: Operator,
         root: std::path::PathBuf,
         temporary: std::path::PathBuf,
+    }
+
+    impl AtomicManifestWriterBoundary {
+        pub(crate) fn new(root: &Path) -> Self {
+            let root = root.to_path_buf();
+            let temporary = root.join(".atomic");
+            std::fs::create_dir_all(&temporary).unwrap();
+            let operator = Operator::new(
+                crate::opendal::services::Fs::default()
+                    .root(root.to_str().unwrap())
+                    .atomic_write_dir(temporary.to_str().unwrap()),
+            )
+            .unwrap();
+            Self {
+                operator,
+                root,
+                temporary,
+            }
+        }
+
+        pub(crate) async fn writer(
+            &self,
+            operation: &IcebergCommitOperation,
+            path: &str,
+        ) -> Result<Box<dyn FileWrite>> {
+            let target = url::Url::parse(path).unwrap().to_file_path().unwrap();
+            let relative = target.strip_prefix(&self.root).unwrap().to_string_lossy();
+            let permit = operation
+                .write_admission_for_test()
+                .admit(path)?
+                .acquire()
+                .await?;
+            permit.check_active()?;
+            IcebergFsStorage::ensure_parent_dir(&self.operator, &relative).await?;
+            permit.check_active()?;
+            // For this fresh owned path, append selects FS's serial writer
+            // while still creating an atomic temporary file. The default
+            // positional writer caches its first segment until a later write.
+            assert!(!target.exists(), "test artifact must be a fresh owned path");
+            let mut writer = self
+                .operator
+                .writer_with(&relative)
+                .append(true)
+                .await
+                .map_err(|error| {
+                    Error::new(ErrorKind::Unexpected, "open atomic artifact test writer")
+                        .with_source(error)
+                })?;
+            permit.stream_started.store(true, Ordering::Release);
+            if let Err(error) = permit.check_active() {
+                return Err(abort_after_failure(&mut writer, error, Some(&permit)).await);
+            }
+            Ok(Box::new(IcebergFsFileWrite {
+                writer: Some(writer),
+                permit: Some(permit),
+                _phase: None,
+                stream: None,
+                local_closed: false,
+            }))
+        }
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2416,41 +2476,7 @@ mod manifest_stream_tests {
                 // local operator. Use a real private atomic FS backend (default
                 // FS abort is Unsupported), preserving the real operation's
                 // admission, WritePermit and IcebergFsFileWrite lifecycle.
-                let target = url::Url::parse(path).unwrap().to_file_path().unwrap();
-                let relative = target.strip_prefix(&atomic.root).unwrap().to_string_lossy();
-                let permit = probe
-                    .operation
-                    .write_admission_for_test()
-                    .admit(path)?
-                    .acquire()
-                    .await?;
-                permit.check_active()?;
-                IcebergFsStorage::ensure_parent_dir(&atomic.operator, &relative).await?;
-                permit.check_active()?;
-                // For this fresh owned path, append selects FS's serial writer
-                // while still creating an atomic temporary file. The default
-                // positional writer caches its first segment until a later write.
-                assert!(!target.exists(), "test artifact must be a fresh owned path");
-                let mut writer = atomic
-                    .operator
-                    .writer_with(&relative)
-                    .append(true)
-                    .await
-                    .map_err(|error| {
-                        Error::new(ErrorKind::Unexpected, "open atomic manifest test writer")
-                            .with_source(error)
-                    })?;
-                permit.stream_started.store(true, Ordering::Release);
-                if let Err(error) = permit.check_active() {
-                    return Err(abort_after_failure(&mut writer, error, Some(&permit)).await);
-                }
-                Box::new(IcebergFsFileWrite {
-                    writer: Some(writer),
-                    permit: Some(permit),
-                    _phase: None,
-                    stream: None,
-                    local_closed: false,
-                })
+                atomic.writer(&probe.operation, path).await?
             } else {
                 // Normal manifest and list outputs exercise the complete original
                 // IcebergFsStorage path, including resolution and writer opening.
@@ -2577,22 +2603,9 @@ mod manifest_stream_tests {
         gate: Option<Arc<HalfWriteGate>>,
     ) -> (ManifestProbeArtifacts, Arc<ManifestStreamProbe>) {
         let attempt = fixture.operation.begin_attempt().unwrap();
-        let atomic = gate.as_ref().map(|_| {
-            let root = fixture.directory.path().to_path_buf();
-            let temporary = root.join(".atomic");
-            std::fs::create_dir_all(&temporary).unwrap();
-            let operator = Operator::new(
-                crate::opendal::services::Fs::default()
-                    .root(root.to_str().unwrap())
-                    .atomic_write_dir(temporary.to_str().unwrap()),
-            )
-            .unwrap();
-            AtomicManifestWriterBoundary {
-                operator,
-                root,
-                temporary,
-            }
-        });
+        let atomic = gate
+            .as_ref()
+            .map(|_| AtomicManifestWriterBoundary::new(fixture.directory.path()));
         let probe = Arc::new(ManifestStreamProbe {
             operation: fixture.operation.clone(),
             original: attempt.file_io().clone(),

@@ -907,7 +907,7 @@ fn a_compiled_root_relation_passes_the_frontend_exact_schema_decoder() {
         Chunk::try_new_with_chunk_schema(batch, schema).expect("root chunk")
     };
     let ordinal = WriteTargetOrdinal::try_new(0).expect("ordinal");
-    let mut decoder = RootWriteResultDecoder::new(
+    let mut decoder = RootWriteResultDecoder::for_test_local(
         RootWriteDecodeContract::try_new(&[ordinal], session.write_targets())
             .expect("decode contract"),
     );
@@ -938,7 +938,7 @@ fn a_compiled_root_relation_passes_the_frontend_exact_schema_decoder() {
         root_result_layout.slots(),
     )
     .expect("drifted schema");
-    let mut decoder = RootWriteResultDecoder::new(
+    let mut decoder = RootWriteResultDecoder::for_test_local(
         RootWriteDecodeContract::try_new(&[ordinal], session.write_targets())
             .expect("decode contract"),
     );

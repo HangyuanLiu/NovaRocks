@@ -1831,8 +1831,7 @@ pub(crate) fn frozen_copy_on_write_source_payload_with_original_scope(
     ),
     novarocks_spi::connector::ConnectorCowBeginCause,
 > {
-    use crate::commit::write_stack::control::cow_begin::{add, mul, projection_error};
-    use std::mem::size_of;
+    use crate::commit::write_stack::control::cow_begin::projection_error;
     scope.active()?;
     let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
         corrupt("Iceberg copy-on-write base snapshot is absent from its metadata")
@@ -1844,61 +1843,8 @@ pub(crate) fn frozen_copy_on_write_source_payload_with_original_scope(
     })?;
     let plan = existing_serde_projection::Plan::inspect(metadata, &schema, scope)
         .map_err(projection_error)?;
-    let mut other = (size_of::<IcebergTablePayload>()
-        + size_of::<IcebergTableInfo>()
-        + size_of::<IcebergDataFileInfo>()) as u64;
-    for text in [
-        catalog.as_str(),
-        namespace,
-        namespace,
-        table_name,
-        table_name,
-        metadata.location(),
-    ] {
-        other = add(other, text.len() as u64)?;
-    }
-    other = add(other, 36)?;
-    // Fixed lineage identities plus growable metadata/hidden-name vectors.
-    // Reserve old+new Vec growth and every property-derived String before the
-    // original builders perform their case folding/splitting.
-    let identities = ["_file", "_pos", "_row_id", "_last_updated_sequence_number"];
-    for name in identities {
-        other = add(
-            other,
-            add(name.len() as u64, (2 * size_of::<String>()) as u64)?,
-        )?;
-    }
-    let node = (size_of::<usize>()
-        + 4
-        + 11 * 2 * size_of::<String>()
-        + 12 * size_of::<usize>()
-        + 9 * (std::mem::align_of::<usize>() - 1)) as u64;
-    for (key, value) in metadata.properties() {
-        let chars = value.split(',').count() as u64;
-        other = add(
-            other,
-            add(
-                mul((key.len() + value.len()) as u64, 3)?,
-                add(mul(chars, (3 * size_of::<String>()) as u64)?, mul(node, 2)?)?,
-            )?,
-        )?;
-    }
-    let shape = plan.shape();
-    let prospective = add(
-        add(
-            shape.owned_upper().map_err(projection_error)?,
-            shape.maximum_field_temporary,
-        )?,
-        other,
-    )?;
-    let existing = scope.upper();
-    // The same prospective recipe authorizes the complete overlap once; it is
-    // carried conservatively through the subsequent branch and compiler owners.
-    let mut checked = plan
-        .authorize(1, existing, other, scope)
-        .map_err(projection_error)?;
+    let mut checked = plan.for_copies(1, scope).map_err(projection_error)?;
     let output = checked.build_one().map_err(projection_error)?;
-    scope.cover_total(add(existing, prospective)?)?;
     let (serialized_metadata, schema, guard) = output.into_guarded_parts();
     let payload = IcebergTablePayload {
         namespace: namespace.to_string(),
@@ -1927,117 +1873,6 @@ pub(crate) fn frozen_copy_on_write_source_payload_with_original_scope(
     };
     scope.active()?;
     Ok((payload, guard))
-}
-
-/// Borrowed layout for the Nova-owned Arrow projection/annotation passes.
-/// Library schema conversion internals remain under the original call owner;
-/// every explicit Field/name/metadata clone and vector pass is included here.
-pub(crate) fn cow_projected_schema_upper(
-    metadata: &crate::iceberg::spec::TableMetadata,
-    snapshot_id: i64,
-    scope: &crate::commit::write_stack::control::cow_begin::CowBeginScope<'_>,
-) -> Result<u64, novarocks_spi::connector::ConnectorCowBeginCause> {
-    use crate::commit::write_stack::control::cow_begin::{add, mul, projection_error};
-    use crate::iceberg::spec::{NestedField, Type};
-    use std::mem::size_of;
-    fn field_upper(
-        field: &NestedField,
-        scope: &crate::commit::write_stack::control::cow_begin::CowBeginScope<'_>,
-    ) -> Result<u64, novarocks_spi::connector::ConnectorCowBeginCause> {
-        scope.active()?;
-        let defaults = existing_serde_projection::count(field, scope).map_err(projection_error)?;
-        let own =
-            (size_of::<Field>() + 2 * size_of::<usize>() + 3 * size_of::<Arc<Field>>()) as u64;
-        // Arrow field metadata includes field ids, defaults, logical-domain
-        // facts and hidden markers. The public map's next resize coexistence
-        // is covered by 16 possible entries and controls per field/pass.
-        let mut n = add(
-            own,
-            add(
-                field.name.len() as u64,
-                add(
-                    defaults,
-                    crate::read_snapshot::cow_capture::geometry::hash_max::<
-                        novarocks_spi::connector::ConnectorCowBeginCause,
-                        (String, String),
-                    >(16)
-                    .map_err(crate::commit::write_stack::control::cow_begin::geometry_error)?,
-                )?,
-            )?,
-        )?;
-        match field.field_type.as_ref() {
-            Type::Struct(ty) => {
-                for child in ty.fields() {
-                    n = add(n, field_upper(child, scope)?)?;
-                }
-            }
-            Type::List(ty) => {
-                n = add(n, field_upper(&ty.element_field, scope)?)?;
-            }
-            Type::Map(ty) => {
-                n = add(n, field_upper(&ty.key_field, scope)?)?;
-                n = add(n, field_upper(&ty.value_field, scope)?)?;
-                n = add(
-                    n,
-                    (size_of::<Field>()
-                        + 3 * size_of::<Arc<Field>>()
-                        + 2 * size_of::<usize>()
-                        + "entries".len()) as u64,
-                )?;
-            }
-            Type::Primitive(_) | Type::Variant(_) => {}
-        }
-        Ok(n)
-    }
-    let schema = metadata
-        .snapshot_by_id(snapshot_id)
-        .ok_or_else(|| corrupt("Iceberg exact table source snapshot is absent"))?
-        .schema(metadata)
-        .map_err(|_| corrupt("Iceberg exact table source schema is unavailable"))?;
-    let mut n = (size_of::<arrow::datatypes::Schema>() + 2 * size_of::<usize>()) as u64;
-    for f in schema.as_struct().fields() {
-        n = add(n, field_upper(f, scope)?)?;
-    }
-    // SQL carrier adaptation, scalar/nominal-domain projection, default and
-    // hidden annotation and final projection retain old/new graphs. The added
-    // nominal pass owns another field-reference vector and schema/field graph.
-    n = mul(n, 7)?;
-    for (key, value) in metadata.properties() {
-        n = add(n, mul((key.len() + value.len()) as u64, 6)?)?;
-    }
-    let scalar_nodes = metadata
-        .properties()
-        .values()
-        .try_fold(0u64, |n, s| add(n, s.len() as u64))?;
-    n = add(
-        n,
-        crate::commit::write_stack::control::cow_begin::tree_upper::<i32, (i64, i64)>(
-            scalar_nodes,
-        )?,
-    )?;
-    let roots = schema.as_struct().fields().len() as u64;
-    // The shared nominal author inserts at most one declaration per exact root.
-    // Its ordinal tree coexists with scalar declarations and the Arrow output.
-    n = add(
-        n,
-        crate::commit::write_stack::control::cow_begin::tree_upper::<
-            usize,
-            novarocks_type_contract::ValueLogicalType,
-        >(roots)?,
-    )?;
-    // Price the new key/longest canonical label through each retained graph;
-    // existing property-string work also covers lowercase validation temporaries.
-    n = add(
-        n,
-        mul(
-            mul(
-                roots,
-                (novarocks_type_contract::NR_LOGICAL_TYPE_KEY.len() + "largeint".len()) as u64,
-            )?,
-            7,
-        )?,
-    )?;
-    Ok(n)
 }
 
 /// The frozen target one staged write session opens on.
