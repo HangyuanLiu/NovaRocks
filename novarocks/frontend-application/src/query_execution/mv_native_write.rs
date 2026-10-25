@@ -103,6 +103,41 @@ impl PreparedMvNativeWriteAssembly {
     }
 }
 
+/// MV uses the same complete-write consumer as the other write intents. The
+/// original session and reservation are consumed once, without constructing a
+/// synchronous execution request.
+impl crate::query::statement_computation::StatementComputationAssembly
+    for PreparedMvNativeWriteAssembly
+{
+    type Output = crate::query_execution::internal_consumer::write::WriteComputationOutput;
+
+    fn prepare(
+        self,
+        initial: crate::query_execution::logical_execution::InitialComputationReservation,
+        runtime: crate::query_execution::internal_consumer::decoded::DecodedConsumerRuntime,
+    ) -> Result<
+        (
+            crate::query_execution::logical_execution::PreparedLogicalComputation,
+            novarocks_query_application::api::ReservedExecutionIdentity,
+            Self::Output,
+        ),
+        novarocks_query_application::api::QueryExecutionError,
+    > {
+        crate::query_execution::internal_consumer::write::prepare_write_computation(
+            self.description,
+            self.template,
+            std::sync::Arc::new(
+                crate::query_execution::contract::ResolvedQueryOptions::from_upstream(
+                    self.query_options,
+                ),
+            ),
+            self.session,
+            initial,
+            runtime,
+        )
+    }
+}
+
 /// A session-driven MV write, one step away from dispatch.
 ///
 /// The session rides along as the request's single commit authority, so no

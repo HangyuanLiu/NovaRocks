@@ -693,8 +693,7 @@ fn interpret_committed_write(
     MvApplicationError,
 > {
     match outcome.map_err(|error| {
-        MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string())
-            .with_original_failure(connector_original_failure(error))
+        MvApplicationError::from_connector(MvApplicationErrorKind::Engine, error)
     })? {
         ExternalMutationOutcome::KnownCommitted {
             cleanup,
@@ -732,20 +731,6 @@ fn interpret_committed_write(
         )
         .with_original_failure(mutation_original_failure(failure))),
     }
-}
-
-// Reuse the Connector author's original shared cause when present. A plain
-// Connector failure is captured once at this terminal boundary, not rebuilt
-// from its diagnostic or publication classification.
-fn connector_original_failure(
-    error: novarocks_spi::connector::ConnectorError,
-) -> novarocks_failure_contract::SharedFailureCause {
-    if let Some(cause) = std::error::Error::source(&error)
-        .and_then(|source| source.downcast_ref::<novarocks_failure_contract::SharedFailureCause>())
-    {
-        return cause.clone();
-    }
-    novarocks_failure_contract::SharedFailureCause::new(error)
 }
 
 fn mutation_original_failure(

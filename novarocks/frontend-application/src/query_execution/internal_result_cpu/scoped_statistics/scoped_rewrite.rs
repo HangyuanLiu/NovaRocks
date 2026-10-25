@@ -84,6 +84,54 @@ impl InternalResultCpu {
         Ok((source.clone(), source))
     }
 
+    /// Authenticate the actual metadata author from this retained planning
+    /// generation. Management and pre-computation MV phases retain payload on
+    /// their original Root without claiming a computation position.
+    pub(crate) fn planning_metadata_cpu_port(
+        &self,
+        scope: &WorkScope,
+        window: ResultWindowAlias,
+        planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
+        cancellation: QueryCancellationView,
+        runtime: tokio::runtime::Handle,
+        wake: Arc<dyn StatusIntakeWake>,
+    ) -> Result<Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>, WorkError> {
+        if !window.is_for_scope(scope) || !window.is_root_backed_internal() {
+            return Err(WorkError::Conflict);
+        }
+        scope.check()?;
+        let _ = self.provider_creator_source(scope)?;
+        let binding = planning.binding();
+        let (key, source_type) =
+            binding
+                .metadata()
+                .provider_metadata_cpu_author()
+                .ok_or(WorkError::InvalidConfig(
+                    "selected metadata CPU author is unsupported",
+                ))?;
+        if key.instance_id != binding.descriptor().instance_id
+            || key.incarnation != binding.incarnation()
+        {
+            return Err(WorkError::Conflict);
+        }
+        Ok(Arc::new(ScopedProviderCreatorCpu {
+            cpu: self.clone(),
+            scope: scope.clone(),
+            window,
+            descriptor: binding.descriptor().clone(),
+            incarnation: binding.incarnation(),
+            source_type,
+            mode: CreatorCpuMode::ProviderMetadata,
+            cancellation,
+            runtime,
+            wake,
+            state: std::sync::Mutex::new(CreatorPortState {
+                job: None,
+                busy: false,
+            }),
+        }))
+    }
+
     pub(crate) fn cleanup_metadata_cpu_port(
         &self,
         scope: &WorkScope,

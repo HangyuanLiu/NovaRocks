@@ -296,6 +296,22 @@ impl MvApplicationError {
         }
     }
 
+    /// Preserve the Connector author's original cause without deriving business
+    /// disposition or compilation authority from it.
+    pub fn from_connector(
+        kind: MvApplicationErrorKind,
+        error: novarocks_spi::connector::ConnectorError,
+    ) -> Self {
+        let message = error.to_string();
+        let original = std::error::Error::source(&error)
+            .and_then(|source| {
+                source.downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+            })
+            .cloned()
+            .unwrap_or_else(|| novarocks_failure_contract::SharedFailureCause::new(error));
+        Self::new(kind, message).with_original_failure(original)
+    }
+
     pub(crate) fn from_compile(error: novarocks_sql::compiler::SqlCompileError) -> Self {
         let control = match &error {
             novarocks_sql::compiler::SqlCompileError::Cancelled => {
@@ -676,5 +692,60 @@ mod compile_error_tests {
                 assert_eq!(provider.kind(), MvCreateProviderErrorKind::Analysis);
             }
         }
+    }
+
+    #[test]
+    fn connector_projection_keeps_original_shared_cause_and_caller_kind() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+        let error = ConnectorError::from_domain(
+            ConnectorErrorKind::ResourceExhausted,
+            novarocks_workload_control::WorkError::Capacity("refresh pin source refusal"),
+        );
+        let original = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<SharedFailureCause>())
+            .expect("actual Connector domain source")
+            .clone();
+        let fact = original.failure_fact();
+        let message = error.to_string();
+        let projected = MvApplicationError::from_connector(MvApplicationErrorKind::Engine, error);
+        assert_eq!(projected.kind(), MvApplicationErrorKind::Engine);
+        assert_eq!(projected.message(), message);
+        assert_eq!(projected.original_failure(), Some(&original));
+        assert_eq!(
+            std::error::Error::source(&projected)
+                .and_then(|source| source.downcast_ref::<SharedFailureCause>()),
+            Some(&original),
+        );
+        assert_eq!(projected.original_failure().unwrap().failure_fact(), fact);
+        assert!(
+            projected
+                .original_failure()
+                .unwrap()
+                .downcast_ref::<novarocks_workload_control::WorkError>()
+                .is_some()
+        );
+        assert_eq!(projected.compile_control_error(), None);
+        assert_eq!(projected.unavailable_implementation(), None);
+    }
+
+    #[test]
+    fn plain_connector_is_captured_once_as_the_actual_error() {
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+        let error =
+            ConnectorError::new(ConnectorErrorKind::Unavailable, "refresh provider offline");
+        assert!(std::error::Error::source(&error).is_none());
+        let message = error.to_string();
+        let projected =
+            MvApplicationError::from_connector(MvApplicationErrorKind::Unavailable, error);
+        let original = projected.original_failure().expect("captured actual error");
+        let actual = original
+            .downcast_ref::<ConnectorError>()
+            .expect("no synthetic wrapper");
+        assert_eq!(actual.kind(), ConnectorErrorKind::Unavailable);
+        assert_eq!(actual.to_string(), message);
+        assert_eq!(projected.clone().original_failure(), Some(original));
+        assert_eq!(projected.kind(), MvApplicationErrorKind::Unavailable);
+        assert_eq!(projected.compile_control_error(), None);
     }
 }
