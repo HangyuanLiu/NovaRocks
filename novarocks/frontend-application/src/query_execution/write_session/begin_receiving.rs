@@ -30,6 +30,8 @@ struct BeginInput {
     lease: ConnectorWriteStackLease,
     catalog_properties: novarocks_spi::connector::CatalogProperties,
     staged: bool,
+    finish_publication: WritePublicationState,
+    metadata_only_publication: bool,
 }
 
 #[derive(Debug)]
@@ -105,6 +107,26 @@ impl WriteBeginReceiving {
         catalog_properties: novarocks_spi::connector::CatalogProperties,
         staged: bool,
     ) {
+        self.install_publication_input(
+            lease,
+            catalog_properties,
+            staged,
+            WritePublicationState::Ordinary,
+        );
+    }
+    pub(super) fn install_publication_input(
+        &self,
+        lease: ConnectorWriteStackLease,
+        catalog_properties: novarocks_spi::connector::CatalogProperties,
+        staged: bool,
+        finish_publication: WritePublicationState,
+    ) {
+        let metadata_only_publication = matches!(
+            &finish_publication,
+            WritePublicationState::Pending { declaration }
+                if declaration.technique()
+                    == novarocks_spi::connector::ConnectorManagedPublicationTechnique::MetadataOnly
+        );
         let mut slot = self.input.lock().unwrap_or_else(|p| p.into_inner());
         assert!(
             slot.is_none(),
@@ -114,6 +136,8 @@ impl WriteBeginReceiving {
             lease,
             catalog_properties,
             staged,
+            finish_publication,
+            metadata_only_publication,
         });
     }
     pub(super) fn control(
@@ -152,9 +176,9 @@ impl WriteBeginReceiving {
                     input.lease,
                     input.catalog_properties,
                     plan,
-                    WritePublicationState::Ordinary,
+                    input.finish_publication,
                     input.staged,
-                    false,
+                    input.metadata_only_publication,
                 ));
                 Ok(session)
             }
@@ -325,6 +349,22 @@ impl WriteBeginReceiving {
             self.plan.lock().unwrap_or_else(|p| p.into_inner()).as_ref(),
             Some(Ok(_))
         )
+    }
+    #[cfg(test)]
+    pub(super) fn retains_pending_declaration(
+        &self,
+        expected: &ConnectorDocumentPublicationDeclaration,
+    ) -> bool {
+        self.input
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|input| {
+                matches!(
+                    &input.finish_publication,
+                    WritePublicationState::Pending { declaration } if declaration == expected
+                )
+            })
     }
     #[cfg(test)]
     pub(super) fn retains_input(&self) -> bool {

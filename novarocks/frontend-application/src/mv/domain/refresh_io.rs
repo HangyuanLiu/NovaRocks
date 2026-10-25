@@ -175,6 +175,150 @@ pub(crate) fn observe_current_refresh_revision_with_ports(
     Ok((observation, revision))
 }
 
+/// Load one exact metadata generation through the existing async Provider author.
+/// The original statement or Management round retains the actual I/O source.
+async fn load_refresh_metadata_async(
+    connector_control: &dyn ConnectorControlResolver,
+    table_ref: &TableIdentity,
+    connector_context: &ConnectorRequestContext,
+) -> Result<
+    (
+        novarocks_spi::connector::ConnectorControlPlanningLease,
+        novarocks_spi::connector::ConnectorTableMetadata,
+    ),
+    novarocks_spi::connector::ConnectorError,
+> {
+    let lease = crate::connector::metadata_binding_typed(connector_control, &table_ref.catalog)?;
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease_async(
+        &lease,
+        connector_context.clone(),
+        &table_ref.namespace,
+        &table_ref.table,
+        ConnectorTableResolution::StrictBaseTable,
+    )
+    .await?;
+    Ok((lease, metadata))
+}
+
+/// Interpret a durable revision against the same loaded Provider generation.
+pub(crate) async fn snapshot_from_exact_revision_with_ports_async(
+    connector_control: &dyn ConnectorControlResolver,
+    table_ref: &TableIdentity,
+    revision: &ConnectorExactSemanticRevision,
+    connector_context: &ConnectorRequestContext,
+) -> Result<i64, novarocks_spi::connector::ConnectorError> {
+    let (lease, metadata) =
+        load_refresh_metadata_async(connector_control, table_ref, connector_context).await?;
+    match lease
+        .binding()
+        .metadata()
+        .read_selector_from_exact_revision(&metadata.table, revision)?
+    {
+        ConnectorReadSelector::SnapshotId(snapshot_id) => Ok(snapshot_id),
+        _ => Err(novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            format!(
+                "provider returned a non-snapshot MV read selector for {}",
+                table_ref.fqn()
+            ),
+        )),
+    }
+}
+
+/// Observe the narrow base facts from one exact metadata load, without a sync I/O bridge.
+pub(crate) async fn observe_current_refresh_base_with_ports_async(
+    connector_control: &dyn ConnectorControlResolver,
+    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
+    table_ref: &TableIdentity,
+    connector_context: &ConnectorRequestContext,
+) -> Result<
+    crate::mv::domain::storage_observation::MvRefreshBaseObservation,
+    novarocks_spi::connector::ConnectorError,
+> {
+    let (lease, metadata) =
+        load_refresh_metadata_async(connector_control, table_ref, connector_context).await?;
+    observe_loaded_refresh_base(
+        storage_observation,
+        &lease,
+        &metadata,
+        table_ref,
+        connector_context,
+    )
+}
+
+/// Freeze both occurrence facts and semantic revision from that same generation.
+pub(crate) async fn observe_current_refresh_revision_with_ports_async(
+    connector_control: &dyn ConnectorControlResolver,
+    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
+    table_ref: &TableIdentity,
+    connector_context: &ConnectorRequestContext,
+) -> Result<
+    (
+        crate::mv::domain::storage_observation::MvRefreshBaseObservation,
+        ConnectorExactSemanticRevision,
+    ),
+    novarocks_spi::connector::ConnectorError,
+> {
+    let (lease, metadata) =
+        load_refresh_metadata_async(connector_control, table_ref, connector_context).await?;
+    let observation = observe_loaded_refresh_base(
+        storage_observation,
+        &lease,
+        &metadata,
+        table_ref,
+        connector_context,
+    )?;
+    let revision = lease
+        .binding()
+        .metadata()
+        .exact_semantic_revision(&metadata.table, ConnectorReadSelector::Current)?;
+    if let Some(observed_snapshot) = observation.current_snapshot_id() {
+        let selector = lease
+            .binding()
+            .metadata()
+            .read_selector_from_exact_revision(&metadata.table, &revision)?;
+        if selector != ConnectorReadSelector::SnapshotId(observed_snapshot) {
+            return Err(novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+                format!(
+                    "MV scheduler source observation and exact revision disagree for {}",
+                    table_ref.fqn()
+                ),
+            ));
+        }
+    }
+    Ok((observation, revision))
+}
+
+// This inspector is pure over the sealed metadata; only its load above awaits I/O.
+fn observe_loaded_refresh_base(
+    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
+    lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
+    table_ref: &TableIdentity,
+    connector_context: &ConnectorRequestContext,
+) -> Result<
+    crate::mv::domain::storage_observation::MvRefreshBaseObservation,
+    novarocks_spi::connector::ConnectorError,
+> {
+    let observation = crate::mv::domain::storage_observation::observe_refresh_base(
+        storage_observation,
+        lease,
+        metadata,
+        connector_context.clone(),
+    )?;
+    if observation.table() != &metadata.identity {
+        return Err(novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+            format!(
+                "MV refresh base observation identity does not match loaded metadata for {}",
+                table_ref.fqn()
+            ),
+        ));
+    }
+    Ok(observation)
+}
+
 #[allow(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."

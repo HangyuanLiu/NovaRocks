@@ -2104,7 +2104,21 @@ mod tests {
         .await
         .expect("open frontend application host");
         host.install_statement_control_for_test();
+        let serving = host.serving_snapshot_reader();
+        assert!(!serving.frontend_serving_snapshot().base_ready());
+        host.mark_workload_ready().expect("open internal governed startup work");
+        let snapshot = serving.frontend_serving_snapshot();
+        assert_eq!(snapshot.serving_state,
+            novarocks_query_application::serving_admission::FrontendServingState::Starting);
+        assert!(!snapshot.base_ready(), "internal authority cannot expose public readiness");
+        let management = host.workload_root_admission()
+            .try_begin_root(WorkRequest::new(WorkClass::Management))
+            .expect("mandatory startup may use a real Management Root");
+        drop(management.business);
+        management.owner.complete_after_terminal_cancel_settled();
         host.mark_ready().expect("mark frontend host ready");
+        assert!(serving.frontend_serving_snapshot().base_ready());
+        drop(serving);
         let work = host
             .workload_root_admission()
             .try_begin_root(WorkRequest::new(WorkClass::Query))

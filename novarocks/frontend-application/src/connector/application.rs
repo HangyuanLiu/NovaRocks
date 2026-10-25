@@ -737,6 +737,32 @@ pub(crate) fn metadata_load_connector_table_with_planning_lease_typed(
         })
 }
 
+/// Load through the retained generation's original asynchronous I/O author.
+/// The same schema-creation observer checks the original operation control;
+/// this does not create a second query, resource permit or metadata snapshot.
+pub(crate) async fn metadata_load_connector_table_with_planning_lease_async(
+    binding: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+    namespace: &str,
+    table: &str,
+    resolution: ConnectorTableResolution,
+) -> Result<novarocks_spi::connector::ConnectorTableMetadata, ConnectorError> {
+    let instance_id = binding.binding().descriptor().instance_id.clone();
+    let context = context_for_planning_lease_typed(binding, context)?;
+    super::schema_creation::load_frontend_table_async(
+        binding.binding().metadata().as_ref(),
+        ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+                table: Arc::from(table),
+            },
+            resolution,
+            context,
+        },
+    )
+    .await
+}
 pub(crate) fn sql_columns_from_connector_metadata(
     metadata: &novarocks_spi::connector::ConnectorTableMetadata,
 ) -> Result<Vec<novarocks_types::schema::ColumnDef>, String> {

@@ -2069,8 +2069,9 @@ impl FrontendApplicationHost {
         .expect("install the original test statement-control owner");
     }
 
-    /// Open the original serving and root gates after mandatory installation.
-    pub(crate) fn mark_ready(&self) -> Result<(), FrontendApplicationError> {
+    /// Permit governed startup work after all original sources are installed.
+    /// Public SQL/serving readiness remains closed until mandatory restore exits.
+    pub(crate) fn mark_workload_ready(&self) -> Result<(), FrontendApplicationError> {
         if !self.execution_runtime_owner.statement_control_installed {
             self.execution_runtime_owner.close_admission();
             return Err(FrontendApplicationError::server(
@@ -2082,6 +2083,12 @@ impl FrontendApplicationHost {
                 "mark frontend workload authority ready after bootstrap: {error}"
             ))
         })?;
+        Ok(())
+    }
+
+    /// Publish serving readiness only after the role has finished mandatory startup.
+    pub(crate) fn mark_ready(&self) -> Result<(), FrontendApplicationError> {
+        self.mark_workload_ready()?;
         if let Some(controller) = self
             .catalog_role_runtime
             .as_ref()

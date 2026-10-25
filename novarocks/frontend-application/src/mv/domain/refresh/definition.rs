@@ -47,6 +47,33 @@ pub fn load_iceberg_mv_definition_by_target(
         })
 }
 
+/// Load only from the selected original read execution, retaining repository
+/// failures and their observation/cause instead of reducing them to text.
+pub(crate) async fn load_iceberg_mv_definition_by_target_async(
+    readiness: &crate::mv::domain::readiness::MvReadinessExecution<'_>,
+    target: &IcebergMvTarget,
+) -> Result<StoredKeyedMvProjection, novarocks_mv_application::repository::MvRepositoryError> {
+    #[cfg(test)]
+    record_definition_load();
+    readiness
+        .load_ready(&MvTarget {
+            catalog: Some(target.catalog.clone()),
+            database: target.namespace.clone(),
+            name: target.table.clone(),
+        })
+        .await?
+        .map(|loaded| loaded.projection)
+        .ok_or_else(|| {
+            novarocks_mv_application::repository::MvRepositoryError::new(
+                novarocks_mv_application::repository::MvRepositoryErrorKind::NotFound,
+                format!(
+                    "iceberg materialized view {}.{}.{} has no MV definition",
+                    target.catalog, target.namespace, target.table
+                ),
+            )
+        })
+}
+
 /// Computes the stable persisted-SQL fingerprint used by refresh artifacts.
 pub fn mv_definition_fingerprint(select_sql: &str) -> String {
     hex::encode(Sha256::digest(select_sql.as_bytes()))

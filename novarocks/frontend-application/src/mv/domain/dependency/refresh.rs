@@ -120,6 +120,43 @@ pub(crate) fn build_upstream_refresh_steps_with_readiness(
         .collect()
 }
 
+/// Read the dependency graph through the caller's selected original requests.
+/// The outer statement retains and progresses its StateStore owner around polls.
+pub(crate) async fn build_upstream_refresh_steps_with_readiness_async(
+    readiness: &crate::mv::domain::readiness::MvReadinessExecution<'_>,
+    requested: &MvDependencyObjectRef,
+) -> Result<Vec<MvRefreshDependencyStep>, novarocks_mv_application::repository::MvRepositoryError> {
+    use novarocks_mv_application::repository::{MvRepositoryError, MvRepositoryErrorKind};
+    let invalid = |message| MvRepositoryError::new(MvRepositoryErrorKind::InvalidRequest, message);
+    let projections = readiness.list_ready_projections().await?;
+    let inventory = projections
+        .iter()
+        .map(|loaded| &loaded.projection)
+        .collect::<Vec<_>>();
+    let mut edges = Vec::new();
+    for loaded in &projections {
+        let target = stored_keyed_definition_dependency_ref(&loaded.projection);
+        let dependencies = readiness
+            .list_ready_dependencies_by_downstream(loaded)
+            .await?;
+        let upstream_mvs = classify_ready_dependency_occurrences(dependencies, &inventory)
+            .map_err(&invalid)?
+            .into_iter()
+            .filter(|dependency| {
+                dependency.upstream.object_type == MvDependencyObjectType::MaterializedView
+            })
+            .map(|dependency| dependency.upstream)
+            .collect::<Vec<_>>();
+        edges.push((target, upstream_mvs));
+    }
+    topological_upstream_order_for_edges(requested, &edges)
+        .map_err(&invalid)?
+        .iter()
+        .map(refresh_step_for_dependency_object)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(invalid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

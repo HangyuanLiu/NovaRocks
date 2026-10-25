@@ -281,7 +281,7 @@ impl ConnectorWriteSession {
     pub(crate) async fn begin_async_in(
         lease: ConnectorWriteStackLease,
         catalog_properties: novarocks_spi::connector::CatalogProperties,
-        mut request: ConnectorWriteBeginRequest,
+        request: ConnectorWriteBeginRequest,
         receiving: &WriteBeginReceiving,
     ) -> Result<Arc<Self>, ConnectorError> {
         receiving.claim()?;
@@ -294,12 +294,61 @@ impl ConnectorWriteSession {
                 "application-document writes require an application-document session entrypoint",
             ));
         }
+        Self::begin_validated_async_in(
+            lease,
+            catalog_properties,
+            request,
+            WritePublicationState::Ordinary,
+            receiving,
+        )
+        .await
+    }
+
+    /// Retain the exact pending declaration in the original receiving Source
+    /// before constructing the Provider's borrowed application-document begin.
+    pub(crate) async fn begin_pending_application_document_publication_async_in(
+        lease: ConnectorWriteStackLease,
+        catalog_properties: novarocks_spi::connector::CatalogProperties,
+        request: ConnectorWriteBeginRequest,
+        receiving: &WriteBeginReceiving,
+    ) -> Result<Arc<Self>, ConnectorError> {
+        receiving.claim()?;
+        let declaration = match &request.flavor {
+            ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, .. } => {
+                declaration.clone()
+            }
+            _ => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "pending application-document publication requires an application-document write",
+                ));
+            }
+        };
+        Self::begin_validated_async_in(
+            lease,
+            catalog_properties,
+            request,
+            WritePublicationState::Pending { declaration },
+            receiving,
+        )
+        .await
+    }
+
+    // Both explicit entrypoints claim and validate their flavor before using
+    // this one original Provider poll/result-before-child-Drop/adoption path.
+    async fn begin_validated_async_in(
+        lease: ConnectorWriteStackLease,
+        catalog_properties: novarocks_spi::connector::CatalogProperties,
+        mut request: ConnectorWriteBeginRequest,
+        finish_publication: WritePublicationState,
+        receiving: &WriteBeginReceiving,
+    ) -> Result<Arc<Self>, ConnectorError> {
         let staged = matches!(
             &request.flavor,
             ConnectorWriteSessionFlavor::StagedCreate(_)
         );
         request.context = context_for_write_begin(request.context, &catalog_properties)?;
-        receiving.install_input(lease, catalog_properties, staged);
+        receiving.install_publication_input(lease, catalog_properties, staged, finish_publication);
         let control = receiving.control();
         receiving.enter_factory();
         let mut original = control.begin_write_async(request);
@@ -1547,6 +1596,29 @@ pub(crate) fn begin_connector_application_document_write_session_pending(
     })
 }
 
+/// Borrow the original asynchronous begin while retaining its exact declaration.
+/// Preparation and Provider refusals keep the original ConnectorError.
+pub(crate) async fn begin_connector_application_document_write_session_pending_async_in(
+    lease: ConnectorWriteStackLease,
+    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
+    request: ConnectorWriteBeginRequest,
+    receiving: &WriteBeginReceiving,
+) -> Result<Arc<ConnectorWriteSession>, ConnectorError> {
+    let catalog_properties = write_lease.catalog_properties().cloned().ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "connector write lease has no immutable catalog runtime identity",
+        )
+    })?;
+    ConnectorWriteSession::begin_pending_application_document_publication_async_in(
+        lease,
+        catalog_properties,
+        request,
+        receiving,
+    )
+    .await
+}
+
 /// The external commit of one completed write session, and the rows it made
 /// visible.
 ///
@@ -1773,6 +1845,8 @@ pub(crate) mod tests {
     pub(crate) struct Recorded {
         decoded_fragments: usize,
         pub(crate) begin: usize,
+        begin_async: usize,
+        begin_declaration: Option<ConnectorDocumentPublicationDeclaration>,
         capture_begin_context: bool,
         begin_context: Option<ConnectorRequestContext>,
         pub(crate) finish_future_drops: usize,
@@ -1989,6 +2063,7 @@ pub(crate) mod tests {
                     + 'a,
             >,
         > {
+            self.recorded.lock().unwrap().begin_async += 1;
             Box::pin(FakeBeginFuture {
                 original: Box::pin(async move { self.begin_write(request) }),
                 recorded: Arc::clone(&self.recorded),
@@ -2238,6 +2313,13 @@ pub(crate) mod tests {
             {
                 let mut recorded = self.recorded.lock().expect("recorded");
                 recorded.begin += 1;
+                if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
+                    declaration,
+                    ..
+                } = &request.flavor
+                {
+                    recorded.begin_declaration = Some(declaration.clone());
+                }
                 if recorded.capture_begin_context {
                     recorded.begin_context = Some(request.context);
                 }
@@ -2620,6 +2702,17 @@ pub(crate) mod tests {
         ConnectorDocumentPublicationDeclaration,
         KeyedPublicationIntent,
     ) {
+        application_document_publication_for(
+            novarocks_spi::connector::ConnectorManagedPublicationTechnique::Full,
+        )
+    }
+
+    fn application_document_publication_for(
+        technique: novarocks_spi::connector::ConnectorManagedPublicationTechnique,
+    ) -> (
+        ConnectorDocumentPublicationDeclaration,
+        KeyedPublicationIntent,
+    ) {
         let instance_id = catalog_handle().catalog_name().clone();
         let incarnation = novarocks_spi::connector::ProviderBindingEpoch::from_bytes([8; 16]);
         let descriptor = ConnectorInstanceDescriptor {
@@ -2684,7 +2777,7 @@ pub(crate) mod tests {
             admission,
             object_id,
             base,
-            novarocks_spi::connector::ConnectorManagedPublicationTechnique::Full,
+            technique,
             novarocks_spi::connector::ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
             None,
             None,
@@ -3068,6 +3161,200 @@ pub(crate) mod tests {
             fixture.recorded.lock().expect("recorded").publication,
             Some(expected)
         );
+    }
+
+    #[tokio::test]
+    async fn pending_document_async_begin_retains_exact_declaration_and_one_late_bind() {
+        struct BindingOnlyControl(ConnectorProviderBindingKey);
+        impl LegacyWriteControl for BindingOnlyControl {
+            fn binding_key(&self) -> &ConnectorProviderBindingKey {
+                &self.0
+            }
+        }
+        let (declaration, publication) = application_document_publication();
+        let expected = ConnectorWriteFinishPublication::KeyedDocuments(publication.clone());
+        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let key = lease.session().binding_key().clone();
+        let write_lease = novarocks_spi::connector::ConnectorWriteLease::new(
+            key.clone(),
+            Arc::new(BindingOnlyControl(key)),
+            || {},
+        )
+        .unwrap()
+        .with_catalog_properties(catalog_properties())
+        .unwrap();
+        let original = Arc::new(Mutex::new(None));
+        let receiving = WriteBeginReceiving::new(Arc::clone(&original));
+        let session = begin_connector_application_document_write_session_pending_async_in(
+            lease,
+            &write_lease,
+            application_document_begin_request(declaration.clone()),
+            &receiving,
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &session,
+            original.lock().unwrap().as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(&session, &receiving.session().unwrap()));
+        assert_eq!(
+            session.pending_publication_declaration().unwrap(),
+            declaration
+        );
+        assert!(!session.metadata_only_publication);
+        assert!(
+            session
+                .finish_empty_metadata_only_publication(request_context())
+                .is_err()
+        );
+        assert_eq!(recorded.lock().unwrap().finish, 0);
+        session.accumulate(empty_prepared()).unwrap();
+        session
+            .bind_keyed_document_publication(publication.clone())
+            .unwrap();
+        assert!(
+            session
+                .bind_keyed_document_publication(publication)
+                .is_err()
+        );
+        session.finish_accumulated(request_context()).unwrap();
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(recorded.begin, 1);
+        assert_eq!(recorded.begin_async, 1);
+        assert_eq!(recorded.begin_future_drops, 1);
+        assert_eq!(recorded.begin_declaration, Some(declaration));
+        assert_eq!(recorded.finish, 1);
+        assert_eq!(recorded.publication, Some(expected));
+        assert!(receiving.local_health_failure().is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_document_async_metadata_only_permission_comes_from_the_declaration() {
+        let (declaration, publication) = application_document_publication_for(
+            novarocks_spi::connector::ConnectorManagedPublicationTechnique::MetadataOnly,
+        );
+        let expected = ConnectorWriteFinishPublication::KeyedDocuments(publication.clone());
+        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let original = Arc::new(Mutex::new(None));
+        let receiving = WriteBeginReceiving::new(Arc::clone(&original));
+        let mut request = application_document_begin_request(declaration.clone());
+        request.intent = novarocks_spi::connector::ConnectorWriteIntent::Append;
+        let session =
+            ConnectorWriteSession::begin_pending_application_document_publication_async_in(
+                lease,
+                catalog_properties(),
+                request,
+                &receiving,
+            )
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &session,
+            original.lock().unwrap().as_ref().unwrap()
+        ));
+        assert_eq!(
+            session.pending_publication_declaration().unwrap(),
+            declaration
+        );
+        assert!(session.metadata_only_publication);
+        assert!(
+            session
+                .finish_empty_metadata_only_publication(request_context())
+                .is_err()
+        );
+        assert_eq!(
+            recorded.lock().unwrap().finish,
+            0,
+            "pending declaration is not a bound publication"
+        );
+        session
+            .bind_keyed_document_publication(publication)
+            .unwrap();
+        session
+            .finish_empty_metadata_only_publication(request_context())
+            .unwrap();
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(recorded.begin_async, 1);
+        assert_eq!(recorded.begin_declaration, Some(declaration));
+        assert_eq!(recorded.finish, 1);
+        assert_eq!(recorded.finish_rows, 0);
+        assert_eq!(recorded.publication, Some(expected));
+    }
+
+    #[test]
+    fn pending_document_async_drop_panic_retains_plan_input_and_exact_declaration() {
+        let (declaration, _) = application_document_publication();
+        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        recorded.lock().unwrap().panic_begin_future_drop = true;
+        let original = Arc::new(Mutex::new(None));
+        let receiving = WriteBeginReceiving::new(Arc::clone(&original));
+        let mut borrowed = Box::pin(
+            ConnectorWriteSession::begin_pending_application_document_publication_async_in(
+                lease,
+                catalog_properties(),
+                application_document_begin_request(declaration.clone()),
+                &receiving,
+            ),
+        );
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                std::future::Future::poll(borrowed.as_mut(), &mut cx)
+            }))
+            .is_err()
+        );
+        assert!(receiving.retains_plan());
+        assert!(receiving.retains_input());
+        assert!(receiving.retains_pending_declaration(&declaration));
+        assert!(receiving.local_health_failure().is_some());
+        assert!(receiving.completed_result().is_err());
+        assert!(receiving.session().is_none());
+        assert!(original.lock().unwrap().is_none());
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(recorded.begin, 1);
+        assert_eq!(recorded.begin_async, 1);
+        assert_eq!(recorded.begin_future_drops, 1);
+        assert_eq!(recorded.begin_declaration, Some(declaration));
+        assert_eq!(recorded.finish, 0);
+    }
+
+    #[tokio::test]
+    async fn async_document_and_ordinary_entries_reject_the_other_flavor_before_begin() {
+        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let receiving = WriteBeginReceiving::new(Arc::new(Mutex::new(None)));
+        let failure =
+            ConnectorWriteSession::begin_pending_application_document_publication_async_in(
+                lease,
+                catalog_properties(),
+                begin_request(),
+                &receiving,
+            )
+            .await
+            .err()
+            .expect("ordinary request cannot acquire an application-document session");
+        assert_eq!(failure.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(recorded.lock().unwrap().begin, 0);
+        assert_eq!(recorded.lock().unwrap().begin_async, 0);
+        assert!(receiving.session().is_none());
+        assert!(!receiving.retains_input());
+
+        let (declaration, _) = application_document_publication();
+        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let receiving = WriteBeginReceiving::new(Arc::new(Mutex::new(None)));
+        let failure = ConnectorWriteSession::begin_async_in(
+            lease,
+            catalog_properties(),
+            application_document_begin_request(declaration),
+            &receiving,
+        )
+        .await
+        .err()
+        .expect("ordinary async entry cannot erase an application-document declaration");
+        assert_eq!(failure.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(recorded.lock().unwrap().begin, 0);
+        assert_eq!(recorded.lock().unwrap().begin_async, 0);
+        assert!(receiving.session().is_none());
     }
 
     #[test]
