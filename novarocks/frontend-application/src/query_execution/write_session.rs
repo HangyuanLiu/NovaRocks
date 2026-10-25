@@ -948,7 +948,7 @@ impl ConnectorWriteSession {
         self.lease
             .handle_encoder()
             .encode_writer_handle_payload(handle)
-            .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error.to_string()))
+            .map_err(|error| ConnectorError::from_domain(ConnectorErrorKind::Internal, error))
     }
 
     pub(crate) fn seal_write_targets(&self) -> Result<SealedWriteTargets, ConnectorError> {
@@ -959,12 +959,12 @@ impl ConnectorWriteSession {
             let encoded = encoder
                 .encode_writer_handle(target.handle())
                 .map_err(|error| {
-                    ConnectorError::new(ConnectorErrorKind::Internal, error.to_string())
+                    ConnectorError::from_domain(ConnectorErrorKind::Internal, error)
                 })?;
             let canonical = encoder
                 .canonical_writer_handle_bytes(target.handle())
                 .map_err(|error| {
-                    ConnectorError::new(ConnectorErrorKind::Internal, error.to_string())
+                    ConnectorError::from_domain(ConnectorErrorKind::Internal, error)
                 })?;
             ledger.charge(target.ordinal(), canonical.len())?;
             if handles.insert(target.ordinal().get(), encoded).is_some() {
@@ -2559,6 +2559,14 @@ pub(crate) mod tests {
         payload_bytes: usize,
         outcome: ExternalMutationOutcome<ConnectorWriteReceipt>,
     ) -> (ConnectorWriteStackLease, Arc<Mutex<Recorded>>) {
+        unopened_fixture_with_encoder(targets, outcome, Arc::new(FakeEncoder { payload_bytes }))
+    }
+
+    fn unopened_fixture_with_encoder(
+        targets: usize,
+        outcome: ExternalMutationOutcome<ConnectorWriteReceipt>,
+        encoder: Arc<dyn ConnectorWriteHandleWireEncoder>,
+    ) -> (ConnectorWriteStackLease, Arc<Mutex<Recorded>>) {
         let adapter = adapter();
         let binding_key = ConnectorProviderBindingKey {
             instance_id: catalog_handle().catalog_name().clone(),
@@ -2576,7 +2584,7 @@ pub(crate) mod tests {
         let group = ConnectorControlWriteBinding::new(
             Arc::new(UnusedLegacyControl),
             session_control,
-            Arc::new(FakeEncoder { payload_bytes }),
+            encoder,
             Arc::new(FakeDecoder {
                 adapter,
                 recorded: Arc::clone(&recorded),
@@ -3547,6 +3555,73 @@ pub(crate) mod tests {
         let recorded = recorded.lock().expect("recorded");
         assert_eq!(recorded.begin, 0);
         assert_eq!(recorded.finish, 0);
+    }
+
+    #[test]
+    fn session_encoding_and_sealing_retain_the_original_codec_cause() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        use novarocks_spi::connector::{
+            ConnectorCodecError, ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorFieldPath,
+        };
+
+        struct RefusingEncoder(ConnectorCodecError);
+        impl ConnectorWriteHandleWireEncoder for RefusingEncoder {
+            fn owner(&self) -> &str {
+                "fake"
+            }
+            fn encode_writer_handle_payload(
+                &self,
+                _handle: &ConnectorWriterHandle,
+            ) -> Result<ConnectorEncodedPayload, ConnectorCodecError> {
+                Err(self.0.clone())
+            }
+        }
+
+        let mut ledger =
+            ConnectorDecodeLedger::new(ConnectorDecodeLimits::try_new(8, 8, 8, 8, 8).unwrap());
+        ledger.charge_raw(7).unwrap();
+        let original = ConnectorCodecError::from_domain(
+            ConnectorFieldPath::root("writer"),
+            ledger.charge_raw(2).unwrap_err(),
+        );
+        let fact = original.failure_fact();
+        let (lease, recorded) = unopened_fixture_with_encoder(
+            1,
+            known_committed(),
+            Arc::new(RefusingEncoder(original.clone())),
+        );
+        let session =
+            ConnectorWriteSession::begin(lease, catalog_properties(), begin_request()).unwrap();
+        let payload_error = session
+            .encode_writer_handle_payload(session.targets()[0].handle())
+            .expect_err("actual provider encoder refuses the payload");
+        let sealed_error = session
+            .seal_write_targets()
+            .expect_err("the same encoder refuses the sealed carrier");
+        for error in [&payload_error, &sealed_error] {
+            assert_eq!(error.failure_fact(), fact);
+            let mut source: &(dyn std::error::Error + 'static) = error;
+            loop {
+                if let Some(codec) = source.downcast_ref::<ConnectorCodecError>() {
+                    assert_eq!(codec, &original);
+                    let cause = std::error::Error::source(codec)
+                        .unwrap()
+                        .downcast_ref::<SharedFailureCause>()
+                        .unwrap();
+                    let expected = std::error::Error::source(&original)
+                        .unwrap()
+                        .downcast_ref::<SharedFailureCause>()
+                        .unwrap();
+                    assert_eq!(cause, expected);
+                    break;
+                }
+                source = source.source().expect("retain the concrete original codec");
+            }
+        }
+        session
+            .abort(request_context())
+            .expect("abort the same unstarted write session");
+        assert_eq!(recorded.lock().unwrap().abort, 1);
     }
 
     #[test]

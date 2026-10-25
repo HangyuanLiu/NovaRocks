@@ -16,6 +16,7 @@
 // under the License.
 
 //! The original Provider completion Source binds actual selected read facts.
+use super::ProviderReadError;
 use novarocks_spi::connector::read_stack::ConnectorReadRequestControlFactory;
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 use novarocks_workload_control::joint_admission::{
@@ -38,7 +39,7 @@ pub(super) struct ProviderCreatorControlBinding {
     admission: Option<JointAdmission>,
     receipt: Option<JointAdjustmentReceipt>,
     wait: Option<JointProposalSlotWait>,
-    refusal: Option<WorkError>,
+    refusal: Option<ProviderReadError>,
     bound: bool,
     polling: bool,
 }
@@ -48,7 +49,7 @@ impl ProviderCreatorControlBinding {
         parent: &WorkScope,
         factory: &dyn ConnectorReadRequestControlFactory,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<(), WorkError>> {
+    ) -> Poll<Result<(), ProviderReadError>> {
         if let Some(error) = &self.refusal {
             return Poll::Ready(Err(error.clone()));
         }
@@ -56,7 +57,7 @@ impl ProviderCreatorControlBinding {
             return Poll::Ready(Ok(()));
         }
         if self.polling {
-            return Poll::Ready(Err(WorkError::Conflict));
+            return Poll::Ready(Err(WorkError::Conflict.into()));
         }
         self.polling = true;
         let result = self.poll_original(parent, factory, cx);
@@ -71,11 +72,11 @@ impl ProviderCreatorControlBinding {
         parent: &WorkScope,
         factory: &dyn ConnectorReadRequestControlFactory,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<(), WorkError>> {
+    ) -> Poll<Result<(), ProviderReadError>> {
         if let Some(wait) = self.wait.as_mut() {
             match Pin::new(wait).poll(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
                 Poll::Ready(Ok(())) => drop(self.wait.take()),
             }
         }
@@ -87,7 +88,7 @@ impl ProviderCreatorControlBinding {
                         self.wait = Some(signal.into_wait());
                         match Pin::new(self.wait.as_mut().unwrap()).poll(cx) {
                             Poll::Pending => return Poll::Pending,
-                            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                            Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
                             Poll::Ready(Ok(())) => {
                                 drop(self.wait.take());
                                 cx.waker().wake_by_ref();
@@ -112,11 +113,9 @@ impl ProviderCreatorControlBinding {
                     })
             });
             if let Some(error) = refusal {
-                return Poll::Ready(Err(error));
+                return Poll::Ready(Err(error.into()));
             }
-            selected.map_err(|_| {
-                WorkError::InvalidConfig("provider creator selected planning dependencies")
-            })?;
+            selected.map_err(ProviderReadError::from)?;
             self.proposal.as_mut().unwrap().end_change()?;
             self.admission = Some(
                 self.proposal
@@ -129,7 +128,7 @@ impl ProviderCreatorControlBinding {
         if self.receipt.is_none() {
             let mut batch = match Pin::new(self.admission.as_mut().unwrap()).poll(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error.error)),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error.error.into())),
                 Poll::Ready(Ok(batch)) => batch,
             };
             self.receipt = batch.adjustment.take();
@@ -137,7 +136,7 @@ impl ProviderCreatorControlBinding {
             drop(batch);
             drop(self.admission.take());
             if !empty {
-                return Poll::Ready(Err(WorkError::Conflict));
+                return Poll::Ready(Err(WorkError::Conflict.into()));
             }
         }
         let notification = self

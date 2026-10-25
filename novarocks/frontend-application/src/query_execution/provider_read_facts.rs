@@ -35,7 +35,9 @@
 //! fact, a plan, or anything encoded.
 
 mod control_binding;
+mod error;
 use control_binding::ProviderCreatorControlBinding;
+pub(crate) use error::{ProviderReadCpuFailure, ProviderReadError};
 
 use novarocks_query_application::api::RuntimeSplitPlacement;
 
@@ -189,7 +191,7 @@ struct ProviderCreatorSource {
     responsibility: Option<ConnectorBlockingIoResponsibility>,
     prepared: Option<PreparedProviderRead>,
     job: Option<ProviderReadCpuJob>,
-    result: Option<Result<ProviderReadFact, String>>,
+    result: Option<Result<ProviderReadFact, ProviderReadError>>,
 }
 #[derive(Default)]
 struct ProviderCreatorWake(AtomicWaker);
@@ -312,19 +314,16 @@ impl FrontendProviderReadFacts {
     }
 }
 
-#[async_trait]
-impl ProviderReadFactPort for FrontendProviderReadFacts {
+impl FrontendProviderReadFacts {
     /// What a freeze leaves this role: the ability to reacquire exactly the
     /// handle that was frozen, for one attempt, and the provider-side half of
     /// that read's wire form. Neither holds a secret and neither offers a way
     /// to choose a different read.
-    type Access = FrozenProviderRead;
-
-    async fn resolve_provider_reads(
+    pub(crate) async fn resolve_provider_reads_typed(
         &self,
         needs: &[ProviderReadNeed],
-        taken: &ReadAccessSink<Self::Access>,
-    ) -> Result<Vec<ProviderReadFact>, String> {
+        taken: &ReadAccessSink<FrozenProviderRead>,
+    ) -> Result<Vec<ProviderReadFact>, ProviderReadError> {
         let mut facts = Vec::with_capacity(needs.len());
         // One original Source serializes its pure creators. This private body
         // lock is never acquired by the worker; no WC/Core/registry lock spans
@@ -337,6 +336,17 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
             // An interrupted previous borrow is not another request. Its same
             // job/output/cause must be observed/closed by this original owner.
             if source.job.is_some() || source.prepared.is_some() {
+                if let Some(cause) = source
+                    .job
+                    .as_ref()
+                    .and_then(ProviderReadCpuJob::health_failure)
+                {
+                    return Err(ProviderReadError::ActualExit(
+                        novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
+                            "completion Provider creator actual exit is unproven", cause,
+                        )
+                    ));
+                }
                 return Err("provider read source has an unresolved creator".into());
             }
             let cpu = {
@@ -346,12 +356,12 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
                 } else {
                     self.blocking
                         .provider_creator_cpu()
-                        .map_err(|e| e.to_string())?
+                        .map_err(ProviderReadError::from)?
                 }
                 #[cfg(not(test))]
                 self.blocking
                     .provider_creator_cpu()
-                    .map_err(|e| e.to_string())?
+                    .map_err(ProviderReadError::from)?
             };
             let fixture = {
                 #[cfg(test)]
@@ -369,7 +379,7 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
                         self.capacity.scope(),
                         &self.capacity.window_alias(),
                     )
-                    .map_err(|e| e.to_string())?,
+                    .map_err(ProviderReadError::from)?,
                 );
             } else {
                 // Catalog resolution already retained this exact admitted
@@ -380,9 +390,11 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
                 let read = self
                     .control
                     .typed_read_for_planning_lease(&lease)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(ProviderReadError::from)?;
                 let factory = read.request_factory().ok_or_else(|| {
-                    "provider creator has no exact request control factory".to_owned()
+                    ProviderReadError::Contract({
+                        "provider creator has no exact request control factory".to_owned()
+                    })
                 })?;
                 if self.creator_mode == ProviderCreatorMode::GovernedReadIo {
                     let io = self
@@ -390,7 +402,9 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
                         .io_admission()
                         .and_then(|p| p.upgrade())
                         .ok_or_else(|| {
-                            "read Provider source has no original I/O owner".to_owned()
+                            ProviderReadError::Contract({
+                                "read Provider source has no original I/O owner".to_owned()
+                            })
                         })?;
                     let mut dependencies = Vec::new();
                     factory
@@ -400,23 +414,25 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
                             }
                             Ok(())
                         })
-                        .map_err(|e| e.to_string())?;
+                        .map_err(ProviderReadError::from)?;
                     let profile =
                     novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile::from_geometry(
-                        factory.planning_io_geometry().map_err(|e| e.to_string())?,
+                        factory.planning_io_geometry().map_err(ProviderReadError::from)?,
                         dependencies,
                     )
-                    .map_err(|e| e.to_string())?;
+                    .map_err(ProviderReadError::from)?;
                     io.configure_read_source(&profile)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(ProviderReadError::from)?;
                     std::future::poll_fn(|cx| io.poll_read_source_ready(cx))
                         .await
-                        .map_err(|e| e.to_string())?;
+                        .map_err(ProviderReadError::from)?;
                     // Exact factory service facts are joined into the SAME Root
                     // payload/action D before the child can retain this creator.
                     for dependency in profile.initial_dependencies() {
-                        source.creator_request =
-                            Some(io.request(dependency.clone()).map_err(|e| e.to_string())?);
+                        source.creator_request = Some(
+                            io.request(dependency.clone())
+                                .map_err(ProviderReadError::from)?,
+                        );
                         std::future::poll_fn(|cx| {
                             let ProviderCreatorSource {
                                 creator_request,
@@ -429,7 +445,7 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
                                 .poll_admitted_in(creator_permit, cx)
                         })
                         .await
-                        .map_err(|e| e.to_string())?;
+                        .map_err(ProviderReadError::from)?;
                         drop(source.creator_request.take());
                         drop(source.creator_permit.take());
                     }
@@ -440,14 +456,14 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
                         .poll(self.capacity.scope(), factory.as_ref(), cx)
                 })
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(ProviderReadError::from)?;
                 if source.admission.is_none() {
                     source.admission = Some(
                         ConnectorBlockingIoResponsibility::request(
                             self.capacity.scope(),
                             &self.capacity.window_alias(),
                         )
-                        .map_err(|e| e.to_string())?,
+                        .map_err(ProviderReadError::from)?,
                     );
                 }
                 source.responsibility = Some(
@@ -457,7 +473,7 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
                         .expect("same child request")
                         .ready()
                         .await
-                        .map_err(|e| e.to_string())?,
+                        .map_err(ProviderReadError::from)?,
                 );
                 source.admission.take();
             }
@@ -475,26 +491,26 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
             )
             .await?;
             let responsibility = source.responsibility.as_ref().expect("same original child");
-            let scope = responsibility.scope().map_err(|e| e.to_string())?;
+            let scope = responsibility.scope().map_err(ProviderReadError::from)?;
             #[cfg(test)]
             let action = if fixture {
                 ProviderCreatorCpuSource::UnqualifiedFixture
             } else {
                 ProviderCreatorCpuSource::Bound(
                     cpu.provider_creator_source(&scope)
-                        .map_err(|e| e.to_string())?,
+                        .map_err(ProviderReadError::from)?,
                 )
             };
             #[cfg(not(test))]
             let action = ProviderCreatorCpuSource::Bound(
                 cpu.provider_creator_source(&scope)
-                    .map_err(|e| e.to_string())?,
+                    .map_err(ProviderReadError::from)?,
             );
-            let window = responsibility.window().map_err(|e| e.to_string())?;
+            let window = responsibility.window().map_err(ProviderReadError::from)?;
             let backing = responsibility.retain_backing();
             let cancellation =
                 novarocks_query_application::cancellation::QueryCancellationView::governed(
-                    scope.cancellation().map_err(|e| e.to_string())?,
+                    scope.cancellation().map_err(ProviderReadError::from)?,
                     None,
                 );
             let input = ProviderReadCreatorInput::new(
@@ -520,7 +536,11 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
                     .poll_finish_in(cx, result)
             })
             .await
-            .map_err(|_| "original provider creator failure remains in its source".to_owned())?;
+            .map_err(|cause| ProviderReadError::ActualExit(
+                novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
+                    "completion Provider creator actual exit is unproven", cause,
+                )
+            ))?;
             // Result is already stable before input/worker retirement callbacks.
             // Only a genuinely joined, healthy original job is removed here.
             source.job.take();
@@ -580,7 +600,7 @@ impl AdmittedRead {
     fn provider_relation(
         &self,
         relation: &ProviderReadRelationNeed,
-    ) -> Result<SchemaTableName, String> {
+    ) -> Result<SchemaTableName, ProviderReadError> {
         use crate::catalog_application::query_bindings::QueryFrozenCohortRead;
 
         let (namespace, table) = match self {
@@ -600,7 +620,7 @@ impl AdmittedRead {
                 read.group.table_name().to_string(),
             ),
         };
-        SchemaTableName::try_new(&namespace, &table).map_err(|error| error.to_string())
+        SchemaTableName::try_new(&namespace, &table).map_err(ProviderReadError::from)
     }
 }
 
@@ -622,7 +642,7 @@ fn prepare_read_opening(
     control: &ConnectorControlHost,
     bindings: &QueryTableBindingStore,
     context: &ConnectorRequestContext,
-) -> Result<ReadOpening, String> {
+) -> Result<ReadOpening, ProviderReadError> {
     let relation = need.relation();
     let identity = relation_identity(relation);
     let name = format!("{}.{}", identity.namespace, identity.table);
@@ -639,14 +659,16 @@ fn prepare_read_opening(
     {
         let binding = bindings.binding(need.binding())?;
         let target = binding.mv_target_read.as_ref().ok_or_else(|| {
-            format!("provider read of {name} has no admitted MV target materialization")
+            ProviderReadError::Contract({
+                format!("provider read of {name} has no admitted MV target materialization")
+            })
         })?;
         if target.target_table_uuid != *target_table_uuid
             || target.frozen_snapshot_id != *target_snapshot_id
         {
             return Err(format!(
                 "provider read of {name} names a different MV target UUID or snapshot than its frozen binding"
-            ));
+            ).into());
         }
         AdmittedRead::MvTarget {
             materialization: if *use_affected_partitions {
@@ -660,39 +682,43 @@ fn prepare_read_opening(
         let input = frozen_input(relation)?;
         match input {
             QueryFrozenReadInput::Current | QueryFrozenReadInput::Snapshot(_) => {
-                AdmittedRead::Relation(
-                    bindings
-                        .frozen_read_input(need.binding(), input)
-                        .map_err(|error| format!("provider read of {name}: {error}"))?,
-                )
+                AdmittedRead::Relation(bindings.frozen_read_input(need.binding(), input).map_err(
+                    |error| {
+                        ProviderReadError::from(error).context(format!("provider read of {name}"))
+                    },
+                )?)
             }
             QueryFrozenReadInput::PinnedFileSet | QueryFrozenReadInput::TableExecute => {
-                AdmittedRead::Cohort(
-                    bindings
-                        .frozen_cohort_read(need.binding(), input)
-                        .map_err(|error| format!("provider read of {name}: {error}"))?,
-                )
+                AdmittedRead::Cohort(bindings.frozen_cohort_read(need.binding(), input).map_err(
+                    |error| {
+                        ProviderReadError::from(error).context(format!("provider read of {name}"))
+                    },
+                )?)
             }
         }
     };
     let planning_lease = admitted.planning_lease().clone();
     let read = control
         .typed_read_for_planning_lease(&planning_lease)
-        .map_err(|error| format!("provider read of {name} has no typed read binding: {error}"))?;
+        .map_err(|error| {
+            ProviderReadError::from(error)
+                .context(format!("provider read of {name} has no typed read binding"))
+        })?;
     // The control this read is negotiated and frozen through is the same one
     // its attempt access is sealed against. A provider may pin what it
     // resolved while answering -- the sealed access is then a view of that pin
     // -- and asking through a second control would seal against a request that
     // was never asked anything.
-    let request_control = request_control_for(&read, context)
-        .map_err(|error| format!("provider read of {name}: {error}"))?;
+    let request_control = request_control_for(&read, context).map_err(|error| {
+        ProviderReadError::from(error).context(format!("provider read of {name}"))
+    })?;
     // A provider spells one of its metadata relations as the base relation
     // plus the kind's suffix; the plan states the two separately, because
     // which metadata relation this is belongs to the read and not to the
     // name. Put them back together where the provider is asked.
-    let table = admitted
-        .provider_relation(relation)
-        .map_err(|error| format!("provider read of {name}: {error}"))?;
+    let table = admitted.provider_relation(relation).map_err(|error| {
+        ProviderReadError::from(error).context(format!("provider read of {name}"))
+    })?;
 
     Ok(ReadOpening {
         name,
@@ -722,7 +748,7 @@ fn begin_one_read(
     control: &ConnectorControlHost,
     bindings: &QueryTableBindingStore,
     context: &ConnectorRequestContext,
-) -> Result<PreparedProviderRead, String> {
+) -> Result<PreparedProviderRead, ProviderReadError> {
     let opening = prepare_read_opening(&need, control, bindings, context)?;
     Ok(PreparedProviderRead {
         observation: None,
@@ -733,7 +759,7 @@ fn begin_one_read(
 async fn prepare_observation(
     prepared: &mut PreparedProviderRead,
     session: &ConnectorSession,
-) -> Result<(), String> {
+) -> Result<(), ProviderReadError> {
     use crate::catalog_application::query_bindings::QueryFrozenCohortRead;
     use novarocks_spi::connector::read_stack::{
         ConnectorReadRelationPreparationKind as K,
@@ -759,7 +785,7 @@ async fn prepare_observation(
                 K::TableExecute { procedure:novarocks_spi::connector::read_stack::ConnectorReadTableExecuteProcedure::RewritePositionDeleteFiles(
                     novarocks_spi::connector::read_stack::ConnectorReadFrozenRewriteGroup::from_cohort(&read.group,read.group_digest)) }
             },
-            (relation,_)=>return Err(unsupported_family(relation)),
+            (relation,_)=>return Err(unsupported_family(relation).into()),
         }
     } else {
         match need.relation() {
@@ -774,7 +800,10 @@ async fn prepare_observation(
                         metadata_kind(*kind)?,
                         metadata_version(*version),
                     )
-                    .map_err(|error| format!("provider read of {}: {error}", opening.name))?,
+                    .map_err(|error| {
+                        ProviderReadError::from(error)
+                            .context(format!("provider read of {}", opening.name))
+                    })?,
                 ),
             },
             ProviderReadRelationNeed::Delta {
@@ -798,7 +827,8 @@ async fn prepare_observation(
                     return Err(format!(
                         "provider read of {} lacks its exact MV target admission",
                         opening.name
-                    ));
+                    )
+                    .into());
                 };
                 match &materialization.mv_partition_selection {
                     Some(selection) => {
@@ -806,7 +836,8 @@ async fn prepare_observation(
                             return Err(format!(
                                 "provider read of {} has a different MV target selection object",
                                 opening.name
-                            ));
+                            )
+                            .into());
                         }
                         K::MvTargetPartition {
                             selection: selection.clone(),
@@ -818,7 +849,7 @@ async fn prepare_observation(
                     },
                 }
             }
-            relation => return Err(unsupported_family(relation)),
+            relation => return Err(unsupported_family(relation).into()),
         }
     };
     let request = Request::new(opening.table.clone(), kind);
@@ -836,20 +867,20 @@ fn relation_open_error(
     relation: &ProviderReadRelationNeed,
     opening: &ReadOpening,
     error: ConnectorError,
-) -> String {
+) -> ProviderReadError {
     let name = &opening.name;
-    match relation {
+    let context = match relation {
         ProviderReadRelationNeed::Data { .. } | ProviderReadRelationNeed::FrozenInputSet { .. } => {
-            format!("provider read of {name} cannot be opened: {error}")
+            format!("provider read of {name} cannot be opened")
         }
         ProviderReadRelationNeed::Metadata { .. } => {
-            format!("provider read of {name} cannot be opened as metadata: {error}")
+            format!("provider read of {name} cannot be opened as metadata")
         }
         ProviderReadRelationNeed::Delta { .. } => {
-            format!("provider read of {name} cannot open change window: {error}")
+            format!("provider read of {name} cannot open change window")
         }
         ProviderReadRelationNeed::MvTarget { .. } => {
-            format!("provider read of {name} cannot open frozen MV target: {error}")
+            format!("provider read of {name} cannot open frozen MV target")
         }
         ProviderReadRelationNeed::PinnedFileSet { .. } => {
             let AdmittedRead::Cohort(
@@ -858,22 +889,27 @@ fn relation_open_error(
                 ),
             ) = &opening.admitted
             else {
-                return unsupported_family(relation);
+                return ProviderReadError::Contract(unsupported_family(relation));
             };
             format!(
-                "provider read of {name} cannot be opened restricted to the {} data files pinned at version {}: {error}",
+                "provider read of {name} cannot be opened restricted to the {} data files pinned at version {}",
                 read.pinned.files().len(),
                 read.pinned.version_ordinal()
             )
         }
         ProviderReadRelationNeed::TableExecute { .. } => {
-            format!("provider read of {name} cannot be opened as table-execute: {error}")
+            format!("provider read of {name} cannot be opened as table-execute")
         }
-    }
+    };
+    ProviderReadError::from(error).context(context)
 }
-fn relation_open_missing(relation: &ProviderReadRelationNeed, opening: &ReadOpening) -> String {
+
+fn relation_open_missing(
+    relation: &ProviderReadRelationNeed,
+    opening: &ReadOpening,
+) -> ProviderReadError {
     let name = &opening.name;
-    match relation {
+    ProviderReadError::Contract(match relation {
         ProviderReadRelationNeed::Data { .. } | ProviderReadRelationNeed::FrozenInputSet { .. } => {
             format!("provider read of {name} is no longer resolvable after admission pinned it")
         }
@@ -892,7 +928,7 @@ fn relation_open_missing(relation: &ProviderReadRelationNeed, opening: &ReadOpen
         ProviderReadRelationNeed::TableExecute { .. } => {
             format!("provider read of {name} exposes no table-execute relation")
         }
-    }
+    })
 }
 
 /// One closed Provider creator's original stable input/output. The fixed CPU
@@ -905,7 +941,7 @@ pub(crate) struct ProviderReadCreatorInput {
     context: ConnectorRequestContext,
     deposits: ReadAccessDeposit<FrozenProviderRead>,
     rejected_access: Option<FrozenReadAccess<FrozenProviderRead>>,
-    result: Option<Result<ProviderReadFact, String>>,
+    result: Option<Result<ProviderReadFact, ProviderReadError>>,
     started: bool,
 }
 impl ProviderReadCreatorInput {
@@ -942,7 +978,7 @@ impl ProviderReadCreatorInput {
     /// Delivery does not retire this input or its original rejected capability.
     pub(crate) fn take_result_in(
         &mut self,
-        target: &mut Option<Result<ProviderReadFact, String>>,
+        target: &mut Option<Result<ProviderReadFact, ProviderReadError>>,
     ) -> Result<(), &'static str> {
         if target.is_some() {
             return Err("Provider creator target is occupied");
@@ -964,15 +1000,15 @@ fn finish_prepared_read_borrowed(
     context: &ConnectorRequestContext,
     deposits: &ReadAccessDeposit<FrozenProviderRead>,
     rejected_access: Option<&mut Option<FrozenReadAccess<FrozenProviderRead>>>,
-) -> Result<ProviderReadFact, String> {
+) -> Result<ProviderReadFact, ProviderReadError> {
     let PreparedProviderRead {
         need,
         observation,
         opening,
     } = prepared;
-    let observation = observation
-        .take()
-        .ok_or_else(|| "Provider creator observation was already consumed".to_owned())?;
+    let observation = observation.take().ok_or_else(|| {
+        ProviderReadError::Contract("Provider creator observation was already consumed".to_owned())
+    })?;
     let metadata = opening.request_control.metadata();
     let opened = match observation {
         ReadObservation::OriginalFrozenSource => open_relation(
@@ -992,10 +1028,12 @@ fn finish_prepared_read_borrowed(
             let (placement, kind) =
                 if let ProviderReadRelationNeed::Metadata { kind, .. } = need.relation() {
                     let hint = hint.ok_or_else(|| {
-                        format!(
-                            "provider read of {} has no metadata unit hint",
-                            opening.name
-                        )
+                        ProviderReadError::Contract({
+                            format!(
+                                "provider read of {} has no metadata unit hint",
+                                opening.name
+                            )
+                        })
                     })?;
                     let placement = match hint {
                         novarocks_spi::connector::read_stack::SystemTableUnitHint::ManyUnits => {
@@ -1034,6 +1072,18 @@ pub(crate) fn freeze_one_read(
     context: &ConnectorRequestContext,
     deposits: &ReadAccessDeposit<FrozenProviderRead>,
 ) -> Result<ProviderReadFact, String> {
+    freeze_one_read_typed(need, control, bindings, session, context, deposits)
+        .map_err(|error| error.to_string())
+}
+
+fn freeze_one_read_typed(
+    need: &ProviderReadNeed,
+    control: &ConnectorControlHost,
+    bindings: &QueryTableBindingStore,
+    session: &ConnectorSession,
+    context: &ConnectorRequestContext,
+    deposits: &ReadAccessDeposit<FrozenProviderRead>,
+) -> Result<ProviderReadFact, ProviderReadError> {
     let opening = prepare_read_opening(need, control, bindings, context)?;
     let metadata = opening.request_control.metadata();
     let opened = open_relation(
@@ -1059,7 +1109,7 @@ fn finish_read_from_opened(
         Option<ConnectorReadMetadataKind>,
     ),
     rejected_access: Option<&mut Option<FrozenReadAccess<FrozenProviderRead>>>,
-) -> Result<ProviderReadFact, String> {
+) -> Result<ProviderReadFact, ProviderReadError> {
     let relation = need.relation();
     let name = &opening.name;
     let planning_lease = &opening.planning_lease;
@@ -1074,7 +1124,10 @@ fn finish_read_from_opened(
     //    each column by its own schema spelling.
     let column_bindings = metadata
         .get_column_bindings(session, &handle)
-        .map_err(|error| format!("provider read of {name} cannot read its columns: {error}"))?;
+        .map_err(|error| {
+            ProviderReadError::from(error)
+                .context(format!("provider read of {name} cannot read its columns"))
+        })?;
     let assignments = assignments_for(need.columns(), &column_bindings, &name)?;
     let columns_by_ordinal = assignments
         .iter()
@@ -1092,12 +1145,14 @@ fn finish_read_from_opened(
         ops: offer.ops.clone(),
     };
     let offered = negotiation.ops.len();
-    let negotiated = metadata
-        .negotiate(session, &negotiation)
-        .map_err(|error| format!("provider read of {name} could not be negotiated: {error}"))?;
-    negotiated
-        .verify_shape(offered)
-        .map_err(|error| format!("provider read of {name} answered the wrong shape: {error}"))?;
+    let negotiated = metadata.negotiate(session, &negotiation).map_err(|error| {
+        ProviderReadError::from(error)
+            .context(format!("provider read of {name} could not be negotiated"))
+    })?;
+    negotiated.verify_shape(offered).map_err(|error| {
+        ProviderReadError::from(error)
+            .context(format!("provider read of {name} answered the wrong shape"))
+    })?;
 
     // 4. Commit it. Everything after this point describes a read that is no
     //    longer negotiable.
@@ -1109,9 +1164,15 @@ fn finish_read_from_opened(
     };
     let frozen = metadata
         .freeze(session, &freeze_request)
-        .map_err(|error| format!("provider read of {name} could not be frozen: {error}"))?
+        .map_err(|error| {
+            ProviderReadError::from(error)
+                .context(format!("provider read of {name} could not be frozen"))
+        })?
         .into_verified(&freeze_request)
-        .map_err(|error| format!("provider read of {name} froze the wrong read: {error}"))?;
+        .map_err(|error| {
+            ProviderReadError::from(error)
+                .context(format!("provider read of {name} froze the wrong read"))
+        })?;
     // The provider publishes the public fields of exactly the columns this
     // read assigns, repeats included, from the handle it froze. Asking later
     // would need a live provider; asking with SQL names would guess.
@@ -1127,9 +1188,9 @@ fn finish_read_from_opened(
     if let Err(error) = &public_schema
         && error.kind() != novarocks_spi::connector::ConnectorErrorKind::Unsupported
     {
-        return Err(format!(
-            "provider read of {name} could not publish its schema: {error}"
-        ));
+        return Err(ProviderReadError::from(error.clone()).context(format!(
+            "provider read of {name} could not publish its schema"
+        )));
     }
 
     // 5. Assemble everything the freeze leaves behind, so that taking the
@@ -1138,7 +1199,10 @@ fn finish_read_from_opened(
     let encoder = read.encoder();
     let provider_relation = metadata
         .relation(relation_kind, negotiated.handle.clone())
-        .map_err(|error| format!("provider read of {name} has no frozen relation: {error}"))?;
+        .map_err(|error| {
+            ProviderReadError::from(error)
+                .context(format!("provider read of {name} has no frozen relation"))
+        })?;
     let (enforced_predicate, unenforced_predicate, remaining_expression) =
         filter_responsibility(&offer, &negotiated.outcomes);
     let (schema, named_columns) =
@@ -1146,14 +1210,19 @@ fn finish_read_from_opened(
     let catalog_properties = planning_lease
         .binding()
         .catalog_properties()
-        .map_err(|error| format!("provider read of {name} has no catalog properties: {error}"))?
+        .map_err(|error| {
+            ProviderReadError::from(error)
+                .context(format!("provider read of {name} has no catalog properties"))
+        })?
         .clone();
 
     // 6. Take the capability and account for it in the same breath.
     let access = read
         .seal_attempt_access(&request_control, &negotiated.handle)
         .map_err(|error| {
-            format!("provider read of {name} cannot seal its per-attempt access: {error}")
+            ProviderReadError::from(error).context(format!(
+                "provider read of {name} cannot seal its per-attempt access"
+            ))
         })?;
     deposits
         .deposit(
@@ -1195,9 +1264,17 @@ fn finish_read_from_opened(
     // 7. Project the frozen read into the contract the plan is built against.
     let relation_payload = encoder
         .encode_relation_payload(&provider_relation)
-        .map_err(|error| format!("provider read of {name} cannot encode its relation: {error}"))?;
+        .map_err(|error| {
+            ProviderReadError::from(error).context(format!(
+                "provider read of {name} cannot encode its relation"
+            ))
+        })?;
     let input_version = ExactInputVersion::try_new(frozen.input_version().as_bytes().to_vec())
-        .map_err(|error| format!("provider read of {name} has no exact input version: {error}"))?;
+        .map_err(|error| {
+            ProviderReadError::from(error).context(format!(
+                "provider read of {name} has no exact input version"
+            ))
+        })?;
     let contract = ProviderReadStaticContract {
         sql_binding: need.binding(),
         request: ProviderReadRequestBinding::from_need(need),
@@ -1215,12 +1292,16 @@ fn finish_read_from_opened(
         coverage_evidence: frozen.coverage_evidence().into(),
     };
     ProviderReadFact::negotiated(need, contract).map_err(|error| {
-        format!("provider read of {name} answered its own request wrongly: {error}")
+        ProviderReadError::Contract(format!(
+            "provider read of {name} answered its own request wrongly: {error}"
+        ))
     })
 }
 
 /// Which admission-frozen input this read names.
-fn frozen_input(relation: &ProviderReadRelationNeed) -> Result<QueryFrozenReadInput, String> {
+fn frozen_input(
+    relation: &ProviderReadRelationNeed,
+) -> Result<QueryFrozenReadInput, ProviderReadError> {
     let version = match relation {
         ProviderReadRelationNeed::Data { version, .. }
         | ProviderReadRelationNeed::FrozenInputSet { version, .. }
@@ -1236,7 +1317,9 @@ fn frozen_input(relation: &ProviderReadRelationNeed) -> Result<QueryFrozenReadIn
         // are stated by the Delta need and select the window at open time.
         ProviderReadRelationNeed::Delta { .. } => return Ok(QueryFrozenReadInput::Current),
         ProviderReadRelationNeed::MvTarget { .. } => {
-            return Err("MV target reads require their target admission".to_string());
+            return Err("MV target reads require their target admission"
+                .to_string()
+                .into());
         }
     };
     Ok(match version {
@@ -1308,7 +1391,7 @@ fn open_relation(
         Option<RuntimeSplitPlacement>,
         Option<ConnectorReadMetadataKind>,
     ),
-    String,
+    ProviderReadError,
 > {
     use crate::catalog_application::query_bindings::QueryFrozenCohortRead;
 
@@ -1328,22 +1411,18 @@ fn open_relation(
                     return metadata
                         .adopt_frozen_source(session, source)
                         .map(|handle| (handle, None, None))
-                        .map_err(|error| {
-                            format!("provider read of {name} cannot adopt its original frozen source: {error}")
-                        });
+                        .map_err(|error| ProviderReadError::from(error).context(format!("provider read of {name} cannot adopt its original frozen source")));
                 }
                 metadata
                 .get_pinned_file_set_handle(session, table, &read.pinned)
-                .map_err(|error| {
-                    format!(
-                        "provider read of {name} cannot be opened restricted to the {} data files pinned at version {}: {error}",
+                .map_err(|error| ProviderReadError::from(error).context(format!(
+                        "provider read of {name} cannot be opened restricted to the {} data files pinned at version {}",
                         read.pinned.files().len(),
                         read.pinned.version_ordinal()
-                    )
-                })?
-                .ok_or_else(|| {
+                    )))?
+                .ok_or_else(|| ProviderReadError::Contract({
                     format!("provider read of {name} exposes no pinned file set read")
-                })
+                }))
                 .map(|handle| (handle, None, None))
             }
             (
@@ -1357,23 +1436,28 @@ fn open_relation(
                         novarocks_spi::connector::read_stack::ConnectorReadFrozenRewriteGroup::from_cohort(&read.group, read.group_digest),
                     ),
                 )
-                .map_err(|error| {
-                    format!("provider read of {name} cannot be opened as table-execute: {error}")
-                })?
-                .ok_or_else(|| {
+                .map_err(|error| ProviderReadError::from(error).context(format!("provider read of {name} cannot be opened as table-execute")))?
+                .ok_or_else(|| ProviderReadError::Contract({
                     format!("provider read of {name} exposes no table-execute relation")
-                })
+                }))
                 .map(|handle| (handle, None, None)),
-            _ => Err(unsupported_family(relation)),
+            _ => Err(unsupported_family(relation).into()),
         };
     }
     match relation {
         ProviderReadRelationNeed::Data { version, .. }
         | ProviderReadRelationNeed::FrozenInputSet { version, .. } => metadata
             .get_table_handle(session, table, relation_version(*version), None)
-            .map_err(|error| format!("provider read of {name} cannot be opened: {error}"))?
+            .map_err(|error| {
+                ProviderReadError::from(error)
+                    .context(format!("provider read of {name} cannot be opened"))
+            })?
             .ok_or_else(|| {
-                format!("provider read of {name} is no longer resolvable after admission pinned it")
+                ProviderReadError::Contract({
+                    format!(
+                        "provider read of {name} is no longer resolvable after admission pinned it"
+                    )
+                })
             })
             .map(|handle| (handle, None, None)),
         ProviderReadRelationNeed::Metadata { kind, version, .. } => {
@@ -1381,14 +1465,22 @@ fn open_relation(
                 metadata_kind(*kind)?,
                 metadata_version(*version),
             )
-            .map_err(|error| format!("provider read of {name}: {error}"))?;
+            .map_err(|error| {
+                ProviderReadError::from(error).context(format!("provider read of {name}"))
+            })?;
             let plan = metadata
                 .get_system_table_plan_for_request(session, table, &request)
                 .map_err(|error| {
-                    format!("provider read of {name} cannot be opened as metadata: {error}")
+                    ProviderReadError::from(error).context(format!(
+                        "provider read of {name} cannot be opened as metadata"
+                    ))
                 })?
                 .ok_or_else(|| {
-                    format!("provider read of {name} is not a metadata relation of this provider")
+                    ProviderReadError::Contract({
+                        format!(
+                            "provider read of {name} is not a metadata relation of this provider"
+                        )
+                    })
                 })?;
             let placement = match plan.unit_hint() {
                 novarocks_spi::connector::read_stack::SystemTableUnitHint::ManyUnits => {
@@ -1417,8 +1509,15 @@ fn open_relation(
                     *to_snapshot_id,
                 ),
             )
-            .map_err(|error| format!("provider read of {name} cannot open change window: {error}"))?
-            .ok_or_else(|| format!("provider read of {name} exposes no change window"))
+            .map_err(|error| {
+                ProviderReadError::from(error)
+                    .context(format!("provider read of {name} cannot open change window"))
+            })?
+            .ok_or_else(|| {
+                ProviderReadError::Contract(format!(
+                    "provider read of {name} exposes no change window"
+                ))
+            })
             .map(|handle| (handle, None, None)),
         ProviderReadRelationNeed::MvTarget {
             target_snapshot_id, ..
@@ -1428,9 +1527,9 @@ fn open_relation(
                 object_id,
             } = admitted
             else {
-                return Err(format!(
-                    "provider read of {name} lacks its exact MV target admission"
-                ));
+                return Err(
+                    format!("provider read of {name} lacks its exact MV target admission").into(),
+                );
             };
             let selection = materialization.mv_partition_selection.as_ref();
             let opened = match selection {
@@ -1438,7 +1537,8 @@ fn open_relation(
                     if selection.object_id() != object_id {
                         return Err(format!(
                             "provider read of {name} has a different MV target selection object"
-                        ));
+                        )
+                        .into());
                     }
                     metadata.get_mv_target_partition_handle(session, table, selection)
                 }
@@ -1448,12 +1548,18 @@ fn open_relation(
             };
             opened
                 .map_err(|error| {
-                    format!("provider read of {name} cannot open frozen MV target: {error}")
+                    ProviderReadError::from(error).context(format!(
+                        "provider read of {name} cannot open frozen MV target"
+                    ))
                 })?
-                .ok_or_else(|| format!("provider read of {name} exposes no frozen MV target"))
+                .ok_or_else(|| {
+                    ProviderReadError::Contract(format!(
+                        "provider read of {name} exposes no frozen MV target"
+                    ))
+                })
                 .map(|handle| (handle, None, None))
         }
-        _ => Err(unsupported_family(relation)),
+        _ => Err(unsupported_family(relation).into()),
     }
 }
 
@@ -1486,7 +1592,9 @@ const fn metadata_version(version: ProviderReadVersionNeed) -> ConnectorReadMeta
 /// it this read wants is the read's own version. So the overlay is unwrapped
 /// here, and the snapshot its name carries has to be the one the read asks
 /// for -- two different snapshots would be two different reads.
-fn provider_relation_name(relation: &ProviderReadRelationNeed) -> Result<String, String> {
+fn provider_relation_name(
+    relation: &ProviderReadRelationNeed,
+) -> Result<String, ProviderReadError> {
     let identity = relation_identity(relation);
     if let Some((base_table, overlaid)) =
         crate::catalog_application::query_bindings::parse_time_travel_overlay_identity(
@@ -1503,7 +1611,8 @@ fn provider_relation_name(relation: &ProviderReadRelationNeed) -> Result<String,
             return Err(format!(
                 "provider read of {} names snapshot {overlaid} but asks for {version:?}",
                 identity.table
-            ));
+            )
+            .into());
         }
         return Ok(base_table.to_string());
     }
@@ -1518,7 +1627,7 @@ fn provider_relation_name(relation: &ProviderReadRelationNeed) -> Result<String,
 }
 
 /// The provider's own spelling of one metadata relation.
-fn metadata_kind(kind: MetadataTableKind) -> Result<ConnectorReadMetadataKind, String> {
+fn metadata_kind(kind: MetadataTableKind) -> Result<ConnectorReadMetadataKind, ProviderReadError> {
     let suffix = match kind {
         MetadataTableKind::Snapshots => "$snapshots",
         MetadataTableKind::History => "$history",
@@ -1530,8 +1639,9 @@ fn metadata_kind(kind: MetadataTableKind) -> Result<ConnectorReadMetadataKind, S
         }
         MetadataTableKind::Entries => "$entries",
     };
-    ConnectorReadMetadataKind::try_new(suffix)
-        .map_err(|error| format!("metadata relation kind {suffix}: {error}"))
+    ConnectorReadMetadataKind::try_new(suffix).map_err(|error| {
+        ProviderReadError::from(error).context(format!("metadata relation kind {suffix}"))
+    })
 }
 
 /// Bind each requested ordinal to the provider column it names.
@@ -1539,7 +1649,7 @@ fn assignments_for(
     columns: &[ProviderReadColumnNeed],
     bindings: &[ConnectorReadColumnBinding],
     name: &str,
-) -> Result<Vec<ConnectorReadAssignment>, String> {
+) -> Result<Vec<ConnectorReadAssignment>, ProviderReadError> {
     let mut assignments = Vec::with_capacity(columns.len());
     for column in columns {
         let binding = unique_binding(bindings, column.name(), name)?;
@@ -1549,10 +1659,10 @@ fn assignments_for(
             column.connector_type(),
         )
         .map_err(|error| {
-            format!(
-                "provider read of {name} cannot bind output column '{}': {error}",
+            ProviderReadError::from(error).context(format!(
+                "provider read of {name} cannot bind output column '{}'",
                 column.name()
-            )
+            ))
         })?;
         assignments.push(assignment);
     }
@@ -1566,15 +1676,18 @@ fn unique_binding<'a>(
     bindings: &'a [ConnectorReadColumnBinding],
     column: &str,
     name: &str,
-) -> Result<&'a ConnectorReadColumnBinding, String> {
+) -> Result<&'a ConnectorReadColumnBinding, ProviderReadError> {
     let mut matched = bindings.iter().filter(|binding| binding.name() == column);
     let first = matched.next().ok_or_else(|| {
-        format!("provider read of {name} has no provider column named '{column}'")
+        ProviderReadError::Contract({
+            format!("provider read of {name} has no provider column named '{column}'")
+        })
     })?;
     if matched.next().is_some() {
         return Err(format!(
             "provider read of {name} matches more than one provider column named '{column}'"
-        ));
+        )
+        .into());
     }
     Ok(first)
 }
@@ -1605,7 +1718,7 @@ fn offered_ops(
     need: &ProviderReadNeed,
     assignments: &[ConnectorReadAssignment],
     columns: &BTreeMap<u32, ConnectorReadColumnHandle>,
-) -> Result<OfferedOps, String> {
+) -> Result<OfferedOps, ProviderReadError> {
     let mut ops = vec![ReadPushdownOp::Projection {
         assignments: assignments.to_vec(),
     }];
@@ -1632,7 +1745,7 @@ fn offered_ops(
 fn provider_constraint(
     filter: &Constraint<u32>,
     columns: &BTreeMap<u32, ConnectorReadColumnHandle>,
-) -> Result<ConnectorReadConstraint, String> {
+) -> Result<ConnectorReadConstraint, ProviderReadError> {
     let mut missing = None;
     let summary = filter.summary().transform_keys(|ordinal| {
         let column = columns.get(ordinal).cloned();
@@ -1646,16 +1759,20 @@ fn provider_constraint(
         let column = columns
             .get(ordinal)
             .cloned()
-            .ok_or_else(|| format!("read constraint names projection ordinal {ordinal}, which the read does not project"))?;
+            .ok_or_else(|| ProviderReadError::Contract(format!("read constraint names projection ordinal {ordinal}, which the read does not project")))?;
         assignments.insert(Arc::clone(variable), column);
     }
     if let Some(ordinal) = missing {
         return Err(format!(
             "read constraint names projection ordinal {ordinal}, which the read does not project"
-        ));
+        )
+        .into());
     }
-    ConnectorReadConstraint::try_new(summary, filter.expression().clone(), assignments)
-        .map_err(|error| format!("read constraint cannot be offered: {error}"))
+    ConnectorReadConstraint::try_new(summary, filter.expression().clone(), assignments).map_err(
+        |error| {
+            ProviderReadError::from(error).context(format!("read constraint cannot be offered"))
+        },
+    )
 }
 
 /// What the provider guaranteed, per predicate occurrence.
@@ -1790,17 +1907,17 @@ fn column_facts(
     assignments: &[ConnectorReadAssignment],
     encoder: &dyn ConnectorReadWireEncoder,
     name: &str,
-) -> Result<ProviderColumnFacts, String> {
+) -> Result<ProviderColumnFacts, ProviderReadError> {
     let mut facts = Vec::with_capacity(columns.len());
     let mut named = Vec::with_capacity(columns.len());
     for (column, assignment) in columns.iter().zip(assignments.iter()) {
         let payload = encoder
             .encode_column_payload(assignment.column())
             .map_err(|error| {
-                format!(
-                    "provider read of {name} cannot encode column '{}': {error}",
+                ProviderReadError::from(error).context(format!(
+                    "provider read of {name} cannot encode column '{}'",
                     column.name()
-                )
+                ))
             })?;
         let reference = ProviderColumnReference {
             column_payload: payload,
@@ -1820,7 +1937,7 @@ fn read_properties(
     properties: &ConnectorReadProperties<ConnectorReadColumnHandle>,
     ordinals: &BTreeMap<ConnectorReadColumnHandle, u32>,
     name: &str,
-) -> Result<ProviderReadProperties, String> {
+) -> Result<ProviderReadProperties, ProviderReadError> {
     let distribution = match properties.distribution() {
         ConnectorReadDistribution::Unconstrained => ProviderReadDistribution::Unconstrained,
         ConnectorReadDistribution::Singleton => ProviderReadDistribution::Singleton,
@@ -1835,7 +1952,8 @@ fn read_properties(
             return Err(format!(
                 "provider read of {name} declares a partitioned distribution without the \
                      partition proof a plan property requires"
-            ));
+            )
+            .into());
         }
     };
     let ordering = properties
@@ -1843,7 +1961,9 @@ fn read_properties(
         .iter()
         .map(|key| {
             let request_ordinal = ordinals.get(key.column()).copied().ok_or_else(|| {
-                format!("provider read of {name} orders by a column it does not project")
+                ProviderReadError::Contract({
+                    format!("provider read of {name} orders by a column it does not project")
+                })
             })?;
             Ok(ProviderReadOrderingKey {
                 request_ordinal,
@@ -1857,7 +1977,7 @@ fn read_properties(
                 },
             })
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, ProviderReadError>>()?;
     Ok(ProviderReadProperties {
         distribution,
         ordering: ordering.into_boxed_slice(),
@@ -1868,7 +1988,7 @@ fn read_properties(
 fn request_control_for(
     read: &ConnectorControlReadBinding,
     context: &ConnectorRequestContext,
-) -> Result<ConnectorReadRequestControl, String> {
+) -> Result<ConnectorReadRequestControl, ProviderReadError> {
     let Some(factory) = read.request_factory() else {
         return Ok(ConnectorReadRequestControl::unsupported_attempt_access(
             read.metadata(),
@@ -1877,10 +1997,26 @@ fn request_control_for(
     };
     let planning =
         ConnectorPlanningContext::try_from_request(context.clone().without_attempt_capabilities())
-            .map_err(|error| format!("read planning context: {error}"))?;
+            .map_err(|error| {
+                ProviderReadError::from(error).context(format!("read planning context"))
+            })?;
     factory
         .for_planning(&planning)
-        .map_err(|error| format!("read request control: {error}"))
+        .map_err(|error| ProviderReadError::from(error).context(format!("read request control")))
+}
+
+#[async_trait]
+impl ProviderReadFactPort for FrontendProviderReadFacts {
+    type Access = FrozenProviderRead;
+    async fn resolve_provider_reads(
+        &self,
+        needs: &[ProviderReadNeed],
+        taken: &ReadAccessSink<Self::Access>,
+    ) -> Result<Vec<ProviderReadFact>, String> {
+        self.resolve_provider_reads_typed(needs, taken)
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -1909,6 +2045,7 @@ mod tests {
         assert!(
             metadata_kind(MetadataTableKind::Partitions)
                 .unwrap_err()
+                .to_string()
                 .contains("invariant: $partitions is a SQL view over $files")
         );
         assert_eq!(

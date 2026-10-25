@@ -34,6 +34,24 @@ use novarocks_sql::planning::dml::{
     DmlStatisticsEvidence, DmlStatisticsFailure, DmlStatisticsSnapshot,
 };
 
+/// The actual statistics observer's refusal and its request label travel
+/// together. Existing legacy callers render only at their outer String port.
+#[derive(Clone, Debug)]
+pub(crate) struct StatisticsSnapshotFailure {
+    pub(crate) label: String,
+    pub(crate) error: novarocks_spi::connector::ConnectorError,
+}
+impl std::fmt::Display for StatisticsSnapshotFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "freeze statistics for {}: {}", self.label, self.error)
+    }
+}
+impl std::error::Error for StatisticsSnapshotFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 #[derive(Clone, Default)]
 /// Query-scoped handles for the one unified statistics resolver.  This is not
 /// a provider registry: absent pins intentionally produce missing statistics
@@ -78,6 +96,20 @@ impl QueryStatisticsContext {
         bindings: Arc<QueryTableBindingStore>,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Self, String> {
+        Self::from_statistics_resolver_with_bindings_async_typed(
+            resolver,
+            bindings,
+            connector_context,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn from_statistics_resolver_with_bindings_async_typed(
+        resolver: &impl QueryStatisticsResolver,
+        bindings: Arc<QueryTableBindingStore>,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<Self, StatisticsSnapshotFailure> {
         Ok(Self {
             snapshot: DmlStatisticsSnapshot::from_evidence(
                 project_statistics_evidence_async(
@@ -161,7 +193,7 @@ async fn project_statistics_evidence_async(
     resolver: &UnifiedStatisticsResolver,
     bindings: &QueryTableBindingStore,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<Vec<DmlStatisticsEvidence>, String> {
+) -> Result<Vec<DmlStatisticsEvidence>, StatisticsSnapshotFailure> {
     let mut evidence = Vec::new();
     for (binding_id, binding) in bindings.captured_bindings() {
         let facts = materialization_statistics_facts(&binding.resolved);
@@ -378,7 +410,8 @@ pub(crate) async fn resolve_statistics_need_async(
                 need.metrics(),
                 connector_context,
             )
-            .await?
+            .await
+            .map_err(|error| error.to_string())?
         }
         // An unknown token is a contradiction with the exact catalog fact
         // that introduced this SQL binding. It must not become a best-effort
@@ -400,7 +433,7 @@ async fn project_binding_statistics_for_metrics_async(
     binding: &QueryTableBinding,
     requested_metrics: &[StatisticsMetric],
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<DmlStatisticsEvidence, String> {
+) -> Result<DmlStatisticsEvidence, StatisticsSnapshotFailure> {
     let Some(pin) = binding.statistics_pin.as_ref() else {
         return Ok(DmlStatisticsEvidence::Missing {
             binding: binding_id,
@@ -467,7 +500,10 @@ async fn project_binding_statistics_for_metrics_async(
                     | novarocks_spi::connector::ConnectorErrorKind::DeadlineExceeded
             ) =>
         {
-            return Err(format!("freeze statistics for {label}: {error}"));
+            return Err(StatisticsSnapshotFailure {
+                label: label.to_owned(),
+                error,
+            });
         }
         Err(StatisticsResolutionFailure::Connector(error)) => {
             return Ok(DmlStatisticsEvidence::Missing {
@@ -656,6 +692,7 @@ mod unified_tests {
         reads: AtomicUsize,
         requested_metrics: Mutex<Vec<Vec<StatisticsMetric>>>,
         async_reads: AtomicUsize,
+        refusal: Mutex<Option<ConnectorError>>,
     }
 
     impl ContextObservingProvider {
@@ -752,6 +789,9 @@ mod unified_tests {
                 .lock()
                 .expect("statistics fixture metrics lock")
                 .push(request.metrics.metrics().to_vec());
+            if let Some(error) = self.refusal.lock().unwrap().as_ref() {
+                return Err(error.clone());
+            }
             if request.context.is_cancelled() {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::Cancelled,
@@ -787,6 +827,9 @@ mod unified_tests {
                     .lock()
                     .expect("statistics fixture metrics lock")
                     .push(request.metrics.metrics().to_vec());
+                if let Some(error) = self.refusal.lock().unwrap().as_ref() {
+                    return Err(error.clone());
+                }
                 Err(ConnectorError::new(
                     ConnectorErrorKind::Internal,
                     "asynchronous statistics fixture has no evidence",
@@ -841,6 +884,7 @@ mod unified_tests {
             reads: AtomicUsize::new(0),
             requested_metrics: Mutex::new(Vec::new()),
             async_reads: AtomicUsize::new(0),
+            refusal: Mutex::new(None),
         })
     }
 
@@ -956,6 +1000,48 @@ mod unified_tests {
             provider.requested_metrics.lock().unwrap().as_slice(),
             [expected.metrics().to_vec()]
         );
+    }
+
+    #[tokio::test]
+    async fn async_snapshot_preserves_the_actual_statistics_refusal_and_shared_cause() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        let provider = observing_provider();
+        let original = ConnectorError::from_domain(
+            ConnectorErrorKind::Cancelled,
+            ConnectorError::new(
+                ConnectorErrorKind::Cancelled,
+                "original statistics reader stop",
+            ),
+        );
+        *provider.refusal.lock().unwrap() = Some(original.clone());
+        let bindings = QueryTableBindingStore::try_new().unwrap();
+        bindings.insert_strict_base_binding_for_test(
+            "ice.main",
+            "db",
+            "orders",
+            connector_binding_with_statistics(provider.clone()),
+        );
+        let context = request_context(Instant::now() + Duration::from_secs(60), false);
+        let error = project_statistics_evidence_async(
+            &UnifiedStatisticsResolver::default(),
+            &bindings,
+            &context,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.error, original);
+        assert_eq!(error.error.failure_fact(), original.failure_fact());
+        let cause = std::error::Error::source(&error.error)
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap();
+        let expected = std::error::Error::source(&original)
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap();
+        assert_eq!(cause, expected);
+        assert_eq!(provider.async_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.reads.load(Ordering::SeqCst), 1);
     }
 
     #[test]

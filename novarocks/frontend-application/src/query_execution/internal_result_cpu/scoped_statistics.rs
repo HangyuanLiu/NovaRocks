@@ -43,7 +43,12 @@ impl ClosedCreatorInput {
     }
     pub(super) fn take_read_result_in(
         &mut self,
-        target: &mut Option<Result<novarocks_sql::compiler::ProviderReadFact, String>>,
+        target: &mut Option<
+            Result<
+                novarocks_sql::compiler::ProviderReadFact,
+                super::super::provider_read_facts::ProviderReadError,
+            >,
+        >,
     ) -> Result<(), &'static str> {
         match self {
             Self::Read(input) => input.take_result_in(target),

@@ -100,18 +100,38 @@ impl FrontendCompletionCustody {
         needs: &[novarocks_sql::compiler::ProviderReadNeed],
         taken: &novarocks_query_application::preparation::ReadAccessSink<FrozenProviderRead>,
     ) -> Result<Vec<novarocks_sql::compiler::ProviderReadFact>, String> {
-        use novarocks_query_application::preparation::ProviderReadFactPort;
+        self.resolve_provider_reads_typed(needs, taken)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn resolve_provider_reads_typed(
+        &self,
+        needs: &[novarocks_sql::compiler::ProviderReadNeed],
+        taken: &novarocks_query_application::preparation::ReadAccessSink<FrozenProviderRead>,
+    ) -> Result<
+        Vec<novarocks_sql::compiler::ProviderReadFact>,
+        crate::query_execution::provider_read_facts::ProviderReadError,
+    > {
         let provider = {
             let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            if state.joined || state.health.is_some() {
+            if let Some(health) = &state.health {
+                return Err(
+                    crate::query_execution::provider_read_facts::ProviderReadError::ActualExit(
+                        health.clone(),
+                    ),
+                );
+            }
+            if state.joined {
                 return Err("completion Provider source is closed or unhealthy".into());
             }
-            state
-                .provider
-                .clone()
-                .ok_or_else(|| "completion Provider source is not installed".to_owned())?
+            state.provider.clone().ok_or_else(|| {
+                crate::query_execution::provider_read_facts::ProviderReadError::Contract(
+                    "completion Provider source is not installed".to_owned(),
+                )
+            })?
         };
-        provider.resolve_provider_reads(needs, taken).await
+        provider.resolve_provider_reads_typed(needs, taken).await
     }
 
     pub(crate) fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {

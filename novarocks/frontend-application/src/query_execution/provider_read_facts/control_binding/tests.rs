@@ -344,3 +344,70 @@ fn original_provider_child_waiting_reply_keeps_exact_parent_cancellation() {
     drop((child, blockers, alias, window, capacity, scope));
     finish(control, root, driver);
 }
+
+#[test]
+fn factory_refusal_keeps_original_connector_source_and_fact_in_the_same_binding() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
+    struct RefusingFactory {
+        error: ConnectorError,
+        visits: AtomicUsize,
+    }
+    impl ConnectorReadRequestControlFactory for RefusingFactory {
+        fn visit_planning_dependencies(
+            &self,
+            _: &mut dyn FnMut(&SharedDependency) -> Result<(), ConnectorError>,
+        ) -> Result<(), ConnectorError> {
+            self.visits.fetch_add(1, Ordering::SeqCst);
+            Err(self.error.clone())
+        }
+        fn for_planning(
+            &self,
+            _: &ConnectorPlanningContext,
+        ) -> Result<ConnectorReadRequestControl, ConnectorError> {
+            panic!("a refused original factory cannot dispatch a read")
+        }
+    }
+    let (control, mut driver, capacity) = fixture();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let scope = root.owner.scope();
+    // Deliberately distinct outer kind: only the original producer fact may
+    // choose Control, never a facade label or the resulting diagnostic.
+    let error = ConnectorError::from_domain(
+        ConnectorErrorKind::ResourceExhausted,
+        WorkError::Cancelled(novarocks_workload_control::CancellationReason::Requested),
+    );
+    let cause = std::error::Error::source(&error)
+        .and_then(|source| source.downcast_ref::<SharedFailureCause>())
+        .unwrap()
+        .clone();
+    let factory = RefusingFactory {
+        error,
+        visits: AtomicUsize::new(0),
+    };
+    let mut binding = ProviderCreatorControlBinding::default();
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..2 {
+        let refusal = match binding.poll(&scope, &factory, &mut cx) {
+            Poll::Ready(Err(error)) => error,
+            _ => panic!("the actual selected factory refused before child admission"),
+        };
+        assert_eq!(refusal.fact(), Some(cause.failure_fact()));
+        assert_eq!(refusal.fact().unwrap().class(), FailureClass::Control);
+        let same = refusal
+            .into_original_cause()
+            .expect("actual producer failure");
+        assert_eq!(same, cause);
+    }
+    assert_eq!(
+        factory.visits.load(Ordering::SeqCst),
+        1,
+        "no replay after the source cached its refusal"
+    );
+    assert_eq!(control.snapshot().scopes.len(), 1);
+    binding.after_source_exit();
+    drop((binding, scope, factory, capacity));
+    drive(&mut driver);
+    finish(control, root, driver);
+}

@@ -1250,7 +1250,11 @@ fn frozen_mv_target_routing_preserves_exact_provider_facts_and_generic_history()
         "db.orders",
     )
     .expect_err("ordinary admission cannot open an MV target");
-    assert!(error.contains("lacks its exact MV target admission"));
+    assert!(
+        error
+            .to_string()
+            .contains("lacks its exact MV target admission")
+    );
     partitioned.mv_partition_selection = Some(selection(
         ConnectorTableObjectId::try_new(Bytes::from_static(b"foreign-object")).unwrap(),
     ));

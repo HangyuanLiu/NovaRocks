@@ -864,7 +864,12 @@ impl ProviderReadCpuJob {
     pub(crate) fn poll_finish_in(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        destination: &mut Option<Result<novarocks_sql::compiler::ProviderReadFact, String>>,
+        destination: &mut Option<
+            Result<
+                novarocks_sql::compiler::ProviderReadFact,
+                super::provider_read_facts::ProviderReadError,
+            >,
+        >,
     ) -> std::task::Poll<Result<(), Arc<dyn std::error::Error + Send + Sync>>> {
         use std::task::Poll;
         let job = self.job.as_mut().expect("same original Provider CPU job");
@@ -885,11 +890,35 @@ impl ProviderReadCpuJob {
                     .take_read_result_in(destination)
                     .expect("one stable Provider result receiver");
             } else {
-                let detail = match self.marker.as_ref() {
-                    Some(Err(error)) => error.detail().as_str().to_owned(),
-                    _ => "Provider creator stopped before result delivery".into(),
+                use super::provider_read_facts::{ProviderReadCpuFailure, ProviderReadError};
+                let error = match self.marker.as_ref() {
+                    Some(Err(execution)) => {
+                        let admission = job
+                            .retirement
+                            .state
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .admission_failure
+                            .clone();
+                        ProviderReadError::Cpu(ProviderReadCpuFailure {
+                            execution: execution.clone(),
+                            admission,
+                        })
+                    }
+                    Some(Ok(value)) => match value.value() {
+                        Err(InternalDomainFailure::Source(source)) => {
+                            ProviderReadError::Original(source.clone())
+                        }
+                        Err(InternalDomainFailure::Diagnostic(message)) => {
+                            ProviderReadError::Contract(message.clone())
+                        }
+                        _ => ProviderReadError::Contract(
+                            "Provider creator stopped before result delivery".into(),
+                        ),
+                    },
+                    None => unreachable!("same original marker was received above"),
                 };
-                *destination = Some(Err(detail));
+                *destination = Some(Err(error));
             }
         }
         self.retire_sources()?;
