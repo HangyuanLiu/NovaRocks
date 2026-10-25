@@ -296,6 +296,33 @@ impl MvApplicationError {
         }
     }
 
+    /// Preserve the refresh product's original scheduler classification.
+    pub(crate) fn from_refresh_product(
+        error: &novarocks_mv_application::product::MvProductError,
+    ) -> Self {
+        use novarocks_mv_application::product::MvProductErrorKind as Kind;
+        let kind = match error.kind() {
+            Kind::KnownCommittedFinalizeFailed => {
+                MvApplicationErrorKind::KnownCommittedFinalizeFailed
+            }
+            Kind::Conflict => MvApplicationErrorKind::AlreadyActive,
+            Kind::Unavailable => MvApplicationErrorKind::Unavailable,
+            Kind::InvalidRequest => MvApplicationErrorKind::InvalidRequest,
+            Kind::CommitUnknown => MvApplicationErrorKind::CommitUnknown,
+            Kind::TargetReplaced => MvApplicationErrorKind::BindingInvalidated,
+            Kind::ProviderKnownUncommitted | Kind::Corruption | Kind::ShutdownCancelled => {
+                MvApplicationErrorKind::Engine
+            }
+        };
+        let mut failure = Self::new(kind, error.to_string())
+            .with_compile_control(error.compile_control_error())
+            .with_unavailable_implementation(error.unavailable_implementation().cloned());
+        if let Some(cause) = error.original_failure() {
+            failure = failure.with_original_failure(cause.clone());
+        }
+        failure
+    }
+
     /// Preserve the Connector author's original cause without deriving business
     /// disposition or compilation authority from it.
     pub fn from_connector(

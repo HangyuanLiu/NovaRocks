@@ -830,8 +830,19 @@ async fn admitted_current_retries_resolution_after_a_still_unknown_observation()
 #[tokio::test]
 async fn an_actual_local_committed_effect_still_uses_committed_convergence() {
     let fixture = Fixture::new(vec![]);
-    fixture
-        .dispatched()
+    let publication = fixture.dispatched();
+    // A Provider publication verdict alone does not install the management
+    // entrance's original committed responsibility. Its actual terminal must
+    // be received before Current can consume that exact convergence cut.
+    let premature = fixture
+        .observe(MvConvergence::CommittedEffect)
+        .await
+        .err()
+        .expect("Current must not bypass the original publication terminal");
+    assert!(premature.to_string().contains("ObservationNotAllowed"));
+    assert_eq!(*fixture.caps.events.lock().unwrap(), vec!["capture"]);
+    fixture.caps.events.lock().unwrap().clear();
+    publication
         .record_terminal(EffectDisposition::KnownCommitted)
         .unwrap();
     assert_ne!(

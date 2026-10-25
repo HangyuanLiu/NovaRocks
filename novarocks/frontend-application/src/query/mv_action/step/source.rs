@@ -17,7 +17,7 @@
 
 //! Stable original custody for one MV step's concrete borrowed phases.
 
-use super::super::{CommandInput, MvWake, StepRequest, original_error, service};
+use super::super::{CommandInput, MvPhaseFailure, MvWake, StepRequest, original_error, service};
 use crate::mv::domain::{
     application::{MvApplicationError, MvApplicationErrorKind},
     refresh::target_binding::MvTargetBinding,
@@ -100,7 +100,7 @@ enum Phase {
 /// Observation never borrows the unique Body or grants work authority.
 pub(super) struct StepSource {
     body: Mutex<Option<Box<Body>>>,
-    response: Mutex<Option<Result<(), QueryServiceError>>>,
+    response: Mutex<Option<Result<(), MvPhaseFailure>>>,
     active: AtomicBool,
     poisoned: AtomicBool,
     health: Mutex<Option<StatementNativeHealthFailure>>,
@@ -150,7 +150,7 @@ struct Body {
     assembly: Option<PreparedMvNativeWriteAssembly>,
     needed: Option<Arc<ConnectorWriteNeededReady>>,
     published: Option<MvRefreshPublicationFinalizationFacts>,
-    commit_result: Option<Result<(), QueryServiceError>>,
+    commit_result: Option<Result<(), MvPhaseFailure>>,
     project: Option<ProjectInput>,
     terminal_recorded: Option<(EffectDisposition, Result<(), QueryServiceError>)>,
 }
@@ -384,7 +384,7 @@ impl StepSource {
     }
     pub(super) fn take_phase_result_in(
         &self,
-        target: &mut Option<Result<(), QueryServiceError>>,
+        target: &mut Option<Result<(), MvPhaseFailure>>,
     ) -> Result<(), QueryServiceError> {
         if target.is_some() {
             return Err(service("MV phase result receiver is occupied"));
@@ -491,12 +491,12 @@ impl StepSource {
     pub(super) fn receive_committed(
         &self,
         needed: &Arc<ConnectorWriteNeededReady>,
-    ) -> Result<(), QueryServiceError> {
+    ) -> Result<(), MvPhaseFailure> {
         let mut loan = self.loan()?;
         let body = loan.body.as_mut().unwrap();
         match body.needed.as_ref() {
             Some(original) if !Arc::ptr_eq(original, needed) => {
-                return Err(service("MV received a different publication receipt"));
+                return Err(phase_service("MV received a different publication receipt"));
             }
             Some(_) => {
                 if let Some(result) = &body.commit_result {
@@ -507,14 +507,14 @@ impl StepSource {
         }
         let result = (|| {
             if needed.effect() != ExternalMutationEffect::Applied {
-                return Err(service(
+                return Err(phase_service(
                     "MV publication did not apply its declared document set",
                 ));
             }
             let intent = body
                 .intent
                 .as_ref()
-                .ok_or_else(|| service("MV committed publication lost its original intent"))?
+                .ok_or_else(|| phase_service("MV committed publication lost its original intent"))?
                 .clone();
             let mut guard = PollGuard {
                 source: self,
@@ -681,7 +681,7 @@ impl StepSource {
             Poll::Ready(Ok(()))
         }
     }
-    async fn run(&self, phase: Phase) -> Result<(), QueryServiceError> {
+    async fn run(&self, phase: Phase) -> Result<(), MvPhaseFailure> {
         let mut loan = self.loan()?;
         let body = loan.body.as_mut().unwrap();
         match phase {
@@ -706,9 +706,9 @@ impl Body {
             self.wake.clone(),
         )
     }
-    async fn prepare(&mut self, source: &StepSource) -> Result<(), QueryServiceError> {
+    async fn prepare(&mut self, source: &StepSource) -> Result<(), MvPhaseFailure> {
         if self.preparation_started {
-            return Err(service("MV original preparation was already started"));
+            return Err(phase_service("MV original preparation was already started"));
         }
         self.preparation_started = true;
         // Preserve the original activity-before-preparation order, including
@@ -739,6 +739,35 @@ impl Body {
                 },
             )));
         }
+        #[cfg(novarocks_dev_controls)]
+        if let super::super::MvCommandRequest::ScheduledRefresh { requested, .. } =
+            &self.input.request
+        {
+            // Dependency steps must not consume the requested target's one
+            // scheduler claim. The activity lease is already in this Body.
+            if requested == &self.preparation_input.request.target {
+                if let Some(controls) = self.input.services.controls.as_ref() {
+                    match controls
+                        .scheduler_async(requested, &self.cancellation)
+                        .await
+                    {
+                        Ok(true) => {
+                            return Err(domain_error(MvApplicationError::new(
+                                MvApplicationErrorKind::ShutdownCancelled,
+                                "MV scheduler barrier was cancelled",
+                            )));
+                        }
+                        Err(error) => {
+                            return Err(domain_error(MvApplicationError::new(
+                                MvApplicationErrorKind::Unavailable,
+                                error,
+                            )));
+                        }
+                        Ok(false) => {}
+                    }
+                }
+            }
+        }
         // The outer Step installed this Source before this first child exists.
         let original = MvRefreshPreparationOriginal::for_refresh(
             self.preparation_input.clone(),
@@ -746,7 +775,7 @@ impl Body {
         );
         self.preparation
             .install_preparation(original)
-            .map_err(|_| service("MV original preparation slot is occupied"))?;
+            .map_err(|_| phase_service("MV original preparation slot is occupied"))?;
         poll_fn(|cx| self.preparation.poll_ready(cx))
             .await
             .map_err(|e| turn_error(source, e))?;
@@ -755,7 +784,7 @@ impl Body {
             .preparation_original()
             .take_result_in(&mut self.preparation_result)
         {
-            return Err(service(
+            return Err(phase_service(
                 "MV original preparation returned no receivable result",
             ));
         }
@@ -768,12 +797,14 @@ impl Body {
             .as_mut()
             .map_err(|e| domain_error(e.clone()))?;
         let MvRefreshPreparationOutput::Refresh(prepared) = output else {
-            return Err(service(
+            return Err(phase_service(
                 "MV refresh reader returned another operation's output",
             ));
         };
         if prepared.prepared.attempt != self.attempt {
-            return Err(service("MV preparation replaced its reserved attempt"));
+            return Err(phase_service(
+                "MV preparation replaced its reserved attempt",
+            ));
         }
         if matches!(prepared.prepared.work, PreparedMvRefreshWork::NoOp) {
             self.kind = Some(StepPreparedKind::NoOp);
@@ -813,7 +844,7 @@ impl Body {
         let target = prepared
             .target_binding
             .as_ref()
-            .ok_or_else(|| service("MV preparation has no exact retained target"))?;
+            .ok_or_else(|| phase_service("MV preparation has no exact retained target"))?;
         let planning = target.lease().clone();
         let binding = planning.binding();
         if prepared.prepared.observed_binding
@@ -850,19 +881,19 @@ impl Body {
         }
         Ok(())
     }
-    async fn activate(&mut self, source: &StepSource) -> Result<(), QueryServiceError> {
+    async fn activate(&mut self, source: &StepSource) -> Result<(), MvPhaseFailure> {
         if self.activation_started {
-            return Err(service("MV original activation was already started"));
+            return Err(phase_service("MV original activation was already started"));
         }
         self.activation_started = true;
         let planning = self
             .planning
             .as_ref()
-            .ok_or_else(|| service("MV activation has no retained planning lease"))?;
+            .ok_or_else(|| phase_service("MV activation has no retained planning lease"))?;
         let exact = self
             .exact_write
             .as_ref()
-            .ok_or_else(|| service("MV activation has no exact write lease"))?;
+            .ok_or_else(|| phase_service("MV activation has no exact write lease"))?;
         let current = self
             .input
             .ports
@@ -892,7 +923,7 @@ impl Body {
                 let session = self
                     .data
                     .as_ref()
-                    .ok_or_else(|| service("MV data activation lost its original artifact"))?
+                    .ok_or_else(|| phase_service("MV data activation lost its original artifact"))?
                     .begin_session_in(
                         self.context.clone(),
                         exact,
@@ -955,13 +986,17 @@ impl Body {
                     .map_err(connector_error)?,
                 );
             }
-            _ => return Err(service("MV activation requires a prepared publication")),
+            _ => {
+                return Err(phase_service(
+                    "MV activation requires a prepared publication",
+                ));
+            }
         }
         Ok(())
     }
-    async fn precommit(&mut self, source: &StepSource) -> Result<(), QueryServiceError> {
+    async fn precommit(&mut self, source: &StepSource) -> Result<(), MvPhaseFailure> {
         if self.precommit.is_some() {
-            return Err(service("MV original precommit was already started"));
+            return Err(phase_service("MV original precommit was already started"));
         }
         #[cfg(novarocks_dev_controls)]
         if self.kind == Some(StepPreparedKind::Data) {
@@ -995,7 +1030,7 @@ impl Body {
         );
         self.admitted
             .as_ref()
-            .ok_or_else(|| service("MV precommit lost its original admission"))?
+            .ok_or_else(|| phase_service("MV precommit lost its original admission"))?
             .recheck_current_dependencies_async(
                 self.planning.as_ref().unwrap(),
                 &self.context,
@@ -1021,7 +1056,7 @@ impl Body {
             .as_mut()
             .unwrap()
             .install_activation(original)
-            .map_err(|_| service("MV precommit original receiver is occupied"))?;
+            .map_err(|_| phase_service("MV precommit original receiver is occupied"))?;
         let turn = self.precommit.as_mut().unwrap();
         poll_fn(|cx| turn.poll_ready(cx))
             .await
@@ -1032,26 +1067,28 @@ impl Body {
         turn.retire_transferred().map_err(service)?;
         match self.precommit_result.as_ref().unwrap() {
             Ok(MvWriteActivationOutput::PublicationPrepared) => Ok(()),
-            Ok(_) => Err(service("MV precommit returned another operation's output")),
+            Ok(_) => Err(phase_service(
+                "MV precommit returned another operation's output",
+            )),
             Err(error) => Err(domain_error(error.clone())),
         }
     }
-    async fn project(&mut self, source: &StepSource) -> Result<(), QueryServiceError> {
+    async fn project(&mut self, source: &StepSource) -> Result<(), MvPhaseFailure> {
         let project = self
             .project
             .as_ref()
-            .ok_or_else(|| service("MV projection has no original finite context"))?;
+            .ok_or_else(|| phase_service("MV projection has no original finite context"))?;
         self.io
             .check_existing_metadata_obligation_context(&self.root, &project.context)
             .map_err(original_error)?;
         let published = self
             .published
             .as_ref()
-            .ok_or_else(|| service("MV projection has no received committed facts"))?;
+            .ok_or_else(|| phase_service("MV projection has no received committed facts"))?;
         let snapshot_id = published
             .publication_version()
             .snapshot_id()
-            .ok_or_else(|| service("MV committed receipt has no exact snapshot"))?;
+            .ok_or_else(|| phase_service("MV committed receipt has no exact snapshot"))?;
         #[cfg(novarocks_dev_controls)]
         if let Some(controls) = &self.input.services.controls {
             let target = self.product_target.as_ref().unwrap();
@@ -1124,15 +1161,18 @@ impl Body {
             &source.project_registration,
         )
         .await
-        .map_err(|error| match error.original_failure() {
-            Some(cause) => QueryServiceError::from_failure_cause(cause.clone()),
-            None => domain_error(MvApplicationError::new(
+        .map_err(|error| {
+            let mut domain = MvApplicationError::new(
                 MvApplicationErrorKind::KnownCommittedFinalizeFailed,
                 error.to_string(),
-            )),
+            );
+            if let Some(cause) = error.original_failure() {
+                domain = domain.with_original_failure(cause.clone());
+            }
+            domain_error(domain)
         })
     }
-    async fn close(&mut self, source: &StepSource) -> Result<(), QueryServiceError> {
+    async fn close(&mut self, source: &StepSource) -> Result<(), MvPhaseFailure> {
         // The outer Step waits for Native and its publication Call first. These
         // are only this Source's concrete CPU, Provider and registration tails.
         if let Some(write) = self.write.as_mut() {
@@ -1221,44 +1261,52 @@ impl Drop for PhaseCall {
     }
 }
 
-pub(super) fn domain_error(error: MvApplicationError) -> QueryServiceError {
-    crate::query::routed_execution_service_error(crate::query::product_command_error(
-        crate::mv::command::mv_application_command_error(error),
-    ))
+pub(super) fn domain_error(error: MvApplicationError) -> MvPhaseFailure {
+    let service =
+        crate::query::routed_execution_service_error(crate::query::product_command_error(
+            crate::mv::command::mv_application_command_error(error.clone()),
+        ));
+    MvPhaseFailure {
+        service,
+        domain: Some(error),
+    }
 }
-fn connector_error(error: ConnectorError) -> QueryServiceError {
+fn phase_service(message: impl ToString) -> MvPhaseFailure {
+    service(message).into()
+}
+fn connector_error(error: ConnectorError) -> MvPhaseFailure {
     domain_error(MvApplicationError::from_connector(
         MvApplicationErrorKind::Engine,
         error,
     ))
 }
-fn turn_error(source: &StepSource, error: MvTurnFailure) -> QueryServiceError {
+fn turn_error(source: &StepSource, error: MvTurnFailure) -> MvPhaseFailure {
     match error {
-        MvTurnFailure::Admission(error) => original_error(error),
-        MvTurnFailure::Cpu(error) => QueryServiceError::from_execution_failure(error),
-        MvTurnFailure::Health(health) => health_error(source, health),
+        MvTurnFailure::Admission(error) => original_error(error).into(),
+        MvTurnFailure::Cpu(error) => QueryServiceError::from_execution_failure(error).into(),
+        MvTurnFailure::Health(health) => health_error(source, health).into(),
     }
 }
 fn health_error(source: &StepSource, health: StatementNativeHealthFailure) -> QueryServiceError {
     source.retain_health(health);
     service("MV original local exit is unproven")
 }
-fn write_error(source: &StepSource, error: MvWritePreparationFailure) -> QueryServiceError {
+fn write_error(source: &StepSource, error: MvWritePreparationFailure) -> MvPhaseFailure {
     match error {
         MvWritePreparationFailure::Domain(error) => domain_error(error),
         MvWritePreparationFailure::Turn(error) => turn_error(source, error),
         MvWritePreparationFailure::Provider(error) => match error.into_original_cause() {
-            Ok(cause) => QueryServiceError::from_failure_cause(cause),
+            Ok(cause) => QueryServiceError::from_failure_cause(cause).into(),
             Err(crate::query_execution::provider_read_facts::ProviderReadError::ActualExit(
                 health,
-            )) => health_error(source, health),
+            )) => health_error(source, health).into(),
             Err(crate::query_execution::provider_read_facts::ProviderReadError::Contract(
                 message,
-            )) => service(message),
+            )) => phase_service(message),
             Err(_) => unreachable!("typed Provider source was received above"),
         },
         MvWritePreparationFailure::Statistics(error) => connector_error(error.error),
-        MvWritePreparationFailure::Health(health) => health_error(source, health),
+        MvWritePreparationFailure::Health(health) => health_error(source, health).into(),
     }
 }
 

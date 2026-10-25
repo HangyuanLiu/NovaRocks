@@ -563,6 +563,26 @@ async fn known_committed_refresh_rejects_a_different_publication_before_projecti
 
     assert_eq!(error.kind(), MvProductErrorKind::Corruption);
     assert!(effects.events().is_empty());
+    use novarocks_failure_contract::{
+        FailureClass, FailureProjection, FailureReason, SharedFailureCause, domain,
+    };
+    let fact = error.failure_fact();
+    assert_eq!(fact.class(), FailureClass::Data);
+    assert_eq!(
+        fact.reason(),
+        FailureReason::new(domain::METADATA, crate::product::failure_reason::CORRUPTION)
+    );
+    let cause = SharedFailureCause::new(error);
+    assert_eq!(cause.failure_fact(), fact);
+    assert_eq!(
+        cause
+            .downcast_ref::<crate::product::MvProductError>()
+            .unwrap()
+            .kind(),
+        MvProductErrorKind::Corruption
+    );
+    assert_eq!(execution.dispatches, 1);
+    assert_eq!(execution.projections, 0);
 }
 
 #[tokio::test]

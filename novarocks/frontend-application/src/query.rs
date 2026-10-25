@@ -1240,6 +1240,10 @@ async fn execute_materialized_view_statement(
         .map_err(product_command_error)
 }
 
+pub(crate) fn product_command_service_error(error: CommandError) -> QueryServiceError {
+    routed_execution_service_error(product_command_error(error))
+}
+
 fn product_command_error(error: CommandError) -> RoutedExecutionError {
     let disposition = error.external_effect_disposition();
     if let Some(cause) = error.failure_cause() {

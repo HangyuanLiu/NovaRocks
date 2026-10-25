@@ -69,11 +69,46 @@ pub(crate) struct MvExecutionServices {
 pub(crate) struct MvCommandCompletion {
     pub(crate) performed_publication: bool,
 }
+#[derive(Default)]
+struct MvCommandCompletionFacts {
+    completed: std::sync::OnceLock<MvCommandCompletion>,
+    failure: std::sync::OnceLock<crate::mv::domain::application::MvApplicationError>,
+}
 #[derive(Clone, Default)]
-pub(crate) struct MvCommandCompletionReceiving(Arc<std::sync::OnceLock<MvCommandCompletion>>);
+pub(crate) struct MvCommandCompletionReceiving(Arc<MvCommandCompletionFacts>);
 impl MvCommandCompletionReceiving {
     pub(crate) fn observed(&self) -> Option<&MvCommandCompletion> {
-        self.0.get()
+        self.0.completed.get()
+    }
+    pub(crate) fn observed_failure(
+        &self,
+    ) -> Option<&crate::mv::domain::application::MvApplicationError> {
+        self.0.failure.get()
+    }
+    fn receive_selected_failure(&self, selected: &Result<(), MvPhaseFailure>) {
+        if let Err(MvPhaseFailure {
+            domain: Some(domain),
+            ..
+        }) = selected
+        {
+            self.0.failure.get_or_init(|| domain.clone());
+        }
+    }
+}
+
+/// A phase business result keeps the original domain policy next to its
+/// service projection. Native/control failures without a domain remain None.
+#[derive(Clone, Debug)]
+pub(super) struct MvPhaseFailure {
+    service: QueryServiceError,
+    domain: Option<crate::mv::domain::application::MvApplicationError>,
+}
+impl From<QueryServiceError> for MvPhaseFailure {
+    fn from(service: QueryServiceError) -> Self {
+        Self {
+            service,
+            domain: None,
+        }
     }
 }
 
@@ -162,7 +197,7 @@ struct MvCommandOriginal {
     progress_refusal: Option<WorkError>,
     initialized: bool,
     graph_received: bool,
-    selected: Option<Result<(), QueryServiceError>>,
+    selected: Option<Result<(), MvPhaseFailure>>,
     disposition: Option<StatementExternalEffectDisposition>,
     health: Option<StatementNativeHealthFailure>,
     completion: MvCommandCompletionReceiving,
@@ -283,21 +318,28 @@ impl MvCommandOriginal {
     fn selected_value(&self) -> Option<Result<StatementActionValue, QueryServiceError>> {
         let result = self.selected.as_ref()?;
         if result.is_ok() {
-            let observed = self.completion.0.get_or_init(|| MvCommandCompletion {
-                performed_publication: self.performed_publication,
-            });
+            let observed = self
+                .completion
+                .0
+                .completed
+                .get_or_init(|| MvCommandCompletion {
+                    performed_publication: self.performed_publication,
+                });
             assert_eq!(
                 observed.performed_publication, self.performed_publication,
                 "one original MV command completion"
             );
         }
+        self.completion.receive_selected_failure(result);
         Some(
             result
                 .clone()
                 .map(|()| StatementActionValue::Ok)
-                .map_err(|error| match self.observed_effect() {
-                    Some(disposition) => error.attach_external_effect_disposition(disposition),
-                    None => error,
+                .map_err(|failure| match self.observed_effect() {
+                    Some(disposition) => failure
+                        .service
+                        .attach_external_effect_disposition(disposition),
+                    None => failure.service,
                 }),
         )
     }
@@ -434,7 +476,7 @@ impl MvCommandOriginal {
             return Poll::Ready(result);
         }
         if let Poll::Ready(Err(error)) = self.poll_initialize(owner, cx) {
-            self.selected = Some(Err(error));
+            self.selected = Some(Err(error.into()));
         }
         if !self.initialized {
             return match self.selected_value() {
@@ -462,6 +504,13 @@ impl MvCommandOriginal {
             }
         }
         loop {
+            // Prior business Ready does not drive its Provider or Native tail.
+            // Poll each original here even while the next serial step waits;
+            // ordinary Pending never gates that next step's business work.
+            self.poll_retired_progress(cx);
+            if self.local_health_failure().is_some() {
+                return Poll::Pending;
+            }
             if self.selected.is_some() {
                 break;
             }
@@ -480,7 +529,7 @@ impl MvCommandOriginal {
                 ) {
                     Ok(step) => self.active = Some(step),
                     Err(error) => {
-                        self.selected = Some(Err(error));
+                        self.selected = Some(Err(error.into()));
                         break;
                     }
                 }
@@ -515,6 +564,13 @@ impl MvCommandOriginal {
             // an admission condition for the next independent business step.
         }
         Poll::Ready(self.selected_value().expect("selected original MV result"))
+    }
+    fn poll_retired_progress(&mut self, cx: &mut Context<'_>) {
+        for original in &mut self.retired {
+            if let Poll::Ready(Err(error)) = original.poll_closed(cx) {
+                self.health.get_or_insert(error);
+            }
+        }
     }
     fn poll_original_progress(&mut self, cx: &mut Context<'_>) {
         if let Some(io) = &self.io {

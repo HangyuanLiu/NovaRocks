@@ -31,8 +31,7 @@ use novarocks_mv_application::ports::{
     MvProviderFailure, MvProviderFailureKind, MvRefreshExecutionPort, MvRefreshKnownCommittedPort,
 };
 use novarocks_mv_application::product::{
-    MvProductError, MvProductErrorKind, MvProductResult, MvRefreshAttemptIdentity,
-    MvTarget as ProductMvTarget,
+    MvProductError, MvProductResult, MvRefreshAttemptIdentity, MvTarget as ProductMvTarget,
 };
 use novarocks_mv_application::publication::{
     MvRefreshPublicationFinalizationFacts, MvRefreshPublicationIntent,
@@ -598,26 +597,7 @@ fn product_target(
 }
 
 fn product_error(error: MvProductError) -> MvApplicationError {
-    let kind = match error.kind() {
-        MvProductErrorKind::KnownCommittedFinalizeFailed => {
-            MvApplicationErrorKind::KnownCommittedFinalizeFailed
-        }
-        MvProductErrorKind::Conflict => MvApplicationErrorKind::AlreadyActive,
-        MvProductErrorKind::Unavailable => MvApplicationErrorKind::Unavailable,
-        MvProductErrorKind::InvalidRequest => MvApplicationErrorKind::InvalidRequest,
-        MvProductErrorKind::CommitUnknown => MvApplicationErrorKind::CommitUnknown,
-        MvProductErrorKind::TargetReplaced => MvApplicationErrorKind::BindingInvalidated,
-        MvProductErrorKind::ProviderKnownUncommitted
-        | MvProductErrorKind::Corruption
-        | MvProductErrorKind::ShutdownCancelled => MvApplicationErrorKind::Engine,
-    };
-    let mut failure = MvApplicationError::new(kind, error.to_string())
-        .with_compile_control(error.compile_control_error())
-        .with_unavailable_implementation(error.unavailable_implementation().cloned());
-    if let Some(cause) = error.original_failure() {
-        failure = failure.with_original_failure(cause.clone());
-    }
-    failure
+    MvApplicationError::from_refresh_product(&error)
 }
 
 #[cfg(novarocks_dev_controls)]
@@ -819,6 +799,7 @@ fn unavailable(message: impl Into<String>) -> MvApplicationError {
 }
 #[cfg(test)]
 mod tests {
+    use novarocks_mv_application::product::MvProductErrorKind;
     use std::sync::Arc;
 
     use novarocks_mv_application::publication::MvRefreshCommittedFacts;

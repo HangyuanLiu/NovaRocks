@@ -299,6 +299,54 @@ impl std::error::Error for MvProductError {
     }
 }
 
+/// Reasons authored by the MV product itself, within the metadata domain.
+/// Original domain and compile-control causes keep their own facts instead.
+pub mod failure_reason {
+    use std::num::NonZeroU16;
+    pub const INVALID_REQUEST: NonZeroU16 = NonZeroU16::new(920).unwrap();
+    pub const CONFLICT: NonZeroU16 = NonZeroU16::new(921).unwrap();
+    pub const UNAVAILABLE: NonZeroU16 = NonZeroU16::new(922).unwrap();
+    pub const PROVIDER_KNOWN_UNCOMMITTED: NonZeroU16 = NonZeroU16::new(923).unwrap();
+    pub const COMMIT_UNKNOWN: NonZeroU16 = NonZeroU16::new(924).unwrap();
+    pub const TARGET_REPLACED: NonZeroU16 = NonZeroU16::new(925).unwrap();
+    pub const CORRUPTION: NonZeroU16 = NonZeroU16::new(926).unwrap();
+    pub const SHUTDOWN_CANCELLED: NonZeroU16 = NonZeroU16::new(927).unwrap();
+    pub const KNOWN_COMMITTED_FINALIZE_FAILED: NonZeroU16 = NonZeroU16::new(928).unwrap();
+}
+impl novarocks_failure_contract::FailureProjection for MvProductError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass as C, FailureFact, FailureReason, domain};
+        if let Some(original) = &self.original_failure {
+            return original.failure_fact();
+        }
+        if let Some(control) = &self.compile_control {
+            return control.failure_fact();
+        }
+        let (class, reason) = match self.kind {
+            MvProductErrorKind::InvalidRequest => (C::Data, failure_reason::INVALID_REQUEST),
+            MvProductErrorKind::Conflict => (C::Dependency, failure_reason::CONFLICT),
+            MvProductErrorKind::Unavailable => (C::Dependency, failure_reason::UNAVAILABLE),
+            MvProductErrorKind::ProviderKnownUncommitted => {
+                (C::Dependency, failure_reason::PROVIDER_KNOWN_UNCOMMITTED)
+            }
+            MvProductErrorKind::CommitUnknown => (C::Dependency, failure_reason::COMMIT_UNKNOWN),
+            MvProductErrorKind::TargetReplaced => (C::Dependency, failure_reason::TARGET_REPLACED),
+            MvProductErrorKind::Corruption => (C::Data, failure_reason::CORRUPTION),
+            MvProductErrorKind::ShutdownCancelled => {
+                return FailureFact::stop_observation(FailureReason::new(
+                    domain::METADATA,
+                    failure_reason::SHUTDOWN_CANCELLED,
+                ));
+            }
+            MvProductErrorKind::KnownCommittedFinalizeFailed => (
+                C::Dependency,
+                failure_reason::KNOWN_COMMITTED_FINALIZE_FAILED,
+            ),
+        };
+        FailureFact::new(class, FailureReason::new(domain::METADATA, reason))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

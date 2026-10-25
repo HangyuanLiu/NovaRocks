@@ -19,7 +19,7 @@
 
 mod source;
 
-use super::{CommandInput, MvWake, StepRequest, native::MvNativePhase, service};
+use super::{CommandInput, MvPhaseFailure, MvWake, StepRequest, native::MvNativePhase, service};
 use crate::query::statement_publication::StatementPublication;
 use crate::query_execution::maintenance::io_admission::MetadataIoAdmission;
 use crate::state_store::execution::StateStoreOriginalOwner;
@@ -59,7 +59,7 @@ pub(super) struct MvStepOriginal {
     execution: StepExecution,
     prepared: bool,
     prepared_kind: Option<StepPreparedKind>,
-    selected: Option<Result<(), QueryServiceError>>,
+    selected: Option<Result<(), MvPhaseFailure>>,
 }
 
 #[derive(Clone, Copy)]
@@ -77,7 +77,7 @@ struct StepExecution {
     root: novarocks_workload_control::WorkScope,
     source: Option<Arc<StepSource>>,
     future: Option<PhaseFuture>,
-    phase_result: Option<Result<(), QueryServiceError>>,
+    phase_result: Option<Result<(), MvPhaseFailure>>,
     future_busy: bool,
     retained_health: StatementNativeHealthFailure,
     native: Option<MvNativePhase>,
@@ -85,7 +85,7 @@ struct StepExecution {
     call_context: Option<ConnectorRequestContext>,
     published: Option<Result<MvRefreshPublicationFinalizationFacts, MvProviderFailure>>,
     projected: Option<Result<(), MvProviderFailure>>,
-    failure: Option<QueryServiceError>,
+    failure: Option<MvPhaseFailure>,
     phase: Phase,
     projection_started: bool,
     closing_started: bool,
@@ -201,20 +201,20 @@ impl MvStepOriginal {
     }
     fn select(
         &mut self,
-        mut result: Result<(), QueryServiceError>,
-    ) -> Poll<Result<(), QueryServiceError>> {
+        mut result: Result<(), MvPhaseFailure>,
+    ) -> Poll<Result<(), MvPhaseFailure>> {
         if let Some(publication) = &mut self.execution.publication {
             if publication.disposition().is_some() {
                 if let Err(error) = &result {
                     if publication.committed() && publication.local_finalization.is_none() {
                         // The original typed primary remains in result. This
                         // sidecar records only the necessary-finalization verdict.
-                        publication.local_finalization = Some(Err(error.to_string()));
+                        publication.local_finalization = Some(Err(error.service.to_string()));
                     }
                 }
                 if let Err(error) = publication.freeze_terminal() {
                     if result.is_ok() {
-                        result = Err(error);
+                        result = Err(error.into());
                     }
                 }
                 // A Provider NoOp is not proof that this MV's declared P was
@@ -224,8 +224,12 @@ impl MvStepOriginal {
                     != Some(novarocks_spi::connector::ExternalMutationEffect::NoOp)
                 {
                     if let Some(terminal) = publication.attempt.terminal() {
-                        result = result
-                            .map_err(|error| error.attach_publication_terminal(terminal.clone()));
+                        result = result.map_err(|mut failure| {
+                            failure.service = failure
+                                .service
+                                .attach_publication_terminal(terminal.clone());
+                            failure
+                        });
                     }
                 }
             }
@@ -235,7 +239,7 @@ impl MvStepOriginal {
             // actual Native receipt and unknown publication stay in this Source.
             if let Err(error) = source.release_business_activity() {
                 if result.is_ok() {
-                    result = Err(error);
+                    result = Err(error.into());
                 }
             }
         }
@@ -247,7 +251,8 @@ impl MvStepOriginal {
         store: &StateStoreOriginalOwner,
         owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<(), QueryServiceError>> {
+    ) -> Poll<Result<(), MvPhaseFailure>> {
+        self.execution.poll_live_tails(cx);
         if self.local_health_failure().is_some() {
             return Poll::Pending;
         }
@@ -293,14 +298,16 @@ impl MvStepOriginal {
                     cancellation
                         .reason()
                         .map(crate::query::cancellation_error)
-                        .map_or(Ok(()), Err),
+                        .map_or(Ok(()), |error| Err(error.into())),
                 );
             }
             let (target, attempt) = source
                 .refresh_identity()?
                 .ok_or_else(|| service("MV prepared publication has no original identity"))?;
             if attempt != self.attempt {
-                return self.select(Err(service("MV preparation replaced its original attempt")));
+                return self.select(Err(
+                    service("MV preparation replaced its original attempt").into()
+                ));
             }
             self.transition = Some(MvRefreshTransition::new(target, attempt));
             self.prepared = true;
@@ -333,7 +340,7 @@ impl MvStepOriginal {
                 .execution
                 .failure
                 .clone()
-                .unwrap_or_else(|| product_error(error.clone()))),
+                .unwrap_or_else(|| product_failure(error.clone()))),
         };
         self.select(result)
     }
@@ -345,6 +352,18 @@ impl MvStepOriginal {
     }
 }
 impl StepExecution {
+    fn poll_live_tails(&mut self, cx: &mut Context<'_>) {
+        // A received business fact permits necessary Current work while its
+        // original Call continues cleanup. Neither tail can gate that work.
+        if let Some(publication) = self.publication.as_mut() {
+            if publication.committed_needed().is_some() {
+                let _ = publication.poll_retirement(cx);
+            }
+        }
+        if let Some(native) = self.native.as_mut() {
+            native.poll_ready_tail(cx);
+        }
+    }
     fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
         self.future_busy
             .then(|| self.retained_health.clone())
@@ -360,12 +379,14 @@ impl StepExecution {
                     .and_then(StatementPublication::local_health_failure)
             })
     }
-    fn poll_phase(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), QueryServiceError>> {
+    fn poll_phase(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), MvPhaseFailure>> {
         if self.future_busy {
             return Poll::Pending;
         }
         if self.future.is_none() {
-            return Poll::Ready(Err(service("MV original phase has no installed Future")));
+            return Poll::Ready(Err(
+                service("MV original phase has no installed Future").into()
+            ));
         }
         self.future_busy = true;
         if self.future.as_mut().unwrap().as_mut().poll(cx).is_pending() {
@@ -380,23 +401,27 @@ impl StepExecution {
             .unwrap()
             .take_phase_result_in(&mut self.phase_result)
         {
-            self.phase_result = Some(Err(error));
+            self.phase_result = Some(Err(error.into()));
         }
         drop(self.future.take());
         self.future_busy = false;
         Poll::Ready(self.phase_result.take().expect("original phase response"))
     }
-    fn fail(&mut self, error: QueryServiceError) {
-        self.failure.get_or_insert(error);
+    fn fail(&mut self, error: impl Into<MvPhaseFailure>) {
+        self.failure.get_or_insert(error.into());
     }
-    fn reject_execution(&mut self, error: QueryServiceError) {
+    fn reject_execution(&mut self, error: impl Into<MvPhaseFailure>) {
+        let error = error.into();
         if let Some(source) = &self.source {
             if let Ok(context) = source.publication_context() {
                 self.call_context = Some(context);
             }
         }
         self.fail(error.clone());
-        self.published = Some(Err(provider_error(error, self.publication.as_ref())));
+        self.published = Some(Err(provider_error(
+            error.service,
+            self.publication.as_ref(),
+        )));
     }
     fn poll_closed(
         &mut self,
@@ -757,6 +782,13 @@ impl MvRefreshProgressPort for StepPort<'_, '_> {
                         obligation,
                     )
                     .map_err(QueryServiceError::from_failure_cause)?;
+                // The exact Applied publication is already interpreted and
+                // validated by the product. Close its original management
+                // responsibility BEFORE requesting Current convergence: that
+                // observation consumes the pending committed effect itself.
+                // The precommit CPU borrower has actually exited at this cut.
+                source.record_terminal(EffectDisposition::KnownCommitted)?;
+                self.execution.terminal_recorded = true;
                 self.execution.future = Some(source.project(needed, finite, requests));
                 self.execution.projection_started = true;
                 Ok(())
@@ -776,31 +808,22 @@ impl MvRefreshProgressPort for StepPort<'_, '_> {
         };
         match result {
             Ok(()) => {
-                if let Err(error) = source.record_terminal(EffectDisposition::KnownCommitted) {
-                    self.execution.fail(error.clone());
-                    self.execution.projected = Some(Err(provider_error(
-                        error,
-                        self.execution.publication.as_ref(),
-                    )));
-                } else {
-                    self.execution.terminal_recorded = true;
-                    self.execution.projected = Some(Ok(()));
-                    self.execution
-                        .publication
-                        .as_mut()
-                        .unwrap()
-                        .local_finalization = Some(Ok(()));
-                }
+                self.execution.projected = Some(Ok(()));
+                self.execution
+                    .publication
+                    .as_mut()
+                    .unwrap()
+                    .local_finalization = Some(Ok(()));
             }
             Err(error) => {
                 self.execution
                     .publication
                     .as_mut()
                     .unwrap()
-                    .local_finalization = Some(Err(error.to_string()));
+                    .local_finalization = Some(Err(error.service.to_string()));
                 self.execution.fail(error.clone());
                 self.execution.projected = Some(Err(provider_error(
-                    error,
+                    error.service,
                     self.execution.publication.as_ref(),
                 )));
             }
@@ -863,12 +886,193 @@ fn provider_error(
     }
     failure
 }
+fn product_failure(error: MvProductError) -> MvPhaseFailure {
+    let mut domain =
+        crate::mv::domain::application::MvApplicationError::from_refresh_product(&error);
+    let service = product_error(error);
+    // A plain Product failure has an actual typed author at the service
+    // boundary. Reuse that same cause rather than capturing it a second time.
+    if domain.original_failure().is_none() {
+        if let Some(cause) = service.failure_cause() {
+            domain = domain.with_original_failure(cause.clone());
+        }
+    }
+    MvPhaseFailure {
+        service,
+        domain: Some(domain),
+    }
+}
+
 fn product_error(error: MvProductError) -> QueryServiceError {
     if let Some(cause) = error.original_failure() {
-        return QueryServiceError::from_failure_cause(cause.clone());
+        return QueryServiceError::from_failure_cause(cause.clone())
+            .with_compile_control(error.compile_control_error());
     }
     if let Some(control) = error.compile_control_error() {
         return QueryServiceError::from_compile_control(control);
     }
-    service(error.to_string())
+    if let Some(analyze) = error.unavailable_implementation() {
+        return QueryServiceError::from_user_error(analyze.to_user_error(None));
+    }
+    QueryServiceError::from_failure_cause(novarocks_failure_contract::SharedFailureCause::new(
+        error,
+    ))
+}
+
+#[cfg(test)]
+mod product_failure_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
+    use novarocks_mv_application::product::MvProductErrorKind;
+
+    #[test]
+    fn product_failure_keeps_its_actual_owner_and_corruption_fact() {
+        let original =
+            MvProductError::new(MvProductErrorKind::Corruption, "original MV proof differs");
+        let fact = original.failure_fact();
+        let selected = product_error(original);
+        let cause = selected.failure_cause().expect("actual product cause");
+        let received = cause
+            .downcast_ref::<MvProductError>()
+            .expect("same typed product owner");
+        assert_eq!(received.kind(), MvProductErrorKind::Corruption);
+        assert_eq!(received.message(), "original MV proof differs");
+        assert_eq!(fact.class(), FailureClass::Data);
+        assert_eq!(cause.failure_fact(), fact);
+        assert_eq!(selected.execution_failure().unwrap().fact(), fact);
+        assert!(selected.compile_control_error().is_none());
+        assert!(
+            selected.external_effect_disposition().is_none(),
+            "classification alone is no commit proof"
+        );
+    }
+
+    #[test]
+    fn product_failure_keeps_original_domain_and_real_compile_sidecar() {
+        let cause = SharedFailureCause::new(novarocks_workload_control::WorkError::Capacity(
+            "original MV Root budget",
+        ));
+        let control = novarocks_type_contract::CompileControlError::DeadlineExceeded;
+        let product = MvProductError::new(MvProductErrorKind::Unavailable, "domain failed")
+            .with_original_failure(cause.clone())
+            .with_compile_control(Some(control.clone()));
+        assert_eq!(product.failure_fact(), cause.failure_fact());
+        let selected = product_error(product);
+        assert_eq!(selected.failure_cause(), Some(&cause));
+        assert_eq!(
+            selected.execution_failure().unwrap().fact(),
+            cause.failure_fact()
+        );
+        assert_eq!(selected.compile_control_error(), Some(control));
+    }
+
+    #[test]
+    fn selected_domain_failure_keeps_policy_and_cause_after_service_projection() {
+        use super::super::MvCommandCompletionReceiving;
+        use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
+        let cause = SharedFailureCause::new(novarocks_workload_control::WorkError::Capacity(
+            "original scheduled MV observation",
+        ));
+        let original = MvApplicationError::new(
+            MvApplicationErrorKind::Unavailable,
+            "scheduled MV observation unavailable",
+        )
+        .with_original_failure(cause.clone());
+        let phase = source::domain_error(original.clone());
+        assert_eq!(phase.service.failure_cause(), Some(&cause));
+        let completion = MvCommandCompletionReceiving::default();
+        // Creating an earlier, unselected domain failure is not a command
+        // result. Neither it nor a successful phase installs failure policy.
+        let _earlier_cleanup = source::domain_error(MvApplicationError::new(
+            MvApplicationErrorKind::Engine,
+            "unselected cleanup diagnostic",
+        ));
+        completion.receive_selected_failure(&Ok(()));
+        assert!(completion.observed_failure().is_none());
+        completion.receive_selected_failure(&Err(phase));
+        let observed = completion.observed_failure().unwrap();
+        assert_eq!(observed, &original);
+        assert_eq!(observed.kind(), MvApplicationErrorKind::Unavailable);
+        assert_eq!(observed.original_failure(), Some(&cause));
+        // A later retirement diagnostic cannot overwrite the chosen primary.
+        completion.receive_selected_failure(&Err(_earlier_cleanup));
+        assert_eq!(completion.observed_failure(), Some(&original));
+        assert!(completion.observed().is_none());
+    }
+
+    #[test]
+    fn service_failure_without_a_domain_keeps_none() {
+        let cause = SharedFailureCause::new(novarocks_workload_control::WorkError::Released);
+        let phase = MvPhaseFailure::from(QueryServiceError::from_failure_cause(cause.clone()));
+        assert!(phase.domain.is_none());
+        assert_eq!(phase.service.failure_cause(), Some(&cause));
+        let completion = super::super::MvCommandCompletionReceiving::default();
+        completion.receive_selected_failure(&Err(phase));
+        assert!(completion.observed_failure().is_none());
+    }
+
+    #[test]
+    fn plain_product_phase_reuses_the_actual_product_cause() {
+        let phase = product_failure(MvProductError::new(
+            MvProductErrorKind::Corruption,
+            "original publication proof differs",
+        ));
+        let source = phase.service.failure_cause().unwrap();
+        assert!(source.downcast_ref::<MvProductError>().is_some());
+        let domain = phase.domain.unwrap();
+        assert_eq!(domain.original_failure(), Some(source));
+        assert_eq!(
+            domain.kind(),
+            crate::mv::domain::application::MvApplicationErrorKind::Engine
+        );
+        assert!(phase.service.external_effect_disposition().is_none());
+    }
+
+    #[test]
+    fn product_phase_keeps_the_existing_transient_domain_mapping() {
+        let cause = SharedFailureCause::new(novarocks_workload_control::WorkError::Capacity(
+            "original MV product observation",
+        ));
+        let original = MvProductError::new(MvProductErrorKind::Unavailable, "domain unavailable")
+            .with_original_failure(cause.clone());
+        let phase = product_failure(original);
+        assert_eq!(phase.service.failure_cause(), Some(&cause));
+        let domain = phase.domain.unwrap();
+        assert_eq!(
+            domain.kind(),
+            crate::mv::domain::application::MvApplicationErrorKind::Unavailable
+        );
+        assert_eq!(domain.original_failure(), Some(&cause));
+        assert_eq!(
+            domain.original_failure().unwrap().failure_fact(),
+            cause.failure_fact()
+        );
+    }
+
+    #[test]
+    fn product_missing_pure_implementation_keeps_the_analyzer_user_code() {
+        let overload =
+            novarocks_functions::FunctionOverloadId::try_new("fixture/missing/mv-product-pure-v1")
+                .unwrap();
+        let novarocks_sql::compiler::SqlCompileError::Analyze(analyze) =
+            novarocks_sql::compiler::SqlCompileError::from(
+                novarocks_functions::FunctionBindingError::UnavailableImplementation(overload),
+            )
+        else {
+            panic!("the actual SQL author keeps missing-implementation identity");
+        };
+        let expected = analyze.code();
+        let product = MvProductError::new(
+            MvProductErrorKind::Unavailable,
+            "pure implementation unavailable",
+        )
+        .with_unavailable_implementation(Some(analyze));
+        let selected = product_error(product);
+        assert_eq!(
+            selected.user_error().unwrap().code().as_str(),
+            expected.as_str()
+        );
+        assert!(selected.failure_cause().is_none());
+        assert!(selected.compile_control_error().is_none());
+    }
 }

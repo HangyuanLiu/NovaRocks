@@ -648,6 +648,36 @@ impl MvTestControls {
         target: &novarocks_sql::planning::mv::SqlMvTarget,
         cancellation: &novarocks_query_application::cancellation::QueryCancellationView,
     ) -> Result<bool, String> {
+        if let Some(barrier) = self.claim_scheduler_barrier(target)? {
+            wait_release(
+                &barrier.claim,
+                &barrier.trigger,
+                Duration::from_secs(120),
+                || cancellation.is_cancelled(),
+            )?;
+        }
+        Ok(cancellation.is_cancelled())
+    }
+    pub(crate) async fn scheduler_async(
+        &self,
+        target: &novarocks_sql::planning::mv::SqlMvTarget,
+        cancellation: &novarocks_query_application::cancellation::QueryCancellationView,
+    ) -> Result<bool, String> {
+        if let Some(barrier) = self.claim_scheduler_barrier(target)? {
+            wait_release_async(
+                &barrier.claim,
+                &barrier.trigger,
+                Duration::from_secs(120),
+                || cancellation.is_cancelled(),
+            )
+            .await?;
+        }
+        Ok(cancellation.is_cancelled())
+    }
+    fn claim_scheduler_barrier(
+        &self,
+        target: &novarocks_sql::planning::mv::SqlMvTarget,
+    ) -> Result<Option<AuthorizedBarrier>, String> {
         for action in &self.actions {
             let Action::Scheduler {
                 target: expected,
@@ -673,15 +703,12 @@ impl MvTestControls {
             )
             .map_err(|error| format!("write authorized MV scheduler marker: {error}"))?;
             claim.record_hit().map_err(|error| error.to_string())?;
-            return wait_release(
-                &claim,
-                &directory.join("mvx4-scheduler-hold.trigger"),
-                Duration::from_secs(120),
-                || cancellation.is_cancelled(),
-            )
-            .map(|()| cancellation.is_cancelled());
+            return Ok(Some(AuthorizedBarrier {
+                claim,
+                trigger: directory.join("mvx4-scheduler-hold.trigger"),
+            }));
         }
-        Ok(cancellation.is_cancelled())
+        Ok(None)
     }
 
     /// Pin the first real admitted object and D/L/C. P and provider versions
@@ -2282,6 +2309,76 @@ pub(crate) mod tests {
                 .unwrap(),
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduler_async_yields_to_release_and_keeps_the_original_claim() {
+        let directory =
+            std::env::temp_dir().join(format!("nrmvasyncscheduler-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&directory).unwrap();
+        let trigger = directory.join("mvx4-scheduler-hold.trigger");
+        std::fs::write(&trigger, "hold").unwrap();
+        let session = TestSession::new(
+            vec![
+                json!({"action":"scheduler-hold","catalog":"ice","namespace":"sales","mv":"orders","directory":directory}),
+            ],
+            SessionRole::Fe,
+            3000,
+        );
+        let controls = session.controls().unwrap();
+        let observed = session.role.scope().clone();
+        let marker = directory.join("mvx4-scheduler-admitted-orders.marker");
+        let release = trigger.clone();
+        let caller = std::thread::current().id();
+        let releaser = tokio::spawn(async move {
+            assert_eq!(std::thread::current().id(), caller);
+            assert!(marker.exists());
+            assert_eq!(
+                observed
+                    .observations()
+                    .iter()
+                    .filter(|event| event.event == "hit")
+                    .count(),
+                1
+            );
+            std::fs::remove_file(release).unwrap();
+        });
+        let cancellation =
+            novarocks_query_application::cancellation::QueryCancellationSource::new();
+        assert!(
+            !controls
+                .scheduler_async(
+                    &novarocks_sql::planning::mv::SqlMvTarget {
+                        catalog: Some("ice".into()),
+                        database: "sales".into(),
+                        name: "orders".into()
+                    },
+                    &cancellation.view()
+                )
+                .await
+                .unwrap()
+        );
+        releaser.await.unwrap();
+        assert!(!trigger.exists());
+        assert!(
+            controls.actions[0]
+                .grant
+                .claim_once(controls.process)
+                .is_err()
+        );
+        for expected in ["claimed", "hit", "claim-released"] {
+            assert_eq!(
+                session
+                    .role
+                    .scope()
+                    .observations()
+                    .iter()
+                    .filter(|event| event.event == expected)
+                    .count(),
+                1
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

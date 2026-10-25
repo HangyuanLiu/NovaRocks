@@ -18,7 +18,7 @@
 //! The original statement owns dependency observation and its pure graph turn.
 //! A borrowed waiter never owns the StateStore request or CPU exit receipt.
 
-use super::{CommandInput, MvCommandRequest, MvWake, StepRequest};
+use super::{CommandInput, MvCommandRequest, MvPhaseFailure, MvWake, StepRequest};
 use crate::mv::domain::{
     application::{MvApplicationError, MvApplicationErrorKind, MvRefreshRequest},
     dependency::refresh::MvRefreshDependencyStep,
@@ -51,7 +51,7 @@ pub(super) struct DependencyPreparation {
     driver: Option<MvRefreshTurnCustody>,
     raw: Option<Result<MvRefreshPreparationOutput, MvApplicationError>>,
     steps: Option<Vec<StepRequest>>,
-    failure: Option<QueryServiceError>,
+    failure: Option<MvPhaseFailure>,
     health: Option<StatementNativeHealthFailure>,
     exit_unproven: StatementNativeHealthFailure,
     busy: bool,
@@ -180,7 +180,7 @@ impl DependencyPreparation {
     pub(super) fn poll_steps(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Vec<StepRequest>, QueryServiceError>> {
+    ) -> Poll<Result<Vec<StepRequest>, MvPhaseFailure>> {
         if self.local_health_failure().is_some() {
             return Poll::Pending;
         }
@@ -193,14 +193,15 @@ impl DependencyPreparation {
     fn poll_steps_inner(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Vec<StepRequest>, QueryServiceError>> {
+    ) -> Poll<Result<Vec<StepRequest>, MvPhaseFailure>> {
         if let Some(error) = &self.failure {
             return Poll::Ready(Err(error.clone()));
         }
         if self.handed_off {
             return Poll::Ready(Err(super::service(
                 "MV dependency steps were already transferred",
-            )));
+            )
+            .into()));
         }
         if self.steps.is_none() {
             let driver = self
@@ -215,13 +216,13 @@ impl DependencyPreparation {
                 }
                 Poll::Ready(Err(MvTurnFailure::Admission(error))) => {
                     let error = super::original_error(error);
-                    self.failure = Some(error.clone());
-                    return Poll::Ready(Err(error));
+                    self.failure = Some(error.clone().into());
+                    return Poll::Ready(Err(error.into()));
                 }
                 Poll::Ready(Err(MvTurnFailure::Cpu(error))) => {
                     let error = QueryServiceError::from_execution_failure(error);
-                    self.failure = Some(error.clone());
-                    return Poll::Ready(Err(error));
+                    self.failure = Some(error.clone().into());
+                    return Poll::Ready(Err(error.into()));
                 }
                 Poll::Ready(Ok(())) => {}
             }
@@ -250,7 +251,7 @@ impl DependencyPreparation {
                         };
                         match refresh_steps(steps, statement, requested) {
                             Ok(steps) => self.steps = Some(steps),
-                            Err(error) => self.failure = Some(error),
+                            Err(error) => self.failure = Some(error.into()),
                         }
                     }
                     Err(error) => self.failure = Some(application_error(error)),
@@ -327,7 +328,14 @@ fn refresh_steps(
         .collect())
 }
 
-fn application_error(error: MvApplicationError) -> QueryServiceError {
+fn application_error(error: MvApplicationError) -> MvPhaseFailure {
+    let service = application_service_error(error.clone());
+    MvPhaseFailure {
+        service,
+        domain: Some(error),
+    }
+}
+fn application_service_error(error: MvApplicationError) -> QueryServiceError {
     if let Some(cause) = error.original_failure() {
         return QueryServiceError::from_failure_cause(cause.clone())
             .with_compile_control(error.compile_control_error());
@@ -444,8 +452,11 @@ mod tests {
         let source = application.original_failure().unwrap().clone();
         let fact = source.failure_fact();
         let selected = application_error(application);
-        assert_eq!(selected.failure_cause(), Some(&source));
-        assert_eq!(selected.execution_failure().unwrap().fact(), fact);
-        assert!(selected.compile_control_error().is_none());
+        assert_eq!(selected.service.failure_cause(), Some(&source));
+        assert_eq!(selected.service.execution_failure().unwrap().fact(), fact);
+        assert!(selected.service.compile_control_error().is_none());
+        let domain = selected.domain.expect("original dependency domain policy");
+        assert_eq!(domain.kind(), MvApplicationErrorKind::Engine);
+        assert_eq!(domain.original_failure(), Some(&source));
     }
 }
