@@ -54,8 +54,9 @@ pub struct NativeRpcClient {
     backend_process_id: Option<BackendProcessId>,
 }
 
-/// Only the three BE-origin methods use this role-local cache. Their manifest
-/// classes are distinct physical lanes. Membership has no BE peer identity.
+/// BE-origin methods use this role-local cache. Exchange unit methods share a
+/// physical connection owner; manifest routing still names the exact RPC.
+/// Membership has no BE peer identity.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct NativeChannelKey {
     backend_process_id: Option<BackendProcessId>,
@@ -83,7 +84,7 @@ impl NativeChannelKey {
             | (NativeTrafficClass::Membership, None) => Ok(Self {
                 backend_process_id,
                 endpoint,
-                method,
+                method: crate::native_channel_identity::connection_owner_method(method),
             }),
             _ => Err("Native outbound method requires its exact frozen peer domain".to_owned()),
         }

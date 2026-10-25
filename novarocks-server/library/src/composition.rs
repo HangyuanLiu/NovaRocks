@@ -458,6 +458,7 @@ pub fn compose_backend_server_config(
         )
         .map_err(|error| anyhow::anyhow!("resolve normal-close capacity limits: {error}"))?,
         execution_runtime_config: backend_execution_runtime_config(config),
+        exchange_flow_limits: runtime_config.exchange_flow_limits()?,
         scan_preparation_config: novarocks_worker::ScanPreparationConfig::try_new(
             runtime_config.prefetch_input_bytes_per_stream,
             runtime_config.prefetch_max_candidates,

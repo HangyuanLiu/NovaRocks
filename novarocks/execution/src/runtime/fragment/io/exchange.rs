@@ -99,6 +99,50 @@ impl From<FragmentIoError> for ExchangeTransmitRejection {
 
 /// Host-owned transport boundary for exchange frames.
 pub trait ExchangeFrameTransmitter: Send + Sync + 'static {
+    fn deliver_unit(
+        &self,
+        _frame: super::exchange_unit::ExchangeUnitFrame,
+        _stop: tokio_util::sync::CancellationToken,
+        activity: super::exchange_unit::ExchangeCallActivity,
+        done: super::exchange_unit::ExchangeDeliveryCallback,
+    ) {
+        done(super::exchange_unit::ExchangeCallOutcome::Refused(
+            super::exchange_unit::unit_transport_not_installed(),
+        ));
+        drop(activity);
+    }
+
+    fn register_unit_demands(
+        &self,
+        _destination: RuntimeEndpoint,
+        _entries: Vec<super::exchange_unit::ExchangeDemandEntry>,
+        _stop: tokio_util::sync::CancellationToken,
+        done: super::exchange_unit::ExchangeDemandCallback,
+    ) {
+        done(super::exchange_unit::ExchangeDemandCallOutcome::Refused(
+            super::exchange_unit::unit_transport_not_installed(),
+        ));
+    }
+
+    fn watch_unit_facts(
+        &self,
+        _destination: RuntimeEndpoint,
+        _stream: ExchangeStreamIdentity,
+        _wake: super::exchange_unit::ExchangeGrantWake,
+    ) -> Result<(), novarocks_failure_contract::FailureFact> {
+        Err(super::exchange_unit::unit_transport_not_installed())
+    }
+
+    fn forget_unit_facts(&self, _stream: ExchangeStreamIdentity) {}
+
+    fn schedule_unit_retry(
+        &self,
+        _delay: std::time::Duration,
+        _task: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<(), novarocks_failure_contract::FailureFact> {
+        Err(super::exchange_unit::unit_transport_not_installed())
+    }
+
     fn transmit(&self, frame: ExchangeFrame) -> Result<(), ExchangeTransmitRejection>;
 
     /// A task-scoped stop signal. Transports with cancellable I/O should

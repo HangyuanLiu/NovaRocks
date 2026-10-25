@@ -155,6 +155,34 @@ async fn connection_id(channel: Channel, method: NativeRpcMethod) -> usize {
 }
 
 #[tokio::test]
+async fn unit_methods_reuse_one_exact_peer_connection_without_changing_the_rpc_path() {
+    let runtime = test_backend_data_runtime();
+    let server = Server::start(1).await;
+    let peer = BackendProcessId::new_v7();
+    let methods = [
+        NativeRpcMethod::DeliverExchangeUnit,
+        NativeRpcMethod::RegisterExchangeDemand,
+        NativeRpcMethod::SubscribeExchangeGrants,
+    ];
+    let mut first_key = None;
+    for method in methods {
+        let key = NativeChannelKey::new(Some(peer), server.endpoint.clone(), method).unwrap();
+        if let Some(first) = &first_key {
+            assert_eq!(&key, first);
+        } else {
+            first_key = Some(key.clone());
+        }
+        let channel = get_or_create_channel(&runtime, key).await.unwrap();
+        assert_eq!(connection_id(channel, method).await, 1);
+    }
+    assert_eq!(server.accepted.load(Ordering::SeqCst), 1);
+    runtime
+        .channels()
+        .remove(first_key.unwrap().inline_identity().unwrap());
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn actual_cached_channels_separate_process_endpoint_and_manifest_method() {
     let runtime = test_backend_data_runtime();
     let first = Server::start(1).await;

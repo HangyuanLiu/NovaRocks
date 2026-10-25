@@ -107,7 +107,8 @@ impl StaticPlanInterpreter {
 /// boundary under the synchronous creation and direct release contract, so
 /// the two never share an island.
 #[cfg(not(feature = "native-compatibility-test-fixture"))]
-pub const NATIVE_COMPAT_EPOCH: u64 = 8;
+// Receiver-authorized Exchange units, explicit End, and covered grant subscriptions.
+pub const NATIVE_COMPAT_EPOCH: u64 = 10;
 
 /// Test-only alternate epoch used to produce an actual different-island binary.
 #[cfg(feature = "native-compatibility-test-fixture")]
@@ -664,7 +665,7 @@ mod tests {
         #[cfg(feature = "native-compatibility-test-fixture")]
         assert_eq!(NATIVE_COMPAT_EPOCH, 9);
         #[cfg(not(feature = "native-compatibility-test-fixture"))]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 8);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 10);
     }
     #[test]
     fn cumulative_exchange_close_does_not_share_the_pre_change_stream_epoch() {

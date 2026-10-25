@@ -28,6 +28,7 @@ use crate::catalog_source_config::{CatalogSourceConfig, preflight_catalog_source
 use crate::env_reference::resolve_env_references;
 use crate::state_store_config::{StateStoreAppConfig, StateStoreConfig};
 use crate::state_store_limits::StateStoreLimitOverrides;
+use novarocks_execution::runtime::execution_runtime::ExchangeFlowLimits;
 use novarocks_execution_contract::{LeaseValidFor, MaxWait};
 use novarocks_memory::{AuthorityConfig, ConfigError as MemoryConfigError};
 use novarocks_native_adapter::{
@@ -704,6 +705,7 @@ fn deserialize_loaded_config(path: &Path, value: toml::Value) -> Result<NovaRock
     validate_application_configuration(&cfg)?;
     validate_connector_credential_configuration(&cfg)?;
     cfg.runtime.native_ingress.validate()?;
+    cfg.runtime.exchange_flow_limits()?;
     validate_query_blocking_config(&cfg.runtime)?;
     validate_query_control_config(&cfg.runtime)?;
     validate_task_execution_config(&cfg.runtime)?;
@@ -1265,6 +1267,18 @@ impl FrontendConstantPolicyConfig {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
+    #[serde(default = "default_exchange_instance_floor_slots")]
+    pub exchange_instance_floor_slots: usize,
+    #[serde(default = "default_exchange_instance_max_slots")]
+    pub exchange_instance_max_slots: usize,
+    #[serde(default = "default_exchange_process_floor_slots")]
+    pub exchange_process_floor_slots: usize,
+    #[serde(default = "default_exchange_floating_slots")]
+    pub exchange_floating_slots: usize,
+    #[serde(default = "default_exchange_stream_window")]
+    pub exchange_stream_window: usize,
+    #[serde(default = "default_exchange_transport_timeout_ms")]
+    pub exchange_transport_timeout_ms: u64,
     #[serde(default = "default_exchange_wait_ms")]
     pub exchange_wait_ms: u64,
     #[serde(default = "default_exchange_max_transmit_batched_bytes")]
@@ -1837,6 +1851,30 @@ impl ObjectStorageConfig {
             io_timeout_ms: self.io_timeout_ms,
         }
     }
+}
+
+fn default_exchange_instance_floor_slots() -> usize {
+    ExchangeFlowLimits::default().instance_floor_slots()
+}
+
+fn default_exchange_instance_max_slots() -> usize {
+    ExchangeFlowLimits::default().instance_max_slots()
+}
+
+fn default_exchange_process_floor_slots() -> usize {
+    ExchangeFlowLimits::default().process_floor_slots()
+}
+
+fn default_exchange_floating_slots() -> usize {
+    ExchangeFlowLimits::default().floating_slots()
+}
+
+fn default_exchange_stream_window() -> usize {
+    ExchangeFlowLimits::default().stream_window()
+}
+
+fn default_exchange_transport_timeout_ms() -> u64 {
+    duration_millis(ExchangeFlowLimits::default().transport_timeout())
 }
 
 fn default_exchange_wait_ms() -> u64 {
@@ -2606,6 +2644,12 @@ fn default_object_storage_retry_log_first_n() -> u32 {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
+            exchange_instance_floor_slots: default_exchange_instance_floor_slots(),
+            exchange_instance_max_slots: default_exchange_instance_max_slots(),
+            exchange_process_floor_slots: default_exchange_process_floor_slots(),
+            exchange_floating_slots: default_exchange_floating_slots(),
+            exchange_stream_window: default_exchange_stream_window(),
+            exchange_transport_timeout_ms: default_exchange_transport_timeout_ms(),
             exchange_wait_ms: default_exchange_wait_ms(),
             exchange_max_transmit_batched_bytes: default_exchange_max_transmit_batched_bytes(),
             exchange_io_threads: default_exchange_io_threads(),
@@ -2805,6 +2849,19 @@ impl ExecutionServicesConfig {
 }
 
 impl RuntimeConfig {
+    /// Resolves the exchange structural limits without constructing a runtime.
+    pub fn exchange_flow_limits(&self) -> Result<ExchangeFlowLimits> {
+        ExchangeFlowLimits::try_new(
+            self.exchange_instance_floor_slots,
+            self.exchange_instance_max_slots,
+            self.exchange_process_floor_slots,
+            self.exchange_floating_slots,
+            self.exchange_stream_window,
+            Duration::from_millis(self.exchange_transport_timeout_ms),
+        )
+        .context("resolve runtime exchange flow limits")
+    }
+
     pub fn effective_process_mem_limit_bytes(&self) -> Result<u64> {
         crate::memory_limit::resolve_starrocks_process_mem_limit_bytes(&self.mem_limit)
             .with_context(|| format!("resolve runtime.mem_limit '{}'", self.mem_limit))
@@ -3135,6 +3192,90 @@ mod tests {
     };
     use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
     use novarocks_types::ClusterRole;
+
+    #[test]
+    fn exchange_flow_defaults_parse_and_resolve_to_the_execution_limits() {
+        let absent = toml::from_str::<RuntimeConfig>("").expect("omitted settings use defaults");
+        let expected = super::ExchangeFlowLimits::default();
+        assert_eq!(
+            absent.exchange_flow_limits().expect("valid defaults"),
+            expected
+        );
+        assert_eq!(
+            RuntimeConfig::default()
+                .exchange_flow_limits()
+                .expect("valid explicit defaults"),
+            expected
+        );
+        assert_eq!(expected.instance_floor_slots(), 1);
+        assert_eq!(expected.instance_max_slots(), 32);
+        assert_eq!(expected.process_floor_slots(), 8192);
+        assert_eq!(expected.floating_slots(), 8192);
+        assert_eq!(expected.stream_window(), 2);
+        assert_eq!(
+            expected.transport_timeout(),
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn exchange_flow_settings_preserve_explicit_values_and_zero_floating() {
+        let runtime = toml::from_str::<RuntimeConfig>(
+            "exchange_instance_floor_slots = 2\n\
+             exchange_instance_max_slots = 5\n\
+             exchange_process_floor_slots = 17\n\
+             exchange_floating_slots = 0\n\
+             exchange_stream_window = 3\n\
+             exchange_transport_timeout_ms = 71\n",
+        )
+        .expect("explicit exchange settings parse");
+        let limits = runtime
+            .exchange_flow_limits()
+            .expect("valid explicit limits");
+        assert_eq!(limits.instance_floor_slots(), 2);
+        assert_eq!(limits.instance_max_slots(), 5);
+        assert_eq!(limits.process_floor_slots(), 17);
+        assert_eq!(limits.floating_slots(), 0);
+        assert_eq!(limits.stream_window(), 3);
+        assert_eq!(
+            limits.transport_timeout(),
+            std::time::Duration::from_millis(71)
+        );
+    }
+
+    #[test]
+    fn exchange_flow_settings_refuse_zero_or_inverted_bounds_without_clamping() {
+        for (settings, field) in [
+            (
+                "exchange_instance_floor_slots = 0",
+                "exchange_instance_floor_slots",
+            ),
+            (
+                "exchange_instance_max_slots = 0",
+                "exchange_instance_max_slots",
+            ),
+            (
+                "exchange_process_floor_slots = 0",
+                "exchange_process_floor_slots",
+            ),
+            (
+                "exchange_instance_floor_slots = 2\nexchange_process_floor_slots = 1",
+                "exchange_process_floor_slots",
+            ),
+            ("exchange_stream_window = 0", "exchange_stream_window"),
+            (
+                "exchange_transport_timeout_ms = 0",
+                "exchange_transport_timeout_ms",
+            ),
+        ] {
+            let runtime = toml::from_str::<RuntimeConfig>(settings).expect("the raw values parse");
+            let error = runtime
+                .exchange_flow_limits()
+                .expect_err("invalid bounds are refused");
+            assert!(format!("{error:#}").contains(field), "{error:#}");
+        }
+        assert!(toml::from_str::<RuntimeConfig>("exchange_floating_slots = -1").is_err());
+    }
 
     #[test]
     fn query_blocking_config_derives_workers_and_rejects_zero_queue() {

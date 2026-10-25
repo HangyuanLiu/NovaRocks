@@ -502,6 +502,41 @@ type TaskStatusEvents = Pin<
 
 #[tonic::async_trait]
 impl NovaRocksGrpc for LaneProbe {
+    type SubscribeExchangeGrantsStream = std::pin::Pin<
+        Box<
+            dyn tokio_stream::Stream<Item = Result<proto::ExchangeGrantBatch, tonic::Status>>
+                + Send
+                + 'static,
+        >,
+    >;
+
+    async fn deliver_exchange_unit(
+        &self,
+        _request: tonic::Request<proto::DeliverExchangeUnitRequest>,
+    ) -> Result<tonic::Response<proto::DeliverExchangeUnitResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "Exchange unit delivery is not installed",
+        ))
+    }
+
+    async fn register_exchange_demand(
+        &self,
+        _request: tonic::Request<proto::RegisterExchangeDemandRequest>,
+    ) -> Result<tonic::Response<proto::RegisterExchangeDemandResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "Exchange demand registration is not installed",
+        ))
+    }
+
+    async fn subscribe_exchange_grants(
+        &self,
+        _request: tonic::Request<proto::SubscribeExchangeGrantsRequest>,
+    ) -> Result<tonic::Response<Self::SubscribeExchangeGrantsStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "Exchange grant subscription is not installed",
+        ))
+    }
+
     type ExchangeStream = tokio_stream::Empty<Result<proto::ExchangeResponse, tonic::Status>>;
     type SubscribeTaskStatusStream = TaskStatusEvents;
     async fn exchange(

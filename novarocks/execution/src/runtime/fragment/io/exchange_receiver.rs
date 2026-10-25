@@ -44,6 +44,47 @@ pub struct ExchangeReceiverRegistration {
 /// Execution uses this port instead of a process-global exchange map. The
 /// role installs one shared implementation for native ingress and operators.
 pub trait ExchangeReceiverPort: Send + Sync + 'static {
+    fn register_unit_demand(
+        &self,
+        _key: ExchangeReceiverKey,
+        _entry: super::exchange_unit::ExchangeDemandEntry,
+    ) -> Result<
+        super::exchange_unit::ExchangeStreamObservation,
+        novarocks_failure_contract::FailureFact,
+    > {
+        Err(super::exchange_unit::unit_transport_not_installed())
+    }
+
+    fn receive_unit(
+        &self,
+        _key: ExchangeReceiverKey,
+        _frame: super::exchange_unit::ExchangeUnitReceiverFrame,
+    ) -> Result<super::exchange_unit::ExchangeUnitReceipt, novarocks_failure_contract::FailureFact>
+    {
+        Err(super::exchange_unit::unit_transport_not_installed())
+    }
+
+    /// A bounded page from the authoritative receiver state. The subscriber
+    /// installs its change feed before enumerating pages, then merges facts.
+    fn unit_sender_states(
+        &self,
+        _sender: novarocks_types::BackendProcessId,
+        _after: Option<novarocks_execution_contract::ExchangeStreamIdentity>,
+        _limit: usize,
+    ) -> Result<
+        Vec<super::exchange_unit::ExchangeStreamObservation>,
+        novarocks_failure_contract::FailureFact,
+    > {
+        Err(super::exchange_unit::unit_transport_not_installed())
+    }
+
+    fn set_unit_state_listener(
+        &self,
+        _listener: Arc<dyn super::exchange_unit::ExchangeUnitStateListener>,
+    ) -> Result<(), novarocks_failure_contract::FailureFact> {
+        Err(super::exchange_unit::unit_transport_not_installed())
+    }
+
     fn register(
         &self,
         registration: ExchangeReceiverRegistration,

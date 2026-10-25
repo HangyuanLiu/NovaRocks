@@ -25,6 +25,17 @@ use novarocks_types::{BackendProcessId, NativeEndpoint, NativeReferenceHost};
 
 const MAX_HOST_BYTES: usize = 253;
 
+/// Method routing stays exact in the manifest; the three unit methods share
+/// one physical Exchange connection owner instead of multiplying peer quotas.
+pub(crate) const fn connection_owner_method(method: NativeRpcMethod) -> NativeRpcMethod {
+    match method {
+        NativeRpcMethod::RegisterExchangeDemand | NativeRpcMethod::SubscribeExchangeGrants => {
+            NativeRpcMethod::DeliverExchangeUnit
+        }
+        _ => method,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) enum InlineNativeReferenceHostKind {
     Ipv4,
@@ -77,7 +88,7 @@ impl InlineNativeChannelIdentity {
             host_len: source.len() as u8,
             port: endpoint.port(),
             reference_host_kind,
-            method,
+            method: connection_owner_method(method),
         })
     }
 
@@ -252,7 +263,11 @@ mod tests {
             let without_peer =
                 InlineNativeChannelIdentity::from_parts(None, &endpoint, entry.method);
             match entry.method {
-                NativeRpcMethod::ExchangeUnary | NativeRpcMethod::TransmitRuntimeFilterEnvelope => {
+                NativeRpcMethod::ExchangeUnary
+                | NativeRpcMethod::DeliverExchangeUnit
+                | NativeRpcMethod::RegisterExchangeDemand
+                | NativeRpcMethod::SubscribeExchangeGrants
+                | NativeRpcMethod::TransmitRuntimeFilterEnvelope => {
                     assert!(with_peer.is_ok());
                     assert_eq!(
                         without_peer.unwrap_err().kind(),

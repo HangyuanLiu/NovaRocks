@@ -44,6 +44,8 @@ fn test_execution_function_set()
 fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
     let control_grpc_port = unused_port();
     BackendServerConfig {
+        exchange_flow_limits:
+            novarocks_execution::runtime::execution_runtime::ExchangeFlowLimits::default(),
         build_identity: "fixture-backend-build".to_owned(),
         #[cfg(novarocks_dev_controls)]
         test_session: None,

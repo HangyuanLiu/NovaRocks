@@ -66,6 +66,9 @@ pub enum NativeRpcMethod {
     Heartbeat,
     PruneCatalogs,
     ExchangeUnary,
+    DeliverExchangeUnit,
+    RegisterExchangeDemand,
+    SubscribeExchangeGrants,
     TransmitRuntimeFilterEnvelope,
     AnnounceBackend,
     RetiredFetchResult,
@@ -94,7 +97,7 @@ macro_rules! contract {
 }
 use FrontendNativeLane::{LifecycleControl, Observation, ResultData, Submission};
 use NativeTrafficClass::Frontend;
-pub const NATIVE_METHODS: [NativeMethodContract; 14] = [
+pub const NATIVE_METHODS: [NativeMethodContract; 17] = [
     contract!(
         FetchTaskResult,
         "FetchTaskResult",
@@ -174,6 +177,30 @@ pub const NATIVE_METHODS: [NativeMethodContract; 14] = [
         BackendData,
         BackendToBackend,
         Unary
+    ),
+    contract!(
+        DeliverExchangeUnit,
+        "DeliverExchangeUnit",
+        NativeTrafficClass::Exchange,
+        BackendData,
+        BackendToBackend,
+        Unary
+    ),
+    contract!(
+        RegisterExchangeDemand,
+        "RegisterExchangeDemand",
+        NativeTrafficClass::Exchange,
+        BackendData,
+        BackendToBackend,
+        Unary
+    ),
+    contract!(
+        SubscribeExchangeGrants,
+        "SubscribeExchangeGrants",
+        NativeTrafficClass::Exchange,
+        BackendData,
+        BackendToBackend,
+        ServerStream
     ),
     contract!(
         TransmitRuntimeFilterEnvelope,
@@ -295,6 +322,31 @@ mod tests {
         );
         assert!(!NativeRpcMethod::RetiredExchange.is_allowed_at(NativeEndpointDomain::BackendData));
     }
+    #[test]
+    fn unit_methods_share_exchange_routing_and_keep_the_subscription_streaming() {
+        for method in [
+            NativeRpcMethod::DeliverExchangeUnit,
+            NativeRpcMethod::RegisterExchangeDemand,
+            NativeRpcMethod::SubscribeExchangeGrants,
+        ] {
+            assert_eq!(method.contract().traffic, NativeTrafficClass::Exchange);
+            assert_eq!(
+                method.contract().direction,
+                NativeDirection::BackendToBackend
+            );
+            assert!(method.is_allowed_at(NativeEndpointDomain::BackendData));
+            assert!(!method.is_allowed_at(NativeEndpointDomain::BackendControl));
+        }
+        assert_eq!(
+            NativeRpcMethod::SubscribeExchangeGrants.contract().body,
+            NativeBodyKind::ServerStream
+        );
+        assert_eq!(
+            NativeRpcMethod::RegisterExchangeDemand.contract().body,
+            NativeBodyKind::Unary
+        );
+    }
+
     #[test]
     fn new_work_and_mixed_updates_never_use_urgent_control() {
         for kind in [
