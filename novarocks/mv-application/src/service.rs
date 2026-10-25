@@ -304,22 +304,32 @@ fn settle_unpublished_stage(
         Ok(()) => primary,
         // A failed abort is a second failure; preserve its complete diagnostic
         // instead of replacing it with the original pure admission cause.
-        Err(abort) => MvProductError::new(
-            primary.kind(),
-            format!("{}; staged target abort failed: {abort}", primary.message()),
-        )
-        .with_compile_control(primary.compile_control_error()),
+        Err(abort) => {
+            let mut failure = MvProductError::new(
+                primary.kind(),
+                format!("{}; staged target abort failed: {abort}", primary.message()),
+            )
+            .with_compile_control(primary.compile_control_error());
+            if let Some(cause) = primary.original_failure() {
+                failure = failure.with_original_failure(cause.clone());
+            }
+            failure
+        }
     }
 }
 
 fn known_committed_finalize_failure(failure: MvProviderFailure) -> MvProductError {
     // Publication is already committed: this remains a finalization failure,
     // even when its diagnostic originated in SQL preparation.
-    MvProductError::new(
+    let mut error = MvProductError::new(
         MvProductErrorKind::KnownCommittedFinalizeFailed,
         failure.message(),
     )
-    .with_compile_control(failure.compile_control_error())
+    .with_compile_control(failure.compile_control_error());
+    if let Some(cause) = failure.original_failure() {
+        error = error.with_original_failure(cause.clone());
+    }
+    error
 }
 
 fn validate_published_refresh(
@@ -386,3 +396,35 @@ impl MvKeyedProductService {
 #[cfg(test)]
 #[path = "service_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod original_failure_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+
+    #[test]
+    fn committed_finalization_keeps_original_source_without_reclassifying_its_fact() {
+        let source =
+            SharedFailureCause::new(novarocks_type_contract::CompileControlError::Cancelled);
+        let fact = source.failure_fact();
+        let error = known_committed_finalize_failure(
+            MvProviderFailure::new(
+                crate::ports::MvProviderFailureKind::Unavailable,
+                "original refusal",
+            )
+            .with_original_failure(source.clone()),
+        );
+        assert_eq!(
+            error.kind(),
+            MvProductErrorKind::KnownCommittedFinalizeFailed
+        );
+        assert_eq!(error.original_failure(), Some(&source));
+        assert_eq!(error.original_failure().unwrap().failure_fact(), fact);
+        assert_eq!(error.compile_control_error(), None);
+        assert_eq!(
+            std::error::Error::source(&error)
+                .and_then(|cause| cause.downcast_ref::<SharedFailureCause>()),
+            Some(&source),
+        );
+    }
+}

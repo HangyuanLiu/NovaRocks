@@ -1212,6 +1212,20 @@ async fn execute_product_statement(
     Ok((result, execution_owner))
 }
 
+/// Receive the specialized MV command through the same typed failure boundary
+/// as other product commands. The caller retains the original statement owner.
+async fn execute_materialized_view_statement(
+    route: &dyn SpecializedStatementRoute,
+    statement: &novarocks_parser::ast::MaterializedViewStatement,
+    context: &RequestContext,
+    command_context: &CommandContext,
+) -> Result<StatementResult, RoutedExecutionError> {
+    route
+        .execute_materialized_view(statement, context, command_context)
+        .await
+        .map_err(product_command_error)
+}
+
 fn product_command_error(error: CommandError) -> RoutedExecutionError {
     let disposition = error.external_effect_disposition();
     if let Some(cause) = error.failure_cause() {
@@ -2803,13 +2817,13 @@ impl FrontendQuerySession {
                 }
             }),
             ParsedStatement::MaterializedView(statement) => Box::pin(async move {
-                let result = command_executor
-                    .execute_materialized_view(&statement, &context, &command_context)
-                    .await
-                    .map_err(|error| match error.compile_control_error() {
-                        Some(control) => RoutedExecutionError::Control(control),
-                        None => RoutedExecutionError::Engine(error.to_string()),
-                    });
+                let result = execute_materialized_view_statement(
+                    command_executor.as_ref(),
+                    &statement,
+                    &context,
+                    &command_context,
+                )
+                .await;
                 Ok((result, execution_owner))
             }),
             ParsedStatement::View(statement) => Box::pin(async move {
@@ -6189,5 +6203,133 @@ mod mv_guard_application_cause_tests {
         assert_eq!(service, original);
         assert!(service.failure_cause().is_none());
         assert!(service.execution_failure().is_none());
+    }
+}
+#[cfg(test)]
+mod mv_command_original_route_tests {
+    use super::*;
+    use novarocks_sql::compiler::SessionOptimizerSettings;
+    use novarocks_workload_control::ResourceConfig;
+    use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+    use novarocks_query_application::{
+        api::StatementExternalEffectDisposition,
+        session_control::{SessionToken, StatementToken},
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct OriginalCommandRoute {
+        command: Mutex<Option<CommandError>>,
+        calls: AtomicUsize,
+    }
+    impl SpecializedStatementRoute for OriginalCommandRoute {
+        fn execute_materialized_view(
+            &self,
+            statement: &novarocks_parser::ast::MaterializedViewStatement,
+            _: &RequestContext,
+            _: &CommandContext,
+        ) -> CommandFuture {
+            assert!(matches!(
+                statement,
+                novarocks_parser::ast::MaterializedViewStatement::Refresh(_)
+            ));
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let command = self
+                .command
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one original command");
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                Err(command)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn specialized_mv_route_retains_original_cause_and_actual_publication_fact() {
+        use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
+        let workload = novarocks_workload_control::WorkloadControl::try_new(
+            novarocks_workload_control::WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
+            },
+        )
+        .unwrap();
+        workload.mark_ready().unwrap();
+        let root = workload
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let cancellation =
+            QueryCancellationView::governed(root.owner.scope().cancellation().unwrap(), None);
+        let request = RequestContext::admit(RequestAdmission::new(
+            Some("ice".into()),
+            "db".into(),
+            ClusterRole::Fe,
+            BackendTopologySnapshot::empty(1),
+            None,
+            cancellation,
+            SessionOptimizerSettings::default(),
+            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        ));
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let connector = novarocks_spi::connector::ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(5),
+            stop.view(),
+            64 * 1024,
+            1024 * 1024,
+        )
+        .unwrap();
+        let context = CommandContext::new(
+            root.owner.scope().clone(),
+            connector,
+            StatementToken::new(SessionToken::new(725, 1), 1),
+            "mv-route-test",
+        );
+        let parsed = novarocks_parser::parse("REFRESH MATERIALIZED VIEW db.mv").unwrap();
+        let [ParsedStatement::MaterializedView(statement)] = parsed.as_slice() else {
+            panic!("MV refresh");
+        };
+        let source = SharedFailureCause::new(novarocks_workload_control::WorkError::Capacity(
+            "original publication failure",
+        ));
+        let fact = source.failure_fact();
+        for (kind, disposition) in [
+            (
+                MvApplicationErrorKind::CommitUnknown,
+                StatementExternalEffectDisposition::CommitUnknown,
+            ),
+            (
+                MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+                StatementExternalEffectDisposition::KnownCommitted,
+            ),
+        ] {
+            let command = crate::mv::command::project_product_failure_for_test(
+                MvApplicationError::new(kind, "private provider detail")
+                    .with_original_failure(source.clone()),
+            );
+            let route = OriginalCommandRoute {
+                command: Mutex::new(Some(command)),
+                calls: AtomicUsize::new(0),
+            };
+            let routed =
+                execute_materialized_view_statement(&route, statement, &request, &context).await;
+            let service =
+                selected_execution_or_worker_fallback(routed, internal_error("late observer stop"));
+            assert_eq!(route.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(service.failure_cause(), Some(&source));
+            assert_eq!(service.execution_failure().unwrap().fact(), fact);
+            assert_eq!(service.external_effect_disposition(), Some(disposition));
+            assert!(service.message().contains("do not retry statement"));
+            assert!(!service.message().contains("private provider detail"));
+            assert!(service.compile_control_error().is_none());
+            assert!(service.publication_terminal().is_none());
+        }
+        drop(context);
+        drop(request);
+        drop(root.business);
+        root.owner.complete_after_terminal_cancel_settled();
     }
 }

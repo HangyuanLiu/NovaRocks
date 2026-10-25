@@ -280,6 +280,7 @@ pub enum MvApplicationErrorKind {
 pub struct MvApplicationError {
     kind: MvApplicationErrorKind,
     message: String,
+    original_failure: Option<novarocks_failure_contract::SharedFailureCause>,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
     unavailable_implementation: Option<novarocks_sql::analyze_error::AnalyzeError>,
 }
@@ -289,6 +290,7 @@ impl MvApplicationError {
         Self {
             kind,
             message: message.into(),
+            original_failure: None,
             compile_control: None,
             unavailable_implementation: None,
         }
@@ -323,6 +325,9 @@ impl MvApplicationError {
         // Public SQL codes are rendered only at the final typed command boundary.
         let message = error.to_string();
         let mut failure = Self::new(MvApplicationErrorKind::InvalidRequest, message);
+        if let novarocks_sql::compiler::SqlCompileError::CompilationSource(source) = &error {
+            failure.original_failure = Some(source.clone());
+        }
         failure.compile_control = control;
         failure.unavailable_implementation = unavailable_implementation;
         failure
@@ -334,6 +339,18 @@ impl MvApplicationError {
         self.compile_control = error;
         self
     }
+    pub fn with_original_failure(
+        mut self,
+        cause: novarocks_failure_contract::SharedFailureCause,
+    ) -> Self {
+        self.original_failure = Some(cause);
+        self
+    }
+
+    pub fn original_failure(&self) -> Option<&novarocks_failure_contract::SharedFailureCause> {
+        self.original_failure.as_ref()
+    }
+
     pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
         self.compile_control.clone()
     }
@@ -379,7 +396,11 @@ impl fmt::Display for MvApplicationError {
     }
 }
 
-impl std::error::Error for MvApplicationError {}
+impl std::error::Error for MvApplicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.original_failure.as_ref().map(|cause| cause as _)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MvCreateProviderErrorKind {
@@ -581,6 +602,12 @@ mod compile_error_tests {
             let compile = SqlCompileError::CompilationSource(source.clone());
             let application = MvApplicationError::from_compile(compile.clone());
             let provider = MvCreateProviderError::from_compile(compile);
+            assert_eq!(application.original_failure(), Some(&source));
+            assert_eq!(
+                std::error::Error::source(&application)
+                    .and_then(|cause| cause.downcast_ref::<SharedFailureCause>()),
+                Some(&source),
+            );
             for control in [
                 application.compile_control_error(),
                 provider.compile_control_error(),
@@ -615,6 +642,7 @@ mod compile_error_tests {
             let application = MvApplicationError::from_compile(compile.clone());
             let provider = MvCreateProviderError::from_compile(compile);
             assert_eq!(application.message(), expected);
+            assert_eq!(application.original_failure(), None);
             assert_eq!(provider.message(), expected);
             assert_eq!(application.compile_control_error(), None);
             assert_eq!(application.unavailable_implementation(), None);
@@ -638,6 +666,7 @@ mod compile_error_tests {
                 let application = MvApplicationError::from_compile(compile.clone());
                 let provider = MvCreateProviderError::from_compile(compile);
                 assert_eq!(application.message(), expected);
+                assert_eq!(application.original_failure(), None);
                 assert_eq!(provider.message(), expected);
                 assert_eq!(application.compile_control_error(), Some(control.clone()));
                 assert_eq!(provider.compile_control_error(), Some(control.clone()));

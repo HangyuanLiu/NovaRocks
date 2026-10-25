@@ -41,6 +41,7 @@ pub enum MvProviderFailureKind {
 pub struct MvProviderFailure {
     kind: MvProviderFailureKind,
     message: String,
+    original_failure: Option<novarocks_failure_contract::SharedFailureCause>,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
     unavailable_implementation: Option<novarocks_sql::analyze_error::AnalyzeError>,
 }
@@ -50,6 +51,7 @@ impl MvProviderFailure {
         Self {
             kind,
             message: message.into(),
+            original_failure: None,
             compile_control: None,
             unavailable_implementation: None,
         }
@@ -62,6 +64,18 @@ impl MvProviderFailure {
         self.compile_control = error;
         self
     }
+    pub fn with_original_failure(
+        mut self,
+        cause: novarocks_failure_contract::SharedFailureCause,
+    ) -> Self {
+        self.original_failure = Some(cause);
+        self
+    }
+
+    pub fn original_failure(&self) -> Option<&novarocks_failure_contract::SharedFailureCause> {
+        self.original_failure.as_ref()
+    }
+
     pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
         self.compile_control.clone()
     }
@@ -114,9 +128,13 @@ impl MvProviderFailure {
             MvProviderFailureKind::TargetReplaced => MvProductErrorKind::TargetReplaced,
             MvProviderFailureKind::Corruption => MvProductErrorKind::Corruption,
         };
-        MvProductError::new(kind, self.message)
+        let mut failure = MvProductError::new(kind, self.message)
             .with_compile_control(self.compile_control)
-            .with_unavailable_implementation(self.unavailable_implementation)
+            .with_unavailable_implementation(self.unavailable_implementation);
+        if let Some(cause) = self.original_failure {
+            failure = failure.with_original_failure(cause);
+        }
+        failure
     }
 }
 
@@ -126,7 +144,11 @@ impl fmt::Display for MvProviderFailure {
     }
 }
 
-impl std::error::Error for MvProviderFailure {}
+impl std::error::Error for MvProviderFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.original_failure.as_ref().map(|cause| cause as _)
+    }
+}
 
 /// Provider effects required by the product-owned CREATE transition.
 ///

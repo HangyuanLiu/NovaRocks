@@ -95,7 +95,7 @@ impl MvCommandExecutor {
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         execution: &QueryExecutionContext,
-    ) -> Result<StatementResult, novarocks_sql::compiler::SqlCompileError> {
+    ) -> Result<StatementResult, novarocks_query_application::api::CommandError> {
         match statement {
             MaterializedViewStatement::Create(statement) => {
                 let statement = lower_typed_create(statement)?;
@@ -104,11 +104,8 @@ impl MvCommandExecutor {
                     current_database,
                     &statement.name_parts,
                 )?;
-                self.refresh_service.execute_serialized(
-                    &target,
-                    MvActivityOwner::Create,
-                    execution,
-                    || {
+                self.refresh_service
+                    .execute_serialized(&target, MvActivityOwner::Create, execution, || {
                         create_mv_with_ports(
                             &self.ports,
                             self.refresh_service.as_ref(),
@@ -117,8 +114,8 @@ impl MvCommandExecutor {
                             &statement,
                             connector_context,
                         )
-                    },
-                )
+                    })
+                    .map_err(mv_command_error)
             }
             MaterializedViewStatement::Drop(statement) => {
                 let statement = MvDropStatement {
@@ -141,7 +138,7 @@ impl MvCommandExecutor {
                             connector_context,
                         )
                     })
-                    .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
+                    .map_err(novarocks_query_application::api::CommandError::from)
             }
             MaterializedViewStatement::Alter(statement)
                 if !matches!(&statement.action, TypedAlterAction::Repartition(_)) =>
@@ -162,7 +159,7 @@ impl MvCommandExecutor {
                             connector_context,
                         )
                     })
-                    .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
+                    .map_err(novarocks_query_application::api::CommandError::from)
             }
             MaterializedViewStatement::Alter(statement) => self.execute_repartition(
                 current_catalog,
@@ -183,14 +180,16 @@ impl MvCommandExecutor {
                 current_catalog,
                 &lower_typed_show(statement)?,
             )
-            .map_err(novarocks_sql::compiler::SqlCompileError::Compilation),
-            MaterializedViewStatement::ExplainRefresh(statement) => self.execute_explain_refresh(
-                current_catalog,
-                current_database,
-                &lower_typed_refresh(&statement.refresh)?,
-                lower_typed_explain_level(statement.level),
-                connector_context,
-            ),
+            .map_err(novarocks_query_application::api::CommandError::from),
+            MaterializedViewStatement::ExplainRefresh(statement) => self
+                .execute_explain_refresh(
+                    current_catalog,
+                    current_database,
+                    &lower_typed_refresh(&statement.refresh)?,
+                    lower_typed_explain_level(statement.level),
+                    connector_context,
+                )
+                .map_err(mv_command_error),
         }
     }
 
@@ -288,7 +287,7 @@ impl MvCommandExecutor {
         statement: &MvAlterStatement,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         execution: &QueryExecutionContext,
-    ) -> Result<StatementResult, novarocks_sql::compiler::SqlCompileError> {
+    ) -> Result<StatementResult, novarocks_query_application::api::CommandError> {
         let MvAlterAction::Repartition(fields) = &statement.action else {
             return Err("MV repartition executor received a non-repartition action"
                 .to_string()
@@ -323,7 +322,7 @@ impl MvCommandExecutor {
                 execution,
             )
             .map(|()| StatementResult::Ok)
-            .map_err(mv_compile_error)
+            .map_err(mv_application_command_error)
     }
 
     fn execute_refresh(
@@ -333,7 +332,7 @@ impl MvCommandExecutor {
         statement: &MvRefreshRequest,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         execution: &QueryExecutionContext,
-    ) -> Result<StatementResult, novarocks_sql::compiler::SqlCompileError> {
+    ) -> Result<StatementResult, novarocks_query_application::api::CommandError> {
         let requested_target =
             resolve_refresh_mv_target(current_catalog, current_database, &statement.name_parts)?;
         let target_catalog = requested_target.catalog.as_deref().ok_or_else(|| {
@@ -386,18 +385,45 @@ impl MvCommandExecutor {
                         execution,
                     )
                     .map(|()| StatementResult::Ok)
-                    .map_err(mv_compile_error)?,
+                    .map_err(mv_application_command_error)?,
             );
             // The next dependency must observe the upstream commit, not the
             // request-local metadata snapshot frozen before this step.
             step_context = step_context.after_external_effect();
         }
         last_result.ok_or_else(|| {
-            novarocks_sql::compiler::SqlCompileError::Compilation(
+            novarocks_query_application::api::CommandError::from(
                 "MV refresh dependency planner returned no steps".to_string(),
             )
         })
     }
+}
+
+fn mv_application_command_error(
+    error: crate::mv::domain::application::MvApplicationError,
+) -> novarocks_query_application::api::CommandError {
+    use crate::mv::domain::application::MvApplicationErrorKind;
+    use novarocks_query_application::api::StatementExternalEffectDisposition;
+    // These two kinds are emitted only with the original publication's fact.
+    // Other business failures alone do not prove the absence of an effect.
+    let disposition = match error.kind() {
+        MvApplicationErrorKind::CommitUnknown => {
+            Some(StatementExternalEffectDisposition::CommitUnknown)
+        }
+        MvApplicationErrorKind::KnownCommittedFinalizeFailed => {
+            Some(StatementExternalEffectDisposition::KnownCommitted)
+        }
+        _ => None,
+    };
+    let command = if let Some(cause) = error.original_failure() {
+        // A Provider source is not a compiler failure. Retain a compile
+        // sidecar only when the actual compiler already supplied one.
+        novarocks_query_application::api::CommandError::from_failure_cause(cause.clone())
+            .with_compile_control(error.compile_control_error())
+    } else {
+        mv_command_error(mv_compile_error(error))
+    };
+    command.with_external_effect_disposition(disposition)
 }
 
 fn mv_compile_error(
@@ -413,10 +439,10 @@ fn mv_compile_error(
 }
 
 #[cfg(test)]
-pub(super) fn project_product_failure_for_test(
+pub(crate) fn project_product_failure_for_test(
     error: crate::mv::domain::application::MvApplicationError,
 ) -> novarocks_query_application::api::CommandError {
-    mv_command_error(mv_compile_error(error))
+    mv_application_command_error(error)
 }
 
 /// Role-local implementation of the Query Application MV consumer. It owns
@@ -440,15 +466,13 @@ impl MaterializedViewCommandConsumer for FrontendMvCommandConsumer {
         context: &RequestContext,
         command_context: &CommandContext,
     ) -> Result<StatementResult, novarocks_query_application::api::CommandError> {
-        self.executor
-            .execute(
-                command.statement(),
-                context.session().current_catalog(),
-                context.session().current_database(),
-                command_context.connector_context(),
-                context.execution(),
-            )
-            .map_err(mv_command_error)
+        self.executor.execute(
+            command.statement(),
+            context.session().current_catalog(),
+            context.session().current_database(),
+            command_context.connector_context(),
+            context.execution(),
+        )
     }
 }
 
@@ -1233,6 +1257,66 @@ mod refresh_refusal_projection_tests {
             let user = mv_command_error(mv_compile_error(failure));
             assert_eq!(user.compile_control_error(), Some(control.clone()));
             assert_eq!(user.to_string(), control.to_string());
+        }
+    }
+}
+
+#[cfg(test)]
+mod original_publication_effect_tests {
+    use super::*;
+    use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
+    use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+    use novarocks_query_application::api::StatementExternalEffectDisposition;
+
+    #[test]
+    fn original_publication_fact_survives_the_independent_provider_failure() {
+        let source = SharedFailureCause::new(novarocks_workload_control::WorkError::Capacity(
+            "original provider operation failed",
+        ));
+        let original_fact = source.failure_fact();
+        for (kind, effect) in [
+            (
+                MvApplicationErrorKind::CommitUnknown,
+                Some(StatementExternalEffectDisposition::CommitUnknown),
+            ),
+            (
+                MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+                Some(StatementExternalEffectDisposition::KnownCommitted),
+            ),
+            (MvApplicationErrorKind::Engine, None),
+            (MvApplicationErrorKind::InvalidRequest, None),
+        ] {
+            let command = mv_application_command_error(
+                MvApplicationError::new(kind, "MV operation failed")
+                    .with_original_failure(source.clone()),
+            );
+            assert_eq!(command.failure_cause(), Some(&source));
+            assert_eq!(
+                command.failure_cause().unwrap().failure_fact(),
+                original_fact
+            );
+            assert_eq!(command.compile_control_error(), None);
+            assert_eq!(command.external_effect_disposition(), effect);
+            if let Some(effect) = effect {
+                assert!(effect.do_not_retry());
+            }
+        }
+        // The publication fact is independent of whether this older error
+        // already carries a typed cause, so a legacy diagnostic keeps it too.
+        for (kind, effect) in [
+            (
+                MvApplicationErrorKind::CommitUnknown,
+                StatementExternalEffectDisposition::CommitUnknown,
+            ),
+            (
+                MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+                StatementExternalEffectDisposition::KnownCommitted,
+            ),
+        ] {
+            let command =
+                mv_application_command_error(MvApplicationError::new(kind, "publication failed"));
+            assert_eq!(command.external_effect_disposition(), Some(effect));
+            assert_eq!(command.failure_cause(), None);
         }
     }
 }
