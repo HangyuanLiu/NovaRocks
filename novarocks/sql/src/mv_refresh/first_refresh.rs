@@ -267,6 +267,31 @@ impl SqlMvFirstRefreshArtifact {
     fn sql(&self) -> &str {
         self.0.sql()
     }
+
+    /// Declare catalog facts for this original opaque SQL artifact. Its text
+    /// stays SQL-owned; the caller observes only exact SchemaOnly requests.
+    pub fn catalog_preparation(
+        &self,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        control: crate::compiler::SqlCompileControl,
+    ) -> Result<crate::compiler::SqlCapturedCatalogPreparation, crate::compiler::SqlCompileError>
+    {
+        control.check()?;
+        let statements = novarocks_parser::parse(self.sql())
+            .map_err(|error| crate::compiler::SqlCompileError::Compilation(error.to_string()))?;
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+            return Err(crate::compiler::SqlCompileError::InvalidRequest(
+                "MV first-refresh artifact is not a query".into(),
+            ));
+        };
+        crate::compiler::SqlCapturedCatalogPreparation::try_new(
+            query.clone(),
+            current_catalog,
+            current_database,
+            control,
+        )
+    }
 }
 
 /// Immutable application facts required to consume one opaque first-refresh

@@ -34,6 +34,7 @@ pub use crate::functions::{
     builtin_sql_function_catalog, contribute_builtin_functions,
 };
 pub use crate::optimizer::options::SessionOptimizerSettings;
+mod captured_catalog;
 mod dml_catalog;
 mod logical_explain;
 mod scalar_presence_catalog;
@@ -47,6 +48,7 @@ pub use crate::planner::distributed::build::{
     FragmentPackageSemantics, PackageSemanticsError, author_fragment_package_semantics,
     check_pure_call_definitions_observed,
 };
+pub use captured_catalog::{SqlCapturedCatalog, SqlCapturedCatalogPreparation};
 #[cfg(test)]
 pub(crate) use completion_driver::compile_authored_aggregate_for_test;
 pub use dml_catalog::SqlDmlCatalogPreparation;
